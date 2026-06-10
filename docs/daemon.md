@@ -43,6 +43,10 @@ stored shadow body, the executor skips that request and marks the entity `dirty`
 when the hydration ladder allows it. Source or I/O failures leave the request in
 the queue so a later daemon tick can retry.
 
+`afsd::notion` wires `NotionConnector` into this source boundary. It uses the
+Notion connector's fetch path and `render_native_entity` method so daemon
+hydration persists the same shadow snapshot that CLI pull uses.
+
 ## Supervisor Events
 
 `DaemonSupervisor` currently handles the safe local state transitions that do not

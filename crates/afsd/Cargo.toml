@@ -18,4 +18,7 @@ path = "src/main.rs"
 afs-core.workspace = true
 afs-store.workspace = true
 afs-connector.workspace = true
+afs-notion.workspace = true
 
+[dev-dependencies]
+serde_json = "1.0"

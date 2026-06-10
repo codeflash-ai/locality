@@ -56,7 +56,9 @@ version = "0.1.0"
 dependencies = [
  "afs-connector",
  "afs-core",
+ "afs-notion",
  "afs-store",
+ "serde_json",
 ]
 
 [[package]]
