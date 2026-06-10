@@ -14,7 +14,9 @@ use afs_store::{
 #[test]
 fn mount_config_round_trips_with_read_only_flag() {
     let mut store = InMemoryStateStore::new();
-    let mount = MountConfig::new(mount_id(), "notion", "/Users/saurabh/afs/notion").read_only(true);
+    let mount = MountConfig::new(mount_id(), "notion", "/Users/saurabh/afs/notion")
+        .with_remote_root_id(RemoteId::new("root-page"))
+        .read_only(true);
 
     store.save_mount(mount.clone()).expect("save mount");
 

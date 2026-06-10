@@ -31,7 +31,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 3);
+    assert_eq!(user_version, 4);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -51,7 +51,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 3,
+            supported: 4,
         }
     );
 }
@@ -256,7 +256,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 3);
+    assert_eq!(user_version, 4);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -327,7 +327,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 3);
+    assert_eq!(user_version, 4);
     assert!(entry.apply_effects.is_empty());
 }
 
@@ -366,6 +366,7 @@ impl SqliteFixture {
 
     fn mount_config(&self) -> MountConfig {
         MountConfig::new(self.mount_id.clone(), "notion", self.mount_root.clone())
+            .with_remote_root_id(RemoteId::new("root-page"))
     }
 }
 

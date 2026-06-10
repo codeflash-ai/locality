@@ -7,6 +7,7 @@ pub mod client;
 pub mod dto;
 pub mod fetch;
 pub mod mapping;
+pub mod projection;
 pub mod render;
 
 use std::sync::Arc;
@@ -21,11 +22,13 @@ use afs_core::{AfsError, AfsResult};
 
 use crate::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use crate::fetch::fetch_page_bundle;
+use crate::projection::{enumerate_root_page_tree, enumerate_shared_pages};
 use crate::render::{NotionRenderedEntity, render_native_entity};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotionConfig {
     pub workspace_id: Option<String>,
+    pub root_page_id: Option<afs_core::model::RemoteId>,
     /// Environment variable or future keychain key used to find the bearer token.
     pub token_key: String,
 }
@@ -34,8 +37,16 @@ impl Default for NotionConfig {
     fn default() -> Self {
         Self {
             workspace_id: None,
+            root_page_id: None,
             token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
         }
+    }
+}
+
+impl NotionConfig {
+    pub fn with_root_page_id(mut self, root_page_id: afs_core::model::RemoteId) -> Self {
+        self.root_page_id = Some(root_page_id);
+        self
     }
 }
 
@@ -66,6 +77,15 @@ impl NotionConnector {
         &self.config
     }
 
+    pub fn with_root_page_id(&self, root_page_id: afs_core::model::RemoteId) -> Self {
+        let mut config = self.config.clone();
+        config.root_page_id = Some(root_page_id);
+        Self {
+            config,
+            api: Arc::clone(&self.api),
+        }
+    }
+
     pub fn render_native_entity(&self, entity: &NativeEntity) -> AfsResult<NotionRenderedEntity> {
         render_native_entity(entity)
     }
@@ -84,8 +104,12 @@ impl Connector for NotionConnector {
         }
     }
 
-    fn enumerate(&self, _request: EnumerateRequest) -> AfsResult<Vec<TreeEntry>> {
-        Err(AfsError::NotImplemented("Notion enumerate"))
+    fn enumerate(&self, request: EnumerateRequest) -> AfsResult<Vec<TreeEntry>> {
+        if let Some(root_page_id) = &self.config.root_page_id {
+            enumerate_root_page_tree(self.api.as_ref(), request.mount_id, root_page_id)
+        } else {
+            enumerate_shared_pages(self.api.as_ref(), request.mount_id)
+        }
     }
 
     fn fetch(&self, request: FetchRequest) -> AfsResult<NativeEntity> {

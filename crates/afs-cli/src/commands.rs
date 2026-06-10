@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use afs_connector::{ConnectorPushApplier, ConnectorPushConcurrencyCheck, ConnectorUndoApplier};
+use afs_core::model::{MountId, RemoteId};
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::SqliteStateStore;
 use serde::Serialize;
@@ -10,6 +11,8 @@ use crate::history::{
     HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
     undo_report_exit_code,
 };
+use crate::mount::{MountError, MountOptions, MountReport, run_mount};
+use crate::pull::{PullError, PullReport, run_pull};
 use crate::push::{
     NotImplementedReconciler, PushOptions, PushReport, push_report_exit_code,
     run_push_with_executor,
@@ -33,9 +36,9 @@ pub fn dispatch(args: &[String]) -> i32 {
     let json = has_flag(args, "--json");
     match args[0].as_str() {
         "connect" => stub("connect", json),
-        "mount" => stub("mount", json),
+        "mount" => mount(&args[1..], json),
         "status" => stub("status", json),
-        "pull" => stub("pull", json),
+        "pull" => pull(&args[1..], json),
         "push" => push(&args[1..], json),
         "diff" => diff(&args[1..], json),
         "undo" => undo(&args[1..], json),
@@ -47,6 +50,114 @@ pub fn dispatch(args: &[String]) -> i32 {
             print_help();
             EXIT_USAGE
         }
+    }
+}
+
+fn mount(args: &[String], json: bool) -> i32 {
+    if first_positional(args) != Some("notion") {
+        return command_error(
+            json,
+            CommandError::new(
+                "mount",
+                "usage",
+                "usage: afs mount notion <path> --root-page <page-id> [--mount-id <id>] [--read-only] [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    }
+
+    let Some(root) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "mount",
+                "usage",
+                "usage: afs mount notion <path> --root-page <page-id> [--mount-id <id>] [--read-only] [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+    let Some(root_page_id) = flag_value(args, "--root-page") else {
+        return command_error(
+            json,
+            CommandError::new(
+                "mount",
+                "usage",
+                "afs mount notion requires --root-page <page-id>",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let mut store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("mount", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    let options = MountOptions {
+        mount_id: MountId::new(
+            flag_value(args, "--mount-id")
+                .map(str::to_string)
+                .unwrap_or_else(|| "notion-main".to_string()),
+        ),
+        connector: "notion".to_string(),
+        root: PathBuf::from(root),
+        remote_root_id: Some(RemoteId::new(root_page_id)),
+        read_only: has_flag(args, "--read-only"),
+    };
+
+    match run_mount(&mut store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_mount_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => mount_command_error(json, error),
+    }
+}
+
+fn pull(args: &[String], json: bool) -> i32 {
+    let Some(path) = first_positional(args) else {
+        return command_error(
+            json,
+            CommandError::new("pull", "usage", "usage: afs pull <path> [--json]"),
+            EXIT_USAGE,
+        );
+    };
+
+    let mut store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("pull", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let connector = default_notion_connector();
+
+    match run_pull(&mut store, &connector, PathBuf::from(path)) {
+        Ok(report) if json => {
+            let exit_code = pull_report_exit_code(&report);
+            print_json(&report);
+            exit_code
+        }
+        Ok(report) => {
+            let exit_code = pull_report_exit_code(&report);
+            print_pull_report(&report);
+            exit_code
+        }
+        Err(error) => pull_command_error(json, error),
     }
 }
 
@@ -289,6 +400,27 @@ fn print_push_report(report: &PushReport) {
     }
 }
 
+fn print_mount_report(report: &MountReport) {
+    println!(
+        "mounted {} at {} ({})",
+        report.mount_id, report.root, report.connector
+    );
+}
+
+fn print_pull_report(report: &PullReport) {
+    if report.skipped_dirty > 0 {
+        println!(
+            "pull skipped {} dirty file(s); {} hydrated, {} stubbed, {} enumerated",
+            report.skipped_dirty, report.hydrated, report.stubbed, report.enumerated
+        );
+    } else {
+        println!(
+            "pull complete: {} hydrated, {} stubbed, {} enumerated",
+            report.hydrated, report.stubbed, report.enumerated
+        );
+    }
+}
+
 fn default_notion_connector() -> NotionConnector {
     NotionConnector::new(NotionConfig::default())
 }
@@ -357,6 +489,28 @@ fn history_command_error(command: &'static str, json: bool, error: HistoryError)
     )
 }
 
+fn mount_command_error(json: bool, error: MountError) -> i32 {
+    command_error(
+        json,
+        CommandError::new("mount", error.code(), error.message()),
+        EXIT_INTERNAL,
+    )
+}
+
+fn pull_command_error(json: bool, error: PullError) -> i32 {
+    let exit_code = match &error {
+        PullError::MountNotFound(_)
+        | PullError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
+        PullError::ReadFile { .. } | PullError::WriteFile { .. } => EXIT_INTERNAL,
+        PullError::Store(_) | PullError::Connector(_) | PullError::CurrentDir(_) => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("pull", error.code(), error.message()),
+        exit_code,
+    )
+}
+
 fn print_json<T: Serialize>(value: &T) {
     match serde_json::to_string_pretty(value) {
         Ok(json) => println!("{json}"),
@@ -394,14 +548,57 @@ fn diff_report_exit_code(report: &crate::diff::DiffReport) -> i32 {
     }
 }
 
+fn pull_report_exit_code(report: &PullReport) -> i32 {
+    if report.ok {
+        EXIT_SUCCESS
+    } else {
+        EXIT_VALIDATION
+    }
+}
+
 fn first_positional(args: &[String]) -> Option<&str> {
-    args.iter()
-        .find(|arg| !arg.starts_with('-'))
-        .map(String::as_str)
+    nth_positional(args, 0)
+}
+
+fn nth_positional(args: &[String], index: usize) -> Option<&str> {
+    let mut seen = 0;
+    let mut skip_next = false;
+
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if takes_value(arg) {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        if seen == index {
+            return Some(arg.as_str());
+        }
+        seen += 1;
+    }
+
+    None
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
+}
+
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|index| args.get(index + 1))
+        .filter(|value| !value.starts_with('-'))
+        .map(String::as_str)
+}
+
+fn takes_value(arg: &str) -> bool {
+    matches!(arg, "--root-page" | "--mount-id")
 }
 
 fn default_state_root() -> PathBuf {

@@ -5,9 +5,9 @@ The `afs` command is the single supported control surface for users and coding a
 ## Commands
 
 - `afs connect notion`
-- `afs mount notion [--read-only]`
+- `afs mount notion <path> --root-page <page-id> [--mount-id <id>] [--read-only]`
 - `afs status [path] [--json]`
-- `afs pull [path] [--json]`
+- `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
 - `afs diff [path] [--json]`
 - `afs undo [push-id] [--json]`
@@ -30,6 +30,14 @@ Remaining categories to assign before `afs push` applies remote mutations:
 
 - conflict;
 - remote concurrency failure.
+
+## Initial `afs mount` and `afs pull`
+
+`afs mount notion <path> --root-page <page-id>` creates the local root directory and stores a mount record in SQLite. The current auth path is still developer-oriented: the Notion connector reads its bearer token from `NOTION_TOKEN` until OAuth/keychain support is implemented.
+
+`afs pull <mount-root>` enumerates the configured Notion root page, writes stub Markdown files for projected pages, creates directories for projected databases, hydrates the root page, and persists the root page shadow snapshot. `afs pull <page-file>` hydrates one known entity. Pull refuses to overwrite a hydrated file if its body no longer matches the stored shadow, returning a dirty skip instead.
+
+The JSON report includes `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts.
 
 ## Initial `afs diff --json` Shape
 

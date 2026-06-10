@@ -22,7 +22,7 @@ use crate::records::{EntityRecord, MountConfig, ShadowBlockRecord, ShadowSnapsho
 use crate::repository::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -58,16 +58,18 @@ impl MountRepository for SqliteStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
         let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO mounts (mount_id, connector, root, read_only)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(mount_id) DO UPDATE SET
                 connector = excluded.connector,
                 root = excluded.root,
+                remote_root_id = excluded.remote_root_id,
                 read_only = excluded.read_only",
             params![
                 mount.mount_id.0,
                 mount.connector,
                 path_to_text(&mount.root),
+                mount.remote_root_id.map(|remote_id| remote_id.0),
                 bool_to_int(mount.read_only),
             ],
         )?;
@@ -78,7 +80,7 @@ impl MountRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT mount_id, connector, root, read_only
+                "SELECT mount_id, connector, root, remote_root_id, read_only
                  FROM mounts
                  WHERE mount_id = ?1",
                 params![mount_id.0],
@@ -87,7 +89,8 @@ impl MountRepository for SqliteStateStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
@@ -99,7 +102,7 @@ impl MountRepository for SqliteStateStore {
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT mount_id, connector, root, read_only
+            "SELECT mount_id, connector, root, remote_root_id, read_only
              FROM mounts
              ORDER BY mount_id",
         )?;
@@ -108,7 +111,8 @@ impl MountRepository for SqliteStateStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
 
@@ -395,7 +399,7 @@ const ENTITY_SELECT_WITH_WHERE: &str = "
     FROM entities
     ";
 
-type MountRow = (String, String, String, i64);
+type MountRow = (String, String, String, Option<String>, i64);
 type EntityRow = (
     String,
     String,
@@ -428,6 +432,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             mount_id TEXT PRIMARY KEY,
             connector TEXT NOT NULL,
             root TEXT NOT NULL,
+            remote_root_id TEXT,
             read_only INTEGER NOT NULL CHECK (read_only IN (0, 1))
         );
 
@@ -482,6 +487,13 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         )?;
     }
 
+    if user_version < 4 && !column_exists(connection, "mounts", "remote_root_id")? {
+        connection.execute_batch(
+            "ALTER TABLE mounts
+             ADD COLUMN remote_root_id TEXT;",
+        )?;
+    }
+
     if user_version < SCHEMA_VERSION {
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
@@ -494,7 +506,8 @@ fn mount_from_row(row: MountRow) -> StoreResult<MountConfig> {
         mount_id: MountId(row.0),
         connector: row.1,
         root: PathBuf::from(row.2),
-        read_only: row.3 != 0,
+        remote_root_id: row.3.map(RemoteId),
+        read_only: row.4 != 0,
     })
 }
 

@@ -4,9 +4,11 @@
 
 ## Current Scope
 
-The first implementation is read/render only:
+The current implementation is a live-capable read and pull projection:
 
 - `HttpNotionApi` calls the live Notion REST API with a bearer token from `NOTION_TOKEN`.
+- `search_pages` can enumerate all pages shared with the integration when no root page is configured.
+- root-page enumeration walks child-page blocks and projects the page tree into stable AgentFS paths.
 - `fetch` retrieves page metadata and recursively retrieves paginated block children.
 - fetched pages are serialized into a versioned native JSON bundle inside `NativeEntity.raw`;
 - `render_native_entity` converts that native bundle into canonical Markdown plus a `ShadowDocument`;
@@ -31,3 +33,20 @@ The token must have access to the target page. Live tests are ignored by default
 The renderer currently supports paragraphs, headings, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, dividers, child-page/database directives, and unsupported-block directives.
 
 Nested children are fetched recursively and rendered after their parent. This preserves content and block IDs for the first read path, but it does not yet preserve every Notion nesting/layout nuance. Layout-rich blocks should stay directive-backed until the renderer can round-trip them safely.
+
+## Path Projection
+
+Root-page mounts use the same filename shape described in `plan.md`: `slugified-title ~shortid.md`.
+
+For a page that also has child pages, AgentFS reserves a sibling directory with the same stem:
+
+```text
+roadmap ~aaaaaa.md
+roadmap ~aaaaaa/
+  design-notes ~bbbbbb.md
+  tasks ~cccccc/
+```
+
+The remote ID remains the identity. The short ID starts at six hex characters and lengthens on sibling collisions, while the title slug can change without changing identity.
+
+Database blocks currently project as directories only. Row pages, `_schema.yaml`, and `_view.csv` are still future work.

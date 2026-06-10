@@ -1,0 +1,283 @@
+//! Project Notion pages and child-page blocks into AgentFS tree entries.
+//!
+//! Paths are a local projection, not identity. The remote ID remains the stable
+//! key; the filename suffix makes title changes and sibling collisions
+//! recoverable without treating them as deletes.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
+use afs_core::{AfsError, AfsResult};
+
+use crate::client::NotionApi;
+use crate::dto::{BlockDto, PageDto};
+use crate::render::page_title;
+
+pub fn enumerate_root_page_tree(
+    api: &dyn NotionApi,
+    mount_id: MountId,
+    root_page_id: &RemoteId,
+) -> AfsResult<Vec<TreeEntry>> {
+    let root_page = api.retrieve_page(root_page_id.as_str())?;
+    let mut used_paths = BTreeSet::new();
+    let mut entries = Vec::new();
+    let root_title = page_title(&root_page);
+    let root_path = allocate_page_path(Path::new(""), &root_title, &root_page.id, &mut used_paths);
+
+    entries.push(page_entry(
+        mount_id.clone(),
+        &root_page,
+        root_title,
+        root_path.clone(),
+    ));
+    enumerate_page_children(
+        api,
+        &mount_id,
+        root_page.id.as_str(),
+        page_child_dir(&root_path),
+        &mut used_paths,
+        &mut entries,
+    )?;
+
+    Ok(entries)
+}
+
+pub fn enumerate_shared_pages(api: &dyn NotionApi, mount_id: MountId) -> AfsResult<Vec<TreeEntry>> {
+    let mut cursor = None;
+    let mut used_paths = BTreeSet::new();
+    let mut entries = Vec::new();
+
+    loop {
+        let page = api.search_pages(cursor.as_deref())?;
+        for result in page.results {
+            let title = page_title(&result);
+            let path = allocate_page_path(Path::new(""), &title, &result.id, &mut used_paths);
+            entries.push(page_entry(mount_id.clone(), &result, title, path));
+        }
+
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Err(AfsError::InvalidState(
+                "notion search page had has_more without next_cursor".to_string(),
+            ));
+        }
+    }
+
+    Ok(entries)
+}
+
+fn enumerate_page_children(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    block_id: &str,
+    parent_dir: PathBuf,
+    used_paths: &mut BTreeSet<PathBuf>,
+    entries: &mut Vec<TreeEntry>,
+) -> AfsResult<()> {
+    let mut cursor = None;
+
+    loop {
+        let page = api.retrieve_block_children(block_id, cursor.as_deref())?;
+        for block in page.results {
+            project_child_block(api, mount_id, block, &parent_dir, used_paths, entries)?;
+        }
+
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Err(AfsError::InvalidState(
+                "notion block children page had has_more without next_cursor".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn project_child_block(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    block: BlockDto,
+    parent_dir: &Path,
+    used_paths: &mut BTreeSet<PathBuf>,
+    entries: &mut Vec<TreeEntry>,
+) -> AfsResult<()> {
+    match block.kind.as_str() {
+        "child_page" => {
+            let page = api.retrieve_page(block.id.as_str())?;
+            let title = block
+                .child_page
+                .as_ref()
+                .map(|child| child.title.clone())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| page_title(&page));
+            let path = allocate_page_path(parent_dir, &title, &page.id, used_paths);
+            entries.push(page_entry(mount_id.clone(), &page, title, path.clone()));
+            enumerate_page_children(
+                api,
+                mount_id,
+                page.id.as_str(),
+                page_child_dir(&path),
+                used_paths,
+                entries,
+            )?;
+        }
+        "child_database" => {
+            let title = block
+                .child_database
+                .as_ref()
+                .map(|child| child.title.clone())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| "Untitled database".to_string());
+            let path = allocate_directory_path(parent_dir, &title, &block.id, used_paths);
+            entries.push(TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new(block.id),
+                kind: EntityKind::Database,
+                title,
+                path,
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+            });
+        }
+        _ if block.has_children => {
+            enumerate_page_children(
+                api,
+                mount_id,
+                block.id.as_str(),
+                parent_dir.to_path_buf(),
+                used_paths,
+                entries,
+            )?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn page_entry(mount_id: MountId, page: &PageDto, title: String, path: PathBuf) -> TreeEntry {
+    TreeEntry {
+        mount_id,
+        remote_id: RemoteId::new(page.id.clone()),
+        kind: EntityKind::Page,
+        title,
+        path,
+        hydration: HydrationState::Stub,
+        content_hash: None,
+        remote_edited_at: page.last_edited_time.clone(),
+    }
+}
+
+fn allocate_page_path(
+    parent_dir: &Path,
+    title: &str,
+    remote_id: &str,
+    used_paths: &mut BTreeSet<PathBuf>,
+) -> PathBuf {
+    for short_len in [6, 8, 10, 12, 32] {
+        let stem = projected_stem(title, remote_id, short_len);
+        let file_path = parent_dir.join(format!("{stem}.md"));
+        let child_dir = parent_dir.join(&stem);
+        if !used_paths.contains(&file_path) && !used_paths.contains(&child_dir) {
+            used_paths.insert(file_path.clone());
+            used_paths.insert(child_dir);
+            return file_path;
+        }
+    }
+
+    unreachable!("32 hex chars should make Notion page projection paths unique")
+}
+
+fn allocate_directory_path(
+    parent_dir: &Path,
+    title: &str,
+    remote_id: &str,
+    used_paths: &mut BTreeSet<PathBuf>,
+) -> PathBuf {
+    for short_len in [6, 8, 10, 12, 32] {
+        let path = parent_dir.join(projected_stem(title, remote_id, short_len));
+        if !used_paths.contains(&path) {
+            used_paths.insert(path.clone());
+            return path;
+        }
+    }
+
+    unreachable!("32 hex chars should make Notion database projection paths unique")
+}
+
+fn page_child_dir(page_path: &Path) -> PathBuf {
+    page_path.with_extension("")
+}
+
+fn projected_stem(title: &str, remote_id: &str, short_len: usize) -> String {
+    format!(
+        "{} ~{}",
+        slugify_title(title),
+        short_id(remote_id, short_len)
+    )
+}
+
+fn slugify_title(title: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "untitled".to_string()
+    } else {
+        slug
+    }
+}
+
+fn short_id(remote_id: &str, len: usize) -> String {
+    remote_id
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .take(len)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{allocate_page_path, slugify_title};
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    #[test]
+    fn slugifies_titles_for_stable_paths() {
+        assert_eq!(slugify_title("Roadmap 2026!"), "roadmap-2026");
+        assert_eq!(slugify_title("..."), "untitled");
+    }
+
+    #[test]
+    fn path_projection_reserves_page_child_directory() {
+        let mut used = BTreeSet::new();
+        let first = allocate_page_path(Path::new(""), "Roadmap", "abcdef123456", &mut used);
+        let second = allocate_page_path(Path::new(""), "Roadmap", "abcdef999999", &mut used);
+
+        assert_eq!(first, Path::new("roadmap ~abcdef.md"));
+        assert_eq!(second, Path::new("roadmap ~abcdef99.md"));
+        assert!(used.contains(Path::new("roadmap ~abcdef")));
+    }
+}

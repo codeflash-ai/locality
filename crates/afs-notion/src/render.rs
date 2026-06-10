@@ -222,7 +222,7 @@ fn frontmatter(page: &PageDto, title: &str) -> String {
     )
 }
 
-fn page_title(page: &PageDto) -> String {
+pub(crate) fn page_title(page: &PageDto) -> String {
     page.properties
         .values()
         .find(|property| property.kind == "title")

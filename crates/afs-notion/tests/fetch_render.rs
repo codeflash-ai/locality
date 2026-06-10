@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
-use afs_connector::{Connector, FetchRequest};
-use afs_core::model::RemoteId;
+use afs_connector::{Connector, EnumerateRequest, FetchRequest};
+use afs_core::model::{EntityKind, MountId, RemoteId};
 use afs_core::shadow::MarkdownBlockKind;
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
-    BlockDto, BlockListDto, BlockTreeDto, PageDto, PagePropertyDto, PaginatedListDto,
-    RichTextBlockDto, RichTextDto,
+    BlockDto, BlockListDto, BlockTreeDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
+    RichTextBlockDto, RichTextDto, TitleBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 
@@ -55,7 +56,7 @@ fn fetch_recurses_paginated_block_children_and_render_preserves_shadow_ids() {
 
 #[test]
 fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
-    let page = page();
+    let page = page("page-1", "Roadmap");
     let block = BlockTreeDto {
         block: unsupported_block("bookmark-1", "bookmark"),
         children: Vec::new(),
@@ -93,6 +94,34 @@ fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
 }
 
 #[test]
+fn enumerate_projects_root_page_tree_to_stable_paths() {
+    let root_page_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let api = FixtureNotionApi::tree(root_page_id.as_str());
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root_page_id),
+        Arc::new(api),
+    );
+
+    let entries = connector
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("enumerate");
+
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].path, Path::new("roadmap ~aaaaaa.md"));
+    assert_eq!(entries[0].kind, EntityKind::Page);
+    assert_eq!(
+        entries[1].path,
+        Path::new("roadmap ~aaaaaa/design-notes ~bbbbbb.md")
+    );
+    assert_eq!(entries[1].kind, EntityKind::Page);
+    assert_eq!(entries[2].path, Path::new("roadmap ~aaaaaa/tasks ~cccccc"));
+    assert_eq!(entries[2].kind, EntityKind::Database);
+}
+
+#[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_PAGE_ID"]
 fn live_fetch_and_render_page_from_environment() {
     let page_id = std::env::var("AFS_NOTION_PAGE_ID").expect("AFS_NOTION_PAGE_ID");
@@ -113,11 +142,13 @@ fn live_fetch_and_render_page_from_environment() {
 
 #[derive(Debug)]
 struct FixtureNotionApi {
+    pages: BTreeMap<String, PageDto>,
     children: BTreeMap<(String, Option<String>), BlockListDto>,
 }
 
 impl FixtureNotionApi {
     fn new() -> Self {
+        let pages = BTreeMap::from([("page-1".to_string(), page("page-1", "Roadmap"))]);
         let mut children = BTreeMap::new();
         children.insert(
             ("page-1".to_string(), None),
@@ -151,14 +182,46 @@ impl FixtureNotionApi {
             },
         );
 
-        Self { children }
+        Self { pages, children }
+    }
+
+    fn tree(root_page_id: &str) -> Self {
+        let child_page_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let database_id = "cccccccccccccccccccccccccccccccc";
+        let pages = BTreeMap::from([
+            (root_page_id.to_string(), page(root_page_id, "Roadmap")),
+            (
+                child_page_id.to_string(),
+                page(child_page_id, "Design Notes"),
+            ),
+        ]);
+        let children = BTreeMap::from([
+            (
+                (root_page_id.to_string(), None),
+                PaginatedListDto {
+                    results: vec![
+                        child_page_block(child_page_id, "Design Notes"),
+                        child_database_block(database_id, "Tasks"),
+                    ],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            (
+                (child_page_id.to_string(), None),
+                PaginatedListDto::default(),
+            ),
+        ]);
+
+        Self { pages, children }
     }
 }
 
 impl NotionApi for FixtureNotionApi {
     fn retrieve_page(&self, page_id: &str) -> afs_core::AfsResult<PageDto> {
-        assert_eq!(page_id, "page-1");
-        Ok(page())
+        self.pages.get(page_id).cloned().ok_or_else(|| {
+            afs_core::AfsError::InvalidState(format!("missing fixture page {page_id}"))
+        })
     }
 
     fn retrieve_block_children(
@@ -171,6 +234,14 @@ impl NotionApi for FixtureNotionApi {
             .get(&(block_id.to_string(), start_cursor.map(str::to_string)))
             .cloned()
             .unwrap_or_default())
+    }
+
+    fn search_pages(&self, _start_cursor: Option<&str>) -> afs_core::AfsResult<PageListDto> {
+        Ok(PaginatedListDto {
+            results: self.pages.values().cloned().collect(),
+            next_cursor: None,
+            has_more: false,
+        })
     }
 }
 
@@ -185,9 +256,9 @@ impl WithChildren for BlockDto {
     }
 }
 
-fn page() -> PageDto {
+fn page(id: &str, title: &str) -> PageDto {
     PageDto {
-        id: "page-1".to_string(),
+        id: id.to_string(),
         created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
         last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
         archived: false,
@@ -196,7 +267,7 @@ fn page() -> PageDto {
             "title".to_string(),
             PagePropertyDto {
                 kind: "title".to_string(),
-                title: vec![rich_text("Roadmap")],
+                title: vec![rich_text(title)],
                 rich_text: Vec::new(),
             },
         )]),
@@ -223,6 +294,22 @@ fn rich_text_block(id: &str, kind: &str, text: &str) -> BlockDto {
 
 fn unsupported_block(id: &str, kind: &str) -> BlockDto {
     block(id, kind)
+}
+
+fn child_page_block(id: &str, title: &str) -> BlockDto {
+    let mut block = block(id, "child_page");
+    block.child_page = Some(TitleBlockDto {
+        title: title.to_string(),
+    });
+    block
+}
+
+fn child_database_block(id: &str, title: &str) -> BlockDto {
+    let mut block = block(id, "child_database");
+    block.child_database = Some(TitleBlockDto {
+        title: title.to_string(),
+    });
+    block
 }
 
 fn block(id: &str, kind: &str) -> BlockDto {

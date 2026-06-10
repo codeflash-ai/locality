@@ -14,6 +14,7 @@ pub struct MountConfig {
     pub mount_id: MountId,
     pub connector: String,
     pub root: PathBuf,
+    pub remote_root_id: Option<RemoteId>,
     pub read_only: bool,
 }
 
@@ -23,8 +24,14 @@ impl MountConfig {
             mount_id,
             connector: connector.into(),
             root: root.into(),
+            remote_root_id: None,
             read_only: false,
         }
+    }
+
+    pub fn with_remote_root_id(mut self, remote_root_id: RemoteId) -> Self {
+        self.remote_root_id = Some(remote_root_id);
+        self
     }
 
     pub fn read_only(mut self, read_only: bool) -> Self {

@@ -45,6 +45,7 @@ pub struct PagePropertyDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
 pub struct PaginatedListDto<T> {
     #[serde(default)]
     pub results: Vec<T>,
@@ -65,6 +66,7 @@ impl<T> Default for PaginatedListDto<T> {
 }
 
 pub type BlockListDto = PaginatedListDto<BlockDto>;
+pub type PageListDto = PaginatedListDto<PageDto>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockDto {

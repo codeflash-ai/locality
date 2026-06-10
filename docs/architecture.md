@@ -17,7 +17,7 @@ The optional cloud relay is deliberately not implemented in v1. The local remote
 | --- | --- |
 | `afs-core` | Three-tree model, hydration ladder, validation, diff planning, guardrails, conflicts, journal abstractions. |
 | `afs-connector` | Connector trait and data transfer types for enumerate, fetch, render, parse, apply, and reverse apply. |
-| `afs-notion` | Notion API client, DTOs, block mapping, OAuth/API integration, Markdown/frontmatter conversion. |
+| `afs-notion` | Notion API client, DTOs, block mapping, root-page projection, OAuth/API integration, Markdown/frontmatter conversion. |
 | `afs-store` | SQLite schema, snapshots, journal, mount config, hydration state, tree persistence. |
 | `afs-cli` | Commands: `connect`, `mount`, `status`, `pull`, `push`, `diff`, `undo`, `log`, `resolve`, `config`. |
 | `afsd` | File watcher, hydration engine, pull scheduler, push queue, daemon lifecycle. |
