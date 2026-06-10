@@ -7,10 +7,11 @@ use afs_core::model::{EntityKind, MountId, RemoteId};
 use afs_core::shadow::MarkdownBlockKind;
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
-    BlockDto, BlockListDto, BlockTreeDto, DateMentionDto, EquationRichTextDto, IdRefDto, LinkDto,
+    BlockDto, BlockListDto, BlockTreeDto, DataSourceDto, DataSourcePropertyDto,
+    DataSourceSummaryDto, DatabaseDto, DateMentionDto, EquationRichTextDto, IdRefDto, LinkDto,
     MentionRichTextDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
-    RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, TableBlockDto, TableRowBlockDto,
-    TextRichTextDto, TitleBlockDto,
+    RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
+    SelectPropertySchemaDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 
@@ -244,6 +245,88 @@ fn render_rich_text_annotations_links_mentions_and_equations() {
 }
 
 #[test]
+fn render_database_row_properties_as_frontmatter() {
+    let mut row = page("row-1", "Fix login bug");
+    row.properties.insert(
+        "Status".to_string(),
+        PagePropertyDto {
+            kind: "select".to_string(),
+            select: Some(select_option("status-id", "In progress")),
+            ..Default::default()
+        },
+    );
+    row.properties.insert(
+        "Points".to_string(),
+        PagePropertyDto {
+            kind: "number".to_string(),
+            number: Some(serde_json::Number::from(3)),
+            ..Default::default()
+        },
+    );
+    row.properties.insert(
+        "Tags".to_string(),
+        PagePropertyDto {
+            kind: "multi_select".to_string(),
+            multi_select: vec![select_option("backend-id", "Backend")],
+            ..Default::default()
+        },
+    );
+    row.properties.insert(
+        "Done".to_string(),
+        PagePropertyDto {
+            kind: "checkbox".to_string(),
+            checkbox: Some(false),
+            ..Default::default()
+        },
+    );
+    row.properties.insert(
+        "Due".to_string(),
+        PagePropertyDto {
+            kind: "date".to_string(),
+            date: Some(DateMentionDto {
+                start: "2026-06-10".to_string(),
+                end: None,
+                time_zone: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: row,
+        blocks: Vec::new(),
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert!(
+        rendered
+            .document
+            .frontmatter
+            .contains("title: \"Fix login bug\"")
+    );
+    assert!(
+        rendered
+            .document
+            .frontmatter
+            .contains("\"Status\": \"In progress\"")
+    );
+    assert!(rendered.document.frontmatter.contains("\"Points\": 3"));
+    assert!(rendered.document.frontmatter.contains("\"Done\": false"));
+    assert!(
+        rendered
+            .document
+            .frontmatter
+            .contains("\"Due\": \"2026-06-10\"")
+    );
+    assert!(
+        rendered
+            .document
+            .frontmatter
+            .contains("\"Tags\":\n  - \"Backend\"")
+    );
+}
+
+#[test]
 fn enumerate_projects_root_page_tree_to_stable_paths() {
     let root_page_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let api = FixtureNotionApi::tree(root_page_id.as_str());
@@ -259,7 +342,7 @@ fn enumerate_projects_root_page_tree_to_stable_paths() {
         })
         .expect("enumerate");
 
-    assert_eq!(entries.len(), 3);
+    assert_eq!(entries.len(), 4);
     assert_eq!(entries[0].path, Path::new("roadmap ~aaaaaa.md"));
     assert_eq!(entries[0].kind, EntityKind::Page);
     assert_eq!(
@@ -269,6 +352,11 @@ fn enumerate_projects_root_page_tree_to_stable_paths() {
     assert_eq!(entries[1].kind, EntityKind::Page);
     assert_eq!(entries[2].path, Path::new("roadmap ~aaaaaa/tasks ~cccccc"));
     assert_eq!(entries[2].kind, EntityKind::Database);
+    assert_eq!(
+        entries[3].path,
+        Path::new("roadmap ~aaaaaa/tasks ~cccccc/fix-login-bug ~eeeeee.md")
+    );
+    assert_eq!(entries[3].kind, EntityKind::Page);
 }
 
 #[test]
@@ -294,6 +382,9 @@ fn live_fetch_and_render_page_from_environment() {
 struct FixtureNotionApi {
     pages: BTreeMap<String, PageDto>,
     children: BTreeMap<(String, Option<String>), BlockListDto>,
+    databases: BTreeMap<String, DatabaseDto>,
+    data_sources: BTreeMap<String, DataSourceDto>,
+    data_source_pages: BTreeMap<(String, Option<String>), PageListDto>,
 }
 
 impl FixtureNotionApi {
@@ -332,18 +423,27 @@ impl FixtureNotionApi {
             },
         );
 
-        Self { pages, children }
+        Self {
+            pages,
+            children,
+            databases: BTreeMap::new(),
+            data_sources: BTreeMap::new(),
+            data_source_pages: BTreeMap::new(),
+        }
     }
 
     fn tree(root_page_id: &str) -> Self {
         let child_page_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let database_id = "cccccccccccccccccccccccccccccccc";
+        let data_source_id = "dddddddddddddddddddddddddddddddd";
+        let row_page_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         let pages = BTreeMap::from([
             (root_page_id.to_string(), page(root_page_id, "Roadmap")),
             (
                 child_page_id.to_string(),
                 page(child_page_id, "Design Notes"),
             ),
+            (row_page_id.to_string(), page(row_page_id, "Fix login bug")),
         ]);
         let children = BTreeMap::from([
             (
@@ -361,9 +461,65 @@ impl FixtureNotionApi {
                 (child_page_id.to_string(), None),
                 PaginatedListDto::default(),
             ),
+            ((row_page_id.to_string(), None), PaginatedListDto::default()),
         ]);
+        let databases = BTreeMap::from([(
+            database_id.to_string(),
+            DatabaseDto {
+                id: database_id.to_string(),
+                title: vec![rich_text("Tasks")],
+                data_sources: vec![DataSourceSummaryDto {
+                    id: data_source_id.to_string(),
+                    name: Some("Tasks".to_string()),
+                }],
+                ..Default::default()
+            },
+        )]);
+        let data_sources = BTreeMap::from([(
+            data_source_id.to_string(),
+            DataSourceDto {
+                id: data_source_id.to_string(),
+                name: Some("Tasks".to_string()),
+                properties: BTreeMap::from([
+                    (
+                        "Name".to_string(),
+                        DataSourcePropertyDto {
+                            id: "title".to_string(),
+                            kind: "title".to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "Status".to_string(),
+                        DataSourcePropertyDto {
+                            id: "status-id".to_string(),
+                            kind: "select".to_string(),
+                            select: Some(SelectPropertySchemaDto {
+                                options: vec![select_option("todo-id", "Todo")],
+                            }),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+                ..Default::default()
+            },
+        )]);
+        let data_source_pages = BTreeMap::from([(
+            (data_source_id.to_string(), None),
+            PaginatedListDto {
+                results: vec![page(row_page_id, "Fix login bug")],
+                next_cursor: None,
+                has_more: false,
+            },
+        )]);
 
-        Self { pages, children }
+        Self {
+            pages,
+            children,
+            databases,
+            data_sources,
+            data_source_pages,
+        }
     }
 }
 
@@ -372,6 +528,35 @@ impl NotionApi for FixtureNotionApi {
         self.pages.get(page_id).cloned().ok_or_else(|| {
             afs_core::AfsError::InvalidState(format!("missing fixture page {page_id}"))
         })
+    }
+
+    fn retrieve_database(&self, database_id: &str) -> afs_core::AfsResult<DatabaseDto> {
+        self.databases.get(database_id).cloned().ok_or_else(|| {
+            afs_core::AfsError::InvalidState(format!("missing fixture database {database_id}"))
+        })
+    }
+
+    fn retrieve_data_source(&self, data_source_id: &str) -> afs_core::AfsResult<DataSourceDto> {
+        self.data_sources
+            .get(data_source_id)
+            .cloned()
+            .ok_or_else(|| {
+                afs_core::AfsError::InvalidState(format!(
+                    "missing fixture data source {data_source_id}"
+                ))
+            })
+    }
+
+    fn query_data_source(
+        &self,
+        data_source_id: &str,
+        start_cursor: Option<&str>,
+    ) -> afs_core::AfsResult<PageListDto> {
+        Ok(self
+            .data_source_pages
+            .get(&(data_source_id.to_string(), start_cursor.map(str::to_string)))
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn retrieve_block_children(
@@ -441,8 +626,17 @@ fn page(id: &str, title: &str) -> PageDto {
                 kind: "title".to_string(),
                 title: vec![rich_text(title)],
                 rich_text: Vec::new(),
+                ..Default::default()
             },
         )]),
+    }
+}
+
+fn select_option(id: &str, name: &str) -> SelectOptionDto {
+    SelectOptionDto {
+        id: id.to_string(),
+        name: name.to_string(),
+        color: None,
     }
 }
 

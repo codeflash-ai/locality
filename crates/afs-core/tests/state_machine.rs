@@ -322,5 +322,6 @@ fn entry(remote_id: &str, content_hash: &str, remote_edited_at: &str) -> TreeEnt
         hydration: HydrationState::Hydrated,
         content_hash: Some(content_hash.to_string()),
         remote_edited_at: Some(remote_edited_at.to_string()),
+        stub_frontmatter: None,
     }
 }

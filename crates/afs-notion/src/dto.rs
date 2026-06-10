@@ -34,6 +34,105 @@ pub struct PageDto {
     pub properties: BTreeMap<String, PagePropertyDto>,
 }
 
+/// A Notion database container.
+///
+/// Newer Notion API versions separate database containers from queryable data
+/// sources. The database DTO carries the stable child block/database identity
+/// plus the data source summaries needed to enumerate row pages.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseDto {
+    pub id: String,
+    #[serde(default)]
+    pub created_time: Option<String>,
+    #[serde(default)]
+    pub last_edited_time: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub in_trash: bool,
+    #[serde(default)]
+    pub title: Vec<RichTextDto>,
+    #[serde(default)]
+    pub data_sources: Vec<DataSourceSummaryDto>,
+}
+
+/// Minimal data source reference embedded in a database response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataSourceSummaryDto {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// A queryable Notion data source and its property schema.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataSourceDto {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub created_time: Option<String>,
+    #[serde(default)]
+    pub last_edited_time: Option<String>,
+    #[serde(default)]
+    pub properties: BTreeMap<String, DataSourcePropertyDto>,
+}
+
+/// Notion data source property schema.
+///
+/// The schema details are intentionally shallow for now: AFS needs the stable
+/// property ID, type, and user-visible option names for read projection and
+/// future validation. Connector-specific write validation can add stricter
+/// typed payloads here as it grows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataSourcePropertyDto {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub select: Option<SelectPropertySchemaDto>,
+    #[serde(default)]
+    pub multi_select: Option<SelectPropertySchemaDto>,
+    #[serde(default)]
+    pub status: Option<StatusPropertySchemaDto>,
+    #[serde(default)]
+    pub relation: Option<serde_json::Value>,
+    #[serde(default)]
+    pub formula: Option<serde_json::Value>,
+    #[serde(default)]
+    pub rollup: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectPropertySchemaDto {
+    #[serde(default)]
+    pub options: Vec<SelectOptionDto>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusPropertySchemaDto {
+    #[serde(default)]
+    pub options: Vec<SelectOptionDto>,
+    #[serde(default)]
+    pub groups: Vec<StatusGroupDto>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusGroupDto {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub option_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectOptionDto {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PagePropertyDto {
     #[serde(rename = "type")]
@@ -42,6 +141,40 @@ pub struct PagePropertyDto {
     pub title: Vec<RichTextDto>,
     #[serde(default)]
     pub rich_text: Vec<RichTextDto>,
+    #[serde(default)]
+    pub number: Option<serde_json::Number>,
+    #[serde(default)]
+    pub select: Option<SelectOptionDto>,
+    #[serde(default)]
+    pub multi_select: Vec<SelectOptionDto>,
+    #[serde(default)]
+    pub status: Option<SelectOptionDto>,
+    #[serde(default)]
+    pub checkbox: Option<bool>,
+    #[serde(default)]
+    pub date: Option<DateMentionDto>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub phone_number: Option<String>,
+    #[serde(default)]
+    pub people: Vec<UserMentionDto>,
+    #[serde(default)]
+    pub relation: Vec<IdRefDto>,
+    #[serde(default)]
+    pub created_time: Option<String>,
+    #[serde(default)]
+    pub last_edited_time: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<UserMentionDto>,
+    #[serde(default)]
+    pub last_edited_by: Option<UserMentionDto>,
+    #[serde(default)]
+    pub formula: Option<serde_json::Value>,
+    #[serde(default)]
+    pub rollup: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

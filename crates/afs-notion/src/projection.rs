@@ -1,4 +1,4 @@
-//! Project Notion pages and child-page blocks into AgentFS tree entries.
+//! Project Notion pages, child-page blocks, and databases into AgentFS tree entries.
 //!
 //! Paths are a local projection, not identity. The remote ID remains the stable
 //! key; the filename suffix makes title changes and sibling collisions
@@ -11,8 +11,8 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 use afs_core::{AfsError, AfsResult};
 
 use crate::client::NotionApi;
-use crate::dto::{BlockDto, PageDto};
-use crate::render::page_title;
+use crate::dto::{BlockDto, DatabaseDto, PageDto};
+use crate::render::{page_frontmatter, page_title};
 
 pub fn enumerate_root_page_tree(
     api: &dyn NotionApi,
@@ -129,23 +129,27 @@ fn project_child_block(
             )?;
         }
         "child_database" => {
+            let database = api.retrieve_database(block.id.as_str())?;
             let title = block
                 .child_database
                 .as_ref()
                 .map(|child| child.title.clone())
                 .filter(|title| !title.trim().is_empty())
+                .or_else(|| database_title(&database))
                 .unwrap_or_else(|| "Untitled database".to_string());
-            let path = allocate_directory_path(parent_dir, &title, &block.id, used_paths);
+            let path = allocate_directory_path(parent_dir, &title, &database.id, used_paths);
             entries.push(TreeEntry {
                 mount_id: mount_id.clone(),
-                remote_id: RemoteId::new(block.id),
+                remote_id: RemoteId::new(database.id.clone()),
                 kind: EntityKind::Database,
                 title,
-                path,
+                path: path.clone(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
-                remote_edited_at: None,
+                remote_edited_at: database.last_edited_time.clone(),
+                stub_frontmatter: None,
             });
+            enumerate_database_rows(api, mount_id, &database, &path, used_paths, entries)?;
         }
         _ if block.has_children => {
             enumerate_page_children(
@@ -163,7 +167,50 @@ fn project_child_block(
     Ok(())
 }
 
+fn enumerate_database_rows(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    database: &DatabaseDto,
+    database_dir: &Path,
+    used_paths: &mut BTreeSet<PathBuf>,
+    entries: &mut Vec<TreeEntry>,
+) -> AfsResult<()> {
+    for data_source in &database.data_sources {
+        let mut cursor = None;
+
+        loop {
+            let page = api.query_data_source(&data_source.id, cursor.as_deref())?;
+            for row in page.results {
+                let title = page_title(&row);
+                let path = allocate_page_path(database_dir, &title, &row.id, used_paths);
+                entries.push(page_entry(mount_id.clone(), &row, title, path.clone()));
+                enumerate_page_children(
+                    api,
+                    mount_id,
+                    row.id.as_str(),
+                    page_child_dir(&path),
+                    used_paths,
+                    entries,
+                )?;
+            }
+
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Err(AfsError::InvalidState(
+                    "notion data source query page had has_more without next_cursor".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn page_entry(mount_id: MountId, page: &PageDto, title: String, path: PathBuf) -> TreeEntry {
+    let stub_frontmatter = page_frontmatter(page, &title);
     TreeEntry {
         mount_id,
         remote_id: RemoteId::new(page.id.clone()),
@@ -173,6 +220,16 @@ fn page_entry(mount_id: MountId, page: &PageDto, title: String, path: PathBuf) -
         hydration: HydrationState::Stub,
         content_hash: None,
         remote_edited_at: page.last_edited_time.clone(),
+        stub_frontmatter: Some(stub_frontmatter),
+    }
+}
+
+fn database_title(database: &DatabaseDto) -> Option<String> {
+    let title = crate::render::rich_text_plain_text(&database.title);
+    if title.trim().is_empty() {
+        None
+    } else {
+        Some(title)
     }
 }
 

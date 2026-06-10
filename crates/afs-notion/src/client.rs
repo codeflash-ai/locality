@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::NotionConfig;
-use crate::dto::{BlockDto, BlockListDto, PageDto, PageListDto};
+use crate::dto::{BlockDto, BlockListDto, DataSourceDto, DatabaseDto, PageDto, PageListDto};
 
 pub const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com";
 pub const DEFAULT_NOTION_VERSION: &str = "2026-03-11";
@@ -18,6 +18,22 @@ pub const DEFAULT_NOTION_TOKEN_ENV: &str = "NOTION_TOKEN";
 
 pub trait NotionApi: std::fmt::Debug + Send + Sync {
     fn retrieve_page(&self, page_id: &str) -> AfsResult<PageDto>;
+    fn retrieve_database(&self, database_id: &str) -> AfsResult<DatabaseDto> {
+        let _ = database_id;
+        Err(AfsError::NotImplemented("retrieve Notion database"))
+    }
+    fn retrieve_data_source(&self, data_source_id: &str) -> AfsResult<DataSourceDto> {
+        let _ = data_source_id;
+        Err(AfsError::NotImplemented("retrieve Notion data source"))
+    }
+    fn query_data_source(
+        &self,
+        data_source_id: &str,
+        start_cursor: Option<&str>,
+    ) -> AfsResult<PageListDto> {
+        let _ = (data_source_id, start_cursor);
+        Err(AfsError::NotImplemented("query Notion data source"))
+    }
     fn retrieve_block_children(
         &self,
         block_id: &str,
@@ -161,6 +177,30 @@ impl HttpNotionApi {
 impl NotionApi for HttpNotionApi {
     fn retrieve_page(&self, page_id: &str) -> AfsResult<PageDto> {
         self.get_json(&format!("/v1/pages/{page_id}"), &[])
+    }
+
+    fn retrieve_database(&self, database_id: &str) -> AfsResult<DatabaseDto> {
+        self.get_json(&format!("/v1/databases/{database_id}"), &[])
+    }
+
+    fn retrieve_data_source(&self, data_source_id: &str) -> AfsResult<DataSourceDto> {
+        self.get_json(&format!("/v1/data_sources/{data_source_id}"), &[])
+    }
+
+    fn query_data_source(
+        &self,
+        data_source_id: &str,
+        start_cursor: Option<&str>,
+    ) -> AfsResult<PageListDto> {
+        let mut body = json!({
+            "page_size": 100,
+        });
+
+        if let Some(start_cursor) = start_cursor {
+            body["start_cursor"] = json!(start_cursor);
+        }
+
+        self.post_json(&format!("/v1/data_sources/{data_source_id}/query"), body)
     }
 
     fn retrieve_block_children(

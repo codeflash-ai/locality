@@ -4,10 +4,11 @@ use afs_connector::NativeEntity;
 use afs_core::model::{CanonicalDocument, RemoteId};
 use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use afs_core::{AfsError, AfsResult};
+use serde_json::Value;
 
 use crate::dto::{
-    BlockDto, BlockTreeDto, NotionPageBundle, PageDto, RichTextBlockDto, RichTextDto,
-    TableBlockDto, TableRowBlockDto,
+    BlockDto, BlockTreeDto, DateMentionDto, NotionPageBundle, PageDto, PagePropertyDto,
+    RichTextBlockDto, RichTextDto, TableBlockDto, TableRowBlockDto,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,7 +25,7 @@ pub fn render_native_entity(entity: &NativeEntity) -> AfsResult<NotionRenderedEn
 
 pub fn render_page_bundle(bundle: &NotionPageBundle) -> AfsResult<NotionRenderedEntity> {
     let title = page_title(&bundle.page);
-    let frontmatter = frontmatter(&bundle.page, &title);
+    let frontmatter = page_frontmatter(&bundle.page, &title);
     let mut rendered_blocks = Vec::new();
     render_block_trees(&bundle.blocks, &mut rendered_blocks);
 
@@ -323,8 +324,8 @@ fn apply_shadow_metadata(shadow: &mut ShadowDocument, rendered_blocks: &[Rendere
     }
 }
 
-fn frontmatter(page: &PageDto, title: &str) -> String {
-    format!(
+pub(crate) fn page_frontmatter(page: &PageDto, title: &str) -> String {
+    let mut out = format!(
         "afs:\n  id: {}\n  type: page\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\n",
         page.id,
         yaml_string(
@@ -335,7 +336,9 @@ fn frontmatter(page: &PageDto, title: &str) -> String {
         ),
         yaml_string(page.last_edited_time.as_deref().unwrap_or("unknown")),
         yaml_string(title)
-    )
+    );
+    append_property_frontmatter(&mut out, page);
+    out
 }
 
 pub(crate) fn page_title(page: &PageDto) -> String {
@@ -347,7 +350,7 @@ pub(crate) fn page_title(page: &PageDto) -> String {
         .unwrap_or_else(|| "Untitled".to_string())
 }
 
-fn rich_text_plain_text(rich_text: &[RichTextDto]) -> String {
+pub(crate) fn rich_text_plain_text(rich_text: &[RichTextDto]) -> String {
     rich_text
         .iter()
         .map(rich_text_part_plain_text)
@@ -582,5 +585,197 @@ fn escape_directive_value(value: &str) -> String {
 }
 
 fn yaml_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    format!("\"{}\"", escape_yaml_string(value))
+}
+
+fn escape_yaml_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn append_property_frontmatter(out: &mut String, page: &PageDto) {
+    for (name, property) in &page.properties {
+        if property.kind == "title" {
+            continue;
+        }
+
+        let Some(value) = property_frontmatter_value(property) else {
+            continue;
+        };
+        write_frontmatter_value(out, name, value);
+    }
+}
+
+fn property_frontmatter_value(property: &PagePropertyDto) -> Option<FrontmatterValue> {
+    match property.kind.as_str() {
+        "rich_text" => Some(FrontmatterValue::Scalar(yaml_string(
+            &rich_text_plain_text(&property.rich_text),
+        ))),
+        "number" => Some(number_value(property.number.as_ref())),
+        "select" => Some(option_name(property.select.as_ref())),
+        "multi_select" => Some(FrontmatterValue::List(
+            property
+                .multi_select
+                .iter()
+                .map(|option| option.name.clone())
+                .collect(),
+        )),
+        "status" => Some(option_name(property.status.as_ref())),
+        "checkbox" => Some(
+            property
+                .checkbox
+                .map(FrontmatterValue::Bool)
+                .unwrap_or(FrontmatterValue::Null),
+        ),
+        "date" => Some(date_value(property.date.as_ref())),
+        "url" => Some(optional_string(property.url.as_deref())),
+        "email" => Some(optional_string(property.email.as_deref())),
+        "phone_number" => Some(optional_string(property.phone_number.as_deref())),
+        "people" => Some(FrontmatterValue::List(
+            property
+                .people
+                .iter()
+                .map(|user| user.name.as_deref().unwrap_or(user.id.as_str()).to_string())
+                .collect(),
+        )),
+        "relation" => Some(FrontmatterValue::List(
+            property
+                .relation
+                .iter()
+                .map(|relation| relation.id.clone())
+                .collect(),
+        )),
+        "created_time" => Some(optional_string(property.created_time.as_deref())),
+        "last_edited_time" => Some(optional_string(property.last_edited_time.as_deref())),
+        "created_by" => Some(optional_user(property.created_by.as_ref())),
+        "last_edited_by" => Some(optional_user(property.last_edited_by.as_ref())),
+        "formula" => property.formula.as_ref().and_then(formula_value),
+        _ => None,
+    }
+}
+
+fn number_value(number: Option<&serde_json::Number>) -> FrontmatterValue {
+    number
+        .map(|number| FrontmatterValue::Scalar(number.to_string()))
+        .unwrap_or(FrontmatterValue::Null)
+}
+
+fn option_name(option: Option<&crate::dto::SelectOptionDto>) -> FrontmatterValue {
+    option
+        .map(|option| FrontmatterValue::Scalar(yaml_string(&option.name)))
+        .unwrap_or(FrontmatterValue::Null)
+}
+
+fn date_value(date: Option<&DateMentionDto>) -> FrontmatterValue {
+    let Some(date) = date else {
+        return FrontmatterValue::Null;
+    };
+
+    if date.end.is_none() && date.time_zone.is_none() {
+        return FrontmatterValue::Scalar(yaml_string(&date.start));
+    }
+
+    let mut fields = vec![("start".to_string(), yaml_string(&date.start))];
+    if let Some(end) = date.end.as_deref() {
+        fields.push(("end".to_string(), yaml_string(end)));
+    }
+    if let Some(time_zone) = date.time_zone.as_deref() {
+        fields.push(("time_zone".to_string(), yaml_string(time_zone)));
+    }
+    FrontmatterValue::Map(fields)
+}
+
+fn optional_string(value: Option<&str>) -> FrontmatterValue {
+    value
+        .map(|value| FrontmatterValue::Scalar(yaml_string(value)))
+        .unwrap_or(FrontmatterValue::Null)
+}
+
+fn optional_user(value: Option<&crate::dto::UserMentionDto>) -> FrontmatterValue {
+    value
+        .map(|user| {
+            FrontmatterValue::Scalar(yaml_string(
+                user.name.as_deref().unwrap_or(user.id.as_str()),
+            ))
+        })
+        .unwrap_or(FrontmatterValue::Null)
+}
+
+fn formula_value(value: &Value) -> Option<FrontmatterValue> {
+    let kind = value.get("type").and_then(Value::as_str)?;
+    match kind {
+        "string" => Some(optional_string(value.get("string").and_then(Value::as_str))),
+        "number" => value
+            .get("number")
+            .and_then(Value::as_f64)
+            .map(|number| FrontmatterValue::Scalar(number.to_string())),
+        "boolean" => value
+            .get("boolean")
+            .and_then(Value::as_bool)
+            .map(FrontmatterValue::Bool),
+        "date" => value.get("date").map(json_date_value),
+        _ => None,
+    }
+}
+
+fn json_date_value(value: &Value) -> FrontmatterValue {
+    let Some(start) = value.get("start").and_then(Value::as_str) else {
+        return FrontmatterValue::Null;
+    };
+    let end = value.get("end").and_then(Value::as_str);
+    let time_zone = value.get("time_zone").and_then(Value::as_str);
+    if end.is_none() && time_zone.is_none() {
+        return FrontmatterValue::Scalar(yaml_string(start));
+    }
+
+    let mut fields = vec![("start".to_string(), yaml_string(start))];
+    if let Some(end) = end {
+        fields.push(("end".to_string(), yaml_string(end)));
+    }
+    if let Some(time_zone) = time_zone {
+        fields.push(("time_zone".to_string(), yaml_string(time_zone)));
+    }
+    FrontmatterValue::Map(fields)
+}
+
+fn write_frontmatter_value(out: &mut String, key: &str, value: FrontmatterValue) {
+    let key = yaml_string(key);
+    match value {
+        FrontmatterValue::Null => out.push_str(&format!("{key}: null\n")),
+        FrontmatterValue::Bool(value) => out.push_str(&format!("{key}: {value}\n")),
+        FrontmatterValue::Scalar(value) => out.push_str(&format!("{key}: {value}\n")),
+        FrontmatterValue::List(items) => {
+            if items.is_empty() {
+                out.push_str(&format!("{key}: []\n"));
+            } else {
+                out.push_str(&format!("{key}:\n"));
+                for item in items {
+                    out.push_str(&format!("  - {}\n", yaml_string(&item)));
+                }
+            }
+        }
+        FrontmatterValue::Map(fields) => {
+            if fields.is_empty() {
+                out.push_str(&format!("{key}: {{}}\n"));
+            } else {
+                out.push_str(&format!("{key}:\n"));
+                for (field, value) in fields {
+                    out.push_str(&format!("  {}: {value}\n", yaml_string(&field)));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FrontmatterValue {
+    Null,
+    Bool(bool),
+    Scalar(String),
+    List(Vec<String>),
+    Map(Vec<(String, String)>),
 }

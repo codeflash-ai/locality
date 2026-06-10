@@ -136,6 +136,7 @@ impl Connector for FakeConnector {
             hydration: HydrationState::Hydrated,
             content_hash: None,
             remote_edited_at: None,
+            stub_frontmatter: None,
         }])
     }
 

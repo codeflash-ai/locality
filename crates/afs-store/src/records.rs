@@ -114,6 +114,7 @@ impl From<EntityRecord> for TreeEntry {
             hydration: value.hydration,
             content_hash: value.content_hash,
             remote_edited_at: value.remote_edited_at,
+            stub_frontmatter: None,
         }
     }
 }

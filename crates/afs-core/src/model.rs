@@ -106,6 +106,13 @@ pub struct TreeEntry {
     pub hydration: HydrationState,
     pub content_hash: Option<String>,
     pub remote_edited_at: Option<String>,
+    /// Connector-rendered frontmatter to use when writing an unhydrated stub.
+    ///
+    /// The durable store tracks only identity and sync state; this transient
+    /// projection field lets connectors preserve rich metadata, such as
+    /// database row properties, during mount-root enumeration.
+    #[serde(default)]
+    pub stub_frontmatter: Option<String>,
 }
 
 impl TreeEntry {

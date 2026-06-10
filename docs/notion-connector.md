@@ -8,7 +8,9 @@ The current implementation is a live-capable read, pull, and narrow write projec
 
 - `HttpNotionApi` calls the live Notion REST API with a bearer token from `NOTION_TOKEN`.
 - `search_pages` can enumerate all pages shared with the integration when no root page is configured.
-- root-page enumeration walks child-page blocks and projects the page tree into stable AgentFS paths.
+- root-page enumeration walks child-page and child-database blocks and projects the tree into stable AgentFS paths.
+- child databases retrieve their data sources, write `_schema.yaml`, and enumerate row pages under the database directory.
+- database row stubs carry the row properties in YAML frontmatter before the body is hydrated.
 - `fetch` retrieves page metadata and recursively retrieves paginated block children.
 - fetched pages are serialized into a versioned native JSON bundle inside `NativeEntity.raw`;
 - `render_native_entity` converts that native bundle into canonical Markdown plus a `ShadowDocument`;
@@ -54,7 +56,7 @@ The first Notion apply path is intentionally conservative:
 - supported operations: block update, block append, and block archive;
 - supported writable block forms: paragraphs, headings 1-3, bulleted list items, numbered list items, to-dos, quotes, code fences, and dividers;
 - supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, `afs://` page links, and unchanged preimage mentions such as dates;
-- unsupported write forms fail before API mutation, including tables, page/database creation, property edits, block moves, and rich inline shapes that cannot be represented by the current Markdown parser;
+- unsupported write forms fail before API mutation, including tables, page/database creation, database row creation, property edits, block moves, and rich inline shapes that cannot be represented by the current Markdown parser;
 - appends use Notion's current position object, with `start` for prepends and `after_block` for inserts after a known block;
 - before apply, the connector re-reads the page and compares the current Notion edit timestamp against the last-synced timestamp carried by the push executor;
 - after apply, the CLI reconciler fetches the changed page, rewrites the local file atomically, saves the refreshed shadow, and updates the entity's `remote_edited_at`.
@@ -76,4 +78,13 @@ roadmap ~aaaaaa/
 
 The remote ID remains the identity. The short ID starts at six hex characters and lengthens on sibling collisions, while the title slug can change without changing identity.
 
-Database blocks currently project as directories only. Row pages, `_schema.yaml`, and `_view.csv` are still future work.
+Database blocks project as directories. Each data source under the database contributes row pages directly inside that directory, and `_schema.yaml` mirrors the current property schema with stable property IDs, types, and select/status option names.
+
+```text
+roadmap ~aaaaaa/
+  tasks ~cccccc/
+    _schema.yaml
+    fix-login-bug ~eeeeee.md
+```
+
+Row files are normal page files. Their stubs include page identity plus supported property values in frontmatter, while the body remains the standard AFS stub marker until hydration. `_view.csv`, row creation, and property writes remain future work.

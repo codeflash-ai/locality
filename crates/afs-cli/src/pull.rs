@@ -81,7 +81,7 @@ where
     for entry in &entries {
         let record = merged_entity_record(store, entry)?;
         store.save_entity(record).map_err(PullError::Store)?;
-        if write_stub_if_needed(mount, entry)? {
+        if write_stub_if_needed(connector, mount, entry)? {
             stubbed += 1;
         }
     }
@@ -175,7 +175,11 @@ where
     Ok(record)
 }
 
-fn write_stub_if_needed(mount: &MountConfig, entry: &TreeEntry) -> Result<bool, PullError> {
+fn write_stub_if_needed(
+    connector: &NotionConnector,
+    mount: &MountConfig,
+    entry: &TreeEntry,
+) -> Result<bool, PullError> {
     match entry.kind {
         EntityKind::Page => {
             let path = mount.root.join(&entry.path);
@@ -185,12 +189,23 @@ fn write_stub_if_needed(mount: &MountConfig, entry: &TreeEntry) -> Result<bool, 
             write_atomic(&path, stub_markdown(entry)?)?;
             Ok(true)
         }
-        EntityKind::Database | EntityKind::Directory => {
-            std::fs::create_dir_all(mount.root.join(&entry.path)).map_err(|error| {
-                PullError::WriteFile {
-                    path: mount.root.join(&entry.path),
-                    message: error.to_string(),
-                }
+        EntityKind::Database => {
+            let directory = mount.root.join(&entry.path);
+            std::fs::create_dir_all(&directory).map_err(|error| PullError::WriteFile {
+                path: directory.clone(),
+                message: error.to_string(),
+            })?;
+            let schema = connector
+                .database_schema_yaml(&entry.remote_id)
+                .map_err(PullError::Connector)?;
+            write_atomic(&directory.join("_schema.yaml"), schema)?;
+            Ok(false)
+        }
+        EntityKind::Directory => {
+            let directory = mount.root.join(&entry.path);
+            std::fs::create_dir_all(&directory).map_err(|error| PullError::WriteFile {
+                path: directory,
+                message: error.to_string(),
             })?;
             Ok(false)
         }
@@ -288,7 +303,13 @@ fn is_stub_file(path: &Path) -> Result<bool, PullError> {
 }
 
 fn stub_markdown(entry: &TreeEntry) -> Result<String, PullError> {
-    let document = CanonicalDocument::new(stub_frontmatter(entry), stub_body());
+    let document = CanonicalDocument::new(
+        entry
+            .stub_frontmatter
+            .clone()
+            .unwrap_or_else(|| stub_frontmatter(entry)),
+        stub_body(),
+    );
     Ok(render_canonical_markdown(&document))
 }
 

@@ -5,6 +5,7 @@
 
 pub mod apply;
 pub mod client;
+pub mod database;
 pub mod dto;
 pub mod fetch;
 pub mod mapping;
@@ -18,7 +19,7 @@ use afs_connector::{
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
     ParsedEntity,
 };
-use afs_core::model::{CanonicalDocument, TreeEntry};
+use afs_core::model::{CanonicalDocument, RemoteId, TreeEntry};
 use afs_core::{AfsError, AfsResult};
 
 use crate::apply::{apply_plan, apply_undo, check_concurrency};
@@ -90,6 +91,10 @@ impl NotionConnector {
 
     pub fn render_native_entity(&self, entity: &NativeEntity) -> AfsResult<NotionRenderedEntity> {
         render_native_entity(entity)
+    }
+
+    pub fn database_schema_yaml(&self, database_id: &RemoteId) -> AfsResult<String> {
+        database::database_schema_yaml(self.api.as_ref(), database_id.as_str())
     }
 }
 

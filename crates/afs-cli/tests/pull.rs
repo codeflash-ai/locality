@@ -10,8 +10,9 @@ use afs_cli::pull::run_pull;
 use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
-    BlockDto, BlockListDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
-    RichTextBlockDto, RichTextDto, TextRichTextDto, TitleBlockDto,
+    BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
+    DatabaseDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto, RichTextBlockDto,
+    RichTextDto, SelectOptionDto, SelectPropertySchemaDto, TextRichTextDto, TitleBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{EntityRepository, InMemoryStateStore, MountRepository, ShadowRepository};
@@ -26,11 +27,13 @@ fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
     let report = run_pull(&mut store, &connector, &fixture.root).expect("pull root");
 
     assert!(report.ok);
-    assert_eq!(report.enumerated, 2);
-    assert_eq!(report.stubbed, 2);
+    assert_eq!(report.enumerated, 4);
+    assert_eq!(report.stubbed, 3);
     assert_eq!(report.hydrated, 1);
     assert!(fixture.root_file().exists());
     assert!(fixture.child_file().exists());
+    assert!(fixture.database_schema_file().exists());
+    assert!(fixture.row_file().exists());
     assert!(
         !fs::read_to_string(fixture.root_file())
             .expect("root file")
@@ -41,6 +44,12 @@ fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
             .expect("child file")
             .contains(afs_core::model::CanonicalDocument::STUB_MARKER)
     );
+    let schema = fs::read_to_string(fixture.database_schema_file()).expect("schema file");
+    assert!(schema.contains("type: notion_database_schema"));
+    assert!(schema.contains("\"Status\":"));
+    let row = fs::read_to_string(fixture.row_file()).expect("row file");
+    assert!(row.contains("\"Status\": \"Todo\""));
+    assert!(row.contains(afs_core::model::CanonicalDocument::STUB_MARKER));
 
     assert!(
         store
@@ -139,6 +148,20 @@ impl PullFixture {
             .join("roadmap ~aaaaaa")
             .join("design-notes ~bbbbbb.md")
     }
+
+    fn database_schema_file(&self) -> PathBuf {
+        self.root
+            .join("roadmap ~aaaaaa")
+            .join("tasks ~cccccc")
+            .join("_schema.yaml")
+    }
+
+    fn row_file(&self) -> PathBuf {
+        self.root
+            .join("roadmap ~aaaaaa")
+            .join("tasks ~cccccc")
+            .join("fix-login-bug ~eeeeee.md")
+    }
 }
 
 impl Drop for PullFixture {
@@ -151,11 +174,17 @@ impl Drop for PullFixture {
 struct FixtureNotionApi {
     pages: BTreeMap<String, PageDto>,
     children: BTreeMap<(String, Option<String>), BlockListDto>,
+    databases: BTreeMap<String, DatabaseDto>,
+    data_sources: BTreeMap<String, DataSourceDto>,
+    data_source_pages: BTreeMap<(String, Option<String>), PageListDto>,
 }
 
 impl FixtureNotionApi {
     fn new(requested_root_page_id: &str, returned_root_page_id: &str) -> Self {
         let child_page_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let database_id = "cccccccccccccccccccccccccccccccc";
+        let data_source_id = "dddddddddddddddddddddddddddddddd";
+        let row_page_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         let pages = BTreeMap::from([
             (
                 requested_root_page_id.to_string(),
@@ -169,6 +198,10 @@ impl FixtureNotionApi {
                 child_page_id.to_string(),
                 page(child_page_id, "Design Notes"),
             ),
+            (
+                row_page_id.to_string(),
+                database_row_page(row_page_id, "Fix login bug"),
+            ),
         ]);
         let children = BTreeMap::from([
             (
@@ -177,6 +210,7 @@ impl FixtureNotionApi {
                     results: vec![
                         paragraph_block("paragraph-1", "Root body."),
                         child_page_block(child_page_id, "Design Notes"),
+                        child_database_block(database_id, "Tasks"),
                     ],
                     next_cursor: None,
                     has_more: false,
@@ -190,9 +224,60 @@ impl FixtureNotionApi {
                     has_more: false,
                 },
             ),
+            ((row_page_id.to_string(), None), PaginatedListDto::default()),
         ]);
+        let databases = BTreeMap::from([(
+            database_id.to_string(),
+            DatabaseDto {
+                id: database_id.to_string(),
+                title: vec![rich_text("Tasks")],
+                data_sources: vec![DataSourceSummaryDto {
+                    id: data_source_id.to_string(),
+                    name: Some("Tasks".to_string()),
+                }],
+                last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let data_sources = BTreeMap::from([(
+            data_source_id.to_string(),
+            DataSourceDto {
+                id: data_source_id.to_string(),
+                name: Some("Tasks".to_string()),
+                properties: BTreeMap::from([(
+                    "Status".to_string(),
+                    DataSourcePropertyDto {
+                        id: "status-id".to_string(),
+                        kind: "select".to_string(),
+                        select: Some(SelectPropertySchemaDto {
+                            options: vec![SelectOptionDto {
+                                id: "todo-id".to_string(),
+                                name: "Todo".to_string(),
+                                color: None,
+                            }],
+                        }),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+        )]);
+        let data_source_pages = BTreeMap::from([(
+            (data_source_id.to_string(), None),
+            PaginatedListDto {
+                results: vec![database_row_page(row_page_id, "Fix login bug")],
+                next_cursor: None,
+                has_more: false,
+            },
+        )]);
 
-        Self { pages, children }
+        Self {
+            pages,
+            children,
+            databases,
+            data_sources,
+            data_source_pages,
+        }
     }
 }
 
@@ -202,6 +287,33 @@ impl NotionApi for FixtureNotionApi {
             .get(page_id)
             .cloned()
             .ok_or_else(|| afs_core::AfsError::InvalidState(format!("missing page {page_id}")))
+    }
+
+    fn retrieve_database(&self, database_id: &str) -> afs_core::AfsResult<DatabaseDto> {
+        self.databases.get(database_id).cloned().ok_or_else(|| {
+            afs_core::AfsError::InvalidState(format!("missing database {database_id}"))
+        })
+    }
+
+    fn retrieve_data_source(&self, data_source_id: &str) -> afs_core::AfsResult<DataSourceDto> {
+        self.data_sources
+            .get(data_source_id)
+            .cloned()
+            .ok_or_else(|| {
+                afs_core::AfsError::InvalidState(format!("missing data source {data_source_id}"))
+            })
+    }
+
+    fn query_data_source(
+        &self,
+        data_source_id: &str,
+        start_cursor: Option<&str>,
+    ) -> afs_core::AfsResult<PageListDto> {
+        Ok(self
+            .data_source_pages
+            .get(&(data_source_id.to_string(), start_cursor.map(str::to_string)))
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn retrieve_block_children(
@@ -260,9 +372,27 @@ fn page(id: &str, title: &str) -> PageDto {
                 kind: "title".to_string(),
                 title: vec![rich_text(title)],
                 rich_text: Vec::new(),
+                ..Default::default()
             },
         )]),
     }
+}
+
+fn database_row_page(id: &str, title: &str) -> PageDto {
+    let mut page = page(id, title);
+    page.properties.insert(
+        "Status".to_string(),
+        PagePropertyDto {
+            kind: "select".to_string(),
+            select: Some(SelectOptionDto {
+                id: "todo-id".to_string(),
+                name: "Todo".to_string(),
+                color: None,
+            }),
+            ..Default::default()
+        },
+    );
+    page
 }
 
 fn paragraph_block(id: &str, text: &str) -> BlockDto {
@@ -277,6 +407,14 @@ fn paragraph_block(id: &str, text: &str) -> BlockDto {
 fn child_page_block(id: &str, title: &str) -> BlockDto {
     let mut block = block(id, "child_page");
     block.child_page = Some(TitleBlockDto {
+        title: title.to_string(),
+    });
+    block
+}
+
+fn child_database_block(id: &str, title: &str) -> BlockDto {
+    let mut block = block(id, "child_database");
+    block.child_database = Some(TitleBlockDto {
         title: title.to_string(),
     });
     block
