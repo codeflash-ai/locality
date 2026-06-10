@@ -58,3 +58,29 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 - `apply_not_implemented`.
 
 When the core pipeline reaches `proceed_to_apply`, the CLI reports `apply_not_implemented` until journaled connector mutation exists.
+
+## Initial `afs log --json` Shape
+
+`afs log [path]` reads the durable push journal from the SQLite state store. Without a path it lists all journal entries; with a path it resolves the path through the mount/entity mapping and lists entries that touched that entity.
+
+Each JSON entry includes:
+
+- `push_id`;
+- `mount_id`;
+- `remote_ids`;
+- `status`: `prepared`, `applying`, `applied`, `reconciled`, `reverted`, or `failed`;
+- `failure`: the failed status message when present;
+- `plan_summary`;
+- `operation_count`.
+
+Human output is a compact git-log-style list headed by `push <push-id>`.
+
+## Initial `afs undo --json` Shape
+
+`afs undo <push-id>` reads one journal entry and returns an undo decision. The initial safe behavior is:
+
+- `prepared` entries become `reverted` because no remote mutation has started;
+- `reverted` entries return `already_reverted`;
+- `applying`, `applied`, `reconciled`, and `failed` entries return `undo_not_implemented` with exit code `5`.
+
+Remote reversal intentionally remains blocked until the journal records enough pre-push state for safe reverse apply. This preserves the plan's no-content-loss bar instead of pretending that an applied block update can be reversed from the current journal shape alone.

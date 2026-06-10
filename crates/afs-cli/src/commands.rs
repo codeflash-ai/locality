@@ -4,6 +4,9 @@ use afs_store::SqliteStateStore;
 use serde::Serialize;
 
 use crate::diff::{DiffError, run_diff};
+use crate::history::{
+    HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo, undo_report_exit_code,
+};
 use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push};
 
 const EXIT_SUCCESS: i32 = 0;
@@ -29,8 +32,8 @@ pub fn dispatch(args: &[String]) -> i32 {
         "pull" => stub("pull", json),
         "push" => push(&args[1..], json),
         "diff" => diff(&args[1..], json),
-        "undo" => stub("undo", json),
-        "log" => stub("log", json),
+        "undo" => undo(&args[1..], json),
+        "log" => log(&args[1..], json),
         "resolve" => stub("resolve", json),
         "config" => stub("config", json),
         command => {
@@ -38,6 +41,69 @@ pub fn dispatch(args: &[String]) -> i32 {
             print_help();
             EXIT_USAGE
         }
+    }
+}
+
+fn log(args: &[String], json: bool) -> i32 {
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("log", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = LogOptions {
+        path: first_positional(args).map(PathBuf::from),
+    };
+
+    match run_log(&store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_log_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => history_command_error("log", json, error),
+    }
+}
+
+fn undo(args: &[String], json: bool) -> i32 {
+    let Some(push_id) = first_positional(args) else {
+        return command_error(
+            json,
+            CommandError::new("undo", "usage", "usage: afs undo <push-id> [--json]"),
+            EXIT_USAGE,
+        );
+    };
+
+    let mut store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("undo", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    match run_undo(&mut store, push_id) {
+        Ok(report) if json => {
+            let exit_code = undo_report_exit_code(&report);
+            print_json(&report);
+            exit_code
+        }
+        Ok(report) => {
+            let exit_code = undo_report_exit_code(&report);
+            print_undo_report(&report);
+            exit_code
+        }
+        Err(error) => history_command_error("undo", json, error),
     }
 }
 
@@ -134,6 +200,42 @@ fn diff(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn print_log_report(report: &LogReport) {
+    if report.entries.is_empty() {
+        println!("no journal entries");
+        return;
+    }
+
+    for (index, entry) in report.entries.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        println!("push {}", entry.push_id);
+        println!("  status: {}", entry.status);
+        println!("  mount: {}", entry.mount_id);
+        println!("  entities: {}", entry.remote_ids.join(", "));
+        if let Some(failure) = &entry.failure {
+            println!("  failure: {failure}");
+        }
+        println!(
+            "  summary: {} updated, {} created, {} moved, {} archived",
+            entry.plan_summary.blocks_updated,
+            entry.plan_summary.blocks_created,
+            entry.plan_summary.blocks_moved,
+            entry.plan_summary.blocks_archived
+        );
+        println!("  operations: {}", entry.operation_count);
+    }
+}
+
+fn print_undo_report(report: &UndoReport) {
+    if report.ok {
+        println!("{}", report.message);
+    } else {
+        println!("undo blocked for {}: {}", report.push_id, report.message);
+    }
+}
+
 fn print_push_report(report: &PushReport) {
     match report.action.as_str() {
         "noop" => println!("nothing to push"),
@@ -209,6 +311,15 @@ fn command_error(json: bool, error: CommandError, exit_code: i32) -> i32 {
     exit_code
 }
 
+fn history_command_error(command: &'static str, json: bool, error: HistoryError) -> i32 {
+    let exit_code = history_error_exit_code(&error);
+    command_error(
+        json,
+        CommandError::new(command, error.code(), error.message()),
+        exit_code,
+    )
+}
+
 fn print_json<T: Serialize>(value: &T) {
     match serde_json::to_string_pretty(value) {
         Ok(json) => println!("{json}"),
@@ -226,6 +337,15 @@ fn diff_error_exit_code(error: &DiffError) -> i32 {
         DiffError::MountNotFound(_) => EXIT_USAGE,
         DiffError::ReadFile { .. } => EXIT_INTERNAL,
         DiffError::Store(_) => EXIT_INTERNAL,
+    }
+}
+
+fn history_error_exit_code(error: &HistoryError) -> i32 {
+    match error {
+        HistoryError::MountNotFound(_)
+        | HistoryError::JournalNotFound(_)
+        | HistoryError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
+        HistoryError::Store(_) => EXIT_INTERNAL,
     }
 }
 
