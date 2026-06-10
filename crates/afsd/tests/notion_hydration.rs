@@ -251,6 +251,7 @@ fn page(id: &str, title: &str) -> PageDto {
                 kind: "title".to_string(),
                 title: vec![rich_text(title)],
                 rich_text: Vec::new(),
+                ..Default::default()
             },
         )]),
     }
