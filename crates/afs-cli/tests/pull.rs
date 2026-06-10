@@ -277,6 +277,8 @@ fn block(id: &str, kind: &str) -> BlockDto {
         quote: None,
         callout: None,
         code: None,
+        table: None,
+        table_row: None,
         child_page: None,
         child_database: None,
     }

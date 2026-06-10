@@ -2,11 +2,12 @@
 
 use afs_connector::NativeEntity;
 use afs_core::model::{CanonicalDocument, RemoteId};
-use afs_core::shadow::ShadowDocument;
+use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use afs_core::{AfsError, AfsResult};
 
 use crate::dto::{
     BlockDto, BlockTreeDto, NotionPageBundle, PageDto, RichTextBlockDto, RichTextDto,
+    TableBlockDto, TableRowBlockDto,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,13 +43,14 @@ pub fn render_page_bundle(bundle: &NotionPageBundle) -> AfsResult<NotionRendered
         .filter_map(|block| block.shadow_id.clone())
         .collect::<Vec<_>>();
     let body_start_line = frontmatter.lines().count() + 3;
-    let shadow = ShadowDocument::from_synced_body(
+    let mut shadow = ShadowDocument::from_synced_body(
         RemoteId::new(bundle.page.id.clone()),
         body.clone(),
         body_start_line,
         shadow_ids,
     )
     .map_err(|error| AfsError::InvalidState(format!("notion shadow build failed: {error}")))?;
+    apply_shadow_metadata(&mut shadow, &rendered_blocks);
 
     Ok(NotionRenderedEntity {
         document: CanonicalDocument::new(frontmatter, body),
@@ -60,10 +62,29 @@ pub fn render_page_bundle(bundle: &NotionPageBundle) -> AfsResult<NotionRendered
 struct RenderedBlock {
     markdown: String,
     shadow_id: Option<RemoteId>,
+    metadata: RenderedBlockMetadata,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum RenderedBlockMetadata {
+    #[default]
+    None,
+    Table {
+        row_ids: Vec<RemoteId>,
+        has_column_header: bool,
+        has_row_header: bool,
+    },
 }
 
 fn render_block_trees(trees: &[BlockTreeDto], out: &mut Vec<RenderedBlock>) {
     for tree in trees {
+        if tree.block.kind == "table"
+            && let Some(rendered) = render_table_tree(tree)
+        {
+            out.push(rendered);
+            continue;
+        }
+
         out.push(render_block(&tree.block));
         render_block_trees(&tree.children, out);
     }
@@ -118,6 +139,7 @@ fn render_block(block: &BlockDto) -> RenderedBlock {
                     RenderedBlock {
                         markdown: format!("- [{marker}] {text}"),
                         shadow_id,
+                        metadata: RenderedBlockMetadata::None,
                     }
                 }
             }
@@ -145,6 +167,7 @@ fn render_block(block: &BlockDto) -> RenderedBlock {
                         rich_text_plain_text(&code.rich_text)
                     ),
                     shadow_id,
+                    metadata: RenderedBlockMetadata::None,
                 }
             }
             None => directive_block(block, "malformed_code", None),
@@ -152,6 +175,7 @@ fn render_block(block: &BlockDto) -> RenderedBlock {
         "divider" => RenderedBlock {
             markdown: "---".to_string(),
             shadow_id,
+            metadata: RenderedBlockMetadata::None,
         },
         "child_page" => directive_block(
             block,
@@ -187,6 +211,7 @@ fn rich_text_block(
         RenderedBlock {
             markdown: render(&text),
             shadow_id: Some(RemoteId::new(block.id.clone())),
+            metadata: RenderedBlockMetadata::None,
         }
     }
 }
@@ -204,6 +229,97 @@ fn directive_block(block: &BlockDto, directive_type: &str, title: Option<&str>) 
     RenderedBlock {
         markdown,
         shadow_id: None,
+        metadata: RenderedBlockMetadata::None,
+    }
+}
+
+fn render_table_tree(tree: &BlockTreeDto) -> Option<RenderedBlock> {
+    let table = tree.block.table.as_ref()?;
+    let rows = table_rows(&tree.children)?;
+    let markdown = table_to_markdown(table, &rows)?;
+    let row_ids = tree
+        .children
+        .iter()
+        .map(|row| RemoteId::new(row.block.id.clone()))
+        .collect();
+
+    Some(RenderedBlock {
+        markdown,
+        shadow_id: Some(RemoteId::new(tree.block.id.clone())),
+        metadata: RenderedBlockMetadata::Table {
+            row_ids,
+            has_column_header: table.has_column_header,
+            has_row_header: table.has_row_header,
+        },
+    })
+}
+
+fn table_rows(children: &[BlockTreeDto]) -> Option<Vec<&TableRowBlockDto>> {
+    children
+        .iter()
+        .map(|child| {
+            if child.block.kind != "table_row" || !child.children.is_empty() {
+                return None;
+            }
+
+            child.block.table_row.as_ref()
+        })
+        .collect()
+}
+
+fn table_to_markdown(table: &TableBlockDto, rows: &[&TableRowBlockDto]) -> Option<String> {
+    let width = usize::from(table.table_width);
+    if width == 0 || rows.is_empty() || rows.iter().any(|row| row.cells.len() != width) {
+        return None;
+    }
+
+    let mut rendered = Vec::with_capacity(rows.len() + 1);
+    if table.has_column_header {
+        rendered.push(markdown_table_row(&rows[0].cells));
+        rendered.push(markdown_table_separator(width));
+        rendered.extend(rows[1..].iter().map(|row| markdown_table_row(&row.cells)));
+    } else {
+        rendered.push(markdown_table_row(&vec![Vec::new(); width]));
+        rendered.push(markdown_table_separator(width));
+        rendered.extend(rows.iter().map(|row| markdown_table_row(&row.cells)));
+    }
+
+    Some(rendered.join("\n"))
+}
+
+fn markdown_table_row(cells: &[Vec<RichTextDto>]) -> String {
+    format!(
+        "| {} |",
+        cells
+            .iter()
+            .map(|cell| escape_table_cell(&rich_text_to_markdown(cell)))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    )
+}
+
+fn markdown_table_separator(width: usize) -> String {
+    format!("| {} |", vec!["---"; width].join(" | "))
+}
+
+fn escape_table_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', "<br>")
+}
+
+fn apply_shadow_metadata(shadow: &mut ShadowDocument, rendered_blocks: &[RenderedBlock]) {
+    for (shadow_block, rendered_block) in shadow.blocks.iter_mut().zip(rendered_blocks) {
+        if let RenderedBlockMetadata::Table {
+            row_ids,
+            has_column_header,
+            has_row_header,
+        } = &rendered_block.metadata
+        {
+            shadow_block.kind = MarkdownBlockKind::TableWithRows {
+                row_ids: row_ids.clone(),
+                has_column_header: *has_column_header,
+                has_row_header: *has_row_header,
+            };
+        }
     }
 }
 

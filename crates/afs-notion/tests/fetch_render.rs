@@ -8,7 +8,7 @@ use afs_core::shadow::MarkdownBlockKind;
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, BlockTreeDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
-    RichTextBlockDto, RichTextDto, TitleBlockDto,
+    RichTextBlockDto, RichTextDto, TableBlockDto, TableRowBlockDto, TitleBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 
@@ -91,6 +91,94 @@ fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
         rendered.shadow.blocks[0].kind,
         MarkdownBlockKind::Directive { .. }
     ));
+}
+
+#[test]
+fn render_table_as_markdown_table_with_row_shadow_metadata() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: table_block("table-1", 2, true),
+            children: vec![
+                BlockTreeDto {
+                    block: table_row_block("row-1", ["Decision", "Choice"]),
+                    children: Vec::new(),
+                },
+                BlockTreeDto {
+                    block: table_row_block("row-2", ["First connector", "Notion"]),
+                    children: Vec::new(),
+                },
+            ],
+        }],
+    };
+    let raw = serde_json::to_vec(&bundle).expect("raw");
+    let native = afs_connector::NativeEntity {
+        remote_id: RemoteId::new("page-1"),
+        kind: "notion_page".to_string(),
+        raw,
+    };
+    let connector =
+        NotionConnector::with_api(NotionConfig::default(), Arc::new(FixtureNotionApi::new()));
+
+    let rendered = connector
+        .render_native_entity(&native)
+        .expect("render native entity");
+
+    assert_eq!(
+        rendered.document.body,
+        "| Decision | Choice |\n| --- | --- |\n| First connector | Notion |\n"
+    );
+    assert_eq!(rendered.shadow.blocks.len(), 1);
+    assert_eq!(
+        rendered.shadow.blocks[0].remote_id,
+        RemoteId::new("table-1")
+    );
+    assert_eq!(
+        rendered.shadow.blocks[0].kind,
+        MarkdownBlockKind::TableWithRows {
+            row_ids: vec![RemoteId::new("row-1"), RemoteId::new("row-2")],
+            has_column_header: true,
+            has_row_header: false,
+        }
+    );
+}
+
+#[test]
+fn render_malformed_table_as_directives() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: table_block("table-1", 3, true),
+            children: vec![BlockTreeDto {
+                block: table_row_block("row-1", ["Decision", "Choice"]),
+                children: Vec::new(),
+            }],
+        }],
+    };
+    let raw = serde_json::to_vec(&bundle).expect("raw");
+    let native = afs_connector::NativeEntity {
+        remote_id: RemoteId::new("page-1"),
+        kind: "notion_page".to_string(),
+        raw,
+    };
+    let connector =
+        NotionConnector::with_api(NotionConfig::default(), Arc::new(FixtureNotionApi::new()));
+
+    let rendered = connector
+        .render_native_entity(&native)
+        .expect("render native entity");
+
+    assert_eq!(
+        rendered.document.body,
+        "::afs{id=table-1 type=unsupported_table}\n\n::afs{id=row-1 type=unsupported_table_row}\n"
+    );
+    assert!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .all(|block| matches!(block.kind, MarkdownBlockKind::Directive { .. }))
+    );
 }
 
 #[test]
@@ -329,9 +417,32 @@ fn block(id: &str, kind: &str) -> BlockDto {
         quote: None,
         callout: None,
         code: None,
+        table: None,
+        table_row: None,
         child_page: None,
         child_database: None,
     }
+}
+
+fn table_block(id: &str, width: u16, has_column_header: bool) -> BlockDto {
+    let mut block = block(id, "table");
+    block.table = Some(TableBlockDto {
+        table_width: width,
+        has_column_header,
+        has_row_header: false,
+    });
+    block
+}
+
+fn table_row_block<const N: usize>(id: &str, cells: [&str; N]) -> BlockDto {
+    let mut block = block(id, "table_row");
+    block.table_row = Some(TableRowBlockDto {
+        cells: cells
+            .into_iter()
+            .map(|cell| vec![rich_text(cell)])
+            .collect::<Vec<_>>(),
+    });
+    block
 }
 
 fn rich_text(text: &str) -> RichTextDto {

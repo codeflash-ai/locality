@@ -115,6 +115,11 @@ pub enum MarkdownBlockKind {
     List,
     CodeFence,
     Table,
+    TableWithRows {
+        row_ids: Vec<RemoteId>,
+        has_column_header: bool,
+        has_row_header: bool,
+    },
     Directive {
         directive_type: Option<String>,
         raw: String,
@@ -339,7 +344,7 @@ fn kind_tag(kind: &MarkdownBlockKind) -> &'static str {
         MarkdownBlockKind::Paragraph => "paragraph",
         MarkdownBlockKind::List => "list",
         MarkdownBlockKind::CodeFence => "code",
-        MarkdownBlockKind::Table => "table",
+        MarkdownBlockKind::Table | MarkdownBlockKind::TableWithRows { .. } => "table",
         MarkdownBlockKind::Directive { .. } => "directive",
     }
 }

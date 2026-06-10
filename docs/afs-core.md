@@ -60,6 +60,7 @@ The shadow layer stores the synced body text plus a block tree:
 - each shadow block has a remote block ID, kind, source span, stable content hash, and rendered text;
 - directive blocks get their remote ID from the visible directive line;
 - clean Markdown blocks get their remote IDs from connector-rendered shadow metadata;
+- table blocks can carry row-level remote IDs as shadow metadata for future table-aware apply;
 - stable hashes use a deterministic in-process hash, not randomized runtime hashing.
 
 The first planner is deliberately conservative:

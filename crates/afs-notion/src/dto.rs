@@ -100,6 +100,10 @@ pub struct BlockDto {
     #[serde(default)]
     pub code: Option<CodeBlockDto>,
     #[serde(default)]
+    pub table: Option<TableBlockDto>,
+    #[serde(default)]
+    pub table_row: Option<TableRowBlockDto>,
+    #[serde(default)]
     pub child_page: Option<TitleBlockDto>,
     #[serde(default)]
     pub child_database: Option<TitleBlockDto>,
@@ -135,6 +139,22 @@ pub struct CodeBlockDto {
 pub struct TitleBlockDto {
     #[serde(default)]
     pub title: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableBlockDto {
+    #[serde(default)]
+    pub table_width: u16,
+    #[serde(default)]
+    pub has_column_header: bool,
+    #[serde(default)]
+    pub has_row_header: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableRowBlockDto {
+    #[serde(default)]
+    pub cells: Vec<Vec<RichTextDto>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
