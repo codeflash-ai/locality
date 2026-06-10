@@ -12,10 +12,12 @@
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 
+use serde::{Deserialize, Serialize};
+
 use crate::canonical::parse_directive_line;
 use crate::model::{RemoteId, SourceSpan};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShadowDocument {
     pub entity_id: RemoteId,
     pub body_hash: String,
@@ -81,7 +83,7 @@ impl ShadowDocument {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShadowBlock {
     pub remote_id: RemoteId,
     pub kind: MarkdownBlockKind,
@@ -90,7 +92,7 @@ pub struct ShadowBlock {
     pub text: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentedBlock {
     pub remote_id: Option<RemoteId>,
     pub kind: MarkdownBlockKind,
@@ -105,7 +107,7 @@ impl SegmentedBlock {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarkdownBlockKind {
     Heading,
     Paragraph,

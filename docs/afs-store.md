@@ -17,7 +17,7 @@
 | `records` | Durable mount, entity, shadow snapshot, and shadow block record shapes. |
 | `repository` | Split repository traits for mounts, entities, shadows, and journals. |
 | `memory` | Deterministic in-memory implementation for tests and early orchestration. |
-| `sqlite` | Production adapter placeholder that implements the same traits. |
+| `sqlite` | SQLite-backed durable implementation of the repository traits. |
 | `error` | Store-specific structured errors and conversion to `afs-core` errors. |
 
 ## First Contract Implemented
@@ -28,5 +28,16 @@
 - Shadow documents persist through an explicit record shape and load back into `ShadowDocument`.
 - Missing shadows return `StoreError::ShadowMissing`.
 - Journal append/status/list operations are present in memory and also satisfy `afs_core::journal::JournalStore`.
+- SQLite opens a `state.sqlite3` database under the configured state root and initializes the schema idempotently.
+- SQLite persists mounts, entities, shadows, and journals across reopen.
 
-The SQLite schema is intentionally not designed yet. It should now implement the repository traits without changing CLI or daemon orchestration code.
+## SQLite Schema
+
+The first schema keeps high-value lookup fields relational and stores complex connector-neutral payloads as JSON:
+
+- `mounts`: mount id, connector, root path, read-only flag;
+- `entities`: mount id, remote id, kind, title, projected path, hydration, content hash, remote edit time;
+- `shadows`: mount id, entity id, body hash, rendered body, JSON shadow blocks;
+- `journals`: push id, mount id, JSON remote ids, JSON push plan, JSON status.
+
+Shadow blocks and journal plans are JSON by design for now. They round-trip through typed Rust records, and the schema can normalize them later if query patterns justify it.

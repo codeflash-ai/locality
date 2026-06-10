@@ -5,8 +5,9 @@
 //! the destructive-change guardrails from `plan.md`.
 
 use crate::model::RemoteId;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushPlan {
     pub affected_entities: Vec<RemoteId>,
     pub operations: Vec<PushOperation>,
@@ -43,7 +44,7 @@ impl PushPlan {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PushOperation {
     UpdateBlock {
         block_id: RemoteId,
@@ -74,7 +75,7 @@ pub enum PushOperation {
     },
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanSummary {
     pub blocks_created: usize,
     pub blocks_updated: usize,
@@ -111,7 +112,7 @@ impl PlanSummary {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuardrailPolicy {
     pub max_archives_without_confirm: usize,
     pub max_mount_touch_percent_without_confirm: u8,
@@ -126,13 +127,13 @@ impl Default for GuardrailPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GuardrailDecision {
     Proceed,
     ConfirmRequired { reasons: Vec<String> },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanDegradation {
     pub kind: PlanDegradationKind,
     pub message: String,
@@ -147,7 +148,7 @@ impl PlanDegradation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanDegradationKind {
     AmbiguousBlockAlignment,
 }

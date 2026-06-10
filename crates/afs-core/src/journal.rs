@@ -7,11 +7,12 @@
 use crate::AfsResult;
 use crate::model::{MountId, RemoteId};
 use crate::planner::PushPlan;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PushId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub push_id: PushId,
     pub mount_id: MountId,
@@ -20,7 +21,7 @@ pub struct JournalEntry {
     pub status: JournalStatus,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JournalStatus {
     Prepared,
     Applying,

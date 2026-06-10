@@ -7,8 +7,9 @@ use std::path::PathBuf;
 
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId, SourceSpan, TreeEntry};
 use afs_core::shadow::{MarkdownBlockKind, ShadowBlock, ShadowDocument};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountConfig {
     pub mount_id: MountId,
     pub connector: String,
@@ -32,7 +33,7 @@ impl MountConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityRecord {
     pub mount_id: MountId,
     pub remote_id: RemoteId,
@@ -110,7 +111,7 @@ impl From<EntityRecord> for TreeEntry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShadowSnapshotRecord {
     pub mount_id: MountId,
     pub entity_id: RemoteId,
@@ -145,7 +146,7 @@ impl ShadowSnapshotRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShadowBlockRecord {
     pub remote_id: RemoteId,
     pub kind: MarkdownBlockKind,

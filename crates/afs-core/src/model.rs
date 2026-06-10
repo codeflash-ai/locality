@@ -7,7 +7,9 @@
 
 use std::path::PathBuf;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MountId(pub String);
 
 impl MountId {
@@ -20,7 +22,7 @@ impl MountId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RemoteId(pub String);
 
 impl RemoteId {
@@ -33,7 +35,7 @@ impl RemoteId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntityKind {
     Page,
     Database,
@@ -42,7 +44,7 @@ pub enum EntityKind {
     Unknown(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HydrationState {
     Virtual,
     Stub,
@@ -84,14 +86,14 @@ pub struct HydrationTransitionError {
     pub to: HydrationState,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TreeKind {
     Remote,
     Local,
     Synced,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
     pub mount_id: MountId,
     pub remote_id: RemoteId,
@@ -119,7 +121,7 @@ impl TreeEntry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryFingerprint {
     pub kind: EntityKind,
     pub title: String,
@@ -128,7 +130,7 @@ pub struct EntryFingerprint {
     pub remote_edited_at: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalDocument {
     pub frontmatter: String,
     pub body: String,
@@ -165,7 +167,7 @@ impl CanonicalDocument {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalBlock {
     pub remote_id: Option<RemoteId>,
     pub kind: BlockKind,
@@ -233,7 +235,7 @@ impl CanonicalBlock {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockKind {
     NativeMarkdown,
     Directive { directive_type: String, raw: String },
@@ -241,7 +243,7 @@ pub enum BlockKind {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceSpan {
     pub start_line: usize,
     pub end_line: usize,

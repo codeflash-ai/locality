@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::diff::{DiffError, run_diff};
@@ -7,7 +8,7 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ShadowRepository, StoreError,
+    ShadowRepository, SqliteStateStore, StoreError,
 };
 
 #[test]
@@ -109,6 +110,41 @@ fn diff_returns_structured_mount_lookup_error() {
     assert_eq!(error.code(), "mount_not_found");
 }
 
+#[test]
+fn diff_runner_works_with_sqlite_state_store() {
+    let fixture = DiffFixture::new();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.");
+    let mut store = SqliteStateStore::open(fixture.root.join(".state")).expect("open sqlite");
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph."))
+        .expect("save shadow");
+
+    let report = run_diff(&store, &path).expect("diff report");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "confirm_plan");
+    assert_eq!(report.plan.unwrap().summary.blocks_updated, 1);
+}
+
 struct DiffFixture {
     root: PathBuf,
     mount_id: MountId,
@@ -116,11 +152,16 @@ struct DiffFixture {
 
 impl DiffFixture {
     fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("afs-cli-diff-{unique}"));
+        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "afs-cli-diff-{}-{unique}-{suffix}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).expect("fixture root");
         Self {
             root,

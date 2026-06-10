@@ -39,4 +39,4 @@ The first diff implementation resolves a path through the store, reads the canon
 - `guardrail`: `proceed` or `confirm_required`;
 - `action`: the next push action, such as `noop`, `confirm_plan`, `confirm_dangerous_plan`, or `fix_validation`.
 
-The production SQLite-backed command path still returns `not_implemented` until the SQLite repository adapter is built.
+The production command path uses the SQLite store. A real diff requires persisted mount, entity, and shadow rows for the target path.

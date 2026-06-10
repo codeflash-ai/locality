@@ -35,6 +35,8 @@ pub enum StoreError {
     JournalMissing(PushId),
     JournalAlreadyExists(PushId),
     NotImplemented(&'static str),
+    Database(String),
+    Json(String),
     Io(String),
 }
 
@@ -77,6 +79,8 @@ impl Display for StoreError {
                 write!(f, "journal entry `{}` already exists", push_id.0)
             }
             Self::NotImplemented(feature) => write!(f, "not implemented: {feature}"),
+            Self::Database(message) => write!(f, "database error: {message}"),
+            Self::Json(message) => write!(f, "json error: {message}"),
             Self::Io(message) => write!(f, "io error: {message}"),
         }
     }
@@ -90,10 +94,23 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
+impl From<rusqlite::Error> for StoreError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Database(value.to_string())
+    }
+}
+
+impl From<serde_json::Error> for StoreError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value.to_string())
+    }
+}
+
 impl From<StoreError> for AfsError {
     fn from(value: StoreError) -> Self {
         match value {
             StoreError::NotImplemented(feature) => Self::NotImplemented(feature),
+            StoreError::Database(message) | StoreError::Json(message) => Self::Io(message),
             StoreError::Io(message) => Self::Io(message),
             other => Self::Io(other.to_string()),
         }
