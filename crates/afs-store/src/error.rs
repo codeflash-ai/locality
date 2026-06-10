@@ -35,6 +35,10 @@ pub enum StoreError {
     JournalMissing(PushId),
     JournalAlreadyExists(PushId),
     NotImplemented(&'static str),
+    SchemaVersion {
+        found: i64,
+        supported: i64,
+    },
     Database(String),
     Json(String),
     Io(String),
@@ -79,6 +83,10 @@ impl Display for StoreError {
                 write!(f, "journal entry `{}` already exists", push_id.0)
             }
             Self::NotImplemented(feature) => write!(f, "not implemented: {feature}"),
+            Self::SchemaVersion { found, supported } => write!(
+                f,
+                "unsupported schema version {found}; this binary supports up to {supported}"
+            ),
             Self::Database(message) => write!(f, "database error: {message}"),
             Self::Json(message) => write!(f, "json error: {message}"),
             Self::Io(message) => write!(f, "io error: {message}"),
@@ -110,6 +118,9 @@ impl From<StoreError> for AfsError {
     fn from(value: StoreError) -> Self {
         match value {
             StoreError::NotImplemented(feature) => Self::NotImplemented(feature),
+            StoreError::SchemaVersion { found, supported } => Self::Io(format!(
+                "unsupported schema version {found}; this binary supports up to {supported}"
+            )),
             StoreError::Database(message) | StoreError::Json(message) => Self::Io(message),
             StoreError::Io(message) => Self::Io(message),
             other => Self::Io(other.to_string()),

@@ -22,6 +22,7 @@ pub struct JournalEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JournalStatus {
     Prepared,
     Applying,

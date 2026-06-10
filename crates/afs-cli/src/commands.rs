@@ -5,6 +5,11 @@ use serde::Serialize;
 
 use crate::diff::{DiffError, run_diff};
 
+const EXIT_SUCCESS: i32 = 0;
+const EXIT_INTERNAL: i32 = 1;
+const EXIT_USAGE: i32 = 2;
+const EXIT_VALIDATION: i32 = 3;
+
 const COMMANDS: &[&str] = &[
     "connect", "mount", "status", "pull", "push", "diff", "undo", "log", "resolve", "config",
 ];
@@ -12,7 +17,7 @@ const COMMANDS: &[&str] = &[
 pub fn dispatch(args: &[String]) -> i32 {
     if args.is_empty() || has_flag(args, "--help") || has_flag(args, "-h") {
         print_help();
-        return 0;
+        return EXIT_SUCCESS;
     }
 
     let json = has_flag(args, "--json");
@@ -30,7 +35,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         command => {
             eprintln!("unknown command: {command}");
             print_help();
-            2
+            EXIT_USAGE
         }
     }
 }
@@ -40,7 +45,7 @@ fn diff(args: &[String], json: bool) -> i32 {
         return command_error(
             json,
             CommandError::new("diff", "usage", "usage: afs diff <path> [--json]"),
-            2,
+            EXIT_USAGE,
         );
     };
 
@@ -50,25 +55,31 @@ fn diff(args: &[String], json: bool) -> i32 {
             return command_error(
                 json,
                 CommandError::new("diff", "store_open_failed", error.to_string()),
-                1,
+                EXIT_INTERNAL,
             );
         }
     };
 
     match run_diff(&store, PathBuf::from(path)) {
-        Ok(report) if json => print_json(&report),
-        Ok(report) => print_diff_report(&report),
+        Ok(report) if json => {
+            let exit_code = diff_report_exit_code(&report);
+            print_json(&report);
+            exit_code
+        }
+        Ok(report) => {
+            let exit_code = diff_report_exit_code(&report);
+            print_diff_report(&report);
+            exit_code
+        }
         Err(error) => {
             let exit_code = diff_error_exit_code(&error);
-            return command_error(
+            command_error(
                 json,
                 CommandError::new("diff", error.code(), error.message()),
                 exit_code,
-            );
+            )
         }
     }
-
-    0
 }
 
 fn stub(command: &str, json: bool) -> i32 {
@@ -78,7 +89,7 @@ fn stub(command: &str, json: bool) -> i32 {
         println!("afs {command}: not implemented yet");
     }
 
-    0
+    EXIT_SUCCESS
 }
 
 fn print_diff_report(report: &crate::diff::DiffReport) {
@@ -133,9 +144,17 @@ fn print_json<T: Serialize>(value: &T) {
 
 fn diff_error_exit_code(error: &DiffError) -> i32 {
     match error {
-        DiffError::MountNotFound(_) => 2,
-        DiffError::ReadFile { .. } => 1,
-        DiffError::Store(_) => 1,
+        DiffError::MountNotFound(_) => EXIT_USAGE,
+        DiffError::ReadFile { .. } => EXIT_INTERNAL,
+        DiffError::Store(_) => EXIT_INTERNAL,
+    }
+}
+
+fn diff_report_exit_code(report: &crate::diff::DiffReport) -> i32 {
+    if report.ok {
+        EXIT_SUCCESS
+    } else {
+        EXIT_VALIDATION
     }
 }
 
@@ -190,5 +209,40 @@ fn print_help() {
     println!("Commands:");
     for command in COMMANDS {
         println!("  {command}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::diff::{DiffReport, GuardrailOutput};
+
+    use super::{EXIT_SUCCESS, EXIT_VALIDATION, diff_report_exit_code};
+
+    #[test]
+    fn clean_diff_report_exits_successfully() {
+        assert_eq!(diff_report_exit_code(&report(true)), EXIT_SUCCESS);
+    }
+
+    #[test]
+    fn validation_diff_report_exits_with_validation_code() {
+        assert_eq!(diff_report_exit_code(&report(false)), EXIT_VALIDATION);
+    }
+
+    fn report(ok: bool) -> DiffReport {
+        DiffReport {
+            ok,
+            command: "diff",
+            path: "Roadmap.md".to_string(),
+            mount_id: "notion-main".to_string(),
+            entity_id: "page-1".to_string(),
+            validation: Vec::new(),
+            plan: None,
+            guardrail: GuardrailOutput {
+                decision: "proceed".to_string(),
+                reasons: Vec::new(),
+            },
+            action: if ok { "noop" } else { "fix_validation" }.to_string(),
+            completed_stages: Vec::new(),
+        }
     }
 }

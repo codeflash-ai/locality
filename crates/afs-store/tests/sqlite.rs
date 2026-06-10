@@ -6,11 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use afs_core::journal::{JournalEntry, JournalStatus, PushId};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
-use afs_core::shadow::ShadowDocument;
+use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
     ShadowRepository, SqliteStateStore, StoreError,
 };
+use rusqlite::Connection;
 
 #[test]
 fn sqlite_store_initializes_idempotently() {
@@ -18,9 +19,58 @@ fn sqlite_store_initializes_idempotently() {
 
     let first = SqliteStateStore::open(fixture.state_root.clone()).expect("open first");
     let second = SqliteStateStore::open(fixture.state_root.clone()).expect("open second");
+    let connection = Connection::open(&first.db_path).expect("raw connection");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("journal mode");
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
+    assert_eq!(user_version, 1);
+    assert_eq!(journal_mode, "wal");
+}
+
+#[test]
+fn sqlite_store_rejects_newer_schema_version() {
+    let fixture = SqliteFixture::new();
+    fs::create_dir_all(&fixture.state_root).expect("state root");
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(db_path).expect("raw connection");
+    connection
+        .execute_batch("PRAGMA user_version = 999;")
+        .expect("set user version");
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("schema version");
+
+    assert_eq!(
+        error,
+        StoreError::SchemaVersion {
+            found: 999,
+            supported: 1,
+        }
+    );
+}
+
+#[test]
+fn persisted_json_uses_stable_snake_case_names() {
+    assert_eq!(
+        serde_json::to_string(&HydrationState::Hydrated).expect("hydration json"),
+        "\"hydrated\""
+    );
+    assert_eq!(
+        serde_json::to_string(&MarkdownBlockKind::Paragraph).expect("block kind json"),
+        "{\"kind\":\"paragraph\"}"
+    );
+    assert_eq!(
+        serde_json::to_string(&PushOperation::ArchiveBlock {
+            block_id: RemoteId::new("block-1"),
+        })
+        .expect("operation json"),
+        "{\"type\":\"archive_block\",\"block_id\":\"block-1\"}"
+    );
 }
 
 #[test]

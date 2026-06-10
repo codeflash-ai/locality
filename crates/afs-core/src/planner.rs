@@ -45,6 +45,7 @@ impl PushPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum PushOperation {
     UpdateBlock {
         block_id: RemoteId,
@@ -128,6 +129,7 @@ impl Default for GuardrailPolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GuardrailDecision {
     Proceed,
     ConfirmRequired { reasons: Vec<String> },
@@ -149,6 +151,7 @@ impl PlanDegradation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PlanDegradationKind {
     AmbiguousBlockAlignment,
 }

@@ -20,6 +20,7 @@ use crate::records::{EntityRecord, MountConfig, ShadowBlockRecord, ShadowSnapsho
 use crate::repository::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
 
 const DB_FILE: &str = "state.sqlite3";
+const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -39,7 +40,14 @@ impl SqliteStateStore {
 
     fn connection(&self) -> StoreResult<Connection> {
         let connection = Connection::open(&self.db_path)?;
-        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        connection.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            ",
+        )?;
         Ok(connection)
     }
 }
@@ -361,9 +369,19 @@ type ShadowRow = (String, String, String, String, String);
 type JournalRow = (String, String, String, String, String);
 
 fn initialize_schema(connection: &Connection) -> StoreResult<()> {
+    let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version > SCHEMA_VERSION {
+        return Err(StoreError::SchemaVersion {
+            found: user_version,
+            supported: SCHEMA_VERSION,
+        });
+    }
+
     connection.execute_batch(
         "
         PRAGMA foreign_keys = ON;
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
 
         CREATE TABLE IF NOT EXISTS mounts (
             mount_id TEXT PRIMARY KEY,
@@ -406,6 +424,11 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         );
         ",
     )?;
+
+    if user_version < SCHEMA_VERSION {
+        connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    }
+
     Ok(())
 }
 

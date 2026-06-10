@@ -30,6 +30,7 @@
 - Journal append/status/list operations are present in memory and also satisfy `afs_core::journal::JournalStore`.
 - SQLite opens a `state.sqlite3` database under the configured state root and initializes the schema idempotently.
 - SQLite persists mounts, entities, shadows, and journals across reopen.
+- SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
 
 ## SQLite Schema
 
@@ -40,4 +41,4 @@ The first schema keeps high-value lookup fields relational and stores complex co
 - `shadows`: mount id, entity id, body hash, rendered body, JSON shadow blocks;
 - `journals`: push id, mount id, JSON remote ids, JSON push plan, JSON status.
 
-Shadow blocks and journal plans are JSON by design for now. They round-trip through typed Rust records, and the schema can normalize them later if query patterns justify it.
+Shadow blocks and journal plans are JSON by design for now. They round-trip through typed Rust records with stable snake-case serde names, and the schema can normalize them later if query patterns justify it.

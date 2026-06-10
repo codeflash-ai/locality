@@ -148,7 +148,9 @@ fn ambiguous_residual_alignment_is_explicitly_degraded() {
         .plan_push(&shadow, &edited)
         .expect("plan");
 
-    assert_eq!(plan.summary.blocks_updated, 2);
+    assert_eq!(plan.summary.blocks_updated, 0);
+    assert_eq!(plan.summary.blocks_created, 2);
+    assert_eq!(plan.summary.blocks_archived, 2);
     assert_eq!(plan.degradations.len(), 1);
     assert_eq!(
         plan.degradations[0].kind,

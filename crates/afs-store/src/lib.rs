@@ -2,9 +2,8 @@
 //!
 //! `afs-store` owns the repository contracts used by the daemon and CLI to load
 //! mount configuration, locate projected entities, read last-synced shadows, and
-//! journal pushes. The first concrete implementation is an in-memory store for
-//! deterministic tests and early orchestration work. SQLite remains an explicit
-//! placeholder until the repository surface settles.
+//! journal pushes. The crate provides a deterministic in-memory implementation
+//! for tests and a SQLite implementation for local durable state.
 
 pub mod error;
 pub mod memory;

@@ -288,19 +288,19 @@ fn align_residual_by_order(
         .map(|(index, _)| index)
         .collect();
 
+    if residual_edited.len() > 1 && residual_shadow.len() > 1 {
+        return Some(PlanDegradation::new(
+            PlanDegradationKind::AmbiguousBlockAlignment,
+            "multiple edited and synced blocks could not be aligned safely; unmatched edited blocks will be appended and unmatched synced blocks archived",
+        ));
+    }
+
     for (edited_index, shadow_index) in residual_edited.iter().zip(residual_shadow.iter()) {
         matches[*edited_index] = Some(*shadow_index);
         used_shadow.insert(*shadow_index);
     }
 
-    if residual_edited.len() > 1 && residual_shadow.len() > 1 {
-        Some(PlanDegradation::new(
-            PlanDegradationKind::AmbiguousBlockAlignment,
-            "multiple edited and synced blocks required ordered residual alignment",
-        ))
-    } else {
-        None
-    }
+    None
 }
 
 fn should_move_block(

@@ -17,16 +17,18 @@ The `afs` command is the single supported control surface for users and coding a
 
 ## Exit-code contract
 
-The exact numeric assignments are still open, but the categories should be stable before agents depend on the CLI:
+Initial numeric assignments:
 
-- success
-- usage error
-- validation error
-- conflict
-- guardrail confirmation required
-- remote concurrency failure
-- connector/auth/rate-limit failure
-- internal error
+- `0`: success;
+- `1`: internal, I/O, store, connector, auth, or rate-limit failure;
+- `2`: usage error;
+- `3`: validation error.
+
+Remaining categories to assign before `afs push` applies remote mutations:
+
+- conflict;
+- guardrail confirmation required;
+- remote concurrency failure.
 
 ## Initial `afs diff --json` Shape
 

@@ -36,6 +36,7 @@ impl RemoteId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Page,
     Database,
@@ -45,6 +46,7 @@ pub enum EntityKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HydrationState {
     Virtual,
     Stub,
@@ -87,6 +89,7 @@ pub struct HydrationTransitionError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TreeKind {
     Remote,
     Local,
@@ -236,6 +239,7 @@ impl CanonicalBlock {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BlockKind {
     NativeMarkdown,
     Directive { directive_type: String, raw: String },
