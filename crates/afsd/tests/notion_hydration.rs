@@ -84,8 +84,15 @@ fn live_notion_hydration_source_fetches_codeflash_home_page() {
     let rendered = afsd::hydration::HydrationSource::fetch_render(&connector, &request)
         .expect("live Notion fetch/render");
 
-    assert_eq!(rendered.shadow.entity_id, request.remote_id);
+    assert_notion_ids_match(&rendered.shadow.entity_id, &request.remote_id);
     assert!(!rendered.document.frontmatter.is_empty());
+}
+
+fn assert_notion_ids_match(actual: &RemoteId, expected: &RemoteId) {
+    assert_eq!(
+        actual.as_str().replace('-', ""),
+        expected.as_str().replace('-', "")
+    );
 }
 
 #[derive(Clone, Debug)]
