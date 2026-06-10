@@ -1,54 +1,19 @@
-use std::path::PathBuf;
+//! Durable state boundary for AgentFS.
+//!
+//! `afs-store` owns the repository contracts used by the daemon and CLI to load
+//! mount configuration, locate projected entities, read last-synced shadows, and
+//! journal pushes. The first concrete implementation is an in-memory store for
+//! deterministic tests and early orchestration work. SQLite remains an explicit
+//! placeholder until the repository surface settles.
 
-use afs_core::journal::{JournalEntry, JournalStatus, JournalStore, PushId};
-use afs_core::model::{MountId, TreeEntry, TreeKind};
-use afs_core::{AfsError, AfsResult};
+pub mod error;
+pub mod memory;
+pub mod records;
+pub mod repository;
+pub mod sqlite;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MountConfig {
-    pub mount_id: MountId,
-    pub connector: String,
-    pub root: PathBuf,
-    pub read_only: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct SqliteStateStore {
-    pub root: PathBuf,
-}
-
-impl SqliteStateStore {
-    pub fn open(root: PathBuf) -> AfsResult<Self> {
-        Ok(Self { root })
-    }
-}
-
-pub trait StateStore {
-    fn load_mounts(&self) -> AfsResult<Vec<MountConfig>>;
-    fn read_tree_entry(&self, kind: TreeKind, mount_id: &MountId) -> AfsResult<Vec<TreeEntry>>;
-    fn write_tree_entry(&mut self, kind: TreeKind, entry: TreeEntry) -> AfsResult<()>;
-}
-
-impl StateStore for SqliteStateStore {
-    fn load_mounts(&self) -> AfsResult<Vec<MountConfig>> {
-        Err(AfsError::NotImplemented("SQLite mount config loading"))
-    }
-
-    fn read_tree_entry(&self, _kind: TreeKind, _mount_id: &MountId) -> AfsResult<Vec<TreeEntry>> {
-        Err(AfsError::NotImplemented("SQLite tree reads"))
-    }
-
-    fn write_tree_entry(&mut self, _kind: TreeKind, _entry: TreeEntry) -> AfsResult<()> {
-        Err(AfsError::NotImplemented("SQLite tree writes"))
-    }
-}
-
-impl JournalStore for SqliteStateStore {
-    fn append(&mut self, _entry: JournalEntry) -> AfsResult<()> {
-        Err(AfsError::NotImplemented("SQLite journal append"))
-    }
-
-    fn update_status(&mut self, _push_id: &PushId, _status: JournalStatus) -> AfsResult<()> {
-        Err(AfsError::NotImplemented("SQLite journal status update"))
-    }
-}
+pub use error::{StoreError, StoreResult};
+pub use memory::InMemoryStateStore;
+pub use records::{EntityRecord, MountConfig, ShadowBlockRecord, ShadowSnapshotRecord};
+pub use repository::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
+pub use sqlite::SqliteStateStore;

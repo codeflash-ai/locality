@@ -1,0 +1,179 @@
+//! Durable record shapes.
+//!
+//! These types are deliberately close to `afs-core` value types. The store owns
+//! persistence identity and lookup concerns, while the core owns sync semantics.
+
+use std::path::PathBuf;
+
+use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId, SourceSpan, TreeEntry};
+use afs_core::shadow::{MarkdownBlockKind, ShadowBlock, ShadowDocument};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountConfig {
+    pub mount_id: MountId,
+    pub connector: String,
+    pub root: PathBuf,
+    pub read_only: bool,
+}
+
+impl MountConfig {
+    pub fn new(mount_id: MountId, connector: impl Into<String>, root: impl Into<PathBuf>) -> Self {
+        Self {
+            mount_id,
+            connector: connector.into(),
+            root: root.into(),
+            read_only: false,
+        }
+    }
+
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntityRecord {
+    pub mount_id: MountId,
+    pub remote_id: RemoteId,
+    pub kind: EntityKind,
+    pub title: String,
+    pub path: PathBuf,
+    pub hydration: HydrationState,
+    pub content_hash: Option<String>,
+    pub remote_edited_at: Option<String>,
+}
+
+impl EntityRecord {
+    pub fn new(
+        mount_id: MountId,
+        remote_id: RemoteId,
+        kind: EntityKind,
+        title: impl Into<String>,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            mount_id,
+            remote_id,
+            kind,
+            title: title.into(),
+            path: path.into(),
+            hydration: HydrationState::Stub,
+            content_hash: None,
+            remote_edited_at: None,
+        }
+    }
+
+    pub fn with_hydration(mut self, hydration: HydrationState) -> Self {
+        self.hydration = hydration;
+        self
+    }
+
+    pub fn with_content_hash(mut self, content_hash: impl Into<String>) -> Self {
+        self.content_hash = Some(content_hash.into());
+        self
+    }
+
+    pub fn with_remote_edited_at(mut self, remote_edited_at: impl Into<String>) -> Self {
+        self.remote_edited_at = Some(remote_edited_at.into());
+        self
+    }
+}
+
+impl From<TreeEntry> for EntityRecord {
+    fn from(value: TreeEntry) -> Self {
+        Self {
+            mount_id: value.mount_id,
+            remote_id: value.remote_id,
+            kind: value.kind,
+            title: value.title,
+            path: value.path,
+            hydration: value.hydration,
+            content_hash: value.content_hash,
+            remote_edited_at: value.remote_edited_at,
+        }
+    }
+}
+
+impl From<EntityRecord> for TreeEntry {
+    fn from(value: EntityRecord) -> Self {
+        Self {
+            mount_id: value.mount_id,
+            remote_id: value.remote_id,
+            kind: value.kind,
+            title: value.title,
+            path: value.path,
+            hydration: value.hydration,
+            content_hash: value.content_hash,
+            remote_edited_at: value.remote_edited_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShadowSnapshotRecord {
+    pub mount_id: MountId,
+    pub entity_id: RemoteId,
+    pub body_hash: String,
+    pub rendered_body: String,
+    pub blocks: Vec<ShadowBlockRecord>,
+}
+
+impl ShadowSnapshotRecord {
+    pub fn from_document(mount_id: MountId, document: &ShadowDocument) -> Self {
+        Self {
+            mount_id,
+            entity_id: document.entity_id.clone(),
+            body_hash: document.body_hash.clone(),
+            rendered_body: document.rendered_body.clone(),
+            blocks: document
+                .blocks
+                .iter()
+                .cloned()
+                .map(ShadowBlockRecord::from)
+                .collect(),
+        }
+    }
+
+    pub fn into_document(self) -> ShadowDocument {
+        ShadowDocument {
+            entity_id: self.entity_id,
+            body_hash: self.body_hash,
+            rendered_body: self.rendered_body,
+            blocks: self.blocks.into_iter().map(ShadowBlock::from).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShadowBlockRecord {
+    pub remote_id: RemoteId,
+    pub kind: MarkdownBlockKind,
+    pub source_span: SourceSpan,
+    pub content_hash: String,
+    pub text: String,
+}
+
+impl From<ShadowBlock> for ShadowBlockRecord {
+    fn from(value: ShadowBlock) -> Self {
+        Self {
+            remote_id: value.remote_id,
+            kind: value.kind,
+            source_span: value.source_span,
+            content_hash: value.content_hash,
+            text: value.text,
+        }
+    }
+}
+
+impl From<ShadowBlockRecord> for ShadowBlock {
+    fn from(value: ShadowBlockRecord) -> Self {
+        Self {
+            remote_id: value.remote_id,
+            kind: value.kind,
+            source_span: value.source_span,
+            content_hash: value.content_hash,
+            text: value.text,
+        }
+    }
+}
