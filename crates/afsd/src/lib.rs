@@ -1,5 +1,6 @@
 pub mod hydration;
 pub mod scheduler;
+pub mod supervisor;
 pub mod watcher;
 
 use std::path::PathBuf;
