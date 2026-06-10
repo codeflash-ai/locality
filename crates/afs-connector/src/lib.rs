@@ -12,6 +12,7 @@ use afs_core::planner::PushPlan;
 use afs_core::push::{
     PushApplier, PushApplyRequest, PushApplyResult, PushConcurrencyCheck, PushConcurrencyRequest,
 };
+use afs_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult, UndoPlan};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectorKind(pub &'static str);
@@ -55,10 +56,28 @@ pub struct ApplyPlanRequest<'a> {
     pub mount_id: &'a MountId,
     /// Connector-neutral plan approved by the core pipeline.
     pub plan: &'a PushPlan,
+    /// Stable idempotency keys aligned to `plan.operations`.
+    pub operation_ids: &'a [afs_core::journal::PushOperationId],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplyPlanResult {
+    pub changed_remote_ids: Vec<RemoteId>,
+    pub effects: Vec<afs_core::journal::JournalApplyEffect>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyUndoRequest<'a> {
+    /// Push being reversed.
+    pub target_push_id: &'a PushId,
+    /// Mount whose source account/workspace is being mutated.
+    pub mount_id: &'a MountId,
+    /// Connector-neutral undo plan derived by core.
+    pub plan: &'a UndoPlan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyUndoResult {
     pub changed_remote_ids: Vec<RemoteId>,
 }
 
@@ -74,6 +93,8 @@ pub trait Connector {
     fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> AfsResult<()>;
     /// Apply an approved push plan using source-specific API operations.
     fn apply(&self, request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult>;
+    /// Apply a complete undo plan using source-specific reverse operations.
+    fn apply_undo(&self, request: ApplyUndoRequest<'_>) -> AfsResult<ApplyUndoResult>;
 }
 
 /// Adapter from a connector's concurrency check into `afs-core`'s executor hook.
@@ -102,6 +123,7 @@ where
             push_id: request.push_id,
             mount_id: request.mount_id,
             plan: request.plan,
+            operation_ids: request.operation_ids,
         })
     }
 }
@@ -132,9 +154,45 @@ where
             push_id: request.push_id,
             mount_id: request.mount_id,
             plan: request.plan,
+            operation_ids: request.operation_ids,
         })?;
 
         Ok(PushApplyResult {
+            changed_remote_ids: result.changed_remote_ids,
+            effects: result.effects,
+        })
+    }
+}
+
+/// Adapter from a connector's undo method into `afs-core`'s undo hook.
+pub struct ConnectorUndoApplier<'a, C>
+where
+    C: Connector + ?Sized,
+{
+    connector: &'a C,
+}
+
+impl<'a, C> ConnectorUndoApplier<'a, C>
+where
+    C: Connector + ?Sized,
+{
+    pub fn new(connector: &'a C) -> Self {
+        Self { connector }
+    }
+}
+
+impl<C> UndoApplier for ConnectorUndoApplier<'_, C>
+where
+    C: Connector + ?Sized,
+{
+    fn apply_undo(&mut self, request: UndoApplyRequest<'_>) -> AfsResult<UndoApplyResult> {
+        let result = self.connector.apply_undo(ApplyUndoRequest {
+            target_push_id: request.target_push_id,
+            mount_id: request.mount_id,
+            plan: request.plan,
+        })?;
+
+        Ok(UndoApplyResult {
             changed_remote_ids: result.changed_remote_ids,
         })
     }

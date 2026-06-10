@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 use crate::canonical::ParsedCanonicalDocument;
 use crate::diff::{BlockDiffEngine, DiffEngine};
-use crate::journal::{JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId};
+use crate::journal::{
+    JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
+    PushOperationId,
+};
 use crate::model::{MountId, RemoteId};
 use crate::planner::{GuardrailDecision, GuardrailPolicy, PushPlan};
 use crate::shadow::ShadowDocument;
@@ -309,6 +312,8 @@ pub struct PushExecutionResult {
     pub action: PushExecutionAction,
     /// Remote entities reported changed by the connector apply hook.
     pub changed_remote_ids: Vec<RemoteId>,
+    /// Operation-level effects reported by the connector apply hook.
+    pub apply_effects: Vec<JournalApplyEffect>,
     /// Remote entities reconciled from post-apply read-back.
     pub reconciled_remote_ids: Vec<RemoteId>,
     /// Final journal status, or `None` when execution did not start.
@@ -333,6 +338,8 @@ pub struct PushConcurrencyRequest<'a> {
     pub mount_id: &'a MountId,
     /// Approved plan that is about to be applied.
     pub plan: &'a PushPlan,
+    /// Stable idempotency keys for each operation in `plan.operations`.
+    pub operation_ids: &'a [PushOperationId],
     /// Remote entities covered by the journal entry.
     pub remote_ids: &'a [RemoteId],
 }
@@ -350,6 +357,8 @@ pub struct PushApplyRequest<'a> {
     pub mount_id: &'a MountId,
     /// Connector-neutral operations to apply remotely.
     pub plan: &'a PushPlan,
+    /// Stable idempotency keys for each operation in `plan.operations`.
+    pub operation_ids: &'a [PushOperationId],
     /// Remote entities covered by the journal entry.
     pub remote_ids: &'a [RemoteId],
 }
@@ -358,6 +367,8 @@ pub struct PushApplyRequest<'a> {
 pub struct PushApplyResult {
     /// Remote entities the connector reports as changed.
     pub changed_remote_ids: Vec<RemoteId>,
+    /// Durable operation-level effects needed by resume and undo flows.
+    pub effects: Vec<JournalApplyEffect>,
 }
 
 /// Hook that turns a validated push plan into source-specific remote writes.
@@ -415,6 +426,7 @@ where
                 pipeline_action: request.pipeline.action,
             },
             changed_remote_ids: Vec::new(),
+            apply_effects: Vec::new(),
             reconciled_remote_ids: Vec::new(),
             journal_status: None,
             completed_stages: request.pipeline.completed_stages,
@@ -427,21 +439,32 @@ where
         ));
     };
     let remote_ids = plan.affected_entities.clone();
+    let operation_ids = plan
+        .operations
+        .iter()
+        .enumerate()
+        .map(|(index, operation)| {
+            PushOperationId::for_operation(&request.push_id, index, operation)
+        })
+        .collect::<Vec<_>>();
 
-    journal.append(JournalEntry {
-        push_id: request.push_id.clone(),
-        mount_id: request.mount_id.clone(),
-        remote_ids: remote_ids.clone(),
-        plan: plan.clone(),
-        preimages: request.preimages.clone(),
-        status: JournalStatus::Prepared,
-    })?;
+    journal.append(
+        JournalEntry::new(
+            request.push_id.clone(),
+            request.mount_id.clone(),
+            remote_ids.clone(),
+            plan.clone(),
+            JournalStatus::Prepared,
+        )
+        .with_preimages(request.preimages.clone()),
+    )?;
     journal.update_status(&request.push_id, JournalStatus::Applying)?;
 
     if let Err(error) = concurrency.check(PushConcurrencyRequest {
         push_id: &request.push_id,
         mount_id: &request.mount_id,
         plan: &plan,
+        operation_ids: &operation_ids,
         remote_ids: &remote_ids,
     }) {
         mark_failed(journal, &request.push_id, &error)?;
@@ -452,6 +475,7 @@ where
         push_id: &request.push_id,
         mount_id: &request.mount_id,
         plan: &plan,
+        operation_ids: &operation_ids,
         remote_ids: &remote_ids,
     }) {
         Ok(result) => result,
@@ -460,6 +484,11 @@ where
             return Err(error);
         }
     };
+    if let Err(error) = journal.record_apply_effects(&request.push_id, apply_result.effects.clone())
+    {
+        mark_failed(journal, &request.push_id, &error)?;
+        return Err(error);
+    }
     journal.update_status(&request.push_id, JournalStatus::Applied)?;
 
     let reconcile_result = match reconciler.reconcile(PushReconcileRequest {
@@ -484,6 +513,7 @@ where
         push_id: request.push_id,
         action: PushExecutionAction::Reconciled,
         changed_remote_ids: apply_result.changed_remote_ids,
+        apply_effects: apply_result.effects,
         reconciled_remote_ids: reconcile_result.reconciled_remote_ids,
         journal_status: Some(JournalStatus::Reconciled),
         completed_stages,

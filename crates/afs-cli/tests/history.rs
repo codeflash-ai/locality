@@ -3,11 +3,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_cli::history::{HistoryError, LogOptions, run_log, run_undo, undo_report_exit_code};
+use afs_cli::history::{
+    HistoryError, LogOptions, run_log, run_undo, run_undo_with_applier, undo_report_exit_code,
+};
 use afs_core::journal::{JournalEntry, JournalPreimage, JournalStatus, PushId};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
+use afs_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult};
+use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
     MountRepository, SqliteStateStore,
@@ -32,6 +36,7 @@ fn log_lists_journal_entries_newest_first() {
     assert_eq!(report.entries[0].status, "reconciled");
     assert_eq!(report.entries[0].operation_count, 1);
     assert_eq!(report.entries[0].preimage_count, 1);
+    assert_eq!(report.entries[0].apply_effect_count, 0);
     assert_eq!(report.entries[0].plan_summary.blocks_updated, 1);
     assert_eq!(report.entries[1].push_id, "push-1");
 }
@@ -170,6 +175,56 @@ fn undo_reports_blocked_plan_for_append_without_created_id() {
 }
 
 #[test]
+fn undo_with_applier_reverses_complete_plan_and_marks_journal_reverted() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    store
+        .append_journal(journal_entry("push-1", "page-1", JournalStatus::Reconciled))
+        .expect("append journal");
+    let mut applier = FakeUndoApplier::default();
+
+    let report = run_undo_with_applier(&mut store, "push-1", &mut applier).expect("undo report");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "reverse_applied");
+    assert_eq!(report.changed_remote_ids, vec!["page-1"]);
+    assert_eq!(applier.applied_push_ids, vec![PushId("push-1".to_string())]);
+    assert_eq!(
+        store
+            .get_journal(&PushId("push-1".to_string()))
+            .expect("get journal")
+            .expect("journal")
+            .status,
+        JournalStatus::Reverted
+    );
+}
+
+#[test]
+fn undo_with_applier_reports_reverse_apply_failure_without_status_change() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    store
+        .append_journal(journal_entry("push-1", "page-1", JournalStatus::Reconciled))
+        .expect("append journal");
+    let mut applier =
+        FakeUndoApplier::default().with_failure(AfsError::NotImplemented("fake reverse apply"));
+
+    let report = run_undo_with_applier(&mut store, "push-1", &mut applier).expect("undo report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "reverse_apply_not_implemented");
+    assert_eq!(report.message, "not implemented: fake reverse apply");
+    assert_eq!(
+        store
+            .get_journal(&PushId("push-1".to_string()))
+            .expect("get journal")
+            .expect("journal")
+            .status,
+        JournalStatus::Reconciled
+    );
+}
+
+#[test]
 fn undo_reports_missing_journal() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();
@@ -244,6 +299,32 @@ impl HistoryFixture {
 impl Drop for HistoryFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeUndoApplier {
+    applied_push_ids: Vec<PushId>,
+    failure: Option<AfsError>,
+}
+
+impl FakeUndoApplier {
+    fn with_failure(mut self, failure: AfsError) -> Self {
+        self.failure = Some(failure);
+        self
+    }
+}
+
+impl UndoApplier for FakeUndoApplier {
+    fn apply_undo(&mut self, request: UndoApplyRequest<'_>) -> AfsResult<UndoApplyResult> {
+        self.applied_push_ids.push(request.target_push_id.clone());
+
+        match &self.failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(UndoApplyResult {
+                changed_remote_ids: request.plan.affected_entities.clone(),
+            }),
+        }
     }
 }
 

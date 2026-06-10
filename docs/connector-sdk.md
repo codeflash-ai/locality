@@ -1,6 +1,6 @@
 # Connector SDK
 
-A connector implements six responsibilities and leaves caching, journaling, validation, conflict detection, and rate limiting to the host:
+A connector implements seven responsibilities and leaves caching, journaling, validation, conflict detection, and rate limiting to the host:
 
 1. Enumerate remote tree metadata.
 2. Fetch full native content for one entity.
@@ -8,10 +8,15 @@ A connector implements six responsibilities and leaves caching, journaling, vali
 4. Parse edited canonical content back to a connector-owned model.
 5. Check remote concurrency immediately before mutation.
 6. Apply a validated push plan as remote API operations.
+7. Apply a complete undo plan as remote reverse API operations.
 
 First-party connectors compile in as Rust crates. A future third-party connector ABI should be possible if this trait remains narrow, explicit, and host-mediated.
 
-Apply requests include the core `push_id`, mount ID, and approved push plan. Connectors should use the `push_id` when deriving source-side idempotency keys for block-level API calls.
+Apply requests include the core `push_id`, mount ID, approved push plan, and deterministic operation IDs aligned with `plan.operations`. Connectors should use those operation IDs as source-side idempotency keys for block-level API calls when the source supports idempotent writes.
+
+Apply results include changed remote IDs plus operation-level journal effects. Created-block and created-entity effects must include the remote IDs assigned by the source, because undo uses those IDs to reverse appends and creates safely.
+
+Undo requests include the target push ID, mount ID, and a connector-neutral complete undo plan. Connectors should fail the request rather than partially applying a plan they cannot support.
 
 ## v1 connector
 

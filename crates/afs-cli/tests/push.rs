@@ -3,12 +3,18 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_cli::push::{PushOptions, push_report_exit_code, run_push};
+use afs_cli::push::{PushOptions, push_report_exit_code, run_push, run_push_with_executor};
+use afs_core::journal::JournalApplyEffect;
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::push::{
+    PushApplier, PushApplyRequest, PushApplyResult, PushConcurrencyCheck, PushConcurrencyRequest,
+    PushReconcileRequest, PushReconcileResult, PushReconciler,
+};
 use afs_core::shadow::ShadowDocument;
+use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ShadowRepository, SqliteStateStore,
+    EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
+    MountRepository, ShadowRepository, SqliteStateStore,
 };
 
 #[test]
@@ -91,6 +97,94 @@ fn push_safe_plan_with_yes_stops_at_apply_boundary() {
     assert_eq!(report.pipeline_action, "proceed_to_apply");
     assert_eq!(report.action, "apply_not_implemented");
     assert_eq!(push_report_exit_code(&report), 5);
+}
+
+#[test]
+fn push_safe_plan_with_executor_journals_applies_and_reconciles() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph."))
+        .expect("save shadow");
+    let mut concurrency = FakeConcurrency::default();
+    let mut applier = FakeApplier::default();
+    let mut reconciler = FakeReconciler::default();
+
+    let report = run_push_with_executor(
+        &mut store,
+        &path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &mut concurrency,
+        &mut applier,
+        &mut reconciler,
+    )
+    .expect("push report");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "reconciled");
+    assert!(report.push_id.is_some());
+    assert_eq!(report.journal_status.as_deref(), Some("reconciled"));
+    assert_eq!(report.changed_remote_ids, vec!["page-1"]);
+    assert_eq!(report.reconciled_remote_ids, vec!["page-1"]);
+    assert_eq!(report.apply_effect_count, 1);
+    assert_eq!(push_report_exit_code(&report), 0);
+
+    let journal = store
+        .list_journal()
+        .expect("list journal")
+        .pop()
+        .expect("journal");
+    assert_eq!(journal.status, afs_core::journal::JournalStatus::Reconciled);
+    assert_eq!(journal.preimages.len(), 1);
+    assert_eq!(journal.apply_effects.len(), 1);
+    assert_eq!(concurrency.checks, 1);
+    assert_eq!(applier.applies, 1);
+    assert_eq!(reconciler.reconciles, 1);
+}
+
+#[test]
+fn push_executor_reports_connector_not_implemented_with_failed_journal() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph."))
+        .expect("save shadow");
+    let mut concurrency =
+        FakeConcurrency::default().with_failure(AfsError::NotImplemented("fake concurrency"));
+    let mut applier = FakeApplier::default();
+    let mut reconciler = FakeReconciler::default();
+
+    let report = run_push_with_executor(
+        &mut store,
+        &path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &mut concurrency,
+        &mut applier,
+        &mut reconciler,
+    )
+    .expect("push report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "apply_not_implemented");
+    assert_eq!(report.journal_status.as_deref(), Some("failed"));
+    assert_eq!(push_report_exit_code(&report), 5);
+    assert!(matches!(
+        store
+            .list_journal()
+            .expect("list journal")
+            .pop()
+            .expect("journal")
+            .status,
+        afs_core::journal::JournalStatus::Failed(_)
+    ));
 }
 
 #[test]
@@ -236,6 +330,62 @@ impl PushFixture {
 impl Drop for PushFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeConcurrency {
+    checks: usize,
+    failure: Option<AfsError>,
+}
+
+impl FakeConcurrency {
+    fn with_failure(mut self, failure: AfsError) -> Self {
+        self.failure = Some(failure);
+        self
+    }
+}
+
+impl PushConcurrencyCheck for FakeConcurrency {
+    fn check(&mut self, _request: PushConcurrencyRequest<'_>) -> AfsResult<()> {
+        self.checks += 1;
+        match &self.failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeApplier {
+    applies: usize,
+}
+
+impl PushApplier for FakeApplier {
+    fn apply(&mut self, request: PushApplyRequest<'_>) -> AfsResult<PushApplyResult> {
+        self.applies += 1;
+        Ok(PushApplyResult {
+            changed_remote_ids: request.plan.affected_entities.clone(),
+            effects: vec![JournalApplyEffect::UpdatedBlock {
+                operation_id: request.operation_ids[0].clone(),
+                operation_index: 0,
+                block_id: RemoteId::new("paragraph-1"),
+            }],
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeReconciler {
+    reconciles: usize,
+}
+
+impl PushReconciler for FakeReconciler {
+    fn reconcile(&mut self, request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult> {
+        self.reconciles += 1;
+        Ok(PushReconcileResult {
+            reconciled_remote_ids: request.changed_remote_ids.to_vec(),
+        })
     }
 }
 

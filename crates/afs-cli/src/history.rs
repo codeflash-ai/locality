@@ -1,15 +1,18 @@
 //! Journal-backed `afs log` and `afs undo` orchestration.
 //!
 //! The log surface is a read-only view over durable push journals. Undo uses the
-//! journaled preimage snapshots to derive a connector-neutral reverse plan, but
-//! still stops before remote reverse apply until connector support exists.
+//! journaled preimage snapshots and apply effects to derive a connector-neutral
+//! reverse plan, then applies it through a connector hook when the plan is
+//! complete.
 
 use std::path::{Path, PathBuf};
 
+use afs_core::AfsError;
 use afs_core::journal::{JournalEntry, JournalStatus, PushId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::undo::{
-    UndoOperation, UndoPlan, UndoPlanStatus, UnsupportedUndoOperation, plan_journal_undo,
+    UndoApplier, UndoApplyRequest, UndoOperation, UndoPlan, UndoPlanStatus,
+    UnsupportedUndoOperation, plan_journal_undo,
 };
 use afs_store::{EntityRepository, JournalRepository, MountConfig, MountRepository, StoreError};
 use serde::Serialize;
@@ -60,6 +63,7 @@ pub struct UndoReport {
     pub status: String,
     pub action: String,
     pub message: String,
+    pub changed_remote_ids: Vec<String>,
     pub entry: Option<JournalEntryOutput>,
     pub undo_plan: Option<UndoPlanOutput>,
 }
@@ -89,6 +93,7 @@ where
                 status: "reverted".to_string(),
                 action: "reverted_local_journal".to_string(),
                 message: "journal entry reverted before remote apply".to_string(),
+                changed_remote_ids: Vec::new(),
                 entry: Some(JournalEntryOutput::from(reverted)),
                 undo_plan: None,
             })
@@ -100,6 +105,7 @@ where
             status: "reverted".to_string(),
             action: "already_reverted".to_string(),
             message: "journal entry was already reverted".to_string(),
+            changed_remote_ids: Vec::new(),
             entry: Some(JournalEntryOutput::from(entry)),
             undo_plan: None,
         }),
@@ -113,6 +119,7 @@ where
                 status: status_name(&entry.status).to_string(),
                 action: action.to_string(),
                 message: message.to_string(),
+                changed_remote_ids: Vec::new(),
                 undo_plan: Some(UndoPlanOutput::from(undo_plan)),
                 entry: Some(JournalEntryOutput::from(entry)),
             })
@@ -124,14 +131,107 @@ where
             status: status_name(&status).to_string(),
             action: "undo_unsafe_journal_status".to_string(),
             message: undo_boundary_message(&status).to_string(),
+            changed_remote_ids: Vec::new(),
             entry: Some(JournalEntryOutput::from(entry)),
             undo_plan: None,
         }),
     }
 }
 
+pub fn run_undo_with_applier<S, A>(
+    store: &mut S,
+    push_id: impl Into<String>,
+    applier: &mut A,
+) -> Result<UndoReport, HistoryError>
+where
+    S: JournalRepository,
+    A: UndoApplier,
+{
+    let push_id = PushId(push_id.into());
+    let entry = store
+        .get_journal(&push_id)
+        .map_err(HistoryError::Store)?
+        .ok_or_else(|| HistoryError::JournalNotFound(push_id.clone()))?;
+
+    if !matches!(
+        entry.status,
+        JournalStatus::Applied | JournalStatus::Reconciled
+    ) {
+        return run_undo(store, push_id.0);
+    }
+
+    let undo_plan = plan_journal_undo(&entry);
+    if undo_plan.status != UndoPlanStatus::Complete {
+        let (action, message) = undo_boundary(&undo_plan);
+        return Ok(UndoReport {
+            ok: false,
+            command: "undo",
+            push_id: push_id.0,
+            status: status_name(&entry.status).to_string(),
+            action: action.to_string(),
+            message: message.to_string(),
+            changed_remote_ids: Vec::new(),
+            undo_plan: Some(UndoPlanOutput::from(undo_plan)),
+            entry: Some(JournalEntryOutput::from(entry)),
+        });
+    }
+
+    let apply_result = match applier.apply_undo(UndoApplyRequest {
+        target_push_id: &push_id,
+        mount_id: &entry.mount_id,
+        plan: &undo_plan,
+    }) {
+        Ok(result) => result,
+        Err(error) => {
+            let action = match &error {
+                AfsError::NotImplemented(_) => "reverse_apply_not_implemented",
+                _ => "reverse_apply_failed",
+            };
+            return Ok(UndoReport {
+                ok: false,
+                command: "undo",
+                push_id: push_id.0,
+                status: status_name(&entry.status).to_string(),
+                action: action.to_string(),
+                message: error.to_string(),
+                changed_remote_ids: Vec::new(),
+                undo_plan: Some(UndoPlanOutput::from(undo_plan)),
+                entry: Some(JournalEntryOutput::from(entry)),
+            });
+        }
+    };
+
+    store
+        .update_journal_status(&push_id, JournalStatus::Reverted)
+        .map_err(HistoryError::Store)?;
+    let mut reverted = entry;
+    reverted.status = JournalStatus::Reverted;
+
+    Ok(UndoReport {
+        ok: true,
+        command: "undo",
+        push_id: push_id.0,
+        status: "reverted".to_string(),
+        action: "reverse_applied".to_string(),
+        message: "remote undo applied and journal entry marked reverted".to_string(),
+        changed_remote_ids: apply_result
+            .changed_remote_ids
+            .into_iter()
+            .map(|remote_id| remote_id.0)
+            .collect(),
+        undo_plan: Some(UndoPlanOutput::from(undo_plan)),
+        entry: Some(JournalEntryOutput::from(reverted)),
+    })
+}
+
 pub fn undo_report_exit_code(report: &UndoReport) -> i32 {
-    if report.ok { 0 } else { 5 }
+    if report.ok {
+        0
+    } else if report.action == "reverse_apply_failed" {
+        1
+    } else {
+        5
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -142,6 +242,7 @@ pub struct JournalEntryOutput {
     pub status: String,
     pub failure: Option<String>,
     pub preimage_count: usize,
+    pub apply_effect_count: usize,
     pub plan_summary: PlanSummaryOutput,
     pub operation_count: usize,
 }
@@ -162,6 +263,7 @@ impl From<JournalEntry> for JournalEntryOutput {
             status,
             failure,
             preimage_count: value.preimages.len(),
+            apply_effect_count: value.apply_effects.len(),
             plan_summary: PlanSummaryOutput::from(value.plan.summary),
             operation_count,
         }
@@ -220,6 +322,12 @@ pub enum UndoOperationOutput {
         after: Option<String>,
         content: String,
     },
+    ArchiveCreatedBlock {
+        block_id: String,
+    },
+    ArchiveCreatedEntity {
+        entity_id: String,
+    },
 }
 
 impl From<UndoOperation> for UndoOperationOutput {
@@ -243,6 +351,12 @@ impl From<UndoOperation> for UndoOperationOutput {
                 parent_id: parent_id.0,
                 after: after.map(|remote_id| remote_id.0),
                 content,
+            },
+            UndoOperation::ArchiveCreatedBlock { block_id } => Self::ArchiveCreatedBlock {
+                block_id: block_id.0,
+            },
+            UndoOperation::ArchiveCreatedEntity { entity_id } => Self::ArchiveCreatedEntity {
+                entity_id: entity_id.0,
             },
         }
     }

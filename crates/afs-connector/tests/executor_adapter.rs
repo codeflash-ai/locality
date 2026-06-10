@@ -1,16 +1,17 @@
 use std::cell::RefCell;
 
 use afs_connector::{
-    ApplyPlanRequest, ApplyPlanResult, Connector, ConnectorCapabilities, ConnectorKind,
-    ConnectorPushApplier, ConnectorPushConcurrencyCheck, EnumerateRequest, FetchRequest,
-    NativeEntity, ParsedEntity,
+    ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
+    ConnectorCapabilities, ConnectorKind, ConnectorPushApplier, ConnectorPushConcurrencyCheck,
+    ConnectorUndoApplier, EnumerateRequest, FetchRequest, NativeEntity, ParsedEntity,
 };
-use afs_core::journal::PushId;
+use afs_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use afs_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::push::{PushApplier, PushApplyRequest, PushConcurrencyCheck, PushConcurrencyRequest};
+use afs_core::undo::{UndoApplier, UndoApplyRequest, UndoOperation, UndoPlan, UndoPlanStatus};
 use afs_core::{AfsError, AfsResult};
 
 #[test]
@@ -20,6 +21,11 @@ fn connector_adapters_forward_push_identity_and_plan() {
     let mount_id = MountId::new("notion-main");
     let plan = push_plan();
     let remote_ids = vec![RemoteId::new("page-1")];
+    let operation_ids = vec![PushOperationId::for_operation(
+        &push_id,
+        0,
+        &plan.operations[0],
+    )];
 
     let mut concurrency = ConnectorPushConcurrencyCheck::new(&connector);
     concurrency
@@ -27,6 +33,7 @@ fn connector_adapters_forward_push_identity_and_plan() {
             push_id: &push_id,
             mount_id: &mount_id,
             plan: &plan,
+            operation_ids: &operation_ids,
             remote_ids: &remote_ids,
         })
         .expect("concurrency check");
@@ -37,11 +44,13 @@ fn connector_adapters_forward_push_identity_and_plan() {
             push_id: &push_id,
             mount_id: &mount_id,
             plan: &plan,
+            operation_ids: &operation_ids,
             remote_ids: &remote_ids,
         })
         .expect("apply");
 
     assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    assert_eq!(result.effects.len(), 1);
     assert_eq!(
         connector.concurrency_push_ids.borrow().as_slice(),
         std::slice::from_ref(&push_id)
@@ -56,11 +65,50 @@ fn connector_adapters_forward_push_identity_and_plan() {
     );
 }
 
+#[test]
+fn connector_adapter_forwards_undo_plan() {
+    let connector = FakeConnector::default();
+    let target_push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let plan = UndoPlan {
+        target_push_id: target_push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![UndoOperation::RestoreBlockContent {
+            block_id: RemoteId::new("block-1"),
+            content: "Previous".to_string(),
+        }],
+        unsupported: Vec::new(),
+        status: UndoPlanStatus::Complete,
+    };
+
+    let mut applier = ConnectorUndoApplier::new(&connector);
+    let result = applier
+        .apply_undo(UndoApplyRequest {
+            target_push_id: &target_push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+        })
+        .expect("undo apply");
+
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    assert_eq!(
+        connector.undo_push_ids.borrow().as_slice(),
+        std::slice::from_ref(&target_push_id)
+    );
+    assert_eq!(
+        connector.undo_operation_counts.borrow().as_slice(),
+        [plan.operations.len()]
+    );
+}
+
 #[derive(Debug, Default)]
 struct FakeConnector {
     concurrency_push_ids: RefCell<Vec<PushId>>,
     apply_push_ids: RefCell<Vec<PushId>>,
     apply_operation_counts: RefCell<Vec<usize>>,
+    undo_push_ids: RefCell<Vec<PushId>>,
+    undo_operation_counts: RefCell<Vec<usize>>,
 }
 
 impl Connector for FakeConnector {
@@ -136,6 +184,23 @@ impl Connector for FakeConnector {
             .borrow_mut()
             .push(request.plan.operations.len());
         Ok(ApplyPlanResult {
+            changed_remote_ids: request.plan.affected_entities.clone(),
+            effects: vec![JournalApplyEffect::UpdatedBlock {
+                operation_id: request.operation_ids[0].clone(),
+                operation_index: 0,
+                block_id: RemoteId::new("block-1"),
+            }],
+        })
+    }
+
+    fn apply_undo(&self, request: ApplyUndoRequest<'_>) -> AfsResult<ApplyUndoResult> {
+        self.undo_push_ids
+            .borrow_mut()
+            .push(request.target_push_id.clone());
+        self.undo_operation_counts
+            .borrow_mut()
+            .push(request.plan.operations.len());
+        Ok(ApplyUndoResult {
             changed_remote_ids: request.plan.affected_entities.clone(),
         })
     }

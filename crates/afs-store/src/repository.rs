@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use afs_core::journal::{JournalEntry, JournalStatus, PushId};
+use afs_core::journal::{JournalApplyEffect, JournalEntry, JournalStatus, PushId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 
@@ -46,6 +46,11 @@ pub trait ShadowRepository {
 
 pub trait JournalRepository {
     fn append_journal(&mut self, entry: JournalEntry) -> StoreResult<()>;
+    fn record_journal_apply_effects(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+    ) -> StoreResult<()>;
     fn update_journal_status(&mut self, push_id: &PushId, status: JournalStatus)
     -> StoreResult<()>;
     fn get_journal(&self, push_id: &PushId) -> StoreResult<Option<JournalEntry>>;

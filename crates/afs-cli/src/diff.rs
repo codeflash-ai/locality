@@ -15,6 +15,7 @@ use afs_core::push::{
     PushApproval, PushPipelineAction, PushPipelineRequest, PushPipelineResult, PushStage,
     plan_push_pipeline,
 };
+use afs_core::shadow::ShadowDocument;
 use afs_core::validation::ValidationIssue;
 use afs_store::{EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError};
 use serde::Serialize;
@@ -31,6 +32,17 @@ pub fn run_preview<S>(
     target_path: impl AsRef<Path>,
     options: PreviewOptions,
 ) -> Result<DiffReport, DiffError>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+{
+    run_preview_artifacts(store, target_path, options).map(|artifacts| artifacts.report)
+}
+
+pub fn run_preview_artifacts<S>(
+    store: &S,
+    target_path: impl AsRef<Path>,
+    options: PreviewOptions,
+) -> Result<PreviewArtifacts, DiffError>
 where
     S: MountRepository + EntityRepository + ShadowRepository,
 {
@@ -57,13 +69,14 @@ where
     let parsed = match parse_canonical_markdown(&file) {
         Ok(parsed) => parsed,
         Err(error) => {
-            return Ok(DiffReport::validation_failure(
+            let report = DiffReport::validation_failure(
                 options.command,
                 absolute_path,
                 mount,
                 entity.remote_id,
                 vec![parse_error_issue(&relative_path, error)],
-            ));
+            );
+            return Ok(PreviewArtifacts::report_only(report));
         }
     };
 
@@ -71,7 +84,7 @@ where
         .remote_id()
         .is_some_and(|remote_id| remote_id != &entity.remote_id)
     {
-        return Ok(DiffReport::validation_failure(
+        let report = DiffReport::validation_failure(
             options.command,
             absolute_path,
             mount,
@@ -83,7 +96,8 @@ where
                 "frontmatter `afs.id` does not match the entity mapped to this path",
                 Some("restore the generated `afs.id` for this file before pushing".to_string()),
             )],
-        ));
+        );
+        return Ok(PreviewArtifacts::report_only(report));
     }
 
     let shadow = store
@@ -95,13 +109,21 @@ where
             .read_only(mount.read_only),
     );
 
-    Ok(DiffReport::from_pipeline(
+    let report = DiffReport::from_pipeline(
         options.command,
         absolute_path,
         mount,
-        entity.remote_id,
-        output,
-    ))
+        entity.remote_id.clone(),
+        output.clone(),
+    );
+
+    Ok(PreviewArtifacts {
+        report,
+        mount: Some(mount.clone()),
+        entity_id: Some(entity.remote_id),
+        shadow: Some(shadow),
+        pipeline: Some(output),
+    })
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, DiffError> {
@@ -151,6 +173,27 @@ fn parse_error_issue(path: &Path, error: CanonicalParseError) -> ValidationIssue
 pub struct PreviewOptions {
     pub command: &'static str,
     pub approval: PushApproval,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewArtifacts {
+    pub report: DiffReport,
+    pub mount: Option<MountConfig>,
+    pub entity_id: Option<RemoteId>,
+    pub shadow: Option<ShadowDocument>,
+    pub pipeline: Option<PushPipelineResult>,
+}
+
+impl PreviewArtifacts {
+    fn report_only(report: DiffReport) -> Self {
+        Self {
+            report,
+            mount: None,
+            entity_id: None,
+            shadow: None,
+            pipeline: None,
+        }
+    }
 }
 
 impl PreviewOptions {

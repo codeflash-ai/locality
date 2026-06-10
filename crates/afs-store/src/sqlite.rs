@@ -8,7 +8,9 @@
 use std::path::{Path, PathBuf};
 
 use afs_core::AfsResult;
-use afs_core::journal::{JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId};
+use afs_core::journal::{
+    JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
+};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,7 +22,7 @@ use crate::records::{EntityRecord, MountConfig, ShadowBlockRecord, ShadowSnapsho
 use crate::repository::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -283,18 +285,40 @@ impl JournalRepository for SqliteStateStore {
                 remote_ids_json,
                 plan_json,
                 preimages_json,
+                apply_effects_json,
                 status_json
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 entry.push_id.0,
                 entry.mount_id.0,
                 to_json(&entry.remote_ids)?,
                 to_json(&entry.plan)?,
                 to_json(&entry.preimages)?,
+                to_json(&entry.apply_effects)?,
                 to_json(&entry.status)?,
             ],
         )?;
+        Ok(())
+    }
+
+    fn record_journal_apply_effects(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE journals
+             SET apply_effects_json = ?2
+             WHERE push_id = ?1",
+            params![push_id.0, to_json(&effects)?],
+        )?;
+
+        if changed == 0 {
+            return Err(StoreError::JournalMissing(push_id.clone()));
+        }
+
         Ok(())
     }
 
@@ -322,7 +346,7 @@ impl JournalRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json, status_json
+                "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_effects_json, status_json
                  FROM journals
                  WHERE push_id = ?1",
                 params![push_id.0],
@@ -336,7 +360,7 @@ impl JournalRepository for SqliteStateStore {
     fn list_journal(&self) -> StoreResult<Vec<JournalEntry>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json, status_json
+            "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_effects_json, status_json
              FROM journals
              ORDER BY push_id",
         )?;
@@ -353,6 +377,15 @@ impl JournalStore for SqliteStateStore {
 
     fn update_status(&mut self, push_id: &PushId, status: JournalStatus) -> AfsResult<()> {
         self.update_journal_status(push_id, status)
+            .map_err(Into::into)
+    }
+
+    fn record_apply_effects(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+    ) -> AfsResult<()> {
+        self.record_journal_apply_effects(push_id, effects)
             .map_err(Into::into)
     }
 }
@@ -374,7 +407,7 @@ type EntityRow = (
     Option<String>,
 );
 type ShadowRow = (String, String, String, String, String);
-type JournalRow = (String, String, String, String, String, String);
+type JournalRow = (String, String, String, String, String, String, String);
 
 fn initialize_schema(connection: &Connection) -> StoreResult<()> {
     let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -428,6 +461,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             remote_ids_json TEXT NOT NULL,
             plan_json TEXT NOT NULL,
             preimages_json TEXT NOT NULL DEFAULT '[]',
+            apply_effects_json TEXT NOT NULL DEFAULT '[]',
             status_json TEXT NOT NULL,
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
@@ -438,6 +472,13 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         connection.execute_batch(
             "ALTER TABLE journals
              ADD COLUMN preimages_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
+    }
+
+    if user_version < 3 && !column_exists(connection, "journals", "apply_effects_json")? {
+        connection.execute_batch(
+            "ALTER TABLE journals
+             ADD COLUMN apply_effects_json TEXT NOT NULL DEFAULT '[]';",
         )?;
     }
 
@@ -501,6 +542,7 @@ fn journal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRow> {
         row.get(3)?,
         row.get(4)?,
         row.get(5)?,
+        row.get(6)?,
     ))
 }
 
@@ -511,7 +553,8 @@ fn journal_from_row(row: JournalRow) -> StoreResult<JournalEntry> {
         remote_ids: from_json::<Vec<RemoteId>>(&row.2)?,
         plan: from_json(&row.3)?,
         preimages: from_json::<Vec<JournalPreimage>>(&row.4)?,
-        status: from_json(&row.5)?,
+        apply_effects: from_json::<Vec<JournalApplyEffect>>(&row.5)?,
+        status: from_json(&row.6)?,
     })
 }
 

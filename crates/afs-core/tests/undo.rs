@@ -1,4 +1,6 @@
-use afs_core::journal::{JournalEntry, JournalPreimage, JournalStatus, PushId};
+use afs_core::journal::{
+    JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, PushId, PushOperationId,
+};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
@@ -110,6 +112,55 @@ fn append_block_is_unsupported_until_apply_records_created_id() {
     assert_eq!(plan.status, UndoPlanStatus::Blocked);
     assert!(plan.operations.is_empty());
     assert_eq!(plan.unsupported[0].code, "append_block_missing_created_id");
+}
+
+#[test]
+fn append_block_reverses_to_archive_created_block_when_effect_is_journaled() {
+    let mut entry = journal_entry(vec![PushOperation::AppendBlock {
+        parent_id: RemoteId::new("page-1"),
+        after: Some(RemoteId::new("paragraph-1")),
+        content: "New paragraph.".to_string(),
+    }]);
+    entry.apply_effects = vec![JournalApplyEffect::CreatedBlock {
+        operation_id: PushOperationId::for_operation(&entry.push_id, 0, &entry.plan.operations[0]),
+        operation_index: 0,
+        parent_id: RemoteId::new("page-1"),
+        block_id: RemoteId::new("created-block-1"),
+    }];
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![UndoOperation::ArchiveCreatedBlock {
+            block_id: RemoteId::new("created-block-1"),
+        }]
+    );
+}
+
+#[test]
+fn create_entity_reverses_to_archive_created_entity_when_effect_is_journaled() {
+    let mut entry = journal_entry(vec![PushOperation::CreateEntity {
+        parent_id: RemoteId::new("page-1"),
+        title: "New page".to_string(),
+    }]);
+    entry.apply_effects = vec![JournalApplyEffect::CreatedEntity {
+        operation_id: PushOperationId::for_operation(&entry.push_id, 0, &entry.plan.operations[0]),
+        operation_index: 0,
+        parent_id: RemoteId::new("page-1"),
+        entity_id: RemoteId::new("created-page-1"),
+    }];
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![UndoOperation::ArchiveCreatedEntity {
+            entity_id: RemoteId::new("created-page-1"),
+        }]
+    );
 }
 
 #[test]

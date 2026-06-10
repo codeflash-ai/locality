@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use afs_core::AfsResult;
-use afs_core::journal::{JournalEntry, JournalStatus, JournalStore, PushId};
+use afs_core::journal::{JournalApplyEffect, JournalEntry, JournalStatus, JournalStore, PushId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 
@@ -164,6 +164,19 @@ impl JournalRepository for InMemoryStateStore {
         Ok(())
     }
 
+    fn record_journal_apply_effects(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+    ) -> StoreResult<()> {
+        let Some(entry) = self.journals.get_mut(&push_id.0) else {
+            return Err(StoreError::JournalMissing(push_id.clone()));
+        };
+
+        entry.apply_effects = effects;
+        Ok(())
+    }
+
     fn update_journal_status(
         &mut self,
         push_id: &PushId,
@@ -189,6 +202,15 @@ impl JournalRepository for InMemoryStateStore {
 impl JournalStore for InMemoryStateStore {
     fn append(&mut self, entry: JournalEntry) -> AfsResult<()> {
         self.append_journal(entry).map_err(Into::into)
+    }
+
+    fn record_apply_effects(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+    ) -> AfsResult<()> {
+        self.record_journal_apply_effects(push_id, effects)
+            .map_err(Into::into)
     }
 
     fn update_status(&mut self, push_id: &PushId, status: JournalStatus) -> AfsResult<()> {

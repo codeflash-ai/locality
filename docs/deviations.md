@@ -10,5 +10,5 @@ None.
 
 - Hydration aggressiveness remains configurable. The code defaults to the 90-day policy and no eager-under-size threshold.
 - `_view.csv` remains read-only unless the plan is updated.
-- Journals now store core shadow preimages for undo planning; native connector preimages remain undecided.
+- Journals now store core shadow preimages and apply effects for undo planning; native connector preimages remain undecided.
 - `afs` remains the working title.

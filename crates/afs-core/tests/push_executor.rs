@@ -1,7 +1,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use afs_core::journal::{JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId};
+use afs_core::journal::{
+    JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
+};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::planner::{GuardrailDecision, PushOperation, PushPlan};
 use afs_core::push::{
@@ -33,6 +35,7 @@ fn executor_journals_checks_applies_and_reconciles_in_order() {
 
     assert_eq!(result.action, PushExecutionAction::Reconciled);
     assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    assert_eq!(result.apply_effects.len(), 1);
     assert_eq!(result.reconciled_remote_ids, vec![RemoteId::new("page-1")]);
     assert_eq!(result.journal_status, Some(JournalStatus::Reconciled));
     assert_eq!(
@@ -52,6 +55,7 @@ fn executor_journals_checks_applies_and_reconciles_in_order() {
             "update:applying",
             "check",
             "apply",
+            "effects:1",
             "update:applied",
             "reconcile",
             "update:reconciled",
@@ -60,6 +64,7 @@ fn executor_journals_checks_applies_and_reconciles_in_order() {
     let entry = journal.entry.expect("journal");
     assert_eq!(entry.status, JournalStatus::Reconciled);
     assert_eq!(entry.preimages.len(), 1);
+    assert_eq!(entry.apply_effects.len(), 1);
     assert_eq!(concurrency.seen_push_id, Some(push_id()));
     assert_eq!(applier.seen_push_id, Some(push_id()));
     assert_eq!(reconciler.seen_push_id, Some(push_id()));
@@ -192,6 +197,7 @@ fn executor_marks_failed_when_reconcile_fails_after_apply() {
             "update:applying",
             "check",
             "apply",
+            "effects:1",
             "update:applied",
             "reconcile",
             "update:failed",
@@ -273,6 +279,22 @@ impl JournalStore for RecordingJournal {
         entry.status = status;
         Ok(())
     }
+
+    fn record_apply_effects(
+        &mut self,
+        _push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+    ) -> AfsResult<()> {
+        self.events.borrow_mut().push(effect_event(effects.len()));
+        let Some(entry) = self.entry.as_mut() else {
+            return Err(AfsError::InvalidState(
+                "journal effects update before append".to_string(),
+            ));
+        };
+
+        entry.apply_effects = effects;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -342,6 +364,11 @@ impl PushApplier for FakeApplier {
             Some(error) => Err(error.clone()),
             None => Ok(PushApplyResult {
                 changed_remote_ids: self.changed_remote_ids.clone(),
+                effects: vec![JournalApplyEffect::UpdatedBlock {
+                    operation_id: request.operation_ids[0].clone(),
+                    operation_index: 0,
+                    block_id: RemoteId::new("block-1"),
+                }],
             }),
         }
     }
@@ -437,5 +464,12 @@ fn status_event(prefix: &'static str, status: &JournalStatus) -> &'static str {
         ("update", JournalStatus::Reconciled) => "update:reconciled",
         ("update", JournalStatus::Failed(_)) => "update:failed",
         _ => "status:other",
+    }
+}
+
+fn effect_event(effect_count: usize) -> &'static str {
+    match effect_count {
+        1 => "effects:1",
+        _ => "effects:other",
     }
 }

@@ -1,11 +1,12 @@
-//! Connector-neutral undo planning from journaled push preimages.
+//! Connector-neutral undo planning from journaled push preimages and apply effects.
 //!
 //! This module does not mutate remote systems. It derives the reverse intent
 //! that a connector can later apply safely. When the current journal shape does
 //! not contain enough information to reverse an operation without guessing, the
 //! unsupported reason is part of the plan instead of being hidden.
 
-use crate::journal::{JournalEntry, PushId};
+use crate::AfsResult;
+use crate::journal::{JournalApplyEffect, JournalEntry, PushId};
 use crate::model::{MountId, RemoteId};
 use crate::planner::PushOperation;
 use crate::shadow::{ShadowBlock, ShadowDocument};
@@ -45,6 +46,12 @@ pub enum UndoOperation {
         parent_id: RemoteId,
         after: Option<RemoteId>,
         content: String,
+    },
+    ArchiveCreatedBlock {
+        block_id: RemoteId,
+    },
+    ArchiveCreatedEntity {
+        entity_id: RemoteId,
     },
 }
 
@@ -106,11 +113,18 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                     None => unsupported.push(missing_block_preimage(operation_index, block_id)),
                 }
             }
-            PushOperation::AppendBlock { .. } => unsupported.push(UnsupportedUndoOperation::new(
-                operation_index,
-                "append_block_missing_created_id",
-                "cannot archive an appended block until apply journals the created remote block id",
-            )),
+            PushOperation::AppendBlock { .. } => {
+                match find_created_block_effect(entry, operation_index) {
+                    Some(block_id) => {
+                        operations.push(UndoOperation::ArchiveCreatedBlock { block_id });
+                    }
+                    None => unsupported.push(UnsupportedUndoOperation::new(
+                        operation_index,
+                        "append_block_missing_created_id",
+                        "cannot archive an appended block until apply journals the created remote block id",
+                    )),
+                }
+            }
             PushOperation::ArchiveEntity { entity_id } => {
                 unsupported.push(UnsupportedUndoOperation::new(
                     operation_index,
@@ -131,11 +145,18 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                     ),
                 ));
             }
-            PushOperation::CreateEntity { .. } => unsupported.push(UnsupportedUndoOperation::new(
-                operation_index,
-                "create_entity_missing_created_id",
-                "cannot remove a created entity until apply journals the created remote entity id",
-            )),
+            PushOperation::CreateEntity { .. } => {
+                match find_created_entity_effect(entry, operation_index) {
+                    Some(entity_id) => {
+                        operations.push(UndoOperation::ArchiveCreatedEntity { entity_id });
+                    }
+                    None => unsupported.push(UnsupportedUndoOperation::new(
+                        operation_index,
+                        "create_entity_missing_created_id",
+                        "cannot remove a created entity until apply journals the created remote entity id",
+                    )),
+                }
+            }
         }
     }
 
@@ -153,6 +174,23 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
         unsupported,
         status,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndoApplyRequest<'a> {
+    pub target_push_id: &'a PushId,
+    pub mount_id: &'a MountId,
+    pub plan: &'a UndoPlan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndoApplyResult {
+    pub changed_remote_ids: Vec<RemoteId>,
+}
+
+/// Hook that applies a complete connector-neutral undo plan remotely.
+pub trait UndoApplier {
+    fn apply_undo(&mut self, request: UndoApplyRequest<'_>) -> AfsResult<UndoApplyResult>;
 }
 
 fn find_preimage_block<'a>(
@@ -195,4 +233,26 @@ fn missing_block_preimage(operation_index: usize, block_id: &RemoteId) -> Unsupp
             block_id.0
         ),
     )
+}
+
+fn find_created_block_effect(entry: &JournalEntry, operation_index: usize) -> Option<RemoteId> {
+    entry.apply_effects.iter().find_map(|effect| match effect {
+        JournalApplyEffect::CreatedBlock {
+            operation_index: effect_operation_index,
+            block_id,
+            ..
+        } if *effect_operation_index == operation_index => Some(block_id.clone()),
+        _ => None,
+    })
+}
+
+fn find_created_entity_effect(entry: &JournalEntry, operation_index: usize) -> Option<RemoteId> {
+    entry.apply_effects.iter().find_map(|effect| match effect {
+        JournalApplyEffect::CreatedEntity {
+            operation_index: effect_operation_index,
+            entity_id,
+            ..
+        } if *effect_operation_index == operation_index => Some(entity_id.clone()),
+        _ => None,
+    })
 }

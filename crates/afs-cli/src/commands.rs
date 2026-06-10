@@ -1,13 +1,19 @@
 use std::path::PathBuf;
 
+use afs_connector::{ConnectorPushApplier, ConnectorPushConcurrencyCheck, ConnectorUndoApplier};
+use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::SqliteStateStore;
 use serde::Serialize;
 
 use crate::diff::{DiffError, run_diff};
 use crate::history::{
-    HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo, undo_report_exit_code,
+    HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
+    undo_report_exit_code,
 };
-use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push};
+use crate::push::{
+    NotImplementedReconciler, PushOptions, PushReport, push_report_exit_code,
+    run_push_with_executor,
+};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_INTERNAL: i32 = 1;
@@ -92,7 +98,10 @@ fn undo(args: &[String], json: bool) -> i32 {
         }
     };
 
-    match run_undo(&mut store, push_id) {
+    let connector = default_notion_connector();
+    let mut undo_applier = ConnectorUndoApplier::new(&connector);
+
+    match run_undo_with_applier(&mut store, push_id, &mut undo_applier) {
         Ok(report) if json => {
             let exit_code = undo_report_exit_code(&report);
             print_json(&report);
@@ -120,7 +129,7 @@ fn push(args: &[String], json: bool) -> i32 {
         );
     };
 
-    let store = match SqliteStateStore::open(default_state_root()) {
+    let mut store = match SqliteStateStore::open(default_state_root()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -136,7 +145,19 @@ fn push(args: &[String], json: bool) -> i32 {
         confirm_dangerous: has_flag(args, "--confirm"),
     };
 
-    match run_push(&store, PathBuf::from(path), options) {
+    let connector = default_notion_connector();
+    let mut concurrency = ConnectorPushConcurrencyCheck::new(&connector);
+    let mut applier = ConnectorPushApplier::new(&connector);
+    let mut reconciler = NotImplementedReconciler;
+
+    match run_push_with_executor(
+        &mut store,
+        PathBuf::from(path),
+        options,
+        &mut concurrency,
+        &mut applier,
+        &mut reconciler,
+    ) {
         Ok(report) if json => {
             let exit_code = push_report_exit_code(&report);
             print_json(&report);
@@ -247,6 +268,10 @@ fn print_undo_report(report: &UndoReport) {
 fn print_push_report(report: &PushReport) {
     match report.action.as_str() {
         "noop" => println!("nothing to push"),
+        "reconciled" => println!(
+            "push {} reconciled",
+            report.push_id.as_deref().unwrap_or("<unknown>")
+        ),
         "fix_validation" => print_diff_report_fields(&report.validation, report.plan.as_ref()),
         "confirm_plan" => println!("push requires confirmation; rerun with -y or --yes"),
         "confirm_dangerous_plan" => println!("dangerous push requires --confirm"),
@@ -262,6 +287,13 @@ fn print_push_report(report: &PushReport) {
         }
         _ => println!("push stopped: {}", report.action),
     }
+}
+
+fn default_notion_connector() -> NotionConnector {
+    NotionConnector::new(NotionConfig {
+        workspace_id: None,
+        token_key: "notion-default".to_string(),
+    })
 }
 
 fn stub(command: &str, json: bool) -> i32 {
@@ -489,6 +521,11 @@ mod tests {
             },
             action: action.to_string(),
             pipeline_action: action.to_string(),
+            push_id: None,
+            journal_status: None,
+            changed_remote_ids: Vec::new(),
+            reconciled_remote_ids: Vec::new(),
+            apply_effect_count: 0,
             completed_stages: Vec::new(),
             message: None,
         }

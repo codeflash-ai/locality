@@ -31,6 +31,7 @@
 - SQLite opens a `state.sqlite3` database under the configured state root and initializes the schema idempotently.
 - SQLite persists mounts, entities, shadows, and journals across reopen.
 - SQLite migrates v1 journal rows to v2 by adding empty preimage snapshots.
+- SQLite migrates v2 journal rows to v3 by adding empty apply-effect lists.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
 
 ## SQLite Schema
@@ -40,6 +41,6 @@ The first schema keeps high-value lookup fields relational and stores complex co
 - `mounts`: mount id, connector, root path, read-only flag;
 - `entities`: mount id, remote id, kind, title, projected path, hydration, content hash, remote edit time;
 - `shadows`: mount id, entity id, body hash, rendered body, JSON shadow blocks;
-- `journals`: push id, mount id, JSON remote ids, JSON push plan, JSON preimage snapshots, JSON status.
+- `journals`: push id, mount id, JSON remote ids, JSON push plan, JSON preimage snapshots, JSON apply effects, JSON status.
 
-Shadow blocks, journal plans, and journal preimages are JSON by design for now. They round-trip through typed Rust records with stable snake-case serde names, and the schema can normalize them later if query patterns justify it.
+Shadow blocks, journal plans, journal preimages, and journal apply effects are JSON by design for now. They round-trip through typed Rust records with stable snake-case serde names, and the schema can normalize them later if query patterns justify it.

@@ -95,6 +95,8 @@ The push execution layer starts only from `ProceedToApply`. It is connector-neut
 
 Execution prepares the journal before any remote mutation, moves status through `Prepared`, `Applying`, `Applied`, and `Reconciled`, and marks `Failed` on concurrency, apply, or reconcile errors. Non-approved pipeline actions return `NotReady` without touching the journal or connector hooks.
 
+Each approved operation also receives a deterministic `PushOperationId` derived from the push ID, operation index, operation kind, and target remote ID. Connectors return operation-level `JournalApplyEffect` values after apply. Those effects record durable facts such as updated blocks, archived blocks, and created remote block/entity IDs so resume and undo do not have to infer what happened from the remote alone.
+
 ## Undo Contract
 
 Journal entries now include shadow preimages for affected entities. The undo planner uses those preimages to derive reverse operations without guessing:
@@ -102,6 +104,8 @@ Journal entries now include shadow preimages for affected entities. The undo pla
 - block updates reverse to the previous block text;
 - block moves reverse to the previous sibling position;
 - archived blocks reverse to a restore operation with original content and position;
-- appends, created entities, property updates, and archived entities are reported as unsupported until apply journals created IDs and property/entity preimages.
+- appends reverse to archiving the created block when apply journaled the created block ID;
+- created entities reverse to archiving the created entity when apply journaled the created entity ID;
+- property updates and archived entities are reported as unsupported until apply journals property/entity preimages.
 
-Undo plans are marked `Complete`, `Partial`, or `Blocked`. The CLI still stops before remote reverse apply until connector support exists.
+Undo plans are marked `Complete`, `Partial`, or `Blocked`. A complete plan can now be handed to a connector reverse-apply hook; the Notion connector still returns `NotImplemented` until its API implementation exists.

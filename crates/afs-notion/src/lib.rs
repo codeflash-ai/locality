@@ -1,8 +1,9 @@
 pub mod mapping;
 
 use afs_connector::{
-    ApplyPlanRequest, ApplyPlanResult, Connector, ConnectorCapabilities, ConnectorKind,
-    EnumerateRequest, FetchRequest, NativeEntity, ParsedEntity,
+    ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
+    ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
+    ParsedEntity,
 };
 use afs_core::model::{CanonicalDocument, TreeEntry};
 use afs_core::{AfsError, AfsResult};
@@ -63,5 +64,9 @@ impl Connector for NotionConnector {
 
     fn apply(&self, _request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult> {
         Err(AfsError::NotImplemented("Notion apply"))
+    }
+
+    fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> AfsResult<ApplyUndoResult> {
+        Err(AfsError::NotImplemented("Notion undo apply"))
     }
 }

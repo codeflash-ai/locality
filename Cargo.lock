@@ -6,6 +6,7 @@ version = 4
 name = "afs-cli"
 version = "0.1.0"
 dependencies = [
+ "afs-connector",
  "afs-core",
  "afs-notion",
  "afs-store",

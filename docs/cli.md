@@ -46,7 +46,7 @@ The production command path uses the SQLite store. A real diff requires persiste
 
 ## Initial `afs push --json` Shape
 
-The first push implementation runs the same path resolution, parsing, validation, diffing, and guardrail evaluation as `afs diff`, then stops before connector apply. It supports `-y`/`--yes` for safe plans and `--confirm` for dangerous plans.
+The push implementation runs the same path resolution, parsing, validation, diffing, and guardrail evaluation as `afs diff`. When the plan is approved, it enters the journaled connector-apply executor. It supports `-y`/`--yes` for safe plans and `--confirm` for dangerous plans.
 
 The JSON report has the same validation, plan, degradation, guardrail, and stage fields as `afs diff`. Its `action` is one of:
 
@@ -55,9 +55,11 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 - `confirm_plan`;
 - `confirm_dangerous_plan`;
 - `read_only_blocked`;
-- `apply_not_implemented`.
+- `reconciled`;
+- `apply_not_implemented`;
+- `apply_failed`.
 
-When the core pipeline reaches `proceed_to_apply`, the CLI reports `apply_not_implemented` until journaled connector mutation exists.
+Reports also include `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector still reports `apply_not_implemented` because its API mutation methods are stubs, but the CLI now writes a journal first and marks it failed if a connector boundary returns `NotImplemented`.
 
 ## Initial `afs log --json` Shape
 
@@ -71,6 +73,7 @@ Each JSON entry includes:
 - `status`: `prepared`, `applying`, `applied`, `reconciled`, `reverted`, or `failed`;
 - `failure`: the failed status message when present;
 - `preimage_count`;
+- `apply_effect_count`;
 - `plan_summary`;
 - `operation_count`.
 
@@ -78,11 +81,13 @@ Human output is a compact git-log-style list headed by `push <push-id>`.
 
 ## Initial `afs undo --json` Shape
 
-`afs undo <push-id>` reads one journal entry and returns an undo decision. The initial safe behavior is:
+`afs undo <push-id>` reads one journal entry and returns an undo decision. The current safe behavior is:
 
 - `prepared` entries become `reverted` because no remote mutation has started;
 - `reverted` entries return `already_reverted`;
-- `applied` and `reconciled` entries derive an `undo_plan` from journaled preimages, then stop before remote reverse apply with exit code `5`;
+- `applied` and `reconciled` entries derive an `undo_plan` from journaled preimages and apply effects;
+- complete plans are handed to the connector reverse-apply hook, then marked `reverted` on success;
+- Notion currently returns `reverse_apply_not_implemented` with a `NotImplemented` message until its reverse API implementation exists;
 - `applying` and `failed` entries return `undo_unsafe_journal_status` because partial remote effects may still be in flight or unknown.
 
-Undo plans are `complete`, `partial`, or `blocked`. Complete plans currently include reverse operations for block updates, block moves, and archived blocks. Appended blocks, created entities, property updates, and archived entities remain explicitly unsupported until apply journals created IDs and richer property/entity preimages.
+Undo plans are `complete`, `partial`, or `blocked`. Complete plans currently include reverse operations for block updates, block moves, archived blocks, appended blocks with journaled created IDs, and created entities with journaled created IDs. Property updates and archived entities remain explicitly unsupported until richer property/entity preimages are journaled.

@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use afs_core::journal::{JournalEntry, JournalStatus, JournalStore, PushId};
+use afs_core::journal::{
+    JournalApplyEffect, JournalEntry, JournalStatus, JournalStore, PushId, PushOperationId,
+};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
@@ -146,15 +148,16 @@ fn journal_repository_tracks_status_updates() {
     store
         .update_journal_status(&PushId("push-1".to_string()), JournalStatus::Applied)
         .expect("update journal");
+    store
+        .record_journal_apply_effects(&PushId("push-1".to_string()), apply_effects())
+        .expect("record effects");
 
-    assert_eq!(
-        store
-            .get_journal(&PushId("push-1".to_string()))
-            .expect("get journal")
-            .unwrap()
-            .status,
-        JournalStatus::Applied
-    );
+    let entry = store
+        .get_journal(&PushId("push-1".to_string()))
+        .expect("get journal")
+        .unwrap();
+    assert_eq!(entry.status, JournalStatus::Applied);
+    assert_eq!(entry.apply_effects, apply_effects());
     assert_eq!(store.list_journal().expect("list journal").len(), 1);
 }
 
@@ -170,15 +173,15 @@ fn in_memory_store_satisfies_core_journal_store_contract() {
         JournalStatus::Reconciled,
     )
     .expect("core update");
+    JournalStore::record_apply_effects(&mut store, &PushId("push-2".to_string()), apply_effects())
+        .expect("core effects");
 
-    assert_eq!(
-        store
-            .get_journal(&PushId("push-2".to_string()))
-            .expect("get journal")
-            .unwrap()
-            .status,
-        JournalStatus::Reconciled
-    );
+    let entry = store
+        .get_journal(&PushId("push-2".to_string()))
+        .expect("get journal")
+        .unwrap();
+    assert_eq!(entry.status, JournalStatus::Reconciled);
+    assert_eq!(entry.apply_effects, apply_effects());
 }
 
 fn mount_id() -> MountId {
@@ -219,4 +222,12 @@ fn journal_entry(push_id: &str, status: JournalStatus) -> JournalEntry {
         ),
         status,
     )
+}
+
+fn apply_effects() -> Vec<JournalApplyEffect> {
+    vec![JournalApplyEffect::UpdatedBlock {
+        operation_id: PushOperationId("push-1:0:update_block:paragraph-1".to_string()),
+        operation_index: 0,
+        block_id: RemoteId::new("paragraph-1"),
+    }]
 }
