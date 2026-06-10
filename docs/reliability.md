@@ -8,6 +8,8 @@ Correctness belongs primarily in `afs-core` and `afs-store`.
 - Local file mutations use temp-write-plus-rename.
 - Pushes are journaled before remote mutation.
 - Remote apply operations are idempotent.
+- Remote concurrency is checked after journaling and immediately before apply.
+- Apply and reconcile failures mark the journal failed instead of leaving an ambiguous success.
 - Dangerous plans require explicit confirmation.
 - Conflicted local files are preserved untouched.
 - Unknown or unsupported remote blocks round-trip through shadow state.
@@ -18,4 +20,3 @@ Correctness belongs primarily in `afs-core` and `afs-store`.
 - Property tests for hydration state transitions and push-plan invariants.
 - Randomized simulation of local edits, remote edits, crashes, retries, and network failures.
 - Canary tests against a scratch Notion workspace before release.
-

@@ -22,7 +22,7 @@
 | `hydration` | Hydration policy and request types. |
 | `validation` | Structured validation reports and directive integrity checks. |
 | `planner` | Connector-neutral push plans, plan summaries, and guardrail policy. |
-| `push` | Explicit push pipeline request/output types, validation/diff/guardrail orchestration, and guardrail evaluation. |
+| `push` | Explicit push pipeline request/output types, validation/diff/guardrail orchestration, journaled execution hooks, and guardrail evaluation. |
 | `pull` | Polling/relay pull scheduler configuration. |
 | `shadow` | Shadow document snapshots, Markdown block segmentation, stable block hashes, and source spans. |
 | `diff` | Initial block-aware push planner over shadow snapshots and edited canonical documents. |
@@ -72,7 +72,7 @@ The first planner is deliberately conservative:
 
 This is not the final Notion-grade diff engine from `plan.md`; it is the first correct contract surface. Later exact/structural/residual passes can improve the internals while preserving the same `ShadowDocument -> PushPlan` boundary.
 
-## Push Pipeline Contract
+## Push Pipeline And Execution Contract
 
 The push pipeline composes the core primitives into the decision surface used by `afs diff` and `afs push`:
 
@@ -84,4 +84,12 @@ The push pipeline composes the core primitives into the decision surface used by
 - dangerous plans return `ConfirmDangerousPlan` unless `confirm_dangerous` is set;
 - confirmed dangerous plans still preserve the guardrail reasons in the output.
 
-The core pipeline still does not apply remote operations, write journals, or perform concurrency checks. It returns the next required action so CLI/daemon code can decide whether to ask for confirmation, call the connector, or stop for fixes.
+The pipeline itself still does not apply remote operations. It returns the next required action so CLI/daemon code can decide whether to ask for confirmation, execute the plan, or stop for fixes.
+
+The push execution layer starts only from `ProceedToApply`. It is connector-neutral and requires host-supplied hooks for:
+
+- remote concurrency checks immediately before apply;
+- connector-specific remote apply;
+- post-apply read-back and reconciliation.
+
+Execution prepares the journal before any remote mutation, moves status through `Prepared`, `Applying`, `Applied`, and `Reconciled`, and marks `Failed` on concurrency, apply, or reconcile errors. Non-approved pipeline actions return `NotReady` without touching the journal or connector hooks.

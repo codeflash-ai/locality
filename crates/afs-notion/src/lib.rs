@@ -1,11 +1,10 @@
 pub mod mapping;
 
 use afs_connector::{
-    ApplyPlanResult, Connector, ConnectorCapabilities, ConnectorKind, EnumerateRequest,
-    FetchRequest, NativeEntity, ParsedEntity,
+    ApplyPlanRequest, ApplyPlanResult, Connector, ConnectorCapabilities, ConnectorKind,
+    EnumerateRequest, FetchRequest, NativeEntity, ParsedEntity,
 };
 use afs_core::model::{CanonicalDocument, TreeEntry};
-use afs_core::planner::PushPlan;
 use afs_core::{AfsError, AfsResult};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,7 +57,11 @@ impl Connector for NotionConnector {
         Err(AfsError::NotImplemented("Notion parse"))
     }
 
-    fn apply(&self, _plan: &PushPlan) -> AfsResult<ApplyPlanResult> {
+    fn check_concurrency(&self, _request: ApplyPlanRequest<'_>) -> AfsResult<()> {
+        Err(AfsError::NotImplemented("Notion concurrency check"))
+    }
+
+    fn apply(&self, _request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult> {
         Err(AfsError::NotImplemented("Notion apply"))
     }
 }

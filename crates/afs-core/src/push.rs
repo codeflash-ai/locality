@@ -1,18 +1,22 @@
 //! Explicit push pipeline coordination types.
 //!
-//! v1 keeps writes explicit by default. This module does not perform remote I/O;
-//! it models the inspectable stages and evaluates whether a plan can proceed or
-//! must stop for `--confirm`.
+//! v1 keeps writes explicit by default. The first layer models the inspectable
+//! validation, diff, and confirmation stages. The second layer executes an
+//! already-approved plan through host-supplied concurrency, connector-apply, and
+//! reconcile hooks while maintaining the write-ahead journal.
 
 use std::path::PathBuf;
 
 use crate::canonical::ParsedCanonicalDocument;
 use crate::diff::{BlockDiffEngine, DiffEngine};
+use crate::journal::{JournalEntry, JournalStatus, JournalStore, PushId};
+use crate::model::{MountId, RemoteId};
 use crate::planner::{GuardrailDecision, GuardrailPolicy, PushPlan};
 use crate::shadow::ShadowDocument;
 use crate::validation::{
     ValidationIssue, ValidationReport, validate_directive_syntax, validate_frontmatter_identity,
 };
+use crate::{AfsError, AfsResult};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PushStage {
@@ -24,9 +28,9 @@ pub enum PushStage {
     Diff,
     /// Evaluated the human/agent confirmation policy for the plan.
     PlanAndConfirm,
-    /// Reserved for the compare-and-apply stage owned by daemon/connector code.
+    /// Checked remote concurrency and applied the plan through connector code.
     ConcurrencyCheckAndApply,
-    /// Reserved for write-ahead journaling and post-apply shadow reconciliation.
+    /// Wrote the journal and reconciled post-apply remote state.
     JournalAndReconcile,
 }
 
@@ -267,4 +271,219 @@ pub fn plan_push_pipeline(request: PushPipelineRequest<'_>) -> PushPipelineResul
         action,
         completed_stages,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushExecutionRequest {
+    /// Stable push identifier used by journals and connector idempotency keys.
+    pub push_id: PushId,
+    /// Mount being mutated.
+    pub mount_id: MountId,
+    /// Validated and approved pipeline result to execute.
+    pub pipeline: PushPipelineResult,
+}
+
+impl PushExecutionRequest {
+    pub fn new(push_id: PushId, mount_id: MountId, pipeline: PushPipelineResult) -> Self {
+        Self {
+            push_id,
+            mount_id,
+            pipeline,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushExecutionResult {
+    /// Stable push identifier from the request.
+    pub push_id: PushId,
+    /// Terminal execution action.
+    pub action: PushExecutionAction,
+    /// Remote entities reported changed by the connector apply hook.
+    pub changed_remote_ids: Vec<RemoteId>,
+    /// Remote entities reconciled from post-apply read-back.
+    pub reconciled_remote_ids: Vec<RemoteId>,
+    /// Final journal status, or `None` when execution did not start.
+    pub journal_status: Option<JournalStatus>,
+    /// Pipeline stages plus execution stages completed before returning.
+    pub completed_stages: Vec<PushStage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PushExecutionAction {
+    /// The validation/diff/confirmation pipeline has not approved remote apply.
+    NotReady { pipeline_action: PushPipelineAction },
+    /// The connector applied the plan and post-apply reconciliation completed.
+    Reconciled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushConcurrencyRequest<'a> {
+    /// Stable push identifier available for source-side request correlation.
+    pub push_id: &'a PushId,
+    /// Mount whose remote state should be checked.
+    pub mount_id: &'a MountId,
+    /// Approved plan that is about to be applied.
+    pub plan: &'a PushPlan,
+    /// Remote entities covered by the journal entry.
+    pub remote_ids: &'a [RemoteId],
+}
+
+/// Hook for compare-and-swap style remote freshness checks before apply.
+pub trait PushConcurrencyCheck {
+    fn check(&mut self, request: PushConcurrencyRequest<'_>) -> AfsResult<()>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushApplyRequest<'a> {
+    /// Stable push identifier used for connector idempotency keys.
+    pub push_id: &'a PushId,
+    /// Mount receiving the mutation.
+    pub mount_id: &'a MountId,
+    /// Connector-neutral operations to apply remotely.
+    pub plan: &'a PushPlan,
+    /// Remote entities covered by the journal entry.
+    pub remote_ids: &'a [RemoteId],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushApplyResult {
+    /// Remote entities the connector reports as changed.
+    pub changed_remote_ids: Vec<RemoteId>,
+}
+
+/// Hook that turns a validated push plan into source-specific remote writes.
+pub trait PushApplier {
+    fn apply(&mut self, request: PushApplyRequest<'_>) -> AfsResult<PushApplyResult>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushReconcileRequest<'a> {
+    /// Stable push identifier from the apply step.
+    pub push_id: &'a PushId,
+    /// Mount whose post-apply state should be reconciled.
+    pub mount_id: &'a MountId,
+    /// Plan that was applied remotely.
+    pub plan: &'a PushPlan,
+    /// Remote entities changed by apply.
+    pub changed_remote_ids: &'a [RemoteId],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushReconcileResult {
+    /// Remote entities whose post-apply state was read back and accepted.
+    pub reconciled_remote_ids: Vec<RemoteId>,
+}
+
+/// Hook for post-apply read-back, shadow refresh, and divergence detection.
+pub trait PushReconciler {
+    fn reconcile(&mut self, request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult>;
+}
+
+/// Executes an approved push plan without letting connector code run before the
+/// write-ahead journal is prepared.
+///
+/// Non-approved pipeline actions return `NotReady` and do not touch the journal
+/// or connector hooks. Once execution starts, any concurrency, apply, or
+/// reconcile failure marks the journal `Failed` before returning the original
+/// error.
+pub fn execute_journaled_push<J, C, A, R>(
+    journal: &mut J,
+    concurrency: &mut C,
+    applier: &mut A,
+    reconciler: &mut R,
+    request: PushExecutionRequest,
+) -> AfsResult<PushExecutionResult>
+where
+    J: JournalStore,
+    C: PushConcurrencyCheck,
+    A: PushApplier,
+    R: PushReconciler,
+{
+    if request.pipeline.action != PushPipelineAction::ProceedToApply {
+        return Ok(PushExecutionResult {
+            push_id: request.push_id,
+            action: PushExecutionAction::NotReady {
+                pipeline_action: request.pipeline.action,
+            },
+            changed_remote_ids: Vec::new(),
+            reconciled_remote_ids: Vec::new(),
+            journal_status: None,
+            completed_stages: request.pipeline.completed_stages,
+        });
+    }
+
+    let Some(plan) = request.pipeline.plan else {
+        return Err(AfsError::InvalidState(
+            "push pipeline approved apply without a plan".to_string(),
+        ));
+    };
+    let remote_ids = plan.affected_entities.clone();
+
+    journal.append(JournalEntry {
+        push_id: request.push_id.clone(),
+        mount_id: request.mount_id.clone(),
+        remote_ids: remote_ids.clone(),
+        plan: plan.clone(),
+        status: JournalStatus::Prepared,
+    })?;
+    journal.update_status(&request.push_id, JournalStatus::Applying)?;
+
+    if let Err(error) = concurrency.check(PushConcurrencyRequest {
+        push_id: &request.push_id,
+        mount_id: &request.mount_id,
+        plan: &plan,
+        remote_ids: &remote_ids,
+    }) {
+        mark_failed(journal, &request.push_id, &error)?;
+        return Err(error);
+    }
+
+    let apply_result = match applier.apply(PushApplyRequest {
+        push_id: &request.push_id,
+        mount_id: &request.mount_id,
+        plan: &plan,
+        remote_ids: &remote_ids,
+    }) {
+        Ok(result) => result,
+        Err(error) => {
+            mark_failed(journal, &request.push_id, &error)?;
+            return Err(error);
+        }
+    };
+    journal.update_status(&request.push_id, JournalStatus::Applied)?;
+
+    let reconcile_result = match reconciler.reconcile(PushReconcileRequest {
+        push_id: &request.push_id,
+        mount_id: &request.mount_id,
+        plan: &plan,
+        changed_remote_ids: &apply_result.changed_remote_ids,
+    }) {
+        Ok(result) => result,
+        Err(error) => {
+            mark_failed(journal, &request.push_id, &error)?;
+            return Err(error);
+        }
+    };
+    journal.update_status(&request.push_id, JournalStatus::Reconciled)?;
+
+    let mut completed_stages = request.pipeline.completed_stages;
+    completed_stages.push(PushStage::ConcurrencyCheckAndApply);
+    completed_stages.push(PushStage::JournalAndReconcile);
+
+    Ok(PushExecutionResult {
+        push_id: request.push_id,
+        action: PushExecutionAction::Reconciled,
+        changed_remote_ids: apply_result.changed_remote_ids,
+        reconciled_remote_ids: reconcile_result.reconciled_remote_ids,
+        journal_status: Some(JournalStatus::Reconciled),
+        completed_stages,
+    })
+}
+
+fn mark_failed<J>(journal: &mut J, push_id: &PushId, error: &AfsError) -> AfsResult<()>
+where
+    J: JournalStore,
+{
+    journal.update_status(push_id, JournalStatus::Failed(error.to_string()))
 }
