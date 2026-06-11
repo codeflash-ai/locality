@@ -69,6 +69,7 @@ pub struct PushOptions {
 pub struct PushReport {
     pub ok: bool,
     pub command: &'static str,
+    pub via: String,
     pub path: String,
     pub mount_id: String,
     pub entity_id: String,
@@ -113,6 +114,7 @@ impl PushReport {
         let mut cli_report = Self {
             ok: false,
             command: "push",
+            via: "daemon".to_string(),
             path: target_path.display().to_string(),
             mount_id: mount_id.0,
             entity_id: entity_id.0,
@@ -165,6 +167,7 @@ impl PushReport {
         Self {
             ok,
             command: "push",
+            via: "cli".to_string(),
             path: preview.path,
             mount_id: preview.mount_id,
             entity_id: preview.entity_id,

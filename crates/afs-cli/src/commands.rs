@@ -47,12 +47,12 @@ const COMMANDS: &[&str] = &[
     "connections",
     "connection",
     "disconnect",
+    "daemon",
     "mount",
     "info",
     "status",
     "pull",
     "push",
-    "daemon",
     "diff",
     "undo",
     "log",
@@ -74,12 +74,12 @@ pub fn dispatch(args: &[String]) -> i32 {
         "connections" => connections(&args[1..], json),
         "connection" => connection(&args[1..], json),
         "disconnect" => disconnect(&args[1..], json),
+        "daemon" => daemon(&args[1..], json),
         "mount" => mount(&args[1..], json),
         "info" => info(&args[1..], json),
         "status" => status(&args[1..], json),
         "pull" => pull(&args[1..], json),
         "push" => push(&args[1..], json),
-        "daemon" => daemon(&args[1..], json),
         "diff" => diff(&args[1..], json),
         "restore" => restore(&args[1..], json),
         "undo" => undo(&args[1..], json),
@@ -563,7 +563,7 @@ fn pull(args: &[String], json: bool) -> i32 {
             print_pull_report(&report);
             return exit_code;
         }
-        DaemonReport::Unavailable => {}
+        DaemonReport::Unavailable => warn_daemon_fallback("pull"),
         DaemonReport::Error(error) => {
             return command_error(
                 json,
@@ -797,7 +797,7 @@ fn push(args: &[String], json: bool) -> i32 {
             print_push_report(&report);
             return exit_code;
         }
-        DaemonReport::Unavailable => {}
+        DaemonReport::Unavailable => warn_daemon_fallback("push"),
         DaemonReport::Error(error) => {
             return command_error(
                 json,
@@ -936,8 +936,9 @@ fn print_push_report(report: &PushReport) {
     match report.action.as_str() {
         "noop" => println!("nothing to push"),
         "reconciled" => println!(
-            "push {} reconciled",
-            report.push_id.as_deref().unwrap_or("<unknown>")
+            "push {} reconciled (via {})",
+            report.push_id.as_deref().unwrap_or("<unknown>"),
+            report.via
         ),
         "fix_validation" => print_diff_report_fields(&report.validation, report.plan.as_ref()),
         "confirm_plan" => println!("push requires confirmation; rerun with -y or --yes"),
@@ -1046,13 +1047,13 @@ fn print_disconnect_report(report: &DisconnectReport) {
 fn print_pull_report(report: &PullReport) {
     if report.skipped_dirty > 0 {
         println!(
-            "pull skipped {} dirty file(s); {} hydrated, {} stubbed, {} enumerated",
-            report.skipped_dirty, report.hydrated, report.stubbed, report.enumerated
+            "pull skipped {} dirty file(s); {} hydrated, {} stubbed, {} enumerated (via {})",
+            report.skipped_dirty, report.hydrated, report.stubbed, report.enumerated, report.via
         );
     } else {
         println!(
-            "pull complete: {} hydrated, {} stubbed, {} enumerated",
-            report.hydrated, report.stubbed, report.enumerated
+            "pull complete: {} hydrated, {} stubbed, {} enumerated (via {})",
+            report.hydrated, report.stubbed, report.enumerated, report.via
         );
     }
 }
@@ -1442,6 +1443,14 @@ fn read_connect_token(args: &[String], json: bool) -> Result<String, CommandErro
     }
 
     Ok(token.trim().to_string())
+}
+
+fn warn_daemon_fallback(command: &str) {
+    if std::env::var("AFS_DAEMON_DISABLE").is_err() {
+        eprintln!(
+            "afsd not running; executing {command} directly (start afsd for background hydration)"
+        );
+    }
 }
 
 fn resolve_mount_connection(
@@ -1968,6 +1977,7 @@ mod tests {
         PushReport {
             ok: action == "noop",
             command: "push",
+            via: "cli".to_string(),
             path: "Roadmap.md".to_string(),
             mount_id: "notion-main".to_string(),
             entity_id: "page-1".to_string(),

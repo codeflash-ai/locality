@@ -226,7 +226,10 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         };
 
         match run_pull(&mut store, &connector, path) {
-            Ok(report) => DaemonResponse::ok(report),
+            Ok(mut report) => {
+                report.via = "daemon".to_string();
+                DaemonResponse::ok(report)
+            }
             Err(error) => DaemonResponse::error(error.code(), error.message()),
         }
     }

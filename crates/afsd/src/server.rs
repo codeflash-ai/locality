@@ -7,7 +7,7 @@ use std::thread;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use afs_core::{AfsError, AfsResult};
-use afs_store::{MountRepository, SqliteStateStore};
+use afs_store::{MountConfig, MountRepository, SqliteStateStore};
 
 use crate::DaemonConfig;
 use crate::ipc::DaemonResponse;
@@ -52,6 +52,8 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
     remove_stale_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .map_err(|error| AfsError::Io(format!("failed to bind daemon socket: {error}")))?;
+    let mounts = load_mounts(config)?;
+    print_startup_banner(&socket_path, &mounts);
 
     for stream in listener.incoming() {
         match stream {
@@ -68,12 +70,50 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
 
 #[cfg(unix)]
 fn watch_existing_mounts(config: &DaemonConfig, watcher: &mut impl FileWatcher) -> AfsResult<()> {
-    let store = SqliteStateStore::open(config.state_root.clone()).map_err(AfsError::from)?;
-    for mount in store.load_mounts().map_err(AfsError::from)? {
+    for mount in load_mounts(config)? {
         watcher.watch_mount(mount.root)?;
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn load_mounts(config: &DaemonConfig) -> AfsResult<Vec<MountConfig>> {
+    let store = SqliteStateStore::open(config.state_root.clone()).map_err(AfsError::from)?;
+    store.load_mounts().map_err(AfsError::from)
+}
+
+#[cfg(unix)]
+fn print_startup_banner(socket_path: &Path, mounts: &[MountConfig]) {
+    println!("afsd listening on {}", socket_path.display());
+    match mounts {
+        [] => println!("afsd watching 0 mounts"),
+        [mount] => println!("afsd watching 1 mount: {}", mount.root.display()),
+        mounts => {
+            let paths = mounts
+                .iter()
+                .map(|mount| mount.root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("afsd watching {} mounts: {paths}", mounts.len());
+        }
+    }
+    println!("afsd auth: {}", auth_summary(mounts));
+}
+
+#[cfg(unix)]
+fn auth_summary(mounts: &[MountConfig]) -> String {
+    let mut labels = mounts
+        .iter()
+        .map(|mount| match &mount.connection_id {
+            Some(connection_id) => format!("connection {}", connection_id.0),
+            None if std::env::var("NOTION_TOKEN").is_ok() => "NOTION_TOKEN env".to_string(),
+            None => "missing".to_string(),
+        })
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels.dedup();
+    labels.join(", ")
 }
 
 #[cfg(not(unix))]
