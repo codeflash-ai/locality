@@ -4,7 +4,7 @@ The `afs` command is the single supported control surface for users and coding a
 
 ## Commands
 
-- `afs connect notion [--name <id>] [--token-stdin] [--json]`
+- `afs connect notion [--name <id>] [--token-stdin|--no-browser] [--redirect-uri <uri>] [--json]`
 - `afs connections [--json]`
 - `afs profiles [--json]`
 - `afs connection show <id> [--json]`
@@ -42,9 +42,17 @@ Remaining categories to assign before `afs push` applies remote mutations:
 
 ## Provider Connections
 
-`afs connect notion [--name <id>] [--token-stdin]` creates a local provider connection. It probes Notion with `GET /v1/users/me`, stores only metadata in SQLite, and writes the bearer token to the credential store. JSON output never includes the token or `secret_ref`.
+`afs connect notion [--name <id>]` creates a local provider connection. OAuth is preferred. The command reads `AFS_NOTION_OAUTH_CLIENT_ID` and `AFS_NOTION_OAUTH_CLIENT_SECRET` (or `NOTION_OAUTH_CLIENT_ID` / `NOTION_OAUTH_CLIENT_SECRET`), opens a Notion authorization URL, listens for the localhost callback, exchanges the authorization code, stores the OAuth credential bundle in the credential store, and stores only metadata in SQLite. The default callback is `http://127.0.0.1:8757/oauth/notion/callback`; override it with `--redirect-uri <uri>` or `AFS_NOTION_OAUTH_REDIRECT_URI`. The redirect URI must be registered on the Notion public integration.
 
-Connections now point at connector profiles. A profile is AgentFS's local auth-config record: connector, auth kind, scopes, enabled action classes, connector version, status, and capabilities. The built-in local Notion token profile is `notion-token-default`; current token connections use that profile until OAuth/provider-specific profiles are added.
+`--no-browser` prints the authorization URL but does not try to open it. `--token-stdin` is the explicit personal-access-token fallback for local development and CI:
+
+```bash
+echo "$NOTION_TOKEN" | afs connect notion --token-stdin --name work
+```
+
+JSON output never includes OAuth tokens, refresh tokens, client secrets, PATs, or `secret_ref`.
+
+Connections now point at connector profiles. A profile is AgentFS's local auth-config record: connector, auth kind, scopes, enabled action classes, connector version, status, and capabilities. OAuth connections use `notion-oauth-default`; explicit PAT connections use `notion-token-default`.
 
 The default connection ID is `notion-default` when no Notion connection exists. If a Notion connection already exists, pass `--name <id>` to avoid overwriting by accident.
 
@@ -57,6 +65,8 @@ Auth error JSON uses stable codes:
 - `connection_revoked`: mount points at a revoked connection;
 - `auth_profile_unavailable`: connection points at a missing, inactive, or mismatched connector profile;
 - `credential_store_unavailable`: keychain or file credential store failed;
+- `missing_oauth_config`: OAuth was requested but the Notion OAuth client ID or client secret was not configured;
+- `oauth_exchange_failed`: Notion rejected the OAuth authorization code exchange;
 - `connection_probe_failed`: Notion rejected the token during `connect`.
 
 Auth failures exit `1` and include `suggested_command` when there is an obvious recovery command.

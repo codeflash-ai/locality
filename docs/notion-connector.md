@@ -6,7 +6,7 @@
 
 The current implementation is a live-capable read, pull, and narrow write projection:
 
-- `HttpNotionApi` calls the live Notion REST API with a bearer token from `NOTION_TOKEN`.
+- `HttpNotionApi` calls the live Notion REST API with a bearer token resolved from an OAuth connection, an explicit PAT connection, or the legacy `NOTION_TOKEN` environment fallback.
 - `search_pages` can enumerate all pages shared with the integration when no root page is configured.
 - root-page enumeration walks child-page and child-database blocks and projects the tree into stable AgentFS paths.
 - child databases retrieve their data sources, write `_schema.yaml`, and enumerate row pages under the database directory.
@@ -31,6 +31,22 @@ The current implementation is a live-capable read, pull, and narrow write projec
 The generic connector `render` method still returns only `CanonicalDocument`. The Notion connector exposes `render_native_entity` for callers that need the shadow in the same pass. A future connector SDK revision can lift that richer return type into the generic trait once another connector validates the shape.
 
 ## Live Test Hook
+
+The product connection path prefers OAuth:
+
+```sh
+export AFS_NOTION_OAUTH_CLIENT_ID='...'
+export AFS_NOTION_OAUTH_CLIENT_SECRET='...'
+afs connect notion --name work
+```
+
+The Notion public integration must register the callback URI, which defaults to
+`http://127.0.0.1:8757/oauth/notion/callback`. For development and CI, the
+explicit PAT fallback remains available:
+
+```sh
+echo "$NOTION_TOKEN" | afs connect notion --token-stdin --name work
+```
 
 To test against a real page:
 

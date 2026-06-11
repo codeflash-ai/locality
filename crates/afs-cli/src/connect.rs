@@ -2,6 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_notion::NotionConfig;
 use afs_notion::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
+use afs_notion::oauth::{
+    HttpNotionOAuthClient, NotionOAuthCodeExchange, NotionOAuthToken, StoredNotionCredential,
+};
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, CredentialError, CredentialStore,
@@ -10,11 +13,21 @@ use afs_store::{
 use serde::Serialize;
 
 pub const DEFAULT_NOTION_PROFILE_ID: &str = "notion-token-default";
+pub const DEFAULT_NOTION_OAUTH_PROFILE_ID: &str = "notion-oauth-default";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
     pub connection_id: Option<ConnectionId>,
     pub token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthConnectOptions {
+    pub connection_id: Option<ConnectionId>,
+    pub client_id: String,
+    pub client_secret: String,
+    pub code: String,
+    pub redirect_uri: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -102,6 +115,13 @@ pub trait NotionConnectionProbe {
     fn probe(&self, token: &str) -> Result<NotionConnectionProbeResult, ConnectError>;
 }
 
+pub trait NotionOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &NotionOAuthCodeExchange,
+    ) -> Result<NotionOAuthToken, ConnectError>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HttpNotionConnectionProbe;
 
@@ -121,6 +141,16 @@ impl NotionConnectionProbe for HttpNotionConnectionProbe {
             workspace_id: string_field(&user, "/bot/workspace_id"),
             workspace_name: string_field(&user, "/bot/workspace_name"),
         })
+    }
+}
+
+impl NotionOAuthExchange for HttpNotionOAuthClient {
+    fn exchange_code(
+        &self,
+        request: &NotionOAuthCodeExchange,
+    ) -> Result<NotionOAuthToken, ConnectError> {
+        HttpNotionOAuthClient::exchange_code(self, request)
+            .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))
     }
 }
 
@@ -183,6 +213,88 @@ where
         workspace_id: probe_result.workspace_id,
         workspace_name: probe_result.workspace_name,
         auth_kind: "token".to_string(),
+    })
+}
+
+pub fn run_connect_notion_oauth<S, E>(
+    store: &mut S,
+    credentials: &dyn CredentialStore,
+    options: OAuthConnectOptions,
+    exchange: &E,
+) -> Result<ConnectReport, ConnectError>
+where
+    S: ConnectionRepository + ConnectorProfileRepository,
+    E: NotionOAuthExchange,
+{
+    let connection_id = match options.connection_id {
+        Some(connection_id) => connection_id,
+        None => default_connection_id(store)?,
+    };
+    let exchange_request = NotionOAuthCodeExchange {
+        client_id: options.client_id,
+        client_secret: options.client_secret,
+        code: options.code,
+        redirect_uri: options.redirect_uri,
+    };
+    let token = exchange.exchange_code(&exchange_request)?;
+    let acquired_at = timestamp_secs();
+    let secret_ref = format!("connection:{}", connection_id.0);
+    let stored = StoredNotionCredential::from_oauth_token(
+        token.clone(),
+        exchange_request.client_id,
+        exchange_request.client_secret,
+        acquired_at,
+    );
+    let secret = serde_json::to_string(&stored)
+        .map_err(|error| ConnectError::CredentialEncode(error.to_string()))?;
+    credentials
+        .put(&secret_ref, &secret)
+        .map_err(ConnectError::Credential)?;
+
+    let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_NOTION_OAUTH_PROFILE_ID);
+    store
+        .save_connector_profile(default_notion_oauth_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+
+    let display_name = connection_id.0.clone();
+    let account_label = token
+        .workspace_name
+        .clone()
+        .or_else(|| token.workspace_id.clone())
+        .or_else(|| token.bot_id.clone());
+    let connection = ConnectionRecord {
+        connection_id: connection_id.clone(),
+        profile_id: Some(profile_id.clone()),
+        connector: "notion".to_string(),
+        display_name: display_name.clone(),
+        account_label: account_label.clone(),
+        workspace_id: token.workspace_id.clone(),
+        workspace_name: token.workspace_name.clone(),
+        auth_kind: "oauth".to_string(),
+        secret_ref,
+        scopes: vec![],
+        capabilities_json: "{}".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        expires_at: stored.expires_at.map(|expires_at| expires_at.to_string()),
+    };
+    store
+        .save_connection(connection)
+        .map_err(ConnectError::Store)?;
+
+    Ok(ConnectReport {
+        ok: true,
+        command: "connect",
+        connection_id: connection_id.0,
+        profile_id: profile_id.0,
+        connector: "notion".to_string(),
+        display_name,
+        account_label,
+        workspace_id: token.workspace_id,
+        workspace_name: token.workspace_name,
+        auth_kind: "oauth".to_string(),
     })
 }
 
@@ -273,6 +385,8 @@ pub enum ConnectError {
     ConnectionMissing(String),
     ConnectionNameRequired,
     ConnectionProbeFailed(String),
+    OAuthExchangeFailed(String),
+    CredentialEncode(String),
     Credential(CredentialError),
     Store(StoreError),
 }
@@ -283,6 +397,8 @@ impl ConnectError {
             Self::ConnectionMissing(_) => "missing_connection",
             Self::ConnectionNameRequired => "usage",
             Self::ConnectionProbeFailed(_) => "connection_probe_failed",
+            Self::OAuthExchangeFailed(_) => "oauth_exchange_failed",
+            Self::CredentialEncode(_) => "credential_store_unavailable",
             Self::Credential(error) => error.code(),
             Self::Store(_) => "store_error",
         }
@@ -299,6 +415,12 @@ impl ConnectError {
             Self::ConnectionProbeFailed(message) => {
                 format!("Notion connection probe failed: {message}")
             }
+            Self::OAuthExchangeFailed(message) => {
+                format!("Notion OAuth exchange failed: {message}")
+            }
+            Self::CredentialEncode(message) => {
+                format!("failed to encode Notion credential: {message}")
+            }
             Self::Credential(error) => error.to_string(),
             Self::Store(error) => error.to_string(),
         }
@@ -306,10 +428,10 @@ impl ConnectError {
 
     pub fn suggested_command(&self) -> Option<&'static str> {
         match self {
-            Self::ConnectionMissing(_) | Self::ConnectionProbeFailed(_) => {
-                Some("afs connect notion")
-            }
-            Self::Credential(_) => Some("afs connect notion"),
+            Self::ConnectionMissing(_)
+            | Self::ConnectionProbeFailed(_)
+            | Self::OAuthExchangeFailed(_) => Some("afs connect notion"),
+            Self::Credential(_) | Self::CredentialEncode(_) => Some("afs connect notion"),
             Self::ConnectionNameRequired | Self::Store(_) => None,
         }
     }
@@ -368,6 +490,22 @@ fn default_notion_token_profile(now: String) -> ConnectorProfileRecord {
     }
 }
 
+fn default_notion_oauth_profile(now: String) -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new(DEFAULT_NOTION_OAUTH_PROFILE_ID),
+        connector: "notion".to_string(),
+        display_name: "Notion OAuth".to_string(),
+        auth_kind: "oauth".to_string(),
+        scopes: vec![],
+        capabilities_json: "{}".to_string(),
+        enabled_actions_json: "[\"read\",\"write\"]".to_string(),
+        connector_version: "notion.v1".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
 fn default_connection_id<S>(store: &S) -> Result<ConnectionId, ConnectError>
 where
     S: ConnectionRepository,
@@ -386,10 +524,14 @@ where
 }
 
 fn timestamp() -> String {
+    timestamp_secs().to_string()
+}
+
+fn timestamp_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn user_label(value: &serde_json::Value) -> Option<String> {

@@ -43,10 +43,10 @@ pull/push execution context
   mount's connection and profile at execution time. Daemon IPC does not carry
   bearer tokens.
 
-The first local profile is `notion-token-default`, used by token-based Notion
-connections. The model is intentionally compatible with future OAuth profiles,
-connector version pinning, scoped action sets, health checks, and remote relay
-execution.
+Notion ships with two local profiles: `notion-oauth-default` for the preferred
+OAuth connection flow and `notion-token-default` for explicit PAT fallback.
+The model is intentionally compatible with connector version pinning, scoped
+action sets, health checks, and remote relay execution.
 
 ## Crate map
 

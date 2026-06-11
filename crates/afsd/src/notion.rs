@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{Connector, FetchRequest};
 use afs_core::model::MountId;
@@ -8,6 +9,7 @@ use afs_core::{AfsError, AfsResult};
 use afs_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use afs_notion::dto::NotionPageBundle;
 use afs_notion::media::fetch_media_assets;
+use afs_notion::oauth::{HttpNotionOAuthClient, NotionOAuthRefresh, StoredNotionCredential};
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
@@ -239,9 +241,7 @@ fn connector_from_connection(
         });
     }
 
-    let token = credentials
-        .get(&connection.secret_ref)
-        .map_err(|error| credential_error(connection, error))?;
+    let token = connection_access_token(credentials, connection)?;
     let config = NotionConfig {
         workspace_id: connection.workspace_id.clone(),
         root_page_id: mount.remote_root_id.clone(),
@@ -249,6 +249,50 @@ fn connector_from_connection(
         token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
     };
     Ok(NotionConnector::new(config))
+}
+
+fn connection_access_token(
+    credentials: &dyn CredentialStore,
+    connection: &ConnectionRecord,
+) -> Result<String, ConnectorResolveError> {
+    let secret = credentials
+        .get(&connection.secret_ref)
+        .map_err(|error| credential_error(connection, error))?;
+    if connection.auth_kind != "oauth" {
+        return Ok(secret);
+    }
+
+    let mut stored = serde_json::from_str::<StoredNotionCredential>(&secret)
+        .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))?;
+    if stored.expires_soon(timestamp_secs()) {
+        let (Some(client_id), Some(client_secret), Some(refresh_token)) = (
+            stored.oauth_client_id.clone(),
+            stored.oauth_client_secret.clone(),
+            stored.refresh_token.clone(),
+        ) else {
+            return Err(ConnectorResolveError::AuthRequired {
+                connection_id: connection.connection_id.0.clone(),
+                suggested_command: "afs connect notion".to_string(),
+            });
+        };
+        let refreshed = HttpNotionOAuthClient::new()
+            .refresh_token(&NotionOAuthRefresh {
+                client_id,
+                client_secret,
+                refresh_token,
+            })
+            .map_err(|error| {
+                ConnectorResolveError::CredentialStoreUnavailable(error.to_string())
+            })?;
+        stored = stored.refreshed(refreshed, timestamp_secs());
+        let secret = serde_json::to_string(&stored).map_err(|error| {
+            ConnectorResolveError::CredentialStoreUnavailable(error.to_string())
+        })?;
+        credentials
+            .put(&connection.secret_ref, &secret)
+            .map_err(|error| credential_error(connection, error))?;
+    }
+    Ok(stored.access_token)
 }
 
 fn credential_error(
@@ -264,6 +308,13 @@ fn credential_error(
             ConnectorResolveError::CredentialStoreUnavailable(message)
         }
     }
+}
+
+fn timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn active_notion_connections<S>(store: &S) -> Result<Vec<ConnectionRecord>, ConnectorResolveError>

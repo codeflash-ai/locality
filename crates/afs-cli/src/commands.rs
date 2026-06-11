@@ -1,11 +1,14 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use afs_connector::ConnectorUndoApplier;
 use afs_core::AfsError;
 use afs_core::journal::PushId;
 use afs_core::model::{MountId, RemoteId};
+use afs_notion::oauth::{DEFAULT_NOTION_OAUTH_AUTHORIZE_URL, HttpNotionOAuthClient};
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileRepository,
     JournalRepository, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
@@ -19,8 +22,9 @@ use serde_json::Value;
 
 use crate::connect::{
     ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport, ConnectionsReport,
-    DisconnectReport, HttpNotionConnectionProbe, ProfilesReport, run_connect_notion,
-    run_connection_show, run_connections, run_disconnect, run_profiles,
+    DisconnectReport, HttpNotionConnectionProbe, OAuthConnectOptions, ProfilesReport,
+    run_connect_notion, run_connect_notion_oauth, run_connection_show, run_connections,
+    run_disconnect, run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
@@ -119,22 +123,9 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: afs connect notion [--name <id>] [--token-stdin] [--json]",
+                "usage: afs connect notion [--name <id>] [--token-stdin|--no-browser] [--redirect-uri <uri>] [--json]",
             ),
             EXIT_USAGE,
-        );
-    }
-
-    let token = match read_connect_token(args, json) {
-        Ok(token) => token,
-        Err(error) => return command_error(json, error, EXIT_INTERNAL),
-    };
-    if token.is_empty() {
-        return command_error(
-            json,
-            CommandError::new("connect", "auth_required", "empty Notion token")
-                .with_suggested_command("afs connect notion --token-stdin"),
-            EXIT_INTERNAL,
         );
     }
 
@@ -150,13 +141,57 @@ fn connect(args: &[String], json: bool) -> i32 {
         }
     };
     let credentials = open_credential_store(&state_root);
-    let options = ConnectOptions {
-        connection_id: flag_value(args, "--name").map(ConnectionId::new),
-        token,
-    };
-    let probe = HttpNotionConnectionProbe;
 
-    match run_connect_notion(&mut store, credentials.as_ref(), options, &probe) {
+    if has_flag(args, "--token-stdin") {
+        let token = match read_connect_token(args, json) {
+            Ok(token) => token,
+            Err(error) => return command_error(json, error, EXIT_INTERNAL),
+        };
+        if token.is_empty() {
+            return command_error(
+                json,
+                CommandError::new("connect", "auth_required", "empty Notion token")
+                    .with_suggested_command("afs connect notion --token-stdin"),
+                EXIT_INTERNAL,
+            );
+        }
+
+        let options = ConnectOptions {
+            connection_id: flag_value(args, "--name").map(ConnectionId::new),
+            token,
+        };
+        let probe = HttpNotionConnectionProbe;
+        return match run_connect_notion(&mut store, credentials.as_ref(), options, &probe) {
+            Ok(report) if json => {
+                print_json(&report);
+                EXIT_SUCCESS
+            }
+            Ok(report) => {
+                print_connect_report(&report);
+                EXIT_SUCCESS
+            }
+            Err(error) => connect_command_error("connect", json, error),
+        };
+    }
+
+    let oauth_config = match notion_oauth_config(args) {
+        Ok(config) => config,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    let authorization =
+        match run_local_notion_oauth(&oauth_config, has_flag(args, "--no-browser"), json) {
+            Ok(authorization) => authorization,
+            Err(error) => return command_error(json, error, EXIT_INTERNAL),
+        };
+    let options = OAuthConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        client_id: oauth_config.client_id,
+        client_secret: oauth_config.client_secret,
+        code: authorization.code,
+        redirect_uri: oauth_config.redirect_uri,
+    };
+    let exchange = HttpNotionOAuthClient::new();
+    match run_connect_notion_oauth(&mut store, credentials.as_ref(), options, &exchange) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -1529,6 +1564,365 @@ fn read_connect_token(args: &[String], json: bool) -> Result<String, CommandErro
     Ok(token.trim().to_string())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NotionOAuthCliConfig {
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalOAuthAuthorization {
+    code: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalRedirect {
+    bind_addr: String,
+    callback_path: String,
+}
+
+fn notion_oauth_config(args: &[String]) -> Result<NotionOAuthCliConfig, CommandError> {
+    let client_id = env_first(&["AFS_NOTION_OAUTH_CLIENT_ID", "NOTION_OAUTH_CLIENT_ID"])
+        .ok_or_else(|| missing_oauth_config("AFS_NOTION_OAUTH_CLIENT_ID"))?;
+    let client_secret = env_first(&[
+        "AFS_NOTION_OAUTH_CLIENT_SECRET",
+        "NOTION_OAUTH_CLIENT_SECRET",
+    ])
+    .ok_or_else(|| missing_oauth_config("AFS_NOTION_OAUTH_CLIENT_SECRET"))?;
+    let redirect_uri = flag_value(args, "--redirect-uri")
+        .map(str::to_string)
+        .or_else(|| env_first(&["AFS_NOTION_OAUTH_REDIRECT_URI", "NOTION_OAUTH_REDIRECT_URI"]))
+        .unwrap_or_else(|| "http://127.0.0.1:8757/oauth/notion/callback".to_string());
+
+    local_redirect(&redirect_uri).map_err(|message| {
+        CommandError::new("connect", "invalid_redirect_uri", message)
+            .with_suggested_command("afs connect notion --token-stdin")
+    })?;
+
+    Ok(NotionOAuthCliConfig {
+        client_id,
+        client_secret,
+        redirect_uri,
+    })
+}
+
+fn missing_oauth_config(name: &str) -> CommandError {
+    CommandError::new(
+        "connect",
+        "missing_oauth_config",
+        format!(
+            "missing {name}; configure Notion OAuth env vars or use --token-stdin for a personal access token"
+        ),
+    )
+    .with_suggested_command("afs connect notion --token-stdin")
+}
+
+fn run_local_notion_oauth(
+    config: &NotionOAuthCliConfig,
+    no_browser: bool,
+    json: bool,
+) -> Result<LocalOAuthAuthorization, CommandError> {
+    let redirect = local_redirect(&config.redirect_uri).map_err(|message| {
+        CommandError::new("connect", "invalid_redirect_uri", message)
+            .with_suggested_command("afs connect notion --token-stdin")
+    })?;
+    let listener = TcpListener::bind(&redirect.bind_addr).map_err(|error| {
+        CommandError::new(
+            "connect",
+            "callback_bind_failed",
+            format!(
+                "failed to listen for Notion OAuth callback at {}: {error}",
+                redirect.bind_addr
+            ),
+        )
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| CommandError::new("connect", "callback_failed", error.to_string()))?;
+
+    let state = random_state();
+    let authorize_url = notion_authorize_url(&config.client_id, &config.redirect_uri, &state);
+    if !json {
+        println!("opening Notion authorization in your browser...");
+        println!("callback: {}", config.redirect_uri);
+        println!("authorization URL: {authorize_url}");
+    }
+    if !no_browser
+        && let Err(error) = open_browser(&authorize_url)
+        && !json
+    {
+        eprintln!("afs connect: failed to open browser: {error}");
+        eprintln!("open the authorization URL manually");
+    }
+
+    wait_for_oauth_callback(&listener, &redirect.callback_path, &state)
+}
+
+fn wait_for_oauth_callback(
+    listener: &TcpListener,
+    callback_path: &str,
+    expected_state: &str,
+) -> Result<LocalOAuthAuthorization, CommandError> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let mut buffer = [0_u8; 8192];
+                let read = stream.read(&mut buffer).map_err(|error| {
+                    CommandError::new("connect", "callback_failed", error.to_string())
+                })?;
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let result = parse_oauth_callback(&request, callback_path, expected_state);
+                let response = match &result {
+                    Ok(_) => oauth_http_response(
+                        "Notion connected",
+                        "Notion authorization is complete. You can close this window.",
+                    ),
+                    Err(error) => oauth_http_response("AgentFS OAuth failed", &error.message),
+                };
+                let _ = stream.write_all(response.as_bytes());
+                return result;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(CommandError::new(
+                        "connect",
+                        "oauth_timeout",
+                        "timed out waiting for Notion OAuth callback",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(CommandError::new(
+                    "connect",
+                    "callback_failed",
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+}
+
+fn parse_oauth_callback(
+    request: &str,
+    callback_path: &str,
+    expected_state: &str,
+) -> Result<LocalOAuthAuthorization, CommandError> {
+    let request_line = request
+        .lines()
+        .next()
+        .ok_or_else(|| CommandError::new("connect", "callback_failed", "empty callback"))?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    if method != "GET" {
+        return Err(CommandError::new(
+            "connect",
+            "callback_failed",
+            "OAuth callback used an unsupported HTTP method",
+        ));
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path != callback_path {
+        return Err(CommandError::new(
+            "connect",
+            "callback_failed",
+            format!("OAuth callback path `{path}` did not match `{callback_path}`"),
+        ));
+    }
+    let params = query_params(query);
+    if let Some(error) = params.get("error") {
+        return Err(CommandError::new(
+            "connect",
+            "oauth_denied",
+            params
+                .get("error_description")
+                .cloned()
+                .unwrap_or_else(|| format!("Notion returned OAuth error `{error}`")),
+        ));
+    }
+    if params.get("state").map(String::as_str) != Some(expected_state) {
+        return Err(CommandError::new(
+            "connect",
+            "oauth_state_mismatch",
+            "Notion OAuth callback state did not match",
+        ));
+    }
+    let code = params
+        .get("code")
+        .filter(|code| !code.is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            CommandError::new(
+                "connect",
+                "oauth_missing_code",
+                "Notion OAuth callback did not include a code",
+            )
+        })?;
+    Ok(LocalOAuthAuthorization { code })
+}
+
+fn oauth_http_response(title: &str, message: &str) -> String {
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body><h1>{}</h1><p>{}</p></body></html>",
+        html_escape(title),
+        html_escape(title),
+        html_escape(message)
+    );
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn notion_authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
+    format!(
+        "{DEFAULT_NOTION_OAUTH_AUTHORIZE_URL}?client_id={}&response_type=code&owner=user&redirect_uri={}&state={}",
+        url_encode(client_id),
+        url_encode(redirect_uri),
+        url_encode(state)
+    )
+}
+
+fn local_redirect(uri: &str) -> Result<LocalRedirect, String> {
+    let rest = uri
+        .strip_prefix("http://")
+        .ok_or_else(|| "Notion OAuth redirect URI must start with http://".to_string())?;
+    let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let callback_path = format!("/{}", path);
+    if callback_path == "/" {
+        return Err("Notion OAuth redirect URI must include a callback path".to_string());
+    }
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .ok_or_else(|| "Notion OAuth redirect URI must include a localhost port".to_string())?;
+    if host != "127.0.0.1" && host != "localhost" {
+        return Err("Notion OAuth redirect URI must use 127.0.0.1 or localhost".to_string());
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "Notion OAuth redirect URI has an invalid port".to_string())?;
+    Ok(LocalRedirect {
+        bind_addr: format!("127.0.0.1:{port}"),
+        callback_path,
+    })
+}
+
+fn query_params(query: &str) -> std::collections::BTreeMap<String, String> {
+    query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            Some((url_decode(key).ok()?, url_decode(value).ok()?))
+        })
+        .collect()
+}
+
+fn env_first(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn open_browser(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = ProcessCommand::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = ProcessCommand::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = {
+        let mut command = ProcessCommand::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "browser command exited with {status}"
+        )))
+    }
+}
+
+fn random_state() -> String {
+    let mut bytes = [0_u8; 24];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_err()
+    {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id() as u128;
+        let mixed = nanos ^ (pid << 64);
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (mixed.rotate_left(index as u32) & 0xff) as u8;
+        }
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn url_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn url_decode(value: &str) -> Result<String, ()> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|_| ())?;
+                decoded.push(u8::from_str_radix(hex, 16).map_err(|_| ())?);
+                index += 3;
+            }
+            b'%' => return Err(()),
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| ())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn warn_daemon_fallback(command: &str) {
     if std::env::var("AFS_DAEMON_DISABLE").is_err() {
         eprintln!(
@@ -1745,6 +2139,8 @@ fn connect_command_error(command: &'static str, json: bool, error: ConnectError)
     let exit_code = match &error {
         ConnectError::ConnectionNameRequired => EXIT_USAGE,
         ConnectError::ConnectionProbeFailed(_)
+        | ConnectError::OAuthExchangeFailed(_)
+        | ConnectError::CredentialEncode(_)
         | ConnectError::Credential(_)
         | ConnectError::Store(_) => EXIT_INTERNAL,
         ConnectError::ConnectionMissing(_) => EXIT_INTERNAL,
@@ -2003,6 +2399,7 @@ fn takes_value(arg: &str) -> bool {
             | "--projection"
             | "--helper"
             | "--display-name"
+            | "--redirect-uri"
     )
 }
 
@@ -2022,7 +2419,7 @@ fn escape_json_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct CommandError {
     ok: bool,
     command: &'static str,
@@ -2073,7 +2470,10 @@ mod tests {
     use crate::diff::{DiffReport, GuardrailOutput};
     use crate::push::PushReport;
 
-    use super::{EXIT_SUCCESS, EXIT_VALIDATION, diff_report_exit_code};
+    use super::{
+        EXIT_SUCCESS, EXIT_VALIDATION, diff_report_exit_code, local_redirect, notion_authorize_url,
+        parse_oauth_callback,
+    };
 
     #[test]
     fn clean_diff_report_exits_successfully() {
@@ -2103,6 +2503,48 @@ mod tests {
             crate::push::push_report_exit_code(&push_report("apply_not_implemented")),
             5
         );
+    }
+
+    #[test]
+    fn local_redirect_accepts_loopback_callback_uri() {
+        let redirect =
+            local_redirect("http://127.0.0.1:8757/oauth/notion/callback").expect("redirect");
+
+        assert_eq!(redirect.bind_addr, "127.0.0.1:8757");
+        assert_eq!(redirect.callback_path, "/oauth/notion/callback");
+    }
+
+    #[test]
+    fn oauth_callback_requires_matching_state() {
+        let request = "GET /oauth/notion/callback?code=abc123&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        let authorization =
+            parse_oauth_callback(request, "/oauth/notion/callback", "expected").expect("callback");
+
+        assert_eq!(authorization.code, "abc123");
+        assert!(
+            parse_oauth_callback(request, "/oauth/notion/callback", "other")
+                .expect_err("state mismatch")
+                .code
+                .contains("oauth_state_mismatch")
+        );
+    }
+
+    #[test]
+    fn notion_authorize_url_encodes_redirect_and_state() {
+        let url = notion_authorize_url(
+            "client id",
+            "http://127.0.0.1:8757/oauth/notion/callback",
+            "state+value",
+        );
+
+        assert!(url.contains("client_id=client%20id"));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("owner=user"));
+        assert!(
+            url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A8757%2Foauth%2Fnotion%2Fcallback")
+        );
+        assert!(url.contains("state=state%2Bvalue"));
     }
 
     fn report(ok: bool) -> DiffReport {

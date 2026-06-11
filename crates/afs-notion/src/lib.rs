@@ -10,6 +10,7 @@ pub mod dto;
 pub mod fetch;
 pub mod mapping;
 pub mod media;
+pub mod oauth;
 pub mod projection;
 pub mod render;
 pub mod schema;
