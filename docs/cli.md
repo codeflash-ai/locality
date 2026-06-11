@@ -6,6 +6,7 @@ The `afs` command is the single supported control surface for users and coding a
 
 - `afs connect notion`
 - `afs mount notion <path> --root-page <page-id> [--mount-id <id>] [--read-only]`
+- `afs info [path] [--json]`
 - `afs status [path] [--json]`
 - `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
@@ -38,6 +39,19 @@ Remaining categories to assign before `afs push` applies remote mutations:
 `afs pull <mount-root>` enumerates the configured Notion root page, writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page shadow snapshot. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the stored shadow, returning a dirty skip instead.
 
 The JSON report includes `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts.
+
+## Initial `afs info --json` Shape
+
+`afs info [path]` explains the local source-of-record context for one path using only the SQLite state store. It defaults to the current working directory, resolves the containing mount, identifies the exact or nearest projected entity, reports immediate child counts, and includes pending/failed journal counts for that local context. It does not read or hydrate file bodies and does not call remote connectors.
+
+The JSON report includes:
+
+- `mount`: mount ID, connector, root, remote root ID, and read-only state;
+- `subject`: role, source type, local path, existence, backing entity metadata, and database schema path when applicable;
+- `children`: immediate child counts by entity type plus subtree entity count;
+- `journals`: pending and failed journal counts in the context.
+
+Human output is a compact path summary for people and agents working in nested directories.
 
 ## Initial `afs status --json` Shape
 

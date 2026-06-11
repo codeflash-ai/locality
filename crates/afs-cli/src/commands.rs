@@ -15,6 +15,7 @@ use crate::history::{
     HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
     undo_report_exit_code,
 };
+use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
 use crate::pull::{PullError, PullReport, run_pull};
 use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
@@ -26,7 +27,8 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_VALIDATION: i32 = 3;
 
 const COMMANDS: &[&str] = &[
-    "connect", "mount", "status", "pull", "push", "diff", "undo", "log", "resolve", "config",
+    "connect", "mount", "info", "status", "pull", "push", "diff", "undo", "log", "resolve",
+    "config",
 ];
 
 pub fn dispatch(args: &[String]) -> i32 {
@@ -39,6 +41,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     match args[0].as_str() {
         "connect" => stub("connect", json),
         "mount" => mount(&args[1..], json),
+        "info" => info(&args[1..], json),
         "status" => status(&args[1..], json),
         "pull" => pull(&args[1..], json),
         "push" => push(&args[1..], json),
@@ -216,6 +219,35 @@ fn status(args: &[String], json: bool) -> i32 {
             EXIT_SUCCESS
         }
         Err(error) => status_command_error(json, error, state_root),
+    }
+}
+
+fn info(args: &[String], json: bool) -> i32 {
+    let state_root = default_state_root();
+    let store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("info", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = InfoOptions {
+        path: first_positional(args).map(PathBuf::from),
+    };
+
+    match run_info(&store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_info_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => info_command_error(json, error, state_root),
     }
 }
 
@@ -556,6 +588,71 @@ fn print_status_report(report: &StatusReport) {
     }
 }
 
+fn print_info_report(report: &InfoReport) {
+    println!("Path: {}", report.target);
+    println!(
+        "Mount: {} ({})",
+        report.mount.mount_id, report.mount.connector
+    );
+    println!("Root: {}", report.mount.root);
+    println!("Role: {}", report.subject.role.label());
+    println!("Source: {}", report.subject.source);
+
+    if let Some(remote_root_id) = &report.mount.remote_root_id {
+        println!("Remote root ID: {remote_root_id}");
+    }
+    if let Some(entity) = &report.subject.entity {
+        println!("Title: {}", entity.title);
+        println!("Remote ID: {}", entity.entity_id);
+        println!("Entity path: {}", entity.path);
+        println!("Hydration: {}", entity.hydration);
+        if let Some(remote_edited_at) = &entity.remote_edited_at {
+            println!("Remote edited: {remote_edited_at}");
+        }
+    }
+    if let Some(schema_path) = &report.subject.schema_path {
+        println!("Schema: {schema_path}");
+    }
+
+    println!(
+        "Children: {} page{}, {} database{}, {} director{}, {} asset{}, {} unknown",
+        report.children.pages,
+        plural(report.children.pages),
+        report.children.databases,
+        plural(report.children.databases),
+        report.children.directories,
+        if report.children.directories == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        report.children.assets,
+        plural(report.children.assets),
+        report.children.unknown,
+    );
+    println!("Subtree entities: {}", report.children.subtree);
+    println!(
+        "Journals: {} pending, {} failed",
+        report.journals.pending, report.journals.failed
+    );
+    println!(
+        "Write mode: {}",
+        if report.mount.read_only {
+            "read-only"
+        } else {
+            "read-write"
+        }
+    );
+
+    if !report.suggestions.is_empty() {
+        println!("Next: {}", report.suggestions.join("; "));
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
 fn default_notion_connector() -> NotionConnector {
     NotionConnector::new(NotionConfig::default())
 }
@@ -733,6 +830,29 @@ fn status_command_error(json: bool, error: StatusError, state_root: PathBuf) -> 
     command_error(
         json,
         CommandError::new("status", error.code(), message),
+        exit_code,
+    )
+}
+
+fn info_command_error(json: bool, error: InfoError, state_root: PathBuf) -> i32 {
+    let exit_code = match &error {
+        InfoError::MountNotFound(_)
+        | InfoError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
+        InfoError::CurrentDir(_) | InfoError::Store(_) => EXIT_INTERNAL,
+    };
+    let message = match &error {
+        InfoError::MountNotFound(_) => {
+            format!(
+                "{} in state dir `{}`",
+                error.message(),
+                state_root.display()
+            )
+        }
+        _ => error.message(),
+    };
+    command_error(
+        json,
+        CommandError::new("info", error.code(), message),
         exit_code,
     )
 }

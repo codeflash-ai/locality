@@ -8,6 +8,7 @@ Notion facts:
 - This mount maps one Notion root; paths are a projection, IDs in filenames/frontmatter are durable.
 - Pages are `.md`; databases are directories; database rows are row `.md` files.
 - `_schema.yaml` describes database properties; `_view.csv` is read-only.
+- Listing directories does not hydrate stubs; run `afs info .` for local source context.
 - Stubs contain `<!-- afs:stub`; run `afs pull <path>` before relying on the body.
 - Edit Markdown and normal property frontmatter only; do not edit `afs` identity fields or `::afs{...}` directives.
 - Preview with `afs diff <path>`; push with `afs push <path>`; use `--json` for automation.
