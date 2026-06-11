@@ -160,6 +160,8 @@ pub struct PagePropertyDto {
     #[serde(default)]
     pub phone_number: Option<String>,
     #[serde(default)]
+    pub files: Vec<FilePropertyDto>,
+    #[serde(default)]
     pub people: Vec<UserMentionDto>,
     #[serde(default)]
     pub relation: Vec<IdRefDto>,
@@ -175,6 +177,10 @@ pub struct PagePropertyDto {
     pub formula: Option<serde_json::Value>,
     #[serde(default)]
     pub rollup: Option<serde_json::Value>,
+    #[serde(default)]
+    pub unique_id: Option<UniqueIdPropertyDto>,
+    #[serde(default)]
+    pub verification: Option<VerificationPropertyDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +292,8 @@ pub struct BlockDto {
     pub ai_block: Option<serde_json::Value>,
     #[serde(default)]
     pub custom_block: Option<serde_json::Value>,
+    #[serde(default)]
+    pub button: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +371,19 @@ pub struct FileBlockDto {
     pub file: Option<HostedFileDto>,
     #[serde(default)]
     pub caption: Vec<RichTextDto>,
+}
+
+/// File reference used by Notion page `files` properties.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePropertyDto {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub external: Option<ExternalFileDto>,
+    #[serde(default)]
+    pub file: Option<HostedFileDto>,
 }
 
 /// External file reference used by image, video, file, PDF, and audio blocks.
@@ -517,6 +538,26 @@ pub struct DateMentionDto {
     pub end: Option<String>,
     #[serde(default)]
     pub time_zone: Option<String>,
+}
+
+/// Notion auto-incrementing unique ID property value.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UniqueIdPropertyDto {
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub number: Option<i64>,
+}
+
+/// Verification property value returned by Notion wiki-style databases.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationPropertyDto {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub verified_by: Option<UserMentionDto>,
+    #[serde(default)]
+    pub date: Option<DateMentionDto>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

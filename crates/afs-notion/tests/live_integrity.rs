@@ -28,7 +28,12 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
     let mut cleanup = LiveCleanup::new(api.clone());
     let connector = NotionConnector::new(NotionConfig::default());
     let title = format!("AFS live block integrity {}", unique_suffix());
-    let page = cleanup.create_page(&env.parent_page_id, &title, rich_block_children());
+    let page = cleanup.create_page(
+        &env.parent_page_id,
+        &title,
+        rich_block_children(&env.parent_page_id),
+    );
+    cleanup.create_page(&page.id, "AFS nested child page", Vec::new());
     let page_id = RemoteId::new(page.id.clone());
     let page_path = Path::new("live-integrity/block-coverage.md");
 
@@ -44,11 +49,25 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
         .download_rendered_media(&rendered, &env.local_dir)
         .expect("download rendered media");
 
+    assert!(rendered.document.body.contains("# Heading one"));
+    assert!(rendered.document.body.contains("## Heading two"));
+    assert!(rendered.document.body.contains("### Heading three"));
     assert!(rendered.document.body.contains("#### Heading four"));
     assert!(rendered.document.body.contains("**Bold** _italic_"));
     assert!(rendered.document.body.contains("```rust"));
+    assert!(rendered.document.body.contains("| Left | Right |"));
     assert!(rendered.document.body.contains("$$\nE=mc^2\n$$"));
     assert!(rendered.document.body.contains("type=image"));
+    assert!(rendered.document.body.contains("type=video"));
+    assert!(rendered.document.body.contains("type=file"));
+    assert!(rendered.document.body.contains("type=pdf"));
+    assert!(rendered.document.body.contains("type=audio"));
+    assert!(rendered.document.body.contains("type=embed"));
+    assert!(rendered.document.body.contains("type=table_of_contents"));
+    assert!(rendered.document.body.contains("type=breadcrumb"));
+    assert!(rendered.document.body.contains("type=column_list"));
+    assert!(rendered.document.body.contains("type=link_to_page"));
+    assert!(rendered.document.body.contains("type=child_page"));
     assert!(rendered.document.body.contains("local=\"media/"));
     assert!(
         rendered.media_assets.iter().any(|asset| {
@@ -69,9 +88,53 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
         vec![page_id.clone()],
         vec![
             PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "heading_1")),
+                content: "# Edited heading one".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "heading_2")),
+                content: "## Edited heading two".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "heading_3")),
+                content: "### Edited heading three".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "heading_4")),
+                content: "#### Edited heading four".to_string(),
+            },
+            PushOperation::UpdateBlock {
                 block_id: RemoteId::new(paragraph_id),
                 content: "**Edited bold** with [external](https://example.com/) and $x+y$."
                     .to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "bulleted_list_item")),
+                content: "- Edited bullet".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "numbered_list_item")),
+                content: "1. Edited number".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "to_do")),
+                content: "- [x] Edited checkbox".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "quote")),
+                content: "> Edited quote".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "code")),
+                content: "```rust\nfn edited() {}\n```".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "divider")),
+                content: "---".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new(first_block_id(&bundle, "equation")),
+                content: "$$\na^2+b^2=c^2\n$$".to_string(),
             },
             PushOperation::AppendBlock {
                 parent_id: page_id.clone(),
@@ -90,7 +153,42 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
     let verified_render = connector
         .render_native_entity_for_path(&verified, page_path)
         .expect("verify render");
+    assert!(
+        verified_render
+            .document
+            .body
+            .contains("# Edited heading one")
+    );
+    assert!(
+        verified_render
+            .document
+            .body
+            .contains("## Edited heading two")
+    );
+    assert!(
+        verified_render
+            .document
+            .body
+            .contains("### Edited heading three")
+    );
+    assert!(
+        verified_render
+            .document
+            .body
+            .contains("#### Edited heading four")
+    );
     assert!(verified_render.document.body.contains("**Edited bold**"));
+    assert!(verified_render.document.body.contains("- Edited bullet"));
+    assert!(verified_render.document.body.contains("1. Edited number"));
+    assert!(
+        verified_render
+            .document
+            .body
+            .contains("- [x] Edited checkbox")
+    );
+    assert!(verified_render.document.body.contains("> Edited quote"));
+    assert!(verified_render.document.body.contains("fn edited() {}"));
+    assert!(verified_render.document.body.contains("a^2+b^2=c^2"));
     assert!(
         verified_render
             .document
@@ -133,6 +231,10 @@ fn live_database_row_property_create_edit_verify_integrity() {
                 (
                     "Status".to_string(),
                     PropertyValue::String("Todo".to_string()),
+                ),
+                (
+                    "State".to_string(),
+                    PropertyValue::String("Not started".to_string()),
                 ),
                 (
                     "Tags".to_string(),
@@ -192,6 +294,12 @@ fn live_database_row_property_create_edit_verify_integrity() {
         rendered
             .document
             .frontmatter
+            .contains("\"State\": \"Not started\"")
+    );
+    assert!(
+        rendered
+            .document
+            .frontmatter
             .contains("\"URL\": \"https://example.com/afs-live\"")
     );
 
@@ -205,6 +313,10 @@ fn live_database_row_property_create_edit_verify_integrity() {
                     PropertyValue::Number("43".to_string()),
                 ),
                 ("Done".to_string(), PropertyValue::Bool(true)),
+                (
+                    "State".to_string(),
+                    PropertyValue::String("In progress".to_string()),
+                ),
                 (
                     "URL".to_string(),
                     PropertyValue::String("https://example.com/afs-live-updated".to_string()),
@@ -231,6 +343,12 @@ fn live_database_row_property_create_edit_verify_integrity() {
             .document
             .frontmatter
             .contains("\"Done\": true")
+    );
+    assert!(
+        verified_render
+            .document
+            .frontmatter
+            .contains("\"State\": \"In progress\"")
     );
     assert!(
         verified_render
@@ -325,6 +443,7 @@ impl LiveCleanup {
                                 ]
                             }
                         },
+                        "State": { "status": {} },
                         "Tags": {
                             "multi_select": {
                                 "options": [
@@ -337,7 +456,10 @@ impl LiveCleanup {
                         "Due": { "date": {} },
                         "URL": { "url": {} },
                         "Email": { "email": {} },
-                        "Phone": { "phone_number": {} }
+                        "Phone": { "phone_number": {} },
+                        "Files": { "files": {} },
+                        "People": { "people": {} },
+                        "Unique": { "unique_id": { "prefix": "AFS" } }
                     }
                 }
             }))
@@ -440,8 +562,23 @@ fn apply_plan(connector: &NotionConnector, plan: &PushPlan) -> afs_connector::Ap
         .expect("apply live plan")
 }
 
-fn rich_block_children() -> Vec<Value> {
+fn rich_block_children(parent_page_id: &str) -> Vec<Value> {
     vec![
+        json!({
+            "object": "block",
+            "type": "heading_1",
+            "heading_1": { "rich_text": rich_text("Heading one") }
+        }),
+        json!({
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": { "rich_text": rich_text("Heading two") }
+        }),
+        json!({
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": { "rich_text": rich_text("Heading three") }
+        }),
         json!({
             "object": "block",
             "type": "heading_4",
@@ -489,6 +626,20 @@ fn rich_block_children() -> Vec<Value> {
         }),
         json!({
             "object": "block",
+            "type": "toggle",
+            "toggle": {
+                "rich_text": rich_text("Toggle item"),
+                "children": [
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": { "rich_text": rich_text("Nested toggle child") }
+                    }
+                ]
+            }
+        }),
+        json!({
+            "object": "block",
             "type": "code",
             "code": { "rich_text": rich_text("fn main() {}"), "language": "rust" }
         }),
@@ -509,11 +660,129 @@ fn rich_block_children() -> Vec<Value> {
         }),
         json!({
             "object": "block",
+            "type": "embed",
+            "embed": { "url": "https://example.com/embed" }
+        }),
+        json!({
+            "object": "block",
+            "type": "table",
+            "table": {
+                "table_width": 2,
+                "has_column_header": true,
+                "has_row_header": false,
+                "children": [
+                    {
+                        "object": "block",
+                        "type": "table_row",
+                        "table_row": {
+                            "cells": [rich_text("Left"), rich_text("Right")]
+                        }
+                    },
+                    {
+                        "object": "block",
+                        "type": "table_row",
+                        "table_row": {
+                            "cells": [rich_text("A"), rich_text("B")]
+                        }
+                    }
+                ]
+            }
+        }),
+        json!({
+            "object": "block",
+            "type": "column_list",
+            "column_list": {
+                "children": [
+                    {
+                        "object": "block",
+                        "type": "column",
+                        "column": {
+                            "children": [
+                                {
+                                    "object": "block",
+                                    "type": "paragraph",
+                                    "paragraph": { "rich_text": rich_text("Column one") }
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "object": "block",
+                        "type": "column",
+                        "column": {
+                            "children": [
+                                {
+                                    "object": "block",
+                                    "type": "paragraph",
+                                    "paragraph": { "rich_text": rich_text("Column two") }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }),
+        json!({
+            "object": "block",
+            "type": "table_of_contents",
+            "table_of_contents": { "color": "default" }
+        }),
+        json!({
+            "object": "block",
+            "type": "breadcrumb",
+            "breadcrumb": {}
+        }),
+        json!({
+            "object": "block",
+            "type": "link_to_page",
+            "link_to_page": {
+                "type": "page_id",
+                "page_id": parent_page_id
+            }
+        }),
+        json!({
+            "object": "block",
             "type": "image",
             "image": {
                 "type": "external",
                 "external": { "url": LIVE_IMAGE_URL },
                 "caption": rich_text("W3C test image")
+            }
+        }),
+        json!({
+            "object": "block",
+            "type": "video",
+            "video": {
+                "type": "external",
+                "external": { "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ" },
+                "caption": rich_text("External video")
+            }
+        }),
+        json!({
+            "object": "block",
+            "type": "file",
+            "file": {
+                "type": "external",
+                "external": { "url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf" },
+                "caption": rich_text("External file")
+            }
+        }),
+        json!({
+            "object": "block",
+            "type": "pdf",
+            "pdf": {
+                "type": "external",
+                "external": { "url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf" },
+                "caption": rich_text("External PDF")
+            }
+        }),
+        json!({
+            "object": "block",
+            "type": "audio",
+            "audio": {
+                "type": "external",
+                "external": { "url": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3" },
+                "caption": rich_text("External audio")
             }
         }),
     ]

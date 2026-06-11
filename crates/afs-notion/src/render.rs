@@ -12,6 +12,7 @@ use crate::dto::{
     BlockDto, BlockTreeDto, DateMentionDto, EquationBlockDto, FileBlockDto, LinkToPageBlockDto,
     MeetingNotesBlockDto, NotionPageBundle, PageDto, PagePropertyDto, RichTextBlockDto,
     RichTextDto, SyncedBlockDto, TableBlockDto, TableRowBlockDto, UrlBlockDto,
+    VerificationPropertyDto,
 };
 use crate::media::{MediaAsset, media_local_path};
 
@@ -272,7 +273,7 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
         ),
         "meeting_notes" => titled_directive(block, "meeting_notes", block.meeting_notes.as_ref()),
         "transcription" => titled_directive(block, "transcription", block.transcription.as_ref()),
-        "tab" | "ai_block" | "custom_block" => directive_block(block, &block.kind, None),
+        "tab" | "ai_block" | "custom_block" | "button" => directive_block(block, &block.kind, None),
         "unsupported" => directive_block(block, "unsupported", None),
         other => directive_block(block, &format!("unsupported_{other}"), None),
     }
@@ -860,6 +861,9 @@ fn property_frontmatter_value(property: &PagePropertyDto) -> Option<FrontmatterV
         "url" => Some(optional_string(property.url.as_deref())),
         "email" => Some(optional_string(property.email.as_deref())),
         "phone_number" => Some(optional_string(property.phone_number.as_deref())),
+        "files" => Some(FrontmatterValue::List(
+            property.files.iter().map(file_property_label).collect(),
+        )),
         "people" => Some(FrontmatterValue::List(
             property
                 .people
@@ -879,6 +883,9 @@ fn property_frontmatter_value(property: &PagePropertyDto) -> Option<FrontmatterV
         "created_by" => Some(optional_user(property.created_by.as_ref())),
         "last_edited_by" => Some(optional_user(property.last_edited_by.as_ref())),
         "formula" => property.formula.as_ref().and_then(formula_value),
+        "rollup" => property.rollup.as_ref().map(rollup_value),
+        "unique_id" => Some(unique_id_value(property.unique_id.as_ref())),
+        "verification" => Some(verification_value(property.verification.as_ref())),
         _ => None,
     }
 }
@@ -930,6 +937,23 @@ fn optional_user(value: Option<&crate::dto::UserMentionDto>) -> FrontmatterValue
         .unwrap_or(FrontmatterValue::Null)
 }
 
+fn file_property_label(file: &crate::dto::FilePropertyDto) -> String {
+    let url = file
+        .external
+        .as_ref()
+        .map(|external| external.url.as_str())
+        .or_else(|| file.file.as_ref().map(|hosted| hosted.url.as_str()))
+        .unwrap_or_default();
+    let name = file.name.as_deref().unwrap_or_default();
+
+    match (name.is_empty(), url.is_empty()) {
+        (false, false) => format!("{name} <{url}>"),
+        (false, true) => name.to_string(),
+        (true, false) => url.to_string(),
+        (true, true) => String::new(),
+    }
+}
+
 fn formula_value(value: &Value) -> Option<FrontmatterValue> {
     let kind = value.get("type").and_then(Value::as_str)?;
     match kind {
@@ -943,8 +967,66 @@ fn formula_value(value: &Value) -> Option<FrontmatterValue> {
             .and_then(Value::as_bool)
             .map(FrontmatterValue::Bool),
         "date" => value.get("date").map(json_date_value),
-        _ => None,
+        _ => Some(json_value(value)),
     }
+}
+
+fn rollup_value(value: &Value) -> FrontmatterValue {
+    let kind = value.get("type").and_then(Value::as_str);
+    match kind {
+        Some("number") => value
+            .get("number")
+            .and_then(Value::as_f64)
+            .map(|number| FrontmatterValue::Scalar(number.to_string()))
+            .unwrap_or(FrontmatterValue::Null),
+        Some("date") => value
+            .get("date")
+            .map(json_date_value)
+            .unwrap_or(FrontmatterValue::Null),
+        Some("array") => FrontmatterValue::List(
+            value
+                .get("array")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().map(compact_json).collect())
+                .unwrap_or_default(),
+        ),
+        _ => json_value(value),
+    }
+}
+
+fn unique_id_value(value: Option<&crate::dto::UniqueIdPropertyDto>) -> FrontmatterValue {
+    let Some(value) = value else {
+        return FrontmatterValue::Null;
+    };
+    let Some(number) = value.number else {
+        return FrontmatterValue::Null;
+    };
+
+    match value.prefix.as_deref().filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => FrontmatterValue::Scalar(yaml_string(&format!("{prefix}-{number}"))),
+        None => FrontmatterValue::Scalar(number.to_string()),
+    }
+}
+
+fn verification_value(value: Option<&VerificationPropertyDto>) -> FrontmatterValue {
+    let Some(value) = value else {
+        return FrontmatterValue::Null;
+    };
+
+    let mut fields = Vec::new();
+    if let Some(state) = value.state.as_deref() {
+        fields.push(("state".to_string(), yaml_string(state)));
+    }
+    if let Some(user) = value.verified_by.as_ref() {
+        fields.push((
+            "verified_by".to_string(),
+            yaml_string(user.name.as_deref().unwrap_or(user.id.as_str())),
+        ));
+    }
+    if let Some(date) = value.date.as_ref() {
+        fields.push(("date".to_string(), yaml_string(&date_mention_label(date))));
+    }
+    FrontmatterValue::Map(fields)
 }
 
 fn json_date_value(value: &Value) -> FrontmatterValue {
@@ -965,6 +1047,14 @@ fn json_date_value(value: &Value) -> FrontmatterValue {
         fields.push(("time_zone".to_string(), yaml_string(time_zone)));
     }
     FrontmatterValue::Map(fields)
+}
+
+fn json_value(value: &Value) -> FrontmatterValue {
+    FrontmatterValue::Scalar(yaml_string(&compact_json(value)))
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
 fn write_frontmatter_value(out: &mut String, key: &str, value: FrontmatterValue) {

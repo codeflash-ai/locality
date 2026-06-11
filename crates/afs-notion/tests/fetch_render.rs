@@ -8,14 +8,16 @@ use afs_core::shadow::MarkdownBlockKind;
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, BlockTreeDto, ColorOnlyBlockDto, DataSourceDto, DataSourcePropertyDto,
-    DataSourceSummaryDto, DatabaseDto, DateMentionDto, EquationBlockDto, EquationRichTextDto,
-    ExternalFileDto, FileBlockDto, IdRefDto, LinkDto, LinkToPageBlockDto, MeetingNotesBlockDto,
-    MentionRichTextDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
-    RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
-    SelectPropertySchemaDto, SyncedBlockDto, SyncedFromDto, TableBlockDto, TableRowBlockDto,
-    TextRichTextDto, TitleBlockDto, UrlBlockDto,
+    DataSourceSummaryDto, DatabaseDto, DateMentionDto, EmptyBlockDto, EquationBlockDto,
+    EquationRichTextDto, ExternalFileDto, FileBlockDto, FilePropertyDto, HostedFileDto, IdRefDto,
+    LinkDto, LinkToPageBlockDto, MeetingNotesBlockDto, MentionRichTextDto, PageDto, PageListDto,
+    PagePropertyDto, PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto,
+    SelectOptionDto, SelectPropertySchemaDto, SyncedBlockDto, SyncedFromDto, TableBlockDto,
+    TableRowBlockDto, TextRichTextDto, TitleBlockDto, UniqueIdPropertyDto, UrlBlockDto,
+    VerificationPropertyDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
+use serde_json::json;
 
 #[test]
 fn fetch_recurses_paginated_block_children_and_render_preserves_shadow_ids() {
@@ -247,6 +249,310 @@ fn render_richer_notion_block_coverage() {
 }
 
 #[test]
+fn render_all_known_notion_block_objects_into_markdown_or_directives() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Coverage"),
+        blocks: vec![
+            BlockTreeDto {
+                block: rich_text_block("paragraph-1", "paragraph", "Paragraph"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("heading-1", "heading_1", "Heading one"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("heading-2", "heading_2", "Heading two"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("heading-3", "heading_3", "Heading three"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("heading-4", "heading_4", "Heading four"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("bullet-1", "bulleted_list_item", "Bullet"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("number-1", "numbered_list_item", "Number"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: to_do_block("todo-1", "Todo", true),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("quote-1", "quote", "Quote"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("callout-1", "callout", "Callout"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: code_block("code-1", "rust", "fn main() {}"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: block("divider-1", "divider"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: table_block("table-1", 2, true),
+                children: vec![
+                    BlockTreeDto {
+                        block: table_row_block("row-1", ["Left", "Right"]),
+                        children: Vec::new(),
+                    },
+                    BlockTreeDto {
+                        block: table_row_block("row-2", ["A", "B"]),
+                        children: Vec::new(),
+                    },
+                ],
+            },
+            BlockTreeDto {
+                block: table_row_block("orphan-row-1", ["Orphan"]),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: child_page_block("child-page-1", "Child Page"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: child_database_block("child-db-1", "Child DB"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: toggle_block("toggle-1", "Toggle summary"),
+                children: vec![BlockTreeDto {
+                    block: rich_text_block("toggle-child-1", "paragraph", "Toggle child"),
+                    children: Vec::new(),
+                }],
+            },
+            BlockTreeDto {
+                block: equation_block("equation-1", "E=mc^2"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: url_block("embed-1", "embed", "https://example.com/embed", "Embed"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: url_block(
+                    "bookmark-1",
+                    "bookmark",
+                    "https://example.com/bookmark",
+                    "Bookmark",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: url_block(
+                    "link-preview-1",
+                    "link_preview",
+                    "https://example.com/preview",
+                    "Preview",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: file_block(
+                    "111111111111aaaa",
+                    "image",
+                    "https://example.com/image.png",
+                    "Image",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: file_block(
+                    "222222222222bbbb",
+                    "video",
+                    "https://example.com/video.mp4",
+                    "Video",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: file_block(
+                    "333333333333cccc",
+                    "file",
+                    "https://example.com/file.txt",
+                    "File",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: file_block(
+                    "444444444444dddd",
+                    "pdf",
+                    "https://example.com/file.pdf",
+                    "PDF",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: file_block(
+                    "555555555555eeee",
+                    "audio",
+                    "https://example.com/audio.mp3",
+                    "Audio",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: synced_block("synced-original-1", ""),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: synced_block("synced-copy-1", "source-block-1"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: link_to_page_block("link-page-1", "target-page-1"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: link_to_database_block("link-db-1", "target-db-1"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: table_of_contents_block("toc-1"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: empty_payload_block("breadcrumb-1", "breadcrumb"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: empty_payload_block("column-list-1", "column_list"),
+                children: vec![
+                    BlockTreeDto {
+                        block: empty_payload_block("column-1", "column"),
+                        children: vec![BlockTreeDto {
+                            block: rich_text_block("column-child-1", "paragraph", "Column one"),
+                            children: Vec::new(),
+                        }],
+                    },
+                    BlockTreeDto {
+                        block: empty_payload_block("column-2", "column"),
+                        children: vec![BlockTreeDto {
+                            block: rich_text_block("column-child-2", "paragraph", "Column two"),
+                            children: Vec::new(),
+                        }],
+                    },
+                ],
+            },
+            BlockTreeDto {
+                block: rich_text_block("template-1", "template", "Template"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: meeting_notes_block("meeting-1", "Meeting"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: transcription_block("transcription-1", "Transcript"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: raw_payload_block("tab-1", "tab"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: raw_payload_block("ai-1", "ai_block"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: raw_payload_block("custom-1", "custom_block"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: raw_payload_block("button-1", "button"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: unsupported_block("future-1", "future_block"),
+                children: Vec::new(),
+            },
+        ],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle_with_options(
+        &bundle,
+        &afs_notion::render::RenderOptions::with_page_path("Docs/Coverage.md"),
+    )
+    .expect("render");
+    let body = &rendered.document.body;
+
+    for expected in [
+        "Paragraph",
+        "# Heading one",
+        "## Heading two",
+        "### Heading three",
+        "#### Heading four",
+        "- Bullet",
+        "1. Number",
+        "- [x] Todo",
+        "> Quote",
+        "> [!NOTE]\n> Callout",
+        "```rust\nfn main() {}\n```",
+        "| Left | Right |",
+        "::afs{id=orphan-row-1 type=unsupported_table_row}",
+        "::afs{id=child-page-1 type=child_page title=\"Child Page\"}",
+        "::afs{id=child-db-1 type=child_database title=\"Child DB\"}",
+        "::afs{id=toggle-1 type=toggle title=\"Toggle summary\"}",
+        "Toggle child",
+        "$$\nE=mc^2\n$$",
+        "::afs{id=embed-1 type=embed title=\"Embed\" url=\"https://example.com/embed\"}",
+        "::afs{id=bookmark-1 type=bookmark title=\"Bookmark\" url=\"https://example.com/bookmark\"}",
+        "::afs{id=link-preview-1 type=link_preview title=\"Preview\" url=\"https://example.com/preview\"}",
+        "type=image title=\"Image\" local=\"media/Docs/Coverage/image-111111111111.png\"",
+        "type=video title=\"Video\" local=\"media/Docs/Coverage/video-222222222222.mp4\"",
+        "type=file title=\"File\" local=\"media/Docs/Coverage/file-333333333333.txt\"",
+        "type=pdf title=\"PDF\" local=\"media/Docs/Coverage/pdf-444444444444.pdf\"",
+        "type=audio title=\"Audio\" local=\"media/Docs/Coverage/audio-555555555555.mp3\"",
+        "::afs{id=synced-original-1 type=synced_block}",
+        "::afs{id=synced-copy-1 type=synced_block source_block_id=\"source-block-1\"}",
+        "::afs{id=link-page-1 type=link_to_page page_id=\"target-page-1\"}",
+        "::afs{id=link-db-1 type=link_to_page database_id=\"target-db-1\"}",
+        "::afs{id=toc-1 type=table_of_contents color=\"default\"}",
+        "::afs{id=breadcrumb-1 type=breadcrumb}",
+        "::afs{id=column-list-1 type=column_list}",
+        "::afs{id=column-1 type=column}",
+        "Column one",
+        "::afs{id=column-2 type=column}",
+        "Column two",
+        "::afs{id=template-1 type=template title=\"Template\"}",
+        "::afs{id=meeting-1 type=meeting_notes title=\"Meeting\"}",
+        "::afs{id=transcription-1 type=transcription title=\"Transcript\"}",
+        "::afs{id=tab-1 type=tab}",
+        "::afs{id=ai-1 type=ai_block}",
+        "::afs{id=custom-1 type=custom_block}",
+        "::afs{id=button-1 type=button}",
+        "::afs{id=future-1 type=unsupported_future_block}",
+    ] {
+        assert!(
+            body.contains(expected),
+            "missing rendered coverage: {expected}"
+        );
+    }
+
+    assert_eq!(
+        rendered
+            .media_assets
+            .iter()
+            .map(|asset| asset.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["image", "video", "file", "pdf", "audio"]
+    );
+}
+
+#[test]
 fn render_table_as_markdown_table_with_row_shadow_metadata() {
     let bundle = afs_notion::dto::NotionPageBundle {
         page: page("page-1", "Roadmap"),
@@ -410,6 +716,14 @@ fn render_rich_text_annotations_links_mentions_and_equations() {
                     equation("E=mc^2"),
                     rich_text(" plus page mention "),
                     page_mention("Roadmap", "page-1"),
+                    rich_text(" database mention "),
+                    database_mention("Tasks", "database-1"),
+                    rich_text(" user mention "),
+                    user_mention("", "user-1", "Ada"),
+                    rich_text(" preview "),
+                    link_preview_mention("Example", "https://example.com/preview"),
+                    rich_text(" unknown "),
+                    unknown_mention("Fallback"),
                 ],
             ),
             children: Vec::new(),
@@ -430,7 +744,7 @@ fn render_rich_text_annotations_links_mentions_and_equations() {
 
     assert_eq!(
         rendered.document.body,
-        "**Bold** _italic_ ~~strike~~ <u>underline</u> `code` [external link](https://example.com/) after link. 2026-06-10 and inline equation $E=mc^2$ plus page mention [Roadmap](afs://page-1)\n"
+        "**Bold** _italic_ ~~strike~~ <u>underline</u> `code` [external link](https://example.com/) after link. 2026-06-10 and inline equation $E=mc^2$ plus page mention [Roadmap](afs://page-1) database mention [Tasks](afs://database-1) user mention @Ada preview [Example](https://example.com/preview) unknown Fallback\n"
     );
 }
 
@@ -514,6 +828,299 @@ fn render_database_row_properties_as_frontmatter() {
             .frontmatter
             .contains("\"Tags\":\n  - \"Backend\"")
     );
+}
+
+#[test]
+fn render_all_supported_page_property_values_as_frontmatter() {
+    let mut row = page("row-1", "Property Coverage");
+    row.properties.extend(BTreeMap::from([
+        (
+            "Rich Text".to_string(),
+            PagePropertyDto {
+                kind: "rich_text".to_string(),
+                rich_text: vec![rich_text("Notes")],
+                ..Default::default()
+            },
+        ),
+        (
+            "Number".to_string(),
+            PagePropertyDto {
+                kind: "number".to_string(),
+                number: Some(serde_json::Number::from(7)),
+                ..Default::default()
+            },
+        ),
+        (
+            "Select".to_string(),
+            PagePropertyDto {
+                kind: "select".to_string(),
+                select: Some(select_option("select-id", "Selected")),
+                ..Default::default()
+            },
+        ),
+        (
+            "Multi Select".to_string(),
+            PagePropertyDto {
+                kind: "multi_select".to_string(),
+                multi_select: vec![
+                    select_option("alpha-id", "Alpha"),
+                    select_option("beta-id", "Beta"),
+                ],
+                ..Default::default()
+            },
+        ),
+        (
+            "Status".to_string(),
+            PagePropertyDto {
+                kind: "status".to_string(),
+                status: Some(select_option("status-id", "In progress")),
+                ..Default::default()
+            },
+        ),
+        (
+            "Checkbox".to_string(),
+            PagePropertyDto {
+                kind: "checkbox".to_string(),
+                checkbox: Some(true),
+                ..Default::default()
+            },
+        ),
+        (
+            "Date Range".to_string(),
+            PagePropertyDto {
+                kind: "date".to_string(),
+                date: Some(DateMentionDto {
+                    start: "2026-06-10".to_string(),
+                    end: Some("2026-06-11".to_string()),
+                    time_zone: Some("America/Los_Angeles".to_string()),
+                }),
+                ..Default::default()
+            },
+        ),
+        (
+            "URL".to_string(),
+            PagePropertyDto {
+                kind: "url".to_string(),
+                url: Some("https://example.com".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "Email".to_string(),
+            PagePropertyDto {
+                kind: "email".to_string(),
+                email: Some("agentfs@example.com".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "Phone".to_string(),
+            PagePropertyDto {
+                kind: "phone_number".to_string(),
+                phone_number: Some("+1 415 555 0100".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "Files".to_string(),
+            PagePropertyDto {
+                kind: "files".to_string(),
+                files: vec![
+                    FilePropertyDto {
+                        name: Some("Spec".to_string()),
+                        kind: "external".to_string(),
+                        external: Some(ExternalFileDto {
+                            url: "https://example.com/spec.pdf".to_string(),
+                        }),
+                        file: None,
+                    },
+                    FilePropertyDto {
+                        name: None,
+                        kind: "file".to_string(),
+                        external: None,
+                        file: Some(HostedFileDto {
+                            url: "https://example.com/hosted.png".to_string(),
+                            expiry_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                        }),
+                    },
+                ],
+                ..Default::default()
+            },
+        ),
+        (
+            "People".to_string(),
+            PagePropertyDto {
+                kind: "people".to_string(),
+                people: vec![user("user-1", Some("Ada"))],
+                ..Default::default()
+            },
+        ),
+        (
+            "Relation".to_string(),
+            PagePropertyDto {
+                kind: "relation".to_string(),
+                relation: vec![IdRefDto {
+                    id: "related-page-1".to_string(),
+                }],
+                ..Default::default()
+            },
+        ),
+        (
+            "Created Time".to_string(),
+            PagePropertyDto {
+                kind: "created_time".to_string(),
+                created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "Last Edited Time".to_string(),
+            PagePropertyDto {
+                kind: "last_edited_time".to_string(),
+                last_edited_time: Some("2026-06-11T00:00:00.000Z".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "Created By".to_string(),
+            PagePropertyDto {
+                kind: "created_by".to_string(),
+                created_by: Some(user("creator-1", Some("Creator"))),
+                ..Default::default()
+            },
+        ),
+        (
+            "Last Edited By".to_string(),
+            PagePropertyDto {
+                kind: "last_edited_by".to_string(),
+                last_edited_by: Some(user("editor-1", Some("Editor"))),
+                ..Default::default()
+            },
+        ),
+        (
+            "Formula String".to_string(),
+            PagePropertyDto {
+                kind: "formula".to_string(),
+                formula: Some(json!({ "type": "string", "string": "computed" })),
+                ..Default::default()
+            },
+        ),
+        (
+            "Formula Number".to_string(),
+            PagePropertyDto {
+                kind: "formula".to_string(),
+                formula: Some(json!({ "type": "number", "number": 9 })),
+                ..Default::default()
+            },
+        ),
+        (
+            "Formula Boolean".to_string(),
+            PagePropertyDto {
+                kind: "formula".to_string(),
+                formula: Some(json!({ "type": "boolean", "boolean": true })),
+                ..Default::default()
+            },
+        ),
+        (
+            "Formula Date".to_string(),
+            PagePropertyDto {
+                kind: "formula".to_string(),
+                formula: Some(json!({
+                    "type": "date",
+                    "date": { "start": "2026-06-12" }
+                })),
+                ..Default::default()
+            },
+        ),
+        (
+            "Rollup Number".to_string(),
+            PagePropertyDto {
+                kind: "rollup".to_string(),
+                rollup: Some(json!({ "type": "number", "number": 11 })),
+                ..Default::default()
+            },
+        ),
+        (
+            "Rollup Array".to_string(),
+            PagePropertyDto {
+                kind: "rollup".to_string(),
+                rollup: Some(json!({
+                    "type": "array",
+                    "array": [
+                        { "type": "title", "title": [{ "type": "text", "plain_text": "Item" }] }
+                    ]
+                })),
+                ..Default::default()
+            },
+        ),
+        (
+            "Unique ID".to_string(),
+            PagePropertyDto {
+                kind: "unique_id".to_string(),
+                unique_id: Some(UniqueIdPropertyDto {
+                    prefix: Some("AFS".to_string()),
+                    number: Some(12),
+                }),
+                ..Default::default()
+            },
+        ),
+        (
+            "Verification".to_string(),
+            PagePropertyDto {
+                kind: "verification".to_string(),
+                verification: Some(VerificationPropertyDto {
+                    state: Some("verified".to_string()),
+                    verified_by: Some(user("verifier-1", Some("Verifier"))),
+                    date: Some(DateMentionDto {
+                        start: "2026-06-10".to_string(),
+                        end: None,
+                        time_zone: None,
+                    }),
+                }),
+                ..Default::default()
+            },
+        ),
+    ]));
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: row,
+        blocks: Vec::new(),
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+    let frontmatter = &rendered.document.frontmatter;
+
+    for expected in [
+        "\"Rich Text\": \"Notes\"",
+        "\"Number\": 7",
+        "\"Select\": \"Selected\"",
+        "\"Multi Select\":\n  - \"Alpha\"\n  - \"Beta\"",
+        "\"Status\": \"In progress\"",
+        "\"Checkbox\": true",
+        "\"Date Range\":\n  \"start\": \"2026-06-10\"\n  \"end\": \"2026-06-11\"\n  \"time_zone\": \"America/Los_Angeles\"",
+        "\"URL\": \"https://example.com\"",
+        "\"Email\": \"agentfs@example.com\"",
+        "\"Phone\": \"+1 415 555 0100\"",
+        "\"Files\":\n  - \"Spec <https://example.com/spec.pdf>\"\n  - \"https://example.com/hosted.png\"",
+        "\"People\":\n  - \"Ada\"",
+        "\"Relation\":\n  - \"related-page-1\"",
+        "\"Created Time\": \"2026-06-10T00:00:00.000Z\"",
+        "\"Last Edited Time\": \"2026-06-11T00:00:00.000Z\"",
+        "\"Created By\": \"Creator\"",
+        "\"Last Edited By\": \"Editor\"",
+        "\"Formula String\": \"computed\"",
+        "\"Formula Number\": 9",
+        "\"Formula Boolean\": true",
+        "\"Formula Date\": \"2026-06-12\"",
+        "\"Rollup Number\": 11",
+        "\"Rollup Array\":",
+        "\"Unique ID\": \"AFS-12\"",
+        "\"Verification\":\n  \"state\": \"verified\"\n  \"verified_by\": \"Verifier\"\n  \"date\": \"2026-06-10\"",
+    ] {
+        assert!(
+            frontmatter.contains(expected),
+            "missing frontmatter coverage: {expected}\n{frontmatter}"
+        );
+    }
 }
 
 #[test]
@@ -893,6 +1500,13 @@ fn select_option(id: &str, name: &str) -> SelectOptionDto {
     }
 }
 
+fn user(id: &str, name: Option<&str>) -> afs_notion::dto::UserMentionDto {
+    afs_notion::dto::UserMentionDto {
+        id: id.to_string(),
+        name: name.map(str::to_string),
+    }
+}
+
 fn rich_text_block(id: &str, kind: &str, text: &str) -> BlockDto {
     let mut block = block(id, kind);
     let value = Some(rich_text_block_content(vec![rich_text(text)]));
@@ -903,6 +1517,12 @@ fn rich_text_block(id: &str, kind: &str, text: &str) -> BlockDto {
         "heading_2" => block.heading_2 = value,
         "heading_3" => block.heading_3 = value,
         "heading_4" => block.heading_4 = value,
+        "bulleted_list_item" => block.bulleted_list_item = value,
+        "numbered_list_item" => block.numbered_list_item = value,
+        "quote" => block.quote = value,
+        "callout" => block.callout = value,
+        "toggle" => block.toggle = value,
+        "template" => block.template = value,
         _ => panic!("unsupported fixture rich text kind: {kind}"),
     }
 
@@ -953,6 +1573,25 @@ fn block(id: &str, kind: &str) -> BlockDto {
 fn toggle_block(id: &str, text: &str) -> BlockDto {
     let mut block = block(id, "toggle");
     block.toggle = Some(rich_text_block_content(vec![rich_text(text)]));
+    block
+}
+
+fn to_do_block(id: &str, text: &str, checked: bool) -> BlockDto {
+    let mut block = block(id, "to_do");
+    block.to_do = Some(afs_notion::dto::ToDoBlockDto {
+        rich_text: vec![rich_text(text)],
+        checked,
+        color: None,
+    });
+    block
+}
+
+fn code_block(id: &str, language: &str, text: &str) -> BlockDto {
+    let mut block = block(id, "code");
+    block.code = Some(afs_notion::dto::CodeBlockDto {
+        rich_text: vec![rich_text(text)],
+        language: Some(language.to_string()),
+    });
     block
 }
 
@@ -1021,6 +1660,16 @@ fn link_to_page_block(id: &str, page_id: &str) -> BlockDto {
     block
 }
 
+fn link_to_database_block(id: &str, database_id: &str) -> BlockDto {
+    let mut block = block(id, "link_to_page");
+    block.link_to_page = Some(LinkToPageBlockDto {
+        kind: "database_id".to_string(),
+        page_id: None,
+        database_id: Some(database_id.to_string()),
+    });
+    block
+}
+
 fn table_of_contents_block(id: &str) -> BlockDto {
     let mut block = block(id, "table_of_contents");
     block.table_of_contents = Some(ColorOnlyBlockDto {
@@ -1029,11 +1678,43 @@ fn table_of_contents_block(id: &str) -> BlockDto {
     block
 }
 
+fn empty_payload_block(id: &str, kind: &str) -> BlockDto {
+    let mut block = block(id, kind);
+    match kind {
+        "breadcrumb" => block.breadcrumb = Some(EmptyBlockDto {}),
+        "column_list" => block.column_list = Some(EmptyBlockDto {}),
+        "column" => block.column = Some(EmptyBlockDto {}),
+        _ => panic!("unsupported fixture empty payload block kind: {kind}"),
+    }
+    block
+}
+
 fn meeting_notes_block(id: &str, title: &str) -> BlockDto {
     let mut block = block(id, "meeting_notes");
     block.meeting_notes = Some(MeetingNotesBlockDto {
         title: Some(title.to_string()),
     });
+    block
+}
+
+fn transcription_block(id: &str, title: &str) -> BlockDto {
+    let mut block = block(id, "transcription");
+    block.transcription = Some(MeetingNotesBlockDto {
+        title: Some(title.to_string()),
+    });
+    block
+}
+
+fn raw_payload_block(id: &str, kind: &str) -> BlockDto {
+    let mut block = block(id, kind);
+    let payload = Some(json!({ "placeholder": true }));
+    match kind {
+        "tab" => block.tab = payload,
+        "ai_block" => block.ai_block = payload,
+        "custom_block" => block.custom_block = payload,
+        "button" => block.button = payload,
+        _ => panic!("unsupported fixture raw payload block kind: {kind}"),
+    }
     block
 }
 
@@ -1122,6 +1803,59 @@ fn page_mention(text: &str, id: &str) -> RichTextDto {
         mention: Some(MentionRichTextDto {
             kind: "page".to_string(),
             page: Some(IdRefDto { id: id.to_string() }),
+            ..Default::default()
+        }),
+        plain_text: text.to_string(),
+        ..Default::default()
+    }
+}
+
+fn database_mention(text: &str, id: &str) -> RichTextDto {
+    RichTextDto {
+        kind: "mention".to_string(),
+        mention: Some(MentionRichTextDto {
+            kind: "database".to_string(),
+            database: Some(IdRefDto { id: id.to_string() }),
+            ..Default::default()
+        }),
+        plain_text: text.to_string(),
+        ..Default::default()
+    }
+}
+
+fn user_mention(text: &str, id: &str, name: &str) -> RichTextDto {
+    RichTextDto {
+        kind: "mention".to_string(),
+        mention: Some(MentionRichTextDto {
+            kind: "user".to_string(),
+            user: Some(user(id, Some(name))),
+            ..Default::default()
+        }),
+        plain_text: text.to_string(),
+        ..Default::default()
+    }
+}
+
+fn link_preview_mention(text: &str, url: &str) -> RichTextDto {
+    RichTextDto {
+        kind: "mention".to_string(),
+        mention: Some(MentionRichTextDto {
+            kind: "link_preview".to_string(),
+            link_preview: Some(LinkDto {
+                url: url.to_string(),
+            }),
+            ..Default::default()
+        }),
+        plain_text: text.to_string(),
+        ..Default::default()
+    }
+}
+
+fn unknown_mention(text: &str) -> RichTextDto {
+    RichTextDto {
+        kind: "mention".to_string(),
+        mention: Some(MentionRichTextDto {
+            kind: "template_mention".to_string(),
             ..Default::default()
         }),
         plain_text: text.to_string(),

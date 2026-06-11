@@ -59,9 +59,9 @@ title: "Fix login bug"
 ---
 ```
 
-Supported read-side property values include title, rich text, number, select, multi-select, status, checkbox, date, URL, email, phone, people, relation IDs, created/edited timestamps, created/edited users, and simple formula values.
+Supported read-side property values include title, rich text, number, select, multi-select, status, checkbox, date, URL, email, phone, files, people, relation IDs, created/edited timestamps, created/edited users, formula, rollup, unique ID, and verification values.
 
-Property writes are planned by comparing edited frontmatter against the shadow frontmatter captured during the last render. The Notion writer currently applies title, rich text, number, select, status, multi-select, checkbox, date, URL, email, and phone properties. Read-only or computed property classes such as people, relation, formula, rollup, created/edited timestamps, and created/edited users remain read-side only until schema validation and richer property preimages are added.
+Property writes are planned by comparing edited frontmatter against the shadow frontmatter captured during the last render. The Notion writer currently applies title, rich text, number, select, status, multi-select, checkbox, date, URL, email, and phone properties. Read-only, computed, or identity-backed property classes such as files, people, relation, formula, rollup, created/edited timestamps, created/edited users, unique ID, and verification remain read-side only until schema validation and richer property preimages are added.
 
 A new database row starts as the same document shape without generated identity fields:
 

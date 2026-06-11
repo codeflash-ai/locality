@@ -49,7 +49,7 @@ export AFS_NOTION_LIVE_DIR=/tmp/afs-notion-live
 cargo test -p afs-notion --test live_integrity -- --ignored
 ```
 
-Those tests cover rich block rendering, supported block edits/appends, image download, database row creation, supported property writes, and read-back verification against the live API. They require the integration to have insert, read, and update content capabilities for the parent page.
+Those tests cover broad block rendering, supported block edits/appends, image download, database row creation, supported property writes, and read-back verification against the live API. They require the integration to have insert, read, and update content capabilities for the parent page. The current support contract is tracked in [notion-object-support.md](notion-object-support.md).
 
 ## Initial Block Rendering
 
