@@ -38,7 +38,7 @@ Sources used for the baseline:
 | `numbered_list_item` | Native Markdown | Yes | fixture, live | One Notion block per list item. |
 | `to_do` | Native Markdown checkbox | Yes | fixture, live | Checked state round-trips through `- [ ]` / `- [x]`. |
 | `quote` | Native Markdown quote | Yes | fixture, live | `>` quote. |
-| `callout` | Native Markdown callout | No | fixture, live read | Writer would currently parse the same shape as `quote`; dedicated callout parsing is needed. |
+| `callout` | Native Markdown callout | Yes | fixture, live read | `> [!NOTE]` callouts update and append as Notion callout blocks. |
 | `code` | Native fenced code | Yes | fixture, live | Language is preserved on simple code fences. |
 | `divider` | Native Markdown rule | Yes | fixture, live | `---`. |
 | `equation` | Native display math | Yes | fixture, live | `$$ ... $$`. |
@@ -125,3 +125,15 @@ Sources used for the baseline:
   policy.
 - People/relation writes are blocked until validation can resolve user IDs and
   related page IDs from local references.
+
+## Next Block Work
+
+1. Add fixture-backed write tests before widening any block type. The Tier 1
+   writer suite now covers headings, numbered lists, to-dos, quotes, callouts,
+   code fences, dividers, and equations.
+2. Treat tables as the next large design item. They need row-level diff/apply
+   rather than whole-table replacement.
+3. Keep layout, generated, synced, and unknown future blocks directive-backed
+   until their Notion semantics can be represented without content loss.
+4. Design media writes separately from text block writes. Upload support needs
+   size limits, retention rules, dedupe, and local file ownership decisions.

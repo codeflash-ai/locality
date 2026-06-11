@@ -202,6 +202,127 @@ fn apply_uses_start_position_and_chains_adjacent_new_blocks() {
 }
 
 #[test]
+fn apply_appends_tier_one_markdown_block_shapes() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("anchor-1")),
+                content: "## Section".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("anchor-2")),
+                content: "1. Numbered".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("anchor-3")),
+                content: "- [x] Done".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("anchor-4")),
+                content: "> Quoted\n> Text".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("anchor-5")),
+                content: "```rust\nfn main() {}\n```".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("anchor-6")),
+                content: "---".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            append_call(
+                "anchor-1",
+                json!({
+                    "object": "block",
+                    "type": "heading_2",
+                    "heading_2": {
+                        "rich_text": rich_text_json("Section"),
+                    },
+                }),
+            ),
+            append_call(
+                "anchor-2",
+                json!({
+                    "object": "block",
+                    "type": "numbered_list_item",
+                    "numbered_list_item": {
+                        "rich_text": rich_text_json("Numbered"),
+                    },
+                }),
+            ),
+            append_call(
+                "anchor-3",
+                json!({
+                    "object": "block",
+                    "type": "to_do",
+                    "to_do": {
+                        "rich_text": rich_text_json("Done"),
+                        "checked": true,
+                    },
+                }),
+            ),
+            append_call(
+                "anchor-4",
+                json!({
+                    "object": "block",
+                    "type": "quote",
+                    "quote": {
+                        "rich_text": rich_text_json("Quoted\nText"),
+                    },
+                }),
+            ),
+            append_call(
+                "anchor-5",
+                json!({
+                    "object": "block",
+                    "type": "code",
+                    "code": {
+                        "rich_text": rich_text_json("fn main() {}"),
+                        "language": "rust",
+                    },
+                }),
+            ),
+            append_call(
+                "anchor-6",
+                json!({
+                    "object": "block",
+                    "type": "divider",
+                    "divider": {},
+                }),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn apply_moves_existing_blocks_after_mid_page_append() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",
@@ -369,6 +490,75 @@ fn apply_updates_toggle_summary_from_rendered_list_item() {
                 },
             }),
         }]
+    );
+}
+
+#[test]
+fn apply_updates_and_appends_callouts_from_markdown() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![callout_block("callout-1", "Old callout")],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("callout-1"),
+                content: "> [!NOTE]\n> Updated callout".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("callout-1")),
+                content: "> [!NOTE]\n> New callout".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "callout-1".to_string(),
+                body: json!({
+                    "callout": {
+                        "rich_text": rich_text_json("Updated callout"),
+                    },
+                }),
+            },
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "callout",
+                        "callout": {
+                            "rich_text": rich_text_json("New callout"),
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "callout-1",
+                        },
+                    },
+                }),
+            },
+        ]
     );
 }
 
@@ -1149,6 +1339,15 @@ fn toggle_block(id: &str, text: &str) -> BlockDto {
     block
 }
 
+fn callout_block(id: &str, text: &str) -> BlockDto {
+    let mut block = block(id, "callout");
+    block.callout = Some(RichTextBlockDto {
+        rich_text: rich_text(text),
+        color: None,
+    });
+    block
+}
+
 fn equation_block(id: &str, expression: &str) -> BlockDto {
     let mut block = block(id, "equation");
     block.equation = Some(EquationBlockDto {
@@ -1218,4 +1417,19 @@ fn rich_text_json(text: &str) -> Value {
             },
         }
     ])
+}
+
+fn append_call(anchor_id: &str, child: Value) -> WriteCall {
+    WriteCall::Append {
+        block_id: "page-1".to_string(),
+        body: json!({
+            "children": [child],
+            "position": {
+                "type": "after_block",
+                "after_block": {
+                    "id": anchor_id,
+                },
+            },
+        }),
+    }
 }

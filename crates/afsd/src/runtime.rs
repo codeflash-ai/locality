@@ -6,7 +6,7 @@
 //! responsive during network I/O.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
@@ -715,9 +715,11 @@ impl RuntimeState {
     }
 }
 
-fn load_persisted_hydrations(state_root: &PathBuf) -> HydrationQueue {
+fn load_persisted_hydrations(state_root: &Path) -> HydrationQueue {
     let mut queue = HydrationQueue::new();
-    match SqliteStateStore::open(state_root.clone()).and_then(|store| store.list_hydration_jobs()) {
+    match SqliteStateStore::open(state_root.to_path_buf())
+        .and_then(|store| store.list_hydration_jobs())
+    {
         Ok(jobs) => {
             for job in jobs {
                 queue.queue_request(job.into_request());

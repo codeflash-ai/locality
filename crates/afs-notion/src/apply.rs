@@ -659,6 +659,10 @@ fn current_block_rich_text(block: &BlockDto) -> AfsResult<Option<&[RichTextDto]>
             .as_ref()
             .map(|block| block.rich_text.as_slice()),
         "quote" => block.quote.as_ref().map(|block| block.rich_text.as_slice()),
+        "callout" => block
+            .callout
+            .as_ref()
+            .map(|block| block.rich_text.as_slice()),
         "to_do" => block.to_do.as_ref().map(|block| block.rich_text.as_slice()),
         "code" => block.code.as_ref().map(|block| block.rich_text.as_slice()),
         "divider" | "equation" => return Ok(None),
@@ -775,6 +779,13 @@ fn parse_supported_block(
         return Ok(NotionBlockPatch::new(
             "numbered_list_item",
             json!({ "rich_text": rich_text_payload(text, preimage)? }),
+        ));
+    }
+
+    if let Some(text) = parse_callout(trimmed) {
+        return Ok(NotionBlockPatch::new(
+            "callout",
+            json!({ "rich_text": rich_text_payload(&text, preimage)? }),
         ));
     }
 
@@ -1633,6 +1644,30 @@ fn parse_quote(markdown: &str) -> Option<String> {
     }
 
     Some(lines.join("\n"))
+}
+
+fn parse_callout(markdown: &str) -> Option<String> {
+    let mut lines = markdown.lines();
+    let marker = lines.next()?.trim_start().strip_prefix("> ")?;
+    if !marker.starts_with("[!") || !marker.ends_with(']') {
+        return None;
+    }
+
+    let mut body = Vec::new();
+    for line in lines {
+        let trimmed = line.trim_start();
+        let text = trimmed
+            .strip_prefix("> ")
+            .or_else(|| trimmed.strip_prefix('>'))?;
+        body.push(text);
+    }
+
+    let text = body.join("\n");
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn looks_like_markdown_table(markdown: &str) -> bool {

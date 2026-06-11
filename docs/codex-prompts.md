@@ -2,6 +2,7 @@
 
 ## Changelog
 
+- 2026-06-11: Added first block-support follow-up: callout write/apply support, Tier 1 append regression coverage, and updated Notion block support docs.
 - 2026-06-11: Completed production-hardening sprint phases A-E: Notion block move apply, push preflight, restore/status recovery UX, local provider connections, daemon status/via reporting, and E2E push workflow regression coverage.
 
 Actionable prompts from manual E2E testing (June 2026). Each prompt is self-contained for a Codex session. Read `plan.md` and `docs/` before starting any task.
