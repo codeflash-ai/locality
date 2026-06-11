@@ -16,10 +16,9 @@ use afs_core::AfsError;
 use afs_core::canonical::parse_canonical_markdown;
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId};
-use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository,
-    SqliteStateStore,
+    SqliteStateStore, open_credential_store,
 };
 use serde_json::json;
 
@@ -30,6 +29,9 @@ use crate::file_provider::{
 };
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome};
 use crate::ipc::{DaemonRequest, DaemonResponse};
+use crate::notion::{
+    ResolvedNotionSource, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
+};
 use crate::pull::run_pull;
 use crate::push::execute_push_job;
 use crate::reconcile::{
@@ -210,13 +212,18 @@ pub struct DefaultRuntimeJobRunner;
 
 impl RuntimeJobRunner for DefaultRuntimeJobRunner {
     fn run_pull(&self, state_root: PathBuf, path: PathBuf) -> DaemonResponse {
-        let mut store = match SqliteStateStore::open(state_root) {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
             Ok(store) => store,
             Err(error) => {
                 return DaemonResponse::error("store_open_failed", error.to_string());
             }
         };
-        let connector = default_notion_connector();
+        let credentials = open_credential_store(&state_root);
+        let connector = match resolve_notion_connector_for_path(&store, credentials.as_ref(), &path)
+        {
+            Ok(connector) => connector,
+            Err(error) => return DaemonResponse::error(error.code(), error.message()),
+        };
 
         match run_pull(&mut store, &connector, path) {
             Ok(report) => DaemonResponse::ok(report),
@@ -225,13 +232,19 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
     }
 
     fn run_push(&self, state_root: PathBuf, job: PushJob) -> DaemonResponse {
-        let mut store = match SqliteStateStore::open(state_root) {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
             Ok(store) => store,
             Err(error) => {
                 return DaemonResponse::error("store_open_failed", error.to_string());
             }
         };
-        let connector = default_notion_connector();
+        let credentials = open_credential_store(&state_root);
+        let connector =
+            match resolve_notion_connector_for_path(&store, credentials.as_ref(), &job.target_path)
+            {
+                Ok(connector) => connector,
+                Err(error) => return DaemonResponse::error(error.code(), error.message()),
+            };
 
         match execute_push_job(&mut store, job, &connector) {
             Ok(report) => DaemonResponse::ok(report),
@@ -245,16 +258,18 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         tick: PullSchedulerTick,
         policy: HydrationPolicy,
     ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
-        let mut store = SqliteStateStore::open(state_root).map_err(AfsError::from)?;
+        let mut store = SqliteStateStore::open(state_root.clone()).map_err(AfsError::from)?;
         let mounts = store.load_mounts().map_err(AfsError::from)?;
-        let connector = default_notion_connector();
+        let credentials = open_credential_store(&state_root);
+        let source = ResolvedNotionSource::new(&store, credentials.as_ref(), &mounts)
+            .map_err(AfsError::from)?;
         let mut hydration = HydrationCollector::default();
         let report = reconcile_scheduled_pull(
             &mut store,
             &mut hydration,
             &mounts,
             &tick,
-            &connector,
+            &source,
             &DefaultFetchScheduleStrategy,
             &policy,
         )?;
@@ -270,8 +285,11 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         state_root: PathBuf,
         request: HydrationRequest,
     ) -> afs_core::AfsResult<HydrationOutcome> {
-        let mut store = SqliteStateStore::open(state_root).map_err(AfsError::from)?;
-        let connector = default_notion_connector();
+        let mut store = SqliteStateStore::open(state_root.clone()).map_err(AfsError::from)?;
+        let credentials = open_credential_store(&state_root);
+        let connector =
+            resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &request.mount_id)
+                .map_err(AfsError::from)?;
         let mut executor = HydrationExecutor::new(&mut store, &connector);
         executor.hydrate_request(request)
     }
@@ -323,17 +341,18 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         mount_id: String,
         identifier: String,
     ) -> DaemonResponse {
-        let mut store = match SqliteStateStore::open(state_root) {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
             Ok(store) => store,
             Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
         };
-        let connector = default_notion_connector();
-        match materialize_file_provider_item(
-            &mut store,
-            &connector,
-            &MountId::new(mount_id),
-            &identifier,
-        ) {
+        let mount_id = MountId::new(mount_id);
+        let credentials = open_credential_store(&state_root);
+        let connector =
+            match resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id) {
+                Ok(connector) => connector,
+                Err(error) => return DaemonResponse::error(error.code(), error.message()),
+            };
+        match materialize_file_provider_item(&mut store, &connector, &mount_id, &identifier) {
             Ok(report) => DaemonResponse::ok(report),
             Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
         }
@@ -882,10 +901,6 @@ fn event_relative_path(root: &std::path::Path, event_path: &std::path::Path) -> 
         .strip_prefix(canonical_root)
         .ok()
         .map(PathBuf::from)
-}
-
-fn default_notion_connector() -> NotionConnector {
-    NotionConnector::new(NotionConfig::default())
 }
 
 fn afs_error_code(error: &AfsError) -> &'static str {

@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
 use afs_core::model::{MountId, RemoteId};
-use afs_store::{InMemoryStateStore, MountRepository, ProjectionMode};
+use afs_store::{ConnectionId, InMemoryStateStore, MountRepository, ProjectionMode};
 
 #[test]
 fn mount_writes_agent_guidance_and_claude_alias() {
@@ -86,6 +86,36 @@ fn mount_preserves_custom_agent_guidance() {
     );
 }
 
+#[test]
+fn mount_persists_connection_id() {
+    let fixture = MountFixture::new("afs-cli-mount-connection");
+    let mut store = InMemoryStateStore::new();
+
+    let report = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("root-page")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount");
+
+    assert_eq!(report.connection_id.as_deref(), Some("work"));
+    assert_eq!(
+        store
+            .get_mount(&MountId::new("notion-main"))
+            .expect("get mount")
+            .expect("mount")
+            .connection_id,
+        Some(ConnectionId::new("work"))
+    );
+}
+
 struct MountFixture {
     root: PathBuf,
 }
@@ -120,6 +150,7 @@ impl MountFixture {
                 connector: connector.to_string(),
                 root: self.root.clone(),
                 remote_root_id: Some(RemoteId::new("root-page")),
+                connection_id: None,
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
             },
