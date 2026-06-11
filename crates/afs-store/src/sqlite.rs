@@ -18,11 +18,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::{StoreError, StoreResult};
-use crate::records::{EntityRecord, MountConfig, ShadowBlockRecord, ShadowSnapshotRecord};
+use crate::records::{
+    EntityRecord, MountConfig, ProjectionMode, ShadowBlockRecord, ShadowSnapshotRecord,
+};
 use crate::repository::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -57,19 +59,21 @@ impl MountRepository for SqliteStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
         let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(mount_id) DO UPDATE SET
                 connector = excluded.connector,
                 root = excluded.root,
                 remote_root_id = excluded.remote_root_id,
-                read_only = excluded.read_only",
+                read_only = excluded.read_only,
+                projection_json = excluded.projection_json",
             params![
                 mount.mount_id.0,
                 mount.connector,
                 path_to_text(&mount.root),
                 mount.remote_root_id.map(|remote_id| remote_id.0),
                 bool_to_int(mount.read_only),
+                to_json(&mount.projection)?,
             ],
         )?;
         Ok(())
@@ -79,7 +83,7 @@ impl MountRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT mount_id, connector, root, remote_root_id, read_only
+                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json
                  FROM mounts
                  WHERE mount_id = ?1",
                 params![mount_id.0],
@@ -90,6 +94,7 @@ impl MountRepository for SqliteStateStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -101,7 +106,7 @@ impl MountRepository for SqliteStateStore {
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT mount_id, connector, root, remote_root_id, read_only
+            "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json
              FROM mounts
              ORDER BY mount_id",
         )?;
@@ -112,6 +117,7 @@ impl MountRepository for SqliteStateStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
 
@@ -401,7 +407,7 @@ const ENTITY_SELECT_WITH_WHERE: &str = "
     FROM entities
     ";
 
-type MountRow = (String, String, String, Option<String>, i64);
+type MountRow = (String, String, String, Option<String>, i64, String);
 type EntityRow = (
     String,
     String,
@@ -438,7 +444,8 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             connector TEXT NOT NULL,
             root TEXT NOT NULL,
             remote_root_id TEXT,
-            read_only INTEGER NOT NULL CHECK (read_only IN (0, 1))
+            read_only INTEGER NOT NULL CHECK (read_only IN (0, 1)),
+            projection_json TEXT NOT NULL DEFAULT '\"plain_files\"'
         );
 
         CREATE TABLE IF NOT EXISTS entities (
@@ -507,6 +514,13 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         )?;
     }
 
+    if user_version < 6 && !column_exists(connection, "mounts", "projection_json")? {
+        connection.execute_batch(
+            "ALTER TABLE mounts
+             ADD COLUMN projection_json TEXT NOT NULL DEFAULT '\"plain_files\"';",
+        )?;
+    }
+
     if user_version < SCHEMA_VERSION {
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
@@ -521,6 +535,7 @@ fn mount_from_row(row: MountRow) -> StoreResult<MountConfig> {
         root: PathBuf::from(row.2),
         remote_root_id: row.3.map(RemoteId),
         read_only: row.4 != 0,
+        projection: from_json::<ProjectionMode>(&row.5)?,
     })
 }
 

@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
 use afs_core::model::{MountId, RemoteId};
-use afs_store::{InMemoryStateStore, MountRepository};
+use afs_store::{InMemoryStateStore, MountRepository, ProjectionMode};
 
 #[test]
 fn mount_writes_agent_guidance_and_claude_alias() {
@@ -121,6 +121,7 @@ impl MountFixture {
                 root: self.root.clone(),
                 remote_root_id: Some(RemoteId::new("root-page")),
                 read_only: false,
+                projection: ProjectionMode::PlainFiles,
             },
         )
         .expect("mount")

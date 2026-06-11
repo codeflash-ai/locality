@@ -54,6 +54,20 @@ remote pull, hydration, or push reconciliation.
 
 ## File Watching
 
+macOS File Provider mounts do not rely on read-after-the-fact watcher events for
+online-only files. The extension calls daemon IPC directly:
+
+- `file_provider_item` returns one projected item from SQLite without reading a
+  Markdown body.
+- `file_provider_children` returns dataless directory contents from SQLite.
+- `file_provider_materialize` hydrates a page with `HydrationReason::FileOpen`
+  and returns the materialized Markdown path once the content exists locally.
+
+Scheduled reconciliation skips writing placeholder Markdown files for mounts
+whose projection mode is `macos_file_provider`; it only updates durable entity
+state and queues policy hydration. Plain-file mounts still use the fallback
+watcher path below.
+
 The foreground daemon starts a `notify` watcher for every mount loaded from the
 SQLite store at startup. Create and modify notifications are normalized to
 `Write` events, native access/open notifications are normalized to `Read`

@@ -1,4 +1,5 @@
 pub mod execution;
+pub mod file_provider;
 pub mod hydration;
 pub mod ipc;
 pub mod notion;

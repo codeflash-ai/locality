@@ -11,7 +11,7 @@ use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
-    ShadowRepository, SqliteStateStore, StoreError,
+    ProjectionMode, ShadowRepository, SqliteStateStore, StoreError,
 };
 use rusqlite::{Connection, params};
 
@@ -31,7 +31,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 5);
+    assert_eq!(user_version, 6);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -51,7 +51,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 5,
+            supported: 6,
         }
     );
 }
@@ -61,6 +61,10 @@ fn persisted_json_uses_stable_snake_case_names() {
     assert_eq!(
         serde_json::to_string(&HydrationState::Hydrated).expect("hydration json"),
         "\"hydrated\""
+    );
+    assert_eq!(
+        serde_json::to_string(&ProjectionMode::MacosFileProvider).expect("projection json"),
+        "\"macos_file_provider\""
     );
     assert_eq!(
         serde_json::to_string(&MarkdownBlockKind::Paragraph).expect("block kind json"),
@@ -285,7 +289,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 5);
+    assert_eq!(user_version, 6);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -356,7 +360,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 5);
+    assert_eq!(user_version, 6);
     assert!(entry.apply_effects.is_empty());
 }
 

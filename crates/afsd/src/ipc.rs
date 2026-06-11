@@ -19,6 +19,18 @@ pub enum DaemonRequest {
         assume_yes: bool,
         confirm_dangerous: bool,
     },
+    FileProviderItem {
+        mount_id: String,
+        identifier: String,
+    },
+    FileProviderChildren {
+        mount_id: String,
+        container_identifier: String,
+    },
+    FileProviderMaterialize {
+        mount_id: String,
+        identifier: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

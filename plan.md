@@ -17,7 +17,7 @@ These were settled interactively and the rest of the document builds on them.
 | Primary runtime | User laptops; sandboxes later |
 | Sync philosophy | Implicit reads, explicit writes (opt-in implicit write mode) |
 | First connector | Notion |
-| Mount mechanism v1 | Real files + daemon, stub files for unhydrated content; OS cloud-file APIs (File Provider / Cloud Filter) in v2 |
+| Mount mechanism v1 | macOS File Provider online-only files first; plain files remain a fallback/dev projection |
 | Block identity | Hybrid: clean Markdown for diffable blocks, visible directives only for undiffable block types |
 | Cloud component | Pure local works fully; optional cloud relay for instant sync and team features |
 | Licensing | Open-source core (daemon, sync engine, Notion connector), paid cloud |
@@ -77,7 +77,7 @@ Five components ship in v1, one is optional cloud.
     Engineering/
       _dir.md                      # directory index: titles, IDs, hydration state
       Roadmap 2026 ~a3f2.md        # hydrated page
-      Architecture ~9c1b.md        # stub (frontmatter only) until read
+      Architecture ~9c1b.md        # online-only until opened
       Sprint Tracker ~44de/        # a Notion database
         _schema.yaml               # property definitions, option lists, validation rules
         _view.csv                  # read-only tabular convenience view
@@ -88,9 +88,9 @@ Five components ship in v1, one is optional cloud.
 
 **Naming.** Filenames are `slugified-title ~shortid.md`. The short ID suffix (first 4 to 6 hex chars of the Notion UUID, lengthened on collision) makes names stable and unique: a teammate renaming a page in Notion changes the slug but the daemon recognizes the ID and performs a local rename rather than delete-plus-create. The internal data model never keys on paths, only on canonical remote IDs; paths are a projection.
 
-**Stubs and hydration.** Every page exists on disk from the moment a mount is created, so the full tree is instantly browsable and grep-able by title and metadata even for a 50k-page workspace. Unhydrated pages are stubs: complete YAML frontmatter plus a single marker line (`<!-- afs:stub — read triggers hydration, or run: afs pull <path> -->`). Hydration happens four ways: explicitly (`afs pull path/`), by policy (default: auto-hydrate anything edited remotely in the last 90 days, plus anything the user starred; configurable per mount), lazily (the watcher sees a read on a stub and hydrates it within about a second, so an agent that opens a stub and retries, or follows the marker's instruction, gets content), and by prefetch (when a page is hydrated, its children and linked pages are queued at low priority, because agents that read one page very often read its neighbors next). The hydration states form an explicit ladder, borrowed from VFS for Git: `virtual → stub → hydrated → dirty → conflicted`, and the state machine only permits legal transitions.
+**Online-only files and hydration.** Every page is addressable from the moment a mount is enumerated, so the full tree is instantly browsable by title and metadata even for a 50k-page workspace. On macOS, unhydrated pages are File Provider dataless items: metadata lives in SQLite, and the first file open asks the daemon to materialize the correct Markdown before the read completes. Hydration happens four ways: explicitly (`afs pull path/`), by policy (default: auto-hydrate anything edited remotely in the last 90 days, plus anything the user starred; configurable per mount), lazily through File Provider `fetchContents`, and by prefetch (when a page is hydrated, its children and linked pages are queued at low priority, because agents that read one page very often read its neighbors next). Plain Markdown stubs remain only as a fallback/dev projection for environments without a virtualization layer. The hydration states form an explicit ladder, borrowed from VFS for Git: `virtual → online-only → hydrated → dirty → conflicted`, and the state machine only permits legal transitions.
 
-**v2 mounting.** macOS File Provider and Windows Cloud Filter API give true dataless placeholders that the OS hydrates on `open()` with zero kernel extensions; this is how Dropbox and OneDrive ship "online-only" files today. The stub design maps one-to-one onto it, so v2 is an upgrade, not a rewrite. Linux sandboxes (the later target) get either eager sync or FUSE, both unproblematic in containers.
+**Other mounting backends.** Windows Cloud Filter should mirror the macOS File Provider model. Linux sandboxes get either eager sync or FUSE, both unproblematic in containers. Plain real-file projection remains useful for tests, CI, and connector development, but it is not the primary user or agent UX.
 
 ## 6. Canonical representation and conversion (Notion)
 

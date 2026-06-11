@@ -14,7 +14,7 @@ use afs_core::hydration::{
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::NotionConnector;
-use afs_store::{EntityRecord, EntityRepository, MountConfig};
+use afs_store::{EntityRecord, EntityRepository, MountConfig, ProjectionMode};
 
 use crate::hydration::HydrationEngine;
 use crate::scheduler::PullSchedulerTick;
@@ -232,6 +232,10 @@ fn refresh_projection<Source>(
 where
     Source: ScheduledPullSource + ?Sized,
 {
+    if mount.projection == ProjectionMode::MacosFileProvider {
+        return Ok(ProjectionWrite::None);
+    }
+
     match entry.kind {
         EntityKind::Page => {
             let path = mount.root.join(&entry.path);

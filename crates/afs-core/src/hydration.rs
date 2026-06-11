@@ -1,9 +1,8 @@
 //! Hydration policy and request types.
 //!
-//! v1 uses real files and stub files. The policy intentionally keeps eager
-//! thresholds configurable because `plan.md` calls default aggressiveness an open
-//! question. The default follows the current plan: recent content plus prefetch,
-//! no eager-under-size cutoff.
+//! Hydration policy stays above the filesystem projection. macOS File Provider
+//! mounts materialize online-only items on open, while plain-file mounts can still
+//! use marker files as a developer fallback.
 
 use std::path::PathBuf;
 
@@ -56,6 +55,7 @@ impl HydrationRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HydrationReason {
     ExplicitPull,
+    FileOpen,
     Policy,
     StubRead,
     Prefetch,

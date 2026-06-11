@@ -10,12 +10,29 @@ use afs_core::shadow::{MarkdownBlockKind, ShadowBlock, ShadowDocument};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionMode {
+    PlainFiles,
+    MacosFileProvider,
+}
+
+impl ProjectionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PlainFiles => "plain_files",
+            Self::MacosFileProvider => "macos_file_provider",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountConfig {
     pub mount_id: MountId,
     pub connector: String,
     pub root: PathBuf,
     pub remote_root_id: Option<RemoteId>,
     pub read_only: bool,
+    pub projection: ProjectionMode,
 }
 
 impl MountConfig {
@@ -26,6 +43,7 @@ impl MountConfig {
             root: root.into(),
             remote_root_id: None,
             read_only: false,
+            projection: ProjectionMode::PlainFiles,
         }
     }
 
@@ -36,6 +54,11 @@ impl MountConfig {
 
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    pub fn projection(mut self, projection: ProjectionMode) -> Self {
+        self.projection = projection;
         self
     }
 }

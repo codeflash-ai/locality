@@ -9,7 +9,10 @@ use afs_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use afs_core::{AfsError, AfsResult};
-use afs_store::{EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository};
+use afs_store::{
+    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
+    ProjectionMode,
+};
 use afsd::execution::{AdvanceScheduledPullJob, DaemonExecutor};
 use afsd::hydration::HydrationQueue;
 use afsd::reconcile::{
@@ -89,6 +92,63 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
         .expect("default root hydration request");
     assert_eq!(request.remote_id, RemoteId::new("root-page"));
     assert_eq!(request.reason, HydrationReason::Policy);
+}
+
+#[test]
+fn scheduled_pull_macos_file_provider_keeps_unhydrated_pages_online_only() {
+    let root = temp_root("scheduled-pull-file-provider");
+    let mount_id = MountId::new("notion-main");
+    let mount = MountConfig::new(mount_id.clone(), "notion", root.clone())
+        .with_remote_root_id(RemoteId::new("root-page"))
+        .projection(ProjectionMode::MacosFileProvider);
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![
+            page_entry(
+                &mount_id,
+                "root-page",
+                "Home",
+                "Home.md",
+                "2026-06-10T00:00:00Z",
+            ),
+            page_entry(
+                &mount_id,
+                "child-page",
+                "Child",
+                "Home/Child.md",
+                "2026-06-10T00:00:00Z",
+            ),
+            database_entry(&mount_id, "tasks-db", "Tasks", "Home/Tasks ~tasks"),
+        ],
+    );
+    source.insert_schema("tasks-db", "title: Tasks\nproperties: {}\n");
+    let mut supervisor = supervisor_with_mounts([mount]);
+
+    supervisor.start().expect("start supervisor");
+    let report = supervisor
+        .advance_and_execute_scheduled_pull(
+            AdvanceScheduledPullJob::new(Duration::ZERO),
+            &source,
+            &DefaultFetchScheduleStrategy,
+        )
+        .expect("scheduled pull");
+
+    assert_eq!(report.enumerated, 3);
+    assert_eq!(report.stubbed, 0);
+    assert_eq!(report.schemas_written, 0);
+    assert_eq!(report.queued_hydrations, 1);
+    assert!(!root.join("Home.md").exists());
+    assert!(!root.join("Home/Child.md").exists());
+    assert!(!root.join("Home/Tasks ~tasks/_schema.yaml").exists());
+
+    let child = supervisor
+        .store()
+        .get_entity(&mount_id, &RemoteId::new("child-page"))
+        .expect("get child entity")
+        .expect("child entity");
+    assert_eq!(child.path, PathBuf::from("Home/Child.md"));
+    assert_eq!(child.hydration, HydrationState::Stub);
 }
 
 #[test]

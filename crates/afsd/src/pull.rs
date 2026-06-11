@@ -12,7 +12,8 @@ use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, TreeEntry};
 use afs_core::shadow::ShadowDocument;
 use afs_notion::NotionConnector;
 use afs_store::{
-    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
+    EntityRecord, EntityRepository, MountConfig, MountRepository, ProjectionMode, ShadowRepository,
+    StoreError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -180,6 +181,10 @@ fn write_stub_if_needed(
     mount: &MountConfig,
     entry: &TreeEntry,
 ) -> Result<bool, PullError> {
+    if mount.projection == ProjectionMode::MacosFileProvider {
+        return Ok(false);
+    }
+
     match entry.kind {
         EntityKind::Page => {
             let path = mount.root.join(&entry.path);

@@ -15,7 +15,9 @@ use afs_notion::dto::{
     RichTextDto, SelectOptionDto, SelectPropertySchemaDto, TextRichTextDto, TitleBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
-use afs_store::{EntityRepository, InMemoryStateStore, MountRepository, ShadowRepository};
+use afs_store::{
+    EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode, ShadowRepository,
+};
 
 #[test]
 fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
@@ -123,6 +125,7 @@ impl PullFixture {
                 root: self.root.clone(),
                 remote_root_id: Some(self.root_page_id.clone()),
                 read_only: false,
+                projection: ProjectionMode::PlainFiles,
             },
         )
         .expect("mount");

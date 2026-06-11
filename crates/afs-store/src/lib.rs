@@ -13,6 +13,8 @@ pub mod sqlite;
 
 pub use error::{StoreError, StoreResult};
 pub use memory::InMemoryStateStore;
-pub use records::{EntityRecord, MountConfig, ShadowBlockRecord, ShadowSnapshotRecord};
+pub use records::{
+    EntityRecord, MountConfig, ProjectionMode, ShadowBlockRecord, ShadowSnapshotRecord,
+};
 pub use repository::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
 pub use sqlite::SqliteStateStore;

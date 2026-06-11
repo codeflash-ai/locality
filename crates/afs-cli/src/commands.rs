@@ -4,7 +4,7 @@ use afs_connector::ConnectorUndoApplier;
 use afs_core::AfsError;
 use afs_core::model::{MountId, RemoteId};
 use afs_notion::{NotionConfig, NotionConnector};
-use afs_store::SqliteStateStore;
+use afs_store::{ProjectionMode, SqliteStateStore};
 use afsd::execution::PushJobReport;
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request};
 use serde::Serialize;
@@ -65,7 +65,7 @@ fn mount(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "mount",
                 "usage",
-                "usage: afs mount notion <path> --root-page <page-id> [--mount-id <id>] [--read-only] [--json]",
+                "usage: afs mount notion <path> --root-page <page-id> [--mount-id <id>] [--projection plain-files|macos-file-provider] [--read-only] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -77,7 +77,7 @@ fn mount(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "mount",
                 "usage",
-                "usage: afs mount notion <path> --root-page <page-id> [--mount-id <id>] [--read-only] [--json]",
+                "usage: afs mount notion <path> --root-page <page-id> [--mount-id <id>] [--projection plain-files|macos-file-provider] [--read-only] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -92,6 +92,17 @@ fn mount(args: &[String], json: bool) -> i32 {
             ),
             EXIT_USAGE,
         );
+    };
+
+    let projection = match projection_mode(args) {
+        Ok(projection) => projection,
+        Err(message) => {
+            return command_error(
+                json,
+                CommandError::new("mount", "usage", message),
+                EXIT_USAGE,
+            );
+        }
     };
 
     let mut store = match SqliteStateStore::open(default_state_root()) {
@@ -115,6 +126,7 @@ fn mount(args: &[String], json: bool) -> i32 {
         root: PathBuf::from(root),
         remote_root_id: Some(RemoteId::new(root_page_id)),
         read_only: has_flag(args, "--read-only"),
+        projection,
     };
 
     match run_mount(&mut store, options) {
@@ -963,8 +975,16 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+fn projection_mode(args: &[String]) -> Result<ProjectionMode, &'static str> {
+    match flag_value(args, "--projection") {
+        None | Some("plain-files") => Ok(ProjectionMode::PlainFiles),
+        Some("macos-file-provider") => Ok(ProjectionMode::MacosFileProvider),
+        Some(_) => Err("--projection must be plain-files or macos-file-provider"),
+    }
+}
+
 fn takes_value(arg: &str) -> bool {
-    matches!(arg, "--root-page" | "--mount-id")
+    matches!(arg, "--root-page" | "--mount-id" | "--projection")
 }
 
 fn default_state_root() -> PathBuf {

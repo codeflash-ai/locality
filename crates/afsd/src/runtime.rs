@@ -15,7 +15,7 @@ use std::time::Instant;
 use afs_core::AfsError;
 use afs_core::canonical::parse_canonical_markdown;
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
-use afs_core::model::{EntityKind, HydrationState};
+use afs_core::model::{EntityKind, HydrationState, MountId};
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository,
@@ -25,6 +25,9 @@ use serde_json::json;
 
 use crate::DaemonConfig;
 use crate::execution::{DaemonEventReport, PushJob};
+use crate::file_provider::{
+    file_provider_children, file_provider_item, materialize_file_provider_item,
+};
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome};
 use crate::ipc::{DaemonRequest, DaemonResponse};
 use crate::pull::run_pull;
@@ -152,6 +155,42 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
             "runtime runner does not handle file events",
         ))
     }
+
+    fn run_file_provider_item(
+        &self,
+        _state_root: PathBuf,
+        _mount_id: String,
+        _identifier: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle file provider item metadata",
+        )
+    }
+
+    fn run_file_provider_children(
+        &self,
+        _state_root: PathBuf,
+        _mount_id: String,
+        _container_identifier: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle file provider child enumeration",
+        )
+    }
+
+    fn run_file_provider_materialize(
+        &self,
+        _state_root: PathBuf,
+        _mount_id: String,
+        _identifier: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle file provider materialization",
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -244,6 +283,60 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
     ) -> afs_core::AfsResult<FileEventRuntimeReport> {
         let mut store = SqliteStateStore::open(state_root).map_err(AfsError::from)?;
         execute_file_event(&mut store, event)
+    }
+
+    fn run_file_provider_item(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        identifier: String,
+    ) -> DaemonResponse {
+        let store = match SqliteStateStore::open(state_root) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        match file_provider_item(&store, &MountId::new(mount_id), &identifier) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+
+    fn run_file_provider_children(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> DaemonResponse {
+        let store = match SqliteStateStore::open(state_root) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        match file_provider_children(&store, &MountId::new(mount_id), &container_identifier) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+
+    fn run_file_provider_materialize(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        identifier: String,
+    ) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        let connector = default_notion_connector();
+        match materialize_file_provider_item(
+            &mut store,
+            &connector,
+            &MountId::new(mount_id),
+            &identifier,
+        ) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
     }
 }
 
@@ -346,6 +439,42 @@ impl RuntimeState {
                 });
                 self.maybe_start_next_job();
             }
+            DaemonRequest::FileProviderItem {
+                mount_id,
+                identifier,
+            } => {
+                self.pending_requests
+                    .push_back(MutatingRequest::FileProviderItem {
+                        mount_id,
+                        identifier,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
+            }
+            DaemonRequest::FileProviderChildren {
+                mount_id,
+                container_identifier,
+            } => {
+                self.pending_requests
+                    .push_back(MutatingRequest::FileProviderChildren {
+                        mount_id,
+                        container_identifier,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
+            }
+            DaemonRequest::FileProviderMaterialize {
+                mount_id,
+                identifier,
+            } => {
+                self.pending_requests
+                    .push_front(MutatingRequest::FileProviderMaterialize {
+                        mount_id,
+                        identifier,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
+            }
         }
     }
 
@@ -364,6 +493,10 @@ impl RuntimeState {
                 respond_to,
             }
             | JobCompletion::Push {
+                response,
+                respond_to,
+            }
+            | JobCompletion::Response {
                 response,
                 respond_to,
             } => {
@@ -492,6 +625,30 @@ fn run_job(
         MutatingJob::Request(MutatingRequest::FileEvent { event }) => {
             JobCompletion::FileEvent(runner.run_file_event(state_root, event))
         }
+        MutatingJob::Request(MutatingRequest::FileProviderItem {
+            mount_id,
+            identifier,
+            respond_to,
+        }) => JobCompletion::Response {
+            response: runner.run_file_provider_item(state_root, mount_id, identifier),
+            respond_to,
+        },
+        MutatingJob::Request(MutatingRequest::FileProviderChildren {
+            mount_id,
+            container_identifier,
+            respond_to,
+        }) => JobCompletion::Response {
+            response: runner.run_file_provider_children(state_root, mount_id, container_identifier),
+            respond_to,
+        },
+        MutatingJob::Request(MutatingRequest::FileProviderMaterialize {
+            mount_id,
+            identifier,
+            respond_to,
+        }) => JobCompletion::Response {
+            response: runner.run_file_provider_materialize(state_root, mount_id, identifier),
+            respond_to,
+        },
         MutatingJob::ScheduledPull { tick } => {
             JobCompletion::ScheduledPull(runner.run_scheduled_pull(state_root, tick, policy))
         }
@@ -524,6 +681,21 @@ enum MutatingRequest {
     FileEvent {
         event: FileEvent,
     },
+    FileProviderItem {
+        mount_id: String,
+        identifier: String,
+        respond_to: Sender<DaemonResponse>,
+    },
+    FileProviderChildren {
+        mount_id: String,
+        container_identifier: String,
+        respond_to: Sender<DaemonResponse>,
+    },
+    FileProviderMaterialize {
+        mount_id: String,
+        identifier: String,
+        respond_to: Sender<DaemonResponse>,
+    },
 }
 
 enum MutatingJob {
@@ -538,6 +710,10 @@ enum JobCompletion {
         respond_to: Sender<DaemonResponse>,
     },
     Push {
+        response: DaemonResponse,
+        respond_to: Sender<DaemonResponse>,
+    },
+    Response {
         response: DaemonResponse,
         respond_to: Sender<DaemonResponse>,
     },

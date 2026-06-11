@@ -271,7 +271,9 @@ pub enum HydrationPriority {
 
 pub fn hydration_priority(reason: &HydrationReason) -> HydrationPriority {
     match reason {
-        HydrationReason::ExplicitPull | HydrationReason::StubRead => HydrationPriority::High,
+        HydrationReason::ExplicitPull | HydrationReason::FileOpen | HydrationReason::StubRead => {
+            HydrationPriority::High
+        }
         HydrationReason::Policy => HydrationPriority::Normal,
         HydrationReason::Prefetch => HydrationPriority::Low,
     }
