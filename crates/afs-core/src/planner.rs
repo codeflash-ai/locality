@@ -85,6 +85,58 @@ pub enum PushOperation {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PushOperationKind {
+    UpdateBlock,
+    AppendBlock,
+    MoveBlock,
+    ArchiveBlock,
+    ArchiveEntity,
+    UpdateProperties,
+    CreateEntity,
+}
+
+impl PushOperationKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UpdateBlock => "update_block",
+            Self::AppendBlock => "append_block",
+            Self::MoveBlock => "move_block",
+            Self::ArchiveBlock => "archive_block",
+            Self::ArchiveEntity => "archive_entity",
+            Self::UpdateProperties => "update_properties",
+            Self::CreateEntity => "create_entity",
+        }
+    }
+
+    pub fn all() -> [Self; 7] {
+        [
+            Self::UpdateBlock,
+            Self::AppendBlock,
+            Self::MoveBlock,
+            Self::ArchiveBlock,
+            Self::ArchiveEntity,
+            Self::UpdateProperties,
+            Self::CreateEntity,
+        ]
+    }
+}
+
+impl PushOperation {
+    pub fn kind(&self) -> PushOperationKind {
+        match self {
+            Self::UpdateBlock { .. } => PushOperationKind::UpdateBlock,
+            Self::AppendBlock { .. } => PushOperationKind::AppendBlock,
+            Self::MoveBlock { .. } => PushOperationKind::MoveBlock,
+            Self::ArchiveBlock { .. } => PushOperationKind::ArchiveBlock,
+            Self::ArchiveEntity { .. } => PushOperationKind::ArchiveEntity,
+            Self::UpdateProperties { .. } => PushOperationKind::UpdateProperties,
+            Self::CreateEntity { .. } => PushOperationKind::CreateEntity,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanSummary {
     pub blocks_created: usize,

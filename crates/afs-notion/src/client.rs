@@ -49,6 +49,15 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
     ) -> AfsResult<BlockListDto>;
     fn search_pages(&self, start_cursor: Option<&str>) -> AfsResult<PageListDto>;
     fn update_block(&self, block_id: &str, body: serde_json::Value) -> AfsResult<BlockDto>;
+    fn move_block(
+        &self,
+        block_id: &str,
+        parent_id: &str,
+        after: Option<&str>,
+    ) -> AfsResult<BlockDto> {
+        let _ = (block_id, parent_id, after);
+        Err(AfsError::NotImplemented("move Notion block"))
+    }
     fn append_block_children(
         &self,
         block_id: &str,
@@ -256,6 +265,18 @@ impl NotionApi for HttpNotionApi {
         self.patch_json(&format!("/v1/blocks/{block_id}"), body)
     }
 
+    fn move_block(
+        &self,
+        block_id: &str,
+        parent_id: &str,
+        after: Option<&str>,
+    ) -> AfsResult<BlockDto> {
+        self.patch_json(
+            &format!("/v1/blocks/{block_id}"),
+            move_block_body(parent_id, after),
+        )
+    }
+
     fn append_block_children(
         &self,
         block_id: &str,
@@ -267,4 +288,25 @@ impl NotionApi for HttpNotionApi {
     fn delete_block(&self, block_id: &str) -> AfsResult<BlockDto> {
         self.delete_json(&format!("/v1/blocks/{block_id}"))
     }
+}
+
+fn move_block_body(parent_id: &str, after: Option<&str>) -> serde_json::Value {
+    let mut body = json!({
+        "parent": {
+            "type": "page_id",
+            "page_id": parent_id,
+        },
+        "position": {
+            "type": "start",
+        },
+    });
+    if let Some(after) = after {
+        body["position"] = json!({
+            "type": "after_block",
+            "after_block": {
+                "id": after,
+            },
+        });
+    }
+    body
 }

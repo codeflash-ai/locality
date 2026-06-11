@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::diff::{
     DiffError, GuardrailOutput, PreviewOptions, PushPlanOutput, ValidationIssueOutput, action_name,
-    run_preview,
+    run_preview, unsupported_action_fields,
 };
 
 pub fn run_push<S>(
@@ -84,6 +84,8 @@ pub struct PushReport {
     pub apply_effect_count: usize,
     pub completed_stages: Vec<String>,
     pub message: Option<String>,
+    pub unsupported: Vec<String>,
+    pub suggested_fix: Option<String>,
 }
 
 impl PushReport {
@@ -107,6 +109,7 @@ impl PushReport {
             .map(push_stage_name)
             .map(str::to_string)
             .collect();
+        let (unsupported, message, suggested_fix) = unsupported_action_fields(&pipeline.action);
         let mut cli_report = Self {
             ok: false,
             command: "push",
@@ -129,7 +132,9 @@ impl PushReport {
             reconciled_remote_ids: Vec::new(),
             apply_effect_count: 0,
             completed_stages,
-            message: None,
+            message,
+            unsupported,
+            suggested_fix,
         };
 
         if let Some(result) = execution {
@@ -137,7 +142,9 @@ impl PushReport {
         } else if let Some(error) = error {
             cli_report.ok = false;
             cli_report.push_id = push_id.map(|push_id| push_id.0);
-            cli_report.message = Some(error.message);
+            if cli_report.message.is_none() {
+                cli_report.message = Some(error.message);
+            }
         } else {
             cli_report.ok = cli_report.action == "noop";
         }
@@ -173,6 +180,8 @@ impl PushReport {
             apply_effect_count: 0,
             completed_stages: preview.completed_stages,
             message,
+            unsupported: preview.unsupported,
+            suggested_fix: preview.suggested_fix,
         }
     }
 
@@ -214,7 +223,7 @@ pub fn push_report_exit_code(report: &PushReport) -> i32 {
         "noop" | "reconciled" => 0,
         "fix_validation" => 3,
         "confirm_plan" | "confirm_dangerous_plan" | "read_only_blocked" => 4,
-        "apply_not_implemented" => 5,
+        "apply_not_implemented" | "unsupported_operations" => 5,
         _ => 1,
     }
 }

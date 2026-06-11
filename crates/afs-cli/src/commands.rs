@@ -22,6 +22,7 @@ use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
 use crate::pull::{PullError, PullReport, run_pull};
 use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
+use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::status::{StatusError, StatusOptions, StatusReport, run_status};
 
 const EXIT_SUCCESS: i32 = 0;
@@ -41,6 +42,7 @@ const COMMANDS: &[&str] = &[
     "undo",
     "log",
     "resolve",
+    "restore",
     "config",
     "file-provider",
 ];
@@ -61,6 +63,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         "push" => push(&args[1..], json),
         "daemon" => daemon(&args[1..], json),
         "diff" => diff(&args[1..], json),
+        "restore" => restore(&args[1..], json),
         "undo" => undo(&args[1..], json),
         "log" => log(&args[1..], json),
         "resolve" => stub("resolve", json),
@@ -208,6 +211,46 @@ fn file_provider_unregister(args: &[String], json: bool) -> i32 {
         vec!["--mount-id".to_string(), mount_id.clone()],
         Some(mount_id),
     )
+}
+
+fn restore(args: &[String], json: bool) -> i32 {
+    let Some(path) = first_positional(args) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "restore",
+                "usage",
+                "usage: afs restore <path> [--force] [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let mut store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("restore", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = RestoreOptions {
+        force: has_flag(args, "--force"),
+    };
+
+    match run_restore(&mut store, PathBuf::from(path), options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_restore_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => restore_command_error(json, error),
+    }
 }
 
 fn mount(args: &[String], json: bool) -> i32 {
@@ -671,6 +714,27 @@ fn print_push_report(report: &PushReport) {
                     .unwrap_or("connector apply is not implemented yet")
             );
         }
+        "unsupported_operations" => {
+            println!(
+                "{}",
+                report
+                    .message
+                    .as_deref()
+                    .unwrap_or("connector cannot apply one or more planned operations")
+            );
+            if let Some(suggested_fix) = &report.suggested_fix {
+                println!("  suggested_fix: {suggested_fix}");
+            }
+        }
+        "apply_failed" => {
+            println!(
+                "{}",
+                report
+                    .message
+                    .as_deref()
+                    .unwrap_or("connector apply failed")
+            );
+        }
         _ => println!("push stopped: {}", report.action),
     }
 }
@@ -703,6 +767,10 @@ fn print_pull_report(report: &PullReport) {
     }
 }
 
+fn print_restore_report(report: &RestoreReport) {
+    println!("restored {}", report.path);
+}
+
 fn print_status_report(report: &StatusReport) {
     if report.mounts.is_empty() {
         println!("no mounts");
@@ -712,20 +780,27 @@ fn print_status_report(report: &StatusReport) {
     let mut printed_entries = 0;
     for mount in &report.mounts {
         for entry in &mount.entries {
-            let line_state = if entry.failed_journal_count > 0 {
-                "failed_journal"
-            } else if entry.pending_journal_count > 0 {
-                "pending_journal"
-            } else {
-                entry.state.as_str()
-            };
-
-            if line_state == "clean" {
+            if entry.state.as_str() == "clean"
+                && entry.pending_journal_count == 0
+                && entry.failed_journal_count == 0
+            {
                 continue;
             }
 
             printed_entries += 1;
-            println!("{line_state} {} {}", mount.mount_id, entry.path);
+            println!("{}  {}", mount.mount_id, entry.path);
+            println!(
+                "  state: {}  hydration: {}",
+                entry.state.as_str(),
+                entry.hydration
+            );
+            for issue in &entry.issues {
+                if issue.code == "last_failure" {
+                    println!("  last_failure: {}", issue.message);
+                } else {
+                    println!("  issue: {} - {}", issue.code, issue.message);
+                }
+            }
         }
     }
 
@@ -1209,6 +1284,23 @@ fn status_command_error(json: bool, error: StatusError, state_root: PathBuf) -> 
     )
 }
 
+fn restore_command_error(json: bool, error: RestoreError) -> i32 {
+    let exit_code = match &error {
+        RestoreError::MountNotFound(_)
+        | RestoreError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
+        RestoreError::ConflictedRequiresForce(_) => 4,
+        RestoreError::CurrentDir(_)
+        | RestoreError::Store(_)
+        | RestoreError::UnsupportedEntity(_)
+        | RestoreError::WriteFile { .. } => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("restore", error.code(), error.message()),
+        exit_code,
+    )
+}
+
 fn info_command_error(json: bool, error: InfoError, state_root: PathBuf) -> i32 {
     let exit_code = match &error {
         InfoError::MountNotFound(_)
@@ -1458,6 +1550,9 @@ mod tests {
                 reasons: Vec::new(),
             },
             action: if ok { "noop" } else { "fix_validation" }.to_string(),
+            unsupported: Vec::new(),
+            message: None,
+            suggested_fix: None,
             completed_stages: Vec::new(),
         }
     }
@@ -1484,6 +1579,8 @@ mod tests {
             apply_effect_count: 0,
             completed_stages: Vec::new(),
             message: None,
+            unsupported: Vec::new(),
+            suggested_fix: None,
         }
     }
 }

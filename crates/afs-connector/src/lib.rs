@@ -8,7 +8,7 @@
 use afs_core::AfsResult;
 use afs_core::journal::PushId;
 use afs_core::model::{CanonicalDocument, MountId, RemoteId, TreeEntry};
-use afs_core::planner::PushPlan;
+use afs_core::planner::{PushOperationKind, PushPlan};
 use afs_core::push::RemotePrecondition;
 use afs_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult, UndoPlan};
 
@@ -84,6 +84,9 @@ pub struct ApplyUndoResult {
 pub trait Connector {
     fn kind(&self) -> ConnectorKind;
     fn capabilities(&self) -> ConnectorCapabilities;
+    fn supported_push_operations(&self) -> std::collections::BTreeSet<PushOperationKind> {
+        PushOperationKind::all().into_iter().collect()
+    }
     fn enumerate(&self, request: EnumerateRequest) -> AfsResult<Vec<TreeEntry>>;
     fn fetch(&self, request: FetchRequest) -> AfsResult<NativeEntity>;
     fn render(&self, entity: &NativeEntity) -> AfsResult<CanonicalDocument>;

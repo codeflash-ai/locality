@@ -621,6 +621,9 @@ pub struct DiffReport {
     pub plan: Option<PushPlanOutput>,
     pub guardrail: GuardrailOutput,
     pub action: String,
+    pub unsupported: Vec<String>,
+    pub message: Option<String>,
+    pub suggested_fix: Option<String>,
     pub completed_stages: Vec<String>,
 }
 
@@ -645,6 +648,9 @@ impl DiffReport {
             plan: None,
             guardrail: GuardrailOutput::proceed(),
             action: action_name(&PushPipelineAction::FixValidation).to_string(),
+            unsupported: Vec::new(),
+            message: None,
+            suggested_fix: None,
             completed_stages: vec![stage_name(&PushStage::ParseAndValidate).to_string()],
         }
     }
@@ -656,7 +662,8 @@ impl DiffReport {
         entity_id: RemoteId,
         result: PushPipelineResult,
     ) -> Self {
-        let ok = result.validation.is_clean();
+        let (unsupported, message, suggested_fix) = unsupported_action_fields(&result.action);
+        let ok = result.validation.is_clean() && unsupported.is_empty();
         Self {
             ok,
             command,
@@ -672,6 +679,9 @@ impl DiffReport {
             plan: result.plan.map(PushPlanOutput::from),
             guardrail: GuardrailOutput::from(result.guardrail),
             action: action_name(&result.action).to_string(),
+            unsupported,
+            message,
+            suggested_fix,
             completed_stages: result
                 .completed_stages
                 .iter()
@@ -948,6 +958,24 @@ pub fn action_name(action: &PushPipelineAction) -> &'static str {
         PushPipelineAction::ConfirmDangerousPlan => "confirm_dangerous_plan",
         PushPipelineAction::ProceedToApply => "proceed_to_apply",
         PushPipelineAction::ReadOnlyBlocked => "read_only_blocked",
+        PushPipelineAction::UnsupportedOperations { .. } => "unsupported_operations",
+    }
+}
+
+pub fn unsupported_action_fields(
+    action: &PushPipelineAction,
+) -> (Vec<String>, Option<String>, Option<String>) {
+    match action {
+        PushPipelineAction::UnsupportedOperations {
+            operations,
+            message,
+            suggested_fix,
+        } => (
+            operations.clone(),
+            Some(message.clone()),
+            Some(suggested_fix.clone()),
+        ),
+        _ => (Vec::new(), None, None),
     }
 }
 

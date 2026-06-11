@@ -14,6 +14,7 @@ pub mod projection;
 pub mod render;
 pub mod schema;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ use afs_connector::{
     ParsedEntity,
 };
 use afs_core::model::{CanonicalDocument, RemoteId, TreeEntry};
+use afs_core::planner::PushOperationKind;
 use afs_core::{AfsError, AfsResult};
 
 use crate::apply::{apply_plan, apply_undo, check_concurrency};
@@ -134,6 +136,19 @@ impl Connector for NotionConnector {
             supports_databases: true,
             supports_oauth: true,
         }
+    }
+
+    fn supported_push_operations(&self) -> BTreeSet<PushOperationKind> {
+        [
+            PushOperationKind::UpdateBlock,
+            PushOperationKind::AppendBlock,
+            PushOperationKind::MoveBlock,
+            PushOperationKind::ArchiveBlock,
+            PushOperationKind::UpdateProperties,
+            PushOperationKind::CreateEntity,
+        ]
+        .into_iter()
+        .collect()
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> AfsResult<Vec<TreeEntry>> {

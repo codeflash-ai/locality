@@ -137,6 +137,26 @@ pub enum PushPipelineAction {
     ProceedToApply,
     /// Stop because the mount is configured read-only.
     ReadOnlyBlocked,
+    /// Stop because the active connector cannot apply one or more planned
+    /// operation kinds.
+    UnsupportedOperations {
+        operations: Vec<String>,
+        message: String,
+        suggested_fix: String,
+    },
+}
+
+impl PushPipelineAction {
+    pub fn unsupported_operations(operations: Vec<String>) -> Self {
+        let joined = operations.join(", ");
+        Self::UnsupportedOperations {
+            operations,
+            message: format!("connector cannot apply: {joined}"),
+            suggested_fix:
+                "reorder edits to avoid unsupported operations, or wait for connector support"
+                    .to_string(),
+        }
+    }
 }
 
 pub fn evaluate_guardrails(
