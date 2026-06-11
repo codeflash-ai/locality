@@ -5,6 +5,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request};
 use serde::{Deserialize, Serialize};
 
@@ -471,6 +474,7 @@ fn start_session(
     if let Some(tcp_addr) = &options.tcp_addr {
         command.env("AFS_DAEMON_TCP_ADDR", tcp_addr);
     }
+    detach_session_process(&mut command);
 
     let child = command
         .spawn()
@@ -483,6 +487,21 @@ fn start_session(
         afsd_bin: afsd_bin.to_path_buf(),
     })
 }
+
+#[cfg(unix)]
+fn detach_session_process(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_session_process(_command: &mut Command) {}
 
 #[cfg(target_os = "macos")]
 fn start_launchd(

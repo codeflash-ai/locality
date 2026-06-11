@@ -20,5 +20,6 @@ afs-connector.workspace = true
 afs-store.workspace = true
 afs-notion.workspace = true
 afsd = { path = "../afsd" }
+libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
