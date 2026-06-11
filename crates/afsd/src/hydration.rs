@@ -49,6 +49,7 @@ pub enum HydrationOutcome {
 pub struct HydrationExecutor<'a, S, Source: ?Sized> {
     store: &'a mut S,
     source: &'a Source,
+    output_root: Option<PathBuf>,
 }
 
 impl<'a, S, Source> HydrationExecutor<'a, S, Source>
@@ -57,7 +58,23 @@ where
     Source: HydrationSource + ?Sized,
 {
     pub fn new(store: &'a mut S, source: &'a Source) -> Self {
-        Self { store, source }
+        Self {
+            store,
+            source,
+            output_root: None,
+        }
+    }
+
+    pub fn new_with_output_root(
+        store: &'a mut S,
+        source: &'a Source,
+        output_root: PathBuf,
+    ) -> Self {
+        Self {
+            store,
+            source,
+            output_root: Some(output_root),
+        }
     }
 
     pub fn hydrate_request(&mut self, request: HydrationRequest) -> AfsResult<HydrationOutcome> {
@@ -69,6 +86,11 @@ where
 
         let mount = require_mount(self.store, &request.mount_id)?;
         let entity = require_entity(self.store, &request.mount_id, &request.remote_id)?;
+        let output_root = self
+            .output_root
+            .as_deref()
+            .unwrap_or(&mount.root)
+            .to_path_buf();
         let path = request_path(&mount, &request.path);
         let can_replace = self.can_replace_file(&mount, &entity, &path)?;
         let rendered = self.source.fetch_render(&request)?;
@@ -83,7 +105,7 @@ where
             if should_recreate_conflict_sidecar(&entity, &path)
                 || !self.remote_matches_shadow(&mount, &entity, &rendered.shadow)?
             {
-                self.materialize_conflict(&mount, entity, &path, rendered)?;
+                self.materialize_conflict(&mount, &output_root, entity, &path, rendered)?;
             } else {
                 self.mark_dirty_if_allowed(entity)?;
             }
@@ -91,7 +113,7 @@ where
         }
 
         for asset in &rendered.assets {
-            let path = mount_relative_path(&mount.root, &asset.path)?;
+            let path = mount_relative_path(&output_root, &asset.path)?;
             write_binary_atomic(&path, &asset.bytes)?;
         }
         write_atomic(&path, render_canonical_markdown(&rendered.document))?;
@@ -167,13 +189,14 @@ where
     fn materialize_conflict(
         &mut self,
         mount: &MountConfig,
+        output_root: &Path,
         mut entity: EntityRecord,
         path: &Path,
         rendered: HydratedEntity,
     ) -> AfsResult<()> {
         let remote_path = remote_variant_path(path);
         for asset in &rendered.assets {
-            let path = mount_relative_path(&mount.root, &asset.path)?;
+            let path = mount_relative_path(output_root, &asset.path)?;
             write_binary_atomic(&path, &asset.bytes)?;
         }
         write_atomic(&remote_path, render_canonical_markdown(&rendered.document))?;

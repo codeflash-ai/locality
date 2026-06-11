@@ -41,6 +41,7 @@ impl ConnectorProfileId {
 pub enum ProjectionMode {
     PlainFiles,
     MacosFileProvider,
+    LinuxFuse,
 }
 
 impl ProjectionMode {
@@ -48,7 +49,12 @@ impl ProjectionMode {
         match self {
             Self::PlainFiles => "plain_files",
             Self::MacosFileProvider => "macos_file_provider",
+            Self::LinuxFuse => "linux_fuse",
         }
+    }
+
+    pub fn uses_virtual_filesystem(&self) -> bool {
+        matches!(self, Self::MacosFileProvider | Self::LinuxFuse)
     }
 }
 

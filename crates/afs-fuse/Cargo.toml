@@ -1,25 +1,23 @@
 [package]
-name = "afsd"
+name = "afs-fuse"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[lib]
-name = "afsd"
-path = "src/lib.rs"
-
 [[bin]]
-name = "afsd"
+name = "afs-fuse"
 path = "src/main.rs"
 
 [dependencies]
 afs-core.workspace = true
-afs-store.workspace = true
-afs-connector.workspace = true
-afs-notion.workspace = true
+afsd = { path = "../afsd" }
 base64 = "0.22"
-notify = "8"
+bytes = "1"
+fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
+futures-util = "0.3"
+libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal"] }

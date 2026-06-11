@@ -6,6 +6,7 @@ members = [
   "crates/afs-connector",
   "crates/afs-store",
   "crates/afs-notion",
+  "crates/afs-fuse",
 ]
 resolver = "2"
 

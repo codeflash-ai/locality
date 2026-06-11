@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
 pub fn execute_push_job<S, Source>(
     store: &mut S,
@@ -46,7 +47,20 @@ where
     S: MountRepository + EntityRepository + ShadowRepository + JournalRepository + JournalStore,
     Source: Connector + HydrationSource + ?Sized,
 {
-    let prepared = preflight_push(source, prepare_push(store, &job)?);
+    execute_push_job_with_content_root(store, job, source, None)
+}
+
+pub fn execute_push_job_with_content_root<S, Source>(
+    store: &mut S,
+    job: PushJob,
+    source: &Source,
+    state_root: Option<&Path>,
+) -> AfsResult<PushJobReport>
+where
+    S: MountRepository + EntityRepository + ShadowRepository + JournalRepository + JournalStore,
+    Source: Connector + HydrationSource + ?Sized,
+{
+    let prepared = preflight_push(source, prepare_push(store, &job, state_root)?);
     let push_id = generate_push_id();
     let mut execution_request = PushExecutionRequest::new(
         push_id.clone(),
@@ -68,7 +82,11 @@ where
     }
 
     let execution_result = {
-        let mut host = DaemonPushHost { store, source };
+        let mut host = DaemonPushHost {
+            store,
+            source,
+            state_root: state_root.map(Path::to_path_buf),
+        };
         execute_journaled_push_with_host(&mut host, execution_request)
     };
 
@@ -141,7 +159,7 @@ struct PreparedPush {
     pipeline: PushPipelineResult,
 }
 
-fn prepare_push<S>(store: &S, job: &PushJob) -> AfsResult<PreparedPush>
+fn prepare_push<S>(store: &S, job: &PushJob, state_root: Option<&Path>) -> AfsResult<PreparedPush>
 where
     S: MountRepository + EntityRepository + ShadowRepository,
 {
@@ -178,7 +196,8 @@ where
         });
     }
 
-    let contents = read_to_string(&absolute_path)?;
+    let read_path = projection_read_path(state_root, &mount, &relative_path, &absolute_path)?;
+    let contents = read_to_string(&read_path)?;
     let parsed = match parse_canonical_markdown(&contents) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -238,9 +257,25 @@ where
     })
 }
 
+fn projection_read_path(
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    relative_path: &Path,
+    absolute_path: &Path,
+) -> AfsResult<PathBuf> {
+    if mount.projection.uses_virtual_filesystem()
+        && let Some(state_root) = state_root
+    {
+        return virtual_fs_content_path(state_root, &mount.mount_id, relative_path);
+    }
+
+    Ok(absolute_path.to_path_buf())
+}
+
 struct DaemonPushHost<'a, S, Source: ?Sized> {
     store: &'a mut S,
     source: &'a Source,
+    state_root: Option<PathBuf>,
 }
 
 impl<S, Source> JournalStore for DaemonPushHost<'_, S, Source>
@@ -324,7 +359,7 @@ where
                     remote_id: remote_id.clone(),
                 })
                 .map_err(AfsError::from)?;
-            let path = mount.root.join(&entity.path);
+            let path = projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
             let rendered =
                 self.source
                     .fetch_render(&afs_core::hydration::HydrationRequest::new(
@@ -367,6 +402,19 @@ where
     }
     store.save_entity(entity.clone()).map_err(AfsError::from)?;
     Ok(())
+}
+
+fn projection_write_path(
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> PathBuf {
+    if mount.projection.uses_virtual_filesystem()
+        && let Some(state_root) = state_root
+    {
+        return virtual_fs_content_root(state_root, &mount.mount_id).join(relative_path);
+    }
+    mount.root.join(relative_path)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

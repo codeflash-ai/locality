@@ -7,7 +7,8 @@ This repository contains the Rust workspace for the `plan.md` design and the fir
 ## Workspace layout
 
 - `crates/afs-cli`: `afs` command surface for humans and agents.
-- `crates/afsd`: per-user daemon supervising mounts, watchers, hydration, pull, and push orchestration.
+- `crates/afsd`: per-user daemon supervising mounts, virtual filesystem projection requests, watchers, hydration, pull, and push orchestration.
+- `crates/afs-fuse`: Linux FUSE projection helper for `linux_fuse` mounts.
 - `crates/afs-core`: connector-agnostic sync engine, three-tree model, diff, planning, conflicts, hydration state, validation, and journal abstractions.
 - `crates/afs-connector`: connector SDK trait for enumerate, fetch, render, parse, and apply.
 - `crates/afs-notion`: first-party Notion connector with live page/block reads, database row projection, schema rendering, narrow block writes, and supported page-property writes.
@@ -17,4 +18,4 @@ This repository contains the Rust workspace for the `plan.md` design and the fir
 
 ## Current status
 
-The implementation is still early, but the main module boundaries are now exercised end to end: mount writes concise agent guidance, mount and pull can project a Notion root page into files, database rows appear as page stubs with property frontmatter, selected pages can hydrate, info explains local source context, status reports local dirty/stub/conflict state, simple block and supported property edits can push with journaling and reconciliation, daemon hydration requests have a tested execution path, and `afs daemon start|stop|status` can run `afsd` as a user-managed background process.
+The implementation is still early, but the main module boundaries are now exercised end to end: mount writes concise agent guidance, mount and pull can project a Notion root page into files, database rows appear as page stubs with property frontmatter, selected pages can hydrate, info explains local source context, status reports local dirty/stub/conflict state, simple block and supported property edits can push with journaling and reconciliation, daemon hydration requests and virtual filesystem metadata/write requests have tested execution paths, Linux FUSE has an initial mount helper, and `afs daemon start|stop|status` can run `afsd` as a user-managed background process.

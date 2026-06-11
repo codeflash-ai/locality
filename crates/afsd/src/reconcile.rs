@@ -14,7 +14,7 @@ use afs_core::hydration::{
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::NotionConnector;
-use afs_store::{EntityRecord, EntityRepository, MountConfig, ProjectionMode};
+use afs_store::{EntityRecord, EntityRepository, MountConfig};
 
 use crate::hydration::HydrationEngine;
 use crate::scheduler::PullSchedulerTick;
@@ -233,7 +233,7 @@ fn refresh_projection<Source>(
 where
     Source: ScheduledPullSource + ?Sized,
 {
-    if mount.projection == ProjectionMode::MacosFileProvider {
+    if mount.projection.uses_virtual_filesystem() {
         return Ok(ProjectionWrite::None);
     }
 
@@ -269,7 +269,7 @@ fn rename_projection_if_needed(
     existing: Option<&EntityRecord>,
     entry: &TreeEntry,
 ) -> AfsResult<()> {
-    if mount.projection == ProjectionMode::MacosFileProvider {
+    if mount.projection.uses_virtual_filesystem() {
         return Ok(());
     }
 

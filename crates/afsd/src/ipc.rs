@@ -24,6 +24,23 @@ pub enum DaemonRequest {
         assume_yes: bool,
         confirm_dangerous: bool,
     },
+    VirtualFsItem {
+        mount_id: String,
+        identifier: String,
+    },
+    VirtualFsChildren {
+        mount_id: String,
+        container_identifier: String,
+    },
+    VirtualFsMaterialize {
+        mount_id: String,
+        identifier: String,
+    },
+    VirtualFsCommitWrite {
+        mount_id: String,
+        identifier: String,
+        contents_base64: String,
+    },
     FileProviderItem {
         mount_id: String,
         identifier: String,
@@ -206,4 +223,58 @@ where
     serde_json::to_writer(&mut *writer, value)?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DaemonRequest;
+
+    #[test]
+    fn virtual_fs_item_command_decodes_as_platform_neutral_request() {
+        let request: DaemonRequest = serde_json::from_str(
+            r#"{"command":"virtual_fs_item","mount_id":"notion-main","identifier":"page-1"}"#,
+        )
+        .expect("decode virtual fs item request");
+
+        assert_eq!(
+            request,
+            DaemonRequest::VirtualFsItem {
+                mount_id: "notion-main".to_string(),
+                identifier: "page-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn file_provider_item_command_remains_a_compatibility_alias() {
+        let request: DaemonRequest = serde_json::from_str(
+            r#"{"command":"file_provider_item","mount_id":"notion-main","identifier":"page-1"}"#,
+        )
+        .expect("decode file provider item request");
+
+        assert_eq!(
+            request,
+            DaemonRequest::FileProviderItem {
+                mount_id: "notion-main".to_string(),
+                identifier: "page-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn virtual_fs_commit_write_command_decodes() {
+        let request: DaemonRequest = serde_json::from_str(
+            r#"{"command":"virtual_fs_commit_write","mount_id":"notion-main","identifier":"page-1","contents_base64":"SGVsbG8="}"#,
+        )
+        .expect("decode virtual fs commit write request");
+
+        assert_eq!(
+            request,
+            DaemonRequest::VirtualFsCommitWrite {
+                mount_id: "notion-main".to_string(),
+                identifier: "page-1".to_string(),
+                contents_base64: "SGVsbG8=".to_string()
+            }
+        );
+    }
 }

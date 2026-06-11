@@ -127,24 +127,46 @@ important invariant: daemon-managed mutations are serialized through one queue.
 Watcher events use the same queue, so local filesystem changes cannot race
 remote pull, hydration, or push reconciliation.
 
-## File Watching
+## Virtual Filesystem Projections
 
-macOS File Provider mounts do not rely on read-after-the-fact watcher events for
-online-only files. The extension calls daemon IPC directly:
+Product-grade online-only mounts must use a virtual filesystem projection, not
+read-after-the-fact file watching. The daemon owns the durable state and exposes a
+platform-neutral `virtual_fs` boundary:
 
-- `file_provider_item` returns one projected item from SQLite without reading a
+- `virtual_fs_item` returns one projected item from SQLite without reading a
   Markdown body.
-- `file_provider_children` returns dataless directory contents from SQLite.
-- `file_provider_materialize` hydrates a page with `HydrationReason::FileOpen`
-  and returns the materialized Markdown path once the content exists locally.
-  The Swift extension copies that path into File Provider's transfer directory
-  before completing `fetchContents`, so the system can take ownership without
-  moving AgentFS's canonical hydrated copy.
+- `virtual_fs_children` returns dataless directory contents from SQLite.
+- `virtual_fs_materialize` hydrates a page with `HydrationReason::FileOpen` and
+  returns the materialized Markdown path once the content exists locally.
+- `virtual_fs_commit_write` records full-file writes from virtual filesystem
+  adapters into daemon-owned content storage and updates local dirty state.
 
-Scheduled reconciliation skips writing placeholder Markdown files for mounts
-whose projection mode is `macos_file_provider`; it only updates durable entity
-state and queues policy hydration. Plain-file mounts still use the fallback
-watcher path below.
+macOS File Provider uses this boundary through compatibility IPC names
+(`file_provider_item`, `file_provider_children`, and
+`file_provider_materialize`). The Swift extension copies the materialized path
+into File Provider's transfer directory before completing `fetchContents`, so the
+system can take ownership without moving AgentFS's canonical hydrated copy.
+
+Linux should use a separate FUSE projection adapter over the same daemon
+boundary. `readdir` and `getattr` read store metadata, `open`/`read` block on
+daemon materialization and then serve real bytes, and write/flush paths should
+route local edits back through daemon-owned dirty/push/reconcile logic. inotify is
+not sufficient for online-only reads because it observes filesystem activity
+after the kernel has already asked for file contents; fanotify permission events
+can block opens but still require a backing file to exist before allowing the
+open. FUSE is the clean Linux equivalent because AgentFS directly serves the
+read.
+
+Virtual projection contents are materialized under `~/.afs/content/<mount-id>/`
+instead of under the mounted root. This avoids recursive FUSE calls when the root
+is itself a virtual mount and gives macOS/Linux adapters one stable byte source.
+
+Scheduled reconciliation skips writing placeholder Markdown files for virtual
+filesystem projection modes such as `macos_file_provider` and `linux_fuse`; it
+only updates durable entity state and queues policy hydration. Plain-file mounts
+still use the fallback watcher path below.
+
+## File Watching
 
 The foreground daemon starts a `notify` watcher for every mount loaded from the
 SQLite store at startup, and `reload_mounts` reconciles those watches with the

@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -421,35 +422,30 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    if mount.projection != ProjectionMode::MacosFileProvider {
-        return command_error(
-            json,
-            CommandError::new(
-                "file-provider",
-                "wrong_projection",
-                format!(
-                    "mount `{}` uses projection `{}`; remount with --projection macos-file-provider",
-                    mount.mount_id.0,
-                    mount.projection.as_str()
-                ),
-            ),
-            EXIT_USAGE,
-        );
-    }
+    let target_os = std::env::consts::OS;
+    let registration = match validate_virtual_projection_registration(&mount, target_os) {
+        Ok(registration) => registration,
+        Err(error) => return command_error(json, error, EXIT_USAGE),
+    };
 
     let mount_id = mount.mount_id.0.clone();
-    let display_name = file_provider_display_name(&mount);
-    run_file_provider_helper(
-        json,
-        "register",
-        vec![
-            "--mount-id".to_string(),
-            mount_id.clone(),
-            "--display-name".to_string(),
-            display_name,
-        ],
-        Some(mount_id),
-    )
+    match registration {
+        VirtualProjectionRegistration::MacosFileProvider => {
+            let display_name = file_provider_display_name(&mount);
+            run_file_provider_helper(
+                json,
+                "register",
+                vec![
+                    "--mount-id".to_string(),
+                    mount_id.clone(),
+                    "--display-name".to_string(),
+                    display_name,
+                ],
+                Some(mount_id),
+            )
+        }
+        VirtualProjectionRegistration::LinuxFuse => run_linux_fuse_register(json, &mount),
+    }
 }
 
 fn file_provider_unregister(args: &[String], json: bool) -> i32 {
@@ -465,10 +461,15 @@ fn file_provider_unregister(args: &[String], json: bool) -> i32 {
         );
     };
 
-    let mount_id = match SqliteStateStore::open(default_state_root())
+    let target_os = std::env::consts::OS;
+    let resolved_mount = SqliteStateStore::open(default_state_root())
         .ok()
-        .and_then(|store| resolve_mount_target(&store, target).ok())
-    {
+        .and_then(|store| resolve_mount_target(&store, target).ok());
+    if target_os == "linux" {
+        return run_linux_fuse_unregister(json, resolved_mount.as_ref(), target);
+    }
+
+    let mount_id = match resolved_mount {
         Some(mount) => mount.mount_id.0,
         None => target.to_string(),
     };
@@ -583,11 +584,7 @@ fn mount(args: &[String], json: bool) -> i32 {
     if first_positional(args) != Some("notion") {
         return command_error(
             json,
-            CommandError::new(
-                "mount",
-                "usage",
-                "usage: afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider] [--read-only] [--json]",
-            ),
+            CommandError::new("mount", "usage", mount_usage()),
             EXIT_USAGE,
         );
     }
@@ -595,11 +592,7 @@ fn mount(args: &[String], json: bool) -> i32 {
     let Some(root) = nth_positional(args, 1) else {
         return command_error(
             json,
-            CommandError::new(
-                "mount",
-                "usage",
-                "usage: afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider] [--read-only] [--json]",
-            ),
+            CommandError::new("mount", "usage", mount_usage()),
             EXIT_USAGE,
         );
     };
@@ -752,6 +745,7 @@ fn status(args: &[String], json: bool) -> i32 {
     };
     let options = StatusOptions {
         path: first_positional(args).map(PathBuf::from),
+        state_root: Some(state_root.clone()),
     };
 
     match run_status(&store, options) {
@@ -1447,6 +1441,305 @@ fn run_file_provider_helper(
         print_file_provider_report(&report);
     }
     EXIT_SUCCESS
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_fuse_register(json: bool, mount: &MountConfig) -> i32 {
+    let state_root = default_state_root();
+    if !daemon_is_running(&state_root) {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "daemon_not_running",
+                "afsd is not running; start it with `afs daemon start` before registering the FUSE mount",
+            ),
+            EXIT_INTERNAL,
+        );
+    }
+
+    let Some(afs_fuse) = afs_fuse_helper_path() else {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "helper_missing",
+                "afs-fuse was not found; build or install the afs-fuse binary",
+            ),
+            EXIT_INTERNAL,
+        );
+    };
+
+    let unit_name = linux_fuse_unit_name(&mount.mount_id.0);
+    let unit_path = match linux_fuse_unit_path(&unit_name) {
+        Ok(path) => path,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    if let Err(error) = write_linux_fuse_unit(&unit_path, &afs_fuse, &state_root, mount) {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+    if let Err(error) = run_systemctl_user(&["daemon-reload"]) {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+    if let Err(error) = run_systemctl_user(&["enable", &unit_name]) {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+    if let Err(error) = run_systemctl_user(&["restart", &unit_name]) {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+
+    let report = FileProviderCommandReport {
+        ok: true,
+        command: "file-provider",
+        action: "register".to_string(),
+        mount_id: Some(mount.mount_id.0.clone()),
+        helper: "systemctl --user".to_string(),
+        helper_report: serde_json::json!({
+            "message": format!("Linux FUSE mount registered for `{}`", mount.mount_id.0),
+            "service": unit_name,
+            "unit_path": unit_path.display().to_string(),
+            "mountpoint": mount.root.display().to_string(),
+            "afs_fuse": afs_fuse.display().to_string(),
+        }),
+    };
+    if json {
+        print_json(&report);
+    } else {
+        print_file_provider_report(&report);
+    }
+    EXIT_SUCCESS
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_linux_fuse_register(json: bool, mount: &MountConfig) -> i32 {
+    command_error(
+        json,
+        CommandError::new(
+            "file-provider",
+            "unsupported_platform",
+            format!(
+                "linux_fuse registration is only supported on Linux; mount `{}` cannot be registered here",
+                mount.mount_id.0
+            ),
+        ),
+        EXIT_USAGE,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_fuse_unregister(json: bool, mount: Option<&MountConfig>, target: &str) -> i32 {
+    if let Some(mount) = mount
+        && let Err(error) = validate_virtual_projection_registration(mount, "linux")
+    {
+        return command_error(json, error, EXIT_USAGE);
+    }
+    let mount_id = mount
+        .map(|mount| mount.mount_id.0.clone())
+        .unwrap_or_else(|| target.to_string());
+    let unit_name = linux_fuse_unit_name(&mount_id);
+    let unit_path = match linux_fuse_unit_path(&unit_name) {
+        Ok(path) => path,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+
+    let _ = run_systemctl_user(&["disable", "--now", &unit_name]);
+    if let Some(mount) = mount {
+        let _ = ProcessCommand::new("fusermount3")
+            .arg("-uz")
+            .arg(&mount.root)
+            .output();
+    }
+    let _ = fs::remove_file(&unit_path);
+    if let Err(error) = run_systemctl_user(&["daemon-reload"]) {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+
+    let report = FileProviderCommandReport {
+        ok: true,
+        command: "file-provider",
+        action: "unregister".to_string(),
+        mount_id: Some(mount_id.clone()),
+        helper: "systemctl --user".to_string(),
+        helper_report: serde_json::json!({
+            "message": format!("Linux FUSE mount unregistered for `{mount_id}`"),
+            "service": unit_name,
+            "unit_path": unit_path.display().to_string(),
+        }),
+    };
+    if json {
+        print_json(&report);
+    } else {
+        print_file_provider_report(&report);
+    }
+    EXIT_SUCCESS
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_linux_fuse_unregister(json: bool, _mount: Option<&MountConfig>, target: &str) -> i32 {
+    command_error(
+        json,
+        CommandError::new(
+            "file-provider",
+            "unsupported_platform",
+            format!("linux_fuse unregister is only supported on Linux for `{target}`"),
+        ),
+        EXIT_USAGE,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_fuse_unit(
+    unit_path: &Path,
+    afs_fuse: &Path,
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), CommandError> {
+    let log_dir = state_root.join("logs");
+    fs::create_dir_all(unit_path.parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
+    fs::create_dir_all(&log_dir)
+        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
+    fs::create_dir_all(&mount.root)
+        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
+
+    let log_path = log_dir.join(format!(
+        "afs-fuse.{}.log",
+        sanitize_systemd_fragment(&mount.mount_id.0)
+    ));
+    let unit = linux_fuse_unit_contents(afs_fuse, state_root, mount, &log_path);
+    fs::write(unit_path, unit)
+        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_unit_contents(
+    afs_fuse: &Path,
+    state_root: &Path,
+    mount: &MountConfig,
+    log_path: &Path,
+) -> String {
+    format!(
+        "[Unit]\nDescription=AgentFS FUSE mount for {mount_id}\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={afs_fuse} --mount-id {mount_id_arg} --state-dir {state_root} --mountpoint {mountpoint}\nExecStop=/usr/bin/fusermount3 -uz {mountpoint}\nKillSignal=SIGINT\nTimeoutStopSec=10\nLimitCORE=0\nRestart=on-failure\nRestartSec=2\nStandardOutput=append:{log_path}\nStandardError=append:{log_path}\n\n[Install]\nWantedBy=default.target\n",
+        mount_id = mount.mount_id.0,
+        afs_fuse = systemd_quote(&afs_fuse.display().to_string()),
+        mount_id_arg = systemd_quote(&mount.mount_id.0),
+        state_root = systemd_quote(&state_root.display().to_string()),
+        mountpoint = systemd_quote(&mount.root.display().to_string()),
+        log_path = log_path.display(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn run_systemctl_user(args: &[&str]) -> Result<(), CommandError> {
+    let output = ProcessCommand::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .map_err(|error| {
+            CommandError::new("file-provider", "systemctl_failed", error.to_string())
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    Err(CommandError::new(
+        "file-provider",
+        "systemctl_failed",
+        if message.is_empty() {
+            format!("systemctl --user exited with {}", output.status)
+        } else {
+            message
+        },
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_is_running(state_root: &Path) -> bool {
+    matches!(send_request(state_root, &DaemonRequest::Ping), Ok(response) if response.ok)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_unit_name(mount_id: &str) -> String {
+    format!(
+        "ai.codeflash.afs.fuse.{}.service",
+        sanitize_systemd_fragment(mount_id)
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_unit_path(unit_name: &str) -> Result<PathBuf, CommandError> {
+    let home = home_dir_path()?;
+    Ok(home.join(".config/systemd/user").join(unit_name))
+}
+
+#[cfg(target_os = "linux")]
+fn sanitize_systemd_fragment(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_quote(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`");
+    format!("\"{escaped}\"")
+}
+
+#[cfg(target_os = "linux")]
+fn home_dir_path() -> Result<PathBuf, CommandError> {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .map_err(|_| CommandError::new("file-provider", "env_missing", "HOME is not set"))
+}
+
+#[cfg(target_os = "linux")]
+fn afs_fuse_helper_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("AFS_FUSE_BIN") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        candidates.push(dir.join("afs-fuse"));
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest_dir.join("../..");
+    candidates.push(workspace.join("target/debug/afs-fuse"));
+    candidates.push(workspace.join("target/release/afs-fuse"));
+
+    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
+        return Some(path);
+    }
+    find_on_path("afs-fuse")
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn print_file_provider_report(report: &FileProviderCommandReport) {
@@ -2463,11 +2756,103 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-fn projection_mode(args: &[String]) -> Result<ProjectionMode, &'static str> {
+fn projection_mode(args: &[String]) -> Result<ProjectionMode, String> {
+    projection_mode_for_target(args, std::env::consts::OS)
+}
+
+fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<ProjectionMode, String> {
     match flag_value(args, "--projection") {
         None | Some("plain-files") => Ok(ProjectionMode::PlainFiles),
-        Some("macos-file-provider") => Ok(ProjectionMode::MacosFileProvider),
-        Some(_) => Err("--projection must be plain-files or macos-file-provider"),
+        Some("macos-file-provider") if target_os == "macos" => {
+            Ok(ProjectionMode::MacosFileProvider)
+        }
+        Some("linux-fuse") if target_os == "linux" => Ok(ProjectionMode::LinuxFuse),
+        Some("macos-file-provider") => Err(format!(
+            "--projection macos-file-provider is only supported on macOS; this binary is running on {target_os}"
+        )),
+        Some("linux-fuse") => Err(format!(
+            "--projection linux-fuse is only supported on Linux; this binary is running on {target_os}"
+        )),
+        Some(_) => Err(format!(
+            "--projection must be {}",
+            projection_usage_options_for_target(target_os)
+        )),
+    }
+}
+
+fn mount_usage() -> String {
+    format!(
+        "usage: afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection {}] [--read-only] [--json]",
+        projection_usage_options_for_target(std::env::consts::OS)
+    )
+}
+
+fn projection_usage_options_for_target(target_os: &str) -> &'static str {
+    match target_os {
+        "macos" => "plain-files|macos-file-provider",
+        "linux" => "plain-files|linux-fuse",
+        _ => "plain-files",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VirtualProjectionRegistration {
+    MacosFileProvider,
+    LinuxFuse,
+}
+
+impl VirtualProjectionRegistration {
+    fn projection(self) -> ProjectionMode {
+        match self {
+            Self::MacosFileProvider => ProjectionMode::MacosFileProvider,
+            Self::LinuxFuse => ProjectionMode::LinuxFuse,
+        }
+    }
+
+    fn projection_cli_value(self) -> &'static str {
+        match self {
+            Self::MacosFileProvider => "macos-file-provider",
+            Self::LinuxFuse => "linux-fuse",
+        }
+    }
+}
+
+fn validate_virtual_projection_registration(
+    mount: &MountConfig,
+    target_os: &str,
+) -> Result<VirtualProjectionRegistration, CommandError> {
+    let Some(registration) = virtual_projection_registration_for_target(target_os) else {
+        return Err(CommandError::new(
+            "file-provider",
+            "unsupported_platform",
+            format!("no virtual filesystem registration is implemented for {target_os}"),
+        ));
+    };
+    let required_projection = registration.projection();
+
+    if mount.projection == required_projection {
+        return Ok(registration);
+    }
+
+    Err(CommandError::new(
+        "file-provider",
+        "wrong_projection",
+        format!(
+            "mount `{}` uses projection `{}`; remount with --projection {}",
+            mount.mount_id.0,
+            mount.projection.as_str(),
+            registration.projection_cli_value()
+        ),
+    ))
+}
+
+fn virtual_projection_registration_for_target(
+    target_os: &str,
+) -> Option<VirtualProjectionRegistration> {
+    match target_os {
+        "macos" => Some(VirtualProjectionRegistration::MacosFileProvider),
+        "linux" => Some(VirtualProjectionRegistration::LinuxFuse),
+        _ => None,
     }
 }
 
@@ -2549,12 +2934,16 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    use afs_core::model::MountId;
+    use afs_store::{MountConfig, ProjectionMode};
+
     use crate::diff::{DiffReport, GuardrailOutput};
     use crate::push::PushReport;
 
     use super::{
-        EXIT_SUCCESS, EXIT_VALIDATION, diff_report_exit_code, local_redirect, notion_authorize_url,
-        parse_oauth_callback,
+        EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration, diff_report_exit_code,
+        local_redirect, notion_authorize_url, parse_oauth_callback, projection_mode_for_target,
+        projection_usage_options_for_target, validate_virtual_projection_registration,
     };
 
     #[test]
@@ -2584,6 +2973,137 @@ mod tests {
         assert_eq!(
             crate::push::push_report_exit_code(&push_report("apply_not_implemented")),
             5
+        );
+    }
+
+    #[test]
+    fn projection_mode_accepts_only_linux_virtual_projection_on_linux() {
+        let args = vec!["--projection".to_string(), "linux-fuse".to_string()];
+
+        assert_eq!(
+            projection_mode_for_target(&args, "linux").expect("linux fuse projection"),
+            ProjectionMode::LinuxFuse
+        );
+        assert!(
+            projection_mode_for_target(&args, "macos")
+                .expect_err("linux fuse rejected on macos")
+                .contains("only supported on Linux")
+        );
+        assert_eq!(
+            projection_usage_options_for_target("linux"),
+            "plain-files|linux-fuse"
+        );
+    }
+
+    #[test]
+    fn projection_mode_accepts_only_macos_virtual_projection_on_macos() {
+        let args = vec![
+            "--projection".to_string(),
+            "macos-file-provider".to_string(),
+        ];
+
+        assert_eq!(
+            projection_mode_for_target(&args, "macos").expect("macos file provider projection"),
+            ProjectionMode::MacosFileProvider
+        );
+        assert!(
+            projection_mode_for_target(&args, "linux")
+                .expect_err("macos file provider rejected on linux")
+                .contains("only supported on macOS")
+        );
+        assert_eq!(
+            projection_usage_options_for_target("macos"),
+            "plain-files|macos-file-provider"
+        );
+    }
+
+    #[test]
+    fn projection_mode_defaults_to_plain_files_on_every_platform() {
+        let args = Vec::new();
+
+        assert_eq!(
+            projection_mode_for_target(&args, "windows").expect("plain files default"),
+            ProjectionMode::PlainFiles
+        );
+        assert_eq!(
+            projection_usage_options_for_target("windows"),
+            "plain-files"
+        );
+    }
+
+    #[test]
+    fn virtual_projection_registration_is_platform_specific() {
+        let macos_mount =
+            MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/afs/notion")
+                .projection(ProjectionMode::MacosFileProvider);
+        let linux_mount =
+            MountConfig::new(MountId::new("notion-linux"), "notion", "/tmp/afs/linux")
+                .projection(ProjectionMode::LinuxFuse);
+
+        assert_eq!(
+            validate_virtual_projection_registration(&macos_mount, "macos")
+                .expect("macos file provider mount is valid"),
+            VirtualProjectionRegistration::MacosFileProvider
+        );
+        assert_eq!(
+            validate_virtual_projection_registration(&linux_mount, "linux")
+                .expect("linux fuse mount is valid"),
+            VirtualProjectionRegistration::LinuxFuse
+        );
+
+        let wrong_projection = validate_virtual_projection_registration(&linux_mount, "macos")
+            .expect_err("linux fuse mount is not a macos file provider domain");
+        assert_eq!(wrong_projection.code, "wrong_projection");
+        assert!(
+            wrong_projection
+                .message
+                .contains("--projection macos-file-provider")
+        );
+
+        let wrong_projection = validate_virtual_projection_registration(&macos_mount, "linux")
+            .expect_err("macos file provider mount is not a linux fuse mount");
+        assert_eq!(wrong_projection.code, "wrong_projection");
+        assert!(wrong_projection.message.contains("--projection linux-fuse"));
+
+        let unsupported_platform =
+            validate_virtual_projection_registration(&macos_mount, "windows")
+                .expect_err("windows has no virtual projection registration yet");
+        assert_eq!(unsupported_platform.code, "unsupported_platform");
+        assert!(
+            unsupported_platform
+                .message
+                .contains("no virtual filesystem registration is implemented")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_fuse_systemd_unit_uses_mount_specific_helper_args() {
+        let mount = MountConfig::new(
+            MountId::new("notion/main"),
+            "notion",
+            "/home/example/afs notion",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let unit_name = super::linux_fuse_unit_name(&mount.mount_id.0);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/agent fs/afs-fuse"),
+            std::path::Path::new("/home/example/.afs"),
+            &mount,
+            std::path::Path::new("/home/example/.afs/logs/afs-fuse.notion_main.log"),
+        );
+
+        assert_eq!(unit_name, "ai.codeflash.afs.fuse.notion_main.service");
+        assert!(unit.contains("ExecStart=\"/opt/agent fs/afs-fuse\""));
+        assert!(unit.contains("--mount-id \"notion/main\""));
+        assert!(unit.contains("--state-dir \"/home/example/.afs\""));
+        assert!(unit.contains("--mountpoint \"/home/example/afs notion\""));
+        assert!(unit.contains("ExecStop=/usr/bin/fusermount3 -uz \"/home/example/afs notion\""));
+        assert!(unit.contains("TimeoutStopSec=10"));
+        assert!(unit.contains("LimitCORE=0"));
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(
+            unit.contains("StandardOutput=append:/home/example/.afs/logs/afs-fuse.notion_main.log")
         );
     }
 

@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,8 +11,9 @@ use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, ShadowRepository, SqliteStateStore,
+    MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
 };
+use afsd::virtual_fs::virtual_fs_content_path;
 
 #[test]
 fn status_reports_clean_and_dirty_hydrated_files() {
@@ -37,6 +38,7 @@ fn status_reports_clean_and_dirty_hydrated_files() {
         &store,
         StatusOptions {
             path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("status report");
@@ -69,6 +71,7 @@ fn status_scopes_to_subdirectory_and_reports_stub() {
         &store,
         StatusOptions {
             path: Some(fixture.root.join("Engineering")),
+            ..StatusOptions::default()
         },
     )
     .expect("status report");
@@ -142,6 +145,7 @@ fn status_reports_missing_and_conflicted_entities() {
         &store,
         StatusOptions {
             path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("status report");
@@ -182,6 +186,7 @@ fn status_reports_pending_and_failed_journals() {
         &store,
         StatusOptions {
             path: Some(fixture.root.join("Roadmap.md")),
+            ..StatusOptions::default()
         },
     )
     .expect("status report");
@@ -221,6 +226,7 @@ fn status_returns_structured_error_for_unknown_path() {
         &store,
         StatusOptions {
             path: Some(fixture.root.join("Missing.md")),
+            ..StatusOptions::default()
         },
     )
     .expect_err("missing path");
@@ -237,6 +243,7 @@ fn status_returns_structured_mount_lookup_error() {
         &store,
         StatusOptions {
             path: Some(fixture.root.join("Missing.md")),
+            ..StatusOptions::default()
         },
     )
     .expect_err("missing mount");
@@ -262,6 +269,7 @@ fn status_runner_works_with_sqlite_state_store() {
         &store,
         StatusOptions {
             path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("status report");
@@ -270,8 +278,52 @@ fn status_runner_works_with_sqlite_state_store() {
     assert_eq!(report.summary.clean, 1);
 }
 
+#[test]
+fn status_reads_virtual_projection_from_content_cache() {
+    let fixture = StatusFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save virtual mount");
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    let cache_path = virtual_fs_content_path(
+        &fixture.state_root,
+        &fixture.mount_id,
+        Path::new("Roadmap.md"),
+    )
+    .expect("content path");
+    fs::create_dir_all(cache_path.parent().expect("content parent")).expect("content parent");
+    fs::write(
+        cache_path,
+        canonical_markdown("page-1", "# Roadmap\n\nSame paragraph."),
+    )
+    .expect("content cache");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+        },
+    )
+    .expect("status report");
+
+    assert!(report.clean);
+    assert_eq!(report.summary.clean, 1);
+    assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
+}
+
 struct StatusFixture {
     root: PathBuf,
+    state_root: PathBuf,
     mount_id: MountId,
 }
 
@@ -287,10 +339,16 @@ impl StatusFixture {
             "afs-cli-status-{}-{unique}-{suffix}",
             std::process::id()
         ));
+        let state_root = std::env::temp_dir().join(format!(
+            "afs-cli-status-state-{}-{unique}-{suffix}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).expect("fixture root");
+        fs::create_dir_all(&state_root).expect("fixture state root");
 
         Self {
             root,
+            state_root,
             mount_id: MountId::new("notion-main"),
         }
     }
@@ -383,6 +441,7 @@ impl StatusFixture {
 impl Drop for StatusFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.state_root);
     }
 }
 

@@ -9,7 +9,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs profiles [--json]`
 - `afs connection show <id> [--json]`
 - `afs disconnect <id> [--json]`
-- `afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--read-only] [--json]`
+- `afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse] [--read-only] [--json]`
 - `afs daemon status [--json]`
 - `afs info [path] [--json]`
 - `afs status [path] [--json]`
@@ -75,11 +75,28 @@ Auth failures exit `1` and include `suggested_command` when there is an obvious 
 
 `afs mount notion <path> --root-page <page-id> [--connection <id>]` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. With one active Notion connection, mount auto-assigns it. With multiple active Notion connections, pass `--connection <id>`. Existing mounts without `connection_id` continue to work through the legacy `NOTION_TOKEN` fallback.
 
-`afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. Scheduled pull for this projection updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension lists dataless files from the daemon and materializes a file on open.
+Projection choices are platform-specific. Linux binaries accept `plain-files` and
+`linux-fuse`; macOS binaries accept `plain-files` and `macos-file-provider`;
+Windows currently accepts `plain-files` only.
 
-`afs file-provider register <mount-id-or-path>` registers a macOS File Provider domain for a mount whose projection is `macos_file_provider`. `unregister` removes that domain, `list` shows domains known to File Provider, and `reset` removes all domains for the installed AgentFS provider. The command shells out to the signed app-bundle helper at `AgentFS.app/Contents/MacOS/agentfs-file-providerctl`; `AFS_FILE_PROVIDERCTL` can override the helper path for development.
+`afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. `--projection linux-fuse` records the equivalent Linux virtual projection for the FUSE helper. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension lists dataless files from the daemon and materializes a file on open.
 
-`afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page shadow snapshot. For macOS File Provider mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the stored shadow, returning a dirty skip instead.
+Linux should expose the same online-only behavior through a FUSE projection
+helper rather than through inotify-triggered placeholder files. The daemon API for
+that path is platform-neutral `virtual_fs`; macOS File Provider commands are
+compatibility aliases over it.
+
+`afs file-provider register <mount-id-or-path>` validates the mount against the
+current platform's virtual projection: `macos_file_provider` on macOS and
+`linux_fuse` on Linux. The macOS path shells out to the signed app-bundle helper
+at `AgentFS.app/Contents/MacOS/agentfs-file-providerctl`; `AFS_FILE_PROVIDERCTL`
+can override the helper path for development. The Linux path writes and starts a
+per-mount systemd user service for `afs-fuse`; `AFS_FUSE_BIN` can override the
+helper binary path for development. `afs file-provider unregister <mount>` stops
+and removes that Linux service. `list` and `reset` still target the macOS File
+Provider helper.
+
+`afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page shadow snapshot. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the stored shadow, returning a dirty skip instead.
 
 The JSON report includes `via`, `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts. `via` is `daemon` when the Unix socket handled the job and `cli` when the command executed directly.
 

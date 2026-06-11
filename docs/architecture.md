@@ -1,6 +1,6 @@
 # Architecture
 
-AgentFS v1 is a local-first Rust system with six implementation surfaces:
+AgentFS v1 is a local-first Rust system with seven implementation surfaces:
 
 1. `afs` CLI: stable command and exit-code surface for humans and agents.
 2. `afsd` daemon: one per user, supervising many mounts.
@@ -8,6 +8,8 @@ AgentFS v1 is a local-first Rust system with six implementation surfaces:
 4. Connector SDK: trait boundary for source-specific APIs.
 5. Notion connector: first first-party connector.
 6. State store: SQLite-backed source of truth under `~/.afs/`.
+7. Platform projections: macOS File Provider now, Linux FUSE next, Windows Cloud
+   Files later.
 
 The optional cloud relay is deliberately not implemented in v1. The local remote-truth boundary should still remain swappable so a future relay can replace direct source polling without changing the sync model.
 
@@ -57,7 +59,7 @@ action sets, health checks, and remote relay execution.
 | `afs-notion` | Notion API client, DTOs, block mapping, root-page projection, OAuth/API integration, Markdown/frontmatter conversion. |
 | `afs-store` | SQLite schema, snapshots, journal, mount config, hydration state, tree persistence. |
 | `afs-cli` | Commands: `connect`, `mount`, `status`, `pull`, `push`, `diff`, `undo`, `log`, `resolve`, `config`. |
-| `afsd` | File watcher, hydration engine, pull scheduler, push queue, daemon lifecycle. |
+| `afsd` | Virtual filesystem boundary, file watcher fallback, hydration engine, pull scheduler, push queue, daemon lifecycle. |
 
 ## Data-flow sketch
 
@@ -65,10 +67,10 @@ action sets, health checks, and remote relay execution.
 agent/editor/grep
       |
       v
-real files under ~/afs/<mount>
+platform projection under ~/afs/<mount>
       |
       v
-afsd watcher and hydration engine
+afsd virtual_fs boundary, watcher fallback, and hydration engine
       |
       v
 afs-core sync model <-> afs-store SQLite state

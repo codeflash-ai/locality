@@ -14,8 +14,7 @@ use afs_core::shadow::ShadowDocument;
 use afs_notion::NotionConnector;
 use afs_notion::render::NotionRenderedEntity;
 use afs_store::{
-    EntityRecord, EntityRepository, MountConfig, MountRepository, ProjectionMode, ShadowRepository,
-    StoreError,
+    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -187,7 +186,7 @@ fn write_stub_if_needed(
     mount: &MountConfig,
     entry: &TreeEntry,
 ) -> Result<bool, PullError> {
-    if mount.projection == ProjectionMode::MacosFileProvider {
+    if mount.projection.uses_virtual_filesystem() {
         return Ok(false);
     }
 
@@ -229,7 +228,7 @@ fn rename_projection_if_needed(
     existing: Option<&EntityRecord>,
     entry: &TreeEntry,
 ) -> Result<(), PullError> {
-    if mount.projection == ProjectionMode::MacosFileProvider {
+    if mount.projection.uses_virtual_filesystem() {
         return Ok(());
     }
 

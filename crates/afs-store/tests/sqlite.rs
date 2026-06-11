@@ -74,6 +74,10 @@ fn persisted_json_uses_stable_snake_case_names() {
         "\"macos_file_provider\""
     );
     assert_eq!(
+        serde_json::to_string(&ProjectionMode::LinuxFuse).expect("projection json"),
+        "\"linux_fuse\""
+    );
+    assert_eq!(
         serde_json::to_string(&MarkdownBlockKind::Paragraph).expect("block kind json"),
         "{\"kind\":\"paragraph\"}"
     );

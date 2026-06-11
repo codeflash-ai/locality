@@ -7,7 +7,9 @@ This package contains the macOS online-only projection:
 - a minimal containing `AgentFS.app` bundle template; and
 - Command Line Tools scripts for a local ad-hoc development bundle.
 
-The extension delegates all durable state and network work to `afsd`:
+The extension delegates all durable state and network work to `afsd`. These
+macOS IPC commands are compatibility aliases over the daemon's platform-neutral
+`virtual_fs` boundary:
 
 - `item(for:)` calls `file_provider_item` for store-only metadata.
 - `enumerator(for:)` calls `file_provider_children` for dataless directory

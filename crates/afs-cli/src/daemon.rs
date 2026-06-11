@@ -1003,6 +1003,7 @@ fn home_dir() -> Result<PathBuf, DaemonControlError> {
         .map_err(|_| DaemonControlError::new("env_missing", "HOME is not set"))
 }
 
+#[allow(dead_code)]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")

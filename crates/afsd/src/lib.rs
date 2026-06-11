@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod server;
 pub mod supervisor;
+pub mod virtual_fs;
 pub mod watcher;
 
 use std::net::SocketAddr;

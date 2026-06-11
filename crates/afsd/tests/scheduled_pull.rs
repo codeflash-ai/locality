@@ -96,11 +96,29 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
 
 #[test]
 fn scheduled_pull_macos_file_provider_keeps_unhydrated_pages_online_only() {
-    let root = temp_root("scheduled-pull-file-provider");
+    assert_virtual_projection_keeps_unhydrated_pages_online_only(
+        ProjectionMode::MacosFileProvider,
+        "scheduled-pull-file-provider",
+    );
+}
+
+#[test]
+fn scheduled_pull_linux_fuse_keeps_unhydrated_pages_online_only() {
+    assert_virtual_projection_keeps_unhydrated_pages_online_only(
+        ProjectionMode::LinuxFuse,
+        "scheduled-pull-linux-fuse",
+    );
+}
+
+fn assert_virtual_projection_keeps_unhydrated_pages_online_only(
+    projection: ProjectionMode,
+    fixture_name: &str,
+) {
+    let root = temp_root(fixture_name);
     let mount_id = MountId::new("notion-main");
     let mount = MountConfig::new(mount_id.clone(), "notion", root.clone())
         .with_remote_root_id(RemoteId::new("root-page"))
-        .projection(ProjectionMode::MacosFileProvider);
+        .projection(projection);
     let mut source = FakeScheduledPullSource::default();
     source.insert_entries(
         &mount_id,

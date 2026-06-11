@@ -80,6 +80,7 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
         &store,
         StatusOptions {
             path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("status");

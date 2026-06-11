@@ -12,11 +12,13 @@ use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
     ShadowRepository, StoreError,
 };
+use afsd::virtual_fs::virtual_fs_content_path;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatusOptions {
     pub path: Option<PathBuf>,
+    pub state_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -100,6 +102,7 @@ where
 {
     let mounts = store.load_mounts().map_err(StatusError::Store)?;
     let target = options.path.as_deref().map(absolute_path).transpose()?;
+    let state_root = options.state_root.unwrap_or_else(default_state_root);
     let scopes = resolve_scopes(store, &mounts, target.as_deref())?;
     let journals = store.list_journal().map_err(StatusError::Store)?;
     let mut summary = StatusSummary::default();
@@ -111,7 +114,7 @@ where
 
         let status_entries = entries
             .into_iter()
-            .map(|entity| classify_entity(store, &scope.mount, entity, &journals))
+            .map(|entity| classify_entity(store, &scope.mount, entity, &journals, &state_root))
             .collect::<Vec<_>>();
 
         for entry in &status_entries {
@@ -212,11 +215,17 @@ where
 {
     match target {
         Some(target) => resolve_target_scope(store, mounts, target).map(|scope| vec![scope]),
-        None => resolve_default_scopes(mounts),
+        None => resolve_default_scopes(store, mounts),
     }
 }
 
-fn resolve_default_scopes(mounts: &[MountConfig]) -> Result<Vec<StatusScope>, StatusError> {
+fn resolve_default_scopes<S>(
+    store: &S,
+    mounts: &[MountConfig],
+) -> Result<Vec<StatusScope>, StatusError>
+where
+    S: EntityRepository,
+{
     if mounts.is_empty() {
         return Ok(Vec::new());
     }
@@ -225,13 +234,7 @@ fn resolve_default_scopes(mounts: &[MountConfig]) -> Result<Vec<StatusScope>, St
         std::env::current_dir().map_err(|error| StatusError::CurrentDir(error.to_string()))?;
     if let Some(mount) = find_mount_for_path(mounts, &cwd) {
         let relative_path = relative_entity_path(mount, &cwd)?;
-        let filter = if relative_path.as_os_str().is_empty() {
-            ScopeFilter::All
-        } else if cwd.is_dir() {
-            ScopeFilter::Subtree(relative_path)
-        } else {
-            ScopeFilter::Exact(relative_path)
-        };
+        let filter = scope_filter_for_relative_path(store, mount, &relative_path)?;
 
         return Ok(vec![StatusScope {
             mount: mount.clone(),
@@ -261,20 +264,30 @@ where
         .cloned()
         .ok_or_else(|| StatusError::MountNotFound(target.to_path_buf()))?;
     let relative_path = relative_entity_path(&mount, target)?;
-    let filter = if relative_path.as_os_str().is_empty() {
-        ScopeFilter::All
-    } else {
-        target_filter(store, &mount, &relative_path, target.is_dir())?
-    };
+    let filter = scope_filter_for_relative_path(store, &mount, &relative_path)?;
 
     Ok(StatusScope { mount, filter })
+}
+
+fn scope_filter_for_relative_path<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Result<ScopeFilter, StatusError>
+where
+    S: EntityRepository,
+{
+    if relative_path.as_os_str().is_empty() {
+        Ok(ScopeFilter::All)
+    } else {
+        target_filter(store, mount, relative_path)
+    }
 }
 
 fn target_filter<S>(
     store: &S,
     mount: &MountConfig,
     relative_path: &Path,
-    path_is_dir: bool,
 ) -> Result<ScopeFilter, StatusError>
 where
     S: EntityRepository,
@@ -283,7 +296,7 @@ where
         .find_entity_by_path(&mount.mount_id, relative_path)
         .map_err(StatusError::Store)?;
     if let Some(entity) = exact {
-        if path_is_dir || matches!(entity.kind, EntityKind::Database | EntityKind::Directory) {
+        if matches!(entity.kind, EntityKind::Database | EntityKind::Directory) {
             return Ok(ScopeFilter::Subtree(relative_path.to_path_buf()));
         }
 
@@ -341,13 +354,15 @@ fn classify_entity<S>(
     mount: &MountConfig,
     entity: EntityRecord,
     journals: &[JournalEntry],
+    state_root: &Path,
 ) -> StatusEntry
 where
     S: ShadowRepository + JournalRepository,
 {
     let absolute_path = mount.root.join(&entity.path);
     let mut issues = Vec::new();
-    let (state, mut state_issues) = classify_local_state(store, mount, &entity, &absolute_path);
+    let (state, mut state_issues) =
+        classify_local_state(store, mount, &entity, &absolute_path, state_root);
     issues.append(&mut state_issues);
 
     let (pending_journal_count, failed_journal_count) =
@@ -389,10 +404,15 @@ fn classify_local_state<S>(
     mount: &MountConfig,
     entity: &EntityRecord,
     absolute_path: &Path,
+    state_root: &Path,
 ) -> (StatusState, Vec<StatusIssue>)
 where
     S: ShadowRepository,
 {
+    if mount.projection.uses_virtual_filesystem() {
+        return classify_virtual_state(store, mount, entity, state_root);
+    }
+
     if !absolute_path.exists() {
         return (
             StatusState::Missing,
@@ -443,6 +463,97 @@ where
     }
 }
 
+fn classify_virtual_state<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    state_root: &Path,
+) -> (StatusState, Vec<StatusIssue>)
+where
+    S: ShadowRepository,
+{
+    match entity.hydration {
+        HydrationState::Conflicted => {
+            return (
+                StatusState::Conflicted,
+                vec![StatusIssue::new(
+                    "entity_conflicted",
+                    "entity is marked conflicted",
+                )],
+            );
+        }
+        HydrationState::Dirty => {
+            return (
+                StatusState::Dirty,
+                vec![StatusIssue::new("entity_dirty", "entity is marked dirty")],
+            );
+        }
+        _ => {}
+    }
+
+    match entity.kind {
+        EntityKind::Page => classify_virtual_page_state(store, mount, entity, state_root),
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_) => hydration_state_without_file_read(&entity.hydration),
+    }
+}
+
+fn classify_virtual_page_state<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    state_root: &Path,
+) -> (StatusState, Vec<StatusIssue>)
+where
+    S: ShadowRepository,
+{
+    if matches!(
+        entity.hydration,
+        HydrationState::Virtual | HydrationState::Stub
+    ) {
+        return (StatusState::Stub, Vec::new());
+    }
+
+    let content_path = match virtual_fs_content_path(state_root, &mount.mount_id, &entity.path) {
+        Ok(path) => path,
+        Err(error) => {
+            return (
+                StatusState::Error,
+                vec![StatusIssue::new(
+                    "content_cache_path_invalid",
+                    format!("invalid virtual content path: {error}"),
+                )],
+            );
+        }
+    };
+    if !content_path.exists() {
+        return (
+            StatusState::Missing,
+            vec![StatusIssue::new(
+                "content_cache_missing",
+                "daemon content cache path is missing",
+            )],
+        );
+    }
+
+    let contents = match std::fs::read_to_string(&content_path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            return (
+                StatusState::Error,
+                vec![StatusIssue::new(
+                    "read_content_cache_failed",
+                    format!("failed to read daemon content cache: {error}"),
+                )],
+            );
+        }
+    };
+
+    classify_page_contents(store, mount, entity, &contents)
+}
+
 fn classify_page_state<S>(
     store: &S,
     mount: &MountConfig,
@@ -465,6 +576,18 @@ where
         }
     };
 
+    classify_page_contents(store, mount, entity, &contents)
+}
+
+fn classify_page_contents<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    contents: &str,
+) -> (StatusState, Vec<StatusIssue>)
+where
+    S: ShadowRepository,
+{
     if matches!(
         entity.hydration,
         HydrationState::Virtual | HydrationState::Stub
@@ -610,6 +733,13 @@ fn absolute_path(path: &Path) -> Result<PathBuf, StatusError> {
             .map(|cwd| cwd.join(path))
             .map_err(|error| StatusError::CurrentDir(error.to_string()))
     }
+}
+
+fn default_state_root() -> PathBuf {
+    std::env::var("AFS_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".afs")))
+        .unwrap_or_else(|_| PathBuf::from(".afs"))
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
