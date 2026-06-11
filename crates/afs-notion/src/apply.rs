@@ -63,7 +63,11 @@ pub fn apply_plan(
         match operation {
             PushOperation::UpdateBlock { block_id, content } => {
                 let current = current_block(&current_blocks, block_id)?;
-                let patch = parse_supported_block(content, current_block_rich_text(current)?)?;
+                let patch = parse_supported_block(
+                    content,
+                    Some(current.kind.as_str()),
+                    current_block_rich_text(current)?,
+                )?;
                 ensure_update_supported(current, &patch)?;
                 api.update_block(block_id.as_str(), patch.update_body())?;
                 effects.push(JournalApplyEffect::UpdatedBlock {
@@ -77,7 +81,7 @@ pub fn apply_plan(
                 after,
                 content,
             } => {
-                let patch = parse_supported_block(content, None)?;
+                let patch = parse_supported_block(content, None, None)?;
                 let chain_key = (parent_id.clone(), after.clone());
                 let effective_after = append_chains
                     .get(&chain_key)
@@ -174,7 +178,7 @@ pub fn apply_undo(
     for operation in &request.plan.operations {
         match operation {
             UndoOperation::RestoreBlockContent { block_id, content } => {
-                let patch = parse_supported_block(content, None)?;
+                let patch = parse_supported_block(content, None, None)?;
                 api.update_block(block_id.as_str(), patch.update_body())?;
             }
             UndoOperation::ArchiveCreatedBlock { block_id } => {
@@ -396,7 +400,7 @@ fn create_page_children(body: &str) -> AfsResult<Vec<Value>> {
                     "creating Notion pages with AFS directive blocks",
                 ));
             }
-            parse_supported_block(&block.text, None).map(|patch| patch.append_child())
+            parse_supported_block(&block.text, None, None).map(|patch| patch.append_child())
         })
         .collect()
 }
@@ -595,6 +599,7 @@ fn current_block_rich_text(block: &BlockDto) -> AfsResult<Option<&[RichTextDto]>
             .heading_4
             .as_ref()
             .map(|block| block.rich_text.as_slice()),
+        "toggle" => block.toggle.as_ref().map(|block| block.rich_text.as_slice()),
         "bulleted_list_item" => block
             .bulleted_list_item
             .as_ref()
@@ -645,6 +650,7 @@ impl NotionBlockPatch {
 
 fn parse_supported_block(
     markdown: &str,
+    current_kind: Option<&str>,
     preimage: Option<&[RichTextDto]>,
 ) -> AfsResult<NotionBlockPatch> {
     let trimmed = markdown.trim_end_matches('\n');
@@ -704,8 +710,13 @@ fn parse_supported_block(
     }
 
     if let Some(text) = parse_bulleted_list_item(trimmed) {
+        let kind = if current_kind == Some("toggle") {
+            "toggle"
+        } else {
+            "bulleted_list_item"
+        };
         return Ok(NotionBlockPatch::new(
-            "bulleted_list_item",
+            kind,
             json!({ "rich_text": rich_text_payload(text, preimage)? }),
         ));
     }

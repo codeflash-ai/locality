@@ -244,6 +244,48 @@ fn apply_updates_equation_blocks_from_display_math() {
 }
 
 #[test]
+fn apply_updates_toggle_summary_from_rendered_list_item() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![toggle_block("toggle-1", "Old toggle")],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("toggle-1"),
+            content: "- Updated toggle".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Update {
+            block_id: "toggle-1".to_string(),
+            body: json!({
+                "toggle": {
+                    "rich_text": rich_text_json("Updated toggle"),
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
 fn check_concurrency_rejects_remote_timestamp_mismatch() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T01:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -974,6 +1016,15 @@ fn paragraph_block_with_rich_text(id: &str, rich_text: Vec<RichTextDto>) -> Bloc
     let mut block = block(id, "paragraph");
     block.paragraph = Some(RichTextBlockDto {
         rich_text,
+        color: None,
+    });
+    block
+}
+
+fn toggle_block(id: &str, text: &str) -> BlockDto {
+    let mut block = block(id, "toggle");
+    block.toggle = Some(RichTextBlockDto {
+        rich_text: rich_text(text),
         color: None,
     });
     block

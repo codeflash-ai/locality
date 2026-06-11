@@ -129,6 +129,46 @@ fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
 }
 
 #[test]
+fn render_toggle_children_as_nested_markdown() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: toggle_block("toggle-1", "toggle heading"),
+            children: vec![
+                BlockTreeDto {
+                    block: rich_text_block("toggle-heading-1", "heading_3", "Toggle body"),
+                    children: Vec::new(),
+                },
+                BlockTreeDto {
+                    block: rich_text_block(
+                        "toggle-paragraph-1",
+                        "paragraph",
+                        "continue toggle body",
+                    ),
+                    children: Vec::new(),
+                },
+            ],
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "- toggle heading\n\n    ### Toggle body\n\n    continue toggle body\n"
+    );
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| block.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["toggle-1", "toggle-heading-1", "toggle-paragraph-1"]
+    );
+}
+
+#[test]
 fn render_richer_notion_block_coverage() {
     let bundle = afs_notion::dto::NotionPageBundle {
         page: page("page-1", "Coverage"),
@@ -209,7 +249,7 @@ fn render_richer_notion_block_coverage() {
         rendered.document.body,
         concat!(
             "#### Heading four\n\n",
-            "::afs{id=toggle-1 type=toggle title=\"Toggle summary\"}\n\n",
+            "- Toggle summary\n\n",
             "$$\nE=mc^2\n$$\n\n",
             "::afs{id=embed-1 type=embed title=\"Embed caption\" url=\"https://example.com/embed\"}\n\n",
             "::afs{id=bookmark-1 type=bookmark title=\"Bookmark caption\" url=\"https://example.com/bookmark\"}\n\n",
@@ -505,8 +545,8 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "::afs{id=orphan-row-1 type=unsupported_table_row}",
         "::afs{id=child-page-1 type=child_page title=\"Child Page\"}",
         "::afs{id=child-db-1 type=child_database title=\"Child DB\"}",
-        "::afs{id=toggle-1 type=toggle title=\"Toggle summary\"}",
-        "Toggle child",
+        "- Toggle summary",
+        "    Toggle child",
         "$$\nE=mc^2\n$$",
         "::afs{id=embed-1 type=embed title=\"Embed\" url=\"https://example.com/embed\"}",
         "::afs{id=bookmark-1 type=bookmark title=\"Bookmark\" url=\"https://example.com/bookmark\"}",

@@ -121,16 +121,33 @@ fn render_block_trees(
     options: &RenderOptions,
     out: &mut Vec<RenderedBlock>,
 ) {
+    render_block_trees_with_indent(trees, options, out, 0);
+}
+
+fn render_block_trees_with_indent(
+    trees: &[BlockTreeDto],
+    options: &RenderOptions,
+    out: &mut Vec<RenderedBlock>,
+    indent_level: usize,
+) {
     for tree in trees {
         if tree.block.kind == "table"
             && let Some(rendered) = render_table_tree(tree)
         {
-            out.push(rendered);
+            out.push(indent_rendered_block(rendered, indent_level));
             continue;
         }
 
-        out.push(render_block(&tree.block, options));
-        render_block_trees(&tree.children, options, out);
+        out.push(indent_rendered_block(
+            render_block(&tree.block, options),
+            indent_level,
+        ));
+        let child_indent_level = if tree.block.kind == "toggle" {
+            indent_level + 1
+        } else {
+            indent_level
+        };
+        render_block_trees_with_indent(&tree.children, options, out, child_indent_level);
     }
 }
 
@@ -231,14 +248,11 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
                 .as_ref()
                 .map(|child| child.title.as_str()),
         ),
-        "toggle" => directive_block(
+        "toggle" => rich_text_block(
             block,
+            block.toggle.as_ref(),
+            |text| format!("- {text}"),
             "toggle",
-            block
-                .toggle
-                .as_ref()
-                .and_then(rich_text_block_title)
-                .as_deref(),
         ),
         "equation" => equation_block(block, block.equation.as_ref()),
         "embed" => url_directive_block(block, "embed", block.embed.as_ref()),
@@ -429,6 +443,27 @@ fn rendered_block(markdown: String, shadow_id: Option<RemoteId>) -> RenderedBloc
         metadata: RenderedBlockMetadata::None,
         media_asset: None,
     }
+}
+
+fn indent_rendered_block(mut block: RenderedBlock, indent_level: usize) -> RenderedBlock {
+    if indent_level == 0 {
+        return block;
+    }
+
+    let prefix = "    ".repeat(indent_level);
+    block.markdown = block
+        .markdown
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    block
 }
 
 fn directive_attrs(
