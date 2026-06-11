@@ -158,6 +158,7 @@ where
 
             let record = merged_entity_record(entry, existing.as_ref());
             store.save_entity(record)?;
+            rename_projection_if_needed(mount, existing.as_ref(), entry)?;
 
             match refresh_projection(source, mount, entry)? {
                 ProjectionWrite::Stub => report.stubbed += 1,
@@ -261,6 +262,47 @@ where
         }
         EntityKind::Asset | EntityKind::Unknown(_) => Ok(ProjectionWrite::None),
     }
+}
+
+fn rename_projection_if_needed(
+    mount: &MountConfig,
+    existing: Option<&EntityRecord>,
+    entry: &TreeEntry,
+) -> AfsResult<()> {
+    if mount.projection == ProjectionMode::MacosFileProvider {
+        return Ok(());
+    }
+
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    if existing.path == entry.path {
+        return Ok(());
+    }
+
+    match entry.kind {
+        EntityKind::Page => {
+            rename_projected_path(
+                &mount.root.join(&existing.path),
+                &mount.root.join(&entry.path),
+            )?;
+            rename_projected_path(
+                &mount.root.join(existing.path.with_extension("")),
+                &mount.root.join(entry.path.with_extension("")),
+            )?;
+        }
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_) => {
+            rename_projected_path(
+                &mount.root.join(&existing.path),
+                &mount.root.join(&entry.path),
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 fn policy_hydration() -> EntityFetchPlan {
@@ -368,6 +410,24 @@ fn create_dir_all(path: &Path) -> AfsResult<()> {
         AfsError::Io(format!(
             "failed to create scheduled pull directory `{}`: {error}",
             path.display()
+        ))
+    })
+}
+
+fn rename_projected_path(from: &Path, to: &Path) -> AfsResult<()> {
+    if from == to || !from.exists() || to.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = to.parent() {
+        create_dir_all(parent)?;
+    }
+
+    std::fs::rename(from, to).map_err(|error| {
+        AfsError::Io(format!(
+            "failed to rename scheduled pull projection `{}` to `{}`: {error}",
+            from.display(),
+            to.display(),
         ))
     })
 }

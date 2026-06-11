@@ -11,12 +11,22 @@ use afs_core::model::{MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 
 use crate::error::StoreResult;
-use crate::records::{EntityRecord, MountConfig, ShadowSnapshotRecord};
+use crate::records::{
+    ConnectionId, ConnectionRecord, EntityRecord, MountConfig, ShadowSnapshotRecord,
+};
 
 pub trait MountRepository {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()>;
     fn get_mount(&self, mount_id: &MountId) -> StoreResult<Option<MountConfig>>;
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>>;
+}
+
+pub trait ConnectionRepository {
+    fn save_connection(&mut self, connection: ConnectionRecord) -> StoreResult<()>;
+    fn get_connection(&self, connection_id: &ConnectionId)
+    -> StoreResult<Option<ConnectionRecord>>;
+    fn list_connections(&self) -> StoreResult<Vec<ConnectionRecord>>;
+    fn delete_connection(&mut self, connection_id: &ConnectionId) -> StoreResult<()>;
 }
 
 pub trait EntityRepository {
@@ -55,4 +65,31 @@ pub trait JournalRepository {
     -> StoreResult<()>;
     fn get_journal(&self, push_id: &PushId) -> StoreResult<Option<JournalEntry>>;
     fn list_journal(&self) -> StoreResult<Vec<JournalEntry>>;
+
+    fn latest_failed_journal_for_entity(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<Option<String>> {
+        let mut latest = None;
+        for journal in self.list_journal()? {
+            if journal.mount_id != *mount_id {
+                continue;
+            }
+            if !journal.remote_ids.iter().any(|id| id == remote_id)
+                && !journal
+                    .plan
+                    .affected_entities
+                    .iter()
+                    .any(|id| id == remote_id)
+            {
+                continue;
+            }
+            if let JournalStatus::Failed(message) = journal.status {
+                latest = Some((journal.push_id.0, message));
+            }
+        }
+
+        Ok(latest.map(|(_, message)| message))
+    }
 }

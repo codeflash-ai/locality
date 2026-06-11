@@ -9,6 +9,19 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId, SourceSpan,
 use afs_core::shadow::{MarkdownBlockKind, ShadowBlock, ShadowDocument};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ConnectionId(pub String);
+
+impl ConnectionId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectionMode {
@@ -31,6 +44,7 @@ pub struct MountConfig {
     pub connector: String,
     pub root: PathBuf,
     pub remote_root_id: Option<RemoteId>,
+    pub connection_id: Option<ConnectionId>,
     pub read_only: bool,
     pub projection: ProjectionMode,
 }
@@ -42,6 +56,7 @@ impl MountConfig {
             connector: connector.into(),
             root: root.into(),
             remote_root_id: None,
+            connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
         }
@@ -49,6 +64,11 @@ impl MountConfig {
 
     pub fn with_remote_root_id(mut self, remote_root_id: RemoteId) -> Self {
         self.remote_root_id = Some(remote_root_id);
+        self
+    }
+
+    pub fn with_connection_id(mut self, connection_id: ConnectionId) -> Self {
+        self.connection_id = Some(connection_id);
         self
     }
 
@@ -61,6 +81,24 @@ impl MountConfig {
         self.projection = projection;
         self
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionRecord {
+    pub connection_id: ConnectionId,
+    pub connector: String,
+    pub display_name: String,
+    pub account_label: Option<String>,
+    pub workspace_id: Option<String>,
+    pub workspace_name: Option<String>,
+    pub auth_kind: String,
+    pub secret_ref: String,
+    pub scopes: Vec<String>,
+    pub capabilities_json: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

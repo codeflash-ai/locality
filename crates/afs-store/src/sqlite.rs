@@ -19,12 +19,15 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
-    EntityRecord, MountConfig, ProjectionMode, ShadowBlockRecord, ShadowSnapshotRecord,
+    ConnectionId, ConnectionRecord, EntityRecord, MountConfig, ProjectionMode, ShadowBlockRecord,
+    ShadowSnapshotRecord,
 };
-use crate::repository::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
+use crate::repository::{
+    ConnectionRepository, EntityRepository, JournalRepository, MountRepository, ShadowRepository,
+};
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -59,14 +62,15 @@ impl MountRepository for SqliteStateStore {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
         let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(mount_id) DO UPDATE SET
                 connector = excluded.connector,
                 root = excluded.root,
                 remote_root_id = excluded.remote_root_id,
                 read_only = excluded.read_only,
-                projection_json = excluded.projection_json",
+                projection_json = excluded.projection_json,
+                connection_id = excluded.connection_id",
             params![
                 mount.mount_id.0,
                 mount.connector,
@@ -74,6 +78,7 @@ impl MountRepository for SqliteStateStore {
                 mount.remote_root_id.map(|remote_id| remote_id.0),
                 bool_to_int(mount.read_only),
                 to_json(&mount.projection)?,
+                mount.connection_id.map(|connection_id| connection_id.0),
             ],
         )?;
         Ok(())
@@ -83,7 +88,7 @@ impl MountRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json
+                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
                  FROM mounts
                  WHERE mount_id = ?1",
                 params![mount_id.0],
@@ -95,6 +100,7 @@ impl MountRepository for SqliteStateStore {
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
@@ -106,7 +112,7 @@ impl MountRepository for SqliteStateStore {
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json
+            "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
              FROM mounts
              ORDER BY mount_id",
         )?;
@@ -118,10 +124,98 @@ impl MountRepository for SqliteStateStore {
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
 
         rows.map(|row| mount_from_row(row?)).collect()
+    }
+}
+
+impl ConnectionRepository for SqliteStateStore {
+    fn save_connection(&mut self, connection_record: ConnectionRecord) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO connections (
+                connection_id,
+                connector,
+                display_name,
+                account_label,
+                workspace_id,
+                workspace_name,
+                auth_kind,
+                secret_ref,
+                scopes_json,
+                capabilities_json,
+                status,
+                created_at,
+                updated_at,
+                expires_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(connection_id) DO UPDATE SET
+                connector = excluded.connector,
+                display_name = excluded.display_name,
+                account_label = excluded.account_label,
+                workspace_id = excluded.workspace_id,
+                workspace_name = excluded.workspace_name,
+                auth_kind = excluded.auth_kind,
+                secret_ref = excluded.secret_ref,
+                scopes_json = excluded.scopes_json,
+                capabilities_json = excluded.capabilities_json,
+                status = excluded.status,
+                updated_at = excluded.updated_at,
+                expires_at = excluded.expires_at",
+            params![
+                connection_record.connection_id.0,
+                connection_record.connector,
+                connection_record.display_name,
+                connection_record.account_label,
+                connection_record.workspace_id,
+                connection_record.workspace_name,
+                connection_record.auth_kind,
+                connection_record.secret_ref,
+                to_json(&connection_record.scopes)?,
+                connection_record.capabilities_json,
+                connection_record.status,
+                connection_record.created_at,
+                connection_record.updated_at,
+                connection_record.expires_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_connection(
+        &self,
+        connection_id: &ConnectionId,
+    ) -> StoreResult<Option<ConnectionRecord>> {
+        let connection = self.connection()?;
+        let sql = CONNECTION_SELECT_WITH_WHERE.to_owned() + "WHERE connection_id = ?1";
+        connection
+            .query_row(&sql, params![connection_id.0], connection_row)
+            .optional()?
+            .map(connection_from_row)
+            .transpose()
+    }
+
+    fn list_connections(&self) -> StoreResult<Vec<ConnectionRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            &(CONNECTION_SELECT_WITH_WHERE.to_owned() + "ORDER BY connector, connection_id"),
+        )?;
+        let rows = statement.query_map([], connection_row)?;
+
+        rows.map(|row| connection_from_row(row?)).collect()
+    }
+
+    fn delete_connection(&mut self, connection_id: &ConnectionId) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM connections WHERE connection_id = ?1",
+            params![connection_id.0],
+        )?;
+        Ok(())
     }
 }
 
@@ -406,8 +500,38 @@ const ENTITY_SELECT_WITH_WHERE: &str = "
     SELECT mount_id, remote_id, kind_json, title, path, hydration_json, content_hash, remote_edited_at
     FROM entities
     ";
+const CONNECTION_SELECT_WITH_WHERE: &str = "
+    SELECT connection_id, connector, display_name, account_label, workspace_id, workspace_name,
+           auth_kind, secret_ref, scopes_json, capabilities_json, status, created_at, updated_at,
+           expires_at
+    FROM connections
+    ";
 
-type MountRow = (String, String, String, Option<String>, i64, String);
+type MountRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    String,
+    Option<String>,
+);
+type ConnectionRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+);
 type EntityRow = (
     String,
     String,
@@ -445,7 +569,25 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             root TEXT NOT NULL,
             remote_root_id TEXT,
             read_only INTEGER NOT NULL CHECK (read_only IN (0, 1)),
-            projection_json TEXT NOT NULL DEFAULT '\"plain_files\"'
+            projection_json TEXT NOT NULL DEFAULT '\"plain_files\"',
+            connection_id TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS connections (
+            connection_id TEXT PRIMARY KEY,
+            connector TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            account_label TEXT,
+            workspace_id TEXT,
+            workspace_name TEXT,
+            auth_kind TEXT NOT NULL,
+            secret_ref TEXT NOT NULL,
+            scopes_json TEXT NOT NULL DEFAULT '[]',
+            capabilities_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS entities (
@@ -521,6 +663,33 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         )?;
     }
 
+    if user_version < 7 {
+        if !column_exists(connection, "mounts", "connection_id")? {
+            connection.execute_batch(
+                "ALTER TABLE mounts
+                 ADD COLUMN connection_id TEXT;",
+            )?;
+        }
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS connections (
+                connection_id TEXT PRIMARY KEY,
+                connector TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                account_label TEXT,
+                workspace_id TEXT,
+                workspace_name TEXT,
+                auth_kind TEXT NOT NULL,
+                secret_ref TEXT NOT NULL,
+                scopes_json TEXT NOT NULL DEFAULT '[]',
+                capabilities_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT
+            );",
+        )?;
+    }
+
     if user_version < SCHEMA_VERSION {
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
@@ -536,6 +705,45 @@ fn mount_from_row(row: MountRow) -> StoreResult<MountConfig> {
         remote_root_id: row.3.map(RemoteId),
         read_only: row.4 != 0,
         projection: from_json::<ProjectionMode>(&row.5)?,
+        connection_id: row.6.map(ConnectionId),
+    })
+}
+
+fn connection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectionRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+    ))
+}
+
+fn connection_from_row(row: ConnectionRow) -> StoreResult<ConnectionRecord> {
+    Ok(ConnectionRecord {
+        connection_id: ConnectionId(row.0),
+        connector: row.1,
+        display_name: row.2,
+        account_label: row.3,
+        workspace_id: row.4,
+        workspace_name: row.5,
+        auth_kind: row.6,
+        secret_ref: row.7,
+        scopes: from_json::<Vec<String>>(&row.8)?,
+        capabilities_json: row.9,
+        status: row.10,
+        created_at: row.11,
+        updated_at: row.12,
+        expires_at: row.13,
     })
 }
 

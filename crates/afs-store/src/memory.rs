@@ -12,8 +12,12 @@ use afs_core::model::{MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 
 use crate::error::{StoreError, StoreResult};
-use crate::records::{EntityRecord, MountConfig, ShadowSnapshotRecord};
-use crate::repository::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
+use crate::records::{
+    ConnectionId, ConnectionRecord, EntityRecord, MountConfig, ShadowSnapshotRecord,
+};
+use crate::repository::{
+    ConnectionRepository, EntityRepository, JournalRepository, MountRepository, ShadowRepository,
+};
 
 type EntityKey = (MountId, RemoteId);
 type PathKey = (MountId, PathBuf);
@@ -22,6 +26,7 @@ type ShadowKey = (MountId, RemoteId);
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
     mounts: BTreeMap<MountId, MountConfig>,
+    connections: BTreeMap<ConnectionId, ConnectionRecord>,
     entities: BTreeMap<EntityKey, EntityRecord>,
     entities_by_path: BTreeMap<PathKey, RemoteId>,
     shadows: BTreeMap<ShadowKey, ShadowSnapshotRecord>,
@@ -58,6 +63,30 @@ impl MountRepository for InMemoryStateStore {
 
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
         Ok(self.mounts.values().cloned().collect())
+    }
+}
+
+impl ConnectionRepository for InMemoryStateStore {
+    fn save_connection(&mut self, connection: ConnectionRecord) -> StoreResult<()> {
+        self.connections
+            .insert(connection.connection_id.clone(), connection);
+        Ok(())
+    }
+
+    fn get_connection(
+        &self,
+        connection_id: &ConnectionId,
+    ) -> StoreResult<Option<ConnectionRecord>> {
+        Ok(self.connections.get(connection_id).cloned())
+    }
+
+    fn list_connections(&self) -> StoreResult<Vec<ConnectionRecord>> {
+        Ok(self.connections.values().cloned().collect())
+    }
+
+    fn delete_connection(&mut self, connection_id: &ConnectionId) -> StoreResult<()> {
+        self.connections.remove(connection_id);
+        Ok(())
     }
 }
 

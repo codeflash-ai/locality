@@ -17,6 +17,9 @@ pub const DEFAULT_NOTION_VERSION: &str = "2026-03-11";
 pub const DEFAULT_NOTION_TOKEN_ENV: &str = "NOTION_TOKEN";
 
 pub trait NotionApi: std::fmt::Debug + Send + Sync {
+    fn retrieve_current_user(&self) -> AfsResult<serde_json::Value> {
+        Err(AfsError::NotImplemented("retrieve Notion current user"))
+    }
     fn retrieve_page(&self, page_id: &str) -> AfsResult<PageDto>;
     fn retrieve_database(&self, database_id: &str) -> AfsResult<DatabaseDto> {
         let _ = database_id;
@@ -49,6 +52,15 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
     ) -> AfsResult<BlockListDto>;
     fn search_pages(&self, start_cursor: Option<&str>) -> AfsResult<PageListDto>;
     fn update_block(&self, block_id: &str, body: serde_json::Value) -> AfsResult<BlockDto>;
+    fn move_block(
+        &self,
+        block_id: &str,
+        parent_id: &str,
+        after: Option<&str>,
+    ) -> AfsResult<BlockDto> {
+        let _ = (block_id, parent_id, after);
+        Err(AfsError::NotImplemented("move Notion block"))
+    }
     fn append_block_children(
         &self,
         block_id: &str,
@@ -171,11 +183,15 @@ impl HttpNotionApi {
     }
 
     fn token(&self) -> AfsResult<String> {
+        if let Some(token) = &self.config.token {
+            return Ok(token.clone());
+        }
+
         std::env::var(&self.config.token_key)
             .or_else(|_| std::env::var(DEFAULT_NOTION_TOKEN_ENV))
             .map_err(|_| {
                 AfsError::InvalidState(format!(
-                    "missing Notion token; set {}",
+                    "missing Notion connection; run `afs connect notion` or set {}",
                     self.config.token_key
                 ))
             })
@@ -183,6 +199,10 @@ impl HttpNotionApi {
 }
 
 impl NotionApi for HttpNotionApi {
+    fn retrieve_current_user(&self) -> AfsResult<serde_json::Value> {
+        self.get_json("/v1/users/me", &[])
+    }
+
     fn retrieve_page(&self, page_id: &str) -> AfsResult<PageDto> {
         self.get_json(&format!("/v1/pages/{page_id}"), &[])
     }
@@ -256,6 +276,18 @@ impl NotionApi for HttpNotionApi {
         self.patch_json(&format!("/v1/blocks/{block_id}"), body)
     }
 
+    fn move_block(
+        &self,
+        block_id: &str,
+        parent_id: &str,
+        after: Option<&str>,
+    ) -> AfsResult<BlockDto> {
+        self.patch_json(
+            &format!("/v1/blocks/{block_id}"),
+            move_block_body(parent_id, after),
+        )
+    }
+
     fn append_block_children(
         &self,
         block_id: &str,
@@ -267,4 +299,25 @@ impl NotionApi for HttpNotionApi {
     fn delete_block(&self, block_id: &str) -> AfsResult<BlockDto> {
         self.delete_json(&format!("/v1/blocks/{block_id}"))
     }
+}
+
+fn move_block_body(parent_id: &str, after: Option<&str>) -> serde_json::Value {
+    let mut body = json!({
+        "parent": {
+            "type": "page_id",
+            "page_id": parent_id,
+        },
+        "position": {
+            "type": "start",
+        },
+    });
+    if let Some(after) = after {
+        body["position"] = json!({
+            "type": "after_block",
+            "after_block": {
+                "id": after,
+            },
+        });
+    }
+    body
 }

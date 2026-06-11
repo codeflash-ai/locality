@@ -24,7 +24,7 @@ fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
     let fixture = PullFixture::new();
     let mut store = InMemoryStateStore::new();
     fixture.mount(&mut store);
-    let connector = fixture.connector();
+    let connector = fixture.connector("Roadmap");
 
     let report = run_pull(&mut store, &connector, &fixture.root).expect("pull root");
 
@@ -32,17 +32,17 @@ fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
     assert_eq!(report.enumerated, 4);
     assert_eq!(report.stubbed, 3);
     assert_eq!(report.hydrated, 1);
-    assert!(fixture.root_file().exists());
-    assert!(fixture.child_file().exists());
+    assert!(fixture.root_file("roadmap").exists());
+    assert!(fixture.child_file("roadmap").exists());
     assert!(fixture.database_schema_file().exists());
     assert!(fixture.row_file().exists());
     assert!(
-        !fs::read_to_string(fixture.root_file())
+        !fs::read_to_string(fixture.root_file("roadmap"))
             .expect("root file")
             .contains(afs_core::model::CanonicalDocument::STUB_MARKER)
     );
     assert!(
-        fs::read_to_string(fixture.child_file())
+        fs::read_to_string(fixture.child_file("roadmap"))
             .expect("child file")
             .contains(afs_core::model::CanonicalDocument::STUB_MARKER)
     );
@@ -76,16 +76,44 @@ fn pull_file_skips_dirty_hydrated_file() {
     let fixture = PullFixture::new();
     let mut store = InMemoryStateStore::new();
     fixture.mount(&mut store);
-    let connector = fixture.connector();
+    let connector = fixture.connector("Roadmap");
     run_pull(&mut store, &connector, &fixture.root).expect("initial pull");
-    fs::write(fixture.root_file(), "---\nafs:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal edit.\n")
+    fs::write(fixture.root_file("roadmap"), "---\nafs:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal edit.\n")
         .expect("dirty write");
 
-    let report = run_pull(&mut store, &connector, fixture.root_file()).expect("pull dirty file");
+    let report =
+        run_pull(&mut store, &connector, fixture.root_file("roadmap")).expect("pull dirty file");
 
     assert!(!report.ok);
     assert_eq!(report.hydrated, 0);
     assert_eq!(report.skipped_dirty, 1);
+}
+
+#[test]
+fn pull_mount_root_renames_existing_projection_when_remote_title_changes() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+
+    run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
+
+    assert!(fixture.root_file("roadmap").exists());
+    assert!(fixture.child_file("roadmap").exists());
+
+    let report = run_pull(&mut store, &fixture.connector("Strategy"), &fixture.root)
+        .expect("pull renamed root");
+
+    assert!(report.ok);
+    assert!(fixture.root_file("strategy").exists());
+    assert!(fixture.child_file("strategy").exists());
+    assert!(!fixture.root_file("roadmap").exists());
+    assert!(!fixture.child_file("roadmap").exists());
+
+    let root_entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get root entity")
+        .expect("root entity");
+    assert_eq!(root_entity.path, PathBuf::from("strategy ~aaaaaa.md"));
 }
 
 struct PullFixture {
@@ -124,6 +152,7 @@ impl PullFixture {
                 connector: "notion".to_string(),
                 root: self.root.clone(),
                 remote_root_id: Some(self.root_page_id.clone()),
+                connection_id: None,
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
             },
@@ -132,23 +161,24 @@ impl PullFixture {
         assert_eq!(store.load_mounts().expect("mounts").len(), 1);
     }
 
-    fn connector(&self) -> NotionConnector {
+    fn connector(&self, root_title: &str) -> NotionConnector {
         NotionConnector::with_api(
             NotionConfig::default(),
             Arc::new(FixtureNotionApi::new(
                 self.root_page_id.as_str(),
                 self.canonical_root_page_id.as_str(),
+                root_title,
             )),
         )
     }
 
-    fn root_file(&self) -> PathBuf {
-        self.root.join("roadmap ~aaaaaa.md")
+    fn root_file(&self, slug: &str) -> PathBuf {
+        self.root.join(format!("{slug} ~aaaaaa.md"))
     }
 
-    fn child_file(&self) -> PathBuf {
+    fn child_file(&self, root_slug: &str) -> PathBuf {
         self.root
-            .join("roadmap ~aaaaaa")
+            .join(format!("{root_slug} ~aaaaaa"))
             .join("design-notes ~bbbbbb.md")
     }
 
@@ -183,7 +213,7 @@ struct FixtureNotionApi {
 }
 
 impl FixtureNotionApi {
-    fn new(requested_root_page_id: &str, returned_root_page_id: &str) -> Self {
+    fn new(requested_root_page_id: &str, returned_root_page_id: &str, root_title: &str) -> Self {
         let child_page_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let database_id = "cccccccccccccccccccccccccccccccc";
         let data_source_id = "dddddddddddddddddddddddddddddddd";
@@ -191,11 +221,11 @@ impl FixtureNotionApi {
         let pages = BTreeMap::from([
             (
                 requested_root_page_id.to_string(),
-                page(returned_root_page_id, "Roadmap"),
+                page(returned_root_page_id, root_title),
             ),
             (
                 returned_root_page_id.to_string(),
-                page(returned_root_page_id, "Roadmap"),
+                page(returned_root_page_id, root_title),
             ),
             (
                 child_page_id.to_string(),

@@ -204,6 +204,12 @@ fn status_reports_pending_and_failed_journals() {
             .iter()
             .any(|issue| issue.code == "failed_journal")
     );
+    assert!(
+        entry
+            .issues
+            .iter()
+            .any(|issue| issue.code == "last_failure" && issue.message == "connector failed")
+    );
 }
 
 #[test]

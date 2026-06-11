@@ -202,6 +202,93 @@ fn apply_uses_start_position_and_chains_adjacent_new_blocks() {
 }
 
 #[test]
+fn apply_moves_existing_blocks_after_mid_page_append() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            paragraph_block("paragraph-1", "First.", false),
+            paragraph_block("paragraph-2", "Second.", false),
+            paragraph_block("directive-1", "Directive placeholder.", false),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: "Inserted paragraph.".to_string(),
+            },
+            PushOperation::MoveBlock {
+                block_id: RemoteId::new("directive-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply");
+
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    assert_eq!(
+        result.effects,
+        vec![
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[0].clone(),
+                operation_index: 0,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-1"),
+            },
+            JournalApplyEffect::MovedBlock {
+                operation_id: operation_ids[1].clone(),
+                operation_index: 1,
+                block_id: RemoteId::new("directive-1"),
+            },
+        ]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": rich_text_json("Inserted paragraph."),
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "paragraph-1",
+                        },
+                    },
+                }),
+            },
+            WriteCall::Move {
+                block_id: "directive-1".to_string(),
+                parent_id: "page-1".to_string(),
+                after: Some("created-1".to_string()),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_updates_equation_blocks_from_display_math() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",
@@ -926,6 +1013,20 @@ impl NotionApi for RecordingNotionApi {
         Ok(block(block_id, "paragraph"))
     }
 
+    fn move_block(
+        &self,
+        block_id: &str,
+        parent_id: &str,
+        after: Option<&str>,
+    ) -> AfsResult<BlockDto> {
+        self.writes.lock().expect("writes").push(WriteCall::Move {
+            block_id: block_id.to_string(),
+            parent_id: parent_id.to_string(),
+            after: after.map(str::to_string),
+        });
+        Ok(block(block_id, "paragraph"))
+    }
+
     fn append_block_children(&self, block_id: &str, body: Value) -> AfsResult<BlockListDto> {
         self.writes.lock().expect("writes").push(WriteCall::Append {
             block_id: block_id.to_string(),
@@ -954,11 +1055,29 @@ impl NotionApi for RecordingNotionApi {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WriteCall {
-    UpdatePage { page_id: String, body: Value },
-    CreatePage { body: Value },
-    Update { block_id: String, body: Value },
-    Append { block_id: String, body: Value },
-    Delete { block_id: String },
+    UpdatePage {
+        page_id: String,
+        body: Value,
+    },
+    CreatePage {
+        body: Value,
+    },
+    Update {
+        block_id: String,
+        body: Value,
+    },
+    Move {
+        block_id: String,
+        parent_id: String,
+        after: Option<String>,
+    },
+    Append {
+        block_id: String,
+        body: Value,
+    },
+    Delete {
+        block_id: String,
+    },
 }
 
 fn page_property(kind: &str) -> PagePropertyDto {

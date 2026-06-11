@@ -272,6 +272,93 @@ fn scheduled_pull_preserves_hydrated_files_and_queues_changed_remote_refresh() {
     );
 }
 
+#[test]
+fn scheduled_pull_renames_existing_projection_when_remote_title_changes() {
+    let root = temp_root("scheduled-pull-rename");
+    let mount_id = MountId::new("notion-main");
+    let mount = MountConfig::new(mount_id.clone(), "notion", root.clone())
+        .with_remote_root_id(RemoteId::new("root-page"));
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![
+            page_entry(
+                &mount_id,
+                "root-page",
+                "Home",
+                "Home.md",
+                "2026-06-10T00:00:00Z",
+            ),
+            page_entry(
+                &mount_id,
+                "child-page",
+                "Child",
+                "Home/Child.md",
+                "2026-06-10T00:00:00Z",
+            ),
+        ],
+    );
+    let mut supervisor = supervisor_with_mounts([mount]);
+
+    supervisor.start().expect("start supervisor");
+    supervisor
+        .advance_and_execute_scheduled_pull(
+            AdvanceScheduledPullJob::new(Duration::ZERO),
+            &source,
+            &DefaultFetchScheduleStrategy,
+        )
+        .expect("initial scheduled pull");
+
+    assert!(root.join("Home.md").exists());
+    assert!(root.join("Home/Child.md").exists());
+
+    source.insert_entries(
+        &mount_id,
+        vec![
+            page_entry(
+                &mount_id,
+                "root-page",
+                "Vision",
+                "Vision.md",
+                "2026-06-11T00:00:00Z",
+            ),
+            page_entry(
+                &mount_id,
+                "child-page",
+                "Child",
+                "Vision/Child.md",
+                "2026-06-11T00:00:00Z",
+            ),
+        ],
+    );
+
+    supervisor
+        .advance_and_execute_scheduled_pull(
+            AdvanceScheduledPullJob::new(Duration::from_secs(15)),
+            &source,
+            &DefaultFetchScheduleStrategy,
+        )
+        .expect("rename scheduled pull");
+
+    assert!(root.join("Vision.md").exists());
+    assert!(root.join("Vision/Child.md").exists());
+    assert!(!root.join("Home.md").exists());
+    assert!(!root.join("Home/Child.md").exists());
+
+    let root_entity = supervisor
+        .store()
+        .get_entity(&mount_id, &RemoteId::new("root-page"))
+        .expect("get root entity")
+        .expect("root entity");
+    assert_eq!(root_entity.path, PathBuf::from("Vision.md"));
+    let child_entity = supervisor
+        .store()
+        .get_entity(&mount_id, &RemoteId::new("child-page"))
+        .expect("get child entity")
+        .expect("child entity");
+    assert_eq!(child_entity.path, PathBuf::from("Vision/Child.md"));
+}
+
 fn supervisor_with_mounts(
     mounts: impl IntoIterator<Item = MountConfig>,
 ) -> DaemonSupervisor<InMemoryStateStore, RecordingWatcher, HydrationQueue> {

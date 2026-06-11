@@ -343,7 +343,7 @@ fn classify_entity<S>(
     journals: &[JournalEntry],
 ) -> StatusEntry
 where
-    S: ShadowRepository,
+    S: ShadowRepository + JournalRepository,
 {
     let absolute_path = mount.root.join(&entity.path);
     let mut issues = Vec::new();
@@ -363,6 +363,11 @@ where
             "failed_journal",
             format!("{failed_journal_count} push journal(s) failed"),
         ));
+        if let Ok(Some(message)) =
+            store.latest_failed_journal_for_entity(&mount.mount_id, &entity.remote_id)
+        {
+            issues.push(StatusIssue::new("last_failure", message));
+        }
     }
 
     StatusEntry {
