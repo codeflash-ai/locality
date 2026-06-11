@@ -599,7 +599,10 @@ fn current_block_rich_text(block: &BlockDto) -> AfsResult<Option<&[RichTextDto]>
             .heading_4
             .as_ref()
             .map(|block| block.rich_text.as_slice()),
-        "toggle" => block.toggle.as_ref().map(|block| block.rich_text.as_slice()),
+        "toggle" => block
+            .toggle
+            .as_ref()
+            .map(|block| block.rich_text.as_slice()),
         "bulleted_list_item" => block
             .bulleted_list_item
             .as_ref()
