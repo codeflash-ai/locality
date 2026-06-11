@@ -126,6 +126,69 @@ fn info_for_database_directory_reports_schema_and_rows() {
 }
 
 #[test]
+fn info_for_database_row_reports_parent_schema() {
+    let fixture = InfoFixture::new();
+    let mut store = fixture.store();
+    fixture.seed_tree(&mut store);
+
+    let report = run_info(
+        &store,
+        InfoOptions {
+            path: Some(
+                fixture
+                    .root
+                    .join("roadmap ~aaaaaa/tasks ~cccccc/fix-login ~dddddd.md"),
+            ),
+        },
+    )
+    .expect("info report");
+
+    let expected_schema = fixture
+        .root
+        .join("roadmap ~aaaaaa/tasks ~cccccc/_schema.yaml")
+        .display()
+        .to_string();
+
+    assert_eq!(report.subject.role, InfoRole::PageFile);
+    assert_eq!(report.subject.source, "Notion page");
+    assert_eq!(
+        report.subject.schema_path.as_deref(),
+        Some(expected_schema.as_str())
+    );
+}
+
+#[test]
+fn info_for_database_row_workspace_reports_parent_schema() {
+    let fixture = InfoFixture::new();
+    let mut store = fixture.store();
+    fixture.seed_tree(&mut store);
+
+    let report = run_info(
+        &store,
+        InfoOptions {
+            path: Some(
+                fixture
+                    .root
+                    .join("roadmap ~aaaaaa/tasks ~cccccc/fix-login ~dddddd"),
+            ),
+        },
+    )
+    .expect("info report");
+
+    let expected_schema = fixture
+        .root
+        .join("roadmap ~aaaaaa/tasks ~cccccc/_schema.yaml")
+        .display()
+        .to_string();
+
+    assert_eq!(report.subject.role, InfoRole::PageWorkspace);
+    assert_eq!(
+        report.subject.schema_path.as_deref(),
+        Some(expected_schema.as_str())
+    );
+}
+
+#[test]
 fn info_without_path_uses_cwd_inside_mount() {
     let fixture = InfoFixture::new();
     let mut store = fixture.store();

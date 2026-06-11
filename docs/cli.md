@@ -47,7 +47,7 @@ The JSON report includes `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty
 The JSON report includes:
 
 - `mount`: mount ID, connector, root, remote root ID, and read-only state;
-- `subject`: role, source type, local path, existence, backing entity metadata, and database schema path when applicable;
+- `subject`: role, source type, local path, existence, backing entity metadata, and database schema path for database directories or rows when applicable;
 - `children`: immediate child counts by entity type plus subtree entity count;
 - `journals`: pending and failed journal counts in the context.
 

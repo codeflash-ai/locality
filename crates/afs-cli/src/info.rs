@@ -220,11 +220,7 @@ fn resolve_subject(
     if let Some(entity) = entities.iter().find(|entity| entity.path == relative_path) {
         let role = role_for_exact_entity(&entity.kind);
         let child_context = child_context_for_entity(entity);
-        let schema_path = if matches!(entity.kind, EntityKind::Database) {
-            Some(mount.root.join(&entity.path).join("_schema.yaml"))
-        } else {
-            None
-        };
+        let schema_path = schema_path_for_entity(mount, entity, entities);
 
         return SubjectContext {
             role,
@@ -239,17 +235,13 @@ fn resolve_subject(
             role: InfoRole::PageWorkspace,
             entity: Some(entity.clone()),
             child_context: relative_path.to_path_buf(),
-            schema_path: None,
+            schema_path: schema_path_for_entity(mount, entity, entities),
         };
     }
 
     if let Some(entity) = nearest_directory_entity(relative_path, entities) {
         let role = role_for_exact_entity(&entity.kind);
-        let schema_path = if matches!(entity.kind, EntityKind::Database) {
-            Some(mount.root.join(&entity.path).join("_schema.yaml"))
-        } else {
-            None
-        };
+        let schema_path = schema_path_for_entity(mount, entity, entities);
 
         return SubjectContext {
             role,
@@ -265,6 +257,35 @@ fn resolve_subject(
         child_context: relative_path.to_path_buf(),
         schema_path: None,
     }
+}
+
+fn schema_path_for_entity(
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    entities: &[EntityRecord],
+) -> Option<PathBuf> {
+    if mount.connector != "notion" {
+        return None;
+    }
+
+    let database = if matches!(entity.kind, EntityKind::Database) {
+        Some(entity)
+    } else {
+        nearest_database_parent(&entity.path, entities)
+    }?;
+
+    Some(mount.root.join(&database.path).join("_schema.yaml"))
+}
+
+fn nearest_database_parent<'a>(
+    path: &Path,
+    entities: &'a [EntityRecord],
+) -> Option<&'a EntityRecord> {
+    entities
+        .iter()
+        .filter(|entity| matches!(entity.kind, EntityKind::Database))
+        .filter(|entity| path.starts_with(&entity.path) && path != entity.path)
+        .max_by_key(|entity| entity.path.components().count())
 }
 
 fn role_for_exact_entity(kind: &EntityKind) -> InfoRole {
