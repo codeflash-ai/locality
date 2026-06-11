@@ -11,12 +11,22 @@ use afs_core::model::{MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 
 use crate::error::StoreResult;
-use crate::records::{EntityRecord, MountConfig, ShadowSnapshotRecord};
+use crate::records::{
+    ConnectionId, ConnectionRecord, EntityRecord, MountConfig, ShadowSnapshotRecord,
+};
 
 pub trait MountRepository {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()>;
     fn get_mount(&self, mount_id: &MountId) -> StoreResult<Option<MountConfig>>;
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>>;
+}
+
+pub trait ConnectionRepository {
+    fn save_connection(&mut self, connection: ConnectionRecord) -> StoreResult<()>;
+    fn get_connection(&self, connection_id: &ConnectionId)
+    -> StoreResult<Option<ConnectionRecord>>;
+    fn list_connections(&self) -> StoreResult<Vec<ConnectionRecord>>;
+    fn delete_connection(&mut self, connection_id: &ConnectionId) -> StoreResult<()>;
 }
 
 pub trait EntityRepository {

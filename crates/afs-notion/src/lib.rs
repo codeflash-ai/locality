@@ -36,12 +36,25 @@ use crate::render::{
     NotionRenderedEntity, RenderOptions, render_native_entity, render_native_entity_with_options,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NotionConfig {
     pub workspace_id: Option<String>,
     pub root_page_id: Option<afs_core::model::RemoteId>,
+    /// Resolved bearer token from a provider connection. Never log this field.
+    pub token: Option<String>,
     /// Environment variable or future keychain key used to find the bearer token.
     pub token_key: String,
+}
+
+impl std::fmt::Debug for NotionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotionConfig")
+            .field("workspace_id", &self.workspace_id)
+            .field("root_page_id", &self.root_page_id)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("token_key", &self.token_key)
+            .finish()
+    }
 }
 
 impl Default for NotionConfig {
@@ -49,6 +62,7 @@ impl Default for NotionConfig {
         Self {
             workspace_id: None,
             root_page_id: None,
+            token: None,
             token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
         }
     }
@@ -57,6 +71,11 @@ impl Default for NotionConfig {
 impl NotionConfig {
     pub fn with_root_page_id(mut self, root_page_id: afs_core::model::RemoteId) -> Self {
         self.root_page_id = Some(root_page_id);
+        self
+    }
+
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
         self
     }
 }

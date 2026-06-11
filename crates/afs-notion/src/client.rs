@@ -17,6 +17,9 @@ pub const DEFAULT_NOTION_VERSION: &str = "2026-03-11";
 pub const DEFAULT_NOTION_TOKEN_ENV: &str = "NOTION_TOKEN";
 
 pub trait NotionApi: std::fmt::Debug + Send + Sync {
+    fn retrieve_current_user(&self) -> AfsResult<serde_json::Value> {
+        Err(AfsError::NotImplemented("retrieve Notion current user"))
+    }
     fn retrieve_page(&self, page_id: &str) -> AfsResult<PageDto>;
     fn retrieve_database(&self, database_id: &str) -> AfsResult<DatabaseDto> {
         let _ = database_id;
@@ -180,11 +183,15 @@ impl HttpNotionApi {
     }
 
     fn token(&self) -> AfsResult<String> {
+        if let Some(token) = &self.config.token {
+            return Ok(token.clone());
+        }
+
         std::env::var(&self.config.token_key)
             .or_else(|_| std::env::var(DEFAULT_NOTION_TOKEN_ENV))
             .map_err(|_| {
                 AfsError::InvalidState(format!(
-                    "missing Notion token; set {}",
+                    "missing Notion connection; run `afs connect notion` or set {}",
                     self.config.token_key
                 ))
             })
@@ -192,6 +199,10 @@ impl HttpNotionApi {
 }
 
 impl NotionApi for HttpNotionApi {
+    fn retrieve_current_user(&self) -> AfsResult<serde_json::Value> {
+        self.get_json("/v1/users/me", &[])
+    }
+
     fn retrieve_page(&self, page_id: &str) -> AfsResult<PageDto> {
         self.get_json(&format!("/v1/pages/{page_id}"), &[])
     }

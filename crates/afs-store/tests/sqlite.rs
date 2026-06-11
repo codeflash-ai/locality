@@ -10,8 +10,9 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use afs_store::{
-    EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
-    ProjectionMode, ShadowRepository, SqliteStateStore, StoreError,
+    ConnectionId, ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
+    JournalRepository, MountConfig, MountRepository, ProjectionMode, ShadowRepository,
+    SqliteStateStore, StoreError,
 };
 use rusqlite::{Connection, params};
 
@@ -31,7 +32,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 6);
+    assert_eq!(user_version, 7);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -51,7 +52,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 6,
+            supported: 7,
         }
     );
 }
@@ -112,6 +113,176 @@ fn mount_entity_and_shadow_round_trip_after_reopen() {
             .expect("load shadow"),
         shadow
     );
+}
+
+#[test]
+fn connections_round_trip_without_storing_secret_value() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    let connection = connection_record("notion-work");
+
+    store
+        .save_connection(connection.clone())
+        .expect("save connection");
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_connection(&ConnectionId::new("notion-work"))
+            .expect("get connection"),
+        Some(connection.clone())
+    );
+    assert_eq!(
+        reopened.list_connections().expect("list connections"),
+        vec![connection]
+    );
+
+    let sqlite_bytes = fs::read(fixture.state_root.join("state.sqlite3")).expect("read db");
+    let sqlite_text = String::from_utf8_lossy(&sqlite_bytes);
+    assert!(!sqlite_text.contains("ntn_secret_test_token"));
+}
+
+#[test]
+fn sqlite_store_migrates_v5_projection_and_connections_schema() {
+    let fixture = SqliteFixture::new();
+    fs::create_dir_all(&fixture.state_root).expect("state root");
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "
+            PRAGMA user_version = 5;
+            CREATE TABLE mounts (
+                mount_id TEXT PRIMARY KEY,
+                connector TEXT NOT NULL,
+                root TEXT NOT NULL,
+                remote_root_id TEXT,
+                read_only INTEGER NOT NULL CHECK (read_only IN (0, 1))
+            );
+            ",
+        )
+        .expect("create v5 schema");
+    connection
+        .execute(
+            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                fixture.mount_id.0.as_str(),
+                "notion",
+                fixture.mount_root.to_string_lossy(),
+                "root-page",
+                0
+            ],
+        )
+        .expect("insert mount");
+    drop(connection);
+
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw reopened connection");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    let connection_column_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('mounts') WHERE name = 'connection_id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("connection_id column");
+    let projection_column_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('mounts') WHERE name = 'projection_json'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("projection_json column");
+    let connection_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'connections'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("connections table");
+
+    assert_eq!(user_version, 7);
+    assert_eq!(connection_column_count, 1);
+    assert_eq!(projection_column_count, 1);
+    assert_eq!(connection_table_count, 1);
+    let mount = store
+        .get_mount(&fixture.mount_id)
+        .expect("get migrated mount")
+        .expect("mount");
+    assert_eq!(mount.connection_id, None);
+    assert_eq!(mount.projection, ProjectionMode::PlainFiles);
+}
+
+#[test]
+fn sqlite_store_migrates_v6_projection_schema_to_connections() {
+    let fixture = SqliteFixture::new();
+    fs::create_dir_all(&fixture.state_root).expect("state root");
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "
+            PRAGMA user_version = 6;
+            CREATE TABLE mounts (
+                mount_id TEXT PRIMARY KEY,
+                connector TEXT NOT NULL,
+                root TEXT NOT NULL,
+                remote_root_id TEXT,
+                read_only INTEGER NOT NULL CHECK (read_only IN (0, 1)),
+                projection_json TEXT NOT NULL DEFAULT '\"plain_files\"'
+            );
+            ",
+        )
+        .expect("create v6 schema");
+    connection
+        .execute(
+            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                fixture.mount_id.0.as_str(),
+                "notion",
+                fixture.mount_root.to_string_lossy(),
+                "root-page",
+                0,
+                serde_json::to_string(&ProjectionMode::MacosFileProvider).expect("projection json"),
+            ],
+        )
+        .expect("insert mount");
+    drop(connection);
+
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw reopened connection");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    let connection_column_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('mounts') WHERE name = 'connection_id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("connection_id column");
+    let connection_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'connections'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("connections table");
+
+    assert_eq!(user_version, 7);
+    assert_eq!(connection_column_count, 1);
+    assert_eq!(connection_table_count, 1);
+    let mount = store
+        .get_mount(&fixture.mount_id)
+        .expect("get migrated mount")
+        .expect("mount");
+    assert_eq!(mount.connection_id, None);
+    assert_eq!(mount.projection, ProjectionMode::MacosFileProvider);
 }
 
 #[test]
@@ -289,7 +460,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 6);
+    assert_eq!(user_version, 7);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -360,7 +531,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 6);
+    assert_eq!(user_version, 7);
     assert!(entry.apply_effects.is_empty());
 }
 
@@ -422,6 +593,25 @@ fn entity_record() -> EntityRecord {
     .with_hydration(HydrationState::Hydrated)
     .with_content_hash("body-hash")
     .with_remote_edited_at("2026-06-10T00:00:00Z")
+}
+
+fn connection_record(connection_id: &str) -> ConnectionRecord {
+    ConnectionRecord {
+        connection_id: ConnectionId::new(connection_id),
+        connector: "notion".to_string(),
+        display_name: "work".to_string(),
+        account_label: Some("AgentFS Workspace".to_string()),
+        workspace_id: Some("workspace-1".to_string()),
+        workspace_name: Some("AgentFS".to_string()),
+        auth_kind: "token".to_string(),
+        secret_ref: format!("connection:{connection_id}"),
+        scopes: vec![],
+        capabilities_json: "{}".to_string(),
+        status: "active".to_string(),
+        created_at: "2026-06-11T00:00:00Z".to_string(),
+        updated_at: "2026-06-11T00:00:00Z".to_string(),
+        expires_at: None,
+    }
 }
 
 fn shadow_document(body: &str) -> ShadowDocument {
