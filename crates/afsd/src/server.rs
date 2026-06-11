@@ -43,6 +43,7 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
     let listener = UnixListener::bind(&socket_path)
         .map_err(|error| AfsError::Io(format!("failed to bind daemon socket: {error}")))?;
 
+    println!("afsd is running (socket: {})", socket_path.display());
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
