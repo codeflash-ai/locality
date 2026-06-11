@@ -1,9 +1,24 @@
 # Daemon
 
-`afsd` is the local supervisor for mounted AgentFS trees. The first implemented
-slice is deliberately deterministic and testable: it wires mount roots to a file
-watcher, converts file events into sync-core state transitions, and exposes a
-pull scheduler that can be advanced by tests without sleeping.
+`afsd` is the local supervisor for mounted AgentFS trees. The daemon is the
+stateful execution owner: CLI surfaces and future IPC submit jobs, while the
+daemon mutates local files, shadows, hydration state, journals, and remote
+sources through one serialized boundary.
+
+## Execution Boundary
+
+`DaemonExecutor` is the daemon-owned job interface. It currently covers file
+events, scheduled pull reconciliation, one-off hydration requests, hydration
+queue drains, and the future push job. The push job intentionally exists before
+the implementation so push apply, journal writes, and post-apply reconciliation
+have a single owner when that path moves into the daemon.
+
+The boundary keeps responsibilities sharp:
+
+- `afs-core` decides pure sync state and validates plans;
+- connectors enumerate, fetch, render, and apply source-specific mutations;
+- `afsd` executes jobs and is the only layer that advances durable sync state or
+  mutates the local projection.
 
 ## Scheduler
 
@@ -75,8 +90,8 @@ with a metadata-only poll.
 
 ## Supervisor Events
 
-`DaemonSupervisor` currently handles the safe local state transitions that do not
-need connector I/O:
+`DaemonSupervisor` implements `DaemonExecutor` and currently handles these
+stateful operations:
 
 - startup loads mounts from the store and registers each root with the watcher;
 - reading a `virtual` or `stub` entity queues hydration to `hydrated`;

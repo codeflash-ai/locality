@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use afs_core::hydration::HydrationReason;
+use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
@@ -9,6 +9,7 @@ use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
     ShadowRepository,
 };
+use afsd::execution::{DaemonExecutor, HydrationDrainJob, HydrationRequestJob, PushJob};
 use afsd::hydration::{HydratedEntity, HydrationQueue, HydrationSource};
 use afsd::scheduler::PullScheduler;
 use afsd::supervisor::DaemonSupervisor;
@@ -34,7 +35,7 @@ fn read_event_on_stub_queues_hydration() {
     supervisor.start().expect("start supervisor");
 
     let report = supervisor
-        .handle_file_event(read_event("/tmp/afs/notion/Roadmap.md"))
+        .execute_file_event(read_event("/tmp/afs/notion/Roadmap.md"))
         .expect("handle read");
 
     assert_eq!(report.queued_hydrations, 1);
@@ -55,7 +56,7 @@ fn read_event_on_hydrated_file_is_ignored() {
     supervisor.start().expect("start supervisor");
 
     let report = supervisor
-        .handle_file_event(read_event("/tmp/afs/notion/Roadmap.md"))
+        .execute_file_event(read_event("/tmp/afs/notion/Roadmap.md"))
         .expect("handle read");
 
     assert_eq!(report.ignored_events, 1);
@@ -68,7 +69,7 @@ fn write_event_on_hydrated_file_marks_entity_dirty() {
     supervisor.start().expect("start supervisor");
 
     let report = supervisor
-        .handle_file_event(FileEvent {
+        .execute_file_event(FileEvent {
             path: PathBuf::from("/tmp/afs/notion/Roadmap.md"),
             kind: FileEventKind::Write,
         })
@@ -105,11 +106,11 @@ fn supervisor_drains_queued_hydration_through_source() {
     let mut supervisor = supervisor_with_entity(HydrationState::Stub);
     supervisor.start().expect("start supervisor");
     supervisor
-        .handle_file_event(read_event("/tmp/afs/notion/Roadmap.md"))
+        .execute_file_event(read_event("/tmp/afs/notion/Roadmap.md"))
         .expect("handle read");
 
     let report = supervisor
-        .drain_hydration(&FakeHydrationSource)
+        .execute_hydration_drain(HydrationDrainJob, &FakeHydrationSource)
         .expect("drain hydration");
 
     assert_eq!(report.hydrated, 1);
@@ -124,15 +125,63 @@ fn supervisor_drains_queued_hydration_through_source() {
     let _ = std::fs::remove_file("/tmp/afs/notion/Roadmap.md");
 }
 
+#[test]
+fn supervisor_hydrates_single_request_through_daemon_job() {
+    let root =
+        std::env::temp_dir().join(format!("afs-supervisor-hydrate-job-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("test root");
+    let page_path = root.join("Roadmap.md");
+    let mut supervisor = supervisor_with_entity_at(root.clone(), HydrationState::Stub);
+    supervisor.start().expect("start supervisor");
+
+    let report = supervisor
+        .execute_hydration_request(
+            HydrationRequestJob::new(HydrationRequest::new(
+                MountId::new("notion-main"),
+                RemoteId::new("page-1"),
+                page_path.clone(),
+                HydrationState::Hydrated,
+                HydrationReason::ExplicitPull,
+            )),
+            &FakeHydrationSource,
+        )
+        .expect("execute hydration job");
+
+    assert_eq!(report.outcome, afsd::hydration::HydrationOutcome::Hydrated);
+    let contents = std::fs::read_to_string(page_path).expect("hydrated file from daemon job");
+    assert!(contents.contains("Hydrated from supervisor."));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn push_job_is_reserved_for_daemon_execution_boundary() {
+    let mut supervisor = supervisor_with_entity(HydrationState::Hydrated);
+    supervisor.start().expect("start supervisor");
+
+    let error = supervisor
+        .execute_push(PushJob {
+            target_path: PathBuf::from("/tmp/afs/notion/Roadmap.md"),
+            assume_yes: true,
+            confirm_dangerous: false,
+        })
+        .expect_err("push execution is not wired yet");
+
+    assert_eq!(error, AfsError::NotImplemented("daemon push execution"));
+}
+
 fn supervisor_with_entity(
     hydration: HydrationState,
 ) -> DaemonSupervisor<InMemoryStateStore, RecordingWatcher, HydrationQueue> {
+    supervisor_with_entity_at(PathBuf::from("/tmp/afs/notion"), hydration)
+}
+
+fn supervisor_with_entity_at(
+    root: PathBuf,
+    hydration: HydrationState,
+) -> DaemonSupervisor<InMemoryStateStore, RecordingWatcher, HydrationQueue> {
     let mut store = InMemoryStateStore::new();
-    let mount = MountConfig::new(
-        MountId::new("notion-main"),
-        "notion",
-        PathBuf::from("/tmp/afs/notion"),
-    );
+    let mount = MountConfig::new(MountId::new("notion-main"), "notion", root);
     store.save_mount(mount.clone()).expect("save mount");
     store
         .save_entity(

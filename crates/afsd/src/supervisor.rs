@@ -1,14 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use afs_core::AfsResult;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::HydrationState;
+use afs_core::{AfsError, AfsResult};
 use afs_store::{EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository};
 
-use crate::hydration::{
-    HydrationDrainReport, HydrationEngine, HydrationExecutor, HydrationQueue, HydrationSource,
+use crate::execution::{
+    AdvanceScheduledPullJob, DaemonEventReport, DaemonExecutor, HydrationDrainJob,
+    HydrationRequestJob, HydrationRequestReport, PushJob, PushJobReport, ScheduledPullJob,
 };
+use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationQueue, HydrationSource};
 use crate::reconcile::{
     FetchScheduleStrategy, ScheduledPullReport, ScheduledPullSource, reconcile_scheduled_pull,
 };
@@ -52,7 +54,7 @@ where
         })
     }
 
-    pub fn handle_file_event(&mut self, event: FileEvent) -> AfsResult<DaemonEventReport> {
+    fn apply_file_event(&mut self, event: FileEvent) -> AfsResult<DaemonEventReport> {
         let mut report = DaemonEventReport::default();
         let Some((mount, entity)) = self.resolve_event_entity(&event.path)? else {
             report.ignored_events = 1;
@@ -95,43 +97,6 @@ where
 
     pub fn tick_scheduler(&mut self, elapsed: Duration) -> AfsResult<PullSchedulerTick> {
         self.scheduler.advance_by(elapsed)
-    }
-
-    pub fn run_scheduled_pull<Source, Strategy>(
-        &mut self,
-        tick: &PullSchedulerTick,
-        source: &Source,
-        strategy: &Strategy,
-    ) -> AfsResult<ScheduledPullReport>
-    where
-        Source: ScheduledPullSource + ?Sized,
-        Strategy: FetchScheduleStrategy + ?Sized,
-    {
-        let mounts = self.mounts.clone();
-        let policy = self.scheduler.config.hydration_policy.clone();
-        reconcile_scheduled_pull(
-            &mut self.store,
-            &mut self.hydration,
-            &mounts,
-            tick,
-            source,
-            strategy,
-            &policy,
-        )
-    }
-
-    pub fn advance_scheduled_pull<Source, Strategy>(
-        &mut self,
-        elapsed: Duration,
-        source: &Source,
-        strategy: &Strategy,
-    ) -> AfsResult<ScheduledPullReport>
-    where
-        Source: ScheduledPullSource + ?Sized,
-        Strategy: FetchScheduleStrategy + ?Sized,
-    {
-        let tick = self.tick_scheduler(elapsed)?;
-        self.run_scheduled_pull(&tick, source, strategy)
     }
 
     pub fn store(&self) -> &S {
@@ -188,30 +153,85 @@ where
     }
 }
 
-impl<S, W> DaemonSupervisor<S, W, HydrationQueue>
+impl<S, W> DaemonExecutor for DaemonSupervisor<S, W, HydrationQueue>
 where
     S: MountRepository + EntityRepository + ShadowRepository,
     W: FileWatcher,
 {
-    pub fn drain_hydration<Source>(&mut self, source: &Source) -> AfsResult<HydrationDrainReport>
+    fn execute_file_event(&mut self, event: FileEvent) -> AfsResult<DaemonEventReport> {
+        self.apply_file_event(event)
+    }
+
+    fn execute_scheduled_pull<Source, Strategy>(
+        &mut self,
+        job: ScheduledPullJob,
+        source: &Source,
+        strategy: &Strategy,
+    ) -> AfsResult<ScheduledPullReport>
+    where
+        Source: ScheduledPullSource + ?Sized,
+        Strategy: FetchScheduleStrategy + ?Sized,
+    {
+        let mounts = self.mounts.clone();
+        let policy = self.scheduler.config.hydration_policy.clone();
+        reconcile_scheduled_pull(
+            &mut self.store,
+            &mut self.hydration,
+            &mounts,
+            &job.tick,
+            source,
+            strategy,
+            &policy,
+        )
+    }
+
+    fn advance_and_execute_scheduled_pull<Source, Strategy>(
+        &mut self,
+        job: AdvanceScheduledPullJob,
+        source: &Source,
+        strategy: &Strategy,
+    ) -> AfsResult<ScheduledPullReport>
+    where
+        Source: ScheduledPullSource + ?Sized,
+        Strategy: FetchScheduleStrategy + ?Sized,
+    {
+        let tick = self.tick_scheduler(job.elapsed)?;
+        self.execute_scheduled_pull(ScheduledPullJob::new(tick), source, strategy)
+    }
+
+    fn execute_hydration_request<Source>(
+        &mut self,
+        job: HydrationRequestJob,
+        source: &Source,
+    ) -> AfsResult<HydrationRequestReport>
+    where
+        Source: HydrationSource + ?Sized,
+    {
+        let mut executor = HydrationExecutor::new(&mut self.store, source);
+        let outcome = executor.hydrate_request(job.request)?;
+        Ok(HydrationRequestReport { outcome })
+    }
+
+    fn execute_hydration_drain<Source>(
+        &mut self,
+        _job: HydrationDrainJob,
+        source: &Source,
+    ) -> AfsResult<crate::hydration::HydrationDrainReport>
     where
         Source: HydrationSource + ?Sized,
     {
         let mut executor = HydrationExecutor::new(&mut self.store, source);
         executor.drain_queue(&mut self.hydration)
     }
+
+    fn execute_push(&mut self, _job: PushJob) -> AfsResult<PushJobReport> {
+        Err(AfsError::NotImplemented("daemon push execution"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonStartReport {
     pub watched_mounts: usize,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DaemonEventReport {
-    pub queued_hydrations: usize,
-    pub marked_dirty: usize,
-    pub ignored_events: usize,
 }
 
 fn event_relative_path(root: &Path, event_path: &Path) -> Option<PathBuf> {

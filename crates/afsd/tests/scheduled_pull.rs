@@ -10,6 +10,7 @@ use afs_core::model::{
 };
 use afs_core::{AfsError, AfsResult};
 use afs_store::{EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository};
+use afsd::execution::{AdvanceScheduledPullJob, DaemonExecutor};
 use afsd::hydration::HydrationQueue;
 use afsd::reconcile::{
     DefaultFetchScheduleStrategy, EntityFetchPlan, EntityFetchSchedule, FetchScheduleStrategy,
@@ -51,7 +52,11 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
 
     supervisor.start().expect("start supervisor");
     let report = supervisor
-        .advance_scheduled_pull(Duration::ZERO, &source, &DefaultFetchScheduleStrategy)
+        .advance_and_execute_scheduled_pull(
+            AdvanceScheduledPullJob::new(Duration::ZERO),
+            &source,
+            &DefaultFetchScheduleStrategy,
+        )
         .expect("scheduled pull");
 
     assert_eq!(report.mounts_checked, 1);
@@ -119,7 +124,11 @@ fn scheduled_pull_strategy_can_dispatch_per_mount() {
 
     supervisor.start().expect("start supervisor");
     let report = supervisor
-        .advance_scheduled_pull(Duration::ZERO, &source, &HotMountOnlyStrategy)
+        .advance_and_execute_scheduled_pull(
+            AdvanceScheduledPullJob::new(Duration::ZERO),
+            &source,
+            &HotMountOnlyStrategy,
+        )
         .expect("scheduled pull");
 
     assert_eq!(report.mounts_checked, 2);
@@ -179,7 +188,11 @@ fn scheduled_pull_preserves_hydrated_files_and_queues_changed_remote_refresh() {
 
     supervisor.start().expect("start supervisor");
     let report = supervisor
-        .advance_scheduled_pull(Duration::ZERO, &source, &DefaultFetchScheduleStrategy)
+        .advance_and_execute_scheduled_pull(
+            AdvanceScheduledPullJob::new(Duration::ZERO),
+            &source,
+            &DefaultFetchScheduleStrategy,
+        )
         .expect("scheduled pull");
 
     assert_eq!(report.stubbed, 0);
