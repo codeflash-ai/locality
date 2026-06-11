@@ -58,6 +58,34 @@ fn fetch_recurses_paginated_block_children_and_render_preserves_shadow_ids() {
 }
 
 #[test]
+fn fetch_does_not_inline_child_page_or_database_content_into_parent_body() {
+    let api = FixtureNotionApi::parent_with_child_boundaries();
+    let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
+
+    let native = connector
+        .fetch(FetchRequest {
+            remote_id: RemoteId::new("parent-page"),
+        })
+        .expect("fetch parent");
+    let bundle: afs_notion::dto::NotionPageBundle =
+        serde_json::from_slice(&native.raw).expect("native bundle");
+
+    assert_eq!(bundle.blocks.len(), 3);
+    assert!(bundle.blocks.iter().all(|tree| tree.children.is_empty()));
+
+    let rendered = connector
+        .render_native_entity(&native)
+        .expect("render parent");
+
+    assert_eq!(
+        rendered.document.body,
+        "Parent body.\n\n::afs{id=child-page type=child_page title=\"Child Page\"}\n\n::afs{id=child-db type=child_database title=\"Tasks\"}\n"
+    );
+    assert!(!rendered.document.body.contains("Child body."));
+    assert!(!rendered.document.body.contains("Database body."));
+}
+
+#[test]
 fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
     let page = page("page-1", "Roadmap");
     let block = BlockTreeDto {
@@ -519,6 +547,69 @@ impl FixtureNotionApi {
             databases,
             data_sources,
             data_source_pages,
+        }
+    }
+
+    fn parent_with_child_boundaries() -> Self {
+        let pages = BTreeMap::from([
+            ("parent-page".to_string(), page("parent-page", "Parent")),
+            ("child-page".to_string(), page("child-page", "Child Page")),
+        ]);
+        let databases = BTreeMap::from([(
+            "child-db".to_string(),
+            DatabaseDto {
+                id: "child-db".to_string(),
+                title: vec![rich_text("Tasks")],
+                data_sources: vec![DataSourceSummaryDto {
+                    id: "data-source-1".to_string(),
+                    name: Some("Tasks".to_string()),
+                }],
+                ..Default::default()
+            },
+        )]);
+        let children = BTreeMap::from([
+            (
+                ("parent-page".to_string(), None),
+                PaginatedListDto {
+                    results: vec![
+                        paragraph_block("parent-paragraph", vec![rich_text("Parent body.")]),
+                        child_page_block("child-page", "Child Page").with_children(),
+                        child_database_block("child-db", "Tasks").with_children(),
+                    ],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            (
+                ("child-page".to_string(), None),
+                PaginatedListDto {
+                    results: vec![paragraph_block(
+                        "child-paragraph",
+                        vec![rich_text("Child body.")],
+                    )],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            (
+                ("child-db".to_string(), None),
+                PaginatedListDto {
+                    results: vec![paragraph_block(
+                        "database-paragraph",
+                        vec![rich_text("Database body.")],
+                    )],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+        ]);
+
+        Self {
+            pages,
+            children,
+            databases,
+            data_sources: BTreeMap::new(),
+            data_source_pages: BTreeMap::new(),
         }
     }
 }

@@ -19,7 +19,7 @@ fn fetch_block_trees(api: &dyn NotionApi, block_id: &str) -> AfsResult<Vec<Block
     loop {
         let page = api.retrieve_block_children(block_id, cursor.as_deref())?;
         for block in page.results {
-            let children = if block.has_children {
+            let children = if should_fetch_children_for_render(&block.kind, block.has_children) {
                 fetch_block_trees(api, &block.id)?
             } else {
                 Vec::new()
@@ -34,4 +34,8 @@ fn fetch_block_trees(api: &dyn NotionApi, block_id: &str) -> AfsResult<Vec<Block
     }
 
     Ok(trees)
+}
+
+fn should_fetch_children_for_render(kind: &str, has_children: bool) -> bool {
+    has_children && !matches!(kind, "child_page" | "child_database")
 }
