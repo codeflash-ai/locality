@@ -1,4 +1,5 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -6,6 +7,8 @@ use std::os::unix::net::UnixStream;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub const DEFAULT_TCP_ADDR: &str = "127.0.0.1:38567";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -89,6 +92,12 @@ pub fn socket_path(state_root: &Path) -> PathBuf {
     state_root.join("afsd.sock")
 }
 
+pub fn default_tcp_addr() -> SocketAddr {
+    DEFAULT_TCP_ADDR
+        .parse()
+        .expect("default daemon TCP address is valid")
+}
+
 #[cfg(unix)]
 pub fn send_request(
     state_root: &Path,
@@ -96,6 +105,17 @@ pub fn send_request(
 ) -> Result<DaemonResponse, DaemonClientError> {
     let path = socket_path(state_root);
     let mut stream = UnixStream::connect(&path)
+        .map_err(|error| DaemonClientError::NotAvailable(error.to_string()))?;
+    write_json_line(&mut stream, request)
+        .map_err(|error| DaemonClientError::Io(error.to_string()))?;
+    read_response(stream)
+}
+
+pub fn send_tcp_request(
+    addr: SocketAddr,
+    request: &DaemonRequest,
+) -> Result<DaemonResponse, DaemonClientError> {
+    let mut stream = TcpStream::connect(addr)
         .map_err(|error| DaemonClientError::NotAvailable(error.to_string()))?;
     write_json_line(&mut stream, request)
         .map_err(|error| DaemonClientError::Io(error.to_string()))?;
@@ -112,26 +132,22 @@ pub fn send_request(
     ))
 }
 
-#[cfg(unix)]
-pub fn read_request(stream: UnixStream) -> Result<DaemonRequest, DaemonClientError> {
+pub fn read_request(stream: impl Read) -> Result<DaemonRequest, DaemonClientError> {
     read_json_line(stream)
 }
 
-#[cfg(unix)]
 pub fn write_response(
-    stream: &mut UnixStream,
+    stream: &mut impl Write,
     response: &DaemonResponse,
 ) -> Result<(), DaemonClientError> {
     write_json_line(stream, response).map_err(|error| DaemonClientError::Io(error.to_string()))
 }
 
-#[cfg(unix)]
-fn read_response(stream: UnixStream) -> Result<DaemonResponse, DaemonClientError> {
+fn read_response(stream: impl Read) -> Result<DaemonResponse, DaemonClientError> {
     read_json_line(stream)
 }
 
-#[cfg(unix)]
-fn read_json_line<T>(stream: UnixStream) -> Result<T, DaemonClientError>
+fn read_json_line<T>(stream: impl Read) -> Result<T, DaemonClientError>
 where
     T: for<'de> Deserialize<'de>,
 {

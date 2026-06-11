@@ -1,3 +1,5 @@
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::thread;
 
@@ -38,6 +40,14 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
         })?;
     watch_existing_mounts(config, &mut file_watcher)?;
     watch_existing_mounts(config, &mut stub_read_watcher)?;
+    if let Some(addr) = config.tcp_addr {
+        let listener = TcpListener::bind(addr).map_err(|error| {
+            AfsError::Io(format!("failed to bind daemon TCP listener: {error}"))
+        })?;
+        let runtime = runtime_handle.clone();
+        thread::spawn(move || accept_tcp_connections(listener, runtime));
+    }
+
     let socket_path = crate::ipc::socket_path(&config.state_root);
     remove_stale_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
@@ -72,18 +82,21 @@ pub fn run_foreground(_config: &DaemonConfig) -> AfsResult<()> {
 }
 
 #[cfg(unix)]
-fn handle_connection(mut stream: UnixStream, runtime: DaemonRuntimeHandle) {
-    let request_stream = match stream.try_clone() {
-        Ok(stream) => stream,
-        Err(error) => {
-            write_best_effort(
-                &mut stream,
-                DaemonResponse::error("ipc_clone_failed", error.to_string()),
-            );
-            return;
+fn accept_tcp_connections(listener: TcpListener, runtime: DaemonRuntimeHandle) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let runtime = runtime.clone();
+                thread::spawn(move || handle_connection(stream, runtime));
+            }
+            Err(error) => eprintln!("afsd TCP accept failed: {error}"),
         }
-    };
-    let response = match crate::ipc::read_request(request_stream) {
+    }
+}
+
+#[cfg(unix)]
+fn handle_connection(mut stream: impl Read + Write, runtime: DaemonRuntimeHandle) {
+    let response = match crate::ipc::read_request(&mut stream) {
         Ok(request) => runtime.request(request),
         Err(error) => DaemonResponse::error("bad_request", error.message()),
     };
@@ -91,7 +104,7 @@ fn handle_connection(mut stream: UnixStream, runtime: DaemonRuntimeHandle) {
 }
 
 #[cfg(unix)]
-fn write_best_effort(stream: &mut UnixStream, response: DaemonResponse) {
+fn write_best_effort(stream: &mut impl Write, response: DaemonResponse) {
     if let Err(error) = crate::ipc::write_response(stream, &response) {
         eprintln!("afsd response failed: {}", error.message());
     }

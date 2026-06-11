@@ -2,6 +2,7 @@
 @preconcurrency import Dispatch
 @preconcurrency import Foundation
 
+@objc(AgentFSFileProviderExtension)
 final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     private let domain: NSFileProviderDomain
     private let client: Result<AgentFSDaemonClient, Error>
@@ -74,8 +75,10 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
         let mountId = self.mountId
         let daemonIdentifier = AgentFSFileProviderItem.daemonIdentifier(itemIdentifier)
         let client: AgentFSDaemonClient
+        let transferDirectory: URL
         do {
             client = try daemonClient()
+            transferDirectory = try temporaryDirectoryURL()
         } catch {
             completionHandler(nil, nil, error)
             progress.completedUnitCount = 1
@@ -91,8 +94,13 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
                     mountId: mountId,
                     identifier: daemonIdentifier
                 )
+                let transferURL = try copyToFileProviderTransferDirectory(
+                    materializedPath: materialized.path,
+                    filename: item.item.filename,
+                    directory: transferDirectory
+                )
                 completion.value(
-                    URL(fileURLWithPath: materialized.path),
+                    transferURL,
                     AgentFSFileProviderItem(metadata: item.item),
                     nil
                 )
@@ -154,6 +162,19 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
         try client.get()
     }
 
+    private func temporaryDirectoryURL() throws -> URL {
+        guard let manager = NSFileProviderManager(for: domain) else {
+            throw NSError(
+                domain: NSCocoaErrorDomain,
+                code: NSFileNoSuchFileError,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "No File Provider manager is available for domain \(mountId).",
+                ]
+            )
+        }
+        return try manager.temporaryDirectoryURL()
+    }
+
     private func unsupportedWriteError() -> NSError {
         NSError(
             domain: NSCocoaErrorDomain,
@@ -163,6 +184,22 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
             ]
         )
     }
+}
+
+private func copyToFileProviderTransferDirectory(
+    materializedPath: String,
+    filename: String,
+    directory: URL
+) throws -> URL {
+    let sourceURL = URL(fileURLWithPath: materializedPath)
+    var transferURL = directory.appendingPathComponent(UUID().uuidString, isDirectory: false)
+    let pathExtension = (filename as NSString).pathExtension
+    if !pathExtension.isEmpty {
+        transferURL.appendPathExtension(pathExtension)
+    }
+    try? FileManager.default.removeItem(at: transferURL)
+    try FileManager.default.copyItem(at: sourceURL, to: transferURL)
+    return transferURL
 }
 
 private struct UncheckedSendable<Value>: @unchecked Sendable {

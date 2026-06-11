@@ -4,6 +4,7 @@ import Foundation
 enum AgentFSDaemonClientError: Error, LocalizedError {
     case homeDirectoryUnavailable
     case socketPathTooLong(String)
+    case invalidDaemonAddress(String)
     case connectFailed(String)
     case writeFailed
     case readFailed
@@ -16,6 +17,8 @@ enum AgentFSDaemonClientError: Error, LocalizedError {
             return "HOME is not set"
         case .socketPathTooLong(let path):
             return "daemon socket path is too long: \(path)"
+        case .invalidDaemonAddress(let value):
+            return "daemon TCP address must be host:port: \(value)"
         case .connectFailed(let message):
             return "failed to connect to afsd: \(message)"
         case .writeFailed:
@@ -110,17 +113,28 @@ struct AgentFSItemMetadata: Decodable {
 }
 
 final class AgentFSDaemonClient: @unchecked Sendable {
-    private let socketPath: String
+    private let transport: AgentFSDaemonTransport
 
-    init(socketPath: String? = nil) throws {
+    init(socketPath: String? = nil, tcpAddress: String? = nil) throws {
         if let socketPath {
-            self.socketPath = socketPath
+            self.transport = .unixSocket(socketPath)
             return
         }
+        if let socketPath = ProcessInfo.processInfo.environment["AFS_DAEMON_SOCKET"] {
+            self.transport = .unixSocket(socketPath)
+            return
+        }
+        let address = tcpAddress
+            ?? ProcessInfo.processInfo.environment["AFS_DAEMON_TCP_ADDR"]
+            ?? "127.0.0.1:38567"
+        self.transport = try AgentFSDaemonTransport.parseTcpAddress(address)
+    }
+
+    static func unixSocketFromHome() throws -> AgentFSDaemonClient {
         guard let home = ProcessInfo.processInfo.environment["HOME"] else {
             throw AgentFSDaemonClientError.homeDirectoryUnavailable
         }
-        self.socketPath = "\(home)/.afs/afsd.sock"
+        return try AgentFSDaemonClient(socketPath: "\(home)/.afs/afsd.sock")
     }
 
     func item(mountId: String, identifier: String) throws -> AgentFSItemPayload {
@@ -151,7 +165,7 @@ final class AgentFSDaemonClient: @unchecked Sendable {
         var payload = try JSONSerialization.data(withJSONObject: object)
         payload.append(0x0a)
 
-        let fd = try connectSocket()
+        let fd = try connect()
         defer {
             close(fd)
         }
@@ -184,7 +198,16 @@ final class AgentFSDaemonClient: @unchecked Sendable {
         )
     }
 
-    private func connectSocket() throws -> Int32 {
+    private func connect() throws -> Int32 {
+        switch transport {
+        case let .unixSocket(path):
+            return try connectUnixSocket(path)
+        case let .tcp(host, port):
+            return try connectTcp(host: host, port: port)
+        }
+    }
+
+    private func connectUnixSocket(_ socketPath: String) throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         if fd < 0 {
             throw AgentFSDaemonClientError.connectFailed(String(cString: strerror(errno)))
@@ -222,6 +245,34 @@ final class AgentFSDaemonClient: @unchecked Sendable {
         return fd
     }
 
+    private func connectTcp(host: String, port: UInt16) throws -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 {
+            throw AgentFSDaemonClientError.connectFailed(String(cString: strerror(errno)))
+        }
+
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        guard inet_pton(AF_INET, host, &address.sin_addr) == 1 else {
+            close(fd)
+            throw AgentFSDaemonClientError.invalidDaemonAddress("\(host):\(port)")
+        }
+
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if result != 0 {
+            let message = String(cString: strerror(errno))
+            close(fd)
+            throw AgentFSDaemonClientError.connectFailed(message)
+        }
+
+        return fd
+    }
+
     private func readLine(fd: Int32) throws -> Data {
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 4096)
@@ -245,5 +296,18 @@ final class AgentFSDaemonClient: @unchecked Sendable {
             throw AgentFSDaemonClientError.readFailed
         }
         return data
+    }
+}
+
+private enum AgentFSDaemonTransport {
+    case unixSocket(String)
+    case tcp(host: String, port: UInt16)
+
+    static func parseTcpAddress(_ address: String) throws -> Self {
+        let parts = address.split(separator: ":", maxSplits: 1).map(String.init)
+        guard parts.count == 2, let port = UInt16(parts[1]) else {
+            throw AgentFSDaemonClientError.invalidDaemonAddress(address)
+        }
+        return .tcp(host: parts[0], port: port)
     }
 }

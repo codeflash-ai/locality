@@ -1,14 +1,16 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use afs_connector::ConnectorUndoApplier;
 use afs_core::AfsError;
 use afs_core::model::{MountId, RemoteId};
 use afs_notion::{NotionConfig, NotionConnector};
-use afs_store::{ProjectionMode, SqliteStateStore};
+use afs_store::{MountConfig, MountRepository, ProjectionMode, SqliteStateStore};
 use afsd::execution::PushJobReport;
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use crate::diff::{DiffError, run_diff};
 use crate::history::{
@@ -27,8 +29,18 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_VALIDATION: i32 = 3;
 
 const COMMANDS: &[&str] = &[
-    "connect", "mount", "info", "status", "pull", "push", "diff", "undo", "log", "resolve",
+    "connect",
+    "mount",
+    "info",
+    "status",
+    "pull",
+    "push",
+    "diff",
+    "undo",
+    "log",
+    "resolve",
     "config",
+    "file-provider",
 ];
 
 pub fn dispatch(args: &[String]) -> i32 {
@@ -50,12 +62,135 @@ pub fn dispatch(args: &[String]) -> i32 {
         "log" => log(&args[1..], json),
         "resolve" => stub("resolve", json),
         "config" => stub("config", json),
+        "file-provider" => file_provider(&args[1..], json),
         command => {
             eprintln!("unknown command: {command}");
             print_help();
             EXIT_USAGE
         }
     }
+}
+
+fn file_provider(args: &[String], json: bool) -> i32 {
+    let Some(action) = first_positional(args) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "usage",
+                "usage: afs file-provider register|unregister <mount-id-or-path> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    match action {
+        "register" => file_provider_register(args, json),
+        "unregister" => file_provider_unregister(args, json),
+        "list" => run_file_provider_helper(json, "list", Vec::new(), None),
+        "reset" => run_file_provider_helper(json, "reset", Vec::new(), None),
+        _ => command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "usage",
+                "usage: afs file-provider register|unregister|list|reset",
+            ),
+            EXIT_USAGE,
+        ),
+    }
+}
+
+fn file_provider_register(args: &[String], json: bool) -> i32 {
+    let Some(target) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "usage",
+                "usage: afs file-provider register <mount-id-or-path> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let mount = match resolve_mount_target(&store, target) {
+        Ok(mount) => mount,
+        Err(message) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "mount_not_found", message),
+                EXIT_USAGE,
+            );
+        }
+    };
+    if mount.projection != ProjectionMode::MacosFileProvider {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "wrong_projection",
+                format!(
+                    "mount `{}` uses projection `{}`; remount with --projection macos-file-provider",
+                    mount.mount_id.0,
+                    mount.projection.as_str()
+                ),
+            ),
+            EXIT_USAGE,
+        );
+    }
+
+    let mount_id = mount.mount_id.0.clone();
+    let display_name = file_provider_display_name(&mount);
+    run_file_provider_helper(
+        json,
+        "register",
+        vec![
+            "--mount-id".to_string(),
+            mount_id.clone(),
+            "--display-name".to_string(),
+            display_name,
+        ],
+        Some(mount_id),
+    )
+}
+
+fn file_provider_unregister(args: &[String], json: bool) -> i32 {
+    let Some(target) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "usage",
+                "usage: afs file-provider unregister <mount-id-or-path> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let mount_id = match SqliteStateStore::open(default_state_root())
+        .ok()
+        .and_then(|store| resolve_mount_target(&store, target).ok())
+    {
+        Some(mount) => mount.mount_id.0,
+        None => target.to_string(),
+    };
+    run_file_provider_helper(
+        json,
+        "unregister",
+        vec!["--mount-id".to_string(), mount_id.clone()],
+        Some(mount_id),
+    )
 }
 
 fn mount(args: &[String], json: bool) -> i32 {
@@ -665,6 +800,194 @@ fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
+fn run_file_provider_helper(
+    json: bool,
+    action: &str,
+    args: Vec<String>,
+    mount_id: Option<String>,
+) -> i32 {
+    let helper = match file_provider_helper_path() {
+        Some(path) => path,
+        None => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "file-provider",
+                    "helper_missing",
+                    "agentfs-file-providerctl was not found; build or install platform/macos/AgentFSFileProvider first",
+                ),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    let mut command = ProcessCommand::new(&helper);
+    command.arg(action);
+    command.args(args);
+    command.arg("--json");
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "helper_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let helper_report =
+        serde_json::from_str::<Value>(&stdout).unwrap_or_else(|_| Value::String(stdout.clone()));
+
+    if !output.status.success() {
+        let message = helper_report
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|message| !message.is_empty())
+            .or_else(|| (!stderr.is_empty()).then_some(stderr))
+            .unwrap_or_else(|| format!("agentfs-file-providerctl exited with {}", output.status));
+        return command_error(
+            json,
+            CommandError::new("file-provider", "helper_failed", message),
+            EXIT_INTERNAL,
+        );
+    }
+
+    let report = FileProviderCommandReport {
+        ok: true,
+        command: "file-provider",
+        action: action.to_string(),
+        mount_id,
+        helper: helper.display().to_string(),
+        helper_report,
+    };
+
+    if json {
+        print_json(&report);
+    } else {
+        print_file_provider_report(&report);
+    }
+    EXIT_SUCCESS
+}
+
+fn print_file_provider_report(report: &FileProviderCommandReport) {
+    if report.action == "list" {
+        let Some(domains) = report
+            .helper_report
+            .get("domains")
+            .and_then(Value::as_array)
+        else {
+            println!("no file provider domains");
+            return;
+        };
+        if domains.is_empty() {
+            println!("no file provider domains");
+            return;
+        }
+        for domain in domains {
+            let identifier = domain
+                .get("identifier")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let display_name = domain
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            println!("{identifier}\t{display_name}");
+        }
+        return;
+    }
+
+    if let Some(message) = report
+        .helper_report
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
+    {
+        println!("{message}");
+    } else {
+        println!("file provider {} complete", report.action);
+    }
+}
+
+fn resolve_mount_target(store: &SqliteStateStore, target: &str) -> Result<MountConfig, String> {
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("failed to load mounts: {error}"))?;
+    if let Some(mount) = mounts
+        .iter()
+        .find(|mount| mount.mount_id.0 == target)
+        .cloned()
+    {
+        return Ok(mount);
+    }
+
+    let target_path = absolute_path(Path::new(target))
+        .map_err(|error| format!("failed to resolve `{target}`: {error}"))?;
+    mounts
+        .into_iter()
+        .filter(|mount| target_path.starts_with(&mount.root))
+        .max_by_key(|mount| mount.root.components().count())
+        .ok_or_else(|| format!("no AgentFS mount matches `{target}`"))
+}
+
+fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(absolute.canonicalize().unwrap_or(absolute))
+}
+
+fn file_provider_display_name(mount: &MountConfig) -> String {
+    mount
+        .root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| mount.mount_id.0.clone())
+}
+
+fn file_provider_helper_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("AFS_FILE_PROVIDERCTL") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        candidates.push(dir.join("agentfs-file-providerctl"));
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let package_dir = manifest_dir.join("../../platform/macos/AgentFSFileProvider");
+    candidates.push(
+        package_dir.join(".build/dev-bundle/AgentFS.app/Contents/MacOS/agentfs-file-providerctl"),
+    );
+    candidates.push(PathBuf::from(
+        "/Applications/AgentFS.app/Contents/MacOS/agentfs-file-providerctl",
+    ));
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(
+            PathBuf::from(home)
+                .join("Applications/AgentFS.app/Contents/MacOS/agentfs-file-providerctl"),
+        );
+    }
+    candidates.push(package_dir.join(".build/debug/agentfs-file-providerctl"));
+    candidates.push(package_dir.join(".build/release/agentfs-file-providerctl"));
+
+    candidates.into_iter().find(|path| path.exists())
+}
+
 fn default_notion_connector() -> NotionConnector {
     NotionConnector::new(NotionConfig::default())
 }
@@ -984,7 +1307,10 @@ fn projection_mode(args: &[String]) -> Result<ProjectionMode, &'static str> {
 }
 
 fn takes_value(arg: &str) -> bool {
-    matches!(arg, "--root-page" | "--mount-id" | "--projection")
+    matches!(
+        arg,
+        "--root-page" | "--mount-id" | "--projection" | "--helper" | "--display-name"
+    )
 }
 
 fn default_state_root() -> PathBuf {
@@ -1009,6 +1335,16 @@ struct CommandError {
     command: &'static str,
     code: String,
     message: String,
+}
+
+#[derive(Serialize)]
+struct FileProviderCommandReport {
+    ok: bool,
+    command: &'static str,
+    action: String,
+    mount_id: Option<String>,
+    helper: String,
+    helper_report: Value,
 }
 
 impl CommandError {

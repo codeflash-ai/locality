@@ -12,6 +12,7 @@ pub mod server;
 pub mod supervisor;
 pub mod watcher;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use afs_core::pull::PullSchedulerConfig;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub state_root: PathBuf,
+    pub tcp_addr: Option<SocketAddr>,
     pub runtime_tick_interval: Duration,
     pub hydration_retry_delay: Duration,
     pub pull_scheduler: PullSchedulerConfig,
@@ -30,6 +32,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             state_root: default_state_root(),
+            tcp_addr: default_tcp_addr(),
             runtime_tick_interval: Duration::from_secs(1),
             hydration_retry_delay: Duration::from_secs(30),
             pull_scheduler: PullSchedulerConfig::default(),
@@ -66,4 +69,16 @@ fn default_state_root() -> PathBuf {
     }
 
     PathBuf::from(".afs")
+}
+
+fn default_tcp_addr() -> Option<SocketAddr> {
+    match std::env::var("AFS_DAEMON_TCP_ADDR") {
+        Ok(value) if matches!(value.as_str(), "0" | "off" | "none" | "disabled") => None,
+        Ok(value) => Some(
+            value
+                .parse()
+                .expect("AFS_DAEMON_TCP_ADDR must be host:port, or off"),
+        ),
+        Err(_) => Some(crate::ipc::default_tcp_addr()),
+    }
 }

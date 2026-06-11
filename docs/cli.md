@@ -15,6 +15,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs log [path] [--json]`
 - `afs resolve --ours|--theirs|--edited <path>`
 - `afs config set <key=value>`
+- `afs file-provider register|unregister|list|reset [target] [--json]`
 
 ## Exit-code contract
 
@@ -37,6 +38,8 @@ Remaining categories to assign before `afs push` applies remote mutations:
 `afs mount notion <path> --root-page <page-id>` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. The current auth path is still developer-oriented: the Notion connector reads its bearer token from `NOTION_TOKEN` until OAuth/keychain support is implemented.
 
 `afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. Scheduled pull for this projection updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension lists dataless files from the daemon and materializes a file on open.
+
+`afs file-provider register <mount-id-or-path>` registers a macOS File Provider domain for a mount whose projection is `macos_file_provider`. `unregister` removes that domain, `list` shows domains known to File Provider, and `reset` removes all domains for the installed AgentFS provider. The command shells out to the signed app-bundle helper at `AgentFS.app/Contents/MacOS/agentfs-file-providerctl`; `AFS_FILE_PROVIDERCTL` can override the helper path for development.
 
 `afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page shadow snapshot. For macOS File Provider mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the stored shadow, returning a dirty skip instead.
 

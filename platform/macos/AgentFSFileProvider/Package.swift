@@ -12,11 +12,19 @@ let package = Package(
             name: "AgentFSFileProvider",
             targets: ["AgentFSFileProvider"]
         ),
+        .executable(
+            name: "agentfs-file-providerctl",
+            targets: ["AgentFSFileProviderCtl"]
+        ),
     ],
     targets: [
         .target(
             name: "AgentFSFileProvider",
-            path: "Sources"
+            path: "Sources/AgentFSFileProvider"
+        ),
+        .executableTarget(
+            name: "AgentFSFileProviderCtl",
+            path: "Sources/AgentFSFileProviderCtl"
         ),
     ]
 )

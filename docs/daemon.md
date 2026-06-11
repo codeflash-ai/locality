@@ -23,10 +23,13 @@ The boundary keeps responsibilities sharp:
 ## Foreground Daemon
 
 `afsd` now runs a foreground Unix-socket server at `AFS_STATE_DIR/afsd.sock`
-or `~/.afs/afsd.sock`. CLI `pull` and `push` try this daemon first and fall
-back to the same in-process executor when the socket is unavailable. Setting
-`AFS_DAEMON_DISABLE=1` forces the fallback path, which is useful for tests and
-recovery.
+or `~/.afs/afsd.sock`, plus a localhost TCP listener at `127.0.0.1:38567` by
+default. CLI `pull` and `push` try the Unix socket first and fall back to the
+same in-process executor when the socket is unavailable. The macOS File
+Provider extension uses the TCP listener because the extension is sandboxed.
+Set `AFS_DAEMON_TCP_ADDR=off` to disable TCP, or set it to `host:port` to move
+the listener. Setting `AFS_DAEMON_DISABLE=1` forces the CLI fallback path,
+which is useful for tests and recovery.
 
 The socket accept loop does not run connector calls directly. It reads one JSON
 request, submits it to `DaemonRuntime`, and waits for the runtime response.
@@ -62,6 +65,9 @@ online-only files. The extension calls daemon IPC directly:
 - `file_provider_children` returns dataless directory contents from SQLite.
 - `file_provider_materialize` hydrates a page with `HydrationReason::FileOpen`
   and returns the materialized Markdown path once the content exists locally.
+  The Swift extension copies that path into File Provider's transfer directory
+  before completing `fetchContents`, so the system can take ownership without
+  moving AgentFS's canonical hydrated copy.
 
 Scheduled reconciliation skips writing placeholder Markdown files for mounts
 whose projection mode is `macos_file_provider`; it only updates durable entity

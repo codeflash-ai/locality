@@ -1,9 +1,11 @@
 # AgentFS macOS File Provider
 
-This package is the first macOS online-only projection slice. It is not yet a
-signed app extension bundle; it is a buildable Swift package that contains the
-extension implementation we will move into an Xcode target with the File
-Provider entitlement.
+This package contains the macOS online-only projection:
+
+- a `NSFileProviderReplicatedExtension` implementation;
+- `agentfs-file-providerctl`, a small domain registration helper;
+- a minimal containing `AgentFS.app` bundle template; and
+- Command Line Tools scripts for a local ad-hoc development bundle.
 
 The extension delegates all durable state and network work to `afsd`:
 
@@ -11,9 +13,32 @@ The extension delegates all durable state and network work to `afsd`:
 - `enumerator(for:)` calls `file_provider_children` for dataless directory
   listings.
 - `fetchContents(for:)` calls `file_provider_materialize`, which blocks until
-  the daemon hydrates the page and returns a local Markdown file URL.
+  the daemon hydrates the page, then copies the materialized Markdown into File
+  Provider's transfer directory before returning it to the system.
 
 The File Provider domain identifier must be the AgentFS `mount_id`; the daemon
-uses that to resolve the mounted Notion tree. The current write callbacks return
-unsupported because the next slice should route File Provider edits through the
-same daemon push/reconciler path as explicit `afs push`.
+uses that to resolve the mounted Notion tree. The extension talks to `afsd` over
+`127.0.0.1:38567` by default because sandboxed app extensions should not depend
+on a Unix socket in `~/.afs`.
+
+## Development Build
+
+```sh
+platform/macos/AgentFSFileProvider/scripts/install-dev-bundle.sh
+```
+
+The script builds `AgentFS.app`, embeds `AgentFSFileProvider.appex`, signs both
+ad-hoc, installs the app to `~/Applications/AgentFS.app`, registers it with
+LaunchServices, and starts the tiny background containing app.
+
+After creating a mount with `--projection macos-file-provider`, register it:
+
+```sh
+afs file-provider register <mount-id-or-path>
+afs file-provider list
+afs file-provider unregister <mount-id-or-path>
+```
+
+The current write callbacks return unsupported because the next slice should
+route File Provider edits through the same daemon push/reconciler path as
+explicit `afs push`.
