@@ -23,6 +23,19 @@ impl ConnectionId {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ConnectorProfileId(pub String);
+
+impl ConnectorProfileId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectionMode {
@@ -87,6 +100,7 @@ impl MountConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionRecord {
     pub connection_id: ConnectionId,
+    pub profile_id: Option<ConnectorProfileId>,
     pub connector: String,
     pub display_name: String,
     pub account_label: Option<String>,
@@ -100,6 +114,21 @@ pub struct ConnectionRecord {
     pub created_at: String,
     pub updated_at: String,
     pub expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorProfileRecord {
+    pub profile_id: ConnectorProfileId,
+    pub connector: String,
+    pub display_name: String,
+    pub auth_kind: String,
+    pub scopes: Vec<String>,
+    pub capabilities_json: String,
+    pub enabled_actions_json: String,
+    pub connector_version: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

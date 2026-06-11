@@ -3,10 +3,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use afs_notion::NotionConfig;
 use afs_notion::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use afs_store::{
-    ConnectionId, ConnectionRecord, ConnectionRepository, CredentialError, CredentialStore,
+    ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
+    ConnectorProfileRecord, ConnectorProfileRepository, CredentialError, CredentialStore,
     StoreError,
 };
 use serde::Serialize;
+
+pub const DEFAULT_NOTION_PROFILE_ID: &str = "notion-token-default";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
@@ -19,6 +22,7 @@ pub struct ConnectReport {
     pub ok: bool,
     pub command: &'static str,
     pub connection_id: String,
+    pub profile_id: String,
     pub connector: String,
     pub display_name: String,
     pub account_label: Option<String>,
@@ -32,6 +36,13 @@ pub struct ConnectionsReport {
     pub ok: bool,
     pub command: &'static str,
     pub connections: Vec<ConnectionSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProfilesReport {
+    pub ok: bool,
+    pub command: &'static str,
+    pub profiles: Vec<ConnectorProfileSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -52,6 +63,7 @@ pub struct DisconnectReport {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConnectionSummary {
     pub connection_id: String,
+    pub profile_id: Option<String>,
     pub connector: String,
     pub display_name: String,
     pub account_label: Option<String>,
@@ -62,6 +74,21 @@ pub struct ConnectionSummary {
     pub created_at: String,
     pub updated_at: String,
     pub expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConnectorProfileSummary {
+    pub profile_id: String,
+    pub connector: String,
+    pub display_name: String,
+    pub auth_kind: String,
+    pub scopes: Vec<String>,
+    pub capabilities_json: String,
+    pub enabled_actions_json: String,
+    pub connector_version: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,7 +131,7 @@ pub fn run_connect_notion<S, P>(
     probe: &P,
 ) -> Result<ConnectReport, ConnectError>
 where
-    S: ConnectionRepository,
+    S: ConnectionRepository + ConnectorProfileRepository,
     P: NotionConnectionProbe,
 {
     let connection_id = match options.connection_id {
@@ -118,9 +145,15 @@ where
         .map_err(ConnectError::Credential)?;
 
     let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_NOTION_PROFILE_ID);
+    store
+        .save_connector_profile(default_notion_token_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+
     let display_name = connection_id.0.clone();
     let connection = ConnectionRecord {
         connection_id: connection_id.clone(),
+        profile_id: Some(profile_id.clone()),
         connector: "notion".to_string(),
         display_name: display_name.clone(),
         account_label: probe_result.account_label.clone(),
@@ -143,12 +176,31 @@ where
         ok: true,
         command: "connect",
         connection_id: connection_id.0,
+        profile_id: profile_id.0,
         connector: "notion".to_string(),
         display_name,
         account_label: probe_result.account_label,
         workspace_id: probe_result.workspace_id,
         workspace_name: probe_result.workspace_name,
         auth_kind: "token".to_string(),
+    })
+}
+
+pub fn run_profiles<S>(store: &S) -> Result<ProfilesReport, ConnectError>
+where
+    S: ConnectorProfileRepository,
+{
+    let mut profiles = store
+        .list_connector_profiles()
+        .map_err(ConnectError::Store)?
+        .into_iter()
+        .map(ConnectorProfileSummary::from)
+        .collect::<Vec<_>>();
+    profiles.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
+    Ok(ProfilesReport {
+        ok: true,
+        command: "profiles",
+        profiles,
     })
 }
 
@@ -267,6 +319,7 @@ impl From<ConnectionRecord> for ConnectionSummary {
     fn from(value: ConnectionRecord) -> Self {
         Self {
             connection_id: value.connection_id.0,
+            profile_id: value.profile_id.map(|profile_id| profile_id.0),
             connector: value.connector,
             display_name: value.display_name,
             account_label: value.account_label,
@@ -278,6 +331,40 @@ impl From<ConnectionRecord> for ConnectionSummary {
             updated_at: value.updated_at,
             expires_at: value.expires_at,
         }
+    }
+}
+
+impl From<ConnectorProfileRecord> for ConnectorProfileSummary {
+    fn from(value: ConnectorProfileRecord) -> Self {
+        Self {
+            profile_id: value.profile_id.0,
+            connector: value.connector,
+            display_name: value.display_name,
+            auth_kind: value.auth_kind,
+            scopes: value.scopes,
+            capabilities_json: value.capabilities_json,
+            enabled_actions_json: value.enabled_actions_json,
+            connector_version: value.connector_version,
+            status: value.status,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+fn default_notion_token_profile(now: String) -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new(DEFAULT_NOTION_PROFILE_ID),
+        connector: "notion".to_string(),
+        display_name: "Notion token auth".to_string(),
+        auth_kind: "token".to_string(),
+        scopes: vec![],
+        capabilities_json: "{}".to_string(),
+        enabled_actions_json: "[\"read\",\"write\"]".to_string(),
+        connector_version: "notion.v1".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
     }
 }
 

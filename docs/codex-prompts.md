@@ -2,6 +2,7 @@
 
 ## Changelog
 
+- 2026-06-11: Started state-of-the-art connector/auth hardening by adding connector profiles/auth-config records, SQLite v9 migration, profile-aware Notion connections, and `afs profiles`.
 - 2026-06-11: Added first block-support follow-up: callout write/apply support, Tier 1 append regression coverage, and updated Notion block support docs.
 - 2026-06-11: Completed production-hardening sprint phases A-E: Notion block move apply, push preflight, restore/status recovery UX, local provider connections, daemon status/via reporting, and E2E push workflow regression coverage.
 

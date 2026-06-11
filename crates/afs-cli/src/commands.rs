@@ -7,8 +7,9 @@ use afs_core::AfsError;
 use afs_core::journal::PushId;
 use afs_core::model::{MountId, RemoteId};
 use afs_store::{
-    ConnectionId, ConnectionRepository, JournalRepository, MountConfig, MountRepository,
-    ProjectionMode, SqliteStateStore, open_credential_store,
+    ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileRepository,
+    JournalRepository, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
+    open_credential_store,
 };
 use afsd::execution::PushJobReport;
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request};
@@ -18,8 +19,8 @@ use serde_json::Value;
 
 use crate::connect::{
     ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport, ConnectionsReport,
-    DisconnectReport, HttpNotionConnectionProbe, run_connect_notion, run_connection_show,
-    run_connections, run_disconnect,
+    DisconnectReport, HttpNotionConnectionProbe, ProfilesReport, run_connect_notion,
+    run_connection_show, run_connections, run_disconnect, run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
@@ -45,6 +46,7 @@ const EXIT_VALIDATION: i32 = 3;
 const COMMANDS: &[&str] = &[
     "connect",
     "connections",
+    "profiles",
     "connection",
     "disconnect",
     "daemon",
@@ -72,6 +74,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     match args[0].as_str() {
         "connect" => connect(&args[1..], json),
         "connections" => connections(&args[1..], json),
+        "profiles" => profiles(&args[1..], json),
         "connection" => connection(&args[1..], json),
         "disconnect" => disconnect(&args[1..], json),
         "daemon" => daemon(&args[1..], json),
@@ -196,6 +199,39 @@ fn connections(args: &[String], json: bool) -> i32 {
             EXIT_SUCCESS
         }
         Err(error) => connect_command_error("connections", json, error),
+    }
+}
+
+fn profiles(args: &[String], json: bool) -> i32 {
+    if first_positional(args).is_some() {
+        return command_error(
+            json,
+            CommandError::new("profiles", "usage", "usage: afs profiles [--json]"),
+            EXIT_USAGE,
+        );
+    }
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("profiles", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    match run_profiles(&store) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_profiles_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("profiles", json, error),
     }
 }
 
@@ -1024,8 +1060,33 @@ fn print_connections_report(report: &ConnectionsReport) {
             .or(connection.workspace_name.as_deref())
             .unwrap_or("-");
         println!(
-            "{}  {}  {}  {}",
-            connection.connection_id, connection.connector, connection.status, label
+            "{}  {}  {}  {}  {}",
+            connection.connection_id,
+            connection
+                .profile_id
+                .as_deref()
+                .unwrap_or("profile:unknown"),
+            connection.connector,
+            connection.status,
+            label
+        );
+    }
+}
+
+fn print_profiles_report(report: &ProfilesReport) {
+    if report.profiles.is_empty() {
+        println!("no profiles");
+        return;
+    }
+
+    for profile in &report.profiles {
+        println!(
+            "{}  {}  {}  {}  {}",
+            profile.profile_id,
+            profile.connector,
+            profile.auth_kind,
+            profile.status,
+            profile.connector_version
         );
     }
 }
@@ -1033,6 +1094,9 @@ fn print_connections_report(report: &ConnectionsReport) {
 fn print_connection_show_report(report: &ConnectionShowReport) {
     let connection = &report.connection;
     println!("connection: {}", connection.connection_id);
+    if let Some(profile_id) = &connection.profile_id {
+        println!("  profile: {profile_id}");
+    }
     println!("  connector: {}", connection.connector);
     println!("  status: {}", connection.status);
     println!("  auth_kind: {}", connection.auth_kind);
@@ -1498,6 +1562,7 @@ fn resolve_mount_connection(
             )
             .with_suggested_command("afs connect notion"));
         }
+        validate_connection_profile(store, &connection)?;
         return Ok(Some(connection.connection_id));
     }
 
@@ -1507,6 +1572,9 @@ fn resolve_mount_connection(
         .into_iter()
         .filter(|connection| connection.connector == "notion" && connection.status == "active")
         .collect::<Vec<_>>();
+    for connection in &active {
+        validate_connection_profile(store, connection)?;
+    }
     match active.as_slice() {
         [connection] => Ok(Some(connection.connection_id.clone())),
         [] if std::env::var("NOTION_TOKEN").is_ok() => Ok(None),
@@ -1522,6 +1590,49 @@ fn resolve_mount_connection(
             "multiple Notion connections exist; pass --connection <id>",
         )),
     }
+}
+
+fn validate_connection_profile(
+    store: &SqliteStateStore,
+    connection: &ConnectionRecord,
+) -> Result<(), CommandError> {
+    let Some(profile_id) = &connection.profile_id else {
+        return Ok(());
+    };
+    let profile = store
+        .get_connector_profile(profile_id)
+        .map_err(|error| CommandError::new("mount", "store_error", error.to_string()))?
+        .ok_or_else(|| {
+            CommandError::new(
+                "mount",
+                "auth_profile_unavailable",
+                format!("connector profile `{}` was not found", profile_id.0),
+            )
+            .with_suggested_command("afs connect notion")
+        })?;
+    if profile.status != "active" {
+        return Err(CommandError::new(
+            "mount",
+            "auth_profile_unavailable",
+            format!(
+                "connector profile `{}` is {}",
+                profile.profile_id.0, profile.status
+            ),
+        )
+        .with_suggested_command("afs connect notion"));
+    }
+    if profile.connector != connection.connector || profile.auth_kind != connection.auth_kind {
+        return Err(CommandError::new(
+            "mount",
+            "auth_profile_unavailable",
+            format!(
+                "connector profile `{}` does not match connection `{}`",
+                profile.profile_id.0, connection.connection_id.0
+            ),
+        )
+        .with_suggested_command("afs connect notion"));
+    }
+    Ok(())
 }
 
 enum DaemonReport<T> {
@@ -1611,6 +1722,7 @@ fn daemon_error_exit_code(code: &str) -> i32 {
         "missing_connection"
         | "auth_required"
         | "connection_revoked"
+        | "auth_profile_unavailable"
         | "credential_store_unavailable" => EXIT_INTERNAL,
         _ => EXIT_INTERNAL,
     }
@@ -1650,6 +1762,7 @@ fn connector_command_error(command: &'static str, json: bool, error: ConnectorRe
         "missing_connection"
         | "auth_required"
         | "connection_revoked"
+        | "auth_profile_unavailable"
         | "credential_store_unavailable" => EXIT_INTERNAL,
         _ => EXIT_INTERNAL,
     };

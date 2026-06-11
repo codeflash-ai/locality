@@ -20,16 +20,16 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
-    ConnectionId, ConnectionRecord, EntityRecord, HydrationJobRecord, MountConfig, ProjectionMode,
-    ShadowBlockRecord, ShadowSnapshotRecord,
+    ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
+    HydrationJobRecord, MountConfig, ProjectionMode, ShadowBlockRecord, ShadowSnapshotRecord,
 };
 use crate::repository::{
-    ConnectionRepository, EntityRepository, HydrationJobRepository, JournalRepository,
-    MountRepository, ShadowRepository,
+    ConnectionRepository, ConnectorProfileRepository, EntityRepository, HydrationJobRepository,
+    JournalRepository, MountRepository, ShadowRepository,
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -140,6 +140,7 @@ impl ConnectionRepository for SqliteStateStore {
         connection.execute(
             "INSERT INTO connections (
                 connection_id,
+                profile_id,
                 connector,
                 display_name,
                 account_label,
@@ -154,8 +155,9 @@ impl ConnectionRepository for SqliteStateStore {
                 updated_at,
                 expires_at
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(connection_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
                 connector = excluded.connector,
                 display_name = excluded.display_name,
                 account_label = excluded.account_label,
@@ -170,6 +172,7 @@ impl ConnectionRepository for SqliteStateStore {
                 expires_at = excluded.expires_at",
             params![
                 connection_record.connection_id.0,
+                connection_record.profile_id.map(|profile_id| profile_id.0),
                 connection_record.connector,
                 connection_record.display_name,
                 connection_record.account_label,
@@ -218,6 +221,75 @@ impl ConnectionRepository for SqliteStateStore {
             params![connection_id.0],
         )?;
         Ok(())
+    }
+}
+
+impl ConnectorProfileRepository for SqliteStateStore {
+    fn save_connector_profile(&mut self, profile: ConnectorProfileRecord) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO connector_profiles (
+                profile_id,
+                connector,
+                display_name,
+                auth_kind,
+                scopes_json,
+                capabilities_json,
+                enabled_actions_json,
+                connector_version,
+                status,
+                created_at,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(profile_id) DO UPDATE SET
+                connector = excluded.connector,
+                display_name = excluded.display_name,
+                auth_kind = excluded.auth_kind,
+                scopes_json = excluded.scopes_json,
+                capabilities_json = excluded.capabilities_json,
+                enabled_actions_json = excluded.enabled_actions_json,
+                connector_version = excluded.connector_version,
+                status = excluded.status,
+                updated_at = excluded.updated_at",
+            params![
+                profile.profile_id.0,
+                profile.connector,
+                profile.display_name,
+                profile.auth_kind,
+                to_json(&profile.scopes)?,
+                profile.capabilities_json,
+                profile.enabled_actions_json,
+                profile.connector_version,
+                profile.status,
+                profile.created_at,
+                profile.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_connector_profile(
+        &self,
+        profile_id: &ConnectorProfileId,
+    ) -> StoreResult<Option<ConnectorProfileRecord>> {
+        let connection = self.connection()?;
+        let sql = CONNECTOR_PROFILE_SELECT_WITH_WHERE.to_owned() + "WHERE profile_id = ?1";
+        connection
+            .query_row(&sql, params![profile_id.0], connector_profile_row)
+            .optional()?
+            .map(connector_profile_from_row)
+            .transpose()
+    }
+
+    fn list_connector_profiles(&self) -> StoreResult<Vec<ConnectorProfileRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            &(CONNECTOR_PROFILE_SELECT_WITH_WHERE.to_owned() + "ORDER BY connector, profile_id"),
+        )?;
+        let rows = statement.query_map([], connector_profile_row)?;
+
+        rows.map(|row| connector_profile_from_row(row?)).collect()
     }
 }
 
@@ -577,10 +649,15 @@ const ENTITY_SELECT_WITH_WHERE: &str = "
     FROM entities
     ";
 const CONNECTION_SELECT_WITH_WHERE: &str = "
-    SELECT connection_id, connector, display_name, account_label, workspace_id, workspace_name,
+    SELECT connection_id, profile_id, connector, display_name, account_label, workspace_id, workspace_name,
            auth_kind, secret_ref, scopes_json, capabilities_json, status, created_at, updated_at,
            expires_at
     FROM connections
+    ";
+const CONNECTOR_PROFILE_SELECT_WITH_WHERE: &str = "
+    SELECT profile_id, connector, display_name, auth_kind, scopes_json, capabilities_json,
+           enabled_actions_json, connector_version, status, created_at, updated_at
+    FROM connector_profiles
     ";
 
 type MountRow = (
@@ -594,6 +671,7 @@ type MountRow = (
 );
 type ConnectionRow = (
     String,
+    Option<String>,
     String,
     String,
     Option<String>,
@@ -607,6 +685,19 @@ type ConnectionRow = (
     String,
     String,
     Option<String>,
+);
+type ConnectorProfileRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
 );
 type EntityRow = (
     String,
@@ -652,6 +743,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
 
         CREATE TABLE IF NOT EXISTS connections (
             connection_id TEXT PRIMARY KEY,
+            profile_id TEXT,
             connector TEXT NOT NULL,
             display_name TEXT NOT NULL,
             account_label TEXT,
@@ -665,6 +757,20 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             expires_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS connector_profiles (
+            profile_id TEXT PRIMARY KEY,
+            connector TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            auth_kind TEXT NOT NULL,
+            scopes_json TEXT NOT NULL DEFAULT '[]',
+            capabilities_json TEXT NOT NULL DEFAULT '{}',
+            enabled_actions_json TEXT NOT NULL DEFAULT '[]',
+            connector_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS entities (
@@ -762,6 +868,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS connections (
                 connection_id TEXT PRIMARY KEY,
+                profile_id TEXT,
                 connector TEXT NOT NULL,
                 display_name TEXT NOT NULL,
                 account_label TEXT,
@@ -795,7 +902,23 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         )?;
     }
 
+    if user_version < 9 {
+        if !column_exists(connection, "connections", "profile_id")? {
+            connection.execute_batch(
+                "ALTER TABLE connections
+                 ADD COLUMN profile_id TEXT;",
+            )?;
+        }
+        seed_default_notion_profile(connection)?;
+        connection.execute_batch(
+            "UPDATE connections
+             SET profile_id = 'notion-token-default'
+             WHERE profile_id IS NULL AND connector = 'notion';",
+        )?;
+    }
+
     if user_version < SCHEMA_VERSION {
+        seed_default_notion_profile(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
 
@@ -830,25 +953,59 @@ fn connection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectionRow> {
         row.get(11)?,
         row.get(12)?,
         row.get(13)?,
+        row.get(14)?,
     ))
 }
 
 fn connection_from_row(row: ConnectionRow) -> StoreResult<ConnectionRecord> {
     Ok(ConnectionRecord {
         connection_id: ConnectionId(row.0),
+        profile_id: row.1.map(ConnectorProfileId),
+        connector: row.2,
+        display_name: row.3,
+        account_label: row.4,
+        workspace_id: row.5,
+        workspace_name: row.6,
+        auth_kind: row.7,
+        secret_ref: row.8,
+        scopes: from_json::<Vec<String>>(&row.9)?,
+        capabilities_json: row.10,
+        status: row.11,
+        created_at: row.12,
+        updated_at: row.13,
+        expires_at: row.14,
+    })
+}
+
+fn connector_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConnectorProfileRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn connector_profile_from_row(row: ConnectorProfileRow) -> StoreResult<ConnectorProfileRecord> {
+    Ok(ConnectorProfileRecord {
+        profile_id: ConnectorProfileId(row.0),
         connector: row.1,
         display_name: row.2,
-        account_label: row.3,
-        workspace_id: row.4,
-        workspace_name: row.5,
-        auth_kind: row.6,
-        secret_ref: row.7,
-        scopes: from_json::<Vec<String>>(&row.8)?,
-        capabilities_json: row.9,
-        status: row.10,
-        created_at: row.11,
-        updated_at: row.12,
-        expires_at: row.13,
+        auth_kind: row.3,
+        scopes: from_json::<Vec<String>>(&row.4)?,
+        capabilities_json: row.5,
+        enabled_actions_json: row.6,
+        connector_version: row.7,
+        status: row.8,
+        created_at: row.9,
+        updated_at: row.10,
     })
 }
 
@@ -938,6 +1095,54 @@ fn journal_from_row(row: JournalRow) -> StoreResult<JournalEntry> {
         apply_effects: from_json::<Vec<JournalApplyEffect>>(&row.5)?,
         status: from_json(&row.6)?,
     })
+}
+
+fn seed_default_notion_profile(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS connector_profiles (
+            profile_id TEXT PRIMARY KEY,
+            connector TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            auth_kind TEXT NOT NULL,
+            scopes_json TEXT NOT NULL DEFAULT '[]',
+            capabilities_json TEXT NOT NULL DEFAULT '{}',
+            enabled_actions_json TEXT NOT NULL DEFAULT '[]',
+            connector_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO connector_profiles (
+            profile_id,
+            connector,
+            display_name,
+            auth_kind,
+            scopes_json,
+            capabilities_json,
+            enabled_actions_json,
+            connector_version,
+            status,
+            created_at,
+            updated_at
+         )
+         VALUES (
+            'notion-token-default',
+            'notion',
+            'Notion token auth',
+            'token',
+            '[]',
+            '{}',
+            '[\"read\",\"write\"]',
+            'notion.v1',
+            'active',
+            '0',
+            '0'
+         )",
+        [],
+    )?;
+    Ok(())
 }
 
 fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreResult<bool> {

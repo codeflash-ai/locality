@@ -11,7 +11,8 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use afs_store::{
-    ConnectionId, ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
+    ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
+    ConnectorProfileRecord, ConnectorProfileRepository, EntityRecord, EntityRepository,
     HydrationJobRecord, HydrationJobRepository, JournalRepository, MountConfig, MountRepository,
     ProjectionMode, ShadowRepository, SqliteStateStore, StoreError,
 };
@@ -33,7 +34,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 8);
+    assert_eq!(user_version, 9);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -53,7 +54,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 8,
+            supported: 9,
         }
     );
 }
@@ -141,6 +142,12 @@ fn connections_round_trip_without_storing_secret_value() {
     assert_eq!(
         reopened.list_connections().expect("list connections"),
         vec![connection]
+    );
+    assert_eq!(
+        reopened
+            .get_connector_profile(&ConnectorProfileId::new("notion-token-default"))
+            .expect("get profile"),
+        Some(default_profile())
     );
 
     let sqlite_bytes = fs::read(fixture.state_root.join("state.sqlite3")).expect("read db");
@@ -261,10 +268,16 @@ fn sqlite_store_migrates_v5_projection_and_connections_schema() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 8);
+    assert_eq!(user_version, 9);
     assert_eq!(connection_column_count, 1);
     assert_eq!(projection_column_count, 1);
     assert_eq!(connection_table_count, 1);
+    assert_eq!(
+        store
+            .list_connector_profiles()
+            .expect("list connector profiles"),
+        vec![default_profile()]
+    );
     let mount = store
         .get_mount(&fixture.mount_id)
         .expect("get migrated mount")
@@ -330,9 +343,15 @@ fn sqlite_store_migrates_v6_projection_schema_to_connections() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 8);
+    assert_eq!(user_version, 9);
     assert_eq!(connection_column_count, 1);
     assert_eq!(connection_table_count, 1);
+    assert_eq!(
+        store
+            .list_connector_profiles()
+            .expect("list connector profiles"),
+        vec![default_profile()]
+    );
     let mount = store
         .get_mount(&fixture.mount_id)
         .expect("get migrated mount")
@@ -409,13 +428,108 @@ fn sqlite_store_migrates_v7_hydration_jobs_schema() {
         )
         .expect("hydration_jobs table");
 
-    assert_eq!(user_version, 8);
+    assert_eq!(user_version, 9);
     assert_eq!(hydration_jobs_table_count, 1);
     assert!(
         store
             .list_hydration_jobs()
             .expect("list hydration jobs")
             .is_empty()
+    );
+}
+
+#[test]
+fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
+    let fixture = SqliteFixture::new();
+    fs::create_dir_all(&fixture.state_root).expect("state root");
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "
+            PRAGMA user_version = 8;
+            CREATE TABLE mounts (
+                mount_id TEXT PRIMARY KEY,
+                connector TEXT NOT NULL,
+                root TEXT NOT NULL,
+                remote_root_id TEXT,
+                read_only INTEGER NOT NULL CHECK (read_only IN (0, 1)),
+                projection_json TEXT NOT NULL DEFAULT '\"plain_files\"',
+                connection_id TEXT
+            );
+            CREATE TABLE connections (
+                connection_id TEXT PRIMARY KEY,
+                connector TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                account_label TEXT,
+                workspace_id TEXT,
+                workspace_name TEXT,
+                auth_kind TEXT NOT NULL,
+                secret_ref TEXT NOT NULL,
+                scopes_json TEXT NOT NULL DEFAULT '[]',
+                capabilities_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT
+            );
+            CREATE TABLE hydration_jobs (
+                mount_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                target_state_json TEXT NOT NULL,
+                reason_json TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                PRIMARY KEY (mount_id, remote_id),
+                FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+            );
+            ",
+        )
+        .expect("create v8 schema");
+    connection
+        .execute(
+            "INSERT INTO connections (
+                connection_id, connector, display_name, account_label, workspace_id,
+                workspace_name, auth_kind, secret_ref, scopes_json, capabilities_json,
+                status, created_at, updated_at, expires_at
+             )
+             VALUES (?1, 'notion', 'work', 'AgentFS Workspace', 'workspace-1', 'AgentFS',
+                     'token', 'connection:notion-work', '[]', '{}', 'active',
+                     '2026-06-11T00:00:00Z', '2026-06-11T00:00:00Z', NULL)",
+            params!["notion-work"],
+        )
+        .expect("insert connection");
+    drop(connection);
+
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw reopened connection");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    let profile_column_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('connections') WHERE name = 'profile_id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("profile_id column");
+
+    assert_eq!(user_version, 9);
+    assert_eq!(profile_column_count, 1);
+    let migrated_connection = store
+        .get_connection(&ConnectionId::new("notion-work"))
+        .expect("get connection")
+        .expect("connection");
+    assert_eq!(
+        migrated_connection.profile_id,
+        Some(ConnectorProfileId::new("notion-token-default"))
+    );
+    assert_eq!(
+        store
+            .get_connector_profile(&ConnectorProfileId::new("notion-token-default"))
+            .expect("get profile"),
+        Some(default_profile())
     );
 }
 
@@ -594,7 +708,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 8);
+    assert_eq!(user_version, 9);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -665,7 +779,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 8);
+    assert_eq!(user_version, 9);
     assert!(entry.apply_effects.is_empty());
 }
 
@@ -744,6 +858,7 @@ fn hydration_job_record() -> HydrationJobRecord {
 fn connection_record(connection_id: &str) -> ConnectionRecord {
     ConnectionRecord {
         connection_id: ConnectionId::new(connection_id),
+        profile_id: Some(ConnectorProfileId::new("notion-token-default")),
         connector: "notion".to_string(),
         display_name: "work".to_string(),
         account_label: Some("AgentFS Workspace".to_string()),
@@ -757,6 +872,22 @@ fn connection_record(connection_id: &str) -> ConnectionRecord {
         created_at: "2026-06-11T00:00:00Z".to_string(),
         updated_at: "2026-06-11T00:00:00Z".to_string(),
         expires_at: None,
+    }
+}
+
+fn default_profile() -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new("notion-token-default"),
+        connector: "notion".to_string(),
+        display_name: "Notion token auth".to_string(),
+        auth_kind: "token".to_string(),
+        scopes: vec![],
+        capabilities_json: "{}".to_string(),
+        enabled_actions_json: "[\"read\",\"write\"]".to_string(),
+        connector_version: "notion.v1".to_string(),
+        status: "active".to_string(),
+        created_at: "0".to_string(),
+        updated_at: "0".to_string(),
     }
 }
 

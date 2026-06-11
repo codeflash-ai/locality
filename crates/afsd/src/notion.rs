@@ -10,8 +10,8 @@ use afs_notion::dto::NotionPageBundle;
 use afs_notion::media::fetch_media_assets;
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
-    ConnectionRecord, ConnectionRepository, CredentialError, CredentialStore, MountConfig,
-    MountRepository,
+    ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
+    CredentialStore, MountConfig, MountRepository,
 };
 
 use crate::hydration::{HydratedAsset, HydratedEntity, HydrationSource};
@@ -34,6 +34,10 @@ pub enum ConnectorResolveError {
         connection_id: String,
         suggested_command: String,
     },
+    AuthProfileUnavailable {
+        profile_id: String,
+        suggested_command: String,
+    },
     CredentialStoreUnavailable(String),
 }
 
@@ -45,6 +49,7 @@ impl ConnectorResolveError {
             Self::MissingConnection { .. } => "missing_connection",
             Self::AuthRequired { .. } => "auth_required",
             Self::ConnectionRevoked { .. } => "connection_revoked",
+            Self::AuthProfileUnavailable { .. } => "auth_profile_unavailable",
             Self::CredentialStoreUnavailable(_) => "credential_store_unavailable",
         }
     }
@@ -62,6 +67,9 @@ impl ConnectorResolveError {
             Self::ConnectionRevoked { connection_id, .. } => {
                 format!("connection `{connection_id}` is revoked")
             }
+            Self::AuthProfileUnavailable { profile_id, .. } => {
+                format!("connector profile `{profile_id}` is unavailable")
+            }
             Self::CredentialStoreUnavailable(message) => message.clone(),
         }
     }
@@ -75,6 +83,9 @@ impl ConnectorResolveError {
                 suggested_command, ..
             }
             | Self::ConnectionRevoked {
+                suggested_command, ..
+            }
+            | Self::AuthProfileUnavailable {
                 suggested_command, ..
             } => Some(suggested_command),
             _ => None,
@@ -94,7 +105,7 @@ pub fn resolve_notion_connector_for_path<S>(
     path: impl AsRef<Path>,
 ) -> Result<NotionConnector, ConnectorResolveError>
 where
-    S: MountRepository + ConnectionRepository,
+    S: MountRepository + ConnectionRepository + ConnectorProfileRepository,
 {
     let target = absolute_path(path.as_ref()).map_err(ConnectorResolveError::MountMissing)?;
     let mounts = store
@@ -111,7 +122,7 @@ pub fn resolve_notion_connector_for_mount_id<S>(
     mount_id: &MountId,
 ) -> Result<NotionConnector, ConnectorResolveError>
 where
-    S: MountRepository + ConnectionRepository,
+    S: MountRepository + ConnectionRepository + ConnectorProfileRepository,
 {
     let mount = store
         .get_mount(mount_id)
@@ -126,7 +137,7 @@ pub fn resolve_notion_connector_for_mount<S>(
     mount: &MountConfig,
 ) -> Result<NotionConnector, ConnectorResolveError>
 where
-    S: ConnectionRepository,
+    S: ConnectionRepository + ConnectorProfileRepository,
 {
     if mount.connector != "notion" {
         return Err(ConnectorResolveError::UnsupportedConnector(
@@ -142,11 +153,13 @@ where
                 message: format!("connection `{}` was not found", connection_id.0),
                 suggested_command: "afs connect notion".to_string(),
             })?;
+        validate_connection_profile(store, &connection)?;
         return connector_from_connection(credentials, mount, &connection);
     }
 
     let active = active_notion_connections(store)?;
     if active.len() == 1 {
+        validate_connection_profile(store, &active[0])?;
         return connector_from_connection(credentials, mount, &active[0]);
     }
 
@@ -181,7 +194,7 @@ impl ResolvedNotionSource {
         mounts: &[MountConfig],
     ) -> Result<Self, ConnectorResolveError>
     where
-        S: ConnectionRepository,
+        S: ConnectionRepository + ConnectorProfileRepository,
     {
         let mut connectors = BTreeMap::new();
         for mount in mounts {
@@ -264,6 +277,35 @@ where
         .into_iter()
         .filter(|connection| connection.connector == "notion" && connection.status == "active")
         .collect())
+}
+
+fn validate_connection_profile<S>(
+    store: &S,
+    connection: &ConnectionRecord,
+) -> Result<(), ConnectorResolveError>
+where
+    S: ConnectorProfileRepository,
+{
+    let Some(profile_id) = &connection.profile_id else {
+        return Ok(());
+    };
+    let profile = store
+        .get_connector_profile(profile_id)
+        .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))?
+        .ok_or_else(|| ConnectorResolveError::AuthProfileUnavailable {
+            profile_id: profile_id.0.clone(),
+            suggested_command: "afs connect notion".to_string(),
+        })?;
+    if profile.status != "active"
+        || profile.connector != connection.connector
+        || profile.auth_kind != connection.auth_kind
+    {
+        return Err(ConnectorResolveError::AuthProfileUnavailable {
+            profile_id: profile.profile_id.0,
+            suggested_command: "afs connect notion".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn warn_env_fallback_once() {

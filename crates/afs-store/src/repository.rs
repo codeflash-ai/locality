@@ -12,8 +12,8 @@ use afs_core::shadow::ShadowDocument;
 
 use crate::error::StoreResult;
 use crate::records::{
-    ConnectionId, ConnectionRecord, EntityRecord, HydrationJobRecord, MountConfig,
-    ShadowSnapshotRecord,
+    ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
+    HydrationJobRecord, MountConfig, ShadowSnapshotRecord,
 };
 
 pub trait MountRepository {
@@ -28,6 +28,15 @@ pub trait ConnectionRepository {
     -> StoreResult<Option<ConnectionRecord>>;
     fn list_connections(&self) -> StoreResult<Vec<ConnectionRecord>>;
     fn delete_connection(&mut self, connection_id: &ConnectionId) -> StoreResult<()>;
+}
+
+pub trait ConnectorProfileRepository {
+    fn save_connector_profile(&mut self, profile: ConnectorProfileRecord) -> StoreResult<()>;
+    fn get_connector_profile(
+        &self,
+        profile_id: &ConnectorProfileId,
+    ) -> StoreResult<Option<ConnectorProfileRecord>>;
+    fn list_connector_profiles(&self) -> StoreResult<Vec<ConnectorProfileRecord>>;
 }
 
 pub trait EntityRepository {

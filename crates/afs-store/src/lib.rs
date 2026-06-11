@@ -19,11 +19,11 @@ pub use credentials::{
 pub use error::{StoreError, StoreResult};
 pub use memory::InMemoryStateStore;
 pub use records::{
-    ConnectionId, ConnectionRecord, EntityRecord, HydrationJobRecord, MountConfig, ProjectionMode,
-    ShadowBlockRecord, ShadowSnapshotRecord,
+    ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
+    HydrationJobRecord, MountConfig, ProjectionMode, ShadowBlockRecord, ShadowSnapshotRecord,
 };
 pub use repository::{
-    ConnectionRepository, EntityRepository, HydrationJobRepository, JournalRepository,
-    MountRepository, ShadowRepository,
+    ConnectionRepository, ConnectorProfileRepository, EntityRepository, HydrationJobRepository,
+    JournalRepository, MountRepository, ShadowRepository,
 };
 pub use sqlite::SqliteStateStore;

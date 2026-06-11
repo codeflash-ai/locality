@@ -6,6 +6,7 @@ The `afs` command is the single supported control surface for users and coding a
 
 - `afs connect notion [--name <id>] [--token-stdin] [--json]`
 - `afs connections [--json]`
+- `afs profiles [--json]`
 - `afs connection show <id> [--json]`
 - `afs disconnect <id> [--json]`
 - `afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--read-only] [--json]`
@@ -43,15 +44,18 @@ Remaining categories to assign before `afs push` applies remote mutations:
 
 `afs connect notion [--name <id>] [--token-stdin]` creates a local provider connection. It probes Notion with `GET /v1/users/me`, stores only metadata in SQLite, and writes the bearer token to the credential store. JSON output never includes the token or `secret_ref`.
 
+Connections now point at connector profiles. A profile is AgentFS's local auth-config record: connector, auth kind, scopes, enabled action classes, connector version, status, and capabilities. The built-in local Notion token profile is `notion-token-default`; current token connections use that profile until OAuth/provider-specific profiles are added.
+
 The default connection ID is `notion-default` when no Notion connection exists. If a Notion connection already exists, pass `--name <id>` to avoid overwriting by accident.
 
-`afs connections` and `afs connection show <id>` list metadata only. `afs disconnect <id>` deletes the credential and marks the connection `revoked`; mounts remain registered and will report `connection_revoked` on the next pull/push until reconnected or remounted.
+`afs connections` and `afs connection show <id>` list connected-account metadata only, including the profile ID but never credentials. `afs profiles` lists connector auth profiles and contains no account secrets. `afs disconnect <id>` deletes the credential and marks the connection `revoked`; mounts remain registered and will report `connection_revoked` on the next pull/push until reconnected or remounted.
 
 Auth error JSON uses stable codes:
 
 - `missing_connection`: no usable connection and no `NOTION_TOKEN` fallback;
 - `auth_required`: connection exists but its credential is missing;
 - `connection_revoked`: mount points at a revoked connection;
+- `auth_profile_unavailable`: connection points at a missing, inactive, or mismatched connector profile;
 - `credential_store_unavailable`: keychain or file credential store failed;
 - `connection_probe_failed`: Notion rejected the token during `connect`.
 

@@ -13,12 +13,12 @@ use afs_core::shadow::ShadowDocument;
 
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
-    ConnectionId, ConnectionRecord, EntityRecord, HydrationJobRecord, MountConfig,
-    ShadowSnapshotRecord,
+    ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
+    HydrationJobRecord, MountConfig, ShadowSnapshotRecord,
 };
 use crate::repository::{
-    ConnectionRepository, EntityRepository, HydrationJobRepository, JournalRepository,
-    MountRepository, ShadowRepository,
+    ConnectionRepository, ConnectorProfileRepository, EntityRepository, HydrationJobRepository,
+    JournalRepository, MountRepository, ShadowRepository,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -30,6 +30,7 @@ type HydrationJobKey = (MountId, RemoteId);
 pub struct InMemoryStateStore {
     mounts: BTreeMap<MountId, MountConfig>,
     connections: BTreeMap<ConnectionId, ConnectionRecord>,
+    connector_profiles: BTreeMap<ConnectorProfileId, ConnectorProfileRecord>,
     entities: BTreeMap<EntityKey, EntityRecord>,
     entities_by_path: BTreeMap<PathKey, RemoteId>,
     shadows: BTreeMap<ShadowKey, ShadowSnapshotRecord>,
@@ -95,6 +96,25 @@ impl ConnectionRepository for InMemoryStateStore {
     fn delete_connection(&mut self, connection_id: &ConnectionId) -> StoreResult<()> {
         self.connections.remove(connection_id);
         Ok(())
+    }
+}
+
+impl ConnectorProfileRepository for InMemoryStateStore {
+    fn save_connector_profile(&mut self, profile: ConnectorProfileRecord) -> StoreResult<()> {
+        self.connector_profiles
+            .insert(profile.profile_id.clone(), profile);
+        Ok(())
+    }
+
+    fn get_connector_profile(
+        &self,
+        profile_id: &ConnectorProfileId,
+    ) -> StoreResult<Option<ConnectorProfileRecord>> {
+        Ok(self.connector_profiles.get(profile_id).cloned())
+    }
+
+    fn list_connector_profiles(&self) -> StoreResult<Vec<ConnectorProfileRecord>> {
+        Ok(self.connector_profiles.values().cloned().collect())
     }
 }
 

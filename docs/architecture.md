@@ -11,6 +11,43 @@ AgentFS v1 is a local-first Rust system with six implementation surfaces:
 
 The optional cloud relay is deliberately not implemented in v1. The local remote-truth boundary should still remain swappable so a future relay can replace direct source polling without changing the sync model.
 
+## Connector and Auth Model
+
+AgentFS keeps connector capability, authentication policy, account credentials,
+mount projection, and execution separate:
+
+```text
+connector implementation
+      |
+      v
+connector profile / auth config
+      |
+      v
+connected account
+      |
+      v
+mount
+      |
+      v
+pull/push execution context
+```
+
+- A connector implementation defines provider behavior and supported sync
+  operations.
+- A connector profile defines how that connector authenticates: auth kind,
+  scopes, enabled action classes, connector version, status, and capabilities.
+- A connected account stores provider/workspace metadata and a `secret_ref`;
+  the bearer token or OAuth secret lives only in the credential store.
+- A mount references a connection ID and never stores credentials.
+- Pull, push, scheduled hydration, and daemon jobs resolve credentials from the
+  mount's connection and profile at execution time. Daemon IPC does not carry
+  bearer tokens.
+
+The first local profile is `notion-token-default`, used by token-based Notion
+connections. The model is intentionally compatible with future OAuth profiles,
+connector version pinning, scoped action sets, health checks, and remote relay
+execution.
+
 ## Crate map
 
 | Crate | Responsibility |
