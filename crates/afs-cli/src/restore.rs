@@ -78,9 +78,11 @@ where
         path: absolute_path.clone(),
         message: error.to_string(),
     })?;
-    remove_conflict_sidecar_if_present(&absolute_path).map_err(|error| RestoreError::WriteFile {
-        path: remote_variant_path(&absolute_path),
-        message: error.to_string(),
+    remove_conflict_sidecar_if_present(&absolute_path).map_err(|error| {
+        RestoreError::WriteFile {
+            path: remote_variant_path(&absolute_path),
+            message: error.to_string(),
+        }
     })?;
 
     entity.hydration = HydrationState::Hydrated;

@@ -184,7 +184,10 @@ where
         if entity.hydration.can_transition_to(&HydrationState::Dirty) {
             entity.hydration = HydrationState::Dirty;
         }
-        if entity.hydration.can_transition_to(&HydrationState::Conflicted) {
+        if entity
+            .hydration
+            .can_transition_to(&HydrationState::Conflicted)
+        {
             entity.hydration = HydrationState::Conflicted;
         }
         entity.content_hash = Some(rendered.shadow.body_hash.clone());

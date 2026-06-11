@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 
 use afs_core::conflict::remote_variant_path;
 use afs_core::model::{EntityKind, HydrationState};
-use afs_store::{
-    EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
-};
+use afs_store::{EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,7 +254,11 @@ fn strip_remote_suffix(path: &Path) -> Option<PathBuf> {
     let stripped = file_name
         .strip_suffix(".remote.md")
         .map(|name| format!("{name}.md"))
-        .or_else(|| file_name.strip_suffix(".remote").map(|name| name.to_string()))?;
+        .or_else(|| {
+            file_name
+                .strip_suffix(".remote")
+                .map(|name| name.to_string())
+        })?;
 
     let mut normalized = path.to_path_buf();
     normalized.set_file_name(stripped);

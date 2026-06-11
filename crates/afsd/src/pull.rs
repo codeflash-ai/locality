@@ -380,7 +380,10 @@ fn conflicted_record(
     if entity.hydration.can_transition_to(&HydrationState::Dirty) {
         entity.hydration = HydrationState::Dirty;
     }
-    if entity.hydration.can_transition_to(&HydrationState::Conflicted) {
+    if entity
+        .hydration
+        .can_transition_to(&HydrationState::Conflicted)
+    {
         entity.hydration = HydrationState::Conflicted;
     }
     entity.content_hash = Some(shadow.body_hash.clone());
@@ -412,7 +415,10 @@ where
         Err(error) => return Err(PullError::Store(error)),
     };
 
-    Ok(shadow.frontmatter == rendered.frontmatter && shadow.rendered_body == rendered.rendered_body)
+    Ok(
+        shadow.frontmatter == rendered.frontmatter
+            && shadow.rendered_body == rendered.rendered_body,
+    )
 }
 
 fn remove_conflict_sidecar_if_present(path: &Path) -> Result<(), PullError> {

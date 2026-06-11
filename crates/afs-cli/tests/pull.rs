@@ -123,11 +123,18 @@ fn pull_mount_root_preserves_shadow_remote_timestamp_for_non_rehydrated_pages() 
     fixture.mount(&mut store);
 
     run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
-    run_pull(&mut store, &fixture.connector("Roadmap"), fixture.child_file("roadmap"))
-        .expect("hydrate child");
+    run_pull(
+        &mut store,
+        &fixture.connector("Roadmap"),
+        fixture.child_file("roadmap"),
+    )
+    .expect("hydrate child");
 
     let child_entity = store
-        .get_entity(&fixture.mount_id, &RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+        .get_entity(
+            &fixture.mount_id,
+            &RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        )
         .expect("get child entity")
         .expect("child entity");
     assert_eq!(
@@ -143,7 +150,10 @@ fn pull_mount_root_preserves_shadow_remote_timestamp_for_non_rehydrated_pages() 
     .expect("refresh root");
 
     let child_entity = store
-        .get_entity(&fixture.mount_id, &RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+        .get_entity(
+            &fixture.mount_id,
+            &RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        )
         .expect("get child entity")
         .expect("child entity");
     assert_eq!(
@@ -293,7 +303,12 @@ impl PullFixture {
         self.connector_with(root_title, "Root body.", "2026-06-10T00:00:00.000Z")
     }
 
-    fn connector_with(&self, root_title: &str, root_body: &str, last_edited_time: &str) -> NotionConnector {
+    fn connector_with(
+        &self,
+        root_title: &str,
+        root_body: &str,
+        last_edited_time: &str,
+    ) -> NotionConnector {
         NotionConnector::with_api(
             NotionConfig::default(),
             Arc::new(FixtureNotionApi::new(

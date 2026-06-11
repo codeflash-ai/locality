@@ -566,11 +566,7 @@ fn resolve(args: &[String], json: bool) -> i32 {
         }
     };
 
-    match run_resolve(
-        &mut store,
-        PathBuf::from(path),
-        ResolveOptions { choice },
-    ) {
+    match run_resolve(&mut store, PathBuf::from(path), ResolveOptions { choice }) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
