@@ -4,7 +4,7 @@ use std::time::Duration;
 use afs_core::AfsResult;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::journal::JournalStore;
-use afs_core::model::HydrationState;
+use afs_core::model::{EntityKind, HydrationState};
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
     ShadowRepository,
@@ -247,6 +247,10 @@ fn event_relative_path(root: &Path, event_path: &Path) -> Option<PathBuf> {
 }
 
 fn should_hydrate_on_read(entity: &EntityRecord) -> bool {
+    if entity.kind != EntityKind::Page {
+        return false;
+    }
+
     matches!(
         entity.hydration,
         HydrationState::Virtual | HydrationState::Stub

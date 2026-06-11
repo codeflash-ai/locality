@@ -4,7 +4,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
-use afs_core::model::HydrationState;
+use afs_core::model::{EntityKind, HydrationState};
 use afs_core::{AfsError, AfsResult};
 use afs_store::{EntityRepository, MountRepository, SqliteStateStore};
 use notify::event::{
@@ -212,6 +212,10 @@ fn poll_stub_accesses(
             .list_entities(&mount.mount_id)
             .map_err(AfsError::from)?
         {
+            if entity.kind != EntityKind::Page {
+                continue;
+            }
+
             if !matches!(
                 entity.hydration,
                 HydrationState::Virtual | HydrationState::Stub
@@ -387,6 +391,49 @@ mod tests {
                 kind: FileEventKind::Read,
             }]
         );
+    }
+
+    #[test]
+    fn stub_access_poll_ignores_database_directories() {
+        let state_root = temp_root("poll-database-state");
+        let mount_root = temp_root("poll-database-mount");
+        let database_path = mount_root.join("Tasks");
+        std::fs::create_dir_all(&database_path).expect("database directory");
+
+        let mount_id = MountId::new("notion-main");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                mount_root.clone(),
+            ))
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id,
+                    RemoteId::new("database-1"),
+                    EntityKind::Database,
+                    "Tasks",
+                    "Tasks",
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save entity");
+
+        let watched_roots = Arc::new(Mutex::new([mount_root].into_iter().collect()));
+        let mut observed = [(database_path, SystemTime::UNIX_EPOCH)]
+            .into_iter()
+            .collect();
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        poll_stub_accesses(&state_root, &watched_roots, &mut observed, &|event| {
+            events.lock().expect("events lock").push(event);
+        })
+        .expect("poll accesses");
+
+        assert!(events.lock().expect("events lock").is_empty());
     }
 
     fn temp_root(name: &str) -> PathBuf {

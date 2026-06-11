@@ -15,7 +15,7 @@ use std::time::Instant;
 use afs_core::AfsError;
 use afs_core::canonical::parse_canonical_markdown;
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
-use afs_core::model::HydrationState;
+use afs_core::model::{EntityKind, HydrationState};
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository,
@@ -648,6 +648,10 @@ where
 }
 
 fn should_hydrate_on_read(entity: &EntityRecord) -> bool {
+    if entity.kind != EntityKind::Page {
+        return false;
+    }
+
     matches!(
         entity.hydration,
         HydrationState::Virtual | HydrationState::Stub

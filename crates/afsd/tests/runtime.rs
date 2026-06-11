@@ -226,6 +226,39 @@ fn default_runner_queues_stub_read_hydration() {
 }
 
 #[test]
+fn default_runner_ignores_database_directory_read() {
+    let fixture = EventFixture::new("database-read");
+    let database_id = RemoteId::new("database-1");
+    let database_path = PathBuf::from("Tasks");
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).expect("open store");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                database_id,
+                EntityKind::Database,
+                "Tasks",
+                database_path.clone(),
+            )
+            .with_hydration(HydrationState::Stub),
+        )
+        .expect("save database entity");
+
+    let report = DefaultRuntimeJobRunner
+        .run_file_event(
+            fixture.state_root.clone(),
+            FileEvent {
+                path: fixture.mount_root.join(database_path),
+                kind: FileEventKind::Read,
+            },
+        )
+        .expect("run file event");
+
+    assert_eq!(report.report.ignored_events, 1);
+    assert!(report.queued_hydrations.is_empty());
+}
+
+#[test]
 fn runtime_drains_hydration_queued_by_read_event() {
     let (hydrated_tx, hydrated_rx) = mpsc::channel();
     let runtime = DaemonRuntime::spawn_with_runner(
