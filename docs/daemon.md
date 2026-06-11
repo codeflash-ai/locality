@@ -56,8 +56,9 @@ remote pull, hydration, or push reconciliation.
 
 The foreground daemon starts a `notify` watcher for every mount loaded from the
 SQLite store at startup. Create and modify notifications are normalized to
-`Write` events, while remove and rename notifications are delivered but ignored
-until delete/rename planning is wired.
+`Write` events, native access/open notifications are normalized to `Read`
+events when the platform reports them, and remove/rename notifications are
+delivered but ignored until delete/rename planning is wired.
 
 Write events for hydrated pages are resolved back to stored entities inside the
 runtime. If the file body still matches the stored shadow, the event is treated
@@ -66,9 +67,16 @@ shadow, the entity transitions to `dirty`. This suppresses feedback from
 hydration, scheduled pull, and explicit pull without relying on fragile timing
 windows or global path ignore lists.
 
-Read/open notifications are intentionally not part of this portable watcher
-slice. Lazy read hydration should be implemented with OS-specific open/read
-signals next, then routed into the same runtime event path.
+The daemon also runs a stub access watcher. It scans only stored `virtual` and
+`stub` entity paths under watched mounts and emits a `Read` event when a stub's
+access time advances. This covers platforms where the regular watcher does not
+surface open/read notifications to user-space. The scan only submits daemon
+events; the runtime decides whether to queue hydration.
+
+Read events are resolved inside `DaemonRuntime`. A read on a `virtual` or `stub`
+entity creates a high-priority `StubRead` hydration request and returns to the
+control loop; connector fetch/render work happens later through the existing
+hydration worker path. Reads of hydrated, dirty, or conflicted files are ignored.
 
 ## Push Execution
 

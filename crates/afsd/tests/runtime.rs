@@ -19,7 +19,8 @@ use afsd::execution::{DaemonEventReport, PushJob};
 use afsd::hydration::HydrationOutcome;
 use afsd::ipc::{DaemonRequest, DaemonResponse};
 use afsd::runtime::{
-    DaemonRuntime, DefaultRuntimeJobRunner, RuntimeJobRunner, ScheduledPullRuntimeReport,
+    DaemonRuntime, DefaultRuntimeJobRunner, FileEventRuntimeReport, RuntimeJobRunner,
+    ScheduledPullRuntimeReport,
 };
 use afsd::scheduler::PullSchedulerTick;
 use afsd::watcher::{FileEvent, FileEventKind};
@@ -157,7 +158,7 @@ fn default_runner_marks_hydrated_write_dirty() {
         .run_file_event(fixture.state_root.clone(), fixture.write_event())
         .expect("run file event");
 
-    assert_eq!(report.marked_dirty, 1);
+    assert_eq!(report.report.marked_dirty, 1);
     let store = SqliteStateStore::open(fixture.state_root).expect("open store");
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.remote_id)
@@ -179,7 +180,7 @@ fn default_runner_marks_frontmatter_only_write_dirty() {
         .run_file_event(fixture.state_root.clone(), fixture.write_event())
         .expect("run file event");
 
-    assert_eq!(report.marked_dirty, 1);
+    assert_eq!(report.report.marked_dirty, 1);
     let store = SqliteStateStore::open(fixture.state_root).expect("open store");
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.remote_id)
@@ -197,13 +198,59 @@ fn default_runner_ignores_clean_daemon_projection_write() {
         .run_file_event(fixture.state_root.clone(), fixture.write_event())
         .expect("run file event");
 
-    assert_eq!(report.ignored_events, 1);
+    assert_eq!(report.report.ignored_events, 1);
     let store = SqliteStateStore::open(fixture.state_root).expect("open store");
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.remote_id)
         .expect("get entity")
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Hydrated);
+}
+
+#[test]
+fn default_runner_queues_stub_read_hydration() {
+    let fixture = EventFixture::new_with_state("stub-read", HydrationState::Stub);
+
+    let report = DefaultRuntimeJobRunner
+        .run_file_event(fixture.state_root.clone(), fixture.read_event())
+        .expect("run file event");
+
+    assert_eq!(report.report.queued_hydrations, 1);
+    assert_eq!(report.queued_hydrations.len(), 1);
+    let request = &report.queued_hydrations[0];
+    assert_eq!(request.mount_id, fixture.mount_id);
+    assert_eq!(request.remote_id, fixture.remote_id);
+    assert_eq!(request.path, fixture.page_path());
+    assert_eq!(request.target_state, HydrationState::Hydrated);
+    assert_eq!(request.reason, HydrationReason::StubRead);
+}
+
+#[test]
+fn runtime_drains_hydration_queued_by_read_event() {
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("read-event-hydration"),
+        ReadHydrationRunner {
+            hydrated: hydrated_tx,
+        },
+    )
+    .expect("spawn runtime");
+
+    runtime
+        .handle()
+        .file_event(FileEvent {
+            path: PathBuf::from("Roadmap.md"),
+            kind: FileEventKind::Read,
+        })
+        .expect("submit read event");
+
+    let request = hydrated_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("hydration drained");
+    assert_eq!(request.mount_id, MountId::new("notion-main"));
+    assert_eq!(request.remote_id, RemoteId::new("page-1"));
+    assert_eq!(request.reason, HydrationReason::StubRead);
+    runtime.shutdown();
 }
 
 #[derive(Clone)]
@@ -364,6 +411,10 @@ struct EventRunner {
     event_tx: mpsc::Sender<FileEvent>,
 }
 
+struct ReadHydrationRunner {
+    hydrated: mpsc::Sender<HydrationRequest>,
+}
+
 impl RuntimeJobRunner for EventRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
         DaemonResponse::error("unexpected_pull", "pull should not run")
@@ -398,11 +449,64 @@ impl RuntimeJobRunner for EventRunner {
         &self,
         _state_root: PathBuf,
         event: FileEvent,
-    ) -> afs_core::AfsResult<DaemonEventReport> {
+    ) -> afs_core::AfsResult<FileEventRuntimeReport> {
         self.event_tx.send(event).expect("send file event");
-        Ok(DaemonEventReport {
-            ignored_events: 1,
-            ..Default::default()
+        Ok(FileEventRuntimeReport {
+            report: DaemonEventReport {
+                ignored_events: 1,
+                ..Default::default()
+            },
+            queued_hydrations: Vec::new(),
+        })
+    }
+}
+
+impl RuntimeJobRunner for ReadHydrationRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        self.hydrated.send(request).expect("notify hydrated");
+        Ok(HydrationOutcome::Hydrated)
+    }
+
+    fn run_file_event(
+        &self,
+        _state_root: PathBuf,
+        _event: FileEvent,
+    ) -> afs_core::AfsResult<FileEventRuntimeReport> {
+        Ok(FileEventRuntimeReport {
+            report: DaemonEventReport {
+                queued_hydrations: 1,
+                ..Default::default()
+            },
+            queued_hydrations: vec![HydrationRequest::new(
+                MountId::new("notion-main"),
+                RemoteId::new("page-1"),
+                PathBuf::from("Roadmap.md"),
+                HydrationState::Hydrated,
+                HydrationReason::StubRead,
+            )],
         })
     }
 }
@@ -503,6 +607,10 @@ struct EventFixture {
 
 impl EventFixture {
     fn new(name: &str) -> Self {
+        Self::new_with_state(name, HydrationState::Hydrated)
+    }
+
+    fn new_with_state(name: &str, hydration: HydrationState) -> Self {
         let state_root = temp_root(&format!("{name}-state"));
         let mount_root = temp_root(&format!("{name}-mount"));
         let mount_id = MountId::new("notion-main");
@@ -537,7 +645,7 @@ impl EventFixture {
                     "Roadmap",
                     "Roadmap.md",
                 )
-                .with_hydration(HydrationState::Hydrated)
+                .with_hydration(hydration)
                 .with_content_hash(shadow.body_hash),
             )
             .expect("save entity");
@@ -558,6 +666,13 @@ impl EventFixture {
         FileEvent {
             path: self.page_path(),
             kind: FileEventKind::Write,
+        }
+    }
+
+    fn read_event(&self) -> FileEvent {
+        FileEvent {
+            path: self.page_path(),
+            kind: FileEventKind::Read,
         }
     }
 

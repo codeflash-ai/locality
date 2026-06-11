@@ -10,7 +10,7 @@ use afs_store::{MountRepository, SqliteStateStore};
 use crate::DaemonConfig;
 use crate::ipc::DaemonResponse;
 use crate::runtime::{DaemonRuntime, DaemonRuntimeHandle};
-use crate::watcher::{FileWatcher, NotifyFileWatcher};
+use crate::watcher::{FileWatcher, NotifyFileWatcher, PollingStubReadWatcher};
 
 #[cfg(unix)]
 pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
@@ -25,7 +25,19 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
             }
         }
     })?;
+    let mut stub_read_watcher =
+        PollingStubReadWatcher::new(config.state_root.clone(), config.runtime_tick_interval, {
+            let runtime = runtime_handle.clone();
+            move |event| {
+                if runtime.file_event(event).is_err() {
+                    eprintln!(
+                        "afsd stub read watcher could not submit file event: runtime stopped"
+                    );
+                }
+            }
+        })?;
     watch_existing_mounts(config, &mut file_watcher)?;
+    watch_existing_mounts(config, &mut stub_read_watcher)?;
     let socket_path = crate::ipc::socket_path(&config.state_root);
     remove_stale_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)

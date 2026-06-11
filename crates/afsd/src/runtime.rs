@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use afs_core::AfsError;
 use afs_core::canonical::parse_canonical_markdown;
-use afs_core::hydration::{HydrationPolicy, HydrationRequest};
+use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::HydrationState;
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
@@ -147,11 +147,17 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
         &self,
         _state_root: PathBuf,
         _event: FileEvent,
-    ) -> afs_core::AfsResult<DaemonEventReport> {
+    ) -> afs_core::AfsResult<FileEventRuntimeReport> {
         Err(AfsError::Unsupported(
             "runtime runner does not handle file events",
         ))
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileEventRuntimeReport {
+    pub report: DaemonEventReport,
+    pub queued_hydrations: Vec<HydrationRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,7 +241,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         &self,
         state_root: PathBuf,
         event: FileEvent,
-    ) -> afs_core::AfsResult<DaemonEventReport> {
+    ) -> afs_core::AfsResult<FileEventRuntimeReport> {
         let mut store = SqliteStateStore::open(state_root).map_err(AfsError::from)?;
         execute_file_event(&mut store, event)
     }
@@ -380,11 +386,14 @@ impl RuntimeState {
                     self.defer_hydration_retry(request);
                 }
             }
-            JobCompletion::FileEvent(result) => {
-                if let Err(error) = result {
-                    eprintln!("afsd file event failed: {error}");
+            JobCompletion::FileEvent(result) => match result {
+                Ok(result) => {
+                    for request in result.queued_hydrations {
+                        self.hydration.queue_request(request);
+                    }
                 }
-            }
+                Err(error) => eprintln!("afsd file event failed: {error}"),
+            },
         }
 
         self.maybe_start_next_job();
@@ -537,27 +546,53 @@ enum JobCompletion {
         request: HydrationRequest,
         result: afs_core::AfsResult<HydrationOutcome>,
     },
-    FileEvent(afs_core::AfsResult<DaemonEventReport>),
+    FileEvent(afs_core::AfsResult<FileEventRuntimeReport>),
 }
 
-fn execute_file_event<S>(store: &mut S, event: FileEvent) -> afs_core::AfsResult<DaemonEventReport>
+fn execute_file_event<S>(
+    store: &mut S,
+    event: FileEvent,
+) -> afs_core::AfsResult<FileEventRuntimeReport>
 where
     S: MountRepository + EntityRepository + ShadowRepository,
 {
-    let mut report = DaemonEventReport::default();
+    let mut runtime_report = FileEventRuntimeReport::default();
     let Some((mount, entity)) = resolve_event_entity(store, &event.path)? else {
-        report.ignored_events = 1;
-        return Ok(report);
+        runtime_report.report.ignored_events = 1;
+        return Ok(runtime_report);
     };
 
     match event.kind {
-        FileEventKind::Write => handle_write_event(store, mount, entity, event.path, &mut report)?,
-        FileEventKind::Read | FileEventKind::Rename | FileEventKind::Remove => {
-            report.ignored_events = 1;
+        FileEventKind::Read => {
+            handle_read_event(mount, entity, &mut runtime_report);
         }
+        FileEventKind::Write => {
+            handle_write_event(store, mount, entity, event.path, &mut runtime_report.report)?;
+        }
+        FileEventKind::Rename | FileEventKind::Remove => runtime_report.report.ignored_events = 1,
     }
 
-    Ok(report)
+    Ok(runtime_report)
+}
+
+fn handle_read_event(
+    mount: MountConfig,
+    entity: EntityRecord,
+    runtime_report: &mut FileEventRuntimeReport,
+) {
+    if !should_hydrate_on_read(&entity) {
+        runtime_report.report.ignored_events = 1;
+        return;
+    }
+
+    runtime_report.queued_hydrations.push(HydrationRequest::new(
+        mount.mount_id.clone(),
+        entity.remote_id,
+        mount.root.join(&entity.path),
+        HydrationState::Hydrated,
+        HydrationReason::StubRead,
+    ));
+    runtime_report.report.queued_hydrations = 1;
 }
 
 fn handle_write_event<S>(
@@ -610,6 +645,13 @@ where
 
     Ok(parsed.document.frontmatter == shadow.frontmatter
         && parsed.document.body == shadow.rendered_body)
+}
+
+fn should_hydrate_on_read(entity: &EntityRecord) -> bool {
+    matches!(
+        entity.hydration,
+        HydrationState::Virtual | HydrationState::Stub
+    )
 }
 
 fn resolve_event_entity<S>(
