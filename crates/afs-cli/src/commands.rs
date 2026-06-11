@@ -3052,8 +3052,9 @@ mod tests {
 
     use super::{
         EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration, diff_report_exit_code,
-        local_redirect, notion_authorize_url, notion_oauth_broker_config, parse_oauth_callback, projection_mode_for_target,
-        projection_usage_options_for_target, validate_virtual_projection_registration,
+        local_redirect, notion_authorize_url, notion_oauth_broker_config, parse_oauth_callback,
+        projection_mode_for_target, projection_usage_options_for_target,
+        validate_virtual_projection_registration,
     };
 
     #[test]
