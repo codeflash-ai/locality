@@ -9,7 +9,10 @@ use afs_core::{AfsError, AfsResult};
 use afs_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use afs_notion::dto::NotionPageBundle;
 use afs_notion::media::fetch_media_assets;
-use afs_notion::oauth::{HttpNotionOAuthClient, NotionOAuthRefresh, StoredNotionCredential};
+use afs_notion::oauth::{
+    HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerRefresh,
+    NotionOAuthRefresh, StoredNotionCredential,
+};
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
@@ -265,25 +268,7 @@ fn connection_access_token(
     let mut stored = serde_json::from_str::<StoredNotionCredential>(&secret)
         .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))?;
     if stored.expires_soon(timestamp_secs()) {
-        let (Some(client_id), Some(client_secret), Some(refresh_token)) = (
-            stored.oauth_client_id.clone(),
-            stored.oauth_client_secret.clone(),
-            stored.refresh_token.clone(),
-        ) else {
-            return Err(ConnectorResolveError::AuthRequired {
-                connection_id: connection.connection_id.0.clone(),
-                suggested_command: "afs connect notion".to_string(),
-            });
-        };
-        let refreshed = HttpNotionOAuthClient::new()
-            .refresh_token(&NotionOAuthRefresh {
-                client_id,
-                client_secret,
-                refresh_token,
-            })
-            .map_err(|error| {
-                ConnectorResolveError::CredentialStoreUnavailable(error.to_string())
-            })?;
+        let refreshed = refresh_oauth_credential(connection, &stored)?;
         stored = stored.refreshed(refreshed, timestamp_secs());
         let secret = serde_json::to_string(&stored).map_err(|error| {
             ConnectorResolveError::CredentialStoreUnavailable(error.to_string())
@@ -293,6 +278,44 @@ fn connection_access_token(
             .map_err(|error| credential_error(connection, error))?;
     }
     Ok(stored.access_token)
+}
+
+fn refresh_oauth_credential(
+    connection: &ConnectionRecord,
+    stored: &StoredNotionCredential,
+) -> Result<afs_notion::oauth::NotionOAuthToken, ConnectorResolveError> {
+    if let Some(broker_url) = stored.oauth_broker_url.clone() {
+        if stored.refresh_token.is_none() && stored.refresh_token_handle.is_none() {
+            return Err(ConnectorResolveError::AuthRequired {
+                connection_id: connection.connection_id.0.clone(),
+                suggested_command: "afs connect notion".to_string(),
+            });
+        }
+        return HttpNotionOAuthBrokerClient::new(broker_url)
+            .refresh_token(&NotionOAuthBrokerRefresh {
+                refresh_token: stored.refresh_token.clone(),
+                refresh_token_handle: stored.refresh_token_handle.clone(),
+            })
+            .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()));
+    }
+
+    let (Some(client_id), Some(client_secret), Some(refresh_token)) = (
+        stored.oauth_client_id.clone(),
+        stored.oauth_client_secret.clone(),
+        stored.refresh_token.clone(),
+    ) else {
+        return Err(ConnectorResolveError::AuthRequired {
+            connection_id: connection.connection_id.0.clone(),
+            suggested_command: "afs connect notion".to_string(),
+        });
+    };
+    HttpNotionOAuthClient::new()
+        .refresh_token(&NotionOAuthRefresh {
+            client_id,
+            client_secret,
+            refresh_token,
+        })
+        .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))
 }
 
 fn credential_error(

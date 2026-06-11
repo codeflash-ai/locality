@@ -4,7 +4,7 @@ The `afs` command is the single supported control surface for users and coding a
 
 ## Commands
 
-- `afs connect notion [--name <id>] [--token-stdin|--no-browser] [--redirect-uri <uri>] [--json]`
+- `afs connect notion [--name <id>] [--token-stdin|--no-browser|--direct-oauth] [--broker-url <url>] [--redirect-uri <uri>] [--json]`
 - `afs connections [--json]`
 - `afs profiles [--json]`
 - `afs connection show <id> [--json]`
@@ -42,7 +42,11 @@ Remaining categories to assign before `afs push` applies remote mutations:
 
 ## Provider Connections
 
-`afs connect notion [--name <id>]` creates a local provider connection. OAuth is preferred. The command reads `AFS_NOTION_OAUTH_CLIENT_ID` and `AFS_NOTION_OAUTH_CLIENT_SECRET` (or `NOTION_OAUTH_CLIENT_ID` / `NOTION_OAUTH_CLIENT_SECRET`), opens a Notion authorization URL, listens for the localhost callback, exchanges the authorization code, stores the OAuth credential bundle in the credential store, and stores only metadata in SQLite. The default callback is `http://localhost:8757/oauth/notion/callback`; override it with `--redirect-uri <uri>` or `AFS_NOTION_OAUTH_REDIRECT_URI`. The redirect URI must be registered on the Notion public integration.
+`afs connect notion [--name <id>]` creates a local provider connection. OAuth is preferred. By default the command uses the AFS OAuth broker because Notion's REST OAuth token endpoint requires a confidential client secret. The CLI asks the broker for a Notion authorization URL, opens the browser, listens for the localhost callback, sends only the returned authorization code plus signed broker session back to the broker, then stores the returned access token and refresh handle in the credential store. SQLite stores only connection metadata and a `secret_ref`.
+
+The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `AFS_NOTION_OAUTH_BROKER_URL`, or `AFS_AUTH_BROKER_URL`. The default callback is `http://localhost:8757/oauth/notion/callback`; override it with `--redirect-uri <uri>` or `AFS_NOTION_OAUTH_REDIRECT_URI`. The redirect URI must be registered on the Notion public integration.
+
+`--direct-oauth` keeps the developer BYO OAuth path. In that mode the command reads `AFS_NOTION_OAUTH_CLIENT_ID` and `AFS_NOTION_OAUTH_CLIENT_SECRET` (or `NOTION_OAUTH_CLIENT_ID` / `NOTION_OAUTH_CLIENT_SECRET`) and exchanges directly with Notion. Direct OAuth stores the user-supplied client secret in the credential store so refresh can work, and should not be the default product path.
 
 `--no-browser` prints the authorization URL but does not try to open it. `--token-stdin` is the explicit personal-access-token fallback for local development and CI:
 
@@ -65,7 +69,8 @@ Auth error JSON uses stable codes:
 - `connection_revoked`: mount points at a revoked connection;
 - `auth_profile_unavailable`: connection points at a missing, inactive, or mismatched connector profile;
 - `credential_store_unavailable`: keychain or file credential store failed;
-- `missing_oauth_config`: OAuth was requested but the Notion OAuth client ID or client secret was not configured;
+- `missing_oauth_config`: direct OAuth was requested but the Notion OAuth client ID or client secret was not configured;
+- `oauth_broker_start_failed`: the configured OAuth broker could not create a Notion authorization session;
 - `oauth_exchange_failed`: Notion rejected the OAuth authorization code exchange;
 - `connection_probe_failed`: Notion rejected the token during `connect`.
 

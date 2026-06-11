@@ -9,7 +9,10 @@ use afs_connector::ConnectorUndoApplier;
 use afs_core::AfsError;
 use afs_core::journal::PushId;
 use afs_core::model::{MountId, RemoteId};
-use afs_notion::oauth::{DEFAULT_NOTION_OAUTH_AUTHORIZE_URL, HttpNotionOAuthClient};
+use afs_notion::oauth::{
+    DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
+    HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
+};
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileRepository,
     JournalRepository, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
@@ -22,10 +25,10 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::connect::{
-    ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport, ConnectionsReport,
-    DisconnectReport, HttpNotionConnectionProbe, OAuthConnectOptions, ProfilesReport,
-    run_connect_notion, run_connect_notion_oauth, run_connection_show, run_connections,
-    run_disconnect, run_profiles,
+    BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
+    ConnectionsReport, DisconnectReport, HttpNotionConnectionProbe, OAuthConnectOptions,
+    ProfilesReport, run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
+    run_connection_show, run_connections, run_disconnect, run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
@@ -125,7 +128,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: afs connect notion [--name <id>] [--token-stdin|--no-browser] [--redirect-uri <uri>] [--json]",
+                "usage: afs connect notion [--name <id>] [--token-stdin|--no-browser|--direct-oauth] [--broker-url <url>] [--redirect-uri <uri>] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -164,6 +167,67 @@ fn connect(args: &[String], json: bool) -> i32 {
         };
         let probe = HttpNotionConnectionProbe;
         return match run_connect_notion(&mut store, credentials.as_ref(), options, &probe) {
+            Ok(report) if json => {
+                print_json(&report);
+                EXIT_SUCCESS
+            }
+            Ok(report) => {
+                print_connect_report(&report);
+                EXIT_SUCCESS
+            }
+            Err(error) => connect_command_error("connect", json, error),
+        };
+    }
+
+    if !has_flag(args, "--direct-oauth") {
+        let broker_config = match notion_oauth_broker_config(args) {
+            Ok(config) => config,
+            Err(error) => return command_error(json, error, EXIT_INTERNAL),
+        };
+        let broker = HttpNotionOAuthBrokerClient::new(broker_config.broker_url.clone());
+        let start = match broker.start(&NotionOAuthBrokerStart {
+            redirect_uri: broker_config.redirect_uri,
+        }) {
+            Ok(start) => start,
+            Err(error) => {
+                return command_error(
+                    json,
+                    CommandError::new(
+                        "connect",
+                        "oauth_broker_start_failed",
+                        format!("Notion OAuth broker start failed: {error}"),
+                    )
+                    .with_suggested_command("afs connect notion --token-stdin"),
+                    EXIT_INTERNAL,
+                );
+            }
+        };
+        let authorization = match run_local_oauth_authorization(
+            "Notion",
+            &start.authorization_url,
+            &start.redirect_uri,
+            &start.state,
+            has_flag(args, "--no-browser"),
+            json,
+        ) {
+            Ok(authorization) => authorization,
+            Err(error) => return command_error(json, error, EXIT_INTERNAL),
+        };
+        let options = BrokerOAuthConnectOptions {
+            connection_id: flag_value(args, "--name").map(ConnectionId::new),
+            broker_url: broker_config.broker_url,
+            client_id: start.client_id,
+            session: start.session,
+            state: start.state,
+            code: authorization.code,
+            redirect_uri: start.redirect_uri,
+        };
+        return match run_connect_notion_broker_oauth(
+            &mut store,
+            credentials.as_ref(),
+            options,
+            &broker,
+        ) {
             Ok(report) if json => {
                 print_json(&report);
                 EXIT_SUCCESS
@@ -1928,6 +1992,12 @@ struct NotionOAuthCliConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct NotionOAuthBrokerCliConfig {
+    broker_url: String,
+    redirect_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LocalOAuthAuthorization {
     code: String,
 }
@@ -1963,12 +2033,33 @@ fn notion_oauth_config(args: &[String]) -> Result<NotionOAuthCliConfig, CommandE
     })
 }
 
+fn notion_oauth_broker_config(args: &[String]) -> Result<NotionOAuthBrokerCliConfig, CommandError> {
+    let broker_url = flag_value(args, "--broker-url")
+        .map(str::to_string)
+        .or_else(|| env_first(&["AFS_NOTION_OAUTH_BROKER_URL", "AFS_AUTH_BROKER_URL"]))
+        .unwrap_or_else(|| DEFAULT_AFS_NOTION_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = flag_value(args, "--redirect-uri")
+        .map(str::to_string)
+        .or_else(|| env_first(&["AFS_NOTION_OAUTH_REDIRECT_URI", "NOTION_OAUTH_REDIRECT_URI"]))
+        .unwrap_or_else(|| "http://localhost:8757/oauth/notion/callback".to_string());
+
+    local_redirect(&redirect_uri).map_err(|message| {
+        CommandError::new("connect", "invalid_redirect_uri", message)
+            .with_suggested_command("afs connect notion --token-stdin")
+    })?;
+
+    Ok(NotionOAuthBrokerCliConfig {
+        broker_url,
+        redirect_uri,
+    })
+}
+
 fn missing_oauth_config(name: &str) -> CommandError {
     CommandError::new(
         "connect",
         "missing_oauth_config",
         format!(
-            "missing {name}; configure Notion OAuth env vars or use --token-stdin for a personal access token"
+            "missing {name}; configure Notion OAuth env vars for --direct-oauth or use --token-stdin for a personal access token"
         ),
     )
     .with_suggested_command("afs connect notion --token-stdin")
@@ -1979,7 +2070,27 @@ fn run_local_notion_oauth(
     no_browser: bool,
     json: bool,
 ) -> Result<LocalOAuthAuthorization, CommandError> {
-    let redirect = local_redirect(&config.redirect_uri).map_err(|message| {
+    let state = random_state();
+    let authorize_url = notion_authorize_url(&config.client_id, &config.redirect_uri, &state);
+    run_local_oauth_authorization(
+        "Notion",
+        &authorize_url,
+        &config.redirect_uri,
+        &state,
+        no_browser,
+        json,
+    )
+}
+
+fn run_local_oauth_authorization(
+    provider_name: &str,
+    authorize_url: &str,
+    redirect_uri: &str,
+    state: &str,
+    no_browser: bool,
+    json: bool,
+) -> Result<LocalOAuthAuthorization, CommandError> {
+    let redirect = local_redirect(redirect_uri).map_err(|message| {
         CommandError::new("connect", "invalid_redirect_uri", message)
             .with_suggested_command("afs connect notion --token-stdin")
     })?;
@@ -1997,11 +2108,9 @@ fn run_local_notion_oauth(
         .set_nonblocking(true)
         .map_err(|error| CommandError::new("connect", "callback_failed", error.to_string()))?;
 
-    let state = random_state();
-    let authorize_url = notion_authorize_url(&config.client_id, &config.redirect_uri, &state);
     if !json {
-        println!("opening Notion authorization in your browser...");
-        println!("callback: {}", config.redirect_uri);
+        println!("opening {provider_name} authorization in your browser...");
+        println!("callback: {redirect_uri}");
         println!("authorization URL: {authorize_url}");
     }
     if !no_browser
@@ -2867,6 +2976,7 @@ fn takes_value(arg: &str) -> bool {
             | "--helper"
             | "--display-name"
             | "--redirect-uri"
+            | "--broker-url"
     )
 }
 
@@ -2942,7 +3052,7 @@ mod tests {
 
     use super::{
         EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration, diff_report_exit_code,
-        local_redirect, notion_authorize_url, parse_oauth_callback, projection_mode_for_target,
+        local_redirect, notion_authorize_url, notion_oauth_broker_config, parse_oauth_callback, projection_mode_for_target,
         projection_usage_options_for_target, validate_virtual_projection_registration,
     };
 
@@ -3156,6 +3266,25 @@ mod tests {
             url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8757%2Foauth%2Fnotion%2Fcallback")
         );
         assert!(url.contains("state=state%2Bvalue"));
+    }
+
+    #[test]
+    fn notion_oauth_broker_config_accepts_explicit_broker_url() {
+        let args = vec![
+            "notion".to_string(),
+            "--broker-url".to_string(),
+            "https://auth.example.test".to_string(),
+            "--redirect-uri".to_string(),
+            "http://localhost:8757/oauth/notion/callback".to_string(),
+        ];
+
+        let config = notion_oauth_broker_config(&args).expect("broker config");
+
+        assert_eq!(config.broker_url, "https://auth.example.test");
+        assert_eq!(
+            config.redirect_uri,
+            "http://localhost:8757/oauth/notion/callback"
+        );
     }
 
     fn report(ok: bool) -> DiffReport {

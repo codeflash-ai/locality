@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use afs_notion::NotionConfig;
 use afs_notion::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use afs_notion::oauth::{
-    HttpNotionOAuthClient, NotionOAuthCodeExchange, NotionOAuthToken, StoredNotionCredential,
+    HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerCodeExchange,
+    NotionOAuthCodeExchange, NotionOAuthToken, StoredNotionCredential,
 };
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
@@ -26,6 +27,17 @@ pub struct OAuthConnectOptions {
     pub connection_id: Option<ConnectionId>,
     pub client_id: String,
     pub client_secret: String,
+    pub code: String,
+    pub redirect_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrokerOAuthConnectOptions {
+    pub connection_id: Option<ConnectionId>,
+    pub broker_url: String,
+    pub client_id: String,
+    pub session: String,
+    pub state: String,
     pub code: String,
     pub redirect_uri: String,
 }
@@ -122,6 +134,13 @@ pub trait NotionOAuthExchange {
     ) -> Result<NotionOAuthToken, ConnectError>;
 }
 
+pub trait NotionOAuthBrokerExchange {
+    fn exchange_code(
+        &self,
+        request: &NotionOAuthBrokerCodeExchange,
+    ) -> Result<NotionOAuthToken, ConnectError>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HttpNotionConnectionProbe;
 
@@ -150,6 +169,16 @@ impl NotionOAuthExchange for HttpNotionOAuthClient {
         request: &NotionOAuthCodeExchange,
     ) -> Result<NotionOAuthToken, ConnectError> {
         HttpNotionOAuthClient::exchange_code(self, request)
+            .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))
+    }
+}
+
+impl NotionOAuthBrokerExchange for HttpNotionOAuthBrokerClient {
+    fn exchange_code(
+        &self,
+        request: &NotionOAuthBrokerCodeExchange,
+    ) -> Result<NotionOAuthToken, ConnectError> {
+        HttpNotionOAuthBrokerClient::exchange_code(self, request)
             .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))
     }
 }
@@ -243,6 +272,88 @@ where
         token.clone(),
         exchange_request.client_id,
         exchange_request.client_secret,
+        acquired_at,
+    );
+    let secret = serde_json::to_string(&stored)
+        .map_err(|error| ConnectError::CredentialEncode(error.to_string()))?;
+    credentials
+        .put(&secret_ref, &secret)
+        .map_err(ConnectError::Credential)?;
+
+    let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_NOTION_OAUTH_PROFILE_ID);
+    store
+        .save_connector_profile(default_notion_oauth_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+
+    let display_name = connection_id.0.clone();
+    let account_label = token
+        .workspace_name
+        .clone()
+        .or_else(|| token.workspace_id.clone())
+        .or_else(|| token.bot_id.clone());
+    let connection = ConnectionRecord {
+        connection_id: connection_id.clone(),
+        profile_id: Some(profile_id.clone()),
+        connector: "notion".to_string(),
+        display_name: display_name.clone(),
+        account_label: account_label.clone(),
+        workspace_id: token.workspace_id.clone(),
+        workspace_name: token.workspace_name.clone(),
+        auth_kind: "oauth".to_string(),
+        secret_ref,
+        scopes: vec![],
+        capabilities_json: "{}".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        expires_at: stored.expires_at.map(|expires_at| expires_at.to_string()),
+    };
+    store
+        .save_connection(connection)
+        .map_err(ConnectError::Store)?;
+
+    Ok(ConnectReport {
+        ok: true,
+        command: "connect",
+        connection_id: connection_id.0,
+        profile_id: profile_id.0,
+        connector: "notion".to_string(),
+        display_name,
+        account_label,
+        workspace_id: token.workspace_id,
+        workspace_name: token.workspace_name,
+        auth_kind: "oauth".to_string(),
+    })
+}
+
+pub fn run_connect_notion_broker_oauth<S, E>(
+    store: &mut S,
+    credentials: &dyn CredentialStore,
+    options: BrokerOAuthConnectOptions,
+    exchange: &E,
+) -> Result<ConnectReport, ConnectError>
+where
+    S: ConnectionRepository + ConnectorProfileRepository,
+    E: NotionOAuthBrokerExchange,
+{
+    let connection_id = match options.connection_id {
+        Some(connection_id) => connection_id,
+        None => default_connection_id(store)?,
+    };
+    let exchange_request = NotionOAuthBrokerCodeExchange {
+        session: options.session,
+        state: options.state,
+        code: options.code,
+        redirect_uri: options.redirect_uri,
+    };
+    let token = exchange.exchange_code(&exchange_request)?;
+    let acquired_at = timestamp_secs();
+    let secret_ref = format!("connection:{}", connection_id.0);
+    let stored = StoredNotionCredential::from_broker_oauth_token(
+        token.clone(),
+        options.client_id,
+        options.broker_url,
         acquired_at,
     );
     let secret = serde_json::to_string(&stored)

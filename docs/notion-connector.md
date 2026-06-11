@@ -35,14 +35,24 @@ The generic connector `render` method still returns only `CanonicalDocument`. Th
 The product connection path prefers OAuth:
 
 ```sh
-export AFS_NOTION_OAUTH_CLIENT_ID='...'
-export AFS_NOTION_OAUTH_CLIENT_SECRET='...'
 afs connect notion --name work
 ```
 
+The default product path uses the AFS OAuth broker so the local CLI never ships
+or stores the Notion OAuth client secret. The broker URL can be overridden with
+`--broker-url <url>`, `AFS_NOTION_OAUTH_BROKER_URL`, or `AFS_AUTH_BROKER_URL`.
 The Notion public integration must register the callback URI, which defaults to
-`http://localhost:8757/oauth/notion/callback`. For development and CI, the
-explicit PAT fallback remains available:
+`http://localhost:8757/oauth/notion/callback`.
+
+For development with a BYO Notion OAuth app, use direct OAuth:
+
+```sh
+export AFS_NOTION_OAUTH_CLIENT_ID='...'
+export AFS_NOTION_OAUTH_CLIENT_SECRET='...'
+afs connect notion --direct-oauth --name work
+```
+
+For development and CI, the explicit PAT fallback remains available:
 
 ```sh
 echo "$NOTION_TOKEN" | afs connect notion --token-stdin --name work
