@@ -321,23 +321,22 @@ where
         return Ok(true);
     }
 
-    if entity.hydration != HydrationState::Hydrated {
-        return Ok(false);
-    }
-
     let contents = std::fs::read_to_string(path).map_err(|error| PullError::ReadFile {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-    let parsed = parse_canonical_markdown(&contents).map_err(|error| PullError::ReadFile {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
-    let shadow = store
-        .load_shadow(&mount.mount_id, &entity.remote_id)
-        .map_err(PullError::Store)?;
+    let parsed = match parse_canonical_markdown(&contents) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(false),
+    };
+    let shadow = match store.load_shadow(&mount.mount_id, &entity.remote_id) {
+        Ok(shadow) => shadow,
+        Err(StoreError::ShadowMissing { .. }) => return Ok(false),
+        Err(error) => return Err(PullError::Store(error)),
+    };
 
-    Ok(parsed.document.body == shadow.rendered_body)
+    Ok(parsed.document.frontmatter == shadow.frontmatter
+        && parsed.document.body == shadow.rendered_body)
 }
 
 fn is_stub_file(path: &Path) -> Result<bool, PullError> {
@@ -506,6 +505,146 @@ impl PullError {
             Self::WriteFile { path, message } => {
                 format!("failed to write `{}`: {message}", path.display())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use afs_core::canonical::render_canonical_markdown;
+    use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+    use afs_core::shadow::{ShadowDocument, stable_hash};
+    use afs_store::{EntityRecord, EntityRepository, InMemoryStateStore, ShadowRepository};
+
+    use super::{can_replace_file, write_atomic};
+    use afs_store::MountConfig;
+
+    #[test]
+    fn can_replace_stale_dirty_file_when_projection_matches_shadow() {
+        let fixture = PullFixture::new();
+        let store = fixture.store_with_shadow(
+            HydrationState::Dirty,
+            fixture.document("Roadmap", "# Roadmap\n\nOriginal body.\n"),
+        );
+
+        assert!(
+            can_replace_file(
+                &store,
+                &fixture.mount,
+                &fixture.entity(HydrationState::Dirty),
+                &fixture.page_path,
+            )
+            .expect("check replace")
+        );
+    }
+
+    #[test]
+    fn can_replace_rejects_frontmatter_only_edits() {
+        let fixture = PullFixture::new();
+        let store = fixture.store_with_shadow(
+            HydrationState::Hydrated,
+            fixture.document("Roadmap", "# Roadmap\n\nOriginal body.\n"),
+        );
+        write_atomic(
+            &fixture.page_path,
+            render_canonical_markdown(
+                &fixture.document("Updated Roadmap", "# Roadmap\n\nOriginal body.\n"),
+            ),
+        )
+        .expect("write edited projection");
+
+        assert!(
+            !can_replace_file(
+                &store,
+                &fixture.mount,
+                &fixture.entity(HydrationState::Hydrated),
+                &fixture.page_path,
+            )
+            .expect("check replace")
+        );
+    }
+
+    struct PullFixture {
+        mount: MountConfig,
+        mount_id: MountId,
+        remote_id: RemoteId,
+        page_path: PathBuf,
+        root: PathBuf,
+    }
+
+    impl PullFixture {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("afs-pull-check-{}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("fixture root");
+            let mount_id = MountId::new("notion-main");
+            let page_path = root.join("Roadmap.md");
+
+            Self {
+                mount: MountConfig::new(mount_id.clone(), "notion", root.clone()),
+                mount_id,
+                remote_id: RemoteId::new("page-1"),
+                page_path,
+                root,
+            }
+        }
+
+        fn entity(&self, hydration: HydrationState) -> EntityRecord {
+            EntityRecord::new(
+                self.mount_id.clone(),
+                self.remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(hydration)
+        }
+
+        fn document(&self, title: &str, body: &str) -> CanonicalDocument {
+            CanonicalDocument::new(
+                format!(
+                    "afs:\n  id: {}\n  type: page\ntitle: {title}\n",
+                    self.remote_id.0
+                ),
+                body.to_string(),
+            )
+        }
+
+        fn store_with_shadow(
+            &self,
+            hydration: HydrationState,
+            document: CanonicalDocument,
+        ) -> InMemoryStateStore {
+            let mut store = InMemoryStateStore::new();
+            let shadow = ShadowDocument {
+                entity_id: self.remote_id.clone(),
+                frontmatter: document.frontmatter.clone(),
+                body_hash: stable_hash(&document.body),
+                rendered_body: document.body.clone(),
+                blocks: Vec::new(),
+            };
+
+            store
+                .save_shadow(&self.mount_id, shadow)
+                .expect("save shadow");
+            write_atomic(&self.page_path, render_canonical_markdown(&document))
+                .expect("write projection");
+            store
+                .save_entity(self.entity(hydration))
+                .expect("save entity");
+
+            store
+        }
+    }
+
+    impl Drop for PullFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 }

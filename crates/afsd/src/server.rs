@@ -55,6 +55,7 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
     let mounts = load_mounts(config)?;
     print_startup_banner(&socket_path, &mounts);
 
+    println!("afsd is running (socket: {})", socket_path.display());
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {

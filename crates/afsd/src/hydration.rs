@@ -133,20 +133,18 @@ where
             return Ok(true);
         }
 
-        if entity.hydration != HydrationState::Hydrated {
-            return Ok(false);
-        }
-
         let contents = read_to_string(path)?;
         let Ok(parsed) = parse_canonical_markdown(&contents) else {
             return Ok(false);
         };
-        let shadow = self
-            .store
-            .load_shadow(&mount.mount_id, &entity.remote_id)
-            .map_err(AfsError::from)?;
+        let shadow = match self.store.load_shadow(&mount.mount_id, &entity.remote_id) {
+            Ok(shadow) => shadow,
+            Err(StoreError::ShadowMissing { .. }) => return Ok(false),
+            Err(error) => return Err(AfsError::from(error)),
+        };
 
-        Ok(parsed.document.body == shadow.rendered_body)
+        Ok(parsed.document.frontmatter == shadow.frontmatter
+            && parsed.document.body == shadow.rendered_body)
     }
 
     fn mark_dirty_if_allowed(&mut self, mut entity: EntityRecord) -> AfsResult<()> {
