@@ -46,7 +46,6 @@ impl SqliteStateStore {
             "
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
-            PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             ",
         )?;
@@ -423,6 +422,9 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             found: user_version,
             supported: SCHEMA_VERSION,
         });
+    }
+    if user_version == SCHEMA_VERSION {
+        return Ok(());
     }
 
     connection.execute_batch(

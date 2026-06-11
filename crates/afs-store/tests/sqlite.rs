@@ -111,6 +111,35 @@ fn mount_entity_and_shadow_round_trip_after_reopen() {
 }
 
 #[test]
+fn existing_schema_reads_do_not_need_write_lock() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    let mount = fixture.mount_config();
+    store.save_mount(mount.clone()).expect("save mount");
+    drop(store);
+
+    let writer = Connection::open(fixture.state_root.join("state.sqlite3")).expect("raw writer");
+    writer
+        .execute_batch(
+            "
+            PRAGMA busy_timeout = 50;
+            PRAGMA journal_mode = WAL;
+            BEGIN IMMEDIATE;
+            ",
+        )
+        .expect("hold writer transaction");
+
+    let reader = SqliteStateStore::open(fixture.state_root.clone()).expect("open reader");
+    let mounts = reader
+        .load_mounts()
+        .expect("load mounts while writer active");
+
+    assert_eq!(mounts, vec![mount]);
+
+    writer.execute_batch("ROLLBACK").expect("rollback writer");
+}
+
+#[test]
 fn duplicate_entity_path_is_rejected() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();
