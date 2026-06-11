@@ -152,8 +152,10 @@ where
 
     if std::env::var(DEFAULT_NOTION_TOKEN_ENV).is_ok() {
         warn_env_fallback_once();
-        let mut config = NotionConfig::default();
-        config.root_page_id = mount.remote_root_id.clone();
+        let config = NotionConfig {
+            root_page_id: mount.remote_root_id.clone(),
+            ..Default::default()
+        };
         return Ok(NotionConnector::new(config));
     }
 

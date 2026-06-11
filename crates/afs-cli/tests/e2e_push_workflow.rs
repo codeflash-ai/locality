@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::diff::run_diff;
@@ -17,7 +17,7 @@ use afs_notion::dto::{
     RichTextBlockDto, RichTextDto, SyncedBlockDto, SyncedFromDto, TextRichTextDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
-use afs_store::{ConnectionId, InMemoryStateStore};
+use afs_store::{ConnectionId, InMemoryStateStore, ProjectionMode};
 use serde_json::Value;
 
 #[test]
@@ -36,6 +36,7 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
             remote_root_id: Some(RemoteId::new("page-1")),
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
+            projection: ProjectionMode::PlainFiles,
         },
     )
     .expect("mount");
@@ -86,8 +87,16 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
     assert_eq!(status.summary.dirty, 0);
 
     let calls = api.calls.lock().expect("calls");
-    assert!(calls.iter().any(|call| matches!(call, WriteCall::Append { .. })));
-    assert!(calls.iter().any(|call| matches!(call, WriteCall::Move { .. })));
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, WriteCall::Append { .. }))
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, WriteCall::Move { .. }))
+    );
 }
 
 #[test]
@@ -108,6 +117,7 @@ fn live_mid_page_insert_push_reconciles() {
             remote_root_id: Some(RemoteId::new(page_id)),
             connection_id: None,
             read_only: false,
+            projection: ProjectionMode::PlainFiles,
         },
     )
     .expect("mount");
@@ -413,5 +423,7 @@ fn insert_after_frontmatter(document: &str, insertion: &str) -> String {
 }
 
 fn file_name(path: &Path) -> &str {
-    path.file_name().and_then(|name| name.to_str()).unwrap_or("")
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
 }

@@ -185,11 +185,11 @@ impl CredentialStore for KeychainCredentialStore {
     }
 
     fn delete(&self, secret_ref: &str) -> CredentialResult<()> {
-        let status = std::process::Command::new("security")
+        let _ = std::process::Command::new("security")
             .args(["delete-generic-password", "-a", secret_ref, "-s", "afs"])
             .status()
             .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
-        if status.success() { Ok(()) } else { Ok(()) }
+        Ok(())
     }
 }
 

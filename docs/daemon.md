@@ -65,6 +65,49 @@ therefore does not block the daemon from accepting other requests or responding
 to pings, and two pull/push/hydration mutations cannot advance durable state at
 the same time.
 
+## Operator Guide
+
+Start the daemon in the foreground:
+
+```bash
+afsd
+```
+
+On startup it prints the socket path, watched mounts, and auth source:
+
+```text
+afsd listening on /Users/alice/.afs/afsd.sock
+afsd watching 1 mount: /Users/alice/afs/notion
+afsd auth: connection notion-work
+```
+
+Check health from the CLI:
+
+```bash
+afs daemon status
+```
+
+Successful output:
+
+```text
+daemon running  socket=/Users/alice/.afs/afsd.sock  ping=ok
+```
+
+Stopped output:
+
+```text
+daemon stopped  socket=/Users/alice/.afs/afsd.sock
+  hint: run `afsd` in another terminal
+```
+
+`afs pull` and `afs push` try the daemon first. Human success output includes `(via daemon)` or `(via cli)`, and JSON reports include `via`. If the socket is unavailable, the CLI falls back to direct execution and prints:
+
+```text
+afsd not running; executing pull directly (start afsd for background hydration)
+```
+
+Set `AFS_DAEMON_DISABLE=1` to force direct execution without the fallback warning.
+
 ## Runtime Loop
 
 `DaemonRuntime` is the foreground daemon's control plane. It owns the scheduler
