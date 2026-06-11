@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 pub struct PullReport {
     pub ok: bool,
     pub command: String,
+    pub via: String,
     pub mount_id: String,
     pub root: String,
     pub target: String,
@@ -110,6 +111,7 @@ where
     Ok(PullReport {
         ok: skipped_dirty == 0,
         command: "pull".to_string(),
+        via: "cli".to_string(),
         mount_id: mount.mount_id.0.clone(),
         root: mount.root.display().to_string(),
         target: target_path.display().to_string(),
@@ -149,6 +151,7 @@ where
     Ok(PullReport {
         ok: skipped_dirty == 0,
         command: "pull".to_string(),
+        via: "cli".to_string(),
         mount_id: mount.mount_id.0.clone(),
         root: mount.root.display().to_string(),
         target: target_path.display().to_string(),

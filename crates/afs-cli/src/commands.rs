@@ -1,17 +1,30 @@
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use afs_connector::ConnectorUndoApplier;
 use afs_core::AfsError;
+use afs_core::journal::PushId;
 use afs_core::model::{MountId, RemoteId};
-use afs_notion::{NotionConfig, NotionConnector};
-use afs_store::{MountConfig, MountRepository, ProjectionMode, SqliteStateStore};
+use afs_store::{
+    ConnectionId, ConnectionRepository, JournalRepository, MountConfig, MountRepository,
+    ProjectionMode, SqliteStateStore, open_credential_store,
+};
 use afsd::execution::PushJobReport;
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::connect::{
+    ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport, ConnectionsReport,
+    DisconnectReport, HttpNotionConnectionProbe, run_connect_notion, run_connection_show,
+    run_connections, run_disconnect,
+};
+use crate::connector::{
+    ConnectorResolveError, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
+};
+use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff};
 use crate::history::{
     HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
@@ -21,6 +34,7 @@ use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
 use crate::pull::{PullError, PullReport, run_pull};
 use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
+use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::status::{StatusError, StatusOptions, StatusReport, run_status};
 
 const EXIT_SUCCESS: i32 = 0;
@@ -30,6 +44,10 @@ const EXIT_VALIDATION: i32 = 3;
 
 const COMMANDS: &[&str] = &[
     "connect",
+    "connections",
+    "connection",
+    "disconnect",
+    "daemon",
     "mount",
     "info",
     "status",
@@ -39,6 +57,7 @@ const COMMANDS: &[&str] = &[
     "undo",
     "log",
     "resolve",
+    "restore",
     "config",
     "file-provider",
 ];
@@ -51,13 +70,18 @@ pub fn dispatch(args: &[String]) -> i32 {
 
     let json = has_flag(args, "--json");
     match args[0].as_str() {
-        "connect" => stub("connect", json),
+        "connect" => connect(&args[1..], json),
+        "connections" => connections(&args[1..], json),
+        "connection" => connection(&args[1..], json),
+        "disconnect" => disconnect(&args[1..], json),
+        "daemon" => daemon(&args[1..], json),
         "mount" => mount(&args[1..], json),
         "info" => info(&args[1..], json),
         "status" => status(&args[1..], json),
         "pull" => pull(&args[1..], json),
         "push" => push(&args[1..], json),
         "diff" => diff(&args[1..], json),
+        "restore" => restore(&args[1..], json),
         "undo" => undo(&args[1..], json),
         "log" => log(&args[1..], json),
         "resolve" => stub("resolve", json),
@@ -68,6 +92,197 @@ pub fn dispatch(args: &[String]) -> i32 {
             print_help();
             EXIT_USAGE
         }
+    }
+}
+
+fn daemon(args: &[String], json: bool) -> i32 {
+    match run_daemon_control(args) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_daemon_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => daemon_command_error(json, error),
+    }
+}
+
+fn connect(args: &[String], json: bool) -> i32 {
+    if first_positional(args) != Some("notion") {
+        return command_error(
+            json,
+            CommandError::new(
+                "connect",
+                "usage",
+                "usage: afs connect notion [--name <id>] [--token-stdin] [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    }
+
+    let token = match read_connect_token(args, json) {
+        Ok(token) => token,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    if token.is_empty() {
+        return command_error(
+            json,
+            CommandError::new("connect", "auth_required", "empty Notion token")
+                .with_suggested_command("afs connect notion --token-stdin"),
+            EXIT_INTERNAL,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let options = ConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        token,
+    };
+    let probe = HttpNotionConnectionProbe;
+
+    match run_connect_notion(&mut store, credentials.as_ref(), options, &probe) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connections(args: &[String], json: bool) -> i32 {
+    if first_positional(args).is_some() {
+        return command_error(
+            json,
+            CommandError::new("connections", "usage", "usage: afs connections [--json]"),
+            EXIT_USAGE,
+        );
+    }
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connections", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    match run_connections(&store) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connections_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connections", json, error),
+    }
+}
+
+fn connection(args: &[String], json: bool) -> i32 {
+    if first_positional(args) != Some("show") {
+        return command_error(
+            json,
+            CommandError::new(
+                "connection",
+                "usage",
+                "usage: afs connection show <id> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    }
+    let Some(connection_id) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "connection",
+                "usage",
+                "usage: afs connection show <id> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connection", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    match run_connection_show(&store, ConnectionId::new(connection_id)) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connection_show_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connection", json, error),
+    }
+}
+
+fn disconnect(args: &[String], json: bool) -> i32 {
+    let Some(connection_id) = first_positional(args) else {
+        return command_error(
+            json,
+            CommandError::new("disconnect", "usage", "usage: afs disconnect <id> [--json]"),
+            EXIT_USAGE,
+        );
+    };
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("disconnect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+
+    match run_disconnect(
+        &mut store,
+        credentials.as_ref(),
+        ConnectionId::new(connection_id),
+    ) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_disconnect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("disconnect", json, error),
     }
 }
 
@@ -193,6 +408,46 @@ fn file_provider_unregister(args: &[String], json: bool) -> i32 {
     )
 }
 
+fn restore(args: &[String], json: bool) -> i32 {
+    let Some(path) = first_positional(args) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "restore",
+                "usage",
+                "usage: afs restore <path> [--force] [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let mut store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("restore", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = RestoreOptions {
+        force: has_flag(args, "--force"),
+    };
+
+    match run_restore(&mut store, PathBuf::from(path), options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_restore_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => restore_command_error(json, error),
+    }
+}
+
 fn mount(args: &[String], json: bool) -> i32 {
     if first_positional(args) != Some("notion") {
         return command_error(
@@ -200,7 +455,7 @@ fn mount(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "mount",
                 "usage",
-                "usage: afs mount notion <path> --root-page <page-id> [--mount-id <id>] [--projection plain-files|macos-file-provider] [--read-only] [--json]",
+                "usage: afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider] [--read-only] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -212,7 +467,7 @@ fn mount(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "mount",
                 "usage",
-                "usage: afs mount notion <path> --root-page <page-id> [--mount-id <id>] [--projection plain-files|macos-file-provider] [--read-only] [--json]",
+                "usage: afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider] [--read-only] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -250,6 +505,10 @@ fn mount(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let connection_id = match resolve_mount_connection(&store, args) {
+        Ok(connection_id) => connection_id,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
 
     let options = MountOptions {
         mount_id: MountId::new(
@@ -260,6 +519,7 @@ fn mount(args: &[String], json: bool) -> i32 {
         connector: "notion".to_string(),
         root: PathBuf::from(root),
         remote_root_id: Some(RemoteId::new(root_page_id)),
+        connection_id,
         read_only: has_flag(args, "--read-only"),
         projection,
     };
@@ -303,7 +563,7 @@ fn pull(args: &[String], json: bool) -> i32 {
             print_pull_report(&report);
             return exit_code;
         }
-        DaemonReport::Unavailable => {}
+        DaemonReport::Unavailable => warn_daemon_fallback("pull"),
         DaemonReport::Error(error) => {
             return command_error(
                 json,
@@ -313,7 +573,7 @@ fn pull(args: &[String], json: bool) -> i32 {
         }
     }
 
-    let mut store = match SqliteStateStore::open(state_root) {
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -323,7 +583,11 @@ fn pull(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let connector = default_notion_connector();
+    let credentials = open_credential_store(&state_root);
+    let connector = match resolve_notion_connector_for_path(&store, credentials.as_ref(), path) {
+        Ok(connector) => connector,
+        Err(error) => return connector_command_error("pull", json, error),
+    };
 
     match run_pull(&mut store, &connector, PathBuf::from(path)) {
         Ok(report) if json => {
@@ -446,7 +710,37 @@ fn undo(args: &[String], json: bool) -> i32 {
         }
     };
 
-    let connector = default_notion_connector();
+    let journal = match store.get_journal(&PushId(push_id.to_string())) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "undo",
+                    "journal_not_found",
+                    format!("journal entry `{push_id}` was not found"),
+                ),
+                EXIT_USAGE,
+            );
+        }
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("undo", "store_error", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let state_root = default_state_root();
+    let credentials = open_credential_store(&state_root);
+    let connector = match resolve_notion_connector_for_mount_id(
+        &store,
+        credentials.as_ref(),
+        &journal.mount_id,
+    ) {
+        Ok(connector) => connector,
+        Err(error) => return connector_command_error("undo", json, error),
+    };
     let mut undo_applier = ConnectorUndoApplier::new(&connector);
 
     match run_undo_with_applier(&mut store, push_id, &mut undo_applier) {
@@ -503,7 +797,7 @@ fn push(args: &[String], json: bool) -> i32 {
             print_push_report(&report);
             return exit_code;
         }
-        DaemonReport::Unavailable => {}
+        DaemonReport::Unavailable => warn_daemon_fallback("push"),
         DaemonReport::Error(error) => {
             return command_error(
                 json,
@@ -513,7 +807,7 @@ fn push(args: &[String], json: bool) -> i32 {
         }
     }
 
-    let mut store = match SqliteStateStore::open(state_root) {
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -524,7 +818,11 @@ fn push(args: &[String], json: bool) -> i32 {
         }
     };
 
-    let connector = default_notion_connector();
+    let credentials = open_credential_store(&state_root);
+    let connector = match resolve_notion_connector_for_path(&store, credentials.as_ref(), path) {
+        Ok(connector) => connector,
+        Err(error) => return connector_command_error("push", json, error),
+    };
 
     match run_push_with_daemon(&mut store, &connector, PathBuf::from(path), options) {
         Ok(report) if json => {
@@ -638,8 +936,9 @@ fn print_push_report(report: &PushReport) {
     match report.action.as_str() {
         "noop" => println!("nothing to push"),
         "reconciled" => println!(
-            "push {} reconciled",
-            report.push_id.as_deref().unwrap_or("<unknown>")
+            "push {} reconciled (via {})",
+            report.push_id.as_deref().unwrap_or("<unknown>"),
+            report.via
         ),
         "fix_validation" => print_diff_report_fields(&report.validation, report.plan.as_ref()),
         "confirm_plan" => println!("push requires confirmation; rerun with -y or --yes"),
@@ -654,6 +953,27 @@ fn print_push_report(report: &PushReport) {
                     .unwrap_or("connector apply is not implemented yet")
             );
         }
+        "unsupported_operations" => {
+            println!(
+                "{}",
+                report
+                    .message
+                    .as_deref()
+                    .unwrap_or("connector cannot apply one or more planned operations")
+            );
+            if let Some(suggested_fix) = &report.suggested_fix {
+                println!("  suggested_fix: {suggested_fix}");
+            }
+        }
+        "apply_failed" => {
+            println!(
+                "{}",
+                report
+                    .message
+                    .as_deref()
+                    .unwrap_or("connector apply failed")
+            );
+        }
         _ => println!("push stopped: {}", report.action),
     }
 }
@@ -663,6 +983,9 @@ fn print_mount_report(report: &MountReport) {
         "mounted {} at {} ({})",
         report.mount_id, report.root, report.connector
     );
+    if let Some(connection_id) = &report.connection_id {
+        println!("connection: {connection_id}");
+    }
     println!(
         "agent guidance: {} {}, {} {}",
         report.guidance.agents_md.action.as_str(),
@@ -672,18 +995,71 @@ fn print_mount_report(report: &MountReport) {
     );
 }
 
+fn print_connect_report(report: &ConnectReport) {
+    let account = report
+        .account_label
+        .as_deref()
+        .or(report.workspace_name.as_deref())
+        .unwrap_or("Notion");
+    println!(
+        "connected notion as \"{}\" (connection: {})",
+        account, report.connection_id
+    );
+}
+
+fn print_connections_report(report: &ConnectionsReport) {
+    if report.connections.is_empty() {
+        println!("no connections");
+        return;
+    }
+
+    for connection in &report.connections {
+        let label = connection
+            .account_label
+            .as_deref()
+            .or(connection.workspace_name.as_deref())
+            .unwrap_or("-");
+        println!(
+            "{}  {}  {}  {}",
+            connection.connection_id, connection.connector, connection.status, label
+        );
+    }
+}
+
+fn print_connection_show_report(report: &ConnectionShowReport) {
+    let connection = &report.connection;
+    println!("connection: {}", connection.connection_id);
+    println!("  connector: {}", connection.connector);
+    println!("  status: {}", connection.status);
+    println!("  auth_kind: {}", connection.auth_kind);
+    if let Some(account_label) = &connection.account_label {
+        println!("  account: {account_label}");
+    }
+    if let Some(workspace_name) = &connection.workspace_name {
+        println!("  workspace: {workspace_name}");
+    }
+}
+
+fn print_disconnect_report(report: &DisconnectReport) {
+    println!("disconnected {} ({})", report.connection_id, report.status);
+}
+
 fn print_pull_report(report: &PullReport) {
     if report.skipped_dirty > 0 {
         println!(
-            "pull skipped {} dirty file(s); {} hydrated, {} stubbed, {} enumerated",
-            report.skipped_dirty, report.hydrated, report.stubbed, report.enumerated
+            "pull skipped {} dirty file(s); {} hydrated, {} stubbed, {} enumerated (via {})",
+            report.skipped_dirty, report.hydrated, report.stubbed, report.enumerated, report.via
         );
     } else {
         println!(
-            "pull complete: {} hydrated, {} stubbed, {} enumerated",
-            report.hydrated, report.stubbed, report.enumerated
+            "pull complete: {} hydrated, {} stubbed, {} enumerated (via {})",
+            report.hydrated, report.stubbed, report.enumerated, report.via
         );
     }
+}
+
+fn print_restore_report(report: &RestoreReport) {
+    println!("restored {}", report.path);
 }
 
 fn print_status_report(report: &StatusReport) {
@@ -695,20 +1071,27 @@ fn print_status_report(report: &StatusReport) {
     let mut printed_entries = 0;
     for mount in &report.mounts {
         for entry in &mount.entries {
-            let line_state = if entry.failed_journal_count > 0 {
-                "failed_journal"
-            } else if entry.pending_journal_count > 0 {
-                "pending_journal"
-            } else {
-                entry.state.as_str()
-            };
-
-            if line_state == "clean" {
+            if entry.state.as_str() == "clean"
+                && entry.pending_journal_count == 0
+                && entry.failed_journal_count == 0
+            {
                 continue;
             }
 
             printed_entries += 1;
-            println!("{line_state} {} {}", mount.mount_id, entry.path);
+            println!("{}  {}", mount.mount_id, entry.path);
+            println!(
+                "  state: {}  hydration: {}",
+                entry.state.as_str(),
+                entry.hydration
+            );
+            for issue in &entry.issues {
+                if issue.code == "last_failure" {
+                    println!("  last_failure: {}", issue.message);
+                } else {
+                    println!("  issue: {} - {}", issue.code, issue.message);
+                }
+            }
         }
     }
 
@@ -793,6 +1176,17 @@ fn print_info_report(report: &InfoReport) {
 
     if !report.suggestions.is_empty() {
         println!("Next: {}", report.suggestions.join("; "));
+    }
+}
+
+fn print_daemon_report(report: &DaemonControlReport) {
+    println!("{}", report.message);
+    println!("  state: {}", report.state.as_str());
+    println!("  manager: {}", report.manager.as_str());
+    println!("  state root: {}", report.state_root);
+    println!("  socket: {}", report.socket);
+    if let Some(log) = &report.stderr_log {
+        println!("  log: {log}");
     }
 }
 
@@ -988,10 +1382,6 @@ fn file_provider_helper_path() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.exists())
 }
 
-fn default_notion_connector() -> NotionConnector {
-    NotionConnector::new(NotionConfig::default())
-}
-
 fn stub(command: &str, json: bool) -> i32 {
     if json {
         println!("{{\"ok\":false,\"command\":\"{command}\",\"error\":\"not_implemented\"}}");
@@ -1035,6 +1425,83 @@ fn print_diff_report_fields(
         plan.summary.blocks_moved,
         plan.summary.blocks_archived
     );
+}
+
+fn read_connect_token(args: &[String], json: bool) -> Result<String, CommandError> {
+    let mut token = String::new();
+    if has_flag(args, "--token-stdin") {
+        io::stdin().read_to_string(&mut token).map_err(|error| {
+            CommandError::new("connect", "stdin_read_failed", error.to_string())
+        })?;
+    } else {
+        if !json {
+            eprint!("Paste Notion token: ");
+        }
+        io::stdin().read_line(&mut token).map_err(|error| {
+            CommandError::new("connect", "stdin_read_failed", error.to_string())
+        })?;
+    }
+
+    Ok(token.trim().to_string())
+}
+
+fn warn_daemon_fallback(command: &str) {
+    if std::env::var("AFS_DAEMON_DISABLE").is_err() {
+        eprintln!(
+            "afsd not running; executing {command} directly (start afsd for background hydration)"
+        );
+    }
+}
+
+fn resolve_mount_connection(
+    store: &SqliteStateStore,
+    args: &[String],
+) -> Result<Option<ConnectionId>, CommandError> {
+    if let Some(connection_id) = flag_value(args, "--connection") {
+        let connection_id = ConnectionId::new(connection_id);
+        let connection = store
+            .get_connection(&connection_id)
+            .map_err(|error| CommandError::new("mount", "store_error", error.to_string()))?
+            .ok_or_else(|| {
+                CommandError::new(
+                    "mount",
+                    "missing_connection",
+                    format!("connection `{}` was not found", connection_id.0),
+                )
+                .with_suggested_command("afs connect notion")
+            })?;
+        if connection.status != "active" {
+            return Err(CommandError::new(
+                "mount",
+                "connection_revoked",
+                format!("connection `{}` is revoked", connection.connection_id.0),
+            )
+            .with_suggested_command("afs connect notion"));
+        }
+        return Ok(Some(connection.connection_id));
+    }
+
+    let active = store
+        .list_connections()
+        .map_err(|error| CommandError::new("mount", "store_error", error.to_string()))?
+        .into_iter()
+        .filter(|connection| connection.connector == "notion" && connection.status == "active")
+        .collect::<Vec<_>>();
+    match active.as_slice() {
+        [connection] => Ok(Some(connection.connection_id.clone())),
+        [] if std::env::var("NOTION_TOKEN").is_ok() => Ok(None),
+        [] => Err(CommandError::new(
+            "mount",
+            "missing_connection",
+            "missing Notion connection; run `afs connect notion`",
+        )
+        .with_suggested_command("afs connect notion")),
+        _ => Err(CommandError::new(
+            "mount",
+            "missing_connection",
+            "multiple Notion connections exist; pass --connection <id>",
+        )),
+    }
 }
 
 enum DaemonReport<T> {
@@ -1101,6 +1568,10 @@ fn daemon_error_exit_code(code: &str) -> i32 {
         "mount_not_found" | "entity_path_missing" => EXIT_USAGE,
         "validation_failed" => EXIT_VALIDATION,
         "not_implemented" => 5,
+        "missing_connection"
+        | "auth_required"
+        | "connection_revoked"
+        | "credential_store_unavailable" => EXIT_INTERNAL,
         _ => EXIT_INTERNAL,
     }
 }
@@ -1110,9 +1581,43 @@ fn command_error(json: bool, error: CommandError, exit_code: i32) -> i32 {
         print_json(&error);
     } else {
         eprintln!("afs {}: {}", error.command, error.message);
+        if let Some(suggested_command) = &error.suggested_command {
+            eprintln!("hint: {suggested_command}");
+        }
     }
 
     exit_code
+}
+
+fn connect_command_error(command: &'static str, json: bool, error: ConnectError) -> i32 {
+    let exit_code = match &error {
+        ConnectError::ConnectionNameRequired => EXIT_USAGE,
+        ConnectError::ConnectionProbeFailed(_)
+        | ConnectError::Credential(_)
+        | ConnectError::Store(_) => EXIT_INTERNAL,
+        ConnectError::ConnectionMissing(_) => EXIT_INTERNAL,
+    };
+    let mut payload = CommandError::new(command, error.code(), error.message());
+    if let Some(suggested_command) = error.suggested_command() {
+        payload = payload.with_suggested_command(suggested_command);
+    }
+    command_error(json, payload, exit_code)
+}
+
+fn connector_command_error(command: &'static str, json: bool, error: ConnectorResolveError) -> i32 {
+    let exit_code = match error.code() {
+        "mount_not_found" => EXIT_USAGE,
+        "missing_connection"
+        | "auth_required"
+        | "connection_revoked"
+        | "credential_store_unavailable" => EXIT_INTERNAL,
+        _ => EXIT_INTERNAL,
+    };
+    let mut payload = CommandError::new(command, error.code(), error.message());
+    if let Some(suggested_command) = error.suggested_command() {
+        payload = payload.with_suggested_command(suggested_command);
+    }
+    command_error(json, payload, exit_code)
 }
 
 fn history_command_error(command: &'static str, json: bool, error: HistoryError) -> i32 {
@@ -1120,6 +1625,18 @@ fn history_command_error(command: &'static str, json: bool, error: HistoryError)
     command_error(
         json,
         CommandError::new(command, error.code(), error.message()),
+        exit_code,
+    )
+}
+
+fn daemon_command_error(json: bool, error: DaemonControlError) -> i32 {
+    let exit_code = match error.code() {
+        "usage" => EXIT_USAGE,
+        _ => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("daemon", error.code(), error.message()),
         exit_code,
     )
 }
@@ -1165,6 +1682,23 @@ fn status_command_error(json: bool, error: StatusError, state_root: PathBuf) -> 
     command_error(
         json,
         CommandError::new("status", error.code(), message),
+        exit_code,
+    )
+}
+
+fn restore_command_error(json: bool, error: RestoreError) -> i32 {
+    let exit_code = match &error {
+        RestoreError::MountNotFound(_)
+        | RestoreError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
+        RestoreError::ConflictedRequiresForce(_) => 4,
+        RestoreError::CurrentDir(_)
+        | RestoreError::Store(_)
+        | RestoreError::UnsupportedEntity(_)
+        | RestoreError::WriteFile { .. } => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("restore", error.code(), error.message()),
         exit_code,
     )
 }
@@ -1309,7 +1843,13 @@ fn projection_mode(args: &[String]) -> Result<ProjectionMode, &'static str> {
 fn takes_value(arg: &str) -> bool {
     matches!(
         arg,
-        "--root-page" | "--mount-id" | "--projection" | "--helper" | "--display-name"
+        "--root-page"
+            | "--mount-id"
+            | "--connection"
+            | "--name"
+            | "--projection"
+            | "--helper"
+            | "--display-name"
     )
 }
 
@@ -1335,6 +1875,8 @@ struct CommandError {
     command: &'static str,
     code: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_command: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1354,7 +1896,13 @@ impl CommandError {
             command,
             code: code.into(),
             message: message.into(),
+            suggested_command: None,
         }
+    }
+
+    fn with_suggested_command(mut self, suggested_command: impl Into<String>) -> Self {
+        self.suggested_command = Some(suggested_command.into());
+        self
     }
 }
 
@@ -1418,6 +1966,9 @@ mod tests {
                 reasons: Vec::new(),
             },
             action: if ok { "noop" } else { "fix_validation" }.to_string(),
+            unsupported: Vec::new(),
+            message: None,
+            suggested_fix: None,
             completed_stages: Vec::new(),
         }
     }
@@ -1426,6 +1977,7 @@ mod tests {
         PushReport {
             ok: action == "noop",
             command: "push",
+            via: "cli".to_string(),
             path: "Roadmap.md".to_string(),
             mount_id: "notion-main".to_string(),
             entity_id: "page-1".to_string(),
@@ -1444,6 +1996,8 @@ mod tests {
             apply_effect_count: 0,
             completed_stages: Vec::new(),
             message: None,
+            unsupported: Vec::new(),
+            suggested_fix: None,
         }
     }
 }

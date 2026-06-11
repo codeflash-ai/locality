@@ -55,6 +55,7 @@ pub fn apply_plan(
     let create_parent_ids = create_parent_ids(&request.plan.operations);
     let bundles = fetch_affected_bundles(api, &request.plan.affected_entities, &create_parent_ids)?;
     let current_blocks = block_map(&bundles);
+    let block_parent_pages = block_parent_page_map(&bundles);
     let mut changed_remote_ids = Vec::new();
     let mut effects = Vec::new();
     let mut append_chains: BTreeMap<(RemoteId, Option<RemoteId>), RemoteId> = BTreeMap::new();
@@ -97,6 +98,29 @@ pub fn apply_plan(
                     operation_index,
                     parent_id: parent_id.clone(),
                     block_id: created_id,
+                });
+            }
+            PushOperation::MoveBlock { block_id, after } => {
+                current_block(&current_blocks, block_id)?;
+                let parent_id = block_parent_pages.get(block_id).ok_or_else(|| {
+                    AfsError::InvalidState(format!(
+                        "push referenced block `{}` without a containing Notion page",
+                        block_id.0
+                    ))
+                })?;
+                let effective_after = append_chains
+                    .get(&(parent_id.clone(), after.clone()))
+                    .cloned()
+                    .or_else(|| after.clone());
+                api.move_block(
+                    block_id.as_str(),
+                    parent_id.as_str(),
+                    effective_after.as_ref().map(RemoteId::as_str),
+                )?;
+                effects.push(JournalApplyEffect::MovedBlock {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    block_id: block_id.clone(),
                 });
             }
             PushOperation::ArchiveBlock { block_id } => {
@@ -232,6 +256,29 @@ fn block_map(bundles: &[NotionPageBundle]) -> BTreeMap<RemoteId, &BlockDto> {
         collect_blocks(&bundle.blocks, &mut blocks);
     }
     blocks
+}
+
+fn block_parent_page_map(bundles: &[NotionPageBundle]) -> BTreeMap<RemoteId, RemoteId> {
+    let mut parents = BTreeMap::new();
+    for bundle in bundles {
+        collect_block_parent_pages(
+            &bundle.blocks,
+            &RemoteId::new(bundle.page.id.clone()),
+            &mut parents,
+        );
+    }
+    parents
+}
+
+fn collect_block_parent_pages(
+    trees: &[BlockTreeDto],
+    page_id: &RemoteId,
+    parents: &mut BTreeMap<RemoteId, RemoteId>,
+) {
+    for tree in trees {
+        parents.insert(RemoteId::new(tree.block.id.clone()), page_id.clone());
+        collect_block_parent_pages(&tree.children, page_id, parents);
+    }
 }
 
 fn collect_blocks<'a>(trees: &'a [BlockTreeDto], blocks: &mut BTreeMap<RemoteId, &'a BlockDto>) {
@@ -1592,11 +1639,11 @@ fn looks_like_markdown_table(markdown: &str) -> bool {
 
 fn unsupported_operation_name(operation: &PushOperation) -> &'static str {
     match operation {
-        PushOperation::MoveBlock { .. } => "moving Notion blocks",
         PushOperation::ArchiveEntity { .. } => "archiving Notion pages",
         PushOperation::CreateEntity { .. } => "creating Notion pages",
         PushOperation::UpdateBlock { .. }
         | PushOperation::AppendBlock { .. }
+        | PushOperation::MoveBlock { .. }
         | PushOperation::UpdateProperties { .. }
         | PushOperation::ArchiveBlock { .. } => "unsupported Notion push operation",
     }

@@ -46,7 +46,7 @@ where
     S: MountRepository + EntityRepository + ShadowRepository + JournalRepository + JournalStore,
     Source: Connector + HydrationSource + ?Sized,
 {
-    let prepared = prepare_push(store, &job)?;
+    let prepared = preflight_push(source, prepare_push(store, &job)?);
     let push_id = generate_push_id();
     let mut execution_request = PushExecutionRequest::new(
         push_id.clone(),
@@ -96,6 +96,40 @@ where
             error: Some(PushJobError::from(error)),
         }),
     }
+}
+
+fn preflight_push<Source>(source: &Source, mut prepared: PreparedPush) -> PreparedPush
+where
+    Source: Connector + ?Sized,
+{
+    let Some(plan) = prepared.pipeline.plan.as_ref() else {
+        return prepared;
+    };
+    if !matches!(
+        prepared.pipeline.action,
+        PushPipelineAction::ProceedToApply
+            | PushPipelineAction::ConfirmPlan
+            | PushPipelineAction::ConfirmDangerousPlan
+    ) {
+        return prepared;
+    }
+
+    let supported = source.supported_push_operations();
+    let unsupported = plan
+        .operations
+        .iter()
+        .map(|operation| operation.kind())
+        .filter(|kind| !supported.contains(kind))
+        .map(|kind| kind.as_str().to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    if !unsupported.is_empty() {
+        prepared.pipeline.action = PushPipelineAction::unsupported_operations(unsupported);
+    }
+
+    prepared
 }
 
 #[derive(Clone, Debug)]

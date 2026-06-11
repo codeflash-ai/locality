@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +13,7 @@ use afs_core::journal::JournalStatus;
 use afs_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
+use afs_core::planner::PushOperationKind;
 use afs_core::push::PushExecutionAction;
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
@@ -88,6 +90,36 @@ fn daemon_push_job_applies_and_reconciles_through_single_store_owner() {
     let journal = supervisor.store().list_journal().expect("journal");
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].status, JournalStatus::Reconciled);
+}
+
+#[test]
+fn daemon_push_job_preflights_unsupported_operations_before_journal() {
+    let fixture = PushFixture::new();
+    let mut supervisor = fixture.supervisor("Old body.");
+    fixture.write_page("New body.");
+    supervisor.start().expect("start supervisor");
+    let source = FakePushSource::with_remote(rendered_entity("page-1", "New body."))
+        .with_supported_operations(BTreeSet::new());
+
+    let report = supervisor
+        .execute_push(fixture.push_job(true), &source)
+        .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    assert_eq!(
+        report.pipeline.action,
+        afs_core::push::PushPipelineAction::unsupported_operations(vec![
+            "update_block".to_string()
+        ])
+    );
+    assert_eq!(source.applied_count(), 0);
+    assert!(
+        supervisor
+            .store()
+            .list_journal()
+            .expect("journal")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -282,6 +314,7 @@ impl FileWatcher for RecordingWatcher {
 struct FakePushSource {
     remote: Option<HydratedEntity>,
     applied: std::cell::Cell<usize>,
+    supported_operations: Option<BTreeSet<PushOperationKind>>,
 }
 
 impl FakePushSource {
@@ -289,11 +322,20 @@ impl FakePushSource {
         Self {
             remote: Some(remote),
             applied: std::cell::Cell::new(0),
+            supported_operations: None,
         }
     }
 
     fn applied_count(&self) -> usize {
         self.applied.get()
+    }
+
+    fn with_supported_operations(
+        mut self,
+        supported_operations: BTreeSet<PushOperationKind>,
+    ) -> Self {
+        self.supported_operations = Some(supported_operations);
+        self
     }
 }
 
@@ -323,6 +365,12 @@ impl Connector for FakePushSource {
             supports_databases: false,
             supports_oauth: false,
         }
+    }
+
+    fn supported_push_operations(&self) -> BTreeSet<PushOperationKind> {
+        self.supported_operations
+            .clone()
+            .unwrap_or_else(|| PushOperationKind::all().into_iter().collect())
     }
 
     fn enumerate(&self, _request: EnumerateRequest) -> AfsResult<Vec<TreeEntry>> {

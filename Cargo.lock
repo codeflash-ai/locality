@@ -11,6 +11,7 @@ dependencies = [
  "afs-notion",
  "afs-store",
  "afsd",
+ "libc",
  "serde",
  "serde_json",
 ]

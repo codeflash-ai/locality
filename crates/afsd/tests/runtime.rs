@@ -149,6 +149,31 @@ fn runtime_routes_file_events_through_worker_queue() {
 }
 
 #[test]
+fn runtime_routes_push_request_through_runner() {
+    let (push_tx, push_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("push-request-routing"),
+        PushRequestRunner { push_tx },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::Push {
+        path: PathBuf::from("Roadmap.md"),
+        assume_yes: true,
+        confirm_dangerous: false,
+    });
+    let job = push_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("push job");
+
+    assert!(response.ok);
+    assert_eq!(job.target_path, PathBuf::from("Roadmap.md"));
+    assert!(job.assume_yes);
+    assert!(!job.confirm_dangerous);
+    runtime.shutdown();
+}
+
+#[test]
 fn default_runner_marks_hydrated_write_dirty() {
     let fixture = EventFixture::new("dirty-write");
     fixture.write_hydrated_page("Original body.");
@@ -446,6 +471,42 @@ struct EventRunner {
 
 struct ReadHydrationRunner {
     hydrated: mpsc::Sender<HydrationRequest>,
+}
+
+struct PushRequestRunner {
+    push_tx: mpsc::Sender<PushJob>,
+}
+
+impl RuntimeJobRunner for PushRequestRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, job: PushJob) -> DaemonResponse {
+        self.push_tx.send(job).expect("send push job");
+        DaemonResponse::ok(json!({ "command": "push" }))
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        Err(AfsError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
 }
 
 impl RuntimeJobRunner for EventRunner {

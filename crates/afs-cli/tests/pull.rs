@@ -124,6 +124,7 @@ impl PullFixture {
                 connector: "notion".to_string(),
                 root: self.root.clone(),
                 remote_root_id: Some(self.root_page_id.clone()),
+                connection_id: None,
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
             },
