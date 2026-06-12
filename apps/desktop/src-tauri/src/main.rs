@@ -18,9 +18,9 @@ use afsd::ipc::{DaemonRequest, send_request};
 use afsd::notion::resolve_notion_connector_for_path;
 use serde::Serialize;
 use tauri::{
-    Manager,
+    AppHandle, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindowBuilder,
     menu::{Menu, MenuItem, Submenu},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 
 #[derive(Clone, Serialize)]
@@ -221,6 +221,44 @@ fn open_path(path: String) -> ActionReport {
             message: format!("Opened {}", expanded.display()),
         },
         Err(message) => ActionReport { ok: false, message },
+    }
+}
+
+#[tauri::command]
+fn show_main_window(app: AppHandle, view: Option<String>) -> ActionReport {
+    show_main_window_with_view(&app, view.as_deref());
+    ActionReport {
+        ok: true,
+        message: "Opened AFS.".to_string(),
+    }
+}
+
+#[tauri::command]
+fn hide_menubar(app: AppHandle) -> ActionReport {
+    if let Some(tray) = app.tray_by_id("main") {
+        if let Err(error) = tray.set_visible(false) {
+            return ActionReport {
+                ok: false,
+                message: format!("Could not hide menu bar icon: {error}"),
+            };
+        }
+    }
+    if let Some(window) = app.get_webview_window("tray") {
+        let _ = window.hide();
+    }
+
+    ActionReport {
+        ok: true,
+        message: "AFS hidden from the menu bar.".to_string(),
+    }
+}
+
+#[tauri::command]
+fn quit_completely(app: AppHandle) -> ActionReport {
+    app.exit(0);
+    ActionReport {
+        ok: true,
+        message: "AFS is quitting.".to_string(),
     }
 }
 
@@ -797,12 +835,17 @@ fn main() {
             review_push_plan,
             push_to_notion,
             open_path,
+            show_main_window,
+            hide_menubar,
+            quit_completely,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AFS desktop app");
 }
 
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    build_tray_popover(app)?;
+
     let open = MenuItem::with_id(app, "open", "Open AFS", true, None::<&str>)?;
     let open_folder =
         MenuItem::with_id(app, "open_folder", "Open Notion Folder", true, None::<&str>)?;
@@ -837,11 +880,34 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     TrayIconBuilder::with_id("main")
         .icon(icon)
         .menu(&menu)
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                position,
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_tray_popover(tray.app_handle(), position);
+            }
+        })
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "open" | "open_folder" | "review_pending" => show_main_window(app),
+            "open" => show_main_window_with_view(app, None),
+            "open_folder" => {
+                if let Ok(snapshot) = load_desktop_snapshot() {
+                    let path = expand_tilde(&snapshot.mount.local_path)
+                        .unwrap_or_else(|_| PathBuf::from(snapshot.mount.local_path));
+                    let _ = open_in_file_manager(&path);
+                }
+                show_main_window_with_view(app, Some("mount"));
+            }
+            "review_pending" => show_main_window_with_view(app, Some("pending")),
             "hide_menubar" => {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Some(tray) = app.tray_by_id("main") {
+                    let _ = tray.set_visible(false);
+                }
+                if let Some(window) = app.get_webview_window("tray") {
                     let _ = window.hide();
                 }
             }
@@ -853,8 +919,52 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-fn show_main_window(app: &tauri::AppHandle) {
+fn build_tray_popover(app: &mut tauri::App) -> tauri::Result<()> {
+    WebviewWindowBuilder::new(app, "tray", WebviewUrl::App("index.html#tray".into()))
+        .title("AFS")
+        .inner_size(360.0, 520.0)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .visible(false)
+        .build()?;
+
+    Ok(())
+}
+
+fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
+    let Some(window) = app.get_webview_window("tray") else {
+        show_main_window_with_view(app, None);
+        return;
+    };
+
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        return;
+    }
+
+    let x = (position.x - 180.0).max(8.0) as i32;
+    let y = (position.y + 12.0).max(8.0) as i32;
+    let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+fn show_main_window_with_view(app: &AppHandle, view: Option<&str>) {
+    if let Some(popover) = app.get_webview_window("tray") {
+        let _ = popover.hide();
+    }
+
     if let Some(window) = app.get_webview_window("main") {
+        if let Some(view) = view {
+            let escaped = view.replace('\\', "\\\\").replace('\'', "\\'");
+            let _ = window.eval(&format!(
+                "window.dispatchEvent(new CustomEvent('afs-open-view', {{ detail: '{}' }}));",
+                escaped
+            ));
+        }
         let _ = window.show();
         let _ = window.set_focus();
     }

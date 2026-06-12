@@ -22,7 +22,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-type AppView = "home" | "pending" | "review" | "activity" | "settings";
+type AppView = "home" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
 
 type DesktopSnapshot = {
@@ -188,13 +188,36 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>, f
 export default function App() {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>(sampleSnapshot);
   const [view, setView] = useState<AppView>("home");
-  const [showOnboarding, setShowOnboarding] = useState(() => window.location.hash !== "#app");
+  const route = window.location.hash;
+  const [showOnboarding, setShowOnboarding] = useState(() => route !== "#app" && route !== "#tray");
 
   useEffect(() => {
     void callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot)
       .then(setSnapshot)
       .catch(() => setSnapshot(sampleSnapshot));
   }, []);
+
+  useEffect(() => {
+    const handleOpenView = (event: Event) => {
+      const nextView = (event as CustomEvent<string>).detail;
+      if (!isAppView(nextView)) {
+        return;
+      }
+      setShowOnboarding(false);
+      setView(nextView);
+    };
+
+    window.addEventListener("afs-open-view", handleOpenView);
+    return () => window.removeEventListener("afs-open-view", handleOpenView);
+  }, []);
+
+  useEffect(() => {
+    document.body.dataset.surface = route === "#tray" ? "tray" : "app";
+  }, [route]);
+
+  if (route === "#tray") {
+    return <TrayPopover snapshot={snapshot} />;
+  }
 
   if (showOnboarding) {
     return (
@@ -415,6 +438,9 @@ function MainShell({
             <SidebarButton active={view === "home"} icon={<Home />} onClick={() => onViewChange("home")}>
               Home
             </SidebarButton>
+            <SidebarButton active={view === "mount"} icon={<FolderOpen />} onClick={() => onViewChange("mount")}>
+              Mount
+            </SidebarButton>
             <SidebarButton
               active={view === "pending" || view === "review"}
               icon={<ListChecks />}
@@ -445,9 +471,16 @@ function MainShell({
         </aside>
 
         <section className="content">
-          {view === "home" && <HomeView snapshot={snapshot} onReview={() => onViewChange("pending")} />}
+          {view === "home" && (
+            <HomeView
+              snapshot={snapshot}
+              onMount={() => onViewChange("mount")}
+              onReview={() => onViewChange("pending")}
+            />
+          )}
+          {view === "mount" && <MountDetailView snapshot={snapshot} onReview={() => onViewChange("pending")} />}
           {view === "pending" && <PendingView snapshot={snapshot} onReview={() => onViewChange("review")} />}
-          {view === "review" && <ReviewView onDone={() => onViewChange("activity")} />}
+          {view === "review" && <ReviewView snapshot={snapshot} onDone={() => onViewChange("activity")} />}
           {view === "activity" && <ActivityView snapshot={snapshot} />}
           {view === "settings" && <SettingsView snapshot={snapshot} />}
         </section>
@@ -456,10 +489,19 @@ function MainShell({
   );
 }
 
-function HomeView({ snapshot, onReview }: { snapshot: DesktopSnapshot; onReview: () => void }) {
+function HomeView({
+  snapshot,
+  onMount,
+  onReview,
+}: {
+  snapshot: DesktopSnapshot;
+  onMount: () => void;
+  onReview: () => void;
+}) {
   const [url, setUrl] = useState("");
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
+  const hasPendingChanges = snapshot.pendingChanges.length > 0;
 
   async function locatePage() {
     if (!url.trim()) {
@@ -488,32 +530,68 @@ function HomeView({ snapshot, onReview }: { snapshot: DesktopSnapshot; onReview:
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Home" title="Notion workspace">
-        <StatusPill tone="ready">Ready</StatusPill>
+        <StatusPill tone={healthTone(snapshot.health.state)}>{healthLabel(snapshot.health.state)}</StatusPill>
       </ViewHeader>
 
-      <section className="workspace-card">
-        <div>
-          <p className="label">Connected workspace</p>
-          <h2>{snapshot.mount.workspaceName}</h2>
-          <p className="path-line">{snapshot.mount.localPath}</p>
-        </div>
-        <SecondaryButton icon={<FolderOpen />} onClick={() => void callCommand("open_path", { path: snapshot.mount.localPath }, { ok: true })}>
-          Open Folder
-        </SecondaryButton>
-      </section>
+      {connectionMissing(snapshot) ? (
+        <section className="empty-action-panel">
+          <BrandTile variant="notion">N</BrandTile>
+          <div>
+            <h2>Connect your Notion workspace</h2>
+            <p>AFS needs access before it can create local files for agents.</p>
+          </div>
+          <PrimaryButton icon={<ChevronRight />} onClick={() => void callCommand("connect_notion", undefined, { ok: true })}>
+            Connect Notion
+          </PrimaryButton>
+        </section>
+      ) : mountMissing(snapshot) ? (
+        <section className="empty-action-panel">
+          <BrandTile variant="folder" />
+          <div>
+            <h2>Create your Notion folder</h2>
+            <p>Use the default visible location under Documents, or choose a different folder.</p>
+          </div>
+          <PrimaryButton
+            icon={<FolderOpen />}
+            onClick={() =>
+              void callCommand("create_workspace_mount", { path: snapshot.mount.localPath }, { ok: true })
+            }
+          >
+            Create Notion Folder
+          </PrimaryButton>
+        </section>
+      ) : (
+        <>
+          <section className="workspace-card">
+            <div>
+              <p className="label">Connected workspace</p>
+              <h2>{snapshot.mount.workspaceName}</h2>
+              <p className="path-line">{snapshot.mount.localPath}</p>
+            </div>
+            <div className="button-row">
+              <SecondaryButton icon={<FolderOpen />} onClick={() => void callCommand("open_path", { path: snapshot.mount.localPath }, { ok: true })}>
+                Open Folder
+              </SecondaryButton>
+              <SecondaryButton icon={<ChevronRight />} onClick={onMount}>
+                Mount Detail
+              </SecondaryButton>
+            </div>
+          </section>
 
-      <section className="panel locate-panel">
-        <LocateBox
-          label="Open a Notion page"
-          value={url}
-          onChange={setUrl}
-          onSubmit={locatePage}
-          state={locateState}
-        />
-        {locatedItem && <LocatedPath item={locatedItem} />}
-      </section>
+          <section className="panel locate-panel">
+            <LocateBox
+              label="Open a Notion page"
+              value={url}
+              onChange={setUrl}
+              onSubmit={locatePage}
+              state={locateState}
+            />
+            {locatedItem && <LocatedPath item={locatedItem} />}
+          </section>
+        </>
+      )}
 
-      {snapshot.pendingChanges.length > 0 ? (
+      {hasPendingChanges ? (
         <section className="attention-panel">
           <div>
             <p className="label">Pending Changes</p>
@@ -546,21 +624,122 @@ function HomeView({ snapshot, onReview }: { snapshot: DesktopSnapshot; onReview:
   );
 }
 
-function PendingView({ snapshot, onReview }: { snapshot: DesktopSnapshot; onReview: () => void }) {
+function MountDetailView({ snapshot, onReview }: { snapshot: DesktopSnapshot; onReview: () => void }) {
+  const hasPendingChanges = snapshot.pendingChanges.length > 0;
+
   return (
     <div className="view-stack">
-      <ViewHeader eyebrow="Pending" title="Pending Changes">
-        <PrimaryButton icon={<ListChecks />} onClick={onReview}>
-          Review Push
-        </PrimaryButton>
+      <ViewHeader eyebrow="Mount" title={snapshot.mount.workspaceName}>
+        <StatusPill tone={healthTone(snapshot.health.state)}>{healthLabel(snapshot.health.state)}</StatusPill>
       </ViewHeader>
-      <p className="view-copy">{snapshot.pendingChanges.length} files have pending changes.</p>
-      <FileChangeList changes={snapshot.pendingChanges} />
+
+      <section className="mount-hero">
+        <div className="mount-hero-icon">
+          <FolderOpen />
+        </div>
+        <div>
+          <p className="label">Notion folder</p>
+          <h2>{snapshot.mount.localPath}</h2>
+          <p>
+            AFS follows your Notion workspace hierarchy here, starting with the pages and databases
+            your connection can access.
+          </p>
+        </div>
+        <div className="mount-actions">
+          <PrimaryButton
+            icon={<FolderOpen />}
+            onClick={() => void callCommand("open_path", { path: snapshot.mount.localPath }, { ok: true })}
+          >
+            Open Folder
+          </PrimaryButton>
+          <SecondaryButton compact icon={<Copy />} onClick={() => copyText(snapshot.mount.localPath)}>
+            Copy Path
+          </SecondaryButton>
+        </div>
+      </section>
+
+      <section className="detail-grid">
+        <div className="panel">
+          <PanelTitle title="Workspace" />
+          <SettingRow title="Source" value="Notion" />
+          <SettingRow title="Workspace" value={snapshot.connection.workspaceName} />
+          <SettingRow title="Account" value={snapshot.connection.accountLabel || "Connected"} />
+          <SettingRow title="Access" value={snapshot.mount.readOnly ? "Read Only" : "Edit enabled"} />
+        </div>
+
+        <div className="panel">
+          <PanelTitle title="Local Files" />
+          <SettingRow title="Location" value={snapshot.mount.localPath} />
+          <SettingRow title="Projection" value={snapshot.mount.projection} />
+          <SettingRow title="Mounted content" value="Workspace hierarchy" />
+          <SettingRow title="Agent guidance" value="AGENTS.md and CLAUDE.md" />
+        </div>
+      </section>
+
+      <section className="safety-strip">
+        <ShieldCheck />
+        <div>
+          <h2>Edits stay pending until reviewed</h2>
+          <p>
+            Local changes are staged first. Push review shows what will update in Notion before
+            remote writes happen.
+          </p>
+        </div>
+        {hasPendingChanges && (
+          <PrimaryButton compact icon={<ListChecks />} onClick={onReview}>
+            Review
+          </PrimaryButton>
+        )}
+      </section>
+
+      <details className="advanced-panel">
+        <summary>Advanced diagnostics</summary>
+        <div className="settings-grid compact-settings">
+          <div className="panel">
+            <SettingRow title="AFS process" value={snapshot.health.state === "stopped" ? "Stopped" : "Running"} />
+            <SettingRow title="State folder" value="~/.afs" />
+            <SettingRow title="Connector" value={snapshot.mount.connector} />
+          </div>
+          <div className="panel">
+            <SettingRow title="Connection status" value={snapshot.connection.status} />
+            <SettingRow title="Mount status" value={snapshot.mount.status} />
+            <SettingRow title="Pending changes" value={String(snapshot.pendingChanges.length)} />
+          </div>
+        </div>
+      </details>
     </div>
   );
 }
 
-function ReviewView({ onDone }: { onDone: () => void }) {
+function PendingView({ snapshot, onReview }: { snapshot: DesktopSnapshot; onReview: () => void }) {
+  const hasPendingChanges = snapshot.pendingChanges.length > 0;
+
+  return (
+    <div className="view-stack">
+      <ViewHeader eyebrow="Pending" title="Pending Changes">
+        <PrimaryButton disabled={!hasPendingChanges} icon={<ListChecks />} onClick={onReview}>
+          Review Push
+        </PrimaryButton>
+      </ViewHeader>
+      {hasPendingChanges ? (
+        <>
+          <p className="view-copy">{snapshot.pendingChanges.length} files have pending changes.</p>
+          <FileChangeList changes={snapshot.pendingChanges} mountPath={snapshot.mount.localPath} />
+        </>
+      ) : (
+        <section className="panel muted-panel">
+          <Check />
+          <div>
+            <h2>No pending changes</h2>
+            <p>Local edits will appear here before they update Notion.</p>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
+function ReviewView({ snapshot, onDone }: { snapshot: DesktopSnapshot; onDone: () => void }) {
   const [plan, setPlan] = useState<PushPlan>(samplePushPlan);
   const [complete, setComplete] = useState(false);
 
@@ -599,10 +778,10 @@ function ReviewView({ onDone }: { onDone: () => void }) {
         <Metric label="Pages deleted" value={plan.pagesDeleted} />
       </section>
 
-      <FileChangeList changes={plan.files} />
+      <FileChangeList changes={plan.files} mountPath={snapshot.mount.localPath} />
 
       <div className="footer-actions">
-        <PrimaryButton icon={<ShieldCheck />} onClick={push}>
+        <PrimaryButton disabled={!plan.canPush} icon={<ShieldCheck />} onClick={push}>
           Push to Notion
         </PrimaryButton>
         <SecondaryButton>Cancel</SecondaryButton>
@@ -648,42 +827,26 @@ function ActivityView({ snapshot }: { snapshot: DesktopSnapshot }) {
 function SettingsView({ snapshot }: { snapshot: DesktopSnapshot }) {
   return (
     <div className="view-stack">
-      <ViewHeader eyebrow="Controls" title="Mount detail and settings" />
-      <section className="workspace-card">
-        <div>
-          <p className="label">Notion</p>
-          <h2>{snapshot.mount.workspaceName}</h2>
-          <p className="path-line">{snapshot.mount.localPath}</p>
-        </div>
-        <PrimaryButton icon={<FolderOpen />}>Open Folder</PrimaryButton>
-      </section>
+      <ViewHeader eyebrow="Settings" title="AFS controls" />
 
       <section className="settings-grid">
         <div className="panel">
-          <PanelTitle title="Location" />
-          <PathRow path={snapshot.mount.localPath} />
-          <SettingRow title="Status" value="Ready" />
-          <SettingRow title="Access" value={snapshot.mount.readOnly ? "Read Only" : "Edit enabled"} />
-          <SettingRow title="Source scope" value={`${snapshot.mount.workspaceName} workspace`} />
-          <SettingRow
-            title="Mounted content"
-            value="Uses Notion workspace and top-level page hierarchy inside the local folder."
-          />
-        </div>
-
-        <div className="panel">
-          <PanelTitle title="General" />
+          <PanelTitle title="Startup" />
           <ToggleRow title="Launch AFS at login" enabled />
           <ToggleRow title="Show AFS in the menu bar" enabled />
           <SettingRow title="Default folder" value="~/Documents/AFS" />
+        </div>
+
+        <div className="panel">
           <PanelTitle title="Safety" />
+          <SettingRow title="Local edits" value="Pending until reviewed" />
           <SettingRow title="Push confirmation" value="Require for large changes" />
           <SettingRow title="Default new mount mode" value="Edit enabled" />
         </div>
 
         <div className="panel">
           <PanelTitle title="Diagnostics" />
-          <SettingRow title="AFS process" value="Running" />
+          <SettingRow title="AFS process" value={snapshot.health.state === "stopped" ? "Stopped" : "Running"} />
           <SettingRow title="State folder" value="~/.afs" />
           <SettingRow title="Projection" value={snapshot.mount.projection} />
           <div className="button-row">
@@ -694,12 +857,12 @@ function SettingsView({ snapshot }: { snapshot: DesktopSnapshot }) {
 
         <div className="panel">
           <PanelTitle title="Quit Options" />
-          <button className="option-row">
+          <button className="option-row" onClick={() => void callCommand("hide_menubar", undefined, { ok: true })}>
             <EyeOff />
             <span>Don't Show in Menubar</span>
             <ChevronRight />
           </button>
-          <button className="option-row danger">
+          <button className="option-row danger" onClick={() => void callCommand("quit_completely", undefined, { ok: true })}>
             <Power />
             <span>Quit Completely</span>
             <ChevronRight />
@@ -710,7 +873,137 @@ function SettingsView({ snapshot }: { snapshot: DesktopSnapshot }) {
   );
 }
 
-function FileChangeList({ changes }: { changes: PendingChange[] }) {
+function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
+  const [url, setUrl] = useState("");
+  const [locateState, setLocateState] = useState<LocateState>("idle");
+  const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
+  const visibleChanges = snapshot.pendingChanges.slice(0, 3);
+
+  async function locatePage() {
+    if (!url.trim()) {
+      return;
+    }
+
+    setLocateState("preparing");
+    try {
+      const item = await callCommand<LocatedItem>(
+        "locate_notion_page",
+        { url },
+        {
+          title: "Roadmap 2026",
+          kind: "Page",
+          localPath: "~/Documents/AFS/Notion/Engineering/Roadmap 2026 ~a3f2.md",
+          state: "ready",
+        },
+      );
+      setLocatedItem(item);
+      setLocateState("ready");
+    } catch {
+      setLocatedItem(null);
+      setLocateState("error");
+    }
+  }
+
+  function openMain(view?: AppView) {
+    void callCommand("show_main_window", { view }, { ok: true });
+  }
+
+  return (
+    <main className="tray-popover">
+      <header className="tray-header">
+        <div className="tray-title">
+          <ApertureIcon state={healthIconState(snapshot.health.state)} />
+          <strong>AFS</strong>
+        </div>
+        <StatusPill tone={healthTone(snapshot.health.state)}>{healthLabel(snapshot.health.state)}</StatusPill>
+      </header>
+
+      <section className="tray-section tray-workspace">
+        <p className="label">Notion</p>
+        <h2>{snapshot.mount.workspaceName}</h2>
+        <button className="path-button" onClick={() => copyText(snapshot.mount.localPath)}>
+          {snapshot.mount.localPath}
+        </button>
+        <PrimaryButton
+          compact
+          icon={<FolderOpen />}
+          onClick={() => void callCommand("open_path", { path: snapshot.mount.localPath }, { ok: true })}
+        >
+          Open Notion Folder
+        </PrimaryButton>
+      </section>
+
+      <section className="tray-section">
+        <div className="tray-locate-label">Open a Notion page</div>
+        <div className="tray-locate-row">
+          <Search />
+          <input
+            value={url}
+            placeholder="Paste Notion URL"
+            onChange={(event) => setUrl(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                locatePage();
+              }
+            }}
+          />
+          <button disabled={!url.trim() || locateState === "preparing"} onClick={locatePage}>
+            {locateState === "preparing" ? "..." : "Open"}
+          </button>
+        </div>
+        {locateState === "error" && <p className="field-error">Paste a Notion page or database URL.</p>}
+        {locatedItem && (
+          <div className="tray-result">
+            <strong>{locatedItem.title}</strong>
+            <code>{locatedItem.localPath}</code>
+            <button onClick={() => copyText(locatedItem.localPath)}>Copy Path</button>
+          </div>
+        )}
+      </section>
+
+      <button className="tray-row-button" onClick={() => openMain("pending")}>
+        <span>Pending Changes</span>
+        <strong>{snapshot.pendingChanges.length}</strong>
+      </button>
+
+      {visibleChanges.length > 0 && (
+        <section className="tray-change-list">
+          {visibleChanges.map((change) => (
+            <button
+              key={change.localPath}
+              onClick={() =>
+                void callCommand("open_path", { path: joinMountPath(snapshot.mount.localPath, change.localPath) }, { ok: true })
+              }
+            >
+              <span>{change.title}</span>
+              <small>{change.summary}</small>
+            </button>
+          ))}
+        </section>
+      )}
+
+      <section className="tray-section tray-suggestion">
+        <p className="label">Suggestion</p>
+        <button onClick={() => openMain("settings")}>Connect Linear</button>
+      </section>
+
+      <footer className="tray-footer">
+        <button onClick={() => openMain("settings")}>Settings</button>
+        <details>
+          <summary>Quit Options</summary>
+          <button onClick={() => void callCommand("hide_menubar", undefined, { ok: true })}>
+            Don't Show in Menubar
+          </button>
+          <button className="danger" onClick={() => void callCommand("quit_completely", undefined, { ok: true })}>
+            Quit Completely
+          </button>
+        </details>
+      </footer>
+    </main>
+  );
+}
+
+function FileChangeList({ changes, mountPath }: { changes: PendingChange[]; mountPath: string }) {
   return (
     <section className="file-list">
       {changes.map((change) => (
@@ -723,7 +1016,12 @@ function FileChangeList({ changes }: { changes: PendingChange[] }) {
             <p>{change.localPath}</p>
             <span>{change.summary}</span>
           </div>
-          <SecondaryButton compact>Open</SecondaryButton>
+          <SecondaryButton
+            compact
+            onClick={() => void callCommand("open_path", { path: joinMountPath(mountPath, change.localPath) }, { ok: true })}
+          >
+            Open
+          </SecondaryButton>
         </article>
       ))}
     </section>
@@ -779,7 +1077,7 @@ function LocatedPath({ item }: { item: LocatedItem }) {
         <SecondaryButton compact icon={<Copy />} onClick={() => copyText(item.localPath)}>
           Copy Path
         </SecondaryButton>
-        <SecondaryButton compact icon={<FolderOpen />}>
+        <SecondaryButton compact icon={<FolderOpen />} onClick={() => void callCommand("open_path", { path: item.localPath }, { ok: true })}>
           Reveal in Finder
         </SecondaryButton>
       </div>
@@ -1022,6 +1320,59 @@ function Metric({ label, value }: { label: string; value: number }) {
       <span>{label}</span>
     </article>
   );
+}
+
+function connectionMissing(snapshot: DesktopSnapshot) {
+  return snapshot.connection.status === "missing";
+}
+
+function mountMissing(snapshot: DesktopSnapshot) {
+  return snapshot.mount.status === "not_mounted";
+}
+
+function isAppView(value: string): value is AppView {
+  return value === "home" || value === "mount" || value === "pending" || value === "review" || value === "activity" || value === "settings";
+}
+
+function healthLabel(state: string) {
+  if (state === "needs_review") {
+    return "Needs Review";
+  }
+  if (state === "reconnect_needed") {
+    return "Reconnect Needed";
+  }
+  if (state === "stopped") {
+    return "Stopped";
+  }
+  return "Ready";
+}
+
+function healthTone(state: string): "ready" | "warn" | "danger" {
+  if (state === "reconnect_needed" || state === "stopped") {
+    return "danger";
+  }
+  if (state === "needs_review") {
+    return "warn";
+  }
+  return "ready";
+}
+
+function healthIconState(state: string): "default" | "review" | "reconnect" {
+  if (state === "reconnect_needed" || state === "stopped") {
+    return "reconnect";
+  }
+  if (state === "needs_review") {
+    return "review";
+  }
+  return "default";
+}
+
+function joinMountPath(mountPath: string, relativePath: string) {
+  if (relativePath.startsWith("/") || relativePath.startsWith("~/")) {
+    return relativePath;
+  }
+
+  return `${mountPath.replace(/\/$/, "")}/${relativePath}`;
 }
 
 function copyText(value: string) {

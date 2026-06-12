@@ -39,6 +39,12 @@ body {
     linear-gradient(180deg, #f7faf9 0%, var(--bg) 100%);
 }
 
+body[data-surface="tray"] {
+  min-width: 360px;
+  min-height: 520px;
+  background: transparent;
+}
+
 button,
 input {
   font: inherit;
@@ -670,9 +676,13 @@ p {
 .panel,
 .suggestion-card,
 .attention-panel,
+.empty-action-panel,
+.mount-hero,
+.safety-strip,
 .file-list,
 .activity-group,
 .summary-grid,
+.advanced-panel,
 .located-path {
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -682,7 +692,10 @@ p {
 
 .workspace-card,
 .suggestion-card,
-.attention-panel {
+.attention-panel,
+.empty-action-panel,
+.mount-hero,
+.safety-strip {
   padding: 18px;
 }
 
@@ -759,6 +772,106 @@ p {
 .attention-panel {
   border-color: rgba(217, 140, 31, 0.22);
   background: rgba(255, 250, 241, 0.82);
+}
+
+.empty-action-panel,
+.mount-hero,
+.safety-strip {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.empty-action-panel .brand-tile {
+  width: 52px;
+  height: 52px;
+  margin: 0;
+}
+
+.empty-action-panel h2,
+.safety-strip h2 {
+  font-size: 18px;
+}
+
+.empty-action-panel p,
+.mount-hero p,
+.safety-strip p {
+  max-width: 560px;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.empty-action-panel .primary-button,
+.mount-actions {
+  margin-left: auto;
+}
+
+.mount-hero {
+  align-items: flex-start;
+}
+
+.mount-hero-icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 13px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.mount-hero h2 {
+  margin-top: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 17px;
+}
+
+.mount-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.safety-strip {
+  border-color: rgba(8, 123, 114, 0.14);
+  background: rgba(239, 250, 247, 0.74);
+}
+
+.safety-strip > svg {
+  width: 24px;
+  height: 24px;
+  color: var(--accent);
+}
+
+.safety-strip .primary-button {
+  margin-left: auto;
+}
+
+.advanced-panel {
+  padding: 14px;
+}
+
+.advanced-panel summary {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.advanced-panel[open] summary {
+  margin-bottom: 14px;
+}
+
+.compact-settings {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .suggestion-card {
@@ -1067,6 +1180,208 @@ p {
   font-size: 16px;
 }
 
+.path-button {
+  max-width: 100%;
+  margin-top: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  text-align: left;
+}
+
+.tray-popover {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 360px;
+  height: 520px;
+  padding: 16px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 24px 70px rgba(20, 30, 43, 0.2);
+}
+
+.tray-header,
+.tray-title,
+.tray-row-button,
+.tray-footer {
+  display: flex;
+  align-items: center;
+}
+
+.tray-header,
+.tray-row-button,
+.tray-footer {
+  justify-content: space-between;
+}
+
+.tray-title {
+  gap: 9px;
+}
+
+.tray-section {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 13px;
+  background: rgba(248, 252, 251, 0.88);
+}
+
+.tray-workspace h2 {
+  font-size: 17px;
+}
+
+.tray-workspace .primary-button {
+  margin-top: 4px;
+}
+
+.tray-locate-label {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.tray-locate-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 5px 5px 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #fff;
+}
+
+.tray-locate-row input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.tray-locate-row button,
+.tray-result button,
+.tray-suggestion button,
+.tray-footer button,
+.tray-row-button,
+.tray-change-list button {
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.tray-locate-row button {
+  min-width: 50px;
+  min-height: 26px;
+  border-radius: 8px;
+  background: #121b28;
+  color: #fff;
+}
+
+.tray-locate-row button:disabled {
+  background: #dce3e7;
+  color: #657283;
+}
+
+.tray-result {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.tray-result code {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tray-result button {
+  justify-self: start;
+  color: var(--accent);
+}
+
+.tray-row-button {
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid rgba(217, 140, 31, 0.18);
+  border-radius: 12px;
+  background: rgba(255, 250, 241, 0.86);
+}
+
+.tray-row-button strong {
+  color: #9d6515;
+}
+
+.tray-change-list {
+  display: grid;
+  gap: 6px;
+}
+
+.tray-change-list button {
+  display: grid;
+  gap: 2px;
+  padding: 9px 10px;
+  border-radius: 10px;
+  background: rgba(248, 252, 251, 0.88);
+  text-align: left;
+}
+
+.tray-change-list small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tray-suggestion button {
+  justify-self: start;
+  color: var(--accent);
+}
+
+.tray-footer {
+  margin-top: auto;
+  padding-top: 4px;
+}
+
+.tray-footer details {
+  position: relative;
+}
+
+.tray-footer summary {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  list-style: none;
+}
+
+.tray-footer details[open] {
+  padding: 8px;
+  border-radius: 10px;
+  background: rgba(248, 252, 251, 0.96);
+}
+
+.tray-footer details[open] button {
+  display: block;
+  margin-top: 8px;
+}
+
+.tray-footer .danger {
+  color: var(--red);
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -1087,6 +1402,7 @@ p {
   }
 
   .settings-grid,
+  .detail-grid,
   .summary-grid {
     grid-template-columns: 1fr;
   }
