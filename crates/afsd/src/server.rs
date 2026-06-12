@@ -227,7 +227,7 @@ impl DaemonWatchManager {
     fn reload_mounts(&mut self) -> AfsResult<DaemonReloadReport> {
         let mut desired = load_mounts(&self.config)?
             .into_iter()
-            .filter(|mount| should_watch_mount(mount))
+            .filter(should_watch_mount)
             .map(|mount| mount.root)
             .collect::<Vec<_>>();
         desired.sort();

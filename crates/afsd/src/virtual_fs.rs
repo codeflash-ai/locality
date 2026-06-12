@@ -200,14 +200,12 @@ where
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
     if let Some(schema) =
         schema_item_for_container(&mount, &entities, content_root, container_identifier)?
-    {
-        if !report
+        && !report
             .children
             .iter()
             .any(|child| child.identifier == schema.identifier)
-        {
-            report.children.push(schema);
-        }
+    {
+        report.children.push(schema);
     }
     for child in &mut report.children {
         rewrite_item_materialized_path(content_root, child)?;
@@ -827,15 +825,13 @@ fn schema_item_for_container(
     content_root: &Path,
     container_identifier: &str,
 ) -> AfsResult<Option<VirtualFsItem>> {
-    let remote_id = if container_identifier == ROOT_CONTAINER_IDENTIFIER {
-        return Ok(None);
-    } else if container_identifier.starts_with(CHILDREN_PREFIX)
+    if container_identifier == ROOT_CONTAINER_IDENTIFIER
+        || container_identifier.starts_with(CHILDREN_PREFIX)
         || container_identifier.starts_with(PATH_PREFIX)
     {
         return Ok(None);
-    } else {
-        RemoteId::new(container_identifier)
-    };
+    }
+    let remote_id = RemoteId::new(container_identifier);
     let Some(entity) = entities
         .iter()
         .find(|entity| entity.remote_id == remote_id && entity.kind == EntityKind::Database)
