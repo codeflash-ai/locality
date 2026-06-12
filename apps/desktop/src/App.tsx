@@ -267,6 +267,7 @@ function Onboarding({
   const [locateUrl, setLocateUrl] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
+  const [locateError, setLocateError] = useState("");
   const [mountError, setMountError] = useState("");
 
   async function startConnect() {
@@ -342,6 +343,7 @@ function Onboarding({
     }
 
     setLocateState("preparing");
+    setLocateError("");
     try {
       const item = await callCommand<LocatedItem>(
         "locate_notion_page",
@@ -355,7 +357,8 @@ function Onboarding({
       );
       setLocatedItem(item);
       setLocateState("ready");
-    } catch {
+    } catch (error) {
+      setLocateError(errorMessage(error));
       setLocateState("error");
       setLocatedItem(null);
     }
@@ -461,6 +464,7 @@ function Onboarding({
               onChange={setLocateUrl}
               onSubmit={locatePage}
               state={locateState}
+              error={locateError}
             />
             {locatedItem && <LocatedPath item={locatedItem} />}
             <div className="agent-demo compact-agent-demo">
@@ -581,6 +585,7 @@ function HomeView({
 }) {
   const [url, setUrl] = useState("");
   const [locateState, setLocateState] = useState<LocateState>("idle");
+  const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [actionError, setActionError] = useState("");
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
@@ -630,6 +635,7 @@ function HomeView({
       return;
     }
     setLocateState("preparing");
+    setLocateError("");
     try {
       const item = await callCommand<LocatedItem>(
         "locate_notion_page",
@@ -643,7 +649,8 @@ function HomeView({
       );
       setLocatedItem(item);
       setLocateState("ready");
-    } catch {
+    } catch (error) {
+      setLocateError(errorMessage(error));
       setLocateState("error");
       setLocatedItem(null);
     }
@@ -708,6 +715,7 @@ function HomeView({
               onChange={setUrl}
               onSubmit={locatePage}
               state={locateState}
+              error={locateError}
             />
             {locatedItem && <LocatedPath item={locatedItem} />}
           </section>
@@ -969,6 +977,9 @@ function SettingsView({
   const daemonStopped = snapshot.health.state === "stopped";
 
   async function repairRuntime() {
+    if (!daemonStopped) {
+      return;
+    }
     setDiagnosticMessage("");
     const report = await callCommand<ActionReport>(
       "ensure_runtime_ready",
@@ -1020,7 +1031,7 @@ function SettingsView({
             <SecondaryButton compact onClick={copyDiagnostics}>
               Copy Summary
             </SecondaryButton>
-            <SecondaryButton compact onClick={() => void repairRuntime()}>
+            <SecondaryButton compact disabled={!daemonStopped} onClick={() => void repairRuntime()}>
               {daemonStopped ? "Start AFS" : "Repair AFS"}
             </SecondaryButton>
           </div>
@@ -1048,6 +1059,7 @@ function SettingsView({
 function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
   const [url, setUrl] = useState("");
   const [locateState, setLocateState] = useState<LocateState>("idle");
+  const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const visibleChanges = snapshot.pendingChanges.slice(0, 3);
 
@@ -1057,6 +1069,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
     }
 
     setLocateState("preparing");
+    setLocateError("");
     try {
       const item = await callCommand<LocatedItem>(
         "locate_notion_page",
@@ -1070,7 +1083,8 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
       );
       setLocatedItem(item);
       setLocateState("ready");
-    } catch {
+    } catch (error) {
+      setLocateError(errorMessage(error));
       setLocatedItem(null);
       setLocateState("error");
     }
@@ -1123,7 +1137,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
             {locateState === "preparing" ? "..." : "Open"}
           </button>
         </div>
-        {locateState === "error" && <p className="field-error">Paste a Notion page or database URL.</p>}
+        {locateState === "error" && <p className="field-error">{locateError || "Paste a Notion page or database URL."}</p>}
         {locatedItem && (
           <div className="tray-result">
             <strong>{locatedItem.title}</strong>
@@ -1206,12 +1220,14 @@ function LocateBox({
   onChange,
   onSubmit,
   state,
+  error,
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
   state: LocateState;
+  error?: string;
 }) {
   return (
     <div className="locate-box">
@@ -1232,7 +1248,7 @@ function LocateBox({
           {state === "preparing" ? "Preparing" : "Open Page"}
         </PrimaryButton>
       </div>
-      {state === "error" && <p className="field-error">Paste a Notion page or database URL.</p>}
+      {state === "error" && <p className="field-error">{error || "Paste a Notion page or database URL."}</p>}
     </div>
   );
 }
