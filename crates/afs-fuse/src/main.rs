@@ -5,10 +5,10 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use afs_core::model::EntityKind;
-use afsd::ipc::{DaemonRequest, DaemonResponse, send_request};
+use afsd::ipc::{DaemonRequest, DaemonResponse, send_request, send_request_with_timeout};
 use afsd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport, VirtualFsItem, VirtualFsItemKind,
     VirtualFsItemReport, VirtualFsMaterializeReport, VirtualFsMutationReport, VirtualFsWriteReport,
@@ -22,6 +22,9 @@ use futures_util::stream;
 use serde::de::DeserializeOwned;
 
 const ATTR_TTL: Duration = Duration::from_secs(1);
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_READY_POLL: Duration = Duration::from_millis(250);
+const DAEMON_PING_TIMEOUT: Duration = Duration::from_secs(2);
 const ROOT_PATH: &str = "/";
 
 #[derive(Clone, Debug)]
@@ -49,6 +52,7 @@ async fn run() -> Result<(), String> {
     })?;
     std::fs::create_dir_all(staging_root(&options.state_root, &options.mount_id))
         .map_err(|error| format!("failed to create staging directory: {error}"))?;
+    wait_for_daemon(&options.state_root).await?;
 
     let fs = AgentFuse::new(DaemonClient {
         state_root: options.state_root.clone(),
@@ -77,6 +81,41 @@ async fn run() -> Result<(), String> {
             options.mountpoint.display()
         )
     })
+}
+
+async fn wait_for_daemon(state_root: &Path) -> Result<(), String> {
+    let started = Instant::now();
+    let mut last_error = String::new();
+
+    while started.elapsed() < DAEMON_READY_TIMEOUT {
+        match ping_daemon(state_root) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error,
+        }
+        tokio::time::sleep(DAEMON_READY_POLL).await;
+    }
+
+    Err(format!(
+        "afsd did not become ready within {}s: {last_error}",
+        DAEMON_READY_TIMEOUT.as_secs()
+    ))
+}
+
+fn ping_daemon(state_root: &Path) -> Result<(), String> {
+    let response = send_request_with_timeout(state_root, &DaemonRequest::Ping, DAEMON_PING_TIMEOUT)
+        .map_err(|error| error.message().to_string())?;
+    daemon_ping_result(response)
+}
+
+fn daemon_ping_result(response: DaemonResponse) -> Result<(), String> {
+    if response.ok {
+        return Ok(());
+    }
+
+    match response.error {
+        Some(error) => Err(format!("{}: {}", error.code, error.message)),
+        None => Err("daemon ping returned a failure without an error message".to_string()),
+    }
 }
 
 #[cfg(unix)]
@@ -1078,6 +1117,17 @@ mod tests {
         let _ = std::fs::remove_file(path);
         assert_eq!(attr.size, 1234);
         assert_eq!(attr.blocks, 3);
+    }
+
+    #[test]
+    fn daemon_ping_result_reports_daemon_errors() {
+        let error = daemon_ping_result(DaemonResponse::error(
+            "not_ready",
+            "daemon is still starting",
+        ))
+        .expect_err("daemon error should fail readiness");
+
+        assert_eq!(error, "not_ready: daemon is still starting");
     }
 
     #[test]
