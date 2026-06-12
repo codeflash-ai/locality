@@ -1408,6 +1408,27 @@ p {
   color: var(--accent);
 }
 
+.tray-suggestion button:disabled {
+  color: var(--subtle);
+  opacity: 0.7;
+}
+
+.tray-suggestion-copy {
+  display: grid;
+  gap: 3px;
+}
+
+.tray-suggestion-copy strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.tray-suggestion-copy span {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .tray-footer {
   margin-top: auto;
   padding-top: 4px;

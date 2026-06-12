@@ -749,7 +749,9 @@ function HomeView({
           <h3>Connect {snapshot.suggestions[0]?.connector ?? "Linear"}</h3>
           <p>{snapshot.suggestions[0]?.description ?? "Mount more workspaces as local files."}</p>
         </div>
-        <SecondaryButton compact>Coming Soon</SecondaryButton>
+        <SecondaryButton compact disabled>
+          Coming Soon
+        </SecondaryButton>
       </section>
     </div>
   );
@@ -1170,7 +1172,11 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
 
       <section className="tray-section tray-suggestion">
         <p className="label">Suggestion</p>
-        <button onClick={() => openMain("settings")}>Connect Linear</button>
+        <div className="tray-suggestion-copy">
+          <strong>Connect {snapshot.suggestions[0]?.connector ?? "Linear"}</strong>
+          <span>{snapshot.suggestions[0]?.description ?? "Mount more workspaces as local files."}</span>
+        </div>
+        <button disabled>Coming Soon</button>
       </section>
 
       <footer className="tray-footer">

@@ -17,3 +17,4 @@ afs-store.workspace = true
 afsd = { path = "../../../crates/afsd" }
 serde = { version = "1.0", features = ["derive"] }
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"

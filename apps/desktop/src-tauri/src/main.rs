@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +32,7 @@ use tauri::{
     menu::{Menu, MenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
+use tauri_plugin_dialog::DialogExt;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,8 +165,17 @@ async fn connect_notion() -> ActionReport {
 }
 
 #[tauri::command]
-fn choose_mount_folder(current: Option<String>) -> Result<Option<String>, String> {
-    choose_folder_with_finder(current)
+async fn choose_mount_folder(
+    app: AppHandle,
+    current: Option<String>,
+) -> Result<Option<String>, String> {
+    let selected = choose_folder_with_dialog(&app, current)?;
+    selected
+        .map(|path| {
+            validate_mount_root(&path, &default_state_root())?;
+            Ok(display_path(&path))
+        })
+        .transpose()
 }
 
 #[tauri::command]
@@ -654,6 +665,76 @@ fn display_path(path: &Path) -> String {
     path.display().to_string()
 }
 
+fn resolve_mount_root(path: &str) -> Result<PathBuf, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Choose a folder for the Notion mount.".to_string());
+    }
+    let root =
+        expand_tilde(path).map_err(|error| format!("Could not resolve mount path: {error}"))?;
+    absolute_path(&root)
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .map_err(|error| format!("Could not resolve current directory: {error}"))
+}
+
+fn validate_mount_root(root: &Path, state_root: &Path) -> Result<(), String> {
+    if root.as_os_str().is_empty() {
+        return Err("Choose a folder for the Notion mount.".to_string());
+    }
+
+    let root = absolute_path(root)?;
+    let state_root = absolute_path(state_root)?;
+    if root.starts_with(&state_root) {
+        return Err("Choose a folder outside the AFS state directory.".to_string());
+    }
+
+    if let Ok(metadata) = fs::metadata(&root) {
+        if !metadata.is_dir() {
+            return Err(format!(
+                "Choose a folder path, not a file: {}",
+                root.display()
+            ));
+        }
+        if metadata.permissions().readonly() {
+            return Err(format!("Selected folder is read-only: {}", root.display()));
+        }
+        return Ok(());
+    }
+
+    let parent = root
+        .ancestors()
+        .skip(1)
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| format!("No existing parent folder for {}", root.display()))?;
+    let metadata = fs::metadata(parent).map_err(|error| {
+        format!(
+            "Could not inspect parent folder `{}`: {error}",
+            parent.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "Mount parent is not a folder: {}",
+            parent.display()
+        ));
+    }
+    if metadata.permissions().readonly() {
+        return Err(format!(
+            "Mount parent folder is read-only: {}",
+            parent.display()
+        ));
+    }
+    Ok(())
+}
+
 fn projection_label(projection: &ProjectionMode) -> &'static str {
     match projection {
         ProjectionMode::PlainFiles => "Plain files",
@@ -696,58 +777,35 @@ fn open_in_file_manager(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn choose_folder_with_finder(current: Option<String>) -> Result<Option<String>, String> {
-    let mut script =
-        "POSIX path of (choose folder with prompt \"Choose where Notion files should appear\""
-            .to_string();
-    if let Some(path) = current
+fn choose_folder_with_dialog(
+    app: &AppHandle,
+    current: Option<String>,
+) -> Result<Option<PathBuf>, String> {
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("Choose where Notion files should appear");
+    if let Some(directory) = current
         .as_deref()
         .and_then(|path| expand_tilde(path).ok())
         .filter(|path| path.exists())
     {
-        script.push_str(" default location POSIX file ");
-        script.push_str(&applescript_string(&path.display().to_string()));
+        dialog = dialog.set_directory(directory);
     }
-    script.push(')');
 
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|error| format!("Could not open folder picker: {error}"))?;
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if path.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(path))
-        }
-    } else {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if message.contains("User canceled") || message.contains("(-128)") {
-            Ok(None)
-        } else {
-            Err(format!("Folder picker failed: {message}"))
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn choose_folder_with_finder(_current: Option<String>) -> Result<Option<String>, String> {
-    Err("Folder picker is only implemented for the macOS desktop app.".to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn applescript_string(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    dialog
+        .blocking_pick_folder()
+        .map(|path| {
+            path.into_path()
+                .map_err(|error| format!("Selected folder path was not usable: {error}"))
+        })
+        .transpose()
 }
 
 fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
     let state_root = default_state_root();
-    let root =
-        expand_tilde(path).map_err(|error| format!("Could not resolve mount path: {error}"))?;
+    let root = resolve_mount_root(path)?;
+    validate_mount_root(&root, &state_root)?;
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open AFS state: {error}"))?;
     let connection_id = preferred_notion_connection_id(&store)?;
@@ -1131,7 +1189,11 @@ fn compact_notion_id(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::notion_id_from_url;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{notion_id_from_url, should_hide_tray_popover, validate_mount_root};
 
     #[test]
     fn extracts_id_from_notion_pretty_workspace_url() {
@@ -1153,6 +1215,82 @@ mod tests {
             .as_deref(),
             Some("37b3ac0ebb88802cbcf4d53c9cfc4972")
         );
+    }
+
+    #[test]
+    fn mount_validation_rejects_file_paths() {
+        let temp = TestTempDir::new("file-path");
+        let file = temp.path().join("notion.md");
+        fs::write(&file, "not a folder").expect("write test file");
+
+        let error =
+            validate_mount_root(&file, &temp.path().join(".afs")).expect_err("file rejected");
+
+        assert!(error.contains("not a file"));
+    }
+
+    #[test]
+    fn mount_validation_rejects_state_directory() {
+        let temp = TestTempDir::new("state-dir");
+        let state_root = temp.path().join(".afs");
+        fs::create_dir_all(&state_root).expect("create state dir");
+
+        let error = validate_mount_root(&state_root, &state_root).expect_err("state dir rejected");
+
+        assert!(error.contains("outside the AFS state directory"));
+    }
+
+    #[test]
+    fn mount_validation_accepts_new_child_under_existing_parent() {
+        let temp = TestTempDir::new("new-child");
+        let root = temp.path().join("Notion");
+
+        validate_mount_root(&root, &temp.path().join(".afs")).expect("valid child path");
+    }
+
+    #[test]
+    fn tray_popover_hides_only_when_tray_window_loses_focus() {
+        assert!(should_hide_tray_popover(
+            "tray",
+            &tauri::WindowEvent::Focused(false)
+        ));
+        assert!(!should_hide_tray_popover(
+            "tray",
+            &tauri::WindowEvent::Focused(true)
+        ));
+        assert!(!should_hide_tray_popover(
+            "main",
+            &tauri::WindowEvent::Focused(false)
+        ));
+    }
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(label: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "afs-desktop-{label}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -1233,6 +1371,12 @@ fn sample_pending_changes() -> Vec<PendingChange> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            if should_hide_tray_popover(window.label(), event) {
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             build_tray(app)?;
             Ok(())
@@ -1253,6 +1397,10 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AFS desktop app");
+}
+
+fn should_hide_tray_popover(window_label: &str, event: &tauri::WindowEvent) -> bool {
+    window_label == "tray" && matches!(event, tauri::WindowEvent::Focused(false))
 }
 
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
