@@ -21,12 +21,13 @@ use afs_notion::oauth::{
 };
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
-    JournalRepository, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
-    open_credential_store,
+    HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    SqliteStateStore, VirtualMutationRepository, open_credential_store,
 };
 use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
 use afsd::ipc::{DaemonRequest, send_request};
 use afsd::notion::resolve_notion_connector_for_path;
+use afsd::virtual_fs::virtual_fs_content_root;
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindowBuilder,
@@ -178,10 +179,7 @@ async fn connect_notion() -> ActionReport {
     CONNECT_NOTION_IN_PROGRESS.store(false, Ordering::Release);
 
     match result {
-        Ok(Ok(())) => ActionReport {
-            ok: true,
-            message: "Notion connected.".to_string(),
-        },
+        Ok(Ok(message)) => ActionReport { ok: true, message },
         Ok(Err(message)) | Err(message) => {
             eprintln!("afs desktop connect notion failed: {message}");
             ActionReport { ok: false, message }
@@ -1270,7 +1268,7 @@ fn file_provider_display_name(root: &str) -> String {
         .unwrap_or_else(|| "Notion".to_string())
 }
 
-fn connect_notion_with_broker(state_root: PathBuf) -> Result<(), String> {
+fn connect_notion_with_broker(state_root: PathBuf) -> Result<String, String> {
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open AFS state: {error}"))?;
     let credentials = open_credential_store(&state_root);
@@ -1294,6 +1292,9 @@ fn connect_notion_with_broker(state_root: PathBuf) -> Result<(), String> {
     )
     .map_err(|error| error.message)?;
     let connection_id = reusable_notion_connection_id(&store);
+    let previous_connection = connection_id
+        .as_ref()
+        .and_then(|connection_id| store.get_connection(connection_id).ok().flatten());
     let options = BrokerOAuthConnectOptions {
         connection_id,
         broker_url,
@@ -1304,9 +1305,195 @@ fn connect_notion_with_broker(state_root: PathBuf) -> Result<(), String> {
         redirect_uri: start.redirect_uri,
     };
 
-    run_connect_notion_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
-        .map(|_| ())
-        .map_err(|error| error.message())
+    let report =
+        run_connect_notion_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
+            .map_err(|error| error.message())?;
+    let refresh_message = refresh_notion_mount_after_connect(
+        &state_root,
+        &mut store,
+        ConnectionId::new(report.connection_id.clone()),
+        previous_connection.as_ref(),
+    )?;
+
+    let connected_message = match report.workspace_name.or(report.account_label) {
+        Some(label) if !label.is_empty() => format!("Connected Notion workspace {label}."),
+        _ => "Connected Notion workspace.".to_string(),
+    };
+    Ok(format!("{connected_message} {refresh_message}"))
+}
+
+fn refresh_notion_mount_after_connect(
+    state_root: &Path,
+    store: &mut SqliteStateStore,
+    connection_id: ConnectionId,
+    previous_connection: Option<&ConnectionRecord>,
+) -> Result<String, String> {
+    let Some(mut mount) = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts: {error}"))?
+        .into_iter()
+        .find(|mount| mount.mount_id.0 == "notion-main" && mount.connector == "notion")
+    else {
+        return Ok("Create a Notion folder to mount the newly connected workspace.".to_string());
+    };
+
+    let next_connection = store
+        .get_connection(&connection_id)
+        .map_err(|error| format!("Could not load connected Notion metadata: {error}"))?;
+    let connection_changed =
+        connection_metadata_changed(previous_connection, next_connection.as_ref());
+
+    mount.connection_id = Some(connection_id);
+    store
+        .save_mount(mount.clone())
+        .map_err(|error| format!("Could not update Notion mount connection: {error}"))?;
+
+    ensure_daemon_running(state_root)?;
+    if mount_has_pending_local_changes(store, state_root, &mount.mount_id)? {
+        reload_daemon_mounts(state_root)?;
+        return Ok(
+            "AFS updated the connection metadata, but kept the current mount cache because there are pending local changes to review."
+                .to_string(),
+        );
+    }
+
+    clear_mount_cached_projection(store, state_root, &mount.mount_id)?;
+    reload_daemon_mounts(state_root)?;
+
+    if mount.projection.uses_virtual_filesystem() {
+        prefetch_virtual_projection_root(state_root, &mount.mount_id.0)?;
+        wait_for_mount_entities(state_root, &mount.mount_id)?;
+        register_virtual_projection(state_root, &mount)?;
+        let _ = mount_access_root(&mount);
+        if let Err(error) = install_virtual_projection_shortcut(&mount) {
+            eprintln!("afs desktop could not refresh virtual projection shortcut: {error}");
+        }
+    }
+
+    if connection_changed {
+        Ok("AFS refreshed the mounted folder for the newly connected workspace.".to_string())
+    } else {
+        Ok("AFS refreshed the mounted folder for the latest Notion access.".to_string())
+    }
+}
+
+fn connection_metadata_changed(
+    previous: Option<&ConnectionRecord>,
+    next: Option<&ConnectionRecord>,
+) -> bool {
+    previous.map(connection_metadata_key) != next.map(connection_metadata_key)
+}
+
+fn connection_metadata_key(
+    connection: &ConnectionRecord,
+) -> (&str, Option<&str>, Option<&str>, Option<&str>) {
+    (
+        connection.connector.as_str(),
+        connection.workspace_id.as_deref(),
+        connection.workspace_name.as_deref(),
+        connection.account_label.as_deref(),
+    )
+}
+
+fn mount_has_pending_local_changes(
+    store: &SqliteStateStore,
+    state_root: &Path,
+    mount_id: &MountId,
+) -> Result<bool, String> {
+    if !store
+        .list_virtual_mutations(mount_id)
+        .map_err(|error| format!("Could not inspect pending virtual changes: {error}"))?
+        .is_empty()
+    {
+        return Ok(true);
+    }
+
+    let status = run_status(
+        store,
+        StatusOptions {
+            path: None,
+            state_root: Some(state_root.to_path_buf()),
+        },
+    )
+    .map_err(|error| error.message())?;
+
+    Ok(status
+        .mounts
+        .iter()
+        .find(|mount| mount.mount_id == mount_id.0)
+        .is_some_and(|mount| {
+            mount.entries.iter().any(|entry| {
+                matches!(entry.state, StatusState::Dirty | StatusState::Conflicted)
+                    || entry.pending_journal_count > 0
+                    || entry.failed_journal_count > 0
+            })
+        }))
+}
+
+fn clear_mount_cached_projection(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    mount_id: &MountId,
+) -> Result<(), String> {
+    let entities = store
+        .list_entities(mount_id)
+        .map_err(|error| format!("Could not list cached Notion items: {error}"))?;
+    for entity in entities {
+        store
+            .delete_hydration_job(mount_id, &entity.remote_id)
+            .map_err(|error| format!("Could not clear hydration job: {error}"))?;
+        store
+            .delete_entity(mount_id, &entity.remote_id)
+            .map_err(|error| format!("Could not clear cached Notion item: {error}"))?;
+    }
+
+    for mutation in store
+        .list_virtual_mutations(mount_id)
+        .map_err(|error| format!("Could not list virtual mutations: {error}"))?
+    {
+        store
+            .delete_virtual_mutation(mount_id, &mutation.local_id)
+            .map_err(|error| format!("Could not clear virtual mutation: {error}"))?;
+    }
+
+    for job in store
+        .list_hydration_jobs()
+        .map_err(|error| format!("Could not list hydration jobs: {error}"))?
+        .into_iter()
+        .filter(|job| job.mount_id == *mount_id)
+    {
+        store
+            .delete_hydration_job(mount_id, &job.remote_id)
+            .map_err(|error| format!("Could not clear hydration job: {error}"))?;
+    }
+
+    let content_root = virtual_fs_content_root(state_root, mount_id);
+    if content_root.exists() {
+        fs::remove_dir_all(&content_root).map_err(|error| {
+            format!(
+                "Could not clear cached Notion file contents at `{}`: {error}",
+                content_root.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn wait_for_mount_entities(state_root: &Path, mount_id: &MountId) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let store = SqliteStateStore::open(state_root.to_path_buf())
+            .map_err(|error| format!("Could not inspect refreshed Notion mount: {error}"))?;
+        let count = store
+            .list_entities(mount_id)
+            .map_err(|error| format!("Could not inspect refreshed Notion mount: {error}"))?
+            .len();
+        if count > 0 || std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 fn reusable_notion_connection_id(store: &SqliteStateStore) -> Option<ConnectionId> {
@@ -1394,7 +1581,12 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{notion_id_from_url, should_hide_tray_popover, validate_mount_root};
+    use afs_store::{ConnectionId, ConnectionRecord};
+
+    use super::{
+        connection_metadata_changed, notion_id_from_url, should_hide_tray_popover,
+        validate_mount_root,
+    };
 
     #[test]
     fn extracts_id_from_notion_pretty_workspace_url() {
@@ -1465,6 +1657,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn connection_metadata_change_detects_workspace_switches() {
+        let previous = test_connection("workspace-1", "Teamspace A");
+        let next = test_connection("workspace-2", "Teamspace B");
+
+        assert!(connection_metadata_changed(Some(&previous), Some(&next)));
+        assert!(!connection_metadata_changed(
+            Some(&previous),
+            Some(&previous)
+        ));
+    }
+
     struct TestTempDir {
         path: PathBuf,
     }
@@ -1491,6 +1695,26 @@ mod tests {
     impl Drop for TestTempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_connection(workspace_id: &str, workspace_name: &str) -> ConnectionRecord {
+        ConnectionRecord {
+            connection_id: ConnectionId::new("notion-default"),
+            profile_id: None,
+            connector: "notion".to_string(),
+            display_name: "notion-default".to_string(),
+            account_label: Some(workspace_name.to_string()),
+            workspace_id: Some(workspace_id.to_string()),
+            workspace_name: Some(workspace_name.to_string()),
+            auth_kind: "oauth".to_string(),
+            secret_ref: "connection:notion-default".to_string(),
+            scopes: Vec::new(),
+            capabilities_json: "{}".to_string(),
+            status: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            expires_at: None,
         }
     }
 }

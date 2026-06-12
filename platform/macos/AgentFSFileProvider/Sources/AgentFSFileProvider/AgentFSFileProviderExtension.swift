@@ -138,9 +138,55 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     completionHandler:
       @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
   ) -> Progress {
-    let progress = Progress(totalUnitCount: 1)
-    completionHandler(nil, [], false, unsupportedWriteError())
-    progress.completedUnitCount = 1
+    let progress = Progress(totalUnitCount: 2)
+    let completion = UncheckedSendable(completionHandler)
+    let progressHandle = UncheckedSendable(progress)
+    let mountId = self.mountId
+    let daemonIdentifier = AgentFSFileProviderItem.daemonIdentifier(item.itemIdentifier)
+    let client: AgentFSDaemonClient
+    do {
+      client = try daemonClient()
+    } catch {
+      completionHandler(nil, [], false, error)
+      progress.completedUnitCount = 2
+      return progress
+    }
+    guard let newContents else {
+      completionHandler(
+        nil,
+        changedFields,
+        false,
+        unsupportedWriteError("Only file content edits are supported right now.")
+      )
+      progress.completedUnitCount = 2
+      return progress
+    }
+
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let data = try Data(contentsOf: newContents)
+        _ = try client.write(
+          mountId: mountId,
+          identifier: daemonIdentifier,
+          contentsBase64: data.base64EncodedString()
+        )
+        progressHandle.value.completedUnitCount = 1
+        let refreshed = try client.item(
+          mountId: mountId,
+          identifier: daemonIdentifier
+        )
+        completion.value(
+          AgentFSFileProviderItem(metadata: refreshed.item),
+          [],
+          false,
+          nil
+        )
+        progressHandle.value.completedUnitCount = 2
+      } catch {
+        completion.value(nil, changedFields, false, agentFSFileProviderError(error))
+        progressHandle.value.completedUnitCount = 2
+      }
+    }
     return progress
   }
 
@@ -179,12 +225,17 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
   }
 
   private func unsupportedWriteError() -> NSError {
+    unsupportedWriteError(
+      "AgentFS currently supports editing existing page files. Create, rename, and delete support will be added through the daemon write pipeline."
+    )
+  }
+
+  private func unsupportedWriteError(_ message: String) -> NSError {
     NSError(
       domain: NSCocoaErrorDomain,
       code: NSFeatureUnsupportedError,
       userInfo: [
-        NSLocalizedDescriptionKey:
-          "AgentFS File Provider writes are routed through the daemon push pipeline in a later slice."
+        NSLocalizedDescriptionKey: message
       ]
     )
   }

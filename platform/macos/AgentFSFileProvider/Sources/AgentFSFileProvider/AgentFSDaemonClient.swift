@@ -106,6 +106,24 @@ struct AgentFSReadPayload: Decodable {
   }
 }
 
+struct AgentFSWritePayload: Decodable {
+  let mountId: String
+  let identifier: String
+  let remoteId: String
+  let path: String
+  let bytesWritten: Int
+  let hydration: String
+
+  enum CodingKeys: String, CodingKey {
+    case mountId = "mount_id"
+    case identifier
+    case remoteId = "remote_id"
+    case path
+    case bytesWritten = "bytes_written"
+    case hydration
+  }
+}
+
 struct AgentFSItemMetadata: Decodable {
   let identifier: String
   let parentIdentifier: String?
@@ -191,6 +209,19 @@ final class AgentFSDaemonClient: @unchecked Sendable {
       "command": "file_provider_read",
       "mount_id": mountId,
       "identifier": identifier,
+    ])
+  }
+
+  func write(
+    mountId: String,
+    identifier: String,
+    contentsBase64: String
+  ) throws -> AgentFSWritePayload {
+    try request([
+      "command": "virtual_fs_commit_write",
+      "mount_id": mountId,
+      "identifier": identifier,
+      "contents_base64": contentsBase64,
     ])
   }
 

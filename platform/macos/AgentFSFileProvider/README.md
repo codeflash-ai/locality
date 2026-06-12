@@ -17,6 +17,10 @@ macOS IPC commands are compatibility aliases over the daemon's platform-neutral
 - `fetchContents(for:)` calls `file_provider_materialize`, which blocks until
   the daemon hydrates the page, then copies the materialized Markdown into File
   Provider's transfer directory before returning it to the system.
+- `modifyItem(_:contents:)` accepts edits to existing page files and calls
+  `virtual_fs_commit_write`. The daemon writes the replacement bytes to the
+  virtual content cache and marks the page dirty so the normal review and push
+  flow can decide when to update Notion.
 
 The File Provider domain identifier must be the AgentFS `mount_id`; the daemon
 uses that to resolve the mounted Notion tree. The extension talks to `afsd` over
@@ -47,6 +51,6 @@ in Finder. Opening the raw mount root is not enough to test lazy enumeration:
 Finder must enter the File Provider domain so directory listings call
 `file_provider_children` on `afsd`.
 
-The current write callbacks return unsupported because the next slice should
-route File Provider edits through the same daemon push/reconciler path as
-explicit `afs push`.
+The current create, rename, and delete callbacks still return unsupported.
+Those operations require separate virtual mutations and should stay aligned with
+the same daemon review and push model before they are exposed to Finder.
