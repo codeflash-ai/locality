@@ -50,11 +50,11 @@ Sources used for the baseline:
 | `embed` | Directive | No | fixture, live read | URL preserved. |
 | `bookmark` | Directive | No | fixture, live read | URL preserved. |
 | `link_preview` | Directive | No | fixture | URL preserved when returned by the API; the current create-page API rejected it as a child block in live testing. |
-| `image` | Directive plus local image download | No | fixture, live read/download | Original URL remains in the directive. |
-| `video` | Directive | No | fixture, live read | Local download intentionally skipped for now. |
-| `file` | Directive | No | fixture, live read | Local download intentionally skipped for now. |
-| `pdf` | Directive | No | fixture, live read | Local download intentionally skipped for now. |
-| `audio` | Directive | No | fixture, live read | Local download intentionally skipped for now. |
+| `image` | Markdown image plus local image download | No | fixture, live read/download | Uses `external.url` or Notion-hosted `file.url`; URL-less payloads fall back to directives. |
+| `video` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |
+| `file` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |
+| `pdf` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |
+| `audio` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |
 | `synced_block` | Directive wrapper; source block ID preserved when present | No | fixture | Rewriting synced blocks is lossy without source/copy semantics; live creation of an original synced block was rejected because Notion requires `synced_from`. |
 | `link_to_page` | Directive | No | fixture, live read | Page/database target ID preserved. |
 | `table_of_contents` | Directive | No | fixture, live read | Generated navigation block; no useful Markdown edit surface. |

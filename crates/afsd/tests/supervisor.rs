@@ -7,7 +7,7 @@ use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ShadowRepository,
+    ProjectionMode, ShadowRepository,
 };
 use afsd::execution::{DaemonExecutor, HydrationDrainJob, HydrationRequestJob};
 use afsd::hydration::{HydratedEntity, HydrationQueue, HydrationSource};
@@ -27,6 +27,80 @@ fn supervisor_start_registers_mount_roots_with_watcher() {
         vec![PathBuf::from("/tmp/afs/notion")]
     );
     assert_eq!(supervisor.mounts().len(), 1);
+}
+
+#[test]
+fn supervisor_start_skips_virtual_projection_mount_roots() {
+    let mut store = InMemoryStateStore::new();
+    let plain_mount = MountConfig::new(
+        MountId::new("notion-plain"),
+        "notion",
+        "/tmp/afs/notion-plain",
+    );
+    let virtual_mount = MountConfig::new(
+        MountId::new("notion-fuse"),
+        "notion",
+        "/tmp/afs/notion-fuse",
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(plain_mount).expect("save plain mount");
+    store.save_mount(virtual_mount).expect("save virtual mount");
+    let mut supervisor = DaemonSupervisor::new(
+        store,
+        RecordingWatcher::default(),
+        HydrationQueue::new(),
+        PullScheduler::new(Default::default()),
+    );
+
+    let report = supervisor.start().expect("start supervisor");
+
+    assert_eq!(report.watched_mounts, 1);
+    assert_eq!(
+        supervisor.watcher().watched,
+        vec![PathBuf::from("/tmp/afs/notion-plain")]
+    );
+    assert_eq!(supervisor.mounts().len(), 2);
+}
+
+#[test]
+fn virtual_projection_file_event_is_ignored_by_host_watcher_path() {
+    let mut store = InMemoryStateStore::new();
+    let mount = MountConfig::new(
+        MountId::new("notion-fuse"),
+        "notion",
+        "/tmp/afs/notion-fuse",
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount.mount_id,
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Stub),
+        )
+        .expect("save entity");
+    let mut supervisor = DaemonSupervisor::new(
+        store,
+        RecordingWatcher::default(),
+        HydrationQueue::new(),
+        PullScheduler::new(Default::default()),
+    );
+    supervisor.start().expect("start supervisor");
+
+    let report = supervisor
+        .execute_file_event(FileEvent {
+            path: PathBuf::from("/tmp/afs/notion-fuse/Roadmap.md"),
+            kind: FileEventKind::Read,
+        })
+        .expect("handle event");
+
+    assert_eq!(report.ignored_events, 1);
+    assert!(supervisor.hydration().is_empty());
 }
 
 #[test]

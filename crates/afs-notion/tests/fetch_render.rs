@@ -2,19 +2,21 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use afs_connector::{Connector, EnumerateRequest, FetchRequest};
+use afs_connector::{
+    ChildContainer, Connector, EnumerateRequest, FetchRequest, ListChildrenRequest,
+};
 use afs_core::model::{EntityKind, MountId, RemoteId};
 use afs_core::shadow::MarkdownBlockKind;
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, BlockTreeDto, ColorOnlyBlockDto, DataSourceDto, DataSourcePropertyDto,
-    DataSourceSummaryDto, DatabaseDto, DateMentionDto, EmptyBlockDto, EquationBlockDto,
-    EquationRichTextDto, ExternalFileDto, FileBlockDto, FilePropertyDto, HostedFileDto, IdRefDto,
-    LinkDto, LinkToPageBlockDto, MeetingNotesBlockDto, MentionRichTextDto, PageDto, PageListDto,
-    PagePropertyDto, PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto,
-    SelectOptionDto, SelectPropertySchemaDto, SyncedBlockDto, SyncedFromDto, TableBlockDto,
-    TableRowBlockDto, TextRichTextDto, TitleBlockDto, UniqueIdPropertyDto, UrlBlockDto,
-    VerificationPropertyDto,
+    DataSourceSummaryDto, DatabaseDto, DatabaseListDto, DateMentionDto, EmptyBlockDto,
+    EquationBlockDto, EquationRichTextDto, ExternalFileDto, FileBlockDto, FilePropertyDto,
+    HostedFileDto, IdRefDto, LinkDto, LinkToPageBlockDto, MeetingNotesBlockDto, MentionRichTextDto,
+    PageDto, PageListDto, PagePropertyDto, PaginatedListDto, ParentDto, RichTextAnnotationsDto,
+    RichTextBlockDto, RichTextDto, SelectOptionDto, SelectPropertySchemaDto, SyncedBlockDto,
+    SyncedFromDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto,
+    UniqueIdPropertyDto, UrlBlockDto, VerificationPropertyDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::json;
@@ -253,7 +255,7 @@ fn render_richer_notion_block_coverage() {
             "$$\nE=mc^2\n$$\n\n",
             "::afs{id=embed-1 type=embed title=\"Embed caption\" url=\"https://example.com/embed\"}\n\n",
             "::afs{id=bookmark-1 type=bookmark title=\"Bookmark caption\" url=\"https://example.com/bookmark\"}\n\n",
-            "::afs{id=image-1 type=image title=\"Image caption\" url=\"https://example.com/image.png\"}\n\n",
+            "![Image caption](https://example.com/image.png)\n\n",
             "::afs{id=synced-1 type=synced_block source_block_id=\"source-block-1\"}\n\n",
             "::afs{id=link-to-page-1 type=link_to_page page_id=\"target-page-1\"}\n\n",
             "::afs{id=toc-1 type=table_of_contents color=\"default\"}\n\n",
@@ -551,11 +553,11 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "::afs{id=embed-1 type=embed title=\"Embed\" url=\"https://example.com/embed\"}",
         "::afs{id=bookmark-1 type=bookmark title=\"Bookmark\" url=\"https://example.com/bookmark\"}",
         "::afs{id=link-preview-1 type=link_preview title=\"Preview\" url=\"https://example.com/preview\"}",
-        "type=image title=\"Image\" local=\"media/Docs/Coverage/image-111111111111.png\"",
-        "type=video title=\"Video\" local=\"media/Docs/Coverage/video-222222222222.mp4\"",
-        "type=file title=\"File\" local=\"media/Docs/Coverage/file-333333333333.txt\"",
-        "type=pdf title=\"PDF\" local=\"media/Docs/Coverage/pdf-444444444444.pdf\"",
-        "type=audio title=\"Audio\" local=\"media/Docs/Coverage/audio-555555555555.mp3\"",
+        "![Image](https://example.com/image.png)",
+        "[Video](https://example.com/video.mp4)",
+        "[File](https://example.com/file.txt)",
+        "[PDF](https://example.com/file.pdf)",
+        "[Audio](https://example.com/audio.mp3)",
         "::afs{id=synced-original-1 type=synced_block}",
         "::afs{id=synced-copy-1 type=synced_block source_block_id=\"source-block-1\"}",
         "::afs{id=link-page-1 type=link_to_page page_id=\"target-page-1\"}",
@@ -681,7 +683,7 @@ fn render_malformed_table_as_directives() {
 }
 
 #[test]
-fn render_media_blocks_with_local_paths_when_page_path_is_available() {
+fn render_media_blocks_as_markdown_links_and_tracks_local_paths() {
     let bundle = afs_notion::dto::NotionPageBundle {
         page: page("page-1", "Coverage"),
         blocks: vec![BlockTreeDto {
@@ -706,17 +708,63 @@ fn render_media_blocks_with_local_paths_when_page_path_is_available() {
         rendered.media_assets[0].local_path,
         Path::new("media/Docs/Coverage ~page1/image-0123456789ab.png")
     );
-    assert!(
-        rendered
-            .document
-            .body
-            .contains("local=\"media/Docs/Coverage ~page1/image-0123456789ab.png\"")
+    assert_eq!(
+        rendered.document.body,
+        "![Image caption](https://example.com/image.PNG?download=1)\n"
     );
-    assert!(
-        rendered
-            .document
-            .body
-            .contains("url=\"https://example.com/image.PNG?download=1\"")
+}
+
+#[test]
+fn render_notion_hosted_media_file_url_as_markdown_image() {
+    let mut block = block("hosted-image-1", "image");
+    block.image = Some(FileBlockDto {
+        kind: "file".to_string(),
+        external: None,
+        file: Some(HostedFileDto {
+            url: "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image.png?X-Amz-Signature=abc"
+                .to_string(),
+            expiry_time: Some("2026-06-12T10:00:00.000Z".to_string()),
+        }),
+        caption: Vec::new(),
+    });
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Coverage"),
+        blocks: vec![BlockTreeDto {
+            block,
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "![Image](https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image.png?X-Amz-Signature=abc)\n"
+    );
+}
+
+#[test]
+fn render_url_less_media_payload_as_directive() {
+    let mut block = block("image-without-url", "image");
+    block.image = Some(FileBlockDto {
+        kind: "file".to_string(),
+        external: None,
+        file: None,
+        caption: vec![rich_text("Image caption")],
+    });
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Coverage"),
+        blocks: vec![BlockTreeDto {
+            block,
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "::afs{id=image-without-url type=image title=\"Image caption\"}\n"
     );
 }
 
@@ -1197,6 +1245,85 @@ fn enumerate_projects_root_page_tree_to_stable_paths() {
 }
 
 #[test]
+fn list_children_returns_workspace_root_pages_without_nested_duplicates() {
+    let api = FixtureNotionApi::workspace();
+    let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
+
+    let result = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("notion-main"),
+            container: ChildContainer::Root,
+            parent_path: Path::new("").to_path_buf(),
+        })
+        .expect("list workspace root");
+
+    assert_eq!(result.entries.len(), 2);
+    assert_eq!(result.entries[0].remote_id, RemoteId::new("root-page"));
+    assert_eq!(result.entries[0].kind, EntityKind::Page);
+    assert_eq!(result.entries[0].path, Path::new("root ~ae.md"));
+    assert_eq!(result.entries[1].remote_id, RemoteId::new("root-db"));
+    assert_eq!(result.entries[1].kind, EntityKind::Database);
+    assert_eq!(result.entries[1].path, Path::new("tasks ~db"));
+}
+
+#[test]
+fn list_children_fetches_one_page_container_without_hydrating_descendants() {
+    let root_page_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let api = FixtureNotionApi::tree(root_page_id.as_str());
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root_page_id.clone()),
+        Arc::new(api),
+    );
+
+    let result = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("notion-main"),
+            container: ChildContainer::PageChildren(root_page_id),
+            parent_path: Path::new("roadmap ~aaaaaa").to_path_buf(),
+        })
+        .expect("list page children");
+
+    assert_eq!(result.entries.len(), 2);
+    assert_eq!(
+        result.entries[0].path,
+        Path::new("roadmap ~aaaaaa/design-notes ~bbbbbb.md")
+    );
+    assert_eq!(result.entries[0].kind, EntityKind::Page);
+    assert_eq!(
+        result.entries[1].path,
+        Path::new("roadmap ~aaaaaa/tasks ~cccccc")
+    );
+    assert_eq!(result.entries[1].kind, EntityKind::Database);
+}
+
+#[test]
+fn list_children_fetches_database_rows_under_database_directory() {
+    let root_page_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let api = FixtureNotionApi::tree(root_page_id.as_str());
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(root_page_id),
+        Arc::new(api),
+    );
+
+    let result = connector
+        .list_children(ListChildrenRequest {
+            mount_id: MountId::new("notion-main"),
+            container: ChildContainer::DatabaseRows(RemoteId::new(
+                "cccccccccccccccccccccccccccccccc",
+            )),
+            parent_path: Path::new("roadmap ~aaaaaa/tasks ~cccccc").to_path_buf(),
+        })
+        .expect("list database rows");
+
+    assert_eq!(result.entries.len(), 1);
+    assert_eq!(
+        result.entries[0].path,
+        Path::new("roadmap ~aaaaaa/tasks ~cccccc/fix-login-bug ~eeeeee.md")
+    );
+    assert_eq!(result.entries[0].kind, EntityKind::Page);
+}
+
+#[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_PAGE_ID"]
 fn live_fetch_and_render_page_from_environment() {
     let page_id = std::env::var("AFS_NOTION_PAGE_ID").expect("AFS_NOTION_PAGE_ID");
@@ -1359,6 +1486,48 @@ impl FixtureNotionApi {
         }
     }
 
+    fn workspace() -> Self {
+        let root_page = page_with_parent(
+            "root-page",
+            "Root",
+            Some(ParentDto {
+                kind: "workspace".to_string(),
+                workspace: Some(true),
+                ..Default::default()
+            }),
+        );
+        let nested_page = page_with_parent(
+            "nested-page",
+            "Nested",
+            Some(ParentDto {
+                kind: "page_id".to_string(),
+                page_id: Some("root-page".to_string()),
+                ..Default::default()
+            }),
+        );
+        let root_database = DatabaseDto {
+            id: "root-db".to_string(),
+            parent: Some(ParentDto {
+                kind: "workspace".to_string(),
+                workspace: Some(true),
+                ..Default::default()
+            }),
+            title: vec![rich_text("Tasks")],
+            ..Default::default()
+        };
+
+        Self {
+            pages: BTreeMap::from([
+                (root_page.id.clone(), root_page),
+                (nested_page.id.clone(), nested_page),
+            ]),
+            children: BTreeMap::new(),
+            databases: BTreeMap::from([(root_database.id.clone(), root_database)]),
+            data_sources: BTreeMap::new(),
+            data_source_pages: BTreeMap::new(),
+        }
+    }
+
     fn parent_with_child_boundaries() -> Self {
         let pages = BTreeMap::from([
             ("parent-page".to_string(), page("parent-page", "Parent")),
@@ -1479,6 +1648,17 @@ impl NotionApi for FixtureNotionApi {
         })
     }
 
+    fn search_databases(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> afs_core::AfsResult<DatabaseListDto> {
+        Ok(PaginatedListDto {
+            results: self.databases.values().cloned().collect(),
+            next_cursor: None,
+            has_more: false,
+        })
+    }
+
     fn update_block(
         &self,
         _block_id: &str,
@@ -1514,8 +1694,13 @@ impl WithChildren for BlockDto {
 }
 
 fn page(id: &str, title: &str) -> PageDto {
+    page_with_parent(id, title, None)
+}
+
+fn page_with_parent(id: &str, title: &str, parent: Option<ParentDto>) -> PageDto {
     PageDto {
         id: id.to_string(),
+        parent,
         created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
         last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
         archived: false,

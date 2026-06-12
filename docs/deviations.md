@@ -8,6 +8,27 @@ None.
 
 ## Temporary Implementation Gaps
 
+- Desktop UI command handlers now read the local AFS store, daemon health,
+  status reports, mounts, connections, journals, and the Notion OAuth broker.
+  They still fall back to sample data when the local store cannot be opened so
+  the UI remains reviewable before a first real connection.
+- Desktop onboarding still uses a timer to advance from the Notion OAuth helper
+  screen after starting the real broker flow in-process. The production app
+  should replace this timer with real connection-state events from the OAuth
+  callback and store refresh.
+- Desktop mount creation currently creates the requested local folder only.
+  Workspace-level Notion mounting still needs a core mount API that can mount an
+  entire authorized workspace rather than requiring `--root-page`.
+- The native Tauri tray now opens an initial rich popover window using the
+  confirmed clean Aperture icon and keeps the native menu for secondary
+  actions. Dynamic amber/red tray badge asset switching, focus-loss dismissal,
+  and exact native positioning polish remain to be implemented.
+- Desktop push review currently pushes the first pending file through the shared
+  Rust push path after the user approves the review. A multi-file review/apply
+  loop should batch or sequence all selected pending changes.
+- Desktop bundling is disabled in `tauri.conf.json` while the app shell is under
+  active development. Signed/notarized DMG, Homebrew packaging, auto-update, and
+  production icon sets remain distribution milestones.
 - Toggle blocks currently render as anchored directives with their summary in the `title` attribute. This preserves identity and child content, but it is not yet the clean nested-list or `<details>` round-trip targeted by `plan.md`.
 - Layout-rich blocks such as columns, tabs, synced blocks, AI/custom blocks, and meeting notes are directive-backed until the diff/apply layer can preserve their nesting and source-specific semantics safely.
 - Database row creation currently validates writable property names and types against the live Notion data source during apply. The `plan.md` target is local `_schema.yaml` validation during the parse/validate stage; that schema-backed preflight remains the next property-validation milestone.

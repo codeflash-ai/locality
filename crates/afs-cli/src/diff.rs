@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use afs_core::canonical::{
     CanonicalParseError, CanonicalParseErrorKind, ParsedCanonicalDocument, parse_canonical_markdown,
 };
+use afs_core::conflict::unresolved_conflict_marker_line;
 use afs_core::diff::property_value_from_frontmatter;
-use afs_core::model::{EntityKind, HydrationState, RemoteId};
+use afs_core::model::{EntityKind, RemoteId};
 use afs_core::planner::{
     GuardrailDecision, GuardrailPolicy, PlanDegradation, PlanDegradationKind, PlanSummary,
     PropertyValue, PushOperation, PushPlan,
@@ -71,19 +72,13 @@ where
         return create_entity_preview(store, absolute_path, mount, relative_path, file, options);
     };
 
-    if options.command == "push" && entity.hydration == HydrationState::Conflicted {
+    if let Some(line) = unresolved_conflict_marker_line(&file) {
         let report = DiffReport::validation_failure(
             options.command,
             absolute_path,
             mount,
             entity.remote_id.clone(),
-            vec![ValidationIssue::new(
-                "entity_conflicted_requires_resolve",
-                relative_path,
-                None,
-                "entity is conflicted; resolve it before pushing",
-                Some("run `afs resolve --ours|--theirs|--edited <path>` first".to_string()),
-            )],
+            vec![unresolved_conflict_marker_issue(&relative_path, line)],
         );
         return Ok(PreviewArtifacts::report_only(report));
     }
@@ -183,6 +178,17 @@ where
                         .to_string(),
                 ),
             )],
+        );
+        return Ok(PreviewArtifacts::report_only(report));
+    }
+
+    if let Some(line) = unresolved_conflict_marker_line(&file) {
+        let report = DiffReport::validation_failure(
+            options.command,
+            absolute_path,
+            mount,
+            parent.remote_id.clone(),
+            vec![unresolved_conflict_marker_issue(&relative_path, line)],
         );
         return Ok(PreviewArtifacts::report_only(report));
     }
@@ -362,6 +368,7 @@ fn create_entity_pipeline(
         vec![parent.remote_id.clone()],
         vec![PushOperation::CreateEntity {
             parent_id: parent.remote_id.clone(),
+            parent_kind: Some(parent.kind.clone()),
             title: parsed.frontmatter.title.clone().unwrap_or_default(),
             properties,
             body: parsed.document.body.clone(),
@@ -549,6 +556,19 @@ fn parse_error_issue(path: &Path, error: CanonicalParseError) -> ValidationIssue
         error.line,
         error.message,
         Some("restore the generated canonical Markdown frontmatter".to_string()),
+    )
+}
+
+fn unresolved_conflict_marker_issue(path: &Path, line: usize) -> ValidationIssue {
+    ValidationIssue::new(
+        "unresolved_conflict_markers",
+        path,
+        Some(line),
+        "file contains unresolved conflict markers",
+        Some(
+            "edit the file to choose the intended content, remove every conflict marker line, then rerun `afs diff` or `afs push`"
+                .to_string(),
+        ),
     )
 }
 
@@ -869,6 +889,7 @@ impl From<PushOperation> for PushOperationOutput {
                 properties,
                 body,
                 source_path,
+                ..
             } => Self::CreateEntity {
                 parent_id: parent_id.0,
                 title,

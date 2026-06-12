@@ -6,7 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::mount::{MountOptions, run_mount};
-use afs_cli::pull::run_pull;
+use afs_cli::pull::{run_pull, run_pull_with_state_root};
+use afs_core::conflict::{
+    CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
+    has_unresolved_conflict_markers,
+};
 use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
@@ -18,6 +22,7 @@ use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
     EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode, ShadowRepository,
 };
+use afsd::virtual_fs::virtual_fs_content_root;
 
 #[test]
 fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
@@ -72,6 +77,63 @@ fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
 }
 
 #[test]
+fn pull_virtual_mount_writes_content_and_schema_to_daemon_cache() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector("Roadmap");
+
+    let report = run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+
+    assert!(report.ok);
+    assert_eq!(report.stubbed, 0);
+    assert_eq!(report.hydrated, 1);
+    assert!(!fixture.root_file("roadmap").exists());
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    assert!(content_root.join("roadmap ~aaaaaa.md").exists());
+    assert!(
+        content_root
+            .join("roadmap ~aaaaaa")
+            .join("tasks ~cccccc")
+            .join("_schema.yaml")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn pull_virtual_file_target_does_not_stat_projection_path_as_directory() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector("Roadmap");
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+
+    fs::create_dir_all(fixture.root_file("roadmap")).expect("sentinel directory at VFS file path");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture.root_file("roadmap"),
+        Some(&state_root),
+    )
+    .expect("pull virtual file target");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 0);
+    assert_eq!(report.hydrated, 1);
+    assert_eq!(report.stubbed, 0);
+
+    let _ = fs::remove_dir_all(state_root);
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[test]
 fn pull_file_skips_dirty_hydrated_file() {
     let fixture = PullFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -87,6 +149,7 @@ fn pull_file_skips_dirty_hydrated_file() {
     assert!(!report.ok);
     assert_eq!(report.hydrated, 0);
     assert_eq!(report.skipped_dirty, 1);
+    assert!(report.conflicts.is_empty());
 }
 
 #[test]
@@ -163,7 +226,7 @@ fn pull_mount_root_preserves_shadow_remote_timestamp_for_non_rehydrated_pages() 
 }
 
 #[test]
-fn pull_file_materializes_remote_sidecar_and_marks_conflicted_when_remote_changed() {
+fn pull_file_writes_inline_conflict_markers_and_marks_conflicted_when_remote_changed() {
     let fixture = PullFixture::new();
     let mut store = InMemoryStateStore::new();
     fixture.mount(&mut store);
@@ -184,15 +247,27 @@ fn pull_file_materializes_remote_sidecar_and_marks_conflicted_when_remote_change
     assert!(!report.ok);
     assert_eq!(report.hydrated, 0);
     assert_eq!(report.skipped_dirty, 1);
-    assert!(
-        fs::read_to_string(fixture.root_file("roadmap"))
-            .expect("local file")
-            .contains("Local edit.")
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(
+        report.conflicts[0].path,
+        fixture.root_file("roadmap").display().to_string()
     );
+    assert_eq!(
+        report.conflicts[0].remote_id,
+        fixture.canonical_root_page_id.as_str()
+    );
+    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("local file");
+    assert!(contents.contains("Local edit."));
+    assert!(contents.contains("Remote body."));
+    assert!(contents.contains(CONFLICT_LOCAL_MARKER));
+    assert!(contents.contains(CONFLICT_SEPARATOR_MARKER));
+    assert!(contents.contains(CONFLICT_REMOTE_MARKER));
+    assert!(has_unresolved_conflict_markers(&contents));
     assert!(
-        fs::read_to_string(fixture.root_remote_file("roadmap"))
-            .expect("remote sidecar")
-            .contains("Remote body.")
+        !fixture
+            .root_file("roadmap")
+            .with_extension("remote.md")
+            .exists()
     );
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
@@ -210,7 +285,7 @@ fn pull_file_materializes_remote_sidecar_and_marks_conflicted_when_remote_change
 }
 
 #[test]
-fn pull_file_recreates_missing_remote_sidecar_for_unresolved_conflict() {
+fn pull_file_leaves_inline_conflict_unchanged_when_remote_changes_again() {
     let fixture = PullFixture::new();
     let mut store = InMemoryStateStore::new();
     fixture.mount(&mut store);
@@ -229,12 +304,12 @@ fn pull_file_recreates_missing_remote_sidecar_for_unresolved_conflict() {
         fixture.root_file("roadmap"),
     )
     .expect("pull conflicted file");
-    fs::remove_file(fixture.root_remote_file("roadmap")).expect("remove remote sidecar");
-    assert!(!fixture.root_remote_file("roadmap").exists());
+    let conflicted_contents =
+        fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
 
     let report = run_pull(
         &mut store,
-        &conflicted_connector,
+        &fixture.connector_with("Roadmap", "Remote body v2.", "2026-06-12T00:00:00.000Z"),
         fixture.root_file("roadmap"),
     )
     .expect("pull unresolved conflict");
@@ -242,10 +317,14 @@ fn pull_file_recreates_missing_remote_sidecar_for_unresolved_conflict() {
     assert!(!report.ok);
     assert_eq!(report.hydrated, 0);
     assert_eq!(report.skipped_dirty, 1);
-    assert!(
-        fs::read_to_string(fixture.root_remote_file("roadmap"))
-            .expect("recreated remote sidecar")
-            .contains("Remote body.")
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(
+        report.conflicts[0].path,
+        fixture.root_file("roadmap").display().to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file"),
+        conflicted_contents
     );
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
@@ -283,6 +362,10 @@ impl PullFixture {
     }
 
     fn mount(&self, store: &mut InMemoryStateStore) {
+        self.mount_with_projection(store, ProjectionMode::PlainFiles);
+    }
+
+    fn mount_with_projection(&self, store: &mut InMemoryStateStore, projection: ProjectionMode) {
         run_mount(
             store,
             MountOptions {
@@ -292,7 +375,7 @@ impl PullFixture {
                 remote_root_id: Some(self.root_page_id.clone()),
                 connection_id: None,
                 read_only: false,
-                projection: ProjectionMode::PlainFiles,
+                projection,
             },
         )
         .expect("mount");
@@ -331,10 +414,6 @@ impl PullFixture {
             .join("design-notes ~bbbbbb.md")
     }
 
-    fn root_remote_file(&self, slug: &str) -> PathBuf {
-        self.root.join(format!("{slug} ~aaaaaa.remote.md"))
-    }
-
     fn database_schema_file(&self) -> PathBuf {
         self.root
             .join("roadmap ~aaaaaa")
@@ -354,6 +433,16 @@ impl Drop for PullFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn unique_temp_path(prefix: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{unique}-{suffix}", std::process::id()))
 }
 
 #[derive(Debug)]
@@ -558,6 +647,7 @@ impl NotionApi for FixtureNotionApi {
 fn page(id: &str, title: &str, last_edited_time: &str) -> PageDto {
     PageDto {
         id: id.to_string(),
+        parent: None,
         created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
         last_edited_time: Some(last_edited_time.to_string()),
         archived: false,

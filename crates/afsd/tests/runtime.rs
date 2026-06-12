@@ -12,7 +12,7 @@ use afs_core::pull::PullMode;
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
     EntityRecord, EntityRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
-    MountRepository, ShadowRepository, SqliteStateStore,
+    MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
 };
 use afsd::DaemonConfig;
 use afsd::execution::{DaemonEventReport, PushJob};
@@ -23,6 +23,7 @@ use afsd::runtime::{
     ScheduledPullRuntimeReport,
 };
 use afsd::scheduler::PullSchedulerTick;
+use afsd::virtual_fs::{ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport};
 use afsd::watcher::{FileEvent, FileEventKind};
 use serde_json::json;
 
@@ -61,6 +62,79 @@ fn runtime_answers_ping_while_pull_worker_is_blocked() {
     release_blocked_runner(&release);
     let pull = pull_thread.join().expect("pull thread");
     assert!(pull.ok);
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_answers_virtual_fs_children_while_pull_worker_is_blocked() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (children_tx, children_rx) = mpsc::channel();
+    let (refresh_tx, refresh_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("children-while-blocked"),
+        BlockingVirtualFsRunner {
+            started: started_tx,
+            release: Arc::clone(&release),
+            children_tx,
+            refresh_tx,
+        },
+    )
+    .expect("spawn runtime");
+    let pull_handle = runtime.handle();
+
+    let pull_thread = thread::spawn(move || {
+        pull_handle.request(DaemonRequest::Pull {
+            path: PathBuf::from("Roadmap.md"),
+        })
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("pull started");
+
+    let metadata_handle = runtime.handle();
+    let (response_tx, response_rx) = mpsc::channel();
+    let metadata_thread = thread::spawn(move || {
+        let response = metadata_handle.request(DaemonRequest::VirtualFsChildren {
+            mount_id: "notion-main".to_string(),
+            container_identifier: ROOT_CONTAINER_IDENTIFIER.to_string(),
+        });
+        response_tx.send(response).expect("send metadata response");
+    });
+
+    let children_call = children_rx.recv_timeout(Duration::from_secs(1));
+    let response = response_rx.recv_timeout(Duration::from_secs(1));
+    let refresh_before_release = refresh_rx.recv_timeout(Duration::from_millis(100));
+
+    release_blocked_runner(&release);
+    assert!(pull_thread.join().expect("pull thread").ok);
+    metadata_thread.join().expect("metadata thread");
+
+    assert_eq!(
+        children_call.expect("virtual fs children should bypass active pull"),
+        (
+            "notion-main".to_string(),
+            ROOT_CONTAINER_IDENTIFIER.to_string()
+        )
+    );
+    assert!(
+        response
+            .expect("virtual fs children response should not wait for pull")
+            .ok
+    );
+    assert!(
+        refresh_before_release.is_err(),
+        "background child refresh should remain serialized behind active mutating work"
+    );
+    assert_eq!(
+        refresh_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued child refresh"),
+        (
+            "notion-main".to_string(),
+            ROOT_CONTAINER_IDENTIFIER.to_string()
+        )
+    );
     runtime.shutdown();
 }
 
@@ -201,6 +275,77 @@ fn runtime_routes_push_request_through_runner() {
     assert!(job.assume_yes);
     assert!(!job.confirm_dangerous);
     runtime.shutdown();
+}
+
+#[test]
+fn default_runner_virtual_fs_children_is_cache_only() {
+    let state_root = temp_root("cache-only-children-state");
+    let mount_root = temp_root("cache-only-children-mount");
+    let mount_id = MountId::new("notion-main");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(mount_id.clone(), "notion", mount_root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            mount_id.clone(),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap.md",
+        ))
+        .expect("save entity");
+    drop(store);
+
+    let response = DefaultRuntimeJobRunner.run_virtual_fs_children(
+        state_root,
+        mount_id.0.clone(),
+        ROOT_CONTAINER_IDENTIFIER.to_string(),
+    );
+
+    assert!(
+        response.ok,
+        "cached child listing should not require connector credentials: {:?}",
+        response.error
+    );
+    let payload = response.payload.expect("children payload");
+    let report: VirtualFsChildrenReport =
+        serde_json::from_value(payload).expect("decode children report");
+    assert!(
+        report
+            .children
+            .iter()
+            .any(|child| child.filename == "Roadmap.md")
+    );
+}
+
+#[test]
+fn default_runner_virtual_fs_children_rejects_plain_files_mount() {
+    let state_root = temp_root("plain-files-children-state");
+    let mount_root = temp_root("plain-files-children-mount");
+    let mount_id = MountId::new("notion-main");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+    store
+        .save_mount(MountConfig::new(mount_id.clone(), "notion", mount_root))
+        .expect("save mount");
+    drop(store);
+
+    let response = DefaultRuntimeJobRunner.run_virtual_fs_children(
+        state_root,
+        mount_id.0.clone(),
+        ROOT_CONTAINER_IDENTIFIER.to_string(),
+    );
+
+    assert!(!response.ok);
+    let error = response.error.expect("plain-files error");
+    assert_eq!(error.code, "unsupported");
+    assert_eq!(
+        error.message,
+        "unsupported feature: plain-files mounts do not support virtual filesystem operations"
+    );
 }
 
 #[test]
@@ -432,6 +577,79 @@ impl RuntimeJobRunner for BlockingPullRunner {
         Err(AfsError::InvalidState(
             "hydration should not run".to_string(),
         ))
+    }
+}
+
+#[derive(Clone)]
+struct BlockingVirtualFsRunner {
+    started: mpsc::Sender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    children_tx: mpsc::Sender<(String, String)>,
+    refresh_tx: mpsc::Sender<(String, String)>,
+}
+
+impl RuntimeJobRunner for BlockingVirtualFsRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        self.started.send(()).expect("notify started");
+        let (lock, condvar) = &*self.release;
+        let mut released = lock.lock().expect("lock release");
+        while !*released {
+            released = condvar.wait(released).expect("wait release");
+        }
+        DaemonResponse::ok(json!({ "command": "pull" }))
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        Err(AfsError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_virtual_fs_children(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> DaemonResponse {
+        self.children_tx
+            .send((mount_id.clone(), container_identifier.clone()))
+            .expect("notify children");
+        DaemonResponse::ok(json!({
+            "mount_id": mount_id,
+            "container_identifier": container_identifier,
+            "children": []
+        }))
+    }
+
+    fn run_virtual_fs_refresh_children(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> afs_core::AfsResult<usize> {
+        self.refresh_tx
+            .send((mount_id, container_identifier))
+            .expect("notify refresh");
+        Ok(0)
     }
 }
 

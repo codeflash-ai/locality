@@ -1,17 +1,16 @@
-use std::fs;
-use std::io::{self, Read, Write};
-use std::net::TcpListener;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::Command as ProcessCommand;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use afs_connector::ConnectorUndoApplier;
 use afs_core::AfsError;
 use afs_core::journal::PushId;
 use afs_core::model::{MountId, RemoteId};
 use afs_notion::oauth::{
-    DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
-    HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
+    DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, HttpNotionOAuthClient,
+    NotionOAuthBrokerStart,
 };
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileRepository,
@@ -35,15 +34,19 @@ use crate::connector::{
 };
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff};
+use crate::file_provider as file_provider_helper;
 use crate::history::{
     HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
     undo_report_exit_code,
 };
 use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
+use crate::local_oauth::{
+    LocalOAuthAuthorization, LocalOAuthError, local_redirect, notion_authorize_url, random_state,
+    run_local_oauth_authorization,
+};
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
-use crate::pull::{PullError, PullReport, run_pull};
+use crate::pull::{PullError, PullReport, run_pull_with_state_root};
 use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
-use crate::resolve::{ResolveChoice, ResolveError, ResolveOptions, ResolveReport, run_resolve};
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::status::{StatusError, StatusOptions, StatusReport, run_status};
 
@@ -51,7 +54,8 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_INTERNAL: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 const EXIT_VALIDATION: i32 = 3;
-const DEFAULT_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_DAEMON_MUTATING_TIMEOUT: Duration = Duration::from_secs(60);
 
 const COMMANDS: &[&str] = &[
     "connect",
@@ -68,7 +72,6 @@ const COMMANDS: &[&str] = &[
     "diff",
     "undo",
     "log",
-    "resolve",
     "restore",
     "config",
     "file-provider",
@@ -95,7 +98,6 @@ pub fn dispatch(args: &[String]) -> i32 {
         "push" => push(&args[1..], json),
         "diff" => diff(&args[1..], json),
         "restore" => restore(&args[1..], json),
-        "resolve" => resolve(&args[1..], json),
         "undo" => undo(&args[1..], json),
         "log" => log(&args[1..], json),
         "config" => stub("config", json),
@@ -212,7 +214,9 @@ fn connect(args: &[String], json: bool) -> i32 {
             json,
         ) {
             Ok(authorization) => authorization,
-            Err(error) => return command_error(json, error, EXIT_INTERNAL),
+            Err(error) => {
+                return command_error(json, local_oauth_command_error(error), EXIT_INTERNAL);
+            }
         };
         let options = BrokerOAuthConnectOptions {
             connection_id: flag_value(args, "--name").map(ConnectionId::new),
@@ -431,7 +435,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "file-provider",
                 "usage",
-                "usage: afs file-provider register|unregister <mount-id-or-path> [--json]",
+                "usage: afs file-provider register|open|unregister <mount-id-or-path> [--json]",
             ),
             EXIT_USAGE,
         );
@@ -439,6 +443,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
 
     match action {
         "register" => file_provider_register(args, json),
+        "open" => file_provider_open(args, json),
         "unregister" => file_provider_unregister(args, json),
         "list" => run_file_provider_helper(json, "list", Vec::new(), None),
         "reset" => run_file_provider_helper(json, "reset", Vec::new(), None),
@@ -447,7 +452,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "file-provider",
                 "usage",
-                "usage: afs file-provider register|unregister|list|reset",
+                "usage: afs file-provider register|open|unregister|list|reset",
             ),
             EXIT_USAGE,
         ),
@@ -510,6 +515,56 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
             )
         }
         VirtualProjectionRegistration::LinuxFuse => run_linux_fuse_register(json, &mount),
+    }
+}
+
+fn file_provider_open(args: &[String], json: bool) -> i32 {
+    let Some(target) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "usage",
+                "usage: afs file-provider open <mount-id-or-path> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let mount = match resolve_mount_target(&store, target) {
+        Ok(mount) => mount,
+        Err(message) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "mount_not_found", message),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let target_os = std::env::consts::OS;
+    let registration = match validate_virtual_projection_registration(&mount, target_os) {
+        Ok(registration) => registration,
+        Err(error) => return command_error(json, error, EXIT_USAGE),
+    };
+
+    match registration {
+        VirtualProjectionRegistration::MacosFileProvider => run_file_provider_helper(
+            json,
+            "open",
+            vec!["--mount-id".to_string(), mount.mount_id.0.clone()],
+            Some(mount.mount_id.0),
+        ),
+        VirtualProjectionRegistration::LinuxFuse => open_path_for_linux_fuse(json, &mount),
     }
 }
 
@@ -587,64 +642,6 @@ fn restore(args: &[String], json: bool) -> i32 {
     }
 }
 
-fn resolve(args: &[String], json: bool) -> i32 {
-    let choice = if has_flag(args, "--ours") {
-        Some(ResolveChoice::Ours)
-    } else if has_flag(args, "--theirs") {
-        Some(ResolveChoice::Theirs)
-    } else if has_flag(args, "--edited") {
-        Some(ResolveChoice::Edited)
-    } else {
-        None
-    };
-    let Some(choice) = choice else {
-        return command_error(
-            json,
-            CommandError::new(
-                "resolve",
-                "usage",
-                "usage: afs resolve --ours|--theirs|--edited <path> [--json]",
-            ),
-            EXIT_USAGE,
-        );
-    };
-    let Some(path) = first_positional(args) else {
-        return command_error(
-            json,
-            CommandError::new(
-                "resolve",
-                "usage",
-                "usage: afs resolve --ours|--theirs|--edited <path> [--json]",
-            ),
-            EXIT_USAGE,
-        );
-    };
-
-    let state_root = default_state_root();
-    let mut store = match SqliteStateStore::open(state_root.clone()) {
-        Ok(store) => store,
-        Err(error) => {
-            return command_error(
-                json,
-                CommandError::new("resolve", "store_open_failed", error.to_string()),
-                EXIT_INTERNAL,
-            );
-        }
-    };
-
-    match run_resolve(&mut store, PathBuf::from(path), ResolveOptions { choice }) {
-        Ok(report) if json => {
-            print_json(&report);
-            EXIT_SUCCESS
-        }
-        Ok(report) => {
-            print_resolve_report(&report);
-            EXIT_SUCCESS
-        }
-        Err(error) => resolve_command_error(json, error),
-    }
-}
-
 fn mount(args: &[String], json: bool) -> i32 {
     if first_positional(args) != Some("notion") {
         return command_error(
@@ -661,17 +658,30 @@ fn mount(args: &[String], json: bool) -> i32 {
             EXIT_USAGE,
         );
     };
-    let Some(root_page_id) = flag_value(args, "--root-page") else {
+    let root_page_id = flag_value(args, "--root-page");
+    let workspace_mount = has_flag(args, "--workspace");
+    if root_page_id.is_some() && workspace_mount {
         return command_error(
             json,
             CommandError::new(
                 "mount",
                 "usage",
-                "afs mount notion requires --root-page <page-id>",
+                "afs mount notion accepts either --workspace or --root-page <page-id>, not both",
             ),
             EXIT_USAGE,
         );
-    };
+    }
+    if root_page_id.is_none() && !workspace_mount {
+        return command_error(
+            json,
+            CommandError::new(
+                "mount",
+                "usage",
+                "afs mount notion requires --workspace or --root-page <page-id>",
+            ),
+            EXIT_USAGE,
+        );
+    }
 
     let projection = match projection_mode(args) {
         Ok(projection) => projection,
@@ -708,7 +718,7 @@ fn mount(args: &[String], json: bool) -> i32 {
         ),
         connector: "notion".to_string(),
         root: PathBuf::from(root),
-        remote_root_id: Some(RemoteId::new(root_page_id)),
+        remote_root_id: root_page_id.map(RemoteId::new),
         connection_id,
         read_only: has_flag(args, "--read-only"),
         projection,
@@ -739,7 +749,7 @@ fn pull(args: &[String], json: bool) -> i32 {
     };
 
     let state_root = default_state_root();
-    match run_daemon_report::<PullReport>(
+    let fallback_reason = match run_daemon_report::<PullReport>(
         &state_root,
         &DaemonRequest::Pull {
             path: PathBuf::from(path),
@@ -755,7 +765,7 @@ fn pull(args: &[String], json: bool) -> i32 {
             print_pull_report(&report);
             return exit_code;
         }
-        DaemonReport::Unavailable(reason) => warn_daemon_fallback("pull", reason),
+        DaemonReport::Unavailable(reason) => reason,
         DaemonReport::Error(error) => {
             return command_error(
                 json,
@@ -763,6 +773,9 @@ fn pull(args: &[String], json: bool) -> i32 {
                 error.exit_code,
             );
         }
+    };
+    if let Some(error) = pull_direct_fallback_error(fallback_reason, None) {
+        return command_error(json, error, EXIT_INTERNAL);
     }
 
     let mut store = match SqliteStateStore::open(state_root.clone()) {
@@ -775,13 +788,24 @@ fn pull(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let fallback_mount = resolve_mount_target(&store, path).ok();
+    if let Some(error) = pull_direct_fallback_error(fallback_reason, fallback_mount.as_ref()) {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+    warn_daemon_fallback("pull", fallback_reason);
+
     let credentials = open_credential_store(&state_root);
     let connector = match resolve_notion_connector_for_path(&store, credentials.as_ref(), path) {
         Ok(connector) => connector,
         Err(error) => return connector_command_error("pull", json, error),
     };
 
-    match run_pull(&mut store, &connector, PathBuf::from(path)) {
+    match run_pull_with_state_root(
+        &mut store,
+        &connector,
+        PathBuf::from(path),
+        Some(&state_root),
+    ) {
         Ok(report) if json => {
             let exit_code = pull_report_exit_code(&report);
             print_json(&report);
@@ -998,7 +1022,7 @@ fn push(args: &[String], json: bool) -> i32 {
                     "daemon_timeout",
                     format!(
                         "afsd did not respond within {}ms after the push request was submitted; refusing direct fallback to avoid duplicate remote writes",
-                        daemon_request_timeout().as_millis()
+                        daemon_mutating_request_timeout().as_millis()
                     ),
                 ),
                 EXIT_INTERNAL,
@@ -1180,6 +1204,9 @@ fn print_push_report(report: &PushReport) {
                     .as_deref()
                     .unwrap_or("connector apply failed")
             );
+            if let Some(suggested_fix) = &report.suggested_fix {
+                println!("  suggested_fix: {suggested_fix}");
+            }
         }
         _ => println!("push stopped: {}", report.action),
     }
@@ -1280,7 +1307,29 @@ fn print_disconnect_report(report: &DisconnectReport) {
 }
 
 fn print_pull_report(report: &PullReport) {
-    if report.skipped_dirty > 0 {
+    if !report.conflicts.is_empty() {
+        let skipped_without_conflicts = report.skipped_dirty.saturating_sub(report.conflicts.len());
+        println!(
+            "pull completed with {} conflicted file(s); {} dirty file(s) skipped, {} hydrated, {} stubbed, {} enumerated (via {})",
+            report.conflicts.len(),
+            skipped_without_conflicts,
+            report.hydrated,
+            report.stubbed,
+            report.enumerated,
+            report.via
+        );
+        println!("  conflicted:");
+        for conflict in &report.conflicts {
+            println!("    {}", conflict.path);
+        }
+        println!("  next: resolve the conflict markers in the file(s)");
+        if report.conflicts.len() == 1 {
+            let path = shell_quote(&report.conflicts[0].path);
+            println!("  then: afs push {path} -y");
+        } else {
+            println!("  then: run `afs push <file> -y` for each resolved file");
+        }
+    } else if report.skipped_dirty > 0 {
         println!(
             "pull skipped {} dirty file(s); {} hydrated, {} stubbed, {} enumerated (via {})",
             report.skipped_dirty, report.hydrated, report.stubbed, report.enumerated, report.via
@@ -1293,12 +1342,18 @@ fn print_pull_report(report: &PullReport) {
     }
 }
 
-fn print_restore_report(report: &RestoreReport) {
-    println!("restored {}", report.path);
+fn shell_quote(value: &str) -> String {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, '/' | '.' | '_' | '-' | '~' | ':' | '=')
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn print_resolve_report(report: &ResolveReport) {
-    println!("{}", report.message);
+fn print_restore_report(report: &RestoreReport) {
+    println!("restored {}", report.path);
 }
 
 fn print_status_report(report: &StatusReport) {
@@ -1463,63 +1518,24 @@ fn run_file_provider_helper(
     args: Vec<String>,
     mount_id: Option<String>,
 ) -> i32 {
-    let helper = match file_provider_helper_path() {
-        Some(path) => path,
-        None => {
-            return command_error(
-                json,
-                CommandError::new(
-                    "file-provider",
-                    "helper_missing",
-                    "agentfs-file-providerctl was not found; build or install platform/macos/AgentFSFileProvider first",
-                ),
-                EXIT_INTERNAL,
-            );
-        }
-    };
-
-    let mut command = ProcessCommand::new(&helper);
-    command.arg(action);
-    command.args(args);
-    command.arg("--json");
-    let output = match command.output() {
-        Ok(output) => output,
+    let helper_report = match file_provider_helper::run_macos_file_provider_helper(action, args) {
+        Ok(report) => report,
         Err(error) => {
             return command_error(
                 json,
-                CommandError::new("file-provider", "helper_failed", error.to_string()),
+                CommandError::new("file-provider", error.code(), error.message()),
                 EXIT_INTERNAL,
             );
         }
     };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let helper_report =
-        serde_json::from_str::<Value>(&stdout).unwrap_or_else(|_| Value::String(stdout.clone()));
-
-    if !output.status.success() {
-        let message = helper_report
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .filter(|message| !message.is_empty())
-            .or_else(|| (!stderr.is_empty()).then_some(stderr))
-            .unwrap_or_else(|| format!("agentfs-file-providerctl exited with {}", output.status));
-        return command_error(
-            json,
-            CommandError::new("file-provider", "helper_failed", message),
-            EXIT_INTERNAL,
-        );
-    }
 
     let report = FileProviderCommandReport {
         ok: true,
         command: "file-provider",
         action: action.to_string(),
         mount_id,
-        helper: helper.display().to_string(),
-        helper_report,
+        helper: helper_report.helper.display().to_string(),
+        helper_report: helper_report.helper_report,
     };
 
     if json {
@@ -1533,47 +1549,12 @@ fn run_file_provider_helper(
 #[cfg(target_os = "linux")]
 fn run_linux_fuse_register(json: bool, mount: &MountConfig) -> i32 {
     let state_root = default_state_root();
-    if !daemon_is_running(&state_root) {
-        return command_error(
-            json,
-            CommandError::new(
-                "file-provider",
-                "daemon_not_running",
-                "afsd is not running; start it with `afs daemon start` before registering the FUSE mount",
-            ),
-            EXIT_INTERNAL,
-        );
-    }
-
-    let Some(afs_fuse) = afs_fuse_helper_path() else {
-        return command_error(
-            json,
-            CommandError::new(
-                "file-provider",
-                "helper_missing",
-                "afs-fuse was not found; build or install the afs-fuse binary",
-            ),
-            EXIT_INTERNAL,
-        );
+    let registration = match file_provider_helper::register_linux_fuse_mount(&state_root, mount) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(json, linux_fuse_command_error(error), EXIT_INTERNAL);
+        }
     };
-
-    let unit_name = linux_fuse_unit_name(&mount.mount_id.0);
-    let unit_path = match linux_fuse_unit_path(&unit_name) {
-        Ok(path) => path,
-        Err(error) => return command_error(json, error, EXIT_INTERNAL),
-    };
-    if let Err(error) = write_linux_fuse_unit(&unit_path, &afs_fuse, &state_root, mount) {
-        return command_error(json, error, EXIT_INTERNAL);
-    }
-    if let Err(error) = run_systemctl_user(&["daemon-reload"]) {
-        return command_error(json, error, EXIT_INTERNAL);
-    }
-    if let Err(error) = run_systemctl_user(&["enable", &unit_name]) {
-        return command_error(json, error, EXIT_INTERNAL);
-    }
-    if let Err(error) = run_systemctl_user(&["restart", &unit_name]) {
-        return command_error(json, error, EXIT_INTERNAL);
-    }
 
     let report = FileProviderCommandReport {
         ok: true,
@@ -1583,10 +1564,10 @@ fn run_linux_fuse_register(json: bool, mount: &MountConfig) -> i32 {
         helper: "systemctl --user".to_string(),
         helper_report: serde_json::json!({
             "message": format!("Linux FUSE mount registered for `{}`", mount.mount_id.0),
-            "service": unit_name,
-            "unit_path": unit_path.display().to_string(),
-            "mountpoint": mount.root.display().to_string(),
-            "afs_fuse": afs_fuse.display().to_string(),
+            "service": registration.service,
+            "unit_path": registration.unit_path.display().to_string(),
+            "mountpoint": registration.mountpoint.display().to_string(),
+            "afs_fuse": registration.afs_fuse.display().to_string(),
         }),
     };
     if json {
@@ -1614,6 +1595,52 @@ fn run_linux_fuse_register(json: bool, mount: &MountConfig) -> i32 {
 }
 
 #[cfg(target_os = "linux")]
+fn open_path_for_linux_fuse(json: bool, mount: &MountConfig) -> i32 {
+    match ProcessCommand::new("xdg-open").arg(&mount.root).spawn() {
+        Ok(_) => {
+            let report = FileProviderCommandReport {
+                ok: true,
+                command: "file-provider",
+                action: "open".to_string(),
+                mount_id: Some(mount.mount_id.0.clone()),
+                helper: "xdg-open".to_string(),
+                helper_report: serde_json::json!({
+                    "message": format!("opened {}", mount.root.display()),
+                    "mountpoint": mount.root.display().to_string(),
+                }),
+            };
+            if json {
+                print_json(&report);
+            } else {
+                print_file_provider_report(&report);
+            }
+            EXIT_SUCCESS
+        }
+        Err(error) => command_error(
+            json,
+            CommandError::new("file-provider", "helper_failed", error.to_string()),
+            EXIT_INTERNAL,
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_path_for_linux_fuse(json: bool, mount: &MountConfig) -> i32 {
+    command_error(
+        json,
+        CommandError::new(
+            "file-provider",
+            "unsupported_platform",
+            format!(
+                "linux_fuse open is only supported on Linux; mount `{}` cannot be opened here",
+                mount.mount_id.0
+            ),
+        ),
+        EXIT_USAGE,
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn run_linux_fuse_unregister(json: bool, mount: Option<&MountConfig>, target: &str) -> i32 {
     if let Some(mount) = mount
         && let Err(error) = validate_virtual_projection_registration(mount, "linux")
@@ -1623,22 +1650,22 @@ fn run_linux_fuse_unregister(json: bool, mount: Option<&MountConfig>, target: &s
     let mount_id = mount
         .map(|mount| mount.mount_id.0.clone())
         .unwrap_or_else(|| target.to_string());
-    let unit_name = linux_fuse_unit_name(&mount_id);
-    let unit_path = match linux_fuse_unit_path(&unit_name) {
+    let unit_name = file_provider_helper::linux_fuse_unit_name(&mount_id);
+    let unit_path = match file_provider_helper::linux_fuse_unit_path(&unit_name) {
         Ok(path) => path,
-        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+        Err(error) => return command_error(json, linux_fuse_command_error(error), EXIT_INTERNAL),
     };
 
-    let _ = run_systemctl_user(&["disable", "--now", &unit_name]);
+    let _ = file_provider_helper::run_systemctl_user(&["disable", "--now", &unit_name]);
     if let Some(mount) = mount {
         let _ = ProcessCommand::new("fusermount3")
             .arg("-uz")
             .arg(&mount.root)
             .output();
     }
-    let _ = fs::remove_file(&unit_path);
-    if let Err(error) = run_systemctl_user(&["daemon-reload"]) {
-        return command_error(json, error, EXIT_INTERNAL);
+    let _ = std::fs::remove_file(&unit_path);
+    if let Err(error) = file_provider_helper::run_systemctl_user(&["daemon-reload"]) {
+        return command_error(json, linux_fuse_command_error(error), EXIT_INTERNAL);
     }
 
     let report = FileProviderCommandReport {
@@ -1675,162 +1702,10 @@ fn run_linux_fuse_unregister(json: bool, _mount: Option<&MountConfig>, target: &
 }
 
 #[cfg(target_os = "linux")]
-fn write_linux_fuse_unit(
-    unit_path: &Path,
-    afs_fuse: &Path,
-    state_root: &Path,
-    mount: &MountConfig,
-) -> Result<(), CommandError> {
-    let log_dir = state_root.join("logs");
-    fs::create_dir_all(unit_path.parent().unwrap_or_else(|| Path::new(".")))
-        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
-    fs::create_dir_all(&log_dir)
-        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
-    fs::create_dir_all(&mount.root)
-        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
-
-    let log_path = log_dir.join(format!(
-        "afs-fuse.{}.log",
-        sanitize_systemd_fragment(&mount.mount_id.0)
-    ));
-    let unit = linux_fuse_unit_contents(afs_fuse, state_root, mount, &log_path);
-    fs::write(unit_path, unit)
-        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))
-}
-
-#[cfg(target_os = "linux")]
-fn linux_fuse_unit_contents(
-    afs_fuse: &Path,
-    state_root: &Path,
-    mount: &MountConfig,
-    log_path: &Path,
-) -> String {
-    format!(
-        "[Unit]\nDescription=AgentFS FUSE mount for {mount_id}\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={afs_fuse} --mount-id {mount_id_arg} --state-dir {state_root} --mountpoint {mountpoint}\nExecStop=/usr/bin/fusermount3 -uz {mountpoint}\nKillSignal=SIGINT\nTimeoutStopSec=10\nLimitCORE=0\nRestart=on-failure\nRestartSec=2\nStandardOutput=append:{log_path}\nStandardError=append:{log_path}\n\n[Install]\nWantedBy=default.target\n",
-        mount_id = mount.mount_id.0,
-        afs_fuse = systemd_quote(&afs_fuse.display().to_string()),
-        mount_id_arg = systemd_quote(&mount.mount_id.0),
-        state_root = systemd_quote(&state_root.display().to_string()),
-        mountpoint = systemd_quote(&mount.root.display().to_string()),
-        log_path = log_path.display(),
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn run_systemctl_user(args: &[&str]) -> Result<(), CommandError> {
-    let output = ProcessCommand::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .output()
-        .map_err(|error| {
-            CommandError::new("file-provider", "systemctl_failed", error.to_string())
-        })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    Err(CommandError::new(
-        "file-provider",
-        "systemctl_failed",
-        if message.is_empty() {
-            format!("systemctl --user exited with {}", output.status)
-        } else {
-            message
-        },
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn daemon_is_running(state_root: &Path) -> bool {
-    matches!(
-        send_request_with_timeout(state_root, &DaemonRequest::Ping, daemon_request_timeout()),
-        Ok(response) if response.ok
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn linux_fuse_unit_name(mount_id: &str) -> String {
-    format!(
-        "ai.codeflash.afs.fuse.{}.service",
-        sanitize_systemd_fragment(mount_id)
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn linux_fuse_unit_path(unit_name: &str) -> Result<PathBuf, CommandError> {
-    let home = home_dir_path()?;
-    Ok(home.join(".config/systemd/user").join(unit_name))
-}
-
-#[cfg(target_os = "linux")]
-fn sanitize_systemd_fragment(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn systemd_quote(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('$', "\\$")
-        .replace('`', "\\`");
-    format!("\"{escaped}\"")
-}
-
-#[cfg(target_os = "linux")]
-fn home_dir_path() -> Result<PathBuf, CommandError> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| CommandError::new("file-provider", "env_missing", "HOME is not set"))
-}
-
-#[cfg(target_os = "linux")]
-fn afs_fuse_helper_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("AFS_FUSE_BIN") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(dir) = current_exe.parent()
-    {
-        candidates.push(dir.join("afs-fuse"));
-    }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace = manifest_dir.join("../..");
-    candidates.push(workspace.join("target/debug/afs-fuse"));
-    candidates.push(workspace.join("target/release/afs-fuse"));
-
-    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
-        return Some(path);
-    }
-    find_on_path("afs-fuse")
-}
-
-#[cfg(target_os = "linux")]
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+fn linux_fuse_command_error(
+    error: file_provider_helper::LinuxFuseRegistrationError,
+) -> CommandError {
+    CommandError::new("file-provider", error.code(), error.message())
 }
 
 fn print_file_provider_report(report: &FileProviderCommandReport) {
@@ -1913,41 +1788,6 @@ fn file_provider_display_name(mount: &MountConfig) -> String {
         .unwrap_or_else(|| mount.mount_id.0.clone())
 }
 
-fn file_provider_helper_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("AFS_FILE_PROVIDERCTL") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(dir) = current_exe.parent()
-    {
-        candidates.push(dir.join("agentfs-file-providerctl"));
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let package_dir = manifest_dir.join("../../platform/macos/AgentFSFileProvider");
-    candidates.push(
-        package_dir.join(".build/dev-bundle/AgentFS.app/Contents/MacOS/agentfs-file-providerctl"),
-    );
-    candidates.push(PathBuf::from(
-        "/Applications/AgentFS.app/Contents/MacOS/agentfs-file-providerctl",
-    ));
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(
-            PathBuf::from(home)
-                .join("Applications/AgentFS.app/Contents/MacOS/agentfs-file-providerctl"),
-        );
-    }
-    candidates.push(package_dir.join(".build/debug/agentfs-file-providerctl"));
-    candidates.push(package_dir.join(".build/release/agentfs-file-providerctl"));
-
-    candidates.into_iter().find(|path| path.exists())
-}
-
 fn stub(command: &str, json: bool) -> i32 {
     if json {
         println!("{{\"ok\":false,\"command\":\"{command}\",\"error\":\"not_implemented\"}}");
@@ -2024,17 +1864,6 @@ struct NotionOAuthBrokerCliConfig {
     redirect_uri: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LocalOAuthAuthorization {
-    code: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LocalRedirect {
-    bind_addr: String,
-    callback_path: String,
-}
-
 fn notion_oauth_config(args: &[String]) -> Result<NotionOAuthCliConfig, CommandError> {
     let client_id = env_first(&["AFS_NOTION_OAUTH_CLIENT_ID", "NOTION_OAUTH_CLIENT_ID"])
         .ok_or_else(|| missing_oauth_config("AFS_NOTION_OAUTH_CLIENT_ID"))?;
@@ -2048,8 +1877,8 @@ fn notion_oauth_config(args: &[String]) -> Result<NotionOAuthCliConfig, CommandE
         .or_else(|| env_first(&["AFS_NOTION_OAUTH_REDIRECT_URI", "NOTION_OAUTH_REDIRECT_URI"]))
         .unwrap_or_else(|| "http://localhost:8757/oauth/notion/callback".to_string());
 
-    local_redirect(&redirect_uri).map_err(|message| {
-        CommandError::new("connect", "invalid_redirect_uri", message)
+    local_redirect(&redirect_uri).map_err(|error| {
+        CommandError::new("connect", error.code, error.message)
             .with_suggested_command("afs connect notion --token-stdin")
     })?;
 
@@ -2070,8 +1899,8 @@ fn notion_oauth_broker_config(args: &[String]) -> Result<NotionOAuthBrokerCliCon
         .or_else(|| env_first(&["AFS_NOTION_OAUTH_REDIRECT_URI", "NOTION_OAUTH_REDIRECT_URI"]))
         .unwrap_or_else(|| "http://localhost:8757/oauth/notion/callback".to_string());
 
-    local_redirect(&redirect_uri).map_err(|message| {
-        CommandError::new("connect", "invalid_redirect_uri", message)
+    local_redirect(&redirect_uri).map_err(|error| {
+        CommandError::new("connect", error.code, error.message)
             .with_suggested_command("afs connect notion --token-stdin")
     })?;
 
@@ -2107,211 +1936,7 @@ fn run_local_notion_oauth(
         no_browser,
         json,
     )
-}
-
-fn run_local_oauth_authorization(
-    provider_name: &str,
-    authorize_url: &str,
-    redirect_uri: &str,
-    state: &str,
-    no_browser: bool,
-    json: bool,
-) -> Result<LocalOAuthAuthorization, CommandError> {
-    let redirect = local_redirect(redirect_uri).map_err(|message| {
-        CommandError::new("connect", "invalid_redirect_uri", message)
-            .with_suggested_command("afs connect notion --token-stdin")
-    })?;
-    let listener = TcpListener::bind(&redirect.bind_addr).map_err(|error| {
-        CommandError::new(
-            "connect",
-            "callback_bind_failed",
-            format!(
-                "failed to listen for Notion OAuth callback at {}: {error}",
-                redirect.bind_addr
-            ),
-        )
-    })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| CommandError::new("connect", "callback_failed", error.to_string()))?;
-
-    if !json {
-        println!("opening {provider_name} authorization in your browser...");
-        println!("callback: {redirect_uri}");
-        println!("authorization URL: {authorize_url}");
-    }
-    if !no_browser
-        && let Err(error) = open_browser(authorize_url)
-        && !json
-    {
-        eprintln!("afs connect: failed to open browser: {error}");
-        eprintln!("open the authorization URL manually");
-    }
-
-    wait_for_oauth_callback(&listener, &redirect.callback_path, state)
-}
-
-fn wait_for_oauth_callback(
-    listener: &TcpListener,
-    callback_path: &str,
-    expected_state: &str,
-) -> Result<LocalOAuthAuthorization, CommandError> {
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let mut buffer = [0_u8; 8192];
-                let read = stream.read(&mut buffer).map_err(|error| {
-                    CommandError::new("connect", "callback_failed", error.to_string())
-                })?;
-                let request = String::from_utf8_lossy(&buffer[..read]);
-                let result = parse_oauth_callback(&request, callback_path, expected_state);
-                let response = match &result {
-                    Ok(_) => oauth_http_response(
-                        "Notion connected",
-                        "Notion authorization is complete. You can close this window.",
-                    ),
-                    Err(error) => oauth_http_response("AgentFS OAuth failed", &error.message),
-                };
-                let _ = stream.write_all(response.as_bytes());
-                return result;
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(CommandError::new(
-                        "connect",
-                        "oauth_timeout",
-                        "timed out waiting for Notion OAuth callback",
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => {
-                return Err(CommandError::new(
-                    "connect",
-                    "callback_failed",
-                    error.to_string(),
-                ));
-            }
-        }
-    }
-}
-
-fn parse_oauth_callback(
-    request: &str,
-    callback_path: &str,
-    expected_state: &str,
-) -> Result<LocalOAuthAuthorization, CommandError> {
-    let request_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| CommandError::new("connect", "callback_failed", "empty callback"))?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let target = parts.next().unwrap_or_default();
-    if method != "GET" {
-        return Err(CommandError::new(
-            "connect",
-            "callback_failed",
-            "OAuth callback used an unsupported HTTP method",
-        ));
-    }
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    if path != callback_path {
-        return Err(CommandError::new(
-            "connect",
-            "callback_failed",
-            format!("OAuth callback path `{path}` did not match `{callback_path}`"),
-        ));
-    }
-    let params = query_params(query);
-    if let Some(error) = params.get("error") {
-        return Err(CommandError::new(
-            "connect",
-            "oauth_denied",
-            params
-                .get("error_description")
-                .cloned()
-                .unwrap_or_else(|| format!("Notion returned OAuth error `{error}`")),
-        ));
-    }
-    if params.get("state").map(String::as_str) != Some(expected_state) {
-        return Err(CommandError::new(
-            "connect",
-            "oauth_state_mismatch",
-            "Notion OAuth callback state did not match",
-        ));
-    }
-    let code = params
-        .get("code")
-        .filter(|code| !code.is_empty())
-        .cloned()
-        .ok_or_else(|| {
-            CommandError::new(
-                "connect",
-                "oauth_missing_code",
-                "Notion OAuth callback did not include a code",
-            )
-        })?;
-    Ok(LocalOAuthAuthorization { code })
-}
-
-fn oauth_http_response(title: &str, message: &str) -> String {
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body><h1>{}</h1><p>{}</p></body></html>",
-        html_escape(title),
-        html_escape(title),
-        html_escape(message)
-    );
-    format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )
-}
-
-fn notion_authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
-    format!(
-        "{DEFAULT_NOTION_OAUTH_AUTHORIZE_URL}?client_id={}&response_type=code&owner=user&redirect_uri={}&state={}",
-        url_encode(client_id),
-        url_encode(redirect_uri),
-        url_encode(state)
-    )
-}
-
-fn local_redirect(uri: &str) -> Result<LocalRedirect, String> {
-    let rest = uri
-        .strip_prefix("http://")
-        .ok_or_else(|| "Notion OAuth redirect URI must start with http://".to_string())?;
-    let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let callback_path = format!("/{}", path);
-    if callback_path == "/" {
-        return Err("Notion OAuth redirect URI must include a callback path".to_string());
-    }
-    let (host, port) = host_port
-        .rsplit_once(':')
-        .ok_or_else(|| "Notion OAuth redirect URI must include a localhost port".to_string())?;
-    if host != "127.0.0.1" && host != "localhost" {
-        return Err("Notion OAuth redirect URI must use 127.0.0.1 or localhost".to_string());
-    }
-    let port = port
-        .parse::<u16>()
-        .map_err(|_| "Notion OAuth redirect URI has an invalid port".to_string())?;
-    Ok(LocalRedirect {
-        bind_addr: format!("{host}:{port}"),
-        callback_path,
-    })
-}
-
-fn query_params(query: &str) -> std::collections::BTreeMap<String, String> {
-    query
-        .split('&')
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| {
-            let (key, value) = part.split_once('=').unwrap_or((part, ""));
-            Some((url_decode(key).ok()?, url_decode(value).ok()?))
-        })
-        .collect()
+    .map_err(local_oauth_command_error)
 }
 
 fn env_first(keys: &[&str]) -> Option<String> {
@@ -2320,99 +1945,13 @@ fn env_first(keys: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn open_browser(url: &str) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = ProcessCommand::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = ProcessCommand::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    };
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let mut command = {
-        let mut command = ProcessCommand::new("xdg-open");
-        command.arg(url);
-        command
-    };
-
-    let status = command.status()?;
-    if status.success() {
-        Ok(())
+fn local_oauth_command_error(error: LocalOAuthError) -> CommandError {
+    let command_error = CommandError::new("connect", error.code, error.message);
+    if command_error.code == "invalid_redirect_uri" {
+        command_error.with_suggested_command("afs connect notion --token-stdin")
     } else {
-        Err(io::Error::other(format!(
-            "browser command exited with {status}"
-        )))
+        command_error
     }
-}
-
-fn random_state() -> String {
-    let mut bytes = [0_u8; 24];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .is_err()
-    {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id() as u128;
-        let mixed = nanos ^ (pid << 64);
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = (mixed.rotate_left(index as u32) & 0xff) as u8;
-        }
-    }
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn url_encode(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
-fn url_decode(value: &str) -> Result<String, ()> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                decoded.push(b' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|_| ())?;
-                decoded.push(u8::from_str_radix(hex, 16).map_err(|_| ())?);
-                index += 3;
-            }
-            b'%' => return Err(()),
-            byte => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8(decoded).map_err(|_| ())
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 fn warn_daemon_fallback(command: &str, reason: DaemonUnavailableReason) {
@@ -2420,13 +1959,49 @@ fn warn_daemon_fallback(command: &str, reason: DaemonUnavailableReason) {
         match reason {
             DaemonUnavailableReason::TimedOut => eprintln!(
                 "afsd did not respond within {}ms; executing {command} directly",
-                daemon_request_timeout().as_millis()
+                daemon_mutating_request_timeout().as_millis()
             ),
             DaemonUnavailableReason::NotAvailable => eprintln!(
                 "afsd not running; executing {command} directly (start afsd for background hydration)"
             ),
             DaemonUnavailableReason::Disabled => {}
         }
+    }
+}
+
+fn pull_direct_fallback_error(
+    reason: DaemonUnavailableReason,
+    mount: Option<&MountConfig>,
+) -> Option<CommandError> {
+    match reason {
+        DaemonUnavailableReason::TimedOut => Some(
+            CommandError::new(
+                "pull",
+                "daemon_timeout",
+                format!(
+                    "afsd did not respond within {}ms after the pull request was submitted; refusing direct fallback to avoid racing daemon hydration",
+                    daemon_mutating_request_timeout().as_millis()
+                ),
+            )
+            .with_suggested_command("afs daemon restart"),
+        ),
+        DaemonUnavailableReason::NotAvailable
+            if mount.is_some_and(|mount| mount.projection.uses_virtual_filesystem()) =>
+        {
+            Some(
+                CommandError::new(
+                    "pull",
+                    "daemon_required",
+                    format!(
+                        "mount `{}` uses projection `{}`; pull for virtual projections must run through afsd so the provider cache stays serialized",
+                        mount.expect("checked mount").mount_id.0,
+                        mount.expect("checked mount").projection.as_str()
+                    ),
+                )
+                .with_suggested_command("afs daemon restart"),
+            )
+        }
+        DaemonUnavailableReason::Disabled | DaemonUnavailableReason::NotAvailable => None,
     }
 }
 
@@ -2555,22 +2130,23 @@ where
         return DaemonReport::Unavailable(DaemonUnavailableReason::Disabled);
     }
 
-    let response = match send_request_with_timeout(state_root, request, daemon_request_timeout()) {
-        Ok(response) => response,
-        Err(DaemonClientError::NotAvailable(_)) => {
-            return DaemonReport::Unavailable(DaemonUnavailableReason::NotAvailable);
-        }
-        Err(DaemonClientError::TimedOut(_)) => {
-            return DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut);
-        }
-        Err(error) => {
-            return DaemonReport::Error(DaemonCommandError {
-                code: "daemon_error".to_string(),
-                message: error.message().to_string(),
-                exit_code: EXIT_INTERNAL,
-            });
-        }
-    };
+    let response =
+        match send_request_with_timeout(state_root, request, daemon_request_timeout_for(request)) {
+            Ok(response) => response,
+            Err(DaemonClientError::NotAvailable(_)) => {
+                return DaemonReport::Unavailable(DaemonUnavailableReason::NotAvailable);
+            }
+            Err(DaemonClientError::TimedOut(_)) => {
+                return DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut);
+            }
+            Err(error) => {
+                return DaemonReport::Error(DaemonCommandError {
+                    code: "daemon_error".to_string(),
+                    message: error.message().to_string(),
+                    exit_code: EXIT_INTERNAL,
+                });
+            }
+        };
 
     if let Some(error) = response.error {
         let exit_code = daemon_error_exit_code(&error.code);
@@ -2605,7 +2181,25 @@ fn daemon_request_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_DAEMON_REQUEST_TIMEOUT)
+        .unwrap_or(DEFAULT_DAEMON_CONTROL_TIMEOUT)
+}
+
+fn daemon_mutating_request_timeout() -> Duration {
+    std::env::var("AFS_DAEMON_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_DAEMON_MUTATING_TIMEOUT)
+}
+
+fn daemon_request_timeout_for(request: &DaemonRequest) -> Duration {
+    match request {
+        DaemonRequest::Pull { .. } | DaemonRequest::Push { .. } => {
+            daemon_mutating_request_timeout()
+        }
+        _ => daemon_request_timeout(),
+    }
 }
 
 fn notify_daemon_mounts_changed(state_root: &std::path::Path) {
@@ -2776,25 +2370,6 @@ fn restore_command_error(json: bool, error: RestoreError) -> i32 {
     )
 }
 
-fn resolve_command_error(json: bool, error: ResolveError) -> i32 {
-    let exit_code = match &error {
-        ResolveError::MountNotFound(_)
-        | ResolveError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
-        ResolveError::EntityNotConflicted(_) => 4,
-        ResolveError::CurrentDir(_)
-        | ResolveError::ReadFile { .. }
-        | ResolveError::RemoteSidecarMissing(_)
-        | ResolveError::Store(_)
-        | ResolveError::UnsupportedEntity(_)
-        | ResolveError::WriteFile { .. } => EXIT_INTERNAL,
-    };
-    command_error(
-        json,
-        CommandError::new("resolve", error.code(), error.message()),
-        exit_code,
-    )
-}
-
 fn info_command_error(json: bool, error: InfoError, state_root: PathBuf) -> i32 {
     let exit_code = match &error {
         InfoError::MountNotFound(_)
@@ -2950,7 +2525,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection {}] [--read-only] [--json]",
+        "usage: afs mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {}] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -3107,12 +2682,13 @@ mod tests {
     use afs_store::{MountConfig, ProjectionMode};
 
     use crate::diff::{DiffReport, GuardrailOutput};
+    use crate::local_oauth::{local_redirect, notion_authorize_url, parse_oauth_callback};
     use crate::push::PushReport;
 
     use super::{
-        EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration, diff_report_exit_code,
-        local_redirect, notion_authorize_url, notion_oauth_broker_config, parse_oauth_callback,
-        projection_mode_for_target, projection_usage_options_for_target,
+        DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
+        diff_report_exit_code, notion_oauth_broker_config, projection_mode_for_target,
+        projection_usage_options_for_target, pull_direct_fallback_error,
         validate_virtual_projection_registration,
     };
 
@@ -3246,34 +2822,36 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn linux_fuse_systemd_unit_uses_mount_specific_helper_args() {
-        let mount = MountConfig::new(
-            MountId::new("notion/main"),
-            "notion",
-            "/home/example/afs notion",
-        )
-        .projection(ProjectionMode::LinuxFuse);
-        let unit_name = super::linux_fuse_unit_name(&mount.mount_id.0);
-        let unit = super::linux_fuse_unit_contents(
-            std::path::Path::new("/opt/agent fs/afs-fuse"),
-            std::path::Path::new("/home/example/.afs"),
-            &mount,
-            std::path::Path::new("/home/example/.afs/logs/afs-fuse.notion_main.log"),
+    fn pull_direct_fallback_refuses_timeout_and_virtual_mount_without_daemon() {
+        let virtual_mount =
+            MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/afs/notion")
+                .projection(ProjectionMode::LinuxFuse);
+        let plain_mount = MountConfig::new(MountId::new("plain"), "notion", "/tmp/afs/plain")
+            .projection(ProjectionMode::PlainFiles);
+
+        let timeout = pull_direct_fallback_error(DaemonUnavailableReason::TimedOut, None)
+            .expect("timed out daemon pull blocks fallback");
+        assert_eq!(timeout.code, "daemon_timeout");
+        assert!(
+            timeout
+                .message
+                .contains("refusing direct fallback to avoid racing daemon hydration")
         );
 
-        assert_eq!(unit_name, "ai.codeflash.afs.fuse.notion_main.service");
-        assert!(unit.contains("ExecStart=\"/opt/agent fs/afs-fuse\""));
-        assert!(unit.contains("--mount-id \"notion/main\""));
-        assert!(unit.contains("--state-dir \"/home/example/.afs\""));
-        assert!(unit.contains("--mountpoint \"/home/example/afs notion\""));
-        assert!(unit.contains("ExecStop=/usr/bin/fusermount3 -uz \"/home/example/afs notion\""));
-        assert!(unit.contains("TimeoutStopSec=10"));
-        assert!(unit.contains("LimitCORE=0"));
-        assert!(unit.contains("Restart=on-failure"));
+        let virtual_without_daemon =
+            pull_direct_fallback_error(DaemonUnavailableReason::NotAvailable, Some(&virtual_mount))
+                .expect("virtual projection requires daemon");
+        assert_eq!(virtual_without_daemon.code, "daemon_required");
+        assert!(virtual_without_daemon.message.contains("linux_fuse"));
+
         assert!(
-            unit.contains("StandardOutput=append:/home/example/.afs/logs/afs-fuse.notion_main.log")
+            pull_direct_fallback_error(DaemonUnavailableReason::NotAvailable, Some(&plain_mount))
+                .is_none()
+        );
+        assert!(
+            pull_direct_fallback_error(DaemonUnavailableReason::Disabled, Some(&virtual_mount))
+                .is_none()
         );
     }
 

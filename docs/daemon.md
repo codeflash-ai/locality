@@ -154,6 +154,8 @@ platform-neutral `virtual_fs` boundary:
   returns the materialized Markdown path once the content exists locally.
 - `virtual_fs_commit_write` records full-file writes from virtual filesystem
   adapters into daemon-owned content storage and updates local dirty state.
+- `virtual_fs_create_file`, `virtual_fs_rename`, and `virtual_fs_trash` record
+  pending virtual mutations that are applied by the normal push pipeline.
 
 macOS File Provider uses this boundary through compatibility IPC names
 (`file_provider_item`, `file_provider_children`, and
@@ -161,15 +163,15 @@ macOS File Provider uses this boundary through compatibility IPC names
 into File Provider's transfer directory before completing `fetchContents`, so the
 system can take ownership without moving AgentFS's canonical hydrated copy.
 
-Linux should use a separate FUSE projection adapter over the same daemon
-boundary. `readdir` and `getattr` read store metadata, `open`/`read` block on
-daemon materialization and then serve real bytes, and write/flush paths should
-route local edits back through daemon-owned dirty/push/reconcile logic. inotify is
-not sufficient for online-only reads because it observes filesystem activity
-after the kernel has already asked for file contents; fanotify permission events
-can block opens but still require a backing file to exist before allowing the
-open. FUSE is the clean Linux equivalent because AgentFS directly serves the
-read.
+Linux uses a separate FUSE projection adapter over the same daemon boundary.
+`readdir` and `getattr` read store metadata, `open`/`read` block on daemon
+materialization and then serve real bytes, write/flush paths route local edits
+back through daemon-owned dirty/push/reconcile logic, and create/rename/unlink
+callbacks become pending virtual mutations. inotify is not sufficient for
+online-only reads because it observes filesystem activity after the kernel has
+already asked for file contents; fanotify permission events can block opens but
+still require a backing file to exist before allowing the open. FUSE is the clean
+Linux equivalent because AgentFS directly serves the read.
 
 Virtual projection contents are materialized under `~/.afs/content/<mount-id>/`
 instead of under the mounted root. This avoids recursive FUSE calls when the root
@@ -177,8 +179,9 @@ is itself a virtual mount and gives macOS/Linux adapters one stable byte source.
 
 Scheduled reconciliation skips writing placeholder Markdown files for virtual
 filesystem projection modes such as `macos_file_provider` and `linux_fuse`; it
-only updates durable entity state and queues policy hydration. Plain-file mounts
-still use the fallback watcher path below.
+updates durable entity state, queues policy hydration, and caches database
+`_schema.yaml` files under daemon-owned content storage. Plain-file mounts still
+use the fallback watcher path below.
 
 ## File Watching
 

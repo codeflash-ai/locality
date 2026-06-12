@@ -23,6 +23,8 @@ pub struct BlockTreeDto {
 pub struct PageDto {
     pub id: String,
     #[serde(default)]
+    pub parent: Option<ParentDto>,
+    #[serde(default)]
     pub created_time: Option<String>,
     #[serde(default)]
     pub last_edited_time: Option<String>,
@@ -34,6 +36,27 @@ pub struct PageDto {
     pub properties: BTreeMap<String, PagePropertyDto>,
 }
 
+/// Parent pointer shared by Notion pages, databases, blocks, and data sources.
+///
+/// AFS uses this metadata for workspace-level mounts: search can discover all
+/// pages shared with an integration, while parent metadata lets the connector
+/// keep the visible mount root limited to top-level accessible pages.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentDto {
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub workspace: Option<bool>,
+    #[serde(default)]
+    pub page_id: Option<String>,
+    #[serde(default)]
+    pub database_id: Option<String>,
+    #[serde(default)]
+    pub data_source_id: Option<String>,
+    #[serde(default)]
+    pub block_id: Option<String>,
+}
+
 /// A Notion database container.
 ///
 /// Newer Notion API versions separate database containers from queryable data
@@ -42,6 +65,8 @@ pub struct PageDto {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatabaseDto {
     pub id: String,
+    #[serde(default)]
+    pub parent: Option<ParentDto>,
     #[serde(default)]
     pub created_time: Option<String>,
     #[serde(default)]
@@ -69,7 +94,11 @@ pub struct DataSourceSummaryDto {
 pub struct DataSourceDto {
     pub id: String,
     #[serde(default)]
+    pub parent: Option<ParentDto>,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub title: Vec<RichTextDto>,
     #[serde(default)]
     pub created_time: Option<String>,
     #[serde(default)]
@@ -206,6 +235,8 @@ impl<T> Default for PaginatedListDto<T> {
 
 pub type BlockListDto = PaginatedListDto<BlockDto>;
 pub type PageListDto = PaginatedListDto<PageDto>;
+pub type DatabaseListDto = PaginatedListDto<DatabaseDto>;
+pub type DataSourceListDto = PaginatedListDto<DataSourceDto>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockDto {

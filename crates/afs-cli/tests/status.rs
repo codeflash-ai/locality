@@ -5,13 +5,17 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::status::{StatusError, StatusOptions, StatusState, run_status};
+use afs_core::conflict::{
+    CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
+};
 use afs_core::journal::{JournalEntry, JournalStatus, PushId};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+    MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use afsd::virtual_fs::virtual_fs_content_path;
 
@@ -139,7 +143,13 @@ fn status_reports_missing_and_conflicted_entities() {
     let mut store = fixture.store();
     fixture.hydrated_page(&mut store, "page-1", "Missing.md", "# Missing\n\nGone.");
     fixture.conflicted_page(&mut store, "page-2", "Conflict.md");
-    fixture.write_page("Conflict.md", "page-2", "# Conflict\n\nLocal.");
+    fixture.write_page(
+        "Conflict.md",
+        "page-2",
+        &format!(
+            "{CONFLICT_LOCAL_MARKER}\n# Conflict\n\nLocal.\n{CONFLICT_SEPARATOR_MARKER}\n# Conflict\n\nRemote.\n{CONFLICT_REMOTE_MARKER}\n"
+        ),
+    );
 
     let report = run_status(
         &store,
@@ -319,6 +329,59 @@ fn status_reads_virtual_projection_from_content_cache() {
     assert!(report.clean);
     assert_eq!(report.summary.clean, 1);
     assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
+}
+
+#[test]
+fn status_reports_pending_virtual_creates_and_deletes() {
+    let fixture = StatusFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save virtual mount");
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:draft",
+            VirtualMutationKind::Create,
+            None,
+            "Draft.md",
+            "Draft",
+        ))
+        .expect("save pending create");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "delete:page-1",
+            VirtualMutationKind::Delete,
+            Some(RemoteId::new("page-1")),
+            "Roadmap.md",
+            "Roadmap",
+        ))
+        .expect("save pending delete");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.clean);
+    assert_eq!(report.summary.total, 2);
+    assert_eq!(report.summary.dirty, 2);
+    assert_eq!(entry_issue(&report, "Draft.md"), "pending_virtual_create");
+    assert_eq!(entry_issue(&report, "Roadmap.md"), "pending_virtual_delete");
 }
 
 struct StatusFixture {
@@ -545,6 +608,29 @@ fn journal_entry(push_id: &str, remote_id: &str, status: JournalStatus) -> Journ
         ),
         status,
     )
+}
+
+fn virtual_mutation(
+    mount_id: &MountId,
+    local_id: &str,
+    kind: VirtualMutationKind,
+    target_remote_id: Option<RemoteId>,
+    path: &str,
+    title: &str,
+) -> VirtualMutationRecord {
+    VirtualMutationRecord {
+        mount_id: mount_id.clone(),
+        local_id: local_id.to_string(),
+        mutation_kind: kind,
+        target_remote_id,
+        parent_remote_id: None,
+        original_path: None,
+        projected_path: PathBuf::from(path),
+        title: title.to_string(),
+        content_path: None,
+        created_at: "2026-06-12T00:00:00Z".to_string(),
+        updated_at: "2026-06-12T00:00:00Z".to_string(),
+    }
 }
 
 fn entry_state(report: &afs_cli::status::StatusReport, path: &str) -> StatusState {

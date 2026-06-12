@@ -1,0 +1,20 @@
+[package]
+name = "afs-desktop"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+afs-cli = { path = "../../../crates/afs-cli" }
+afs-core.workspace = true
+afs-notion.workspace = true
+afs-store.workspace = true
+afsd = { path = "../../../crates/afsd" }
+serde = { version = "1.0", features = ["derive"] }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"

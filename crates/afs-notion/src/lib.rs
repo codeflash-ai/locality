@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use afs_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
-    ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
-    ParsedEntity,
+    ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
+    ListChildrenResult, NativeEntity, ParsedEntity,
 };
 use afs_core::model::{CanonicalDocument, RemoteId, TreeEntry};
 use afs_core::planner::PushOperationKind;
@@ -32,7 +32,9 @@ use crate::apply::{apply_plan, apply_undo, check_concurrency};
 use crate::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use crate::fetch::fetch_page_bundle;
 use crate::media::{MediaDownloadReport, download_media_assets};
-use crate::projection::{enumerate_root_page_tree, enumerate_shared_pages};
+use crate::projection::{
+    enumerate_root_page_tree, enumerate_shared_pages, list_container_children,
+};
 use crate::render::{
     NotionRenderedEntity, RenderOptions, render_native_entity, render_native_entity_with_options,
 };
@@ -164,6 +166,7 @@ impl Connector for NotionConnector {
             PushOperationKind::AppendBlock,
             PushOperationKind::MoveBlock,
             PushOperationKind::ArchiveBlock,
+            PushOperationKind::ArchiveEntity,
             PushOperationKind::UpdateProperties,
             PushOperationKind::CreateEntity,
         ]
@@ -177,6 +180,18 @@ impl Connector for NotionConnector {
         } else {
             enumerate_shared_pages(self.api.as_ref(), request.mount_id)
         }
+    }
+
+    fn list_children(&self, request: ListChildrenRequest) -> AfsResult<ListChildrenResult> {
+        let entries = list_container_children(
+            self.api.as_ref(),
+            request.mount_id,
+            self.config.root_page_id.as_ref(),
+            request.container,
+            &request.parent_path,
+        )?;
+
+        Ok(ListChildrenResult { entries })
     }
 
     fn fetch(&self, request: FetchRequest) -> AfsResult<NativeEntity> {

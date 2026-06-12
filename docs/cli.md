@@ -20,7 +20,6 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs restore <path> [--force] [--json]`
 - `afs undo [push-id] [--json]`
 - `afs log [path] [--json]`
-- `afs resolve --ours|--theirs|--edited <path>`
 - `afs config set <key=value>`
 - `afs file-provider register|unregister|list|reset [target] [--json]`
 
@@ -156,7 +155,7 @@ Human output is a compact path summary for people and agents working in nested d
 
 ## Initial `afs status --json` Shape
 
-`afs status [path]` inspects local mount state only. It resolves the target path through the stored mount/entity mapping, compares hydrated page bodies against their stored shadow snapshots, reports stubs and missing/conflicted projections, and includes pending or failed push journals touching each entity. It does not call remote connectors.
+`afs status [path]` inspects local mount state only. It resolves the target path through the stored mount/entity mapping, compares hydrated page bodies against their stored shadow snapshots, reports stubs, conflicted files with unresolved inline markers, dirty files, missing projections, and pending or failed push journals touching each entity. It does not call remote connectors.
 
 The production state directory defaults to `~/.afs`; `AFS_STATE_DIR` is a developer/test override for isolated runs. When no path is supplied, `afs status` first checks the current working directory: inside a mount it scopes to that subtree, and outside all mounts it reports every registered mount in the active state directory.
 
@@ -180,7 +179,7 @@ notion-main  initial-idea ~37b3ac.md
 
 ## Initial `afs diff --json` Shape
 
-The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its shadow snapshot, and returns the core push-pipeline decision without applying anything. If the path is a new Markdown file directly inside a projected database directory, it plans a `create_entity` operation for a new database row instead of requiring an existing shadow. The JSON report includes:
+The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its shadow snapshot, and returns the core push-pipeline decision without applying anything. If the file contains unresolved inline conflict markers, validation returns `unresolved_conflict_markers` before planning. If the path is a new Markdown file directly inside a projected database directory, it plans a `create_entity` operation for a new database row instead of requiring an existing shadow. The JSON report includes:
 
 - `validation`: machine-readable issues with file, line, message, and suggested fix;
 - `plan.summary`: block/entity/property counts;
@@ -193,7 +192,7 @@ The production command path uses the SQLite store. A real diff requires persiste
 
 ## Initial `afs push --json` Shape
 
-The push implementation runs the same path resolution, parsing, validation, diffing, and guardrail evaluation as `afs diff`. When the plan is approved, it enters the journaled connector-apply executor. It supports `-y`/`--yes` for safe plans and `--confirm` for dangerous plans.
+The push implementation runs the same path resolution, parsing, validation, diffing, and guardrail evaluation as `afs diff`. It refuses `unresolved_conflict_markers`; edit the file to the intended final content and remove every marker line before pushing. When the plan is approved, it enters the journaled connector-apply executor. It supports `-y`/`--yes` for safe plans and `--confirm` for dangerous plans.
 
 The JSON report has the same validation, plan, degradation, guardrail, and stage fields as `afs diff`. Its `action` is one of:
 
@@ -224,9 +223,9 @@ Unsupported-operation JSON shape:
 
 ## `afs restore`
 
-`afs restore <path> [--force] [--json]` is a local recovery command. It resolves the path to a mounted entity, loads the last stored shadow, rewrites the file atomically from canonical frontmatter plus the shadow body, refreshes the entity content hash, and marks hydration back to `hydrated`. It does not call Notion and does not delete failed journals, so `afs log` remains an audit trail.
+`afs restore <path> [--force] [--json]` is a local recovery command. It resolves the path to a mounted entity, loads the last stored shadow, rewrites the file atomically from canonical frontmatter plus the shadow body, refreshes the entity content hash, and marks hydration back to `hydrated`. It removes inline conflict markers by overwriting the file from shadow. It does not call Notion and does not delete failed journals, so `afs log` remains an audit trail.
 
-`afs restore` refuses conflicted entities unless `--force` is supplied.
+`afs restore` refuses legacy conflicted entities unless `--force` is supplied.
 
 Typical recovery:
 

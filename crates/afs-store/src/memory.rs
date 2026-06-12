@@ -14,17 +14,18 @@ use afs_core::shadow::ShadowDocument;
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
-    HydrationJobRecord, MountConfig, ShadowSnapshotRecord,
+    HydrationJobRecord, MountConfig, ShadowSnapshotRecord, VirtualMutationRecord,
 };
 use crate::repository::{
     ConnectionRepository, ConnectorProfileRepository, EntityRepository, HydrationJobRepository,
-    JournalRepository, MountRepository, ShadowRepository,
+    JournalRepository, MountRepository, ShadowRepository, VirtualMutationRepository,
 };
 
 type EntityKey = (MountId, RemoteId);
 type PathKey = (MountId, PathBuf);
 type ShadowKey = (MountId, RemoteId);
 type HydrationJobKey = (MountId, RemoteId);
+type VirtualMutationKey = (MountId, String);
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
@@ -35,6 +36,7 @@ pub struct InMemoryStateStore {
     entities_by_path: BTreeMap<PathKey, RemoteId>,
     shadows: BTreeMap<ShadowKey, ShadowSnapshotRecord>,
     hydration_jobs: BTreeMap<HydrationJobKey, HydrationJobRecord>,
+    virtual_mutations: BTreeMap<VirtualMutationKey, VirtualMutationRecord>,
     journals: BTreeMap<String, JournalEntry>,
 }
 
@@ -57,6 +59,10 @@ impl InMemoryStateStore {
 
     fn hydration_job_key(mount_id: &MountId, remote_id: &RemoteId) -> HydrationJobKey {
         (mount_id.clone(), remote_id.clone())
+    }
+
+    fn virtual_mutation_key(mount_id: &MountId, local_id: &str) -> VirtualMutationKey {
+        (mount_id.clone(), local_id.to_string())
     }
 }
 
@@ -180,6 +186,15 @@ impl EntityRepository for InMemoryStateStore {
             .map(|(_, entity)| entity.clone())
             .collect())
     }
+
+    fn delete_entity(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> StoreResult<()> {
+        let key = Self::entity_key(mount_id, remote_id);
+        if let Some(entity) = self.entities.remove(&key) {
+            self.entities_by_path
+                .remove(&Self::path_key(&entity.mount_id, &entity.path));
+        }
+        Ok(())
+    }
 }
 
 impl ShadowRepository for InMemoryStateStore {
@@ -208,6 +223,57 @@ impl ShadowRepository for InMemoryStateStore {
             .shadows
             .get(&Self::shadow_key(mount_id, entity_id))
             .cloned())
+    }
+}
+
+impl VirtualMutationRepository for InMemoryStateStore {
+    fn save_virtual_mutation(&mut self, mutation: VirtualMutationRecord) -> StoreResult<()> {
+        self.virtual_mutations.insert(
+            Self::virtual_mutation_key(&mutation.mount_id, &mutation.local_id),
+            mutation,
+        );
+        Ok(())
+    }
+
+    fn get_virtual_mutation(
+        &self,
+        mount_id: &MountId,
+        local_id: &str,
+    ) -> StoreResult<Option<VirtualMutationRecord>> {
+        Ok(self
+            .virtual_mutations
+            .get(&Self::virtual_mutation_key(mount_id, local_id))
+            .cloned())
+    }
+
+    fn find_virtual_mutation_by_path(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> StoreResult<Option<VirtualMutationRecord>> {
+        Ok(self
+            .virtual_mutations
+            .values()
+            .find(|mutation| mutation.mount_id == *mount_id && mutation.projected_path == path)
+            .cloned())
+    }
+
+    fn list_virtual_mutations(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<VirtualMutationRecord>> {
+        Ok(self
+            .virtual_mutations
+            .values()
+            .filter(|mutation| mutation.mount_id == *mount_id)
+            .cloned()
+            .collect())
+    }
+
+    fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()> {
+        self.virtual_mutations
+            .remove(&Self::virtual_mutation_key(mount_id, local_id));
+        Ok(())
     }
 }
 

@@ -18,10 +18,12 @@ The current implementation is a live-capable read, pull, and narrow write projec
   equations, display equations, and heading levels 1-4 render to Markdown where there is a
   stable textual representation;
 - simple Notion tables render as Markdown tables with table-row IDs retained in shadow metadata;
-- toggles, media, embeds, bookmarks, synced blocks, column layouts, tabs, meeting notes,
-  AI/custom blocks, and unsupported or lossy blocks render as `::afs{...}` directives so they
+- toggles, embeds, bookmarks, synced blocks, column layouts, tabs, meeting notes,
+  AI/custom blocks, URL-less media payloads, and unsupported or lossy blocks render as `::afs{...}` directives so they
   retain remote identity and useful metadata such as title, URL, source block ID, or target page ID
   when the API exposes it.
+- media blocks with a Notion URL render as ordinary Markdown image or link syntax, while still
+  keeping local media download metadata in the rendered entity for filesystem-aware callers.
 - `afs push -y` can update, append, and archive simple Notion blocks, update supported page
   properties, create new rows in single-data-source databases, and reconcile by reading the changed
   or created page back into the local shadow.
@@ -81,7 +83,7 @@ Those tests cover broad block rendering, supported block edits/appends, image do
 
 ## Initial Block Rendering
 
-The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, and display equations as Markdown. It renders child pages/databases, toggles, media, embeds, bookmarks, synced blocks, column layouts, tabs, table of contents, breadcrumbs, link-to-page blocks, meeting notes, AI/custom blocks, and unknown future blocks as anchored directives.
+The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, and media blocks with URLs as Markdown. It renders child pages/databases, toggles, embeds, bookmarks, synced blocks, column layouts, tabs, table of contents, breadcrumbs, link-to-page blocks, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
 
 Inline rich text is represented with Notion DTOs first, then rendered through one Markdown path:
 
@@ -121,7 +123,7 @@ Multi-data-source databases still stop before row writes because AFS does not ye
 
 ## Local Media
 
-When a caller renders a Notion page for a known filesystem path, media blocks keep their remote `url` directive attribute and add a local `local` attribute. Image blocks are downloaded to a mount-level media tree:
+When a caller renders a Notion page for a known filesystem path, media blocks with `external.url` or Notion-hosted `file.url` render as Markdown image/link syntax. Image blocks are also downloaded to a mount-level media tree:
 
 ```text
 media/
@@ -129,7 +131,7 @@ media/
     image-0123456789ab.png
 ```
 
-The media tree mirrors the Markdown page path without the `.md` extension. This keeps binary files out of content directories while giving agents a stable local file they can open. The first downloader fetches image blocks only; other file-like blocks still retain their remote URL in the directive until size and retention policy are designed.
+The media tree mirrors the Markdown page path without the `.md` extension. This keeps binary files out of content directories while giving agents a stable local file they can open. The first downloader fetches image blocks only; other file-like blocks render their remote URL directly until size and retention policy are designed.
 
 ## Path Projection
 

@@ -64,8 +64,10 @@ impl HydrationState {
             (Virtual, Stub)
                 | (Stub, Hydrated)
                 | (Hydrated, Dirty)
+                | (Hydrated, Conflicted)
                 | (Dirty, Hydrated)
                 | (Dirty, Conflicted)
+                | (Conflicted, Dirty)
                 | (Conflicted, Hydrated)
         ) || self == next
     }

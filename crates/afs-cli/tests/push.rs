@@ -10,6 +10,9 @@ use afs_connector::{
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
     ParsedEntity,
 };
+use afs_core::conflict::{
+    CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
+};
 use afs_core::hydration::HydrationRequest;
 use afs_core::journal::JournalApplyEffect;
 use afs_core::model::{
@@ -81,10 +84,15 @@ fn push_read_only_mount_blocks_write() {
 }
 
 #[test]
-fn push_conflicted_entity_requires_resolution_first() {
+fn push_file_with_conflict_markers_requires_manual_resolution_first() {
     let fixture = PushFixture::new();
     let mut store = fixture.store();
-    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.");
+    let path = fixture.write_page(
+        "Roadmap.md",
+        &format!(
+            "{CONFLICT_LOCAL_MARKER}\n# Roadmap\n\nLocal paragraph.\n{CONFLICT_SEPARATOR_MARKER}\n# Roadmap\n\nRemote paragraph.\n{CONFLICT_REMOTE_MARKER}\n"
+        ),
+    );
     store
         .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nRemote paragraph."))
         .expect("save shadow");
@@ -109,11 +117,40 @@ fn push_conflicted_entity_requires_resolution_first() {
 
     assert!(!report.ok);
     assert_eq!(report.action, "fix_validation");
-    assert_eq!(
-        report.validation[0].code,
-        "entity_conflicted_requires_resolve"
-    );
+    assert_eq!(report.validation[0].code, "unresolved_conflict_markers");
     assert_eq!(push_report_exit_code(&report), 3);
+}
+
+#[test]
+fn push_resolved_conflicted_entity_can_plan_normally() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nResolved paragraph.");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nRemote paragraph."))
+        .expect("save shadow");
+    let conflicted = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("get entity")
+        .expect("entity")
+        .with_hydration(HydrationState::Conflicted);
+    store
+        .save_entity(conflicted)
+        .expect("save conflicted entity");
+
+    let report = run_push(
+        &store,
+        &path,
+        PushOptions {
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "confirm_plan");
+    assert!(report.validation.is_empty());
 }
 
 #[test]
@@ -218,6 +255,41 @@ fn push_daemon_reports_connector_not_implemented_with_failed_journal() {
             .status,
         afs_core::journal::JournalStatus::Failed(_)
     ));
+}
+
+#[test]
+fn push_daemon_suggests_pull_when_remote_changed_since_last_sync() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph."))
+        .expect("save shadow");
+    let source = FakePushSource::with_remote(rendered_entity("Changed paragraph."))
+        .with_concurrency_failure(AfsError::Guardrail(
+            "remote entity `page-1` changed since last sync (expected remote_edited_at `old`, found `new`)"
+                .to_string(),
+        ));
+
+    let report = run_push_with_daemon(
+        &mut store,
+        &source,
+        &path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "apply_failed");
+    let expected = format!(
+        "run `afs pull {}` to update from remote, resolve any conflicts, then rerun `afs push {} -y`",
+        path.display(),
+        path.display()
+    );
+    assert_eq!(report.suggested_fix.as_deref(), Some(expected.as_str()));
 }
 
 #[test]

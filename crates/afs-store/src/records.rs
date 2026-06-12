@@ -149,6 +149,29 @@ pub struct EntityRecord {
     pub remote_edited_at: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtualMutationKind {
+    Create,
+    Rename,
+    Delete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualMutationRecord {
+    pub mount_id: MountId,
+    pub local_id: String,
+    pub mutation_kind: VirtualMutationKind,
+    pub target_remote_id: Option<RemoteId>,
+    pub parent_remote_id: Option<RemoteId>,
+    pub original_path: Option<PathBuf>,
+    pub projected_path: PathBuf,
+    pub title: String,
+    pub content_path: Option<PathBuf>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 impl EntityRecord {
     pub fn new(
         mount_id: MountId,

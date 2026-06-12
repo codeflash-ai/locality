@@ -18,6 +18,7 @@ use afs_store::{EntityRecord, EntityRepository, MountConfig};
 
 use crate::hydration::HydrationEngine;
 use crate::scheduler::PullSchedulerTick;
+use crate::virtual_fs::virtual_fs_content_root;
 
 pub trait ScheduledPullSource {
     fn enumerate_mount(&self, mount: &MountConfig) -> AfsResult<Vec<TreeEntry>>;
@@ -68,6 +69,12 @@ pub struct DefaultFetchScheduleStrategy;
 
 impl FetchScheduleStrategy for DefaultFetchScheduleStrategy {
     fn mount_plan(&self, request: MountFetchSchedule<'_>) -> MountFetchPlan {
+        if request.mount.projection.uses_virtual_filesystem()
+            && request.mount.remote_root_id.is_none()
+        {
+            return MountFetchPlan::default();
+        }
+
         MountFetchPlan {
             enumerate: !request.tick.is_idle(),
         }
@@ -122,6 +129,28 @@ where
     Source: ScheduledPullSource + ?Sized,
     Strategy: FetchScheduleStrategy + ?Sized,
 {
+    reconcile_scheduled_pull_with_state_root(
+        store, hydration, mounts, tick, source, strategy, policy, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_scheduled_pull_with_state_root<S, H, Source, Strategy>(
+    store: &mut S,
+    hydration: &mut H,
+    mounts: &[MountConfig],
+    tick: &PullSchedulerTick,
+    source: &Source,
+    strategy: &Strategy,
+    policy: &HydrationPolicy,
+    state_root: Option<&Path>,
+) -> AfsResult<ScheduledPullReport>
+where
+    S: EntityRepository,
+    H: HydrationEngine,
+    Source: ScheduledPullSource + ?Sized,
+    Strategy: FetchScheduleStrategy + ?Sized,
+{
     let mut report = ScheduledPullReport::default();
 
     for mount in mounts {
@@ -160,7 +189,7 @@ where
             store.save_entity(record)?;
             rename_projection_if_needed(mount, existing.as_ref(), entry)?;
 
-            match refresh_projection(source, mount, entry)? {
+            match refresh_projection(source, mount, entry, state_root)? {
                 ProjectionWrite::Stub => report.stubbed += 1,
                 ProjectionWrite::Schema => report.schemas_written += 1,
                 ProjectionWrite::None => {}
@@ -229,11 +258,21 @@ fn refresh_projection<Source>(
     source: &Source,
     mount: &MountConfig,
     entry: &TreeEntry,
+    state_root: Option<&Path>,
 ) -> AfsResult<ProjectionWrite>
 where
     Source: ScheduledPullSource + ?Sized,
 {
     if mount.projection.uses_virtual_filesystem() {
+        if entry.kind == EntityKind::Database
+            && let Some(state_root) = state_root
+            && let Some(schema) = source.database_schema_yaml(mount, &entry.remote_id)?
+        {
+            let directory = virtual_fs_content_root(state_root, &mount.mount_id).join(&entry.path);
+            create_dir_all(&directory)?;
+            write_atomic(&directory.join("_schema.yaml"), schema)?;
+            return Ok(ProjectionWrite::Schema);
+        }
         return Ok(ProjectionWrite::None);
     }
 

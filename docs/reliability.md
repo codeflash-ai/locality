@@ -13,7 +13,7 @@ Correctness belongs primarily in `afs-core` and `afs-store`.
 - Remote concurrency is checked after journaling and immediately before apply.
 - Apply and reconcile failures mark the journal failed instead of leaving an ambiguous success.
 - Dangerous plans require explicit confirmation.
-- Conflicted local files are preserved untouched.
+- Conflicts preserve local content inside inline markers and cannot push until markers are removed.
 - Unknown or unsupported remote blocks round-trip through shadow state.
 
 ## Test layers

@@ -143,6 +143,7 @@ fn append_block_reverses_to_archive_created_block_when_effect_is_journaled() {
 fn create_entity_reverses_to_archive_created_entity_when_effect_is_journaled() {
     let mut entry = journal_entry(vec![PushOperation::CreateEntity {
         parent_id: RemoteId::new("page-1"),
+        parent_kind: None,
         title: "New page".to_string(),
         properties: Default::default(),
         body: String::new(),

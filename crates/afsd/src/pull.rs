@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use afs_connector::{Connector, EnumerateRequest, FetchRequest};
 use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
-use afs_core::conflict::remote_variant_path;
+use afs_core::conflict::{
+    has_unresolved_conflict_markers, render_inline_conflict_markdown_with_base,
+};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, TreeEntry};
 use afs_core::shadow::ShadowDocument;
 use afs_notion::NotionConnector;
@@ -17,6 +19,8 @@ use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullReport {
@@ -30,12 +34,32 @@ pub struct PullReport {
     pub stubbed: usize,
     pub hydrated: usize,
     pub skipped_dirty: usize,
+    #[serde(default)]
+    pub conflicts: Vec<PullConflict>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullConflict {
+    pub path: String,
+    pub remote_id: String,
 }
 
 pub fn run_pull<S>(
     store: &mut S,
     connector: &NotionConnector,
     target_path: impl AsRef<Path>,
+) -> Result<PullReport, PullError>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+{
+    run_pull_with_state_root(store, connector, target_path, None)
+}
+
+pub fn run_pull_with_state_root<S>(
+    store: &mut S,
+    connector: &NotionConnector,
+    target_path: impl AsRef<Path>,
+    state_root: Option<&Path>,
 ) -> Result<PullReport, PullError>
 where
     S: MountRepository + EntityRepository + ShadowRepository,
@@ -51,8 +75,8 @@ where
         None => connector.clone(),
     };
 
-    if relative_path.as_os_str().is_empty() || target_path.is_dir() {
-        pull_mount_root(store, &mounted_connector, &mount, target_path)
+    if should_pull_mount_root(&mount, &relative_path, &target_path) {
+        pull_mount_root(store, &mounted_connector, &mount, target_path, state_root)
     } else {
         pull_entity_path(
             store,
@@ -60,6 +84,7 @@ where
             &mount,
             &relative_path,
             target_path,
+            state_root,
         )
     }
 }
@@ -69,6 +94,7 @@ fn pull_mount_root<S>(
     connector: &NotionConnector,
     mount: &MountConfig,
     target_path: PathBuf,
+    state_root: Option<&Path>,
 ) -> Result<PullReport, PullError>
 where
     S: EntityRepository + ShadowRepository,
@@ -88,13 +114,14 @@ where
         let record = merged_entity_record(entry, existing.as_ref());
         store.save_entity(record).map_err(PullError::Store)?;
         rename_projection_if_needed(mount, existing.as_ref(), entry)?;
-        if write_stub_if_needed(connector, mount, entry)? {
+        if write_stub_if_needed(connector, mount, entry, state_root)? {
             stubbed += 1;
         }
     }
 
     let mut hydrated = 0;
     let mut skipped_dirty = 0;
+    let mut conflicts = Vec::new();
     if mount.remote_root_id.is_some()
         && let Some(root_entry) = entries.first()
     {
@@ -107,9 +134,13 @@ where
                     remote_id: root_entry.remote_id.clone(),
                 })
             })?;
-        match hydrate_entity(store, connector, mount, root_entity)? {
+        match hydrate_entity(store, connector, mount, root_entity, state_root)? {
             HydrationOutcome::Hydrated => hydrated += 1,
             HydrationOutcome::SkippedDirty => skipped_dirty += 1,
+            HydrationOutcome::Conflicted(conflict) => {
+                skipped_dirty += 1;
+                conflicts.push(conflict);
+            }
         }
     }
 
@@ -124,6 +155,7 @@ where
         stubbed,
         hydrated,
         skipped_dirty,
+        conflicts,
     })
 }
 
@@ -133,6 +165,7 @@ fn pull_entity_path<S>(
     mount: &MountConfig,
     relative_path: &Path,
     target_path: PathBuf,
+    state_root: Option<&Path>,
 ) -> Result<PullReport, PullError>
 where
     S: EntityRepository + ShadowRepository,
@@ -147,10 +180,11 @@ where
             })
         })?;
 
-    let outcome = hydrate_entity(store, connector, mount, entity)?;
-    let (hydrated, skipped_dirty) = match outcome {
-        HydrationOutcome::Hydrated => (1, 0),
-        HydrationOutcome::SkippedDirty => (0, 1),
+    let outcome = hydrate_entity(store, connector, mount, entity, state_root)?;
+    let (hydrated, skipped_dirty, conflicts) = match outcome {
+        HydrationOutcome::Hydrated => (1, 0, Vec::new()),
+        HydrationOutcome::SkippedDirty => (0, 1, Vec::new()),
+        HydrationOutcome::Conflicted(conflict) => (0, 1, vec![conflict]),
     };
 
     Ok(PullReport {
@@ -164,6 +198,7 @@ where
         stubbed: 0,
         hydrated,
         skipped_dirty,
+        conflicts,
     })
 }
 
@@ -185,8 +220,18 @@ fn write_stub_if_needed(
     connector: &NotionConnector,
     mount: &MountConfig,
     entry: &TreeEntry,
+    state_root: Option<&Path>,
 ) -> Result<bool, PullError> {
     if mount.projection.uses_virtual_filesystem() {
+        if entry.kind == EntityKind::Database
+            && let Some(state_root) = state_root
+        {
+            let directory = virtual_fs_content_root(state_root, &mount.mount_id).join(&entry.path);
+            let schema = connector
+                .database_schema_yaml(&entry.remote_id)
+                .map_err(PullError::Connector)?;
+            write_atomic(&directory.join("_schema.yaml"), schema)?;
+        }
         return Ok(false);
     }
 
@@ -269,11 +314,12 @@ fn hydrate_entity<S>(
     connector: &NotionConnector,
     mount: &MountConfig,
     entity: EntityRecord,
+    state_root: Option<&Path>,
 ) -> Result<HydrationOutcome, PullError>
 where
     S: EntityRepository + ShadowRepository,
 {
-    let path = mount.root.join(&entity.path);
+    let path = projection_content_path(state_root, mount, &entity.path)?;
     let can_replace = can_replace_file(store, mount, &entity, &path)?;
     let native = connector
         .fetch(FetchRequest {
@@ -283,8 +329,9 @@ where
     let rendered = connector
         .render_native_entity_for_path(&native, &entity.path)
         .map_err(PullError::Connector)?;
+    let media_root = projection_output_root(state_root, mount)?;
     connector
-        .download_rendered_media(&rendered, &mount.root)
+        .download_rendered_media(&rendered, &media_root)
         .map_err(PullError::Connector)?;
 
     if can_replace {
@@ -292,10 +339,16 @@ where
         return Ok(HydrationOutcome::Hydrated);
     }
 
-    if should_recreate_conflict_sidecar(&entity, &path)
-        || !remote_matches_shadow(store, mount, &entity, &rendered.shadow)?
-    {
+    if file_has_unresolved_conflict_markers(&path)? {
+        let conflict = pull_conflict(mount, &entity);
+        store
+            .save_entity(mark_conflicted_if_allowed(entity))
+            .map_err(PullError::Store)?;
+        return Ok(HydrationOutcome::Conflicted(conflict));
+    } else if !remote_matches_shadow(store, mount, &entity, &rendered.shadow)? {
+        let conflict = pull_conflict(mount, &entity);
         materialize_conflict(store, mount, entity, &path, rendered)?;
+        return Ok(HydrationOutcome::Conflicted(conflict));
     } else {
         store
             .save_entity(mark_dirty_if_allowed(entity))
@@ -303,6 +356,49 @@ where
     }
 
     Ok(HydrationOutcome::SkippedDirty)
+}
+
+fn projection_content_path(
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Result<PathBuf, PullError> {
+    if mount.projection.uses_virtual_filesystem()
+        && let Some(state_root) = state_root
+    {
+        return virtual_fs_content_path(state_root, &mount.mount_id, relative_path).map_err(
+            |error| PullError::WriteFile {
+                path: relative_path.to_path_buf(),
+                message: error.to_string(),
+            },
+        );
+    }
+
+    Ok(mount.root.join(relative_path))
+}
+
+fn projection_output_root(
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+) -> Result<PathBuf, PullError> {
+    if mount.projection.uses_virtual_filesystem()
+        && let Some(state_root) = state_root
+    {
+        return Ok(virtual_fs_content_root(state_root, &mount.mount_id));
+    }
+
+    Ok(mount.root.clone())
+}
+
+fn should_pull_mount_root(mount: &MountConfig, relative_path: &Path, target_path: &Path) -> bool {
+    if relative_path.as_os_str().is_empty() {
+        return true;
+    }
+    if mount.projection.uses_virtual_filesystem() {
+        return false;
+    }
+
+    target_path.is_dir()
 }
 
 fn accept_remote_projection<S>(
@@ -317,7 +413,6 @@ where
 {
     let markdown = render_canonical_markdown(&rendered.document);
     write_atomic(path, markdown)?;
-    remove_conflict_sidecar_if_present(path)?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
         .map_err(PullError::Store)?;
@@ -342,8 +437,23 @@ fn materialize_conflict<S>(
 where
     S: EntityRepository + ShadowRepository,
 {
-    let remote_path = remote_variant_path(path);
-    write_atomic(&remote_path, render_canonical_markdown(&rendered.document))?;
+    let local_contents = std::fs::read_to_string(path).map_err(|error| PullError::ReadFile {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let base_shadow = match store.load_shadow(&mount.mount_id, &entity.remote_id) {
+        Ok(shadow) => Some(shadow),
+        Err(StoreError::ShadowMissing { .. }) => None,
+        Err(error) => return Err(PullError::Store(error)),
+    };
+    let conflict_markdown = render_inline_conflict_markdown_with_base(
+        &local_contents,
+        base_shadow
+            .as_ref()
+            .map(|shadow| shadow.rendered_body.as_str()),
+        &rendered.document,
+    );
+    write_atomic(path, conflict_markdown)?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
         .map_err(PullError::Store)?;
@@ -356,6 +466,13 @@ where
         .map_err(PullError::Store)?;
 
     Ok(())
+}
+
+fn pull_conflict(mount: &MountConfig, entity: &EntityRecord) -> PullConflict {
+    PullConflict {
+        path: mount.root.join(&entity.path).display().to_string(),
+        remote_id: entity.remote_id.0.clone(),
+    }
 }
 
 fn hydrated_record(
@@ -393,10 +510,33 @@ fn conflicted_record(
 }
 
 fn mark_dirty_if_allowed(mut entity: EntityRecord) -> EntityRecord {
-    if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+    if entity.hydration != HydrationState::Conflicted
+        && entity.hydration.can_transition_to(&HydrationState::Dirty)
+    {
         entity.hydration = HydrationState::Dirty;
     }
     entity
+}
+
+fn mark_conflicted_if_allowed(mut entity: EntityRecord) -> EntityRecord {
+    if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+        entity.hydration = HydrationState::Dirty;
+    }
+    if entity
+        .hydration
+        .can_transition_to(&HydrationState::Conflicted)
+    {
+        entity.hydration = HydrationState::Conflicted;
+    }
+    entity
+}
+
+fn file_has_unresolved_conflict_markers(path: &Path) -> Result<bool, PullError> {
+    let contents = std::fs::read_to_string(path).map_err(|error| PullError::ReadFile {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    Ok(has_unresolved_conflict_markers(&contents))
 }
 
 fn remote_matches_shadow<S>(
@@ -418,22 +558,6 @@ where
         shadow.frontmatter == rendered.frontmatter
             && shadow.rendered_body == rendered.rendered_body,
     )
-}
-
-fn remove_conflict_sidecar_if_present(path: &Path) -> Result<(), PullError> {
-    let remote_path = remote_variant_path(path);
-    if !remote_path.exists() {
-        return Ok(());
-    }
-
-    std::fs::remove_file(&remote_path).map_err(|error| PullError::WriteFile {
-        path: remote_path,
-        message: error.to_string(),
-    })
-}
-
-fn should_recreate_conflict_sidecar(entity: &EntityRecord, path: &Path) -> bool {
-    entity.hydration == HydrationState::Conflicted && !remote_variant_path(path).exists()
 }
 
 fn can_replace_file<S>(
@@ -604,6 +728,7 @@ fn remote_precondition_belongs_to_shadow(existing: &EntityRecord) -> bool {
 enum HydrationOutcome {
     Hydrated,
     SkippedDirty,
+    Conflicted(PullConflict),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -227,6 +227,7 @@ impl DaemonWatchManager {
     fn reload_mounts(&mut self) -> AfsResult<DaemonReloadReport> {
         let mut desired = load_mounts(&self.config)?
             .into_iter()
+            .filter(should_watch_mount)
             .map(|mount| mount.root)
             .collect::<Vec<_>>();
         desired.sort();
@@ -281,6 +282,11 @@ impl DaemonWatchManager {
 }
 
 #[cfg(unix)]
+fn should_watch_mount(mount: &MountConfig) -> bool {
+    !mount.projection.uses_virtual_filesystem()
+}
+
+#[cfg(unix)]
 fn remove_stale_socket(socket_path: &Path) -> AfsResult<()> {
     if !socket_path.exists() {
         return Ok(());
@@ -306,7 +312,7 @@ mod tests {
 
     use afs_core::model::MountId;
     use afs_core::pull::PullMode;
-    use afs_store::{MountConfig, MountRepository, SqliteStateStore};
+    use afs_store::{MountConfig, MountRepository, ProjectionMode, SqliteStateStore};
 
     use super::*;
 
@@ -338,6 +344,42 @@ mod tests {
         assert_eq!(
             report.watches.watched_roots,
             vec![mount_root.display().to_string()]
+        );
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn watch_manager_reload_skips_virtual_projection_mounts() {
+        let config = test_config("reload-skip-virtual");
+        let runtime = DaemonRuntime::spawn(config.clone()).expect("spawn runtime");
+        let mut manager =
+            DaemonWatchManager::new(&config, runtime.handle()).expect("watch manager");
+
+        let plain_root = temp_root("reload-plain-mount");
+        let virtual_root = temp_root("reload-fuse-mount");
+        let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                MountId::new("notion-plain"),
+                "notion",
+                plain_root.clone(),
+            ))
+            .expect("save plain mount");
+        store
+            .save_mount(
+                MountConfig::new(MountId::new("notion-fuse"), "notion", virtual_root)
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save virtual mount");
+
+        let report = manager.reload_mounts().expect("reload mounts");
+
+        assert_eq!(report.added, 1);
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.watches.watched_mounts, 1);
+        assert_eq!(
+            report.watches.watched_roots,
+            vec![plain_root.display().to_string()]
         );
         runtime.shutdown();
     }

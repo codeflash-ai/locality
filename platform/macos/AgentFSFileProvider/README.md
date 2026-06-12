@@ -37,9 +37,15 @@ After creating a mount with `--projection macos-file-provider`, register it:
 
 ```sh
 afs file-provider register <mount-id-or-path>
+afs file-provider open <mount-id-or-path>
 afs file-provider list
 afs file-provider unregister <mount-id-or-path>
 ```
+
+`open` asks macOS for the domain's user-visible File Provider URL and opens it
+in Finder. Opening the raw mount root is not enough to test lazy enumeration:
+Finder must enter the File Provider domain so directory listings call
+`file_provider_children` on `afsd`.
 
 The current write callbacks return unsupported because the next slice should
 route File Provider edits through the same daemon push/reconciler path as

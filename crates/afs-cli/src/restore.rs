@@ -7,7 +7,6 @@
 use std::path::{Path, PathBuf};
 
 use afs_core::canonical::render_canonical_markdown;
-use afs_core::conflict::remote_variant_path;
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState};
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
@@ -77,12 +76,6 @@ where
     .map_err(|error| RestoreError::WriteFile {
         path: absolute_path.clone(),
         message: error.to_string(),
-    })?;
-    remove_conflict_sidecar_if_present(&absolute_path).map_err(|error| {
-        RestoreError::WriteFile {
-            path: remote_variant_path(&absolute_path),
-            message: error.to_string(),
-        }
     })?;
 
     entity.hydration = HydrationState::Hydrated;
@@ -209,13 +202,4 @@ fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     }
     std::fs::write(&temp_path, contents)?;
     std::fs::rename(temp_path, path)
-}
-
-fn remove_conflict_sidecar_if_present(path: &Path) -> std::io::Result<()> {
-    let remote_path = remote_variant_path(path);
-    if !remote_path.exists() {
-        return Ok(());
-    }
-
-    std::fs::remove_file(remote_path)
 }

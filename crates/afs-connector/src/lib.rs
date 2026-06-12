@@ -28,6 +28,35 @@ pub struct EnumerateRequest {
     pub cursor: Option<String>,
 }
 
+/// A source-side container whose immediate children can be listed lazily.
+///
+/// Filesystem backends use this for directory enumeration. It is intentionally
+/// source-neutral: a connector maps the variants to its own hierarchy, while
+/// the host maps the returned entries into a local path projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChildContainer {
+    /// The mount root. For workspace mounts, this is the visible workspace root;
+    /// for scoped mounts, this is the configured remote root.
+    Root,
+    /// Child pages/databases under a page.
+    PageChildren(RemoteId),
+    /// Row pages under a database-like collection.
+    DatabaseRows(RemoteId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListChildrenRequest {
+    pub mount_id: MountId,
+    pub container: ChildContainer,
+    /// Path of the local directory receiving these children.
+    pub parent_path: std::path::PathBuf,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListChildrenResult {
+    pub entries: Vec<TreeEntry>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchRequest {
     pub remote_id: RemoteId,
@@ -88,6 +117,16 @@ pub trait Connector {
         PushOperationKind::all().into_iter().collect()
     }
     fn enumerate(&self, request: EnumerateRequest) -> AfsResult<Vec<TreeEntry>>;
+    /// List immediate child metadata for a single filesystem container.
+    ///
+    /// This must not fetch full document bodies. Returning metadata only lets
+    /// FileProvider/FUSE make directory navigation lazy while page hydration
+    /// remains tied to file open or explicit pull.
+    fn list_children(&self, _request: ListChildrenRequest) -> AfsResult<ListChildrenResult> {
+        Err(afs_core::AfsError::Unsupported(
+            "connector does not support lazy child enumeration",
+        ))
+    }
     fn fetch(&self, request: FetchRequest) -> AfsResult<NativeEntity>;
     fn render(&self, entity: &NativeEntity) -> AfsResult<CanonicalDocument>;
     fn parse(&self, document: &CanonicalDocument) -> AfsResult<ParsedEntity>;

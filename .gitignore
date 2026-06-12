@@ -1,4 +1,6 @@
 /target/
+node_modules/
+dist/
 /.afs/
 /.tmp/
 /.idea/

@@ -110,6 +110,40 @@ fn scheduled_pull_linux_fuse_keeps_unhydrated_pages_online_only() {
     );
 }
 
+#[test]
+fn scheduled_pull_skips_workspace_virtual_mounts() {
+    let root = temp_root("scheduled-pull-workspace-virtual");
+    let mount_id = MountId::new("notion-main");
+    let mount = MountConfig::new(mount_id.clone(), "notion", root)
+        .projection(ProjectionMode::MacosFileProvider);
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![page_entry(
+            &mount_id,
+            "workspace-page",
+            "Workspace",
+            "Workspace.md",
+            "2026-06-10T00:00:00Z",
+        )],
+    );
+    let mut supervisor = supervisor_with_mounts([mount]);
+
+    supervisor.start().expect("start supervisor");
+    let report = supervisor
+        .advance_and_execute_scheduled_pull(
+            AdvanceScheduledPullJob::new(Duration::ZERO),
+            &source,
+            &DefaultFetchScheduleStrategy,
+        )
+        .expect("scheduled pull");
+
+    assert_eq!(report.mounts_checked, 1);
+    assert_eq!(report.mounts_polled, 0);
+    assert_eq!(report.enumerated, 0);
+    assert_eq!(source.enumerated_mounts(), Vec::<MountId>::new());
+}
+
 fn assert_virtual_projection_keeps_unhydrated_pages_online_only(
     projection: ProjectionMode,
     fixture_name: &str,

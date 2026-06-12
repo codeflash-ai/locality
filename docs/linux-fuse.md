@@ -33,6 +33,11 @@ behavior as `macos_file_provider`.
   the final bytes through `virtual_fs_commit_write`. The daemon writes the
   content cache and marks dirty state; the FUSE process does not mutate SQLite or
   connector state directly.
+- `create`/`rename`/`unlink`: submit daemon-owned virtual mutations. New
+  Markdown files are kept in the content cache until `afs push` creates the
+  remote page or database row; local deletes become pending remote archives.
+- Database directories may expose a cached `_schema.yaml` file from scheduled
+  pull so row property validation does not need to read through the FUSE mount.
 
 ## Smoke Test
 
@@ -78,6 +83,28 @@ printf '\nFUSE smoke edit %s\n' "$(date -Is)" >> "$file"
 cat "$backup" > "$file"
 ./target/debug/afs status "$file"
 rm -f "$backup"
+```
+
+Exercise pending create, rename, and delete without touching remote state by
+creating a draft inside a page child directory or database directory, renaming
+it, and removing it before pushing:
+
+```bash
+parent="/path/to/mount/<page-or-database-directory>"
+draft="$parent/afs-fuse-smoke.md"
+renamed="$parent/afs-fuse-smoke-renamed.md"
+printf '# FUSE smoke\n' > "$draft"
+mv "$draft" "$renamed"
+./target/debug/afs status "$renamed"
+rm "$renamed"
+./target/debug/afs status "$parent"
+```
+
+The same flow is available as an opt-in script for manual or CI-hosted FUSE
+hosts:
+
+```bash
+AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_MOUNT=/path/to/mount tests/linux_fuse_smoke.sh
 ```
 
 If `ls` reports `Function not implemented`, rebuild the helper and restart the

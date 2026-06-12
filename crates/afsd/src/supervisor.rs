@@ -2,12 +2,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use afs_core::AfsResult;
+use afs_core::conflict::has_unresolved_conflict_markers;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::journal::JournalStore;
 use afs_core::model::{EntityKind, HydrationState};
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
-    ShadowRepository,
+    ShadowRepository, VirtualMutationRepository,
 };
 
 use crate::execution::{
@@ -50,13 +51,16 @@ where
     pub fn start(&mut self) -> AfsResult<DaemonStartReport> {
         self.mounts = self.store.load_mounts()?;
 
+        let mut watched_mounts = 0;
         for mount in &self.mounts {
+            if !should_watch_mount(mount) {
+                continue;
+            }
             self.watcher.watch_mount(mount.root.clone())?;
+            watched_mounts += 1;
         }
 
-        Ok(DaemonStartReport {
-            watched_mounts: self.mounts.len(),
-        })
+        Ok(DaemonStartReport { watched_mounts })
     }
 
     fn apply_file_event(&mut self, event: FileEvent) -> AfsResult<DaemonEventReport> {
@@ -83,9 +87,10 @@ where
                 }
             }
             FileEventKind::Write => {
-                if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+                let next_state = write_event_hydration_state(&event.path, &entity);
+                if entity.hydration.can_transition_to(&next_state) {
                     let mut updated = entity;
-                    updated.hydration = HydrationState::Dirty;
+                    updated.hydration = next_state;
                     self.store.save_entity(updated)?;
                     report.marked_dirty = 1;
                 } else {
@@ -129,6 +134,9 @@ where
         event_path: &Path,
     ) -> AfsResult<Option<(MountConfig, EntityRecord)>> {
         for mount in &self.mounts {
+            if !should_watch_mount(mount) {
+                continue;
+            }
             let Some(relative_path) = event_relative_path(&mount.root, event_path) else {
                 continue;
             };
@@ -147,6 +155,7 @@ where
         if self.mounts.len() == 1
             && event_path.is_relative()
             && let Some(mount) = self.mounts.first()
+            && should_watch_mount(mount)
             && let Some(entity) = self
                 .store
                 .find_entity_by_path(&mount.mount_id, event_path)?
@@ -158,9 +167,25 @@ where
     }
 }
 
+fn write_event_hydration_state(path: &Path, entity: &EntityRecord) -> HydrationState {
+    if entity.kind != EntityKind::Page {
+        return HydrationState::Dirty;
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(contents) if has_unresolved_conflict_markers(&contents) => HydrationState::Conflicted,
+        _ => HydrationState::Dirty,
+    }
+}
+
 impl<S, W> DaemonExecutor for DaemonSupervisor<S, W, HydrationQueue>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + JournalRepository + JournalStore,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + VirtualMutationRepository,
     W: FileWatcher,
 {
     fn execute_file_event(&mut self, event: FileEvent) -> AfsResult<DaemonEventReport> {
@@ -255,4 +280,8 @@ fn should_hydrate_on_read(entity: &EntityRecord) -> bool {
         entity.hydration,
         HydrationState::Virtual | HydrationState::Stub
     )
+}
+
+fn should_watch_mount(mount: &MountConfig) -> bool {
+    !mount.projection.uses_virtual_filesystem()
 }

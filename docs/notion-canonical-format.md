@@ -27,15 +27,16 @@ Clean Markdown is preferred for diffable blocks. Undiffable or lossy blocks rend
 
 Directive integrity is validated before push. Agents may move directive lines as whole lines, but editing directive contents is rejected unless the change maps to an explicit supported operation.
 
-The first renderer supports common text blocks, richer inline text, display equations, and simple tables directly. Inline bold, italic, strikethrough, code, external links, date mentions, page/database mentions, link previews, and equations use ordinary Markdown or small HTML fallbacks when Markdown has no native equivalent. Child pages, child databases, toggles, media, embeds, bookmarks, synced blocks, column layouts, tabs, meeting notes, AI/custom blocks, and unsupported/lossy blocks render as directives. This keeps the page inspectable while preserving remote block IDs for later safer round-trip support.
+The first renderer supports common text blocks, richer inline text, display equations, simple tables, and file-like media blocks with API URLs directly. Inline bold, italic, strikethrough, code, external links, date mentions, page/database mentions, link previews, and equations use ordinary Markdown or small HTML fallbacks when Markdown has no native equivalent. Child pages, child databases, toggles, embeds, bookmarks, synced blocks, column layouts, tabs, meeting notes, AI/custom blocks, URL-less media payloads, and unsupported/lossy blocks render as directives. This keeps the page inspectable while preserving remote block IDs for later safer round-trip support.
 
-Media directives keep the source URL and can include a local media path when rendered through a filesystem-aware pull or reconcile path:
+Media blocks with a Notion `file.url` or `external.url` render as ordinary Markdown. Images use image syntax, while other file-like blocks use links:
 
 ```markdown
-::afs{id=image-id type=image local="media/Roadmap ~aaaaaa/image-imageid.png" url="https://..."}
+![Architecture diagram](https://...)
+[Design brief](https://...)
 ```
 
-The local path points into the mount-level `media/` directory so agents can open downloaded images without cluttering the Markdown page directory.
+When rendered through a filesystem-aware pull or reconcile path, image files are also downloaded into the mount-level `media/` directory so agents can open a local copy without cluttering the Markdown page directory. URL-less media payloads still render as directives, for example `::afs{id=image-id type=image title="Architecture diagram"}`.
 
 The first writer supports block bodies whose Markdown shape maps to one Notion block: paragraphs, headings, single list items, to-dos, quotes, code fences, dividers, and display equations. It also parses the rich inline Markdown emitted by the renderer for bold, italic, strikethrough, underline, code, external links, equations, and `afs://` page links. Unchanged preimage mentions, such as date mentions, are preserved during block updates; unsupported inline shapes fail rather than being flattened silently.
 

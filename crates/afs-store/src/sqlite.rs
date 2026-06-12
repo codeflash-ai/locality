@@ -22,14 +22,15 @@ use crate::error::{StoreError, StoreResult};
 use crate::records::{
     ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
     HydrationJobRecord, MountConfig, ProjectionMode, ShadowBlockRecord, ShadowSnapshotRecord,
+    VirtualMutationKind, VirtualMutationRecord,
 };
 use crate::repository::{
     ConnectionRepository, ConnectorProfileRepository, EntityRepository, HydrationJobRepository,
-    JournalRepository, MountRepository, ShadowRepository,
+    JournalRepository, MountRepository, ShadowRepository, VirtualMutationRepository,
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -387,6 +388,15 @@ impl EntityRepository for SqliteStateStore {
 
         rows.map(|row| entity_from_row(row?)).collect()
     }
+
+    fn delete_entity(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM entities WHERE mount_id = ?1 AND remote_id = ?2",
+            params![mount_id.0, remote_id.0],
+        )?;
+        Ok(())
+    }
 }
 
 impl HydrationJobRepository for SqliteStateStore {
@@ -525,6 +535,114 @@ impl ShadowRepository for SqliteStateStore {
     }
 }
 
+impl VirtualMutationRepository for SqliteStateStore {
+    fn save_virtual_mutation(&mut self, mutation: VirtualMutationRecord) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO virtual_mutations (
+                mount_id,
+                local_id,
+                mutation_kind_json,
+                target_remote_id,
+                parent_remote_id,
+                original_path,
+                projected_path,
+                title,
+                content_path,
+                created_at,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(mount_id, local_id) DO UPDATE SET
+                mutation_kind_json = excluded.mutation_kind_json,
+                target_remote_id = excluded.target_remote_id,
+                parent_remote_id = excluded.parent_remote_id,
+                original_path = excluded.original_path,
+                projected_path = excluded.projected_path,
+                title = excluded.title,
+                content_path = excluded.content_path,
+                updated_at = excluded.updated_at",
+            params![
+                mutation.mount_id.0,
+                mutation.local_id,
+                to_json(&mutation.mutation_kind)?,
+                mutation.target_remote_id.map(|remote_id| remote_id.0),
+                mutation.parent_remote_id.map(|remote_id| remote_id.0),
+                mutation
+                    .original_path
+                    .as_ref()
+                    .map(|path| path_to_text(path)),
+                path_to_text(&mutation.projected_path),
+                mutation.title,
+                mutation
+                    .content_path
+                    .as_ref()
+                    .map(|path| path_to_text(path)),
+                mutation.created_at,
+                mutation.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_virtual_mutation(
+        &self,
+        mount_id: &MountId,
+        local_id: &str,
+    ) -> StoreResult<Option<VirtualMutationRecord>> {
+        let connection = self.connection()?;
+        let sql =
+            VIRTUAL_MUTATION_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 AND local_id = ?2";
+        connection
+            .query_row(&sql, params![mount_id.0, local_id], virtual_mutation_row)
+            .optional()?
+            .map(virtual_mutation_from_row)
+            .transpose()
+    }
+
+    fn find_virtual_mutation_by_path(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> StoreResult<Option<VirtualMutationRecord>> {
+        let connection = self.connection()?;
+        let sql = VIRTUAL_MUTATION_SELECT_WITH_WHERE.to_owned()
+            + "WHERE mount_id = ?1 AND projected_path = ?2";
+        connection
+            .query_row(
+                &sql,
+                params![mount_id.0, path_to_text(path)],
+                virtual_mutation_row,
+            )
+            .optional()?
+            .map(virtual_mutation_from_row)
+            .transpose()
+    }
+
+    fn list_virtual_mutations(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<VirtualMutationRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            &(VIRTUAL_MUTATION_SELECT_WITH_WHERE.to_owned()
+                + "WHERE mount_id = ?1 ORDER BY projected_path, local_id"),
+        )?;
+        let rows = statement.query_map(params![mount_id.0], virtual_mutation_row)?;
+
+        rows.map(|row| virtual_mutation_from_row(row?)).collect()
+    }
+
+    fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM virtual_mutations WHERE mount_id = ?1 AND local_id = ?2",
+            params![mount_id.0, local_id],
+        )?;
+        Ok(())
+    }
+}
+
 impl JournalRepository for SqliteStateStore {
     fn append_journal(&mut self, entry: JournalEntry) -> StoreResult<()> {
         if self.get_journal(&entry.push_id)?.is_some() {
@@ -659,6 +777,11 @@ const CONNECTOR_PROFILE_SELECT_WITH_WHERE: &str = "
            enabled_actions_json, connector_version, status, created_at, updated_at
     FROM connector_profiles
     ";
+const VIRTUAL_MUTATION_SELECT_WITH_WHERE: &str = "
+    SELECT mount_id, local_id, mutation_kind_json, target_remote_id, parent_remote_id,
+           original_path, projected_path, title, content_path, created_at, updated_at
+    FROM virtual_mutations
+    ";
 
 type MountRow = (
     String,
@@ -712,6 +835,19 @@ type EntityRow = (
 type HydrationJobRow = (String, String, String, String, String, i64, Option<String>);
 type ShadowRow = (String, String, String, String, String, String);
 type JournalRow = (String, String, String, String, String, String, String);
+type VirtualMutationRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+);
 
 fn initialize_schema(connection: &Connection) -> StoreResult<()> {
     let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -807,6 +943,23 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             PRIMARY KEY (mount_id, remote_id),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS virtual_mutations (
+            mount_id TEXT NOT NULL,
+            local_id TEXT NOT NULL,
+            mutation_kind_json TEXT NOT NULL,
+            target_remote_id TEXT,
+            parent_remote_id TEXT,
+            original_path TEXT,
+            projected_path TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content_path TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, local_id),
+            UNIQUE (mount_id, projected_path),
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
 
@@ -914,6 +1067,27 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             "UPDATE connections
              SET profile_id = 'notion-token-default'
              WHERE profile_id IS NULL AND connector = 'notion';",
+        )?;
+    }
+
+    if user_version < 10 {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS virtual_mutations (
+                mount_id TEXT NOT NULL,
+                local_id TEXT NOT NULL,
+                mutation_kind_json TEXT NOT NULL,
+                target_remote_id TEXT,
+                parent_remote_id TEXT,
+                original_path TEXT,
+                projected_path TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content_path TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (mount_id, local_id),
+                UNIQUE (mount_id, projected_path),
+                FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+            );",
         )?;
     }
 
@@ -1059,6 +1233,38 @@ fn hydration_job_from_row(row: HydrationJobRow) -> StoreResult<HydrationJobRecor
         reason: from_json::<HydrationReason>(&row.4)?,
         attempts,
         last_error: row.6,
+    })
+}
+
+fn virtual_mutation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VirtualMutationRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn virtual_mutation_from_row(row: VirtualMutationRow) -> StoreResult<VirtualMutationRecord> {
+    Ok(VirtualMutationRecord {
+        mount_id: MountId(row.0),
+        local_id: row.1,
+        mutation_kind: from_json::<VirtualMutationKind>(&row.2)?,
+        target_remote_id: row.3.map(RemoteId),
+        parent_remote_id: row.4.map(RemoteId),
+        original_path: row.5.map(PathBuf::from),
+        projected_path: PathBuf::from(row.6),
+        title: row.7,
+        content_path: row.8.map(PathBuf::from),
+        created_at: row.9,
+        updated_at: row.10,
     })
 }
 

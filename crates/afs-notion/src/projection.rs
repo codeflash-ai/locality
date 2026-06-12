@@ -7,11 +7,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use afs_connector::ChildContainer;
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 use afs_core::{AfsError, AfsResult};
 
 use crate::client::NotionApi;
-use crate::dto::{BlockDto, DatabaseDto, PageDto};
+use crate::dto::{BlockDto, DatabaseDto, PageDto, ParentDto};
 use crate::render::{page_frontmatter, page_title};
 
 pub fn enumerate_root_page_tree(
@@ -64,6 +65,246 @@ pub fn enumerate_shared_pages(api: &dyn NotionApi, mount_id: MountId) -> AfsResu
             return Err(AfsError::InvalidState(
                 "notion search page had has_more without next_cursor".to_string(),
             ));
+        }
+    }
+
+    Ok(entries)
+}
+
+pub fn list_container_children(
+    api: &dyn NotionApi,
+    mount_id: MountId,
+    root_page_id: Option<&RemoteId>,
+    container: ChildContainer,
+    parent_path: &Path,
+) -> AfsResult<Vec<TreeEntry>> {
+    let mut used_paths = BTreeSet::new();
+    match container {
+        ChildContainer::Root => list_root_children(api, mount_id, root_page_id, parent_path),
+        ChildContainer::PageChildren(page_id) => list_page_children(
+            api,
+            &mount_id,
+            page_id.as_str(),
+            parent_path,
+            &mut used_paths,
+        ),
+        ChildContainer::DatabaseRows(database_id) => {
+            let database = api.retrieve_database(database_id.as_str())?;
+            list_database_rows(api, &mount_id, &database, parent_path, &mut used_paths)
+        }
+    }
+}
+
+fn list_root_children(
+    api: &dyn NotionApi,
+    mount_id: MountId,
+    root_page_id: Option<&RemoteId>,
+    parent_path: &Path,
+) -> AfsResult<Vec<TreeEntry>> {
+    let mut used_paths = BTreeSet::new();
+    if let Some(root_page_id) = root_page_id {
+        let page = api.retrieve_page(root_page_id.as_str())?;
+        let title = page_title(&page);
+        let path = allocate_page_path(parent_path, &title, &page.id, &mut used_paths);
+        return Ok(vec![page_entry(mount_id, &page, title, path)]);
+    }
+
+    let pages = search_all_pages(api)?;
+    let accessible_page_ids = pages
+        .iter()
+        .map(|page| page.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+
+    for page in pages
+        .iter()
+        .filter(|page| is_workspace_root_page(page, &accessible_page_ids))
+    {
+        let title = page_title(page);
+        let path = allocate_page_path(parent_path, &title, &page.id, &mut used_paths);
+        entries.push(page_entry(mount_id.clone(), page, title, path));
+    }
+
+    for database in search_all_databases(api)?
+        .iter()
+        .filter(|database| is_workspace_root_parent(database.parent.as_ref(), &accessible_page_ids))
+    {
+        let title = database_title(database).unwrap_or_else(|| "Untitled database".to_string());
+        let path = allocate_directory_path(parent_path, &title, &database.id, &mut used_paths);
+        entries.push(database_entry(mount_id.clone(), database, title, path));
+    }
+
+    Ok(entries)
+}
+
+fn search_all_pages(api: &dyn NotionApi) -> AfsResult<Vec<PageDto>> {
+    let mut cursor = None;
+    let mut pages = Vec::new();
+
+    loop {
+        let page = api.search_pages(cursor.as_deref())?;
+        pages.extend(page.results);
+
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Err(AfsError::InvalidState(
+                "notion search page had has_more without next_cursor".to_string(),
+            ));
+        }
+    }
+
+    Ok(pages)
+}
+
+fn is_workspace_root_page(page: &PageDto, accessible_page_ids: &BTreeSet<&str>) -> bool {
+    is_workspace_root_parent(page.parent.as_ref(), accessible_page_ids)
+}
+
+fn is_workspace_root_parent(
+    parent: Option<&ParentDto>,
+    accessible_page_ids: &BTreeSet<&str>,
+) -> bool {
+    match parent {
+        None => true,
+        Some(parent) if parent.kind == "workspace" => true,
+        Some(ParentDto {
+            page_id: Some(parent_page_id),
+            ..
+        }) => !accessible_page_ids.contains(parent_page_id.as_str()),
+        Some(parent) if parent.kind == "page_id" => parent
+            .page_id
+            .as_deref()
+            .is_none_or(|parent_id| !accessible_page_ids.contains(parent_id)),
+        _ => false,
+    }
+}
+
+fn search_all_databases(api: &dyn NotionApi) -> AfsResult<Vec<DatabaseDto>> {
+    let mut cursor = None;
+    let mut databases = Vec::new();
+
+    loop {
+        let page = api.search_databases(cursor.as_deref())?;
+        databases.extend(page.results);
+
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Err(AfsError::InvalidState(
+                "notion search database page had has_more without next_cursor".to_string(),
+            ));
+        }
+    }
+
+    Ok(databases)
+}
+
+fn list_page_children(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    block_id: &str,
+    parent_dir: &Path,
+    used_paths: &mut BTreeSet<PathBuf>,
+) -> AfsResult<Vec<TreeEntry>> {
+    let mut cursor = None;
+    let mut entries = Vec::new();
+
+    loop {
+        let page = api.retrieve_block_children(block_id, cursor.as_deref())?;
+        for block in page.results {
+            project_direct_child_block(api, mount_id, block, parent_dir, used_paths, &mut entries)?;
+        }
+
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Err(AfsError::InvalidState(
+                "notion block children page had has_more without next_cursor".to_string(),
+            ));
+        }
+    }
+
+    Ok(entries)
+}
+
+fn project_direct_child_block(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    block: BlockDto,
+    parent_dir: &Path,
+    used_paths: &mut BTreeSet<PathBuf>,
+    entries: &mut Vec<TreeEntry>,
+) -> AfsResult<()> {
+    match block.kind.as_str() {
+        "child_page" => {
+            let page = api.retrieve_page(block.id.as_str())?;
+            let title = block
+                .child_page
+                .as_ref()
+                .map(|child| child.title.clone())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| page_title(&page));
+            let path = allocate_page_path(parent_dir, &title, &page.id, used_paths);
+            entries.push(page_entry(mount_id.clone(), &page, title, path));
+        }
+        "child_database" => {
+            let database = api.retrieve_database(block.id.as_str())?;
+            let title = block
+                .child_database
+                .as_ref()
+                .map(|child| child.title.clone())
+                .filter(|title| !title.trim().is_empty())
+                .or_else(|| database_title(&database))
+                .unwrap_or_else(|| "Untitled database".to_string());
+            let path = allocate_directory_path(parent_dir, &title, &database.id, used_paths);
+            entries.push(database_entry(mount_id.clone(), &database, title, path));
+        }
+        _ if block.has_children => {
+            let nested =
+                list_page_children(api, mount_id, block.id.as_str(), parent_dir, used_paths)?;
+            entries.extend(nested);
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn list_database_rows(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    database: &DatabaseDto,
+    database_dir: &Path,
+    used_paths: &mut BTreeSet<PathBuf>,
+) -> AfsResult<Vec<TreeEntry>> {
+    let mut entries = Vec::new();
+    for data_source in &database.data_sources {
+        let mut cursor = None;
+
+        loop {
+            let page = api.query_data_source(&data_source.id, cursor.as_deref())?;
+            for row in page.results {
+                let title = page_title(&row);
+                let path = allocate_page_path(database_dir, &title, &row.id, used_paths);
+                entries.push(page_entry(mount_id.clone(), &row, title, path));
+            }
+
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Err(AfsError::InvalidState(
+                    "notion data source query page had has_more without next_cursor".to_string(),
+                ));
+            }
         }
     }
 
@@ -138,17 +379,12 @@ fn project_child_block(
                 .or_else(|| database_title(&database))
                 .unwrap_or_else(|| "Untitled database".to_string());
             let path = allocate_directory_path(parent_dir, &title, &database.id, used_paths);
-            entries.push(TreeEntry {
-                mount_id: mount_id.clone(),
-                remote_id: RemoteId::new(database.id.clone()),
-                kind: EntityKind::Database,
+            entries.push(database_entry(
+                mount_id.clone(),
+                &database,
                 title,
-                path: path.clone(),
-                hydration: HydrationState::Stub,
-                content_hash: None,
-                remote_edited_at: database.last_edited_time.clone(),
-                stub_frontmatter: None,
-            });
+                path.clone(),
+            ));
             enumerate_database_rows(api, mount_id, &database, &path, used_paths, entries)?;
         }
         _ if block.has_children => {
@@ -221,6 +457,25 @@ fn page_entry(mount_id: MountId, page: &PageDto, title: String, path: PathBuf) -
         content_hash: None,
         remote_edited_at: page.last_edited_time.clone(),
         stub_frontmatter: Some(stub_frontmatter),
+    }
+}
+
+fn database_entry(
+    mount_id: MountId,
+    database: &DatabaseDto,
+    title: String,
+    path: PathBuf,
+) -> TreeEntry {
+    TreeEntry {
+        mount_id,
+        remote_id: RemoteId::new(database.id.clone()),
+        kind: EntityKind::Database,
+        title,
+        path,
+        hydration: HydrationState::Stub,
+        content_hash: None,
+        remote_edited_at: database.last_edited_time.clone(),
+        stub_frontmatter: None,
     }
 }
 

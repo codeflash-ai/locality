@@ -4,6 +4,36 @@ AgentFS mounts systems of record as real Markdown files that agents and editors 
 
 This repository contains the Rust workspace for the `plan.md` design and the first functional slices of the core sync engine, CLI, store, daemon hydration loop, and Notion connector.
 
+## Development
+
+The root `Makefile` is the easiest way to run common project tasks:
+
+```sh
+make help
+```
+
+For a fresh checkout, install the desktop dependencies once:
+
+```sh
+make setup
+```
+
+Common targets:
+
+| Target | What it does |
+| --- | --- |
+| `make build` | Builds the Rust workspace and desktop frontend. |
+| `make check` | Runs Rust `cargo check` plus the desktop TypeScript/Vite build. |
+| `make test` | Runs the default Rust workspace test suite. |
+| `make ci` | Runs the same checks as GitHub Actions: Rust formatting and workspace tests. |
+| `make lint` | Runs Rust formatting checks and clippy with warnings denied. |
+| `make fmt` | Formats all Rust code. |
+| `make dev-desktop` | Starts the desktop Vite dev server at `http://127.0.0.1:1420/`. |
+| `make dev-tauri` | Starts the Tauri desktop app in development mode. |
+| `make build-tauri` | Builds the packaged Tauri desktop app. |
+| `make run-cli ARGS='status --json'` | Runs the `afs` CLI with custom arguments. |
+| `make clean` | Removes Rust and desktop build outputs. |
+
 ## Workspace layout
 
 - `crates/afs-cli`: `afs` command surface for humans and agents.

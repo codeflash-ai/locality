@@ -13,7 +13,7 @@ use afs_core::shadow::ShadowDocument;
 use crate::error::StoreResult;
 use crate::records::{
     ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
-    HydrationJobRecord, MountConfig, ShadowSnapshotRecord,
+    HydrationJobRecord, MountConfig, ShadowSnapshotRecord, VirtualMutationRecord,
 };
 
 pub trait MountRepository {
@@ -52,6 +52,24 @@ pub trait EntityRepository {
         path: &Path,
     ) -> StoreResult<Option<EntityRecord>>;
     fn list_entities(&self, mount_id: &MountId) -> StoreResult<Vec<EntityRecord>>;
+    fn delete_entity(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> StoreResult<()>;
+}
+
+pub trait VirtualMutationRepository {
+    fn save_virtual_mutation(&mut self, mutation: VirtualMutationRecord) -> StoreResult<()>;
+    fn get_virtual_mutation(
+        &self,
+        mount_id: &MountId,
+        local_id: &str,
+    ) -> StoreResult<Option<VirtualMutationRecord>>;
+    fn find_virtual_mutation_by_path(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> StoreResult<Option<VirtualMutationRecord>>;
+    fn list_virtual_mutations(&self, mount_id: &MountId)
+    -> StoreResult<Vec<VirtualMutationRecord>>;
+    fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()>;
 }
 
 pub trait HydrationJobRepository {
