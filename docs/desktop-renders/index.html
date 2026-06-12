@@ -1,0 +1,609 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AFS Desktop UI Renders</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="board-header">
+      <div>
+        <p class="eyebrow">AFS Desktop</p>
+        <h1>Desktop UI Renders</h1>
+        <p class="header-copy">
+          Calm native utility screens for workspace-first onboarding, locating
+          Notion pages as local files, guiding agent edits, and reviewing
+          pending changes.
+        </p>
+      </div>
+      <div class="header-meta">
+        <span class="status-dot ready"></span>
+        Design review draft
+      </div>
+    </header>
+
+    <main class="board">
+      <section class="section" id="onboarding">
+        <div class="section-heading">
+          <p class="eyebrow">First run</p>
+          <h2>Workspace onboarding</h2>
+        </div>
+
+        <div class="artboard-grid onboarding-grid">
+          <article class="desktop-window onboarding-screen">
+            <div class="window-bar">
+              <div class="traffic"><span></span><span></span><span></span></div>
+              <div class="window-title">AFS Setup</div>
+              <div class="step-count">1 of 4</div>
+            </div>
+            <div class="setup-content">
+              <div class="setup-mark">AFS</div>
+              <div>
+                <h3>Let your agents edit Notion as local files.</h3>
+                <p>
+                  Mount your Notion workspace in Documents. Agents edit local
+                  files, then AFS syncs reviewed changes back to Notion.
+                </p>
+              </div>
+              <button class="primary">Connect Notion</button>
+              <p class="quiet-note">
+                Local edits stay pending until you review and push.
+              </p>
+            </div>
+          </article>
+
+          <article class="desktop-window onboarding-screen">
+            <div class="window-bar">
+              <div class="traffic"><span></span><span></span><span></span></div>
+              <div class="window-title">AFS Setup</div>
+              <div class="step-count">2 of 4</div>
+            </div>
+            <div class="setup-content">
+              <div class="setup-mark notion">N</div>
+              <div>
+                <h3>Finish connecting in Notion</h3>
+                <p>
+                  A browser window is open. Choose your workspace, pick the
+                  pages AFS can use, then approve access.
+                </p>
+              </div>
+              <ol class="progress-list oauth-list">
+                <li class="done">Browser opened</li>
+                <li class="active">Select workspace and pages</li>
+                <li>Approve access</li>
+              </ol>
+              <button class="primary disabled">Waiting for Notion</button>
+              <div class="inline-links single-link">
+                <button>Open browser again</button>
+              </div>
+              <p class="quiet-note">
+                Credentials are stored securely in the OS credential store.
+              </p>
+            </div>
+          </article>
+
+          <article class="desktop-window onboarding-screen">
+            <div class="window-bar">
+              <div class="traffic"><span></span><span></span><span></span></div>
+              <div class="window-title">AFS Setup</div>
+              <div class="step-count">3 of 4</div>
+            </div>
+            <div class="setup-content">
+              <div class="setup-mark folder-icon"></div>
+              <div>
+                <h3>Where should your Notion files appear?</h3>
+                <p>
+                  AFS keeps the folder visible in Documents and organized under
+                  its own directory.
+                </p>
+              </div>
+              <div class="path-input">
+                <span>~/Documents/AFS/Notion</span>
+                <button class="icon-button">Choose</button>
+              </div>
+              <button class="primary">Continue</button>
+              <p class="quiet-note">
+                This folder will include AGENTS.md and CLAUDE.md to help your
+                agents edit files natively.
+              </p>
+            </div>
+          </article>
+
+          <article class="desktop-window onboarding-screen">
+            <div class="window-bar">
+              <div class="traffic"><span></span><span></span><span></span></div>
+              <div class="window-title">AFS Setup</div>
+              <div class="step-count">4 of 4</div>
+            </div>
+            <div class="setup-content">
+              <div class="setup-mark progress-mark"></div>
+              <div>
+                <h3>Preparing your Notion workspace</h3>
+                <p>
+                  You can continue as soon as the folder and agent instructions
+                  are ready.
+                </p>
+              </div>
+              <ol class="progress-list">
+                <li class="done">Connected Notion</li>
+                <li class="done">Created local folder</li>
+                <li class="done">Found top-level workspace pages</li>
+                <li class="done">Added agent instructions</li>
+                <li class="active">Preparing workspace in the background</li>
+              </ol>
+              <button class="primary">Continue</button>
+            </div>
+          </article>
+
+          <article class="desktop-window onboarding-screen ready-screen">
+            <div class="window-bar">
+              <div class="traffic"><span></span><span></span><span></span></div>
+              <div class="window-title">AFS Setup</div>
+              <div></div>
+            </div>
+            <div class="setup-content">
+              <div class="setup-mark ready-mark"></div>
+              <div>
+                <h3>Your Notion folder is ready</h3>
+                <p class="path-line">~/Documents/AFS/Notion</p>
+              </div>
+              <button class="primary">Open Notion Folder</button>
+              <div class="open-page-box">
+                <label>Open a Notion page</label>
+                <div class="url-drop">Paste a Notion URL to get its local file path</div>
+              </div>
+              <div class="agent-demo">
+                <span>Try this with an agent</span>
+                <p>
+                  "Edit this Notion file and make the launch plan clearer."
+                </p>
+              </div>
+              <div class="inline-links">
+                <button>Copy folder path</button>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section split-section" id="tray-icons">
+        <div class="section-heading">
+          <p class="eyebrow">Daily use</p>
+          <h2>Tray icon states</h2>
+          <p class="section-copy">
+            The default menu bar icon stays clean. Badges appear only when
+            there are pending changes to review or a connection needs attention.
+          </p>
+        </div>
+
+        <div class="tray-icons-wrap">
+          <article class="menu-bar-render">
+            <div class="menu-left">
+              <span>Finder</span>
+              <span>File</span>
+              <span>Edit</span>
+              <span>View</span>
+            </div>
+            <div class="menu-right">
+              <span class="tray-glyph" aria-label="AFS">
+                <svg aria-hidden="true" viewBox="0 0 28 18">
+                  <path d="M7 14.4 4.5 9 7 3.6" />
+                  <path d="M21 3.6 23.5 9 21 14.4" />
+                  <path d="M9.5 5.7h9" />
+                  <path d="M9.5 12.3h9" />
+                  <path d="M12 9h4" />
+                </svg>
+                <i></i>
+              </span>
+              <span class="menu-muted">Wi-Fi</span>
+              <span>Thu 5:08 PM</span>
+            </div>
+          </article>
+          <div class="icon-state-grid">
+            <div class="icon-state-card">
+              <span class="tray-glyph" aria-label="Ready">
+                <svg aria-hidden="true" viewBox="0 0 28 18">
+                  <path d="M7 14.4 4.5 9 7 3.6" />
+                  <path d="M21 3.6 23.5 9 21 14.4" />
+                  <path d="M9.5 5.7h9" />
+                  <path d="M9.5 12.3h9" />
+                  <path d="M12 9h4" />
+                </svg>
+                <i></i>
+              </span>
+              <strong>Default</strong>
+              <p>Workspace available</p>
+            </div>
+            <div class="icon-state-card">
+              <span class="tray-glyph" aria-label="Working">
+                <svg aria-hidden="true" viewBox="0 0 28 18">
+                  <path d="M7 14.4 4.5 9 7 3.6" />
+                  <path d="M21 3.6 23.5 9 21 14.4" />
+                  <path d="M9.5 5.7h9" />
+                  <path d="M9.5 12.3h9" />
+                  <path d="M12 9h4" />
+                </svg>
+                <i></i>
+              </span>
+              <strong>Working</strong>
+              <p>No badge by default</p>
+            </div>
+            <div class="icon-state-card">
+              <span class="tray-glyph state-review" aria-label="Needs review">
+                <svg aria-hidden="true" viewBox="0 0 28 18">
+                  <path d="M7 14.4 4.5 9 7 3.6" />
+                  <path d="M21 3.6 23.5 9 21 14.4" />
+                  <path d="M9.5 5.7h9" />
+                  <path d="M9.5 12.3h9" />
+                  <path d="M12 9h4" />
+                </svg>
+                <i></i>
+              </span>
+              <strong>Needs Review</strong>
+              <p>Pending changes</p>
+            </div>
+            <div class="icon-state-card">
+              <span class="tray-glyph state-reconnect" aria-label="Reconnect needed">
+                <svg aria-hidden="true" viewBox="0 0 28 18">
+                  <path d="M7 14.4 4.5 9 7 3.6" />
+                  <path d="M21 3.6 23.5 9 21 14.4" />
+                  <path d="M9.5 5.7h9" />
+                  <path d="M9.5 12.3h9" />
+                  <path d="M12 9h4" />
+                </svg>
+                <i></i>
+              </span>
+              <strong>Reconnect Needed</strong>
+              <p>Action required</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section split-section" id="tray-popover">
+        <div class="section-heading">
+          <p class="eyebrow">Daily use</p>
+          <h2>Tray popover</h2>
+        </div>
+
+        <div class="tray-pair">
+          <article class="tray">
+            <div class="tray-top">
+              <strong>AFS</strong>
+              <span class="pill ready">Ready</span>
+            </div>
+            <div class="tray-block">
+              <p class="label">Notion</p>
+              <h3>CodeFlash</h3>
+              <p class="path-line">~/Documents/AFS/Notion</p>
+            </div>
+            <button class="primary full">Open Notion Folder</button>
+            <div class="tray-url-box">
+              <label>Open a Notion page</label>
+              <div>Paste Notion URL</div>
+            </div>
+            <div class="summary-row">
+              <span>Pending Changes</span>
+              <strong>0</strong>
+            </div>
+            <div class="suggestion">
+              <p class="label">Suggestion</p>
+              <span>Connect Linear</span>
+            </div>
+            <div class="tray-footer">
+              <button>Settings</button>
+              <button>Quit Options</button>
+            </div>
+          </article>
+
+          <article class="tray needs-review">
+            <div class="tray-top">
+              <strong>AFS</strong>
+              <span class="pill warn">Needs Review</span>
+            </div>
+            <div class="summary-row large">
+              <span>Pending Changes</span>
+              <strong>3</strong>
+            </div>
+            <ul class="compact-list">
+              <li>roadmap-2026.md</li>
+              <li>launch-plan.md</li>
+              <li>customer-notes.md</li>
+            </ul>
+            <button class="primary full">Review Pending Changes</button>
+            <button class="row-action">Open Notion Folder</button>
+            <div class="tray-url-box">
+              <label>Open a Notion page</label>
+              <div>Paste Notion URL</div>
+            </div>
+            <div class="tray-footer">
+              <button>Settings</button>
+              <button>Quit Options</button>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="home">
+        <div class="section-heading">
+          <p class="eyebrow">Main app</p>
+          <h2>Home</h2>
+        </div>
+        <article class="app-window">
+          <aside class="sidebar">
+            <div class="brand">AFS</div>
+            <nav>
+              <a class="active">Home</a>
+              <a>Pending</a>
+              <a>Activity</a>
+              <a>Settings</a>
+            </nav>
+            <div class="sidebar-status">
+              <span class="status-dot ready"></span>
+              Notion Ready
+            </div>
+          </aside>
+          <section class="app-main">
+            <div class="main-heading">
+              <div>
+                <p class="eyebrow">Home</p>
+                <h2>Notion workspace</h2>
+              </div>
+              <span class="pill ready">Ready</span>
+            </div>
+
+            <div class="workspace-summary">
+              <div>
+                <p class="label">Connected workspace</p>
+                <h3>CodeFlash</h3>
+                <p class="path-line">~/Documents/AFS/Notion</p>
+              </div>
+              <button class="secondary">Open Folder</button>
+            </div>
+
+            <div class="home-url-card">
+              <label>Open a Notion page</label>
+              <div class="home-url-row">
+                <span>Paste Notion URL to get the local file path</span>
+                <button class="primary">Open Page</button>
+              </div>
+              <p>
+                AFS prepares that page first and gives you a path to paste into
+                an agent.
+              </p>
+            </div>
+
+            <div class="two-column">
+              <div class="panel">
+                <div class="panel-title">
+                  <h3>Pending Changes</h3>
+                  <span>0</span>
+                </div>
+                <p>No pending changes.</p>
+              </div>
+              <div class="panel">
+                <div class="panel-title">
+                  <h3>Suggestions</h3>
+                  <span>Next</span>
+                </div>
+                <p>Connect Linear to mount issues and projects as files.</p>
+              </div>
+            </div>
+          </section>
+        </article>
+      </section>
+
+      <section class="section" id="open-page">
+        <div class="section-heading">
+          <p class="eyebrow">Home inline flow</p>
+          <h2>Open page result</h2>
+        </div>
+        <div class="artboard-grid locate-grid">
+          <article class="app-window single-pane">
+            <section class="app-main">
+              <div class="main-heading">
+                <div>
+                  <p class="eyebrow">Home</p>
+                  <h2>Preparing this page</h2>
+                </div>
+              </div>
+              <p class="helper-copy">AFS is making the local file available now.</p>
+              <div class="copy-path preparing-path">
+                <span>~/Documents/AFS/Notion/Engineering/Roadmap 2026 ~a3f2.md</span>
+                <button class="icon-button">Copy</button>
+              </div>
+              <p class="helper-copy">
+                You can copy the path now. The file opens as soon as preparation
+                finishes.
+              </p>
+            </section>
+          </article>
+
+          <article class="app-window single-pane">
+            <section class="app-main">
+              <div class="main-heading">
+                <div>
+                  <p class="eyebrow">Home</p>
+                  <h2>Roadmap 2026</h2>
+                </div>
+                <span class="pill soft">Page</span>
+              </div>
+              <p class="helper-copy">Ready as a local file.</p>
+              <div class="copy-path">
+                <span>~/Documents/AFS/Notion/Engineering/Roadmap 2026 ~a3f2.md</span>
+                <button class="icon-button">Copy</button>
+              </div>
+              <div class="button-row">
+                <button class="primary">Copy Path</button>
+                <button class="secondary">Reveal in Finder</button>
+              </div>
+              <div class="agent-demo wide">
+                <span>Agent prompt</span>
+                <p>
+                  "Use this file to rewrite the launch plan. Keep the title and
+                  update the action items."
+                </p>
+              </div>
+            </section>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="review">
+        <div class="section-heading">
+          <p class="eyebrow">Writes</p>
+          <h2>Pending changes and push review</h2>
+        </div>
+        <div class="artboard-grid review-grid">
+          <article class="app-window single-pane tall">
+            <section class="app-main">
+              <div class="main-heading">
+                <div>
+                  <p class="eyebrow">Pending Changes</p>
+                  <h2>3 files have pending changes</h2>
+                </div>
+              </div>
+              <div class="file-list">
+                <div class="file-item">
+                  <div>
+                    <strong>Roadmap 2026</strong>
+                    <p>Engineering/Roadmap 2026 ~a3f2.md</p>
+                  </div>
+                  <span class="file-meta">2 text edits</span>
+                </div>
+                <div class="file-item attention">
+                  <div>
+                    <strong>Launch Plan</strong>
+                    <p>Marketing/Launch Plan ~8841.md</p>
+                  </div>
+                  <span class="file-meta">needs review</span>
+                </div>
+                <div class="file-item">
+                  <div>
+                    <strong>Customer Notes</strong>
+                    <p>Research/Customer Notes ~3cb0.md</p>
+                  </div>
+                  <span class="file-meta">1 property edit</span>
+                </div>
+              </div>
+              <button class="primary">Review Push</button>
+            </section>
+          </article>
+
+          <article class="app-window single-pane tall">
+            <section class="app-main">
+              <div class="main-heading">
+                <div>
+                  <p class="eyebrow">Review Push</p>
+                  <h2>3 files will update Notion</h2>
+                </div>
+              </div>
+              <div class="review-summary">
+                <div><strong>2</strong><span>pages updated</span></div>
+                <div><strong>1</strong><span>database row</span></div>
+                <div><strong>0</strong><span>pages deleted</span></div>
+              </div>
+              <div class="push-list">
+                <div><span>Roadmap 2026</span><strong>2 block edits</strong></div>
+                <div><span>Launch Plan</span><strong>large deletion</strong></div>
+                <div><span>Customer Notes</span><strong>1 property edit</strong></div>
+              </div>
+              <div class="safety-strip">
+                Push shows a plan before Notion is updated.
+              </div>
+              <button class="primary">Push to Notion</button>
+            </section>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="controls">
+        <div class="section-heading">
+          <p class="eyebrow">Controls</p>
+          <h2>Mount detail and settings</h2>
+        </div>
+        <div class="artboard-grid review-grid">
+          <article class="app-window single-pane tall">
+            <section class="app-main">
+              <div class="main-heading">
+                <div>
+                  <p class="eyebrow">Notion</p>
+                  <h2>CodeFlash</h2>
+                </div>
+                <span class="pill ready">Ready</span>
+              </div>
+              <div class="mount-folder-card">
+                <div>
+                  <span class="label">Local folder</span>
+                  <strong>~/Documents/AFS/Notion</strong>
+                  <p>Visible in Documents and organized as a normal folder.</p>
+                </div>
+                <div class="mount-actions">
+                  <button class="primary">Open Folder</button>
+                  <button class="secondary">Move...</button>
+                </div>
+              </div>
+              <div class="details-table">
+                <div><span>Status</span><strong>Ready</strong></div>
+                <div><span>Pending Changes</span><strong>0</strong></div>
+                <div><span>Access</span><strong>Edit enabled</strong></div>
+                <div><span>Projection</span><strong>macOS File Provider</strong></div>
+                <div><span>Source scope</span><strong>CodeFlash workspace</strong></div>
+              </div>
+              <div class="tree-preview">
+                <strong>Mounted content</strong>
+                <p>
+                  Uses Notion's workspace and top-level page hierarchy inside
+                  the local folder.
+                </p>
+              </div>
+            </section>
+          </article>
+
+          <article class="app-window single-pane tall">
+            <section class="app-main">
+              <div class="main-heading">
+                <div>
+                  <p class="eyebrow">Settings</p>
+                  <h2>Preferences</h2>
+                </div>
+              </div>
+              <div class="settings-list">
+                <div class="setting-row">
+                  <div>
+                    <strong>Launch AFS at login</strong>
+                    <p>Keep your mounted workspaces available.</p>
+                  </div>
+                  <span class="toggle on"></span>
+                </div>
+                <div class="setting-row">
+                  <div>
+                    <strong>Show AFS in the menu bar</strong>
+                    <p>Hide the icon without stopping background sync.</p>
+                  </div>
+                  <span class="toggle on"></span>
+                </div>
+                <div class="setting-row">
+                  <div>
+                    <strong>Default folder</strong>
+                    <p>~/Documents/AFS</p>
+                  </div>
+                  <button class="icon-button">Change</button>
+                </div>
+                <div class="setting-row">
+                  <div>
+                    <strong>Diagnostics</strong>
+                    <p>Logs and support details for troubleshooting.</p>
+                  </div>
+                  <button class="icon-button">Open</button>
+                </div>
+              </div>
+            </section>
+          </article>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
