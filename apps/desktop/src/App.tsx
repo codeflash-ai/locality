@@ -190,6 +190,10 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>, f
   return invoke<T>(command, args);
 }
 
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export default function App() {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>(sampleSnapshot);
   const [view, setView] = useState<AppView>("home");
@@ -202,7 +206,12 @@ export default function App() {
   }
 
   useEffect(() => {
-    void refreshSnapshot().catch(() => setSnapshot(sampleSnapshot));
+    void (async () => {
+      if (isTauriRuntime()) {
+        await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
+      }
+      await refreshSnapshot();
+    })().catch(() => setSnapshot(sampleSnapshot));
   }, []);
 
   useEffect(() => {
@@ -252,6 +261,8 @@ function Onboarding({
 }) {
   const [step, setStep] = useState(() => (window.location.hash === "#onboarding-ready" ? 4 : 1));
   const [oauthReady, setOauthReady] = useState(false);
+  const [oauthInFlight, setOauthInFlight] = useState(false);
+  const [oauthError, setOauthError] = useState("");
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
   const [locateUrl, setLocateUrl] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
@@ -259,9 +270,26 @@ function Onboarding({
   const [mountError, setMountError] = useState("");
 
   async function startConnect() {
-    await callCommand("connect_notion", undefined, { ok: true });
+    setOauthError("");
+    setOauthReady(false);
+    setOauthInFlight(true);
     setStep(2);
-    window.setTimeout(() => setOauthReady(true), 1100);
+    try {
+      const report = await callCommand<ActionReport>(
+        "connect_notion",
+        undefined,
+        { ok: true, message: "Connected demo workspace." },
+      );
+      if (!report.ok) {
+        setOauthError(report.message);
+        return;
+      }
+      setOauthReady(true);
+    } catch (error) {
+      setOauthError(errorMessage(error));
+    } finally {
+      setOauthInFlight(false);
+    }
   }
 
   async function startMount() {
@@ -278,8 +306,33 @@ function Onboarding({
     setStep(4);
   }
 
+  async function chooseFolder() {
+    setMountError("");
+    try {
+      const selected = await callCommand<string | null>(
+        "choose_mount_folder",
+        { current: mountPath },
+        null,
+      );
+      if (selected) {
+        setMountPath(selected.replace(/\/$/, ""));
+      }
+    } catch (error) {
+      setMountError(errorMessage(error));
+    }
+  }
+
   async function openFolderAndFinish() {
-    await callCommand("open_path", { path: mountPath }, { ok: true });
+    setMountError("");
+    const report = await callCommand<ActionReport>(
+      "open_path",
+      { path: mountPath },
+      { ok: true, message: "Opened demo folder." },
+    );
+    if (!report.ok) {
+      setMountError(report.message);
+      return;
+    }
     onComplete();
   }
 
@@ -337,17 +390,18 @@ function Onboarding({
             </div>
             <ProgressList
               items={[
-                { label: "Browser opened", state: "done" },
+                { label: "Browser opened", state: oauthError ? "idle" : "done" },
                 { label: "Select workspace and pages", state: oauthReady ? "done" : "active" },
                 { label: "Approve access", state: oauthReady ? "done" : "idle" },
               ]}
             />
             <PrimaryButton disabled={!oauthReady} onClick={() => setStep(3)}>
-              {oauthReady ? "Continue" : "Waiting for Notion"}
+              {oauthReady ? "Continue" : oauthInFlight ? "Waiting for Notion" : "Continue"}
             </PrimaryButton>
-            <TextButton onClick={() => void callCommand("connect_notion", undefined, { ok: true })}>
+            <TextButton disabled={oauthInFlight} onClick={() => void startConnect()}>
               Open browser again
             </TextButton>
+            {oauthError && <p className="field-error">{oauthError}</p>}
             <p className="quiet-note">Credentials are stored securely in the OS credential store.</p>
           </SetupContent>
         )}
@@ -360,7 +414,9 @@ function Onboarding({
             </div>
             <div className="path-field">
               <input value={mountPath} onChange={(event) => setMountPath(event.target.value)} />
-              <SecondaryButton compact>Choose</SecondaryButton>
+              <SecondaryButton compact onClick={chooseFolder}>
+                Choose
+              </SecondaryButton>
             </div>
             <PrimaryButton disabled={!mountPath.trim()} onClick={startMount}>
               Continue
@@ -505,7 +561,7 @@ function MainShell({
           {view === "pending" && <PendingView snapshot={snapshot} onReview={() => onViewChange("review")} />}
           {view === "review" && <ReviewView snapshot={snapshot} onDone={() => onViewChange("activity")} />}
           {view === "activity" && <ActivityView snapshot={snapshot} />}
-          {view === "settings" && <SettingsView snapshot={snapshot} />}
+          {view === "settings" && <SettingsView snapshot={snapshot} onRefresh={onRefresh} />}
         </section>
       </div>
     </main>
@@ -529,6 +585,20 @@ function HomeView({
   const [actionError, setActionError] = useState("");
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
 
+  async function connectNotion() {
+    setActionError("");
+    const report = await callCommand<ActionReport>(
+      "connect_notion",
+      undefined,
+      { ok: true, message: "Connected demo workspace." },
+    );
+    if (!report.ok) {
+      setActionError(report.message);
+      return;
+    }
+    await onRefresh();
+  }
+
   async function createMount() {
     setActionError("");
     const report = await callCommand<ActionReport>(
@@ -541,6 +611,18 @@ function HomeView({
       return;
     }
     await onRefresh();
+  }
+
+  async function openWorkspaceFolder(path: string) {
+    setActionError("");
+    const report = await callCommand<ActionReport>(
+      "open_path",
+      { path },
+      { ok: true, message: "Opened demo folder." },
+    );
+    if (!report.ok) {
+      setActionError(report.message);
+    }
   }
 
   async function locatePage() {
@@ -580,9 +662,10 @@ function HomeView({
             <h2>Connect your Notion workspace</h2>
             <p>AFS needs access before it can create local files for agents.</p>
           </div>
-          <PrimaryButton icon={<ChevronRight />} onClick={() => void callCommand("connect_notion", undefined, { ok: true })}>
+          <PrimaryButton icon={<ChevronRight />} onClick={() => void connectNotion()}>
             Connect Notion
           </PrimaryButton>
+          {actionError && <p className="field-error">{actionError}</p>}
         </section>
       ) : mountMissing(snapshot) ? (
         <section className="empty-action-panel">
@@ -608,7 +691,7 @@ function HomeView({
               <p className="path-line">{snapshot.mount.localPath}</p>
             </div>
             <div className="button-row">
-              <SecondaryButton icon={<FolderOpen />} onClick={() => void callCommand("open_path", { path: snapshot.mount.localPath }, { ok: true })}>
+              <SecondaryButton icon={<FolderOpen />} onClick={() => void openWorkspaceFolder(snapshot.mount.localPath)}>
                 Open Folder
               </SecondaryButton>
               <SecondaryButton icon={<ChevronRight />} onClick={onMount}>
@@ -616,6 +699,7 @@ function HomeView({
               </SecondaryButton>
             </div>
           </section>
+          {actionError && <p className="field-error">{actionError}</p>}
 
           <section className="panel locate-panel">
             <LocateBox
@@ -665,6 +749,19 @@ function HomeView({
 
 function MountDetailView({ snapshot, onReview }: { snapshot: DesktopSnapshot; onReview: () => void }) {
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
+  const [actionError, setActionError] = useState("");
+
+  async function openFolder() {
+    setActionError("");
+    const report = await callCommand<ActionReport>(
+      "open_path",
+      { path: snapshot.mount.localPath },
+      { ok: true, message: "Opened demo folder." },
+    );
+    if (!report.ok) {
+      setActionError(report.message);
+    }
+  }
 
   return (
     <div className="view-stack">
@@ -685,10 +782,7 @@ function MountDetailView({ snapshot, onReview }: { snapshot: DesktopSnapshot; on
           </p>
         </div>
         <div className="mount-actions">
-          <PrimaryButton
-            icon={<FolderOpen />}
-            onClick={() => void callCommand("open_path", { path: snapshot.mount.localPath }, { ok: true })}
-          >
+          <PrimaryButton icon={<FolderOpen />} onClick={() => void openFolder()}>
             Open Folder
           </PrimaryButton>
           <SecondaryButton compact icon={<Copy />} onClick={() => copyText(snapshot.mount.localPath)}>
@@ -696,6 +790,7 @@ function MountDetailView({ snapshot, onReview }: { snapshot: DesktopSnapshot; on
           </SecondaryButton>
         </div>
       </section>
+      {actionError && <p className="field-error">{actionError}</p>}
 
       <section className="detail-grid">
         <div className="panel">
@@ -863,7 +958,40 @@ function ActivityView({ snapshot }: { snapshot: DesktopSnapshot }) {
   );
 }
 
-function SettingsView({ snapshot }: { snapshot: DesktopSnapshot }) {
+function SettingsView({
+  snapshot,
+  onRefresh,
+}: {
+  snapshot: DesktopSnapshot;
+  onRefresh: () => Promise<void>;
+}) {
+  const [diagnosticMessage, setDiagnosticMessage] = useState("");
+  const daemonStopped = snapshot.health.state === "stopped";
+
+  async function repairRuntime() {
+    setDiagnosticMessage("");
+    const report = await callCommand<ActionReport>(
+      "ensure_runtime_ready",
+      undefined,
+      { ok: true, message: "AFS daemon is running." },
+    );
+    setDiagnosticMessage(report.message);
+    await onRefresh().catch(() => undefined);
+  }
+
+  function copyDiagnostics() {
+    const summary = [
+      `AFS process: ${daemonStopped ? "Stopped" : "Running"}`,
+      "State folder: ~/.afs",
+      `Projection: ${snapshot.mount.projection}`,
+      `Connection: ${snapshot.connection.status}`,
+      `Mount: ${snapshot.mount.status}`,
+      `Pending changes: ${snapshot.pendingChanges.length}`,
+    ].join("\n");
+    copyText(summary);
+    setDiagnosticMessage("Copied diagnostics summary.");
+  }
+
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Settings" title="AFS controls" />
@@ -885,13 +1013,18 @@ function SettingsView({ snapshot }: { snapshot: DesktopSnapshot }) {
 
         <div className="panel">
           <PanelTitle title="Diagnostics" />
-          <SettingRow title="AFS process" value={snapshot.health.state === "stopped" ? "Stopped" : "Running"} />
+          <SettingRow title="AFS process" value={daemonStopped ? "Stopped" : "Running"} />
           <SettingRow title="State folder" value="~/.afs" />
           <SettingRow title="Projection" value={snapshot.mount.projection} />
           <div className="button-row">
-            <SecondaryButton compact>Copy Summary</SecondaryButton>
-            <SecondaryButton compact>Restart AFS</SecondaryButton>
+            <SecondaryButton compact onClick={copyDiagnostics}>
+              Copy Summary
+            </SecondaryButton>
+            <SecondaryButton compact onClick={() => void repairRuntime()}>
+              {daemonStopped ? "Start AFS" : "Repair AFS"}
+            </SecondaryButton>
           </div>
+          {diagnosticMessage && <p className="quiet-note inline-note">{diagnosticMessage}</p>}
         </div>
 
         <div className="panel">
@@ -1291,24 +1424,34 @@ function SecondaryButton({
   children,
   icon,
   compact,
+  disabled,
   onClick,
 }: {
   children: React.ReactNode;
   icon?: React.ReactNode;
   compact?: boolean;
+  disabled?: boolean;
   onClick?: () => void;
 }) {
   return (
-    <button className={`secondary-button ${compact ? "compact" : ""}`} onClick={onClick}>
+    <button className={`secondary-button ${compact ? "compact" : ""}`} disabled={disabled} onClick={onClick}>
       {icon}
       <span>{children}</span>
     </button>
   );
 }
 
-function TextButton({ children, onClick }: { children: React.ReactNode; onClick?: () => void }) {
+function TextButton({
+  children,
+  disabled,
+  onClick,
+}: {
+  children: React.ReactNode;
+  disabled?: boolean;
+  onClick?: () => void;
+}) {
   return (
-    <button className="text-button" onClick={onClick}>
+    <button className="text-button" disabled={disabled} onClick={onClick}>
       {children}
     </button>
   );

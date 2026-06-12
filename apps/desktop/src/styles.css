@@ -50,8 +50,13 @@ input {
   font: inherit;
 }
 
-button {
-  cursor: default;
+button:not(:disabled),
+summary {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
 }
 
 svg {
@@ -202,6 +207,10 @@ p {
   font-size: 12px !important;
 }
 
+.inline-note {
+  margin-top: 10px !important;
+}
+
 .brand-tile {
   display: grid;
   place-items: center;
@@ -260,7 +269,8 @@ p {
     border-color 170ms ease,
     box-shadow 170ms ease,
     color 170ms ease,
-    opacity 170ms ease;
+    opacity 170ms ease,
+    transform 90ms ease;
 }
 
 .primary-button {
@@ -273,6 +283,21 @@ p {
 .primary-button:hover:not(:disabled) {
   background: #0b1320;
   box-shadow: 0 16px 30px rgba(18, 27, 40, 0.26);
+}
+
+.primary-button:active:not(:disabled),
+.secondary-button:active:not(:disabled),
+.text-button:active:not(:disabled),
+.sidebar-link:active:not(:disabled),
+.option-row:active:not(:disabled),
+.path-button:active:not(:disabled),
+.tray-locate-row button:active:not(:disabled),
+.tray-result button:active:not(:disabled),
+.tray-suggestion button:active:not(:disabled),
+.tray-footer button:active:not(:disabled),
+.tray-row-button:active:not(:disabled),
+.tray-change-list button:active:not(:disabled) {
+  transform: translateY(1px) scale(0.99);
 }
 
 .primary-button:disabled {
@@ -313,10 +338,15 @@ p {
   color: var(--ink);
 }
 
-.secondary-button:hover {
+.secondary-button:hover:not(:disabled) {
   border-color: var(--line-strong);
   background: #fff;
   box-shadow: 0 8px 20px rgba(20, 30, 43, 0.08);
+}
+
+.secondary-button:disabled,
+.text-button:disabled {
+  opacity: 0.58;
 }
 
 .text-button {
@@ -327,6 +357,14 @@ p {
   color: var(--accent);
   font-size: 13px;
   font-weight: 800;
+}
+
+.text-button:hover:not(:disabled),
+.path-button:hover:not(:disabled),
+.tray-result button:hover:not(:disabled),
+.tray-suggestion button:hover:not(:disabled),
+.tray-footer button:hover:not(:disabled) {
+  color: var(--accent);
 }
 
 .button-row,
@@ -603,6 +641,10 @@ p {
   font-size: 13px;
   font-weight: 800;
   text-align: left;
+  transition:
+    background-color 170ms ease,
+    color 170ms ease,
+    transform 90ms ease;
 }
 
 .sidebar-link svg {
@@ -1090,6 +1132,14 @@ p {
   font-size: 13px;
   font-weight: 800;
   text-align: left;
+  transition:
+    background-color 170ms ease,
+    color 170ms ease,
+    transform 90ms ease;
+}
+
+.option-row:hover {
+  background: rgba(248, 252, 251, 0.86);
 }
 
 .option-row svg:last-child {
@@ -1190,6 +1240,9 @@ p {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
   text-align: left;
+  transition:
+    color 170ms ease,
+    transform 90ms ease;
 }
 
 .tray-popover {
@@ -1278,6 +1331,10 @@ p {
   color: var(--ink);
   font-size: 12px;
   font-weight: 800;
+  transition:
+    background-color 170ms ease,
+    color 170ms ease,
+    transform 90ms ease;
 }
 
 .tray-locate-row button {

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
@@ -124,23 +125,56 @@ struct ActionReport {
     message: String,
 }
 
+static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
 #[tauri::command]
 fn desktop_snapshot() -> DesktopSnapshot {
     load_desktop_snapshot().unwrap_or_else(|_| sample_snapshot())
 }
 
 #[tauri::command]
-fn connect_notion() -> ActionReport {
-    let state_root = default_state_root();
-    std::thread::spawn(move || {
-        if let Err(error) = connect_notion_with_broker(state_root) {
-            eprintln!("afs desktop connect notion failed: {error}");
-        }
-    });
+async fn connect_notion() -> ActionReport {
+    if CONNECT_NOTION_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return ActionReport {
+            ok: false,
+            message: "A Notion connection flow is already waiting for browser approval."
+                .to_string(),
+        };
+    }
 
-    ActionReport {
-        ok: true,
-        message: "Notion OAuth flow started.".to_string(),
+    let state_root = default_state_root();
+    let result =
+        tauri::async_runtime::spawn_blocking(move || connect_notion_with_broker(state_root))
+            .await
+            .map_err(|error| format!("Notion OAuth worker failed: {error}"));
+    CONNECT_NOTION_IN_PROGRESS.store(false, Ordering::Release);
+
+    match result {
+        Ok(Ok(())) => ActionReport {
+            ok: true,
+            message: "Notion connected.".to_string(),
+        },
+        Ok(Err(message)) | Err(message) => {
+            eprintln!("afs desktop connect notion failed: {message}");
+            ActionReport { ok: false, message }
+        }
+    }
+}
+
+#[tauri::command]
+fn choose_mount_folder(current: Option<String>) -> Result<Option<String>, String> {
+    choose_folder_with_finder(current)
+}
+
+#[tauri::command]
+fn ensure_runtime_ready() -> ActionReport {
+    let state_root = default_state_root();
+    match ensure_daemon_running(&state_root).and_then(|_| reload_daemon_mounts(&state_root)) {
+        Ok(()) => ActionReport {
+            ok: true,
+            message: "AFS daemon is running.".to_string(),
+        },
+        Err(message) => ActionReport { ok: false, message },
     }
 }
 
@@ -234,13 +268,13 @@ fn show_main_window(app: AppHandle, view: Option<String>) -> ActionReport {
 
 #[tauri::command]
 fn hide_menubar(app: AppHandle) -> ActionReport {
-    if let Some(tray) = app.tray_by_id("main") {
-        if let Err(error) = tray.set_visible(false) {
-            return ActionReport {
-                ok: false,
-                message: format!("Could not hide menu bar icon: {error}"),
-            };
-        }
+    if let Some(tray) = app.tray_by_id("main")
+        && let Err(error) = tray.set_visible(false)
+    {
+        return ActionReport {
+            ok: false,
+            message: format!("Could not hide menu bar icon: {error}"),
+        };
     }
     if let Some(window) = app.get_webview_window("tray") {
         let _ = window.hide();
@@ -528,7 +562,7 @@ fn locate_notion_url(url: &str) -> Option<LocatedItem> {
     let mounts = store.load_mounts().ok()?;
     let notion_id = notion_id_from_url(url);
 
-    for mount in mounts {
+    if let Some(mount) = mounts.into_iter().next() {
         let entities = store.list_entities(&mount.mount_id).ok()?;
         let entity = notion_id
             .as_ref()
@@ -635,6 +669,54 @@ fn open_in_file_manager(path: &Path) -> Result<(), String> {
 
     command.spawn().map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn choose_folder_with_finder(current: Option<String>) -> Result<Option<String>, String> {
+    let mut script =
+        "POSIX path of (choose folder with prompt \"Choose where Notion files should appear\""
+            .to_string();
+    if let Some(path) = current
+        .as_deref()
+        .and_then(|path| expand_tilde(path).ok())
+        .filter(|path| path.exists())
+    {
+        script.push_str(" default location POSIX file ");
+        script.push_str(&applescript_string(&path.display().to_string()));
+    }
+    script.push(')');
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| format!("Could not open folder picker: {error}"))?;
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(path))
+        }
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if message.contains("User canceled") || message.contains("(-128)") {
+            Ok(None)
+        } else {
+            Err(format!("Folder picker failed: {message}"))
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn choose_folder_with_finder(_current: Option<String>) -> Result<Option<String>, String> {
+    Err("Folder picker is only implemented for the macOS desktop app.".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
@@ -825,7 +907,10 @@ fn open_virtual_mount_or_path(path: &Path) -> Result<(), String> {
     if let Some(mount) = virtual_mount_for_path(path)
         && mount.projection.uses_virtual_filesystem()
     {
-        return open_virtual_projection(&mount);
+        if open_virtual_projection(&mount).is_ok() {
+            return Ok(());
+        }
+        return open_in_file_manager(&mount.root);
     }
 
     open_in_file_manager(path)
@@ -1067,6 +1152,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             desktop_snapshot,
             connect_notion,
+            choose_mount_folder,
+            ensure_runtime_ready,
             create_workspace_mount,
             locate_notion_page,
             review_push_plan,
@@ -1135,7 +1222,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
                 if let Ok(snapshot) = load_desktop_snapshot() {
                     let path = expand_tilde(&snapshot.mount.local_path)
                         .unwrap_or_else(|_| PathBuf::from(snapshot.mount.local_path));
-                    let _ = open_in_file_manager(&path);
+                    let _ = open_virtual_mount_or_path(&path);
                 }
                 show_main_window_with_view(app, Some("mount"));
             }
@@ -1197,7 +1284,7 @@ fn show_main_window_with_view(app: &AppHandle, view: Option<&str>) {
     if let Some(window) = app.get_webview_window("main") {
         if let Some(view) = view {
             let escaped = view.replace('\\', "\\\\").replace('\'', "\\'");
-            let _ = window.eval(&format!(
+            let _ = window.eval(format!(
                 "window.dispatchEvent(new CustomEvent('afs-open-view', {{ detail: '{}' }}));",
                 escaped
             ));

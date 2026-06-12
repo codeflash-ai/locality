@@ -99,7 +99,11 @@ fn wait_for_oauth_callback(
                     Err(error) => oauth_http_response("AgentFS OAuth failed", &error.message),
                 };
                 let _ = stream.write_all(response.as_bytes());
-                return result;
+                match result {
+                    Ok(authorization) => return Ok(authorization),
+                    Err(error) if retryable_callback_error(&error) => continue,
+                    Err(error) => return Err(error),
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
@@ -115,6 +119,13 @@ fn wait_for_oauth_callback(
             }
         }
     }
+}
+
+fn retryable_callback_error(error: &LocalOAuthError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "callback_failed" | "oauth_state_mismatch" | "oauth_missing_code"
+    )
 }
 
 pub fn parse_oauth_callback(
@@ -337,4 +348,59 @@ fn html_escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::thread;
+
+    use super::{LocalOAuthAuthorization, retryable_callback_error, wait_for_oauth_callback};
+
+    #[test]
+    fn retryable_errors_keep_callback_listener_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        thread::spawn(move || {
+            send_request(addr, "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            send_request(
+                addr,
+                "GET /oauth/notion/callback?state=expected&code=abc123 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+        });
+
+        let authorization =
+            wait_for_oauth_callback(&listener, "/oauth/notion/callback", "expected")
+                .expect("eventual valid callback");
+
+        assert_eq!(
+            authorization,
+            LocalOAuthAuthorization {
+                code: "abc123".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn oauth_denial_is_not_retryable() {
+        let error = super::LocalOAuthError {
+            code: "oauth_denied".to_string(),
+            message: "denied".to_string(),
+        };
+
+        assert!(!retryable_callback_error(&error));
+    }
+
+    fn send_request(addr: SocketAddr, request: &str) {
+        let mut stream = TcpStream::connect(addr).expect("connect callback listener");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+    }
 }
