@@ -176,9 +176,11 @@ impl CredentialStore for KeychainCredentialStore {
             .output()
             .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout)
-                .trim_end_matches(['\r', '\n'])
-                .to_string())
+            let password = keychain_output_password(&output.stdout);
+            if keychain_reports_hex_password(secret_ref, &password) {
+                return Ok(decode_hex_encoded_password(&password).unwrap_or(password));
+            }
+            Ok(password)
         } else {
             Err(CredentialError::NotFound(secret_ref.to_string()))
         }
@@ -191,6 +193,63 @@ impl CredentialStore for KeychainCredentialStore {
             .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
         Ok(())
     }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn keychain_output_password(output: &[u8]) -> String {
+    String::from_utf8_lossy(output)
+        .trim_end_matches(['\r', '\n'])
+        .to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_reports_hex_password(secret_ref: &str, encoded_password: &str) -> bool {
+    let Ok(output) = std::process::Command::new("security")
+        .args(["find-generic-password", "-a", secret_ref, "-s", "afs", "-g"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    keychain_hex_password_from_diagnostics(&output.stderr)
+        .is_some_and(|hex_password| hex_password.eq_ignore_ascii_case(encoded_password))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn keychain_hex_password_from_diagnostics(stderr: &[u8]) -> Option<String> {
+    let diagnostics = String::from_utf8_lossy(stderr);
+    diagnostics.lines().find_map(|line| {
+        let hex_password = line.trim_start().strip_prefix("password: 0x")?;
+        let hex_password = hex_password.split_whitespace().next()?;
+        if hex_password.is_empty() || !hex_password.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(hex_password.to_string())
+    })
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn decode_hex_encoded_password(value: &str) -> Option<String> {
+    let decoded = decode_hex_string(value)?;
+    Some(decoded.trim_end_matches(['\r', '\n']).to_string())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn decode_hex_string(value: &str) -> Option<String> {
+    if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let hex = std::str::from_utf8(chunk).ok()?;
+        bytes.push(u8::from_str_radix(hex, 16).ok()?);
+    }
+
+    String::from_utf8(bytes).ok()
 }
 
 pub fn open_credential_store(state_root: &Path) -> Box<dyn CredentialStore> {
@@ -226,4 +285,58 @@ fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decode_hex_encoded_password, keychain_hex_password_from_diagnostics,
+        keychain_output_password,
+    };
+
+    #[test]
+    fn keychain_output_password_trims_security_newline() {
+        assert_eq!(keychain_output_password(b"secret\n"), "secret");
+    }
+
+    #[test]
+    fn keychain_password_decodes_hex_encoded_json() {
+        let encoded = "7b22776f726b7370616365223a225361727468616be2809973227d0a";
+
+        assert_eq!(
+            decode_hex_encoded_password(encoded).as_deref(),
+            Some("{\"workspace\":\"Sarthak’s\"}")
+        );
+    }
+
+    #[test]
+    fn keychain_password_decodes_hex_encoded_utf8() {
+        assert_eq!(
+            decode_hex_encoded_password("5361727468616be2809973").as_deref(),
+            Some("Sarthak’s")
+        );
+    }
+
+    #[test]
+    fn keychain_password_preserves_invalid_utf8_hex() {
+        assert_eq!(decode_hex_encoded_password("deadbeef"), None);
+    }
+
+    #[test]
+    fn keychain_diagnostics_ignore_quoted_hex_json_password() {
+        assert_eq!(
+            keychain_hex_password_from_diagnostics(br#"password: "7b2261223a317d""#),
+            None
+        );
+    }
+
+    #[test]
+    fn keychain_diagnostics_extract_hex_password_marker() {
+        let diagnostics = br#"password: 0x7B2261223A317D  "{"a":1}""#;
+
+        assert_eq!(
+            keychain_hex_password_from_diagnostics(diagnostics).as_deref(),
+            Some("7B2261223A317D")
+        );
+    }
 }
