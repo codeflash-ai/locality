@@ -255,7 +255,7 @@ fn render_richer_notion_block_coverage() {
             "$$\nE=mc^2\n$$\n\n",
             "::afs{id=embed-1 type=embed title=\"Embed caption\" url=\"https://example.com/embed\"}\n\n",
             "::afs{id=bookmark-1 type=bookmark title=\"Bookmark caption\" url=\"https://example.com/bookmark\"}\n\n",
-            "::afs{id=image-1 type=image title=\"Image caption\" url=\"https://example.com/image.png\"}\n\n",
+            "![Image caption](https://example.com/image.png)\n\n",
             "::afs{id=synced-1 type=synced_block source_block_id=\"source-block-1\"}\n\n",
             "::afs{id=link-to-page-1 type=link_to_page page_id=\"target-page-1\"}\n\n",
             "::afs{id=toc-1 type=table_of_contents color=\"default\"}\n\n",
@@ -553,11 +553,11 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "::afs{id=embed-1 type=embed title=\"Embed\" url=\"https://example.com/embed\"}",
         "::afs{id=bookmark-1 type=bookmark title=\"Bookmark\" url=\"https://example.com/bookmark\"}",
         "::afs{id=link-preview-1 type=link_preview title=\"Preview\" url=\"https://example.com/preview\"}",
-        "type=image title=\"Image\" local=\"media/Docs/Coverage/image-111111111111.png\"",
-        "type=video title=\"Video\" local=\"media/Docs/Coverage/video-222222222222.mp4\"",
-        "type=file title=\"File\" local=\"media/Docs/Coverage/file-333333333333.txt\"",
-        "type=pdf title=\"PDF\" local=\"media/Docs/Coverage/pdf-444444444444.pdf\"",
-        "type=audio title=\"Audio\" local=\"media/Docs/Coverage/audio-555555555555.mp3\"",
+        "![Image](https://example.com/image.png)",
+        "[Video](https://example.com/video.mp4)",
+        "[File](https://example.com/file.txt)",
+        "[PDF](https://example.com/file.pdf)",
+        "[Audio](https://example.com/audio.mp3)",
         "::afs{id=synced-original-1 type=synced_block}",
         "::afs{id=synced-copy-1 type=synced_block source_block_id=\"source-block-1\"}",
         "::afs{id=link-page-1 type=link_to_page page_id=\"target-page-1\"}",
@@ -683,7 +683,7 @@ fn render_malformed_table_as_directives() {
 }
 
 #[test]
-fn render_media_blocks_with_local_paths_when_page_path_is_available() {
+fn render_media_blocks_as_markdown_links_and_tracks_local_paths() {
     let bundle = afs_notion::dto::NotionPageBundle {
         page: page("page-1", "Coverage"),
         blocks: vec![BlockTreeDto {
@@ -708,17 +708,63 @@ fn render_media_blocks_with_local_paths_when_page_path_is_available() {
         rendered.media_assets[0].local_path,
         Path::new("media/Docs/Coverage ~page1/image-0123456789ab.png")
     );
-    assert!(
-        rendered
-            .document
-            .body
-            .contains("local=\"media/Docs/Coverage ~page1/image-0123456789ab.png\"")
+    assert_eq!(
+        rendered.document.body,
+        "![Image caption](https://example.com/image.PNG?download=1)\n"
     );
-    assert!(
-        rendered
-            .document
-            .body
-            .contains("url=\"https://example.com/image.PNG?download=1\"")
+}
+
+#[test]
+fn render_notion_hosted_media_file_url_as_markdown_image() {
+    let mut block = block("hosted-image-1", "image");
+    block.image = Some(FileBlockDto {
+        kind: "file".to_string(),
+        external: None,
+        file: Some(HostedFileDto {
+            url: "https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image.png?X-Amz-Signature=abc"
+                .to_string(),
+            expiry_time: Some("2026-06-12T10:00:00.000Z".to_string()),
+        }),
+        caption: Vec::new(),
+    });
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Coverage"),
+        blocks: vec![BlockTreeDto {
+            block,
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "![Image](https://s3.us-west-2.amazonaws.com/secure.notion-static.com/image.png?X-Amz-Signature=abc)\n"
+    );
+}
+
+#[test]
+fn render_url_less_media_payload_as_directive() {
+    let mut block = block("image-without-url", "image");
+    block.image = Some(FileBlockDto {
+        kind: "file".to_string(),
+        external: None,
+        file: None,
+        caption: vec![rich_text("Image caption")],
+    });
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Coverage"),
+        blocks: vec![BlockTreeDto {
+            block,
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "::afs{id=image-without-url type=image title=\"Image caption\"}\n"
     );
 }
 

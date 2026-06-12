@@ -260,11 +260,11 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
         "embed" => url_directive_block(block, "embed", block.embed.as_ref()),
         "bookmark" => url_directive_block(block, "bookmark", block.bookmark.as_ref()),
         "link_preview" => url_directive_block(block, "link_preview", block.link_preview.as_ref()),
-        "image" => file_directive_block(block, "image", block.image.as_ref(), options),
-        "video" => file_directive_block(block, "video", block.video.as_ref(), options),
-        "file" => file_directive_block(block, "file", block.file.as_ref(), options),
-        "pdf" => file_directive_block(block, "pdf", block.pdf.as_ref(), options),
-        "audio" => file_directive_block(block, "audio", block.audio.as_ref(), options),
+        "image" => file_media_block(block, "image", block.image.as_ref(), options),
+        "video" => file_media_block(block, "video", block.video.as_ref(), options),
+        "file" => file_media_block(block, "file", block.file.as_ref(), options),
+        "pdf" => file_media_block(block, "pdf", block.pdf.as_ref(), options),
+        "audio" => file_media_block(block, "audio", block.audio.as_ref(), options),
         "synced_block" => synced_block_directive(block, block.synced_block.as_ref()),
         "link_to_page" => link_to_page_directive(block, block.link_to_page.as_ref()),
         "table_of_contents" => directive_block_with_attrs(
@@ -343,9 +343,9 @@ fn url_directive_block(
     directive_block_with_attrs(block, directive_type, attrs)
 }
 
-fn file_directive_block(
+fn file_media_block(
     block: &BlockDto,
-    directive_type: &'static str,
+    media_type: &'static str,
     payload: Option<&FileBlockDto>,
     options: &RenderOptions,
 ) -> RenderedBlock {
@@ -353,27 +353,47 @@ fn file_directive_block(
     let mut media_asset = None;
 
     if let Some(payload) = payload {
-        if let Some(title) = rich_text_list_title(&payload.caption) {
+        let title = rich_text_list_title(&payload.caption);
+        if let Some(title) = title.clone() {
             attrs.push(("title", title));
         }
         if let Some(url) = file_url(payload) {
             if let Some(page_path) = options.page_path.as_deref() {
-                let local_path = media_local_path(page_path, &block.id, directive_type, &url);
-                attrs.push(("local", local_path.display().to_string()));
+                let local_path = media_local_path(page_path, &block.id, media_type, &url);
                 media_asset = Some(MediaAsset {
                     block_id: block.id.clone(),
-                    kind: directive_type.to_string(),
+                    kind: media_type.to_string(),
                     source_url: url.clone(),
                     local_path,
                 });
             }
-            attrs.push(("url", url));
+
+            let label = title.unwrap_or_else(|| media_default_label(media_type).to_string());
+            let markdown = if media_type == "image" {
+                format!("![{}]({url})", escape_markdown_link_label(&label))
+            } else {
+                format!("[{}]({url})", escape_markdown_link_label(&label))
+            };
+            let mut rendered = rendered_block(markdown, Some(RemoteId::new(block.id.clone())));
+            rendered.media_asset = media_asset;
+            return rendered;
         }
     }
 
-    let mut rendered = directive_block_with_attrs(block, directive_type, attrs);
+    let mut rendered = directive_block_with_attrs(block, media_type, attrs);
     rendered.media_asset = media_asset;
     rendered
+}
+
+fn media_default_label(media_type: &str) -> &'static str {
+    match media_type {
+        "image" => "Image",
+        "video" => "Video",
+        "file" => "File",
+        "pdf" => "PDF",
+        "audio" => "Audio",
+        _ => "Media",
+    }
 }
 
 fn synced_block_directive(block: &BlockDto, payload: Option<&SyncedBlockDto>) -> RenderedBlock {

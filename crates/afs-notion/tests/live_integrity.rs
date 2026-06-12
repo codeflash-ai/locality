@@ -59,18 +59,33 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
     assert!(rendered.document.body.contains("```rust"));
     assert!(rendered.document.body.contains("| Left | Right |"));
     assert!(rendered.document.body.contains("$$\nE=mc^2\n$$"));
-    assert!(rendered.document.body.contains("type=image"));
-    assert!(rendered.document.body.contains("type=video"));
-    assert!(rendered.document.body.contains("type=file"));
-    assert!(rendered.document.body.contains("type=pdf"));
-    assert!(rendered.document.body.contains("type=audio"));
+    assert!(
+        rendered
+            .document
+            .body
+            .contains(&format!("![W3C test image]({LIVE_IMAGE_URL})"))
+    );
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[External video](https://www.youtube.com/watch?v=dQw4w9WgXcQ)")
+    );
+    assert!(rendered.document.body.contains(
+        "[External file](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)"
+    ));
+    assert!(rendered.document.body.contains(
+        "[External PDF](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)"
+    ));
+    assert!(rendered.document.body.contains(
+        "[External audio](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)"
+    ));
     assert!(rendered.document.body.contains("type=embed"));
     assert!(rendered.document.body.contains("type=table_of_contents"));
     assert!(rendered.document.body.contains("type=breadcrumb"));
     assert!(rendered.document.body.contains("type=column_list"));
     assert!(rendered.document.body.contains("type=link_to_page"));
     assert!(rendered.document.body.contains("type=child_page"));
-    assert!(rendered.document.body.contains("local=\"media/"));
     assert!(
         rendered.media_assets.iter().any(|asset| {
             asset.kind == "image" && env.local_dir.join(&asset.local_path).is_file()
@@ -197,7 +212,12 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
             .body
             .contains("Appended from AFS live integrity.")
     );
-    assert!(verified_render.document.body.contains("type=image"));
+    assert!(
+        verified_render
+            .document
+            .body
+            .contains(&format!("![W3C test image]({LIVE_IMAGE_URL})"))
+    );
 }
 
 #[test]
