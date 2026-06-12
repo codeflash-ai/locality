@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default permissions for the AFS desktop window","local":true,"windows":["main"],"permissions":["core:window:allow-hide","core:window:allow-minimize","core:window:allow-start-dragging","core:window:allow-toggle-maximize"]}}
+{"default":{"identifier":"default","description":"Default permissions for the AFS desktop window","local":true,"windows":["main","tray"],"permissions":["core:window:allow-hide","core:window:allow-minimize","core:window:allow-start-dragging","core:window:allow-toggle-maximize"]}}

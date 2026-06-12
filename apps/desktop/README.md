@@ -5,9 +5,28 @@ review, and settings.
 
 ## Development
 
+Install dependencies once from the repo root:
+
 ```sh
-npm install
-npm run dev
+make setup
+```
+
+Start the Tauri desktop app in development mode:
+
+```sh
+make dev-tauri
+```
+
+Equivalent direct command:
+
+```sh
+npm --prefix apps/desktop run tauri -- dev
+```
+
+For the frontend-only Vite preview:
+
+```sh
+make dev-desktop
 ```
 
 Open the Vite preview at `http://127.0.0.1:1420/`.
@@ -23,6 +42,18 @@ The Rust side is under `src-tauri` and can be checked from the repo root:
 ```sh
 cargo check -p afs-desktop
 ```
+
+## macOS Packaging
+
+Build local `.app` and `.dmg` artifacts from the repo root:
+
+```sh
+make build-tauri
+```
+
+The build stages the macOS File Provider extension before Tauri bundles the
+app. See `docs/macos-distribution.md` for signing, notarization, and Homebrew
+cask notes.
 
 ## Current Scope
 

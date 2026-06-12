@@ -31,6 +31,7 @@ use afsd::virtual_fs::virtual_fs_content_root;
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindowBuilder,
+    image::Image,
     menu::{Menu, MenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
@@ -156,13 +157,20 @@ struct DesktopSettingChange {
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone, Copy)]
+enum TrayVisualState {
+    Ready,
+    Review,
+    Reconnect,
+}
+
 #[tauri::command]
 fn desktop_snapshot() -> DesktopSnapshot {
     load_desktop_snapshot().unwrap_or_else(|_| sample_snapshot())
 }
 
 #[tauri::command]
-async fn connect_notion() -> ActionReport {
+async fn connect_notion(app: AppHandle) -> ActionReport {
     if CONNECT_NOTION_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         return ActionReport {
             ok: false,
@@ -178,13 +186,17 @@ async fn connect_notion() -> ActionReport {
             .map_err(|error| format!("Notion OAuth worker failed: {error}"));
     CONNECT_NOTION_IN_PROGRESS.store(false, Ordering::Release);
 
-    match result {
+    let report = match result {
         Ok(Ok(message)) => ActionReport { ok: true, message },
         Ok(Err(message)) | Err(message) => {
             eprintln!("afs desktop connect notion failed: {message}");
             ActionReport { ok: false, message }
         }
+    };
+    if report.ok {
+        refresh_tray_icon(&app);
     }
+    report
 }
 
 #[tauri::command]
@@ -202,26 +214,35 @@ async fn choose_mount_folder(
 }
 
 #[tauri::command]
-fn ensure_runtime_ready() -> ActionReport {
+fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
     let state_root = default_state_root();
-    match ensure_daemon_running(&state_root).and_then(|_| reload_daemon_mounts(&state_root)) {
-        Ok(()) => ActionReport {
-            ok: true,
-            message: "AFS daemon is running.".to_string(),
-        },
-        Err(message) => ActionReport { ok: false, message },
-    }
+    let report =
+        match ensure_daemon_running(&state_root).and_then(|_| reload_daemon_mounts(&state_root)) {
+            Ok(()) => {
+                refresh_tray_icon(&app);
+                ActionReport {
+                    ok: true,
+                    message: "AFS daemon is running.".to_string(),
+                }
+            }
+            Err(message) => ActionReport { ok: false, message },
+        };
+    report
 }
 
 #[tauri::command]
-fn create_workspace_mount(path: String) -> ActionReport {
-    match create_notion_workspace_mount(&path) {
-        Ok(report) => ActionReport {
-            ok: true,
-            message: report,
-        },
+fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
+    let report = match create_notion_workspace_mount(&path) {
+        Ok(report) => {
+            refresh_tray_icon(&app);
+            ActionReport {
+                ok: true,
+                message: report,
+            }
+        }
         Err(message) => ActionReport { ok: false, message },
-    }
+    };
+    report
 }
 
 #[tauri::command]
@@ -252,7 +273,7 @@ fn review_push_plan() -> PushPlan {
 }
 
 #[tauri::command]
-fn push_to_notion() -> ActionReport {
+fn push_to_notion(app: AppHandle) -> ActionReport {
     let Ok(snapshot) = load_desktop_snapshot() else {
         return ActionReport {
             ok: false,
@@ -272,10 +293,16 @@ fn push_to_notion() -> ActionReport {
     .unwrap_or_else(|_| PathBuf::from(&change.local_path));
 
     match push_target_direct(&target) {
-        Ok(report) => ActionReport {
-            ok: push_report_exit_code(&report) == 0,
-            message: push_report_message(&report),
-        },
+        Ok(report) => {
+            let action_report = ActionReport {
+                ok: push_report_exit_code(&report) == 0,
+                message: push_report_message(&report),
+            };
+            if action_report.ok {
+                refresh_tray_icon(&app);
+            }
+            action_report
+        }
         Err(message) => ActionReport { ok: false, message },
     }
 }
@@ -588,6 +615,148 @@ fn health_state(
     } else {
         "ready"
     }
+}
+
+fn refresh_tray_icon(app: &AppHandle) {
+    let (state, tooltip) = load_desktop_snapshot()
+        .map(|snapshot| {
+            (
+                tray_state_for_health(&snapshot.health.state),
+                tray_tooltip(&snapshot),
+            )
+        })
+        .unwrap_or((
+            TrayVisualState::Reconnect,
+            "AFS needs attention".to_string(),
+        ));
+
+    if let Some(tray) = app.tray_by_id("main") {
+        let is_template = matches!(state, TrayVisualState::Ready);
+        let _ = tray.set_icon_with_as_template(Some(tray_icon_image(state)), is_template);
+        let _ = tray.set_tooltip(Some(tooltip));
+    }
+}
+
+fn tray_state_for_health(state: &str) -> TrayVisualState {
+    if state == "reconnect_needed" || state == "stopped" {
+        TrayVisualState::Reconnect
+    } else if state == "needs_review" {
+        TrayVisualState::Review
+    } else {
+        TrayVisualState::Ready
+    }
+}
+
+fn tray_tooltip(snapshot: &DesktopSnapshot) -> String {
+    match snapshot.health.state.as_str() {
+        "needs_review" => format!("AFS: {} pending changes", snapshot.health.attention_count),
+        "reconnect_needed" => "AFS: reconnect Notion".to_string(),
+        "stopped" => "AFS: daemon stopped".to_string(),
+        _ => "AFS: ready".to_string(),
+    }
+}
+
+fn tray_icon_image(state: TrayVisualState) -> Image<'static> {
+    let size = 36;
+    let mut rgba = vec![0; size * size * 4];
+    let ink = [17, 24, 39, 255];
+    let stroke = 3.4;
+    let paths = [
+        ((8.6, 26.8), (5.8, 18.0)),
+        ((5.8, 18.0), (8.6, 9.2)),
+        ((27.4, 9.2), (30.2, 18.0)),
+        ((30.2, 18.0), (27.4, 26.8)),
+        ((11.8, 13.0), (24.2, 13.0)),
+        ((11.8, 23.0), (24.2, 23.0)),
+        ((15.1, 18.0), (20.9, 18.0)),
+    ];
+
+    for (start, end) in paths {
+        draw_line(&mut rgba, size, start, end, stroke, ink);
+    }
+
+    match state {
+        TrayVisualState::Ready => {}
+        TrayVisualState::Review => {
+            draw_disc(&mut rgba, size, (27.0, 9.0), 5.2, [255, 255, 255, 255]);
+            draw_disc(&mut rgba, size, (27.0, 9.0), 3.6, [217, 140, 31, 255]);
+        }
+        TrayVisualState::Reconnect => {
+            draw_disc(&mut rgba, size, (27.0, 9.0), 5.2, [255, 255, 255, 255]);
+            draw_disc(&mut rgba, size, (27.0, 9.0), 3.6, [207, 63, 63, 255]);
+        }
+    }
+
+    Image::new_owned(rgba, size as u32, size as u32)
+}
+
+fn draw_line(
+    rgba: &mut [u8],
+    size: usize,
+    start: (f64, f64),
+    end: (f64, f64),
+    width: f64,
+    color: [u8; 4],
+) {
+    let half_width = width / 2.0;
+    for y in 0..size {
+        for x in 0..size {
+            let px = x as f64 + 0.5;
+            let py = y as f64 + 0.5;
+            let distance = distance_to_segment((px, py), start, end);
+            let alpha = (half_width + 0.7 - distance).clamp(0.0, 1.0);
+            if alpha > 0.0 {
+                blend_pixel(rgba, size, x, y, color, alpha);
+            }
+        }
+    }
+}
+
+fn draw_disc(rgba: &mut [u8], size: usize, center: (f64, f64), radius: f64, color: [u8; 4]) {
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f64 + 0.5 - center.0;
+            let dy = y as f64 + 0.5 - center.1;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let alpha = (radius + 0.6 - distance).clamp(0.0, 1.0);
+            if alpha > 0.0 {
+                blend_pixel(rgba, size, x, y, color, alpha);
+            }
+        }
+    }
+}
+
+fn distance_to_segment(point: (f64, f64), start: (f64, f64), end: (f64, f64)) -> f64 {
+    let vx = end.0 - start.0;
+    let vy = end.1 - start.1;
+    let wx = point.0 - start.0;
+    let wy = point.1 - start.1;
+    let length_squared = vx * vx + vy * vy;
+    if length_squared == 0.0 {
+        return ((point.0 - start.0).powi(2) + (point.1 - start.1).powi(2)).sqrt();
+    }
+
+    let t = ((wx * vx + wy * vy) / length_squared).clamp(0.0, 1.0);
+    let closest = (start.0 + t * vx, start.1 + t * vy);
+    ((point.0 - closest.0).powi(2) + (point.1 - closest.1).powi(2)).sqrt()
+}
+
+fn blend_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4], coverage: f64) {
+    let idx = (y * size + x) * 4;
+    let src_alpha = (color[3] as f64 / 255.0) * coverage;
+    let dst_alpha = rgba[idx + 3] as f64 / 255.0;
+    let out_alpha = src_alpha + dst_alpha * (1.0 - src_alpha);
+    if out_alpha <= f64::EPSILON {
+        return;
+    }
+
+    for channel in 0..3 {
+        let src = color[channel] as f64 / 255.0;
+        let dst = rgba[idx + channel] as f64 / 255.0;
+        let out = (src * src_alpha + dst * dst_alpha * (1.0 - src_alpha)) / out_alpha;
+        rgba[idx + channel] = (out * 255.0).round() as u8;
+    }
+    rgba[idx + 3] = (out_alpha * 255.0).round() as u8;
 }
 
 fn locate_notion_url(url: &str) -> Result<LocatedItem, String> {
@@ -1584,8 +1753,8 @@ mod tests {
     use afs_store::{ConnectionId, ConnectionRecord};
 
     use super::{
-        connection_metadata_changed, notion_id_from_url, should_hide_tray_popover,
-        validate_mount_root,
+        TrayVisualState, connection_metadata_changed, notion_id_from_url, should_hide_tray_popover,
+        tray_icon_image, validate_mount_root,
     };
 
     #[test]
@@ -1655,6 +1824,26 @@ mod tests {
             "main",
             &tauri::WindowEvent::Focused(false)
         ));
+    }
+
+    #[test]
+    fn tray_icons_have_expected_sizes_and_badges() {
+        let ready = tray_icon_image(TrayVisualState::Ready);
+        let review = tray_icon_image(TrayVisualState::Review);
+        let reconnect = tray_icon_image(TrayVisualState::Reconnect);
+
+        assert_eq!(ready.width(), 36);
+        assert_eq!(ready.height(), 36);
+        assert_eq!(review.width(), 36);
+        assert_eq!(reconnect.height(), 36);
+        assert!(review.rgba().chunks_exact(4).any(|pixel| {
+            pixel[0] > 200 && pixel[1] > 100 && pixel[1] < 180 && pixel[2] < 80 && pixel[3] > 200
+        }));
+        assert!(
+            reconnect.rgba().chunks_exact(4).any(|pixel| {
+                pixel[0] > 180 && pixel[1] < 90 && pixel[2] < 90 && pixel[3] > 200
+            })
+        );
     }
 
     #[test]
@@ -1874,13 +2063,12 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     )?;
     let quit_options = Submenu::with_items(app, "Quit Options", true, &[&hide, &quit])?;
     let menu = Menu::with_items(app, &[&open, &open_folder, &review, &quit_options])?;
-    let icon = app
-        .default_window_icon()
-        .expect("default app icon exists")
-        .clone();
+    let icon = tray_icon_image(TrayVisualState::Ready);
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
+        .icon_as_template(true)
+        .tooltip("AFS")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
@@ -1906,17 +2094,14 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             }
             "review_pending" => show_main_window_with_view(app, Some("pending")),
             "hide_menubar" => {
-                if let Some(tray) = app.tray_by_id("main") {
-                    let _ = tray.set_visible(false);
-                }
-                if let Some(window) = app.get_webview_window("tray") {
-                    let _ = window.hide();
-                }
+                let _ = set_menu_bar_visible(app, false);
             }
             "quit_completely" => app.exit(0),
             _ => {}
         })
         .build(app)?;
+
+    refresh_tray_icon(app.app_handle());
 
     Ok(())
 }
@@ -1947,9 +2132,11 @@ fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
         return;
     }
 
+    refresh_tray_icon(app);
     let x = (position.x - 180.0).max(8.0) as i32;
     let y = (position.y + 12.0).max(8.0) as i32;
     let _ = window.set_position(Position::Physical(PhysicalPosition::new(x, y)));
+    let _ = window.eval("window.dispatchEvent(new CustomEvent('afs-refresh-snapshot'));");
     let _ = window.show();
     let _ = window.set_focus();
 }

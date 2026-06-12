@@ -35,6 +35,10 @@ build-desktop: ## Build the desktop frontend assets.
 build-tauri: ## Build the packaged Tauri desktop app.
 	$(DESKTOP_NPM) run tauri -- build
 
+.PHONY: prepare-macos-file-provider
+prepare-macos-file-provider: ## Stage the macOS File Provider extension for Tauri packaging.
+	$(DESKTOP_DIR)/scripts/prepare-macos-file-provider.sh
+
 .PHONY: check
 check: check-rust check-desktop ## Run Rust checks and desktop type/build checks.
 

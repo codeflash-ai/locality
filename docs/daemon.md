@@ -79,6 +79,13 @@ Start the daemon in the foreground:
 afsd
 ```
 
+From a source checkout, use either repo-root command:
+
+```bash
+make run-daemon
+cargo run -p afsd
+```
+
 On startup it prints the socket path, watched mounts, and auth source:
 
 ```text

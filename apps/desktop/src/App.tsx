@@ -237,6 +237,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const refresh = () => {
+      void refreshSnapshot().catch(() => undefined);
+    };
+
+    window.addEventListener("afs-refresh-snapshot", refresh);
+    return () => {
+      window.removeEventListener("afs-refresh-snapshot", refresh);
+    };
+  }, []);
+
+  useEffect(() => {
     document.body.dataset.surface = route === "#tray" ? "tray" : "app";
   }, [route]);
 

@@ -20,15 +20,17 @@ None.
   Workspace-level Notion mounting still needs a core mount API that can mount an
   entire authorized workspace rather than requiring `--root-page`.
 - The native Tauri tray now opens an initial rich popover window using the
-  confirmed clean Aperture icon and keeps the native menu for secondary
-  actions. Dynamic amber/red tray badge asset switching, focus-loss dismissal,
-  and exact native positioning polish remain to be implemented.
+  confirmed clean Aperture icon, refreshes its snapshot when opened, switches to
+  amber/red badged icons only for review or reconnect states, and keeps the
+  native menu for secondary actions. Exact native popover positioning polish
+  remains to be implemented.
 - Desktop push review currently pushes the first pending file through the shared
   Rust push path after the user approves the review. A multi-file review/apply
   loop should batch or sequence all selected pending changes.
-- Desktop bundling is disabled in `tauri.conf.json` while the app shell is under
-  active development. Signed/notarized DMG, Homebrew packaging, auto-update, and
-  production icon sets remain distribution milestones.
+- Desktop bundling now targets macOS `.app` and `.dmg` artifacts with the
+  File Provider extension staged before Tauri bundling. Signed/notarized DMG,
+  Homebrew packaging, auto-update, and production icon sets remain distribution
+  milestones.
 - Toggle blocks currently render as anchored directives with their summary in the `title` attribute. This preserves identity and child content, but it is not yet the clean nested-list or `<details>` round-trip targeted by `plan.md`.
 - Layout-rich blocks such as columns, tabs, synced blocks, AI/custom blocks, and meeting notes are directive-backed until the diff/apply layer can preserve their nesting and source-specific semantics safely.
 - Database row creation currently validates writable property names and types against the live Notion data source during apply. The `plan.md` target is local `_schema.yaml` validation during the parse/validate stage; that schema-backed preflight remains the next property-validation milestone.
