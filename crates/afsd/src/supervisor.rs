@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use afs_core::AfsResult;
+use afs_core::conflict::has_unresolved_conflict_markers;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::journal::JournalStore;
 use afs_core::model::{EntityKind, HydrationState};
@@ -86,9 +87,10 @@ where
                 }
             }
             FileEventKind::Write => {
-                if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+                let next_state = write_event_hydration_state(&event.path, &entity);
+                if entity.hydration.can_transition_to(&next_state) {
                     let mut updated = entity;
-                    updated.hydration = HydrationState::Dirty;
+                    updated.hydration = next_state;
                     self.store.save_entity(updated)?;
                     report.marked_dirty = 1;
                 } else {
@@ -162,6 +164,17 @@ where
         }
 
         Ok(None)
+    }
+}
+
+fn write_event_hydration_state(path: &Path, entity: &EntityRecord) -> HydrationState {
+    if entity.kind != EntityKind::Page {
+        return HydrationState::Dirty;
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(contents) if has_unresolved_conflict_markers(&contents) => HydrationState::Conflicted,
+        _ => HydrationState::Dirty,
     }
 }
 

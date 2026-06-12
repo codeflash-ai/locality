@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use afs_connector::{Connector, EnumerateRequest, FetchRequest};
 use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
-use afs_core::conflict::remote_variant_path;
+use afs_core::conflict::{has_unresolved_conflict_markers, render_inline_conflict_markdown};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, TreeEntry};
 use afs_core::shadow::ShadowDocument;
 use afs_notion::NotionConnector;
@@ -321,9 +321,11 @@ where
         return Ok(HydrationOutcome::Hydrated);
     }
 
-    if should_recreate_conflict_sidecar(&entity, &path)
-        || !remote_matches_shadow(store, mount, &entity, &rendered.shadow)?
-    {
+    if file_has_unresolved_conflict_markers(&path)? {
+        store
+            .save_entity(mark_conflicted_if_allowed(entity))
+            .map_err(PullError::Store)?;
+    } else if !remote_matches_shadow(store, mount, &entity, &rendered.shadow)? {
         materialize_conflict(store, mount, entity, &path, rendered)?;
     } else {
         store
@@ -389,7 +391,6 @@ where
 {
     let markdown = render_canonical_markdown(&rendered.document);
     write_atomic(path, markdown)?;
-    remove_conflict_sidecar_if_present(path)?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
         .map_err(PullError::Store)?;
@@ -414,8 +415,12 @@ fn materialize_conflict<S>(
 where
     S: EntityRepository + ShadowRepository,
 {
-    let remote_path = remote_variant_path(path);
-    write_atomic(&remote_path, render_canonical_markdown(&rendered.document))?;
+    let local_contents = std::fs::read_to_string(path).map_err(|error| PullError::ReadFile {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let conflict_markdown = render_inline_conflict_markdown(&local_contents, &rendered.document);
+    write_atomic(path, conflict_markdown)?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
         .map_err(PullError::Store)?;
@@ -465,10 +470,33 @@ fn conflicted_record(
 }
 
 fn mark_dirty_if_allowed(mut entity: EntityRecord) -> EntityRecord {
-    if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+    if entity.hydration != HydrationState::Conflicted
+        && entity.hydration.can_transition_to(&HydrationState::Dirty)
+    {
         entity.hydration = HydrationState::Dirty;
     }
     entity
+}
+
+fn mark_conflicted_if_allowed(mut entity: EntityRecord) -> EntityRecord {
+    if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+        entity.hydration = HydrationState::Dirty;
+    }
+    if entity
+        .hydration
+        .can_transition_to(&HydrationState::Conflicted)
+    {
+        entity.hydration = HydrationState::Conflicted;
+    }
+    entity
+}
+
+fn file_has_unresolved_conflict_markers(path: &Path) -> Result<bool, PullError> {
+    let contents = std::fs::read_to_string(path).map_err(|error| PullError::ReadFile {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    Ok(has_unresolved_conflict_markers(&contents))
 }
 
 fn remote_matches_shadow<S>(
@@ -490,22 +518,6 @@ where
         shadow.frontmatter == rendered.frontmatter
             && shadow.rendered_body == rendered.rendered_body,
     )
-}
-
-fn remove_conflict_sidecar_if_present(path: &Path) -> Result<(), PullError> {
-    let remote_path = remote_variant_path(path);
-    if !remote_path.exists() {
-        return Ok(());
-    }
-
-    std::fs::remove_file(&remote_path).map_err(|error| PullError::WriteFile {
-        path: remote_path,
-        message: error.to_string(),
-    })
-}
-
-fn should_recreate_conflict_sidecar(entity: &EntityRecord, path: &Path) -> bool {
-    entity.hydration == HydrationState::Conflicted && !remote_variant_path(path).exists()
 }
 
 fn can_replace_file<S>(

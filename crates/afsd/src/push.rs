@@ -15,6 +15,7 @@ use afs_core::canonical::{
     CanonicalParseError, CanonicalParseErrorKind, parse_canonical_markdown,
     render_canonical_markdown,
 };
+use afs_core::conflict::unresolved_conflict_marker_line;
 use afs_core::diff::property_value_from_frontmatter;
 use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
@@ -226,24 +227,18 @@ where
         .into());
     };
 
-    if entity.hydration == HydrationState::Conflicted {
+    let read_path = projection_read_path(state_root, &mount, &relative_path, &absolute_path)?;
+    let contents = read_to_string(&read_path)?;
+    if let Some(line) = unresolved_conflict_marker_line(&contents) {
         return Ok(PreparedPush {
             absolute_path,
             mount,
             entity,
             shadows: Vec::new(),
-            pipeline: validation_pipeline(ValidationIssue::new(
-                "entity_conflicted_requires_resolve",
-                relative_path,
-                None,
-                "entity is conflicted; resolve it before pushing",
-                Some("run `afs resolve --ours|--theirs|--edited <path>` first".to_string()),
-            )),
+            pipeline: validation_pipeline(unresolved_conflict_marker_issue(&relative_path, line)),
         });
     }
 
-    let read_path = projection_read_path(state_root, &mount, &relative_path, &absolute_path)?;
-    let contents = read_to_string(&read_path)?;
     let parsed = match parse_canonical_markdown(&contents) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -359,6 +354,18 @@ where
             ))
         })?;
     let contents = read_to_string(&read_path)?;
+    if let Some(line) = unresolved_conflict_marker_line(&contents) {
+        return Ok(PreparedPush {
+            absolute_path,
+            mount,
+            entity: parent,
+            shadows: Vec::new(),
+            pipeline: validation_pipeline(unresolved_conflict_marker_issue(
+                &pending.projected_path,
+                line,
+            )),
+        });
+    }
     let parsed = match parse_canonical_markdown(&contents) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -896,6 +903,19 @@ fn validation_pipeline(issue: ValidationIssue) -> PushPipelineResult {
     let mut validation = ValidationReport::clean();
     validation.push(issue);
     validation_report_pipeline(validation)
+}
+
+fn unresolved_conflict_marker_issue(path: &Path, line: usize) -> ValidationIssue {
+    ValidationIssue::new(
+        "unresolved_conflict_markers",
+        path,
+        Some(line),
+        "file contains unresolved conflict markers",
+        Some(
+            "edit the file to choose the intended content, remove every conflict marker line, then rerun `afs diff` or `afs push`"
+                .to_string(),
+        ),
+    )
 }
 
 fn validation_report_pipeline(validation: ValidationReport) -> PushPipelineResult {

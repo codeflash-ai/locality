@@ -5,6 +5,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::status::{StatusError, StatusOptions, StatusState, run_status};
+use afs_core::conflict::{
+    CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
+};
 use afs_core::journal::{JournalEntry, JournalStatus, PushId};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
@@ -140,7 +143,13 @@ fn status_reports_missing_and_conflicted_entities() {
     let mut store = fixture.store();
     fixture.hydrated_page(&mut store, "page-1", "Missing.md", "# Missing\n\nGone.");
     fixture.conflicted_page(&mut store, "page-2", "Conflict.md");
-    fixture.write_page("Conflict.md", "page-2", "# Conflict\n\nLocal.");
+    fixture.write_page(
+        "Conflict.md",
+        "page-2",
+        &format!(
+            "{CONFLICT_LOCAL_MARKER}\n# Conflict\n\nLocal.\n{CONFLICT_SEPARATOR_MARKER}\n# Conflict\n\nRemote.\n{CONFLICT_REMOTE_MARKER}\n"
+        ),
+    );
 
     let report = run_status(
         &store,

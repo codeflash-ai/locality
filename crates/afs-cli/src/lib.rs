@@ -10,7 +10,6 @@ pub mod local_oauth;
 pub mod mount;
 pub mod pull;
 pub mod push;
-pub mod resolve;
 pub mod restore;
 pub mod status;
 

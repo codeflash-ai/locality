@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use afs_core::canonical::parse_canonical_markdown;
+use afs_core::conflict::unresolved_conflict_marker_line;
 use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_store::{
@@ -505,14 +506,11 @@ where
     }
 
     match entity.hydration {
-        HydrationState::Conflicted => {
-            return (
-                StatusState::Conflicted,
-                vec![StatusIssue::new(
-                    "entity_conflicted",
-                    "entity is marked conflicted",
-                )],
-            );
+        HydrationState::Conflicted if entity.kind == EntityKind::Page => {
+            return classify_conflicted_page_state(store, mount, entity, absolute_path);
+        }
+        HydrationState::Dirty if entity.kind == EntityKind::Page => {
+            return classify_dirty_page_state(store, mount, entity, absolute_path);
         }
         HydrationState::Dirty => {
             return (
@@ -554,14 +552,11 @@ where
     S: ShadowRepository,
 {
     match entity.hydration {
-        HydrationState::Conflicted => {
-            return (
-                StatusState::Conflicted,
-                vec![StatusIssue::new(
-                    "entity_conflicted",
-                    "entity is marked conflicted",
-                )],
-            );
+        HydrationState::Conflicted if entity.kind == EntityKind::Page => {
+            return classify_conflicted_virtual_page_state(store, mount, entity, state_root);
+        }
+        HydrationState::Dirty if entity.kind == EntityKind::Page => {
+            return classify_dirty_virtual_page_state(store, mount, entity, state_root);
         }
         HydrationState::Dirty => {
             return (
@@ -660,6 +655,97 @@ where
     classify_page_contents(store, mount, entity, &contents)
 }
 
+fn classify_dirty_page_state<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    absolute_path: &Path,
+) -> (StatusState, Vec<StatusIssue>)
+where
+    S: ShadowRepository,
+{
+    let (state, issues) = classify_page_state(store, mount, entity, absolute_path);
+    dirty_state_with_entity_issue(state, issues)
+}
+
+fn classify_conflicted_page_state<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    absolute_path: &Path,
+) -> (StatusState, Vec<StatusIssue>)
+where
+    S: ShadowRepository,
+{
+    let (state, issues) = classify_page_state(store, mount, entity, absolute_path);
+    conflicted_state_with_entity_issue(state, issues)
+}
+
+fn classify_dirty_virtual_page_state<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    state_root: &Path,
+) -> (StatusState, Vec<StatusIssue>)
+where
+    S: ShadowRepository,
+{
+    let (state, issues) = classify_virtual_page_state(store, mount, entity, state_root);
+    dirty_state_with_entity_issue(state, issues)
+}
+
+fn classify_conflicted_virtual_page_state<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    state_root: &Path,
+) -> (StatusState, Vec<StatusIssue>)
+where
+    S: ShadowRepository,
+{
+    let (state, issues) = classify_virtual_page_state(store, mount, entity, state_root);
+    conflicted_state_with_entity_issue(state, issues)
+}
+
+fn dirty_state_with_entity_issue(
+    state: StatusState,
+    mut issues: Vec<StatusIssue>,
+) -> (StatusState, Vec<StatusIssue>) {
+    match state {
+        StatusState::Clean | StatusState::Dirty => {
+            if !issues.iter().any(|issue| issue.code == "entity_dirty") {
+                issues.insert(
+                    0,
+                    StatusIssue::new("entity_dirty", "entity is marked dirty"),
+                );
+            }
+            (StatusState::Dirty, issues)
+        }
+        StatusState::Stub | StatusState::Conflicted | StatusState::Missing | StatusState::Error => {
+            (state, issues)
+        }
+    }
+}
+
+fn conflicted_state_with_entity_issue(
+    state: StatusState,
+    mut issues: Vec<StatusIssue>,
+) -> (StatusState, Vec<StatusIssue>) {
+    match state {
+        StatusState::Conflicted => {
+            if !issues.iter().any(|issue| issue.code == "entity_conflicted") {
+                issues.insert(
+                    0,
+                    StatusIssue::new("entity_conflicted", "entity is marked conflicted"),
+                );
+            }
+            (StatusState::Conflicted, issues)
+        }
+        StatusState::Clean | StatusState::Dirty => dirty_state_with_entity_issue(state, issues),
+        StatusState::Stub | StatusState::Missing | StatusState::Error => (state, issues),
+    }
+}
+
 fn classify_page_contents<S>(
     store: &S,
     mount: &MountConfig,
@@ -669,6 +755,16 @@ fn classify_page_contents<S>(
 where
     S: ShadowRepository,
 {
+    if let Some(line) = unresolved_conflict_marker_line(contents) {
+        return (
+            StatusState::Conflicted,
+            vec![StatusIssue::new(
+                "unresolved_conflict_markers",
+                format!("file contains unresolved conflict markers starting at line {line}"),
+            )],
+        );
+    }
+
     if matches!(
         entity.hydration,
         HydrationState::Virtual | HydrationState::Stub

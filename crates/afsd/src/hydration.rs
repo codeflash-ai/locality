@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
-use afs_core::conflict::remote_variant_path;
+use afs_core::conflict::{has_unresolved_conflict_markers, render_inline_conflict_markdown};
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
@@ -102,9 +102,9 @@ where
         }
 
         if !can_replace {
-            if should_recreate_conflict_sidecar(&entity, &path)
-                || !self.remote_matches_shadow(&mount, &entity, &rendered.shadow)?
-            {
+            if file_has_unresolved_conflict_markers(&path)? {
+                self.mark_conflicted_if_allowed(entity)?;
+            } else if !self.remote_matches_shadow(&mount, &entity, &rendered.shadow)? {
                 self.materialize_conflict(&mount, &output_root, entity, &path, rendered)?;
             } else {
                 self.mark_dirty_if_allowed(entity)?;
@@ -117,7 +117,6 @@ where
             write_binary_atomic(&path, &asset.bytes)?;
         }
         write_atomic(&path, render_canonical_markdown(&rendered.document))?;
-        remove_conflict_sidecar_if_present(&path)?;
         self.store
             .save_shadow(&mount.mount_id, rendered.shadow.clone())
             .map_err(AfsError::from)?;
@@ -178,8 +177,25 @@ where
     }
 
     fn mark_dirty_if_allowed(&mut self, mut entity: EntityRecord) -> AfsResult<()> {
+        if entity.hydration != HydrationState::Conflicted
+            && entity.hydration.can_transition_to(&HydrationState::Dirty)
+        {
+            entity.hydration = HydrationState::Dirty;
+            self.store.save_entity(entity).map_err(AfsError::from)?;
+        }
+
+        Ok(())
+    }
+
+    fn mark_conflicted_if_allowed(&mut self, mut entity: EntityRecord) -> AfsResult<()> {
         if entity.hydration.can_transition_to(&HydrationState::Dirty) {
             entity.hydration = HydrationState::Dirty;
+        }
+        if entity
+            .hydration
+            .can_transition_to(&HydrationState::Conflicted)
+        {
+            entity.hydration = HydrationState::Conflicted;
             self.store.save_entity(entity).map_err(AfsError::from)?;
         }
 
@@ -194,12 +210,14 @@ where
         path: &Path,
         rendered: HydratedEntity,
     ) -> AfsResult<()> {
-        let remote_path = remote_variant_path(path);
         for asset in &rendered.assets {
             let path = mount_relative_path(output_root, &asset.path)?;
             write_binary_atomic(&path, &asset.bytes)?;
         }
-        write_atomic(&remote_path, render_canonical_markdown(&rendered.document))?;
+        let local_contents = read_to_string(path)?;
+        let conflict_markdown =
+            render_inline_conflict_markdown(&local_contents, &rendered.document);
+        write_atomic(path, conflict_markdown)?;
         self.store
             .save_shadow(&mount.mount_id, rendered.shadow.clone())
             .map_err(AfsError::from)?;
@@ -237,10 +255,6 @@ where
         Ok(shadow.frontmatter == rendered.frontmatter
             && shadow.rendered_body == rendered.rendered_body)
     }
-}
-
-fn should_recreate_conflict_sidecar(entity: &EntityRecord, path: &Path) -> bool {
-    entity.hydration == HydrationState::Conflicted && !remote_variant_path(path).exists()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -467,6 +481,11 @@ fn is_stub_file(path: &Path) -> AfsResult<bool> {
     Ok(contents.contains(CanonicalDocument::STUB_MARKER))
 }
 
+fn file_has_unresolved_conflict_markers(path: &Path) -> AfsResult<bool> {
+    let contents = read_to_string(path)?;
+    Ok(has_unresolved_conflict_markers(&contents))
+}
+
 fn write_atomic(path: &Path, contents: String) -> AfsResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
@@ -498,20 +517,6 @@ fn write_atomic(path: &Path, contents: String) -> AfsResult<()> {
     })?;
 
     Ok(())
-}
-
-fn remove_conflict_sidecar_if_present(path: &Path) -> AfsResult<()> {
-    let remote_path = remote_variant_path(path);
-    if !remote_path.exists() {
-        return Ok(());
-    }
-
-    std::fs::remove_file(&remote_path).map_err(|error| {
-        AfsError::Io(format!(
-            "failed to remove conflict sidecar `{}`: {error}",
-            remote_path.display()
-        ))
-    })
 }
 
 fn write_binary_atomic(path: &Path, contents: &[u8]) -> AfsResult<()> {

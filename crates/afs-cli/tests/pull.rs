@@ -7,6 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::pull::{run_pull, run_pull_with_state_root};
+use afs_core::conflict::{
+    CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
+    has_unresolved_conflict_markers,
+};
 use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
@@ -221,7 +225,7 @@ fn pull_mount_root_preserves_shadow_remote_timestamp_for_non_rehydrated_pages() 
 }
 
 #[test]
-fn pull_file_materializes_remote_sidecar_and_marks_conflicted_when_remote_changed() {
+fn pull_file_writes_inline_conflict_markers_and_marks_conflicted_when_remote_changed() {
     let fixture = PullFixture::new();
     let mut store = InMemoryStateStore::new();
     fixture.mount(&mut store);
@@ -242,15 +246,18 @@ fn pull_file_materializes_remote_sidecar_and_marks_conflicted_when_remote_change
     assert!(!report.ok);
     assert_eq!(report.hydrated, 0);
     assert_eq!(report.skipped_dirty, 1);
+    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("local file");
+    assert!(contents.contains("Local edit."));
+    assert!(contents.contains("Remote body."));
+    assert!(contents.contains(CONFLICT_LOCAL_MARKER));
+    assert!(contents.contains(CONFLICT_SEPARATOR_MARKER));
+    assert!(contents.contains(CONFLICT_REMOTE_MARKER));
+    assert!(has_unresolved_conflict_markers(&contents));
     assert!(
-        fs::read_to_string(fixture.root_file("roadmap"))
-            .expect("local file")
-            .contains("Local edit.")
-    );
-    assert!(
-        fs::read_to_string(fixture.root_remote_file("roadmap"))
-            .expect("remote sidecar")
-            .contains("Remote body.")
+        !fixture
+            .root_file("roadmap")
+            .with_extension("remote.md")
+            .exists()
     );
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
@@ -268,7 +275,7 @@ fn pull_file_materializes_remote_sidecar_and_marks_conflicted_when_remote_change
 }
 
 #[test]
-fn pull_file_recreates_missing_remote_sidecar_for_unresolved_conflict() {
+fn pull_file_leaves_inline_conflict_unchanged_when_remote_changes_again() {
     let fixture = PullFixture::new();
     let mut store = InMemoryStateStore::new();
     fixture.mount(&mut store);
@@ -287,12 +294,12 @@ fn pull_file_recreates_missing_remote_sidecar_for_unresolved_conflict() {
         fixture.root_file("roadmap"),
     )
     .expect("pull conflicted file");
-    fs::remove_file(fixture.root_remote_file("roadmap")).expect("remove remote sidecar");
-    assert!(!fixture.root_remote_file("roadmap").exists());
+    let conflicted_contents =
+        fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
 
     let report = run_pull(
         &mut store,
-        &conflicted_connector,
+        &fixture.connector_with("Roadmap", "Remote body v2.", "2026-06-12T00:00:00.000Z"),
         fixture.root_file("roadmap"),
     )
     .expect("pull unresolved conflict");
@@ -300,10 +307,9 @@ fn pull_file_recreates_missing_remote_sidecar_for_unresolved_conflict() {
     assert!(!report.ok);
     assert_eq!(report.hydrated, 0);
     assert_eq!(report.skipped_dirty, 1);
-    assert!(
-        fs::read_to_string(fixture.root_remote_file("roadmap"))
-            .expect("recreated remote sidecar")
-            .contains("Remote body.")
+    assert_eq!(
+        fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file"),
+        conflicted_contents
     );
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
@@ -391,10 +397,6 @@ impl PullFixture {
         self.root
             .join(format!("{root_slug} ~aaaaaa"))
             .join("design-notes ~bbbbbb.md")
-    }
-
-    fn root_remote_file(&self, slug: &str) -> PathBuf {
-        self.root.join(format!("{slug} ~aaaaaa.remote.md"))
     }
 
     fn database_schema_file(&self) -> PathBuf {

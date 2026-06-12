@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::diff::{DiffError, run_diff};
+use afs_core::conflict::{
+    CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
+};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
@@ -47,6 +50,27 @@ fn diff_reports_safe_plan_as_confirmation_needed() {
     assert_eq!(report.guardrail.decision, "proceed");
     assert_eq!(plan.summary.blocks_updated, 1);
     assert_eq!(plan.operations[0].operation_type(), "update_block");
+}
+
+#[test]
+fn diff_rejects_unresolved_conflict_markers() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page(
+        "Roadmap.md",
+        &format!(
+            "{CONFLICT_LOCAL_MARKER}\n# Roadmap\n\nLocal paragraph.\n{CONFLICT_SEPARATOR_MARKER}\n# Roadmap\n\nRemote paragraph.\n{CONFLICT_REMOTE_MARKER}\n"
+        ),
+    );
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nRemote paragraph."))
+        .expect("save shadow");
+
+    let report = run_diff(&store, &path).expect("diff report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "fix_validation");
+    assert_eq!(report.validation[0].code, "unresolved_conflict_markers");
 }
 
 #[test]

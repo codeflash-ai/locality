@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{ChildContainer, Connector, ListChildrenRequest};
 use afs_core::canonical::parse_canonical_markdown;
+use afs_core::conflict::has_unresolved_conflict_markers;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::{AfsError, AfsResult};
@@ -476,12 +477,6 @@ where
             "only page files can be written by the virtual filesystem",
         ));
     }
-    if entity.hydration == HydrationState::Conflicted {
-        return Err(AfsError::InvalidState(
-            "conflicted virtual filesystem files must be resolved before writing".to_string(),
-        ));
-    }
-
     let path = content_path_for_relative(content_root, &entity.path)?;
     write_binary_atomic(&path, contents)?;
 
@@ -499,14 +494,25 @@ where
         })
         .unwrap_or(false);
 
-    if matches_shadow {
+    let contains_conflict_markers = std::str::from_utf8(contents)
+        .ok()
+        .is_some_and(has_unresolved_conflict_markers);
+
+    if contains_conflict_markers {
+        if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+            entity.hydration = HydrationState::Dirty;
+        }
         if entity
             .hydration
-            .can_transition_to(&HydrationState::Hydrated)
+            .can_transition_to(&HydrationState::Conflicted)
         {
-            entity.hydration = HydrationState::Hydrated;
+            entity.hydration = HydrationState::Conflicted;
         }
-    } else if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+    } else if matches_shadow {
+        entity.hydration = HydrationState::Hydrated;
+    } else if entity.hydration == HydrationState::Conflicted
+        || entity.hydration.can_transition_to(&HydrationState::Dirty)
+    {
         entity.hydration = HydrationState::Dirty;
     }
     store.save_entity(entity.clone()).map_err(AfsError::from)?;

@@ -1,13 +1,19 @@
 //! Conflict data structures and block-overlap helpers.
 //!
 //! The core preserves local content when conflicts occur. Higher layers can
-//! materialize `.remote.md` files and drive `afs resolve`, but the collision
-//! decision is deterministic and lives here.
+//! materialize inline conflict markers, but the collision decision is
+//! deterministic and lives here.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+use crate::canonical::{parse_canonical_markdown, render_canonical_markdown};
+use crate::model::CanonicalDocument;
 use crate::model::RemoteId;
+
+pub const CONFLICT_LOCAL_MARKER: &str = "<<<<<<< LOCAL";
+pub const CONFLICT_SEPARATOR_MARKER: &str = "=======";
+pub const CONFLICT_REMOTE_MARKER: &str = ">>>>>>> REMOTE";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConflictSummary {
@@ -31,12 +37,63 @@ pub enum ConflictResolution {
     Edited(PathBuf),
 }
 
-pub fn remote_variant_path(path: impl AsRef<Path>) -> PathBuf {
-    let path = path.as_ref();
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("md") => path.with_extension("remote.md"),
-        Some(extension) => path.with_extension(format!("remote.{extension}")),
-        None => path.with_extension("remote"),
+pub fn render_inline_conflict_markdown(
+    local_contents: &str,
+    remote_document: &CanonicalDocument,
+) -> String {
+    let (frontmatter, local_body) = match parse_canonical_markdown(local_contents) {
+        Ok(parsed) => (parsed.document.frontmatter, parsed.document.body),
+        Err(_) => (
+            remote_document.frontmatter.clone(),
+            local_contents.to_string(),
+        ),
+    };
+    render_canonical_markdown(&CanonicalDocument::new(
+        frontmatter,
+        render_conflict_marker_body(&local_body, &remote_document.body),
+    ))
+}
+
+pub fn render_conflict_marker_body(local_body: &str, remote_body: &str) -> String {
+    let mut body = String::new();
+    body.push_str(CONFLICT_LOCAL_MARKER);
+    body.push('\n');
+    push_marker_section(&mut body, local_body);
+    body.push_str(CONFLICT_SEPARATOR_MARKER);
+    body.push('\n');
+    push_marker_section(&mut body, remote_body);
+    body.push_str(CONFLICT_REMOTE_MARKER);
+    body.push('\n');
+    body
+}
+
+pub fn unresolved_conflict_marker_line(contents: &str) -> Option<usize> {
+    let mut start_line = None;
+    let mut saw_separator = false;
+
+    for (index, line) in contents.lines().enumerate() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with("<<<<<<<") {
+            start_line = Some(index + 1);
+            saw_separator = false;
+        } else if start_line.is_some() && line == CONFLICT_SEPARATOR_MARKER {
+            saw_separator = true;
+        } else if start_line.is_some() && saw_separator && line.starts_with(">>>>>>>") {
+            return start_line;
+        }
+    }
+
+    None
+}
+
+pub fn has_unresolved_conflict_markers(contents: &str) -> bool {
+    unresolved_conflict_marker_line(contents).is_some()
+}
+
+fn push_marker_section(output: &mut String, section: &str) {
+    output.push_str(section);
+    if !section.ends_with('\n') {
+        output.push('\n');
     }
 }
 

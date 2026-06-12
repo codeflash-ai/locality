@@ -47,7 +47,6 @@ use crate::local_oauth::{
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
 use crate::pull::{PullError, PullReport, run_pull_with_state_root};
 use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
-use crate::resolve::{ResolveChoice, ResolveError, ResolveOptions, ResolveReport, run_resolve};
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::status::{StatusError, StatusOptions, StatusReport, run_status};
 
@@ -73,7 +72,6 @@ const COMMANDS: &[&str] = &[
     "diff",
     "undo",
     "log",
-    "resolve",
     "restore",
     "config",
     "file-provider",
@@ -100,7 +98,6 @@ pub fn dispatch(args: &[String]) -> i32 {
         "push" => push(&args[1..], json),
         "diff" => diff(&args[1..], json),
         "restore" => restore(&args[1..], json),
-        "resolve" => resolve(&args[1..], json),
         "undo" => undo(&args[1..], json),
         "log" => log(&args[1..], json),
         "config" => stub("config", json),
@@ -642,64 +639,6 @@ fn restore(args: &[String], json: bool) -> i32 {
             EXIT_SUCCESS
         }
         Err(error) => restore_command_error(json, error),
-    }
-}
-
-fn resolve(args: &[String], json: bool) -> i32 {
-    let choice = if has_flag(args, "--ours") {
-        Some(ResolveChoice::Ours)
-    } else if has_flag(args, "--theirs") {
-        Some(ResolveChoice::Theirs)
-    } else if has_flag(args, "--edited") {
-        Some(ResolveChoice::Edited)
-    } else {
-        None
-    };
-    let Some(choice) = choice else {
-        return command_error(
-            json,
-            CommandError::new(
-                "resolve",
-                "usage",
-                "usage: afs resolve --ours|--theirs|--edited <path> [--json]",
-            ),
-            EXIT_USAGE,
-        );
-    };
-    let Some(path) = first_positional(args) else {
-        return command_error(
-            json,
-            CommandError::new(
-                "resolve",
-                "usage",
-                "usage: afs resolve --ours|--theirs|--edited <path> [--json]",
-            ),
-            EXIT_USAGE,
-        );
-    };
-
-    let state_root = default_state_root();
-    let mut store = match SqliteStateStore::open(state_root.clone()) {
-        Ok(store) => store,
-        Err(error) => {
-            return command_error(
-                json,
-                CommandError::new("resolve", "store_open_failed", error.to_string()),
-                EXIT_INTERNAL,
-            );
-        }
-    };
-
-    match run_resolve(&mut store, PathBuf::from(path), ResolveOptions { choice }) {
-        Ok(report) if json => {
-            print_json(&report);
-            EXIT_SUCCESS
-        }
-        Ok(report) => {
-            print_resolve_report(&report);
-            EXIT_SUCCESS
-        }
-        Err(error) => resolve_command_error(json, error),
     }
 }
 
@@ -1380,10 +1319,6 @@ fn print_pull_report(report: &PullReport) {
 
 fn print_restore_report(report: &RestoreReport) {
     println!("restored {}", report.path);
-}
-
-fn print_resolve_report(report: &ResolveReport) {
-    println!("{}", report.message);
 }
 
 fn print_status_report(report: &StatusReport) {
@@ -2396,25 +2331,6 @@ fn restore_command_error(json: bool, error: RestoreError) -> i32 {
     command_error(
         json,
         CommandError::new("restore", error.code(), error.message()),
-        exit_code,
-    )
-}
-
-fn resolve_command_error(json: bool, error: ResolveError) -> i32 {
-    let exit_code = match &error {
-        ResolveError::MountNotFound(_)
-        | ResolveError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
-        ResolveError::EntityNotConflicted(_) => 4,
-        ResolveError::CurrentDir(_)
-        | ResolveError::ReadFile { .. }
-        | ResolveError::RemoteSidecarMissing(_)
-        | ResolveError::Store(_)
-        | ResolveError::UnsupportedEntity(_)
-        | ResolveError::WriteFile { .. } => EXIT_INTERNAL,
-    };
-    command_error(
-        json,
-        CommandError::new("resolve", error.code(), error.message()),
         exit_code,
     )
 }

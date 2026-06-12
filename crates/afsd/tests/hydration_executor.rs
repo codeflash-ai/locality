@@ -4,6 +4,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use afs_core::canonical::render_canonical_markdown;
+use afs_core::conflict::{
+    CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
+    has_unresolved_conflict_markers,
+};
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
@@ -173,11 +177,11 @@ fn executor_skips_dirty_file_and_marks_entity_dirty_when_remote_matches_shadow()
         .expect("get entity")
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Dirty);
-    assert!(!fixture.remote_page_path().exists());
+    assert!(!fixture.page_path().with_extension("remote.md").exists());
 }
 
 #[test]
-fn executor_materializes_remote_sidecar_and_marks_entity_conflicted() {
+fn executor_writes_inline_conflict_markers_and_marks_entity_conflicted() {
     let fixture = HydrationFixture::new();
     let mut store = fixture.store(HydrationState::Hydrated);
     let old = rendered_entity("Old body.");
@@ -194,16 +198,14 @@ fn executor_materializes_remote_sidecar_and_marks_entity_conflicted() {
         .expect("materialize conflict");
 
     assert_eq!(outcome, HydrationOutcome::SkippedDirty);
-    assert!(
-        fs::read_to_string(fixture.page_path())
-            .expect("local file")
-            .contains("Local edit.")
-    );
-    assert!(
-        fs::read_to_string(fixture.remote_page_path())
-            .expect("remote sidecar")
-            .contains("Remote body.")
-    );
+    let contents = fs::read_to_string(fixture.page_path()).expect("local file");
+    assert!(contents.contains("Local edit."));
+    assert!(contents.contains("Remote body."));
+    assert!(contents.contains(CONFLICT_LOCAL_MARKER));
+    assert!(contents.contains(CONFLICT_SEPARATOR_MARKER));
+    assert!(contents.contains(CONFLICT_REMOTE_MARKER));
+    assert!(has_unresolved_conflict_markers(&contents));
+    assert!(!fixture.page_path().with_extension("remote.md").exists());
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.remote_id)
         .expect("get entity")
@@ -217,7 +219,7 @@ fn executor_materializes_remote_sidecar_and_marks_entity_conflicted() {
 }
 
 #[test]
-fn executor_recreates_missing_remote_sidecar_for_unresolved_conflict() {
+fn executor_leaves_inline_conflict_unchanged_when_remote_changes_again() {
     let fixture = HydrationFixture::new();
     let mut store = fixture.store(HydrationState::Hydrated);
     let old = rendered_entity("Old body.");
@@ -232,18 +234,21 @@ fn executor_recreates_missing_remote_sidecar_for_unresolved_conflict() {
     executor
         .hydrate_request(fixture.request())
         .expect("materialize conflict");
-    fs::remove_file(fixture.remote_page_path()).expect("remove remote sidecar");
-    assert!(!fixture.remote_page_path().exists());
+    drop(executor);
+    let conflicted_contents =
+        fs::read_to_string(fixture.page_path()).expect("conflict file contents");
 
+    let changed_source =
+        FakeHydrationSource::with_entity("page-1", rendered_entity("Remote body v2."));
+    let mut executor = HydrationExecutor::new(&mut store, &changed_source);
     let outcome = executor
         .hydrate_request(fixture.request())
-        .expect("recreate missing remote sidecar");
+        .expect("skip unresolved conflict");
 
     assert_eq!(outcome, HydrationOutcome::SkippedDirty);
-    assert!(
-        fs::read_to_string(fixture.remote_page_path())
-            .expect("recreated remote sidecar")
-            .contains("Remote body.")
+    assert_eq!(
+        fs::read_to_string(fixture.page_path()).expect("conflict file contents"),
+        conflicted_contents
     );
     let entity = store
         .get_entity(&fixture.mount_id, &fixture.remote_id)
@@ -409,10 +414,6 @@ impl HydrationFixture {
 
     fn page_path(&self) -> PathBuf {
         self.root.join("Roadmap.md")
-    }
-
-    fn remote_page_path(&self) -> PathBuf {
-        self.root.join("Roadmap.remote.md")
     }
 
     fn write_stub(&self) {
