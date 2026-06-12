@@ -18,6 +18,8 @@ use afs_store::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullReport {
     pub ok: bool,
@@ -40,6 +42,18 @@ pub fn run_pull<S>(
 where
     S: MountRepository + EntityRepository + ShadowRepository,
 {
+    run_pull_with_state_root(store, connector, target_path, None)
+}
+
+pub fn run_pull_with_state_root<S>(
+    store: &mut S,
+    connector: &NotionConnector,
+    target_path: impl AsRef<Path>,
+    state_root: Option<&Path>,
+) -> Result<PullReport, PullError>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+{
     let target_path = absolute_path(target_path.as_ref())?;
     let mounts = store.load_mounts().map_err(PullError::Store)?;
     let mount = find_mount_for_path(&mounts, &target_path)
@@ -51,8 +65,8 @@ where
         None => connector.clone(),
     };
 
-    if relative_path.as_os_str().is_empty() || target_path.is_dir() {
-        pull_mount_root(store, &mounted_connector, &mount, target_path)
+    if should_pull_mount_root(&mount, &relative_path, &target_path) {
+        pull_mount_root(store, &mounted_connector, &mount, target_path, state_root)
     } else {
         pull_entity_path(
             store,
@@ -60,6 +74,7 @@ where
             &mount,
             &relative_path,
             target_path,
+            state_root,
         )
     }
 }
@@ -69,6 +84,7 @@ fn pull_mount_root<S>(
     connector: &NotionConnector,
     mount: &MountConfig,
     target_path: PathBuf,
+    state_root: Option<&Path>,
 ) -> Result<PullReport, PullError>
 where
     S: EntityRepository + ShadowRepository,
@@ -88,7 +104,7 @@ where
         let record = merged_entity_record(entry, existing.as_ref());
         store.save_entity(record).map_err(PullError::Store)?;
         rename_projection_if_needed(mount, existing.as_ref(), entry)?;
-        if write_stub_if_needed(connector, mount, entry)? {
+        if write_stub_if_needed(connector, mount, entry, state_root)? {
             stubbed += 1;
         }
     }
@@ -107,7 +123,7 @@ where
                     remote_id: root_entry.remote_id.clone(),
                 })
             })?;
-        match hydrate_entity(store, connector, mount, root_entity)? {
+        match hydrate_entity(store, connector, mount, root_entity, state_root)? {
             HydrationOutcome::Hydrated => hydrated += 1,
             HydrationOutcome::SkippedDirty => skipped_dirty += 1,
         }
@@ -133,6 +149,7 @@ fn pull_entity_path<S>(
     mount: &MountConfig,
     relative_path: &Path,
     target_path: PathBuf,
+    state_root: Option<&Path>,
 ) -> Result<PullReport, PullError>
 where
     S: EntityRepository + ShadowRepository,
@@ -147,7 +164,7 @@ where
             })
         })?;
 
-    let outcome = hydrate_entity(store, connector, mount, entity)?;
+    let outcome = hydrate_entity(store, connector, mount, entity, state_root)?;
     let (hydrated, skipped_dirty) = match outcome {
         HydrationOutcome::Hydrated => (1, 0),
         HydrationOutcome::SkippedDirty => (0, 1),
@@ -185,8 +202,18 @@ fn write_stub_if_needed(
     connector: &NotionConnector,
     mount: &MountConfig,
     entry: &TreeEntry,
+    state_root: Option<&Path>,
 ) -> Result<bool, PullError> {
     if mount.projection.uses_virtual_filesystem() {
+        if entry.kind == EntityKind::Database
+            && let Some(state_root) = state_root
+        {
+            let directory = virtual_fs_content_root(state_root, &mount.mount_id).join(&entry.path);
+            let schema = connector
+                .database_schema_yaml(&entry.remote_id)
+                .map_err(PullError::Connector)?;
+            write_atomic(&directory.join("_schema.yaml"), schema)?;
+        }
         return Ok(false);
     }
 
@@ -269,11 +296,12 @@ fn hydrate_entity<S>(
     connector: &NotionConnector,
     mount: &MountConfig,
     entity: EntityRecord,
+    state_root: Option<&Path>,
 ) -> Result<HydrationOutcome, PullError>
 where
     S: EntityRepository + ShadowRepository,
 {
-    let path = mount.root.join(&entity.path);
+    let path = projection_content_path(state_root, mount, &entity.path)?;
     let can_replace = can_replace_file(store, mount, &entity, &path)?;
     let native = connector
         .fetch(FetchRequest {
@@ -283,8 +311,9 @@ where
     let rendered = connector
         .render_native_entity_for_path(&native, &entity.path)
         .map_err(PullError::Connector)?;
+    let media_root = projection_output_root(state_root, mount)?;
     connector
-        .download_rendered_media(&rendered, &mount.root)
+        .download_rendered_media(&rendered, &media_root)
         .map_err(PullError::Connector)?;
 
     if can_replace {
@@ -303,6 +332,49 @@ where
     }
 
     Ok(HydrationOutcome::SkippedDirty)
+}
+
+fn projection_content_path(
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Result<PathBuf, PullError> {
+    if mount.projection.uses_virtual_filesystem()
+        && let Some(state_root) = state_root
+    {
+        return virtual_fs_content_path(state_root, &mount.mount_id, relative_path).map_err(
+            |error| PullError::WriteFile {
+                path: relative_path.to_path_buf(),
+                message: error.to_string(),
+            },
+        );
+    }
+
+    Ok(mount.root.join(relative_path))
+}
+
+fn projection_output_root(
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+) -> Result<PathBuf, PullError> {
+    if mount.projection.uses_virtual_filesystem()
+        && let Some(state_root) = state_root
+    {
+        return Ok(virtual_fs_content_root(state_root, &mount.mount_id));
+    }
+
+    Ok(mount.root.clone())
+}
+
+fn should_pull_mount_root(mount: &MountConfig, relative_path: &Path, target_path: &Path) -> bool {
+    if relative_path.as_os_str().is_empty() {
+        return true;
+    }
+    if mount.projection.uses_virtual_filesystem() {
+        return false;
+    }
+
+    target_path.is_dir()
 }
 
 fn accept_remote_projection<S>(

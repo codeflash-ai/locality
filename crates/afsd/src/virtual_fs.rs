@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{ChildContainer, Connector, ListChildrenRequest};
 use afs_core::canonical::parse_canonical_markdown;
@@ -9,6 +10,7 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
+    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +19,8 @@ use crate::hydration::{HydrationExecutor, HydrationOutcome, HydrationSource};
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
 const CHILDREN_PREFIX: &str = "children:";
 const PATH_PREFIX: &str = "path:";
+const LOCAL_PREFIX: &str = "local:";
+const SCHEMA_PREFIX: &str = "schema:";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualFsItemReport {
@@ -49,6 +53,14 @@ pub struct VirtualFsWriteReport {
     pub path: String,
     pub bytes_written: usize,
     pub hydration: HydrationState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualFsMutationReport {
+    pub mount_id: String,
+    pub identifier: String,
+    pub path: String,
+    pub item: VirtualFsItem,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,12 +100,15 @@ pub fn virtual_fs_item<S>(
     identifier: &str,
 ) -> AfsResult<VirtualFsItemReport>
 where
-    S: MountRepository + EntityRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
 {
-    let mount = require_mount(store, mount_id)?;
+    let mount = require_virtual_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
+    let mutations = store
+        .list_virtual_mutations(mount_id)
+        .map_err(AfsError::from)?;
     let index = ProviderIndex::new(&entities);
-    let item = resolve_item(&mount, &entities, &index, identifier)?;
+    let item = resolve_item(&mount, &entities, &mutations, &index, identifier)?;
 
     Ok(VirtualFsItemReport {
         mount_id: mount_id.0.clone(),
@@ -108,7 +123,7 @@ pub fn virtual_fs_item_with_content_root<S>(
     identifier: &str,
 ) -> AfsResult<VirtualFsItemReport>
 where
-    S: MountRepository + EntityRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
 {
     let mut report = virtual_fs_item(store, mount_id, identifier)?;
     rewrite_item_materialized_path(content_root, &mut report.item)?;
@@ -121,15 +136,22 @@ pub fn virtual_fs_children<S>(
     container_identifier: &str,
 ) -> AfsResult<VirtualFsChildrenReport>
 where
-    S: MountRepository + EntityRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
 {
-    let mount = require_mount(store, mount_id)?;
+    let mount = require_virtual_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
+    let mutations = store
+        .list_virtual_mutations(mount_id)
+        .map_err(AfsError::from)?;
     let index = ProviderIndex::new(&entities);
     let container_path = container_path(&entities, container_identifier)?;
     let mut children = Vec::new();
+    let deleted_remote_ids = pending_deleted_remote_ids(&mutations);
 
     for entity in &entities {
+        if deleted_remote_ids.contains(&entity.remote_id) {
+            continue;
+        }
         if parent_path(&entity.path) == container_path {
             children.push(entity_item(&mount, entity, &index));
             if entity.kind == EntityKind::Page {
@@ -140,6 +162,13 @@ where
                     &index,
                 ));
             }
+        }
+    }
+    for mutation in &mutations {
+        if mutation.mutation_kind == VirtualMutationKind::Create
+            && parent_path(&mutation.projected_path) == container_path
+        {
+            children.push(pending_item(&mount, mutation, &index));
         }
     }
 
@@ -164,12 +193,31 @@ pub fn virtual_fs_children_with_content_root<S>(
     container_identifier: &str,
 ) -> AfsResult<VirtualFsChildrenReport>
 where
-    S: MountRepository + EntityRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
 {
     let mut report = virtual_fs_children(store, mount_id, container_identifier)?;
+    let mount = require_mount(store, mount_id)?;
+    let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
+    if let Some(schema) =
+        schema_item_for_container(&mount, &entities, content_root, container_identifier)?
+    {
+        if !report
+            .children
+            .iter()
+            .any(|child| child.identifier == schema.identifier)
+        {
+            report.children.push(schema);
+        }
+    }
     for child in &mut report.children {
         rewrite_item_materialized_path(content_root, child)?;
     }
+    report.children.sort_by(|left, right| {
+        left.filename
+            .to_lowercase()
+            .cmp(&right.filename.to_lowercase())
+            .then_with(|| left.identifier.cmp(&right.identifier))
+    });
     Ok(report)
 }
 
@@ -183,7 +231,7 @@ where
     S: MountRepository + EntityRepository,
     C: Connector + ?Sized,
 {
-    let mount = require_mount(store, mount_id)?;
+    let mount = require_virtual_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
     let parent_path = container_path(&entities, container_identifier)?;
     if has_known_entity_child(&entities, &parent_path) {
@@ -223,7 +271,7 @@ where
     S: MountRepository + EntityRepository + ShadowRepository,
     Source: HydrationSource + ?Sized,
 {
-    let mount = require_mount(store, mount_id)?;
+    let mount = require_virtual_mount(store, mount_id)?;
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
     let entity = require_entity(store, mount_id, &remote_id)?;
     if entity.kind != EntityKind::Page {
@@ -276,13 +324,66 @@ pub fn materialize_virtual_fs_item_with_content_root<S, Source>(
     identifier: &str,
 ) -> AfsResult<VirtualFsMaterializeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
     Source: HydrationSource + ?Sized,
 {
-    let mount = require_mount(store, mount_id)?;
+    let mount = require_virtual_mount(store, mount_id)?;
+    if let Some(mutation) = local_mutation(store, mount_id, identifier)? {
+        if mutation.mutation_kind != VirtualMutationKind::Create {
+            return Err(AfsError::Unsupported(
+                "only pending-created local files can be materialized",
+            ));
+        }
+        let path = content_path_for_relative(content_root, &mutation.projected_path)?;
+        if !path.exists() {
+            write_binary_atomic(&path, b"")?;
+        }
+        return Ok(VirtualFsMaterializeReport {
+            mount_id: mount_id.0.clone(),
+            identifier: identifier.to_string(),
+            remote_id: mutation.local_id,
+            path: path.display().to_string(),
+            outcome: VirtualFsMaterializeOutcome::AlreadyMaterialized,
+            hydration: HydrationState::Dirty,
+        });
+    }
+    if let Some(remote_id) = identifier.strip_prefix(SCHEMA_PREFIX) {
+        let entity = require_entity(store, mount_id, &RemoteId::new(remote_id))?;
+        if entity.kind != EntityKind::Database {
+            return Err(AfsError::Unsupported(
+                "only database schemas can be materialized by the virtual filesystem",
+            ));
+        }
+        let path = content_path_for_relative(content_root, &entity.path.join("_schema.yaml"))?;
+        if !path.exists() {
+            return Err(AfsError::InvalidState(format!(
+                "database schema cache is missing for `{}`",
+                entity.path.display()
+            )));
+        }
+        return Ok(VirtualFsMaterializeReport {
+            mount_id: mount_id.0.clone(),
+            identifier: identifier.to_string(),
+            remote_id: remote_id.to_string(),
+            path: path.display().to_string(),
+            outcome: VirtualFsMaterializeOutcome::AlreadyMaterialized,
+            hydration: HydrationState::Hydrated,
+        });
+    }
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
     let entity = require_entity(store, mount_id, &remote_id)?;
     if entity.kind != EntityKind::Page {
+        let path = content_path_for_relative(content_root, &entity.path)?;
+        if path.exists() {
+            return Ok(VirtualFsMaterializeReport {
+                mount_id: mount_id.0.clone(),
+                identifier: identifier.to_string(),
+                remote_id: remote_id.0,
+                path: path.display().to_string(),
+                outcome: VirtualFsMaterializeOutcome::AlreadyMaterialized,
+                hydration: entity.hydration,
+            });
+        }
         return Err(AfsError::Unsupported(
             "only page files can be materialized by the virtual filesystem",
         ));
@@ -333,12 +434,39 @@ pub fn commit_virtual_fs_write<S>(
     contents: &[u8],
 ) -> AfsResult<VirtualFsWriteReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
 {
-    let mount = require_mount(store, mount_id)?;
+    let mount = require_virtual_mount(store, mount_id)?;
     if mount.read_only {
         return Err(AfsError::Unsupported(
             "read-only mounts do not accept virtual filesystem writes",
+        ));
+    }
+    if let Some(mut mutation) = local_mutation(store, mount_id, identifier)? {
+        if mutation.mutation_kind != VirtualMutationKind::Create {
+            return Err(AfsError::Unsupported(
+                "only pending-created local files can be written by local virtual identifier",
+            ));
+        }
+        let path = content_path_for_relative(content_root, &mutation.projected_path)?;
+        write_binary_atomic(&path, contents)?;
+        mutation.content_path = Some(path.clone());
+        mutation.updated_at = now_string();
+        store
+            .save_virtual_mutation(mutation)
+            .map_err(AfsError::from)?;
+        return Ok(VirtualFsWriteReport {
+            mount_id: mount_id.0.clone(),
+            identifier: identifier.to_string(),
+            remote_id: identifier.to_string(),
+            path: path.display().to_string(),
+            bytes_written: contents.len(),
+            hydration: HydrationState::Dirty,
+        });
+    }
+    if identifier.starts_with(SCHEMA_PREFIX) {
+        return Err(AfsError::Unsupported(
+            "database schema files are read-only in virtual filesystem mounts",
         ));
     }
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
@@ -393,6 +521,232 @@ where
     })
 }
 
+pub fn create_virtual_fs_file<S>(
+    store: &mut S,
+    content_root: &Path,
+    mount_id: &MountId,
+    parent_identifier: &str,
+    filename: &str,
+) -> AfsResult<VirtualFsMutationReport>
+where
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
+{
+    let mount = require_virtual_mount(store, mount_id)?;
+    if mount.read_only {
+        return Err(AfsError::Unsupported(
+            "read-only mounts do not accept virtual filesystem creates",
+        ));
+    }
+    if !filename.ends_with(".md") {
+        return Err(AfsError::Unsupported(
+            "virtual filesystem creates currently support only Markdown page files",
+        ));
+    }
+    let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
+    let parent_path = container_path(&entities, parent_identifier)?;
+    let parent_remote_id = create_parent_remote_id(&entities, parent_identifier)?;
+    let projected_path = parent_path.join(filename);
+    ensure_virtual_path_available(store, mount_id, &projected_path)?;
+    let path = content_path_for_relative(content_root, &projected_path)?;
+    write_binary_atomic(&path, b"")?;
+
+    let now = now_string();
+    let mutation = VirtualMutationRecord {
+        mount_id: mount_id.clone(),
+        local_id: new_local_id(),
+        mutation_kind: VirtualMutationKind::Create,
+        target_remote_id: None,
+        parent_remote_id: Some(parent_remote_id),
+        original_path: None,
+        projected_path,
+        title: title_from_filename(filename),
+        content_path: Some(path),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    store
+        .save_virtual_mutation(mutation.clone())
+        .map_err(AfsError::from)?;
+    let index = ProviderIndex::new(&entities);
+    let item = pending_item(&mount, &mutation, &index);
+    Ok(VirtualFsMutationReport {
+        mount_id: mount_id.0.clone(),
+        identifier: mutation.local_id,
+        path: item.path.clone(),
+        item,
+    })
+}
+
+pub fn rename_virtual_fs_item<S>(
+    store: &mut S,
+    content_root: &Path,
+    mount_id: &MountId,
+    identifier: &str,
+    new_parent_identifier: &str,
+    new_filename: &str,
+) -> AfsResult<VirtualFsMutationReport>
+where
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
+{
+    let mount = require_virtual_mount(store, mount_id)?;
+    if mount.read_only {
+        return Err(AfsError::Unsupported(
+            "read-only mounts do not accept virtual filesystem renames",
+        ));
+    }
+    if !new_filename.ends_with(".md") {
+        return Err(AfsError::Unsupported(
+            "virtual filesystem renames currently support only Markdown page files",
+        ));
+    }
+    let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
+    let new_parent_path = container_path(&entities, new_parent_identifier)?;
+    let new_path = new_parent_path.join(new_filename);
+    ensure_virtual_path_available_for_rename(store, mount_id, identifier, &new_path)?;
+
+    if let Some(mut mutation) = local_mutation(store, mount_id, identifier)? {
+        let old_parent = parent_path(&mutation.projected_path).to_path_buf();
+        if old_parent != new_parent_path {
+            return Err(AfsError::Unsupported(
+                "moving virtual filesystem files across parents is not supported yet",
+            ));
+        }
+        let old_path = content_path_for_relative(content_root, &mutation.projected_path)?;
+        let new_content_path = content_path_for_relative(content_root, &new_path)?;
+        rename_cached_file_if_present(&old_path, &new_content_path)?;
+        mutation.projected_path = new_path;
+        mutation.title = title_from_filename(new_filename);
+        mutation.content_path = Some(new_content_path);
+        mutation.updated_at = now_string();
+        store
+            .save_virtual_mutation(mutation.clone())
+            .map_err(AfsError::from)?;
+        let index = ProviderIndex::new(&entities);
+        let item = pending_item(&mount, &mutation, &index);
+        return Ok(VirtualFsMutationReport {
+            mount_id: mount_id.0.clone(),
+            identifier: mutation.local_id,
+            path: item.path.clone(),
+            item,
+        });
+    }
+
+    let remote_id = RemoteId::new(entity_identifier(identifier)?);
+    let mut entity = require_entity(store, mount_id, &remote_id)?;
+    if entity.kind != EntityKind::Page {
+        return Err(AfsError::Unsupported(
+            "only page files can be renamed by the virtual filesystem",
+        ));
+    }
+    let old_parent = parent_path(&entity.path).to_path_buf();
+    if old_parent != new_parent_path {
+        return Err(AfsError::Unsupported(
+            "moving virtual filesystem files across parents is not supported yet",
+        ));
+    }
+    let old_path = content_path_for_relative(content_root, &entity.path)?;
+    let new_content_path = content_path_for_relative(content_root, &new_path)?;
+    rename_cached_file_if_present(&old_path, &new_content_path)?;
+    let original_path = entity.path.clone();
+    entity.path = new_path.clone();
+    entity.title = title_from_filename(new_filename);
+    if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+        entity.hydration = HydrationState::Dirty;
+    }
+    store.save_entity(entity.clone()).map_err(AfsError::from)?;
+    let now = now_string();
+    let mutation = VirtualMutationRecord {
+        mount_id: mount_id.clone(),
+        local_id: format!("rename:{}", remote_id.0),
+        mutation_kind: VirtualMutationKind::Rename,
+        target_remote_id: Some(remote_id.clone()),
+        parent_remote_id: None,
+        original_path: Some(original_path),
+        projected_path: new_path,
+        title: entity.title.clone(),
+        content_path: Some(new_content_path),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    store
+        .save_virtual_mutation(mutation)
+        .map_err(AfsError::from)?;
+    let refreshed = store.list_entities(mount_id).map_err(AfsError::from)?;
+    let index = ProviderIndex::new(&refreshed);
+    let item = entity_item(&mount, &entity, &index);
+    Ok(VirtualFsMutationReport {
+        mount_id: mount_id.0.clone(),
+        identifier: remote_id.0,
+        path: item.path.clone(),
+        item,
+    })
+}
+
+pub fn trash_virtual_fs_item<S>(
+    store: &mut S,
+    content_root: &Path,
+    mount_id: &MountId,
+    identifier: &str,
+) -> AfsResult<VirtualFsMutationReport>
+where
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
+{
+    let mount = require_virtual_mount(store, mount_id)?;
+    if mount.read_only {
+        return Err(AfsError::Unsupported(
+            "read-only mounts do not accept virtual filesystem deletes",
+        ));
+    }
+    let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
+    if let Some(mutation) = local_mutation(store, mount_id, identifier)? {
+        let path = content_path_for_relative(content_root, &mutation.projected_path)?;
+        let _ = std::fs::remove_file(path);
+        store
+            .delete_virtual_mutation(mount_id, &mutation.local_id)
+            .map_err(AfsError::from)?;
+        let index = ProviderIndex::new(&entities);
+        let item = pending_item(&mount, &mutation, &index);
+        return Ok(VirtualFsMutationReport {
+            mount_id: mount_id.0.clone(),
+            identifier: mutation.local_id,
+            path: item.path.clone(),
+            item,
+        });
+    }
+    let remote_id = RemoteId::new(entity_identifier(identifier)?);
+    let entity = require_entity(store, mount_id, &remote_id)?;
+    if entity.kind != EntityKind::Page {
+        return Err(AfsError::Unsupported(
+            "only page files can be deleted by the virtual filesystem",
+        ));
+    }
+    let now = now_string();
+    let mutation = VirtualMutationRecord {
+        mount_id: mount_id.clone(),
+        local_id: format!("delete:{}", remote_id.0),
+        mutation_kind: VirtualMutationKind::Delete,
+        target_remote_id: Some(remote_id.clone()),
+        parent_remote_id: None,
+        original_path: Some(entity.path.clone()),
+        projected_path: entity.path.clone(),
+        title: entity.title.clone(),
+        content_path: Some(content_path_for_relative(content_root, &entity.path)?),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    store
+        .save_virtual_mutation(mutation.clone())
+        .map_err(AfsError::from)?;
+    let index = ProviderIndex::new(&entities);
+    let item = entity_item(&mount, &entity, &index);
+    Ok(VirtualFsMutationReport {
+        mount_id: mount_id.0.clone(),
+        identifier: remote_id.0,
+        path: item.path.clone(),
+        item,
+    })
+}
+
 pub fn virtual_fs_content_root(state_root: &Path, mount_id: &MountId) -> PathBuf {
     virtual_fs_content_base(state_root)
         .join(&mount_id.0)
@@ -443,9 +797,182 @@ pub fn virtual_fs_content_path(
     )
 }
 
+fn local_mutation<S>(
+    store: &S,
+    mount_id: &MountId,
+    identifier: &str,
+) -> AfsResult<Option<VirtualMutationRecord>>
+where
+    S: VirtualMutationRepository,
+{
+    if !identifier.starts_with(LOCAL_PREFIX) {
+        return Ok(None);
+    }
+    store
+        .get_virtual_mutation(mount_id, identifier)
+        .map_err(AfsError::from)
+}
+
+fn pending_deleted_remote_ids(mutations: &[VirtualMutationRecord]) -> BTreeSet<RemoteId> {
+    mutations
+        .iter()
+        .filter(|mutation| mutation.mutation_kind == VirtualMutationKind::Delete)
+        .filter_map(|mutation| mutation.target_remote_id.clone())
+        .collect()
+}
+
+fn schema_item_for_container(
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+    content_root: &Path,
+    container_identifier: &str,
+) -> AfsResult<Option<VirtualFsItem>> {
+    let remote_id = if container_identifier == ROOT_CONTAINER_IDENTIFIER {
+        return Ok(None);
+    } else if container_identifier.starts_with(CHILDREN_PREFIX)
+        || container_identifier.starts_with(PATH_PREFIX)
+    {
+        return Ok(None);
+    } else {
+        RemoteId::new(container_identifier)
+    };
+    let Some(entity) = entities
+        .iter()
+        .find(|entity| entity.remote_id == remote_id && entity.kind == EntityKind::Database)
+    else {
+        return Ok(None);
+    };
+    let path = content_path_for_relative(content_root, &entity.path.join("_schema.yaml"))?;
+    Ok(path
+        .exists()
+        .then(|| schema_item(mount, entity, Some(path))))
+}
+
+fn create_parent_remote_id(
+    entities: &[EntityRecord],
+    parent_identifier: &str,
+) -> AfsResult<RemoteId> {
+    if let Some(remote_id) = parent_identifier.strip_prefix(CHILDREN_PREFIX) {
+        return Ok(RemoteId::new(remote_id));
+    }
+    if parent_identifier == ROOT_CONTAINER_IDENTIFIER || parent_identifier.starts_with(PATH_PREFIX)
+    {
+        return Err(AfsError::Unsupported(
+            "new virtual filesystem files must be created inside a page or database directory",
+        ));
+    }
+    let remote_id = RemoteId::new(parent_identifier);
+    let entity = entities
+        .iter()
+        .find(|entity| entity.remote_id == remote_id)
+        .ok_or_else(|| missing_identifier(parent_identifier))?;
+    match entity.kind {
+        EntityKind::Page | EntityKind::Database => Ok(remote_id),
+        EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => {
+            Err(AfsError::Unsupported(
+                "new virtual filesystem files must be created inside a page or database directory",
+            ))
+        }
+    }
+}
+
+fn ensure_virtual_path_available<S>(store: &S, mount_id: &MountId, path: &Path) -> AfsResult<()>
+where
+    S: EntityRepository + VirtualMutationRepository,
+{
+    if store
+        .find_entity_by_path(mount_id, path)
+        .map_err(AfsError::from)?
+        .is_some()
+        || store
+            .find_virtual_mutation_by_path(mount_id, path)
+            .map_err(AfsError::from)?
+            .is_some()
+    {
+        return Err(AfsError::InvalidState(format!(
+            "virtual filesystem path `{}` already exists",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_virtual_path_available_for_rename<S>(
+    store: &S,
+    mount_id: &MountId,
+    identifier: &str,
+    path: &Path,
+) -> AfsResult<()>
+where
+    S: EntityRepository + VirtualMutationRepository,
+{
+    if let Some(entity) = store
+        .find_entity_by_path(mount_id, path)
+        .map_err(AfsError::from)?
+        && entity.remote_id.0 != identifier
+    {
+        return Err(AfsError::InvalidState(format!(
+            "virtual filesystem path `{}` already exists",
+            path.display()
+        )));
+    }
+    if let Some(mutation) = store
+        .find_virtual_mutation_by_path(mount_id, path)
+        .map_err(AfsError::from)?
+        && mutation.local_id != identifier
+    {
+        return Err(AfsError::InvalidState(format!(
+            "virtual filesystem path `{}` already exists",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn rename_cached_file_if_present(from: &Path, to: &Path) -> AfsResult<()> {
+    if !from.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            AfsError::Io(format!(
+                "failed to create virtual filesystem content directory `{}`: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    std::fs::rename(from, to).map_err(|error| {
+        AfsError::Io(format!(
+            "failed to rename virtual filesystem content `{}` to `{}`: {error}",
+            from.display(),
+            to.display()
+        ))
+    })
+}
+
+fn new_local_id() -> String {
+    format!("{}{}", LOCAL_PREFIX, unique_suffix())
+}
+
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos}", std::process::id())
+}
+
+fn now_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
 fn resolve_item(
     mount: &MountConfig,
     entities: &[EntityRecord],
+    mutations: &[VirtualMutationRecord],
     index: &ProviderIndex,
     identifier: &str,
 ) -> AfsResult<VirtualFsItem> {
@@ -471,11 +998,33 @@ fn resolve_item(
         return Ok(path_dir_item(mount, &path, index));
     }
 
+    if identifier.starts_with(LOCAL_PREFIX) {
+        let mutation = mutations
+            .iter()
+            .find(|mutation| mutation.local_id == identifier)
+            .ok_or_else(|| missing_identifier(identifier))?;
+        return Ok(pending_item(mount, mutation, index));
+    }
+
+    if let Some(remote_id) = identifier.strip_prefix(SCHEMA_PREFIX) {
+        let entity = entities
+            .iter()
+            .find(|entity| entity.remote_id.0 == remote_id && entity.kind == EntityKind::Database)
+            .ok_or_else(|| missing_identifier(identifier))?;
+        return Ok(schema_item(mount, entity, None));
+    }
+
     let remote_id = RemoteId::new(identifier);
     let entity = entities
         .iter()
         .find(|entity| entity.remote_id == remote_id)
         .ok_or_else(|| missing_identifier(identifier))?;
+    if mutations.iter().any(|mutation| {
+        mutation.mutation_kind == VirtualMutationKind::Delete
+            && mutation.target_remote_id.as_ref() == Some(&remote_id)
+    }) {
+        return Err(missing_identifier(identifier));
+    }
     Ok(entity_item(mount, entity, index))
 }
 
@@ -531,6 +1080,61 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
         content_type: content_type.to_string(),
         remote_edited_at: entity.remote_edited_at.clone(),
         materialized_path,
+        byte_size: None,
+    }
+}
+
+fn pending_item(
+    _mount: &MountConfig,
+    mutation: &VirtualMutationRecord,
+    index: &ProviderIndex,
+) -> VirtualFsItem {
+    VirtualFsItem {
+        identifier: mutation.local_id.clone(),
+        parent_identifier: Some(container_identifier_for_path(
+            parent_path(&mutation.projected_path),
+            index,
+        )),
+        filename: filename(&mutation.projected_path),
+        kind: VirtualFsItemKind::File,
+        entity_kind: Some(EntityKind::Page),
+        remote_id: None,
+        path: path_string(&mutation.projected_path),
+        hydration: Some(HydrationState::Dirty),
+        content_type: "net.daringfireball.markdown".to_string(),
+        remote_edited_at: None,
+        materialized_path: mutation
+            .content_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        byte_size: mutation
+            .content_path
+            .as_ref()
+            .and_then(|path| path.metadata().ok())
+            .map(|metadata| metadata.len()),
+    }
+}
+
+fn schema_item(
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    materialized_path: Option<PathBuf>,
+) -> VirtualFsItem {
+    let path = entity.path.join("_schema.yaml");
+    VirtualFsItem {
+        identifier: format!("{SCHEMA_PREFIX}{}", entity.remote_id.0),
+        parent_identifier: Some(entity.remote_id.0.clone()),
+        filename: "_schema.yaml".to_string(),
+        kind: VirtualFsItemKind::File,
+        entity_kind: None,
+        remote_id: Some(entity.remote_id.0.clone()),
+        path: path_string(&path),
+        hydration: Some(HydrationState::Hydrated),
+        content_type: "public.yaml".to_string(),
+        remote_edited_at: entity.remote_edited_at.clone(),
+        materialized_path: materialized_path
+            .or_else(|| Some(mount.root.join(path).to_path_buf()))
+            .map(|path| path.display().to_string()),
         byte_size: None,
     }
 }
@@ -686,6 +1290,19 @@ where
         .ok_or_else(|| StoreError::MountMissing(mount_id.clone()).into())
 }
 
+fn require_virtual_mount<S>(store: &S, mount_id: &MountId) -> AfsResult<MountConfig>
+where
+    S: MountRepository,
+{
+    let mount = require_mount(store, mount_id)?;
+    if !mount.projection.uses_virtual_filesystem() {
+        return Err(AfsError::Unsupported(
+            "plain-files mounts do not support virtual filesystem operations",
+        ));
+    }
+    Ok(mount)
+}
+
 fn require_entity<S>(store: &S, mount_id: &MountId, remote_id: &RemoteId) -> AfsResult<EntityRecord>
 where
     S: EntityRepository,
@@ -718,6 +1335,14 @@ fn filename(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path_string(path))
+}
+
+fn title_from_filename(filename: &str) -> String {
+    filename
+        .strip_suffix(".md")
+        .unwrap_or(filename)
+        .trim()
+        .to_string()
 }
 
 fn path_string(path: &Path) -> String {
@@ -831,16 +1456,19 @@ mod tests {
         ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
         ListChildrenResult, NativeEntity, ParsedEntity,
     };
-    use afs_core::model::{
-        CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
+    use afs_core::{
+        AfsError,
+        model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry},
     };
     use afs_store::{
         EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
+        ProjectionMode, VirtualMutationKind, VirtualMutationRepository,
     };
 
     use super::{
         ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, commit_virtual_fs_write,
-        refresh_virtual_fs_children, virtual_fs_children, virtual_fs_content_path, virtual_fs_item,
+        create_virtual_fs_file, refresh_virtual_fs_children, rename_virtual_fs_item,
+        trash_virtual_fs_item, virtual_fs_children, virtual_fs_content_path, virtual_fs_item,
     };
 
     #[test]
@@ -848,11 +1476,7 @@ mod tests {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
         store
-            .save_mount(MountConfig::new(
-                mount_id.clone(),
-                "notion",
-                "/tmp/afs/notion",
-            ))
+            .save_mount(virtual_mount(&mount_id))
             .expect("save mount");
         store
             .save_entity(EntityRecord {
@@ -895,11 +1519,7 @@ mod tests {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
         store
-            .save_mount(MountConfig::new(
-                mount_id.clone(),
-                "notion",
-                "/tmp/afs/notion",
-            ))
+            .save_mount(virtual_mount(&mount_id))
             .expect("save mount");
         store
             .save_entity(EntityRecord::new(
@@ -938,11 +1558,7 @@ mod tests {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
         store
-            .save_mount(MountConfig::new(
-                mount_id.clone(),
-                "notion",
-                "/tmp/afs/notion",
-            ))
+            .save_mount(virtual_mount(&mount_id))
             .expect("save mount");
         let connector = StaticChildrenConnector {
             entries: vec![TreeEntry {
@@ -1050,11 +1666,7 @@ mod tests {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
         store
-            .save_mount(MountConfig::new(
-                mount_id.clone(),
-                "notion",
-                "/tmp/afs/notion",
-            ))
+            .save_mount(virtual_mount(&mount_id))
             .expect("save mount");
         store
             .save_entity(EntityRecord::new(
@@ -1104,11 +1716,7 @@ mod tests {
         let content_root = state_root.join("content/notion-main/files");
         let mut store = InMemoryStateStore::new();
         store
-            .save_mount(MountConfig::new(
-                mount_id.clone(),
-                "notion",
-                "/tmp/afs/notion",
-            ))
+            .save_mount(virtual_mount(&mount_id))
             .expect("save mount");
         store
             .save_entity(EntityRecord {
@@ -1141,6 +1749,226 @@ mod tests {
             HydrationState::Dirty
         );
         let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn create_file_adds_pending_child_and_cache_file() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("afs-virtual-fs-create");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-root"),
+                EntityKind::Page,
+                "Home",
+                "Home.md",
+            ))
+            .expect("save parent page");
+
+        let created = create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:page-root",
+            "Draft.md",
+        )
+        .expect("create virtual file");
+
+        assert!(created.identifier.starts_with("local:"));
+        assert_eq!(created.item.filename, "Draft.md");
+        assert_eq!(
+            std::fs::read(content_root.join("Home/Draft.md")).expect("read pending cache"),
+            b""
+        );
+        let children =
+            virtual_fs_children(&store, &mount_id, "children:page-root").expect("children");
+        assert!(
+            children.children.iter().any(
+                |child| child.identifier == created.identifier && child.path == "Home/Draft.md"
+            )
+        );
+        assert_eq!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")[0]
+                .mutation_kind,
+            VirtualMutationKind::Create
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn rename_pending_file_updates_overlay_and_moves_cache() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("afs-virtual-fs-rename");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-root"),
+                EntityKind::Page,
+                "Home",
+                "Home.md",
+            ))
+            .expect("save parent page");
+        let created = create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:page-root",
+            "Draft.md",
+        )
+        .expect("create virtual file");
+        std::fs::write(content_root.join("Home/Draft.md"), b"pending body").expect("write cache");
+
+        let renamed = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &created.identifier,
+            "children:page-root",
+            "Updated.md",
+        )
+        .expect("rename virtual file");
+
+        assert_eq!(renamed.identifier, created.identifier);
+        assert!(!content_root.join("Home/Draft.md").exists());
+        assert_eq!(
+            std::fs::read(content_root.join("Home/Updated.md")).expect("read renamed cache"),
+            b"pending body"
+        );
+        let mutation = store
+            .get_virtual_mutation(&mount_id, &created.identifier)
+            .expect("get mutation")
+            .expect("mutation");
+        assert_eq!(mutation.projected_path, PathBuf::from("Home/Updated.md"));
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn trash_remote_page_records_tombstone_and_hides_child() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("afs-virtual-fs-trash");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            ))
+            .expect("save page");
+
+        trash_virtual_fs_item(&mut store, &content_root, &mount_id, "page-1")
+            .expect("trash virtual file");
+
+        let children =
+            virtual_fs_children(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER).expect("children");
+        assert!(
+            !children
+                .children
+                .iter()
+                .any(|child| child.identifier == "page-1")
+        );
+        let mutation = store
+            .get_virtual_mutation(&mount_id, "delete:page-1")
+            .expect("get mutation")
+            .expect("mutation");
+        assert_eq!(mutation.mutation_kind, VirtualMutationKind::Delete);
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn plain_files_mount_rejects_virtual_filesystem_operations() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("afs-virtual-fs-plain-rejects");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                "/tmp/afs/notion",
+            ))
+            .expect("save plain mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            ))
+            .expect("save page");
+
+        assert_plain_files_virtual_error(virtual_fs_item(&store, &mount_id, "page-1"));
+        assert_plain_files_virtual_error(virtual_fs_children(
+            &store,
+            &mount_id,
+            ROOT_CONTAINER_IDENTIFIER,
+        ));
+        assert_plain_files_virtual_error(commit_virtual_fs_write(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "page-1",
+            b"edited",
+        ));
+        assert_plain_files_virtual_error(create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            ROOT_CONTAINER_IDENTIFIER,
+            "Draft.md",
+        ));
+        assert_plain_files_virtual_error(refresh_virtual_fs_children(
+            &mut store,
+            &StaticChildrenConnector {
+                entries: Vec::new(),
+            },
+            &mount_id,
+            ROOT_CONTAINER_IDENTIFIER,
+        ));
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
+        assert!(!content_root.exists());
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    fn assert_plain_files_virtual_error<T: std::fmt::Debug>(result: afs_core::AfsResult<T>) {
+        assert!(matches!(
+            result.expect_err("plain-files virtual filesystem rejection"),
+            AfsError::Unsupported(
+                "plain-files mounts do not support virtual filesystem operations"
+            )
+        ));
+    }
+
+    fn virtual_mount(mount_id: &MountId) -> MountConfig {
+        MountConfig::new(mount_id.clone(), "notion", "/tmp/afs/notion")
+            .projection(ProjectionMode::LinuxFuse)
     }
 
     fn temp_root(prefix: &str) -> PathBuf {

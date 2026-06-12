@@ -6,7 +6,7 @@
 
 use afs_core::AfsResult;
 use afs_core::model::MountId;
-use afs_store::{EntityRepository, MountRepository, ShadowRepository};
+use afs_store::{EntityRepository, MountRepository, ShadowRepository, VirtualMutationRepository};
 
 use crate::hydration::HydrationSource;
 use crate::virtual_fs;
@@ -25,7 +25,7 @@ pub fn file_provider_item<S>(
     identifier: &str,
 ) -> AfsResult<FileProviderItemReport>
 where
-    S: MountRepository + EntityRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
 {
     virtual_fs::virtual_fs_item(store, mount_id, identifier)
 }
@@ -36,7 +36,7 @@ pub fn file_provider_children<S>(
     container_identifier: &str,
 ) -> AfsResult<FileProviderChildrenReport>
 where
-    S: MountRepository + EntityRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
 {
     virtual_fs::virtual_fs_children(store, mount_id, container_identifier)
 }
@@ -48,7 +48,7 @@ pub fn materialize_file_provider_item<S, Source>(
     identifier: &str,
 ) -> AfsResult<FileProviderMaterializeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
     Source: HydrationSource + ?Sized,
 {
     virtual_fs::materialize_virtual_fs_item(store, source, mount_id, identifier)

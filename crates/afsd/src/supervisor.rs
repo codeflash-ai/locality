@@ -7,7 +7,7 @@ use afs_core::journal::JournalStore;
 use afs_core::model::{EntityKind, HydrationState};
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
-    ShadowRepository,
+    ShadowRepository, VirtualMutationRepository,
 };
 
 use crate::execution::{
@@ -50,13 +50,16 @@ where
     pub fn start(&mut self) -> AfsResult<DaemonStartReport> {
         self.mounts = self.store.load_mounts()?;
 
+        let mut watched_mounts = 0;
         for mount in &self.mounts {
+            if !should_watch_mount(mount) {
+                continue;
+            }
             self.watcher.watch_mount(mount.root.clone())?;
+            watched_mounts += 1;
         }
 
-        Ok(DaemonStartReport {
-            watched_mounts: self.mounts.len(),
-        })
+        Ok(DaemonStartReport { watched_mounts })
     }
 
     fn apply_file_event(&mut self, event: FileEvent) -> AfsResult<DaemonEventReport> {
@@ -129,6 +132,9 @@ where
         event_path: &Path,
     ) -> AfsResult<Option<(MountConfig, EntityRecord)>> {
         for mount in &self.mounts {
+            if !should_watch_mount(mount) {
+                continue;
+            }
             let Some(relative_path) = event_relative_path(&mount.root, event_path) else {
                 continue;
             };
@@ -147,6 +153,7 @@ where
         if self.mounts.len() == 1
             && event_path.is_relative()
             && let Some(mount) = self.mounts.first()
+            && should_watch_mount(mount)
             && let Some(entity) = self
                 .store
                 .find_entity_by_path(&mount.mount_id, event_path)?
@@ -160,7 +167,12 @@ where
 
 impl<S, W> DaemonExecutor for DaemonSupervisor<S, W, HydrationQueue>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + JournalRepository + JournalStore,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + VirtualMutationRepository,
     W: FileWatcher,
 {
     fn execute_file_event(&mut self, event: FileEvent) -> AfsResult<DaemonEventReport> {
@@ -255,4 +267,8 @@ fn should_hydrate_on_read(entity: &EntityRecord) -> bool {
         entity.hydration,
         HydrationState::Virtual | HydrationState::Stub
     )
+}
+
+fn should_watch_mount(mount: &MountConfig) -> bool {
+    !mount.projection.uses_virtual_filesystem()
 }

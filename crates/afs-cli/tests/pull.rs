@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::mount::{MountOptions, run_mount};
-use afs_cli::pull::run_pull;
+use afs_cli::pull::{run_pull, run_pull_with_state_root};
 use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
@@ -18,6 +18,7 @@ use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{
     EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode, ShadowRepository,
 };
+use afsd::virtual_fs::virtual_fs_content_root;
 
 #[test]
 fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
@@ -69,6 +70,63 @@ fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
             .load_shadow(&fixture.mount_id, &fixture.canonical_root_page_id)
             .is_ok()
     );
+}
+
+#[test]
+fn pull_virtual_mount_writes_content_and_schema_to_daemon_cache() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector("Roadmap");
+
+    let report = run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+
+    assert!(report.ok);
+    assert_eq!(report.stubbed, 0);
+    assert_eq!(report.hydrated, 1);
+    assert!(!fixture.root_file("roadmap").exists());
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    assert!(content_root.join("roadmap ~aaaaaa.md").exists());
+    assert!(
+        content_root
+            .join("roadmap ~aaaaaa")
+            .join("tasks ~cccccc")
+            .join("_schema.yaml")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn pull_virtual_file_target_does_not_stat_projection_path_as_directory() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector("Roadmap");
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+
+    fs::create_dir_all(fixture.root_file("roadmap")).expect("sentinel directory at VFS file path");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture.root_file("roadmap"),
+        Some(&state_root),
+    )
+    .expect("pull virtual file target");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 0);
+    assert_eq!(report.hydrated, 1);
+    assert_eq!(report.stubbed, 0);
+
+    let _ = fs::remove_dir_all(state_root);
+    let _ = fs::remove_dir_all(&fixture.root);
 }
 
 #[test]
@@ -283,6 +341,10 @@ impl PullFixture {
     }
 
     fn mount(&self, store: &mut InMemoryStateStore) {
+        self.mount_with_projection(store, ProjectionMode::PlainFiles);
+    }
+
+    fn mount_with_projection(&self, store: &mut InMemoryStateStore, projection: ProjectionMode) {
         run_mount(
             store,
             MountOptions {
@@ -292,7 +354,7 @@ impl PullFixture {
                 remote_root_id: Some(self.root_page_id.clone()),
                 connection_id: None,
                 read_only: false,
-                projection: ProjectionMode::PlainFiles,
+                projection,
             },
         )
         .expect("mount");
@@ -354,6 +416,16 @@ impl Drop for PullFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn unique_temp_path(prefix: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{unique}-{suffix}", std::process::id()))
 }
 
 #[derive(Debug)]

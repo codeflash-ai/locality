@@ -151,12 +151,20 @@ pub fn apply_plan(
             }
             PushOperation::CreateEntity {
                 parent_id,
+                parent_kind,
                 title,
                 properties,
                 body,
                 ..
             } => {
-                let request_body = create_page_body(api, parent_id, title, properties, body)?;
+                let request_body = create_page_body(
+                    api,
+                    parent_id,
+                    parent_kind.as_ref(),
+                    title,
+                    properties,
+                    body,
+                )?;
                 let created = api.create_page(request_body)?;
                 let created_id = RemoteId::new(created.id);
                 if !changed_remote_ids.contains(&created_id) {
@@ -169,10 +177,16 @@ pub fn apply_plan(
                     entity_id: created_id,
                 });
             }
-            unsupported => {
-                return Err(AfsError::Unsupported(unsupported_operation_name(
-                    unsupported,
-                )));
+            PushOperation::ArchiveEntity { entity_id } => {
+                api.delete_block(entity_id.as_str())?;
+                if !changed_remote_ids.contains(entity_id) {
+                    changed_remote_ids.push(entity_id.clone());
+                }
+                effects.push(JournalApplyEffect::ArchivedEntity {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    entity_id: entity_id.clone(),
+                });
             }
         }
     }
@@ -354,10 +368,30 @@ fn update_properties_body(
 fn create_page_body(
     api: &dyn NotionApi,
     parent_id: &RemoteId,
+    parent_kind: Option<&afs_core::model::EntityKind>,
     title: &str,
     properties: &BTreeMap<String, PropertyValue>,
     body: &str,
 ) -> AfsResult<Value> {
+    if matches!(parent_kind, Some(afs_core::model::EntityKind::Page)) {
+        let mut request = json!({
+            "parent": {
+                "type": "page_id",
+                "page_id": parent_id.0,
+            },
+            "properties": {
+                "title": {
+                    "title": rich_text(title),
+                }
+            },
+        });
+        let children = create_page_children(body)?;
+        if !children.is_empty() {
+            request["children"] = Value::Array(children);
+        }
+        return Ok(request);
+    }
+
     let database = api.retrieve_database(parent_id.as_str())?;
     let [data_source] = database.data_sources.as_slice() else {
         return Err(AfsError::Unsupported(
@@ -1684,18 +1718,6 @@ fn looks_like_markdown_table(markdown: &str) -> bool {
             .trim()
             .chars()
             .all(|ch| matches!(ch, '|' | '-' | ':' | ' '))
-}
-
-fn unsupported_operation_name(operation: &PushOperation) -> &'static str {
-    match operation {
-        PushOperation::ArchiveEntity { .. } => "archiving Notion pages",
-        PushOperation::CreateEntity { .. } => "creating Notion pages",
-        PushOperation::UpdateBlock { .. }
-        | PushOperation::AppendBlock { .. }
-        | PushOperation::MoveBlock { .. }
-        | PushOperation::UpdateProperties { .. }
-        | PushOperation::ArchiveBlock { .. } => "unsupported Notion push operation",
-    }
 }
 
 fn unsupported_undo_name(operation: &UndoOperation) -> &'static str {

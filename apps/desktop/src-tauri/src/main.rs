@@ -3,6 +3,7 @@ use std::process::Command;
 
 use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
+#[cfg(target_os = "macos")]
 use afs_cli::file_provider::{
     open_macos_file_provider_domain, register_macos_file_provider_domain,
 };
@@ -663,15 +664,20 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
     ensure_daemon_running(&state_root)?;
     reload_daemon_mounts(&state_root)?;
 
-    if projection.uses_virtual_filesystem() {
-        register_virtual_projection(&mount_report.mount_id, &mount_report.root)?;
-        prefetch_virtual_projection_root(&state_root, &mount_report.mount_id)?;
+    let mount = store
+        .get_mount(&MountId::new(mount_report.mount_id.clone()))
+        .map_err(|error| format!("Could not reload created mount: {error}"))?
+        .ok_or_else(|| "Created mount was not found in AFS state.".to_string())?;
+
+    if mount.projection.uses_virtual_filesystem() {
+        register_virtual_projection(&state_root, &mount)?;
+        prefetch_virtual_projection_root(&state_root, &mount.mount_id.0)?;
     }
 
     Ok(format!(
         "Mounted Notion workspace at {} with {}.",
         mount_report.root,
-        projection_label(&projection)
+        projection_label(&mount.projection)
     ))
 }
 
@@ -796,10 +802,12 @@ fn daemon_is_ready(state_root: &Path) -> bool {
     )
 }
 
-fn register_virtual_projection(mount_id: &str, root: &str) -> Result<(), String> {
-    match desktop_projection_mode() {
-        ProjectionMode::MacosFileProvider => register_macos_virtual_projection(mount_id, root),
-        ProjectionMode::LinuxFuse => Ok(()),
+fn register_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
+    match mount.projection {
+        ProjectionMode::MacosFileProvider => {
+            register_macos_virtual_projection(&mount.mount_id.0, &mount.root.display().to_string())
+        }
+        ProjectionMode::LinuxFuse => register_linux_virtual_projection(state_root, mount),
         ProjectionMode::PlainFiles => Ok(()),
     }
 }
@@ -819,6 +827,24 @@ fn register_macos_virtual_projection(mount_id: &str, root: &str) -> Result<(), S
 #[cfg(not(target_os = "macos"))]
 fn register_macos_virtual_projection(_mount_id: &str, _root: &str) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn register_linux_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
+    afs_cli::file_provider::register_linux_fuse_mount(state_root, mount)
+        .map(|_| ())
+        .map_err(|error| format!("Could not register Linux FUSE mount: {}", error.message()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn register_linux_virtual_projection(
+    _state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    Err(format!(
+        "Linux FUSE mounts can only be registered on Linux; mount `{}` cannot be registered here.",
+        mount.mount_id.0
+    ))
 }
 
 fn open_virtual_mount_or_path(path: &Path) -> Result<(), String> {
@@ -866,6 +892,7 @@ fn open_macos_virtual_projection(_mount_id: &str) -> Result<(), String> {
     Err("macOS File Provider mounts can only be opened on macOS.".to_string())
 }
 
+#[cfg(target_os = "macos")]
 fn file_provider_display_name(root: &str) -> String {
     Path::new(root)
         .file_name()

@@ -362,6 +362,7 @@ fn create_entity_pipeline(
         vec![parent.remote_id.clone()],
         vec![PushOperation::CreateEntity {
             parent_id: parent.remote_id.clone(),
+            parent_kind: Some(parent.kind.clone()),
             title: parsed.frontmatter.title.clone().unwrap_or_default(),
             properties,
             body: parsed.document.body.clone(),
@@ -869,6 +870,7 @@ impl From<PushOperation> for PushOperationOutput {
                 properties,
                 body,
                 source_path,
+                ..
             } => Self::CreateEntity {
                 parent_id: parent_id.0,
                 title,

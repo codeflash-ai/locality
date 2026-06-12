@@ -13,13 +13,14 @@ use afs_core::journal::JournalStatus;
 use afs_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
-use afs_core::planner::PushOperationKind;
+use afs_core::planner::{PushOperation, PushOperationKind};
 use afs_core::push::PushExecutionAction;
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, ShadowRepository,
+    MountRepository, ProjectionMode, ShadowRepository, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository,
 };
 use afsd::execution::{DaemonExecutor, PushJob};
 use afsd::hydration::{HydratedEntity, HydrationQueue, HydrationSource};
@@ -214,6 +215,143 @@ fn daemon_push_job_blocks_database_row_schema_violation_before_apply() {
             .list_journal()
             .expect("journal")
             .is_empty()
+    );
+}
+
+#[test]
+fn daemon_push_job_plans_pending_virtual_create() {
+    let fixture = PushFixture::new();
+    let cache_path = fixture.root.join(".content/Draft.md");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(&cache_path, "---\ntitle: Draft\n---\n# Draft\n\nBody.\n").expect("cache file");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            fixture.remote_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap.md",
+        ))
+        .expect("save parent page");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(fixture.remote_id.clone()),
+            "Roadmap/Draft.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    let mut supervisor = DaemonSupervisor::new(
+        store,
+        RecordingWatcher::default(),
+        HydrationQueue::new(),
+        PullScheduler::new(Default::default()),
+    );
+    supervisor.start().expect("start supervisor");
+
+    let report = supervisor
+        .execute_push(
+            PushJob {
+                target_path: fixture.root.join("Roadmap/Draft.md"),
+                assume_yes: false,
+                confirm_dangerous: false,
+            },
+            &FakePushSource::default(),
+        )
+        .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    let plan = report.pipeline.plan.expect("plan");
+    assert_eq!(plan.operations.len(), 1);
+    match &plan.operations[0] {
+        PushOperation::CreateEntity {
+            parent_id,
+            parent_kind,
+            title,
+            source_path,
+            ..
+        } => {
+            assert_eq!(parent_id, &fixture.remote_id);
+            assert_eq!(parent_kind, &Some(EntityKind::Page));
+            assert_eq!(title, "Draft");
+            assert_eq!(source_path, &PathBuf::from("Roadmap/Draft.md"));
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[test]
+fn daemon_push_job_plans_pending_virtual_delete_from_scope() {
+    let fixture = PushFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save page");
+    store
+        .save_shadow(&fixture.mount_id, shadow("page-1", "Old body."))
+        .expect("save shadow");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "delete:page-1",
+            VirtualMutationKind::Delete,
+            Some(fixture.remote_id.clone()),
+            None,
+            "Roadmap.md",
+            None,
+        ))
+        .expect("save mutation");
+    let mut supervisor = DaemonSupervisor::new(
+        store,
+        RecordingWatcher::default(),
+        HydrationQueue::new(),
+        PullScheduler::new(Default::default()),
+    );
+    supervisor.start().expect("start supervisor");
+
+    let report = supervisor
+        .execute_push(
+            PushJob {
+                target_path: fixture.root.clone(),
+                assume_yes: false,
+                confirm_dangerous: false,
+            },
+            &FakePushSource::default(),
+        )
+        .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    let plan = report.pipeline.plan.expect("plan");
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::ArchiveEntity {
+            entity_id: fixture.remote_id.clone()
+        }]
     );
 }
 
@@ -459,4 +597,28 @@ data_sources:
           - name: "Todo"
             id: "todo-id"
 "#
+}
+
+fn virtual_mutation(
+    mount_id: &MountId,
+    local_id: &str,
+    kind: VirtualMutationKind,
+    target_remote_id: Option<RemoteId>,
+    parent_remote_id: Option<RemoteId>,
+    path: &str,
+    content_path: Option<PathBuf>,
+) -> VirtualMutationRecord {
+    VirtualMutationRecord {
+        mount_id: mount_id.clone(),
+        local_id: local_id.to_string(),
+        mutation_kind: kind,
+        target_remote_id,
+        parent_remote_id,
+        original_path: None,
+        projected_path: PathBuf::from(path),
+        title: "Draft".to_string(),
+        content_path,
+        created_at: "2026-06-12T00:00:00Z".to_string(),
+        updated_at: "2026-06-12T00:00:00Z".to_string(),
+    }
 }

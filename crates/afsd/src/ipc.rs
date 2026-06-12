@@ -42,6 +42,21 @@ pub enum DaemonRequest {
         identifier: String,
         contents_base64: String,
     },
+    VirtualFsCreateFile {
+        mount_id: String,
+        parent_identifier: String,
+        filename: String,
+    },
+    VirtualFsRename {
+        mount_id: String,
+        identifier: String,
+        new_parent_identifier: String,
+        new_filename: String,
+    },
+    VirtualFsTrash {
+        mount_id: String,
+        identifier: String,
+    },
     FileProviderItem {
         mount_id: String,
         identifier: String,
@@ -342,6 +357,47 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 identifier: "page-1".to_string(),
                 contents_base64: "SGVsbG8=".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn virtual_fs_mutation_commands_decode() {
+        let create: DaemonRequest = serde_json::from_str(
+            r#"{"command":"virtual_fs_create_file","mount_id":"notion-main","parent_identifier":"children:page-1","filename":"Draft.md"}"#,
+        )
+        .expect("decode virtual fs create request");
+        let rename: DaemonRequest = serde_json::from_str(
+            r#"{"command":"virtual_fs_rename","mount_id":"notion-main","identifier":"local:1","new_parent_identifier":"children:page-1","new_filename":"Updated.md"}"#,
+        )
+        .expect("decode virtual fs rename request");
+        let trash: DaemonRequest = serde_json::from_str(
+            r#"{"command":"virtual_fs_trash","mount_id":"notion-main","identifier":"page-1"}"#,
+        )
+        .expect("decode virtual fs trash request");
+
+        assert_eq!(
+            create,
+            DaemonRequest::VirtualFsCreateFile {
+                mount_id: "notion-main".to_string(),
+                parent_identifier: "children:page-1".to_string(),
+                filename: "Draft.md".to_string(),
+            }
+        );
+        assert_eq!(
+            rename,
+            DaemonRequest::VirtualFsRename {
+                mount_id: "notion-main".to_string(),
+                identifier: "local:1".to_string(),
+                new_parent_identifier: "children:page-1".to_string(),
+                new_filename: "Updated.md".to_string(),
+            }
+        );
+        assert_eq!(
+            trash,
+            DaemonRequest::VirtualFsTrash {
+                mount_id: "notion-main".to_string(),
+                identifier: "page-1".to_string(),
             }
         );
     }

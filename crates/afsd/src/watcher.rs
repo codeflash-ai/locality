@@ -245,6 +245,9 @@ fn poll_stub_accesses(
     let mut current_stub_paths = BTreeSet::new();
 
     for mount in store.load_mounts().map_err(AfsError::from)? {
+        if mount.projection.uses_virtual_filesystem() {
+            continue;
+        }
         if !roots.contains(&mount.root) {
             continue;
         }
@@ -327,7 +330,8 @@ mod tests {
 
     use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
     use afs_store::{
-        EntityRecord, EntityRepository, MountConfig, MountRepository, SqliteStateStore,
+        EntityRecord, EntityRepository, MountConfig, MountRepository, ProjectionMode,
+        SqliteStateStore,
     };
     use notify::event::{AccessKind, AccessMode, DataChange, MetadataKind, ModifyKind};
     use notify::{Event, EventKind};
@@ -467,6 +471,46 @@ mod tests {
         let mut observed = [(database_path, SystemTime::UNIX_EPOCH)]
             .into_iter()
             .collect();
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        poll_stub_accesses(&state_root, &watched_roots, &mut observed, &|event| {
+            events.lock().expect("events lock").push(event);
+        })
+        .expect("poll accesses");
+
+        assert!(events.lock().expect("events lock").is_empty());
+    }
+
+    #[test]
+    fn stub_access_poll_skips_virtual_projection_mounts() {
+        let state_root = temp_root("poll-virtual-state");
+        let mount_root = temp_root("poll-virtual-mount");
+        let page_path = mount_root.join("Roadmap.md");
+        std::fs::write(&page_path, "stub").expect("write stub");
+
+        let mount_id = MountId::new("notion-fuse");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", mount_root.clone())
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id,
+                    RemoteId::new("page-1"),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save entity");
+
+        let watched_roots = Arc::new(Mutex::new([mount_root].into_iter().collect()));
+        let mut observed = [(page_path, SystemTime::UNIX_EPOCH)].into_iter().collect();
         let events = Arc::new(Mutex::new(Vec::new()));
 
         poll_stub_accesses(&state_root, &watched_roots, &mut observed, &|event| {

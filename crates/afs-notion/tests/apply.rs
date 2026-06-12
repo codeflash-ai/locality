@@ -846,6 +846,7 @@ fn apply_creates_database_row_with_properties_and_children() {
         vec![RemoteId::new("database-1")],
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("database-1"),
+            parent_kind: Some(afs_core::model::EntityKind::Database),
             title: "New task".to_string(),
             properties: [
                 (

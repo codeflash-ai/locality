@@ -14,7 +14,8 @@ use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, EntityRecord, EntityRepository,
     HydrationJobRecord, HydrationJobRepository, JournalRepository, MountConfig, MountRepository,
-    ProjectionMode, ShadowRepository, SqliteStateStore, StoreError,
+    ProjectionMode, ShadowRepository, SqliteStateStore, StoreError, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use rusqlite::{Connection, params};
 
@@ -34,7 +35,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 9);
+    assert_eq!(user_version, 10);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -54,7 +55,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 9,
+            supported: 10,
         }
     );
 }
@@ -122,6 +123,51 @@ fn mount_entity_and_shadow_round_trip_after_reopen() {
             .load_shadow(&fixture.mount_id, &RemoteId::new("page-1"))
             .expect("load shadow"),
         shadow
+    );
+}
+
+#[test]
+fn virtual_mutations_round_trip_and_delete_after_reopen() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    let mutation = virtual_mutation_record();
+
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .save_virtual_mutation(mutation.clone())
+        .expect("save mutation");
+    drop(store);
+
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_virtual_mutation(&fixture.mount_id, "local:draft")
+            .expect("get mutation"),
+        Some(mutation.clone())
+    );
+    assert_eq!(
+        reopened
+            .find_virtual_mutation_by_path(&fixture.mount_id, "Roadmap/Draft.md".as_ref())
+            .expect("find mutation by path"),
+        Some(mutation.clone())
+    );
+    assert_eq!(
+        reopened
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list mutations"),
+        vec![mutation]
+    );
+
+    reopened
+        .delete_virtual_mutation(&fixture.mount_id, "local:draft")
+        .expect("delete mutation");
+    assert!(
+        reopened
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list after delete")
+            .is_empty()
     );
 }
 
@@ -272,7 +318,7 @@ fn sqlite_store_migrates_v5_projection_and_connections_schema() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 9);
+    assert_eq!(user_version, 10);
     assert_eq!(connection_column_count, 1);
     assert_eq!(projection_column_count, 1);
     assert_eq!(connection_table_count, 1);
@@ -347,7 +393,7 @@ fn sqlite_store_migrates_v6_projection_schema_to_connections() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 9);
+    assert_eq!(user_version, 10);
     assert_eq!(connection_column_count, 1);
     assert_eq!(connection_table_count, 1);
     assert_eq!(
@@ -432,7 +478,7 @@ fn sqlite_store_migrates_v7_hydration_jobs_schema() {
         )
         .expect("hydration_jobs table");
 
-    assert_eq!(user_version, 9);
+    assert_eq!(user_version, 10);
     assert_eq!(hydration_jobs_table_count, 1);
     assert!(
         store
@@ -519,7 +565,7 @@ fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
         )
         .expect("profile_id column");
 
-    assert_eq!(user_version, 9);
+    assert_eq!(user_version, 10);
     assert_eq!(profile_column_count, 1);
     let migrated_connection = store
         .get_connection(&ConnectionId::new("notion-work"))
@@ -712,7 +758,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 9);
+    assert_eq!(user_version, 10);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -783,7 +829,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 9);
+    assert_eq!(user_version, 10);
     assert!(entry.apply_effects.is_empty());
 }
 
@@ -856,6 +902,24 @@ fn hydration_job_record() -> HydrationJobRecord {
         reason: HydrationReason::Policy,
         attempts: 0,
         last_error: None,
+    }
+}
+
+fn virtual_mutation_record() -> VirtualMutationRecord {
+    VirtualMutationRecord {
+        mount_id: MountId::new("notion-main"),
+        local_id: "local:draft".to_string(),
+        mutation_kind: VirtualMutationKind::Create,
+        target_remote_id: None,
+        parent_remote_id: Some(RemoteId::new("page-1")),
+        original_path: None,
+        projected_path: PathBuf::from("Roadmap/Draft.md"),
+        title: "Draft".to_string(),
+        content_path: Some(PathBuf::from(
+            "/tmp/afs-state/content/notion-main/files/Roadmap/Draft.md",
+        )),
+        created_at: "2026-06-12T00:00:00Z".to_string(),
+        updated_at: "2026-06-12T00:00:00Z".to_string(),
     }
 }
 

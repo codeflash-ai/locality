@@ -10,7 +10,8 @@ use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
-    ShadowRepository, StoreError,
+    ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository,
 };
 use afsd::virtual_fs::virtual_fs_content_path;
 use serde::Serialize;
@@ -98,7 +99,11 @@ pub struct StatusIssue {
 
 pub fn run_status<S>(store: &S, options: StatusOptions) -> Result<StatusReport, StatusError>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + JournalRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + VirtualMutationRepository,
 {
     let mounts = store.load_mounts().map_err(StatusError::Store)?;
     let target = options.path.as_deref().map(absolute_path).transpose()?;
@@ -109,13 +114,29 @@ where
     let mut mount_reports = Vec::new();
 
     for scope in scopes {
-        let mut entries = scoped_entities(store, &scope)?;
+        let mutations = scoped_virtual_mutations(store, &scope)?;
+        let deleted = mutations
+            .iter()
+            .filter(|mutation| mutation.mutation_kind == VirtualMutationKind::Delete)
+            .filter_map(|mutation| mutation.target_remote_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut entries = scoped_entities(store, &scope)?
+            .into_iter()
+            .filter(|entity| !deleted.contains(&entity.remote_id))
+            .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.path.cmp(&right.path));
 
-        let status_entries = entries
+        let mut status_entries = entries
             .into_iter()
             .map(|entity| classify_entity(store, &scope.mount, entity, &journals, &state_root))
             .collect::<Vec<_>>();
+        status_entries.extend(
+            mutations
+                .into_iter()
+                .filter(|mutation| mutation.mutation_kind != VirtualMutationKind::Rename)
+                .map(|mutation| classify_virtual_mutation(&scope.mount, mutation, &state_root)),
+        );
+        status_entries.sort_by(|left, right| left.path.cmp(&right.path));
 
         for entry in &status_entries {
             summary.record(entry);
@@ -211,7 +232,7 @@ fn resolve_scopes<S>(
     target: Option<&Path>,
 ) -> Result<Vec<StatusScope>, StatusError>
 where
-    S: EntityRepository,
+    S: EntityRepository + VirtualMutationRepository,
 {
     match target {
         Some(target) => resolve_target_scope(store, mounts, target).map(|scope| vec![scope]),
@@ -224,7 +245,7 @@ fn resolve_default_scopes<S>(
     mounts: &[MountConfig],
 ) -> Result<Vec<StatusScope>, StatusError>
 where
-    S: EntityRepository,
+    S: EntityRepository + VirtualMutationRepository,
 {
     if mounts.is_empty() {
         return Ok(Vec::new());
@@ -258,7 +279,7 @@ fn resolve_target_scope<S>(
     target: &Path,
 ) -> Result<StatusScope, StatusError>
 where
-    S: EntityRepository,
+    S: EntityRepository + VirtualMutationRepository,
 {
     let mount = find_mount_for_path(mounts, target)
         .cloned()
@@ -275,7 +296,7 @@ fn scope_filter_for_relative_path<S>(
     relative_path: &Path,
 ) -> Result<ScopeFilter, StatusError>
 where
-    S: EntityRepository,
+    S: EntityRepository + VirtualMutationRepository,
 {
     if relative_path.as_os_str().is_empty() {
         Ok(ScopeFilter::All)
@@ -290,7 +311,7 @@ fn target_filter<S>(
     relative_path: &Path,
 ) -> Result<ScopeFilter, StatusError>
 where
-    S: EntityRepository,
+    S: EntityRepository + VirtualMutationRepository,
 {
     let exact = store
         .find_entity_by_path(&mount.mount_id, relative_path)
@@ -303,13 +324,26 @@ where
         return Ok(ScopeFilter::Exact(relative_path.to_path_buf()));
     }
 
+    if store
+        .find_virtual_mutation_by_path(&mount.mount_id, relative_path)
+        .map_err(StatusError::Store)?
+        .is_some()
+    {
+        return Ok(ScopeFilter::Exact(relative_path.to_path_buf()));
+    }
+
     let has_children = store
         .list_entities(&mount.mount_id)
         .map_err(StatusError::Store)?
         .iter()
         .any(|entity| entity.path.starts_with(relative_path));
+    let has_pending_children = store
+        .list_virtual_mutations(&mount.mount_id)
+        .map_err(StatusError::Store)?
+        .iter()
+        .any(|mutation| mutation.projected_path.starts_with(relative_path));
 
-    if has_children {
+    if has_children || has_pending_children {
         Ok(ScopeFilter::Subtree(relative_path.to_path_buf()))
     } else {
         Err(StatusError::Store(StoreError::EntityPathMissing {
@@ -335,18 +369,65 @@ where
         })
         .collect::<Vec<_>>();
 
-    if filtered.is_empty() && !matches!(scope.filter, ScopeFilter::All) {
-        let path = match &scope.filter {
-            ScopeFilter::Exact(path) | ScopeFilter::Subtree(path) => path.clone(),
-            ScopeFilter::All => PathBuf::new(),
-        };
-        return Err(StatusError::Store(StoreError::EntityPathMissing {
-            mount_id: scope.mount.mount_id.clone(),
-            path,
-        }));
-    }
-
     Ok(filtered)
+}
+
+fn scoped_virtual_mutations<S>(
+    store: &S,
+    scope: &StatusScope,
+) -> Result<Vec<VirtualMutationRecord>, StatusError>
+where
+    S: VirtualMutationRepository,
+{
+    Ok(store
+        .list_virtual_mutations(&scope.mount.mount_id)
+        .map_err(StatusError::Store)?
+        .into_iter()
+        .filter(|mutation| match &scope.filter {
+            ScopeFilter::All => true,
+            ScopeFilter::Exact(path) => &mutation.projected_path == path,
+            ScopeFilter::Subtree(path) => mutation.projected_path.starts_with(path),
+        })
+        .collect())
+}
+
+fn classify_virtual_mutation(
+    mount: &MountConfig,
+    mutation: VirtualMutationRecord,
+    _state_root: &Path,
+) -> StatusEntry {
+    let (code, message) = match mutation.mutation_kind {
+        VirtualMutationKind::Create => {
+            ("pending_virtual_create", "file is pending remote creation")
+        }
+        VirtualMutationKind::Rename => (
+            "pending_virtual_rename",
+            "file rename is pending remote update",
+        ),
+        VirtualMutationKind::Delete => ("pending_virtual_delete", "file is pending remote archive"),
+    };
+    let entity_id = mutation
+        .target_remote_id
+        .as_ref()
+        .map(|remote_id| remote_id.0.clone())
+        .unwrap_or_else(|| mutation.local_id.clone());
+
+    StatusEntry {
+        absolute_path: mount
+            .root
+            .join(&mutation.projected_path)
+            .display()
+            .to_string(),
+        path: mutation.projected_path.display().to_string(),
+        entity_id,
+        kind: "page".to_string(),
+        title: mutation.title,
+        hydration: "dirty".to_string(),
+        state: StatusState::Dirty,
+        issues: vec![StatusIssue::new(code, message)],
+        pending_journal_count: 0,
+        failed_journal_count: 0,
+    }
 }
 
 fn classify_entity<S>(

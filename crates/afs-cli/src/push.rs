@@ -10,7 +10,10 @@ use afs_core::AfsResult;
 use afs_core::journal::{JournalStatus, JournalStore};
 use afs_core::model::RemoteId;
 use afs_core::push::{PushApproval, PushExecutionAction, PushExecutionResult};
-use afs_store::{EntityRepository, JournalRepository, MountRepository, ShadowRepository};
+use afs_store::{
+    EntityRepository, JournalRepository, MountRepository, ShadowRepository,
+    VirtualMutationRepository,
+};
 use afsd::execution::{PushJob, PushJobError, PushJobReport};
 use afsd::hydration::HydrationSource;
 use afsd::push::{PushJobAction, execute_push_job};
@@ -48,7 +51,12 @@ pub fn run_push_with_daemon<S, Source>(
     options: PushOptions,
 ) -> AfsResult<PushReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + JournalRepository + JournalStore,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
     let job = PushJob {

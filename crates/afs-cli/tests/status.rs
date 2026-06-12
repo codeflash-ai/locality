@@ -11,7 +11,8 @@ use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+    MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use afsd::virtual_fs::virtual_fs_content_path;
 
@@ -321,6 +322,59 @@ fn status_reads_virtual_projection_from_content_cache() {
     assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
 }
 
+#[test]
+fn status_reports_pending_virtual_creates_and_deletes() {
+    let fixture = StatusFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save virtual mount");
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:draft",
+            VirtualMutationKind::Create,
+            None,
+            "Draft.md",
+            "Draft",
+        ))
+        .expect("save pending create");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "delete:page-1",
+            VirtualMutationKind::Delete,
+            Some(RemoteId::new("page-1")),
+            "Roadmap.md",
+            "Roadmap",
+        ))
+        .expect("save pending delete");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.clean);
+    assert_eq!(report.summary.total, 2);
+    assert_eq!(report.summary.dirty, 2);
+    assert_eq!(entry_issue(&report, "Draft.md"), "pending_virtual_create");
+    assert_eq!(entry_issue(&report, "Roadmap.md"), "pending_virtual_delete");
+}
+
 struct StatusFixture {
     root: PathBuf,
     state_root: PathBuf,
@@ -545,6 +599,29 @@ fn journal_entry(push_id: &str, remote_id: &str, status: JournalStatus) -> Journ
         ),
         status,
     )
+}
+
+fn virtual_mutation(
+    mount_id: &MountId,
+    local_id: &str,
+    kind: VirtualMutationKind,
+    target_remote_id: Option<RemoteId>,
+    path: &str,
+    title: &str,
+) -> VirtualMutationRecord {
+    VirtualMutationRecord {
+        mount_id: mount_id.clone(),
+        local_id: local_id.to_string(),
+        mutation_kind: kind,
+        target_remote_id,
+        parent_remote_id: None,
+        original_path: None,
+        projected_path: PathBuf::from(path),
+        title: title.to_string(),
+        content_path: None,
+        created_at: "2026-06-12T00:00:00Z".to_string(),
+        updated_at: "2026-06-12T00:00:00Z".to_string(),
+    }
 }
 
 fn entry_state(report: &afs_cli::status::StatusReport, path: &str) -> StatusState {

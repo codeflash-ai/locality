@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::model::EntityKind;
 use crate::model::RemoteId;
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +76,8 @@ pub enum PushOperation {
     },
     CreateEntity {
         parent_id: RemoteId,
+        #[serde(default)]
+        parent_kind: Option<EntityKind>,
         title: String,
         #[serde(default)]
         properties: BTreeMap<String, PropertyValue>,

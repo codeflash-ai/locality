@@ -33,17 +33,17 @@ use crate::ipc::{DaemonActiveJobStatus, DaemonRequest, DaemonResponse, DaemonRun
 use crate::notion::{
     ResolvedNotionSource, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
 };
-use crate::pull::run_pull;
+use crate::pull::run_pull_with_state_root;
 use crate::push::execute_push_job_with_content_root;
 use crate::reconcile::{
-    DefaultFetchScheduleStrategy, ScheduledPullReport, reconcile_scheduled_pull,
+    DefaultFetchScheduleStrategy, ScheduledPullReport, reconcile_scheduled_pull_with_state_root,
 };
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::virtual_fs::{
-    VirtualFsItem, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
+    VirtualFsItem, VirtualFsMaterializeOutcome, commit_virtual_fs_write, create_virtual_fs_file,
     materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
-    virtual_fs_children_with_content_root, virtual_fs_content_root,
-    virtual_fs_item_with_content_root,
+    rename_virtual_fs_item, trash_virtual_fs_item, virtual_fs_children_with_content_root,
+    virtual_fs_content_root, virtual_fs_item_with_content_root,
 };
 use crate::watcher::{FileEvent, FileEventKind};
 
@@ -228,6 +228,45 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
         )
     }
 
+    fn run_virtual_fs_create_file(
+        &self,
+        _state_root: PathBuf,
+        _mount_id: String,
+        _parent_identifier: String,
+        _filename: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle virtual filesystem creates",
+        )
+    }
+
+    fn run_virtual_fs_rename(
+        &self,
+        _state_root: PathBuf,
+        _mount_id: String,
+        _identifier: String,
+        _new_parent_identifier: String,
+        _new_filename: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle virtual filesystem renames",
+        )
+    }
+
+    fn run_virtual_fs_trash(
+        &self,
+        _state_root: PathBuf,
+        _mount_id: String,
+        _identifier: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle virtual filesystem deletes",
+        )
+    }
+
     fn run_file_provider_item(
         &self,
         state_root: PathBuf,
@@ -310,7 +349,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Err(error) => return DaemonResponse::error(error.code(), error.message()),
         };
 
-        match run_pull(&mut store, &connector, path) {
+        match run_pull_with_state_root(&mut store, &connector, path, Some(&state_root)) {
             Ok(mut report) => {
                 report.via = "daemon".to_string();
                 DaemonResponse::ok(report)
@@ -352,7 +391,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let source = ResolvedNotionSource::new(&store, credentials.as_ref(), &mounts)
             .map_err(AfsError::from)?;
         let mut hydration = HydrationCollector::default();
-        let report = reconcile_scheduled_pull(
+        let report = reconcile_scheduled_pull_with_state_root(
             &mut store,
             &mut hydration,
             &mounts,
@@ -360,6 +399,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             &source,
             &DefaultFetchScheduleStrategy,
             &policy,
+            Some(&state_root),
         )?;
 
         Ok(ScheduledPullRuntimeReport {
@@ -408,6 +448,9 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
         };
         let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
         let content_root = virtual_fs_content_root(&state_root, &mount_id);
         match virtual_fs_item_with_content_root(&store, &content_root, &mount_id, &identifier) {
             Ok(report) => DaemonResponse::ok(report),
@@ -426,6 +469,9 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
         };
         let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
         let credentials = open_credential_store(&state_root);
         let connector =
             match resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id) {
@@ -460,6 +506,9 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
         };
         let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
         let credentials = open_credential_store(&state_root);
         let connector =
             match resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id) {
@@ -490,6 +539,9 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
         };
         let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
         let credentials = open_credential_store(&state_root);
         let connector =
             match resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id) {
@@ -549,12 +601,113 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Err(error) => return DaemonResponse::error("invalid_base64", error.to_string()),
         };
         let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
         let content_root = virtual_fs_content_root(&state_root, &mount_id);
         match commit_virtual_fs_write(&mut store, &content_root, &mount_id, &identifier, &contents)
         {
             Ok(report) => DaemonResponse::ok(report),
             Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
         }
+    }
+
+    fn run_virtual_fs_create_file(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        parent_identifier: String,
+        filename: String,
+    ) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        match create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &parent_identifier,
+            &filename,
+        ) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+
+    fn run_virtual_fs_rename(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        identifier: String,
+        new_parent_identifier: String,
+        new_filename: String,
+    ) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        match rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &identifier,
+            &new_parent_identifier,
+            &new_filename,
+        ) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+
+    fn run_virtual_fs_trash(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        identifier: String,
+    ) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        match trash_virtual_fs_item(&mut store, &content_root, &mount_id, &identifier) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+}
+
+fn reject_plain_files_virtual_fs_mount<S>(store: &S, mount_id: &MountId) -> Option<DaemonResponse>
+where
+    S: MountRepository,
+{
+    match store.get_mount(mount_id) {
+        Ok(Some(mount)) if !mount.projection.uses_virtual_filesystem() => {
+            let error = AfsError::Unsupported(
+                "plain-files mounts do not support virtual filesystem operations",
+            );
+            Some(DaemonResponse::error(
+                afs_error_code(&error),
+                error.to_string(),
+            ))
+        }
+        Ok(_) => None,
+        Err(error) => Some(DaemonResponse::error("store_error", error.to_string())),
     }
 }
 
@@ -784,6 +937,48 @@ impl RuntimeState {
                         mount_id,
                         identifier,
                         contents_base64,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
+            }
+            DaemonRequest::VirtualFsCreateFile {
+                mount_id,
+                parent_identifier,
+                filename,
+            } => {
+                self.pending_requests
+                    .push_front(MutatingRequest::VirtualFsCreateFile {
+                        mount_id,
+                        parent_identifier,
+                        filename,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
+            }
+            DaemonRequest::VirtualFsRename {
+                mount_id,
+                identifier,
+                new_parent_identifier,
+                new_filename,
+            } => {
+                self.pending_requests
+                    .push_front(MutatingRequest::VirtualFsRename {
+                        mount_id,
+                        identifier,
+                        new_parent_identifier,
+                        new_filename,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
+            }
+            DaemonRequest::VirtualFsTrash {
+                mount_id,
+                identifier,
+            } => {
+                self.pending_requests
+                    .push_front(MutatingRequest::VirtualFsTrash {
+                        mount_id,
+                        identifier,
                         respond_to,
                     });
                 self.maybe_start_next_job();
@@ -1108,6 +1303,44 @@ fn run_job(
             ),
             respond_to,
         },
+        MutatingJob::Request(MutatingRequest::VirtualFsCreateFile {
+            mount_id,
+            parent_identifier,
+            filename,
+            respond_to,
+        }) => JobCompletion::Response {
+            response: runner.run_virtual_fs_create_file(
+                state_root,
+                mount_id,
+                parent_identifier,
+                filename,
+            ),
+            respond_to,
+        },
+        MutatingJob::Request(MutatingRequest::VirtualFsRename {
+            mount_id,
+            identifier,
+            new_parent_identifier,
+            new_filename,
+            respond_to,
+        }) => JobCompletion::Response {
+            response: runner.run_virtual_fs_rename(
+                state_root,
+                mount_id,
+                identifier,
+                new_parent_identifier,
+                new_filename,
+            ),
+            respond_to,
+        },
+        MutatingJob::Request(MutatingRequest::VirtualFsTrash {
+            mount_id,
+            identifier,
+            respond_to,
+        }) => JobCompletion::Response {
+            response: runner.run_virtual_fs_trash(state_root, mount_id, identifier),
+            respond_to,
+        },
         MutatingJob::ScheduledPull { tick } => {
             JobCompletion::ScheduledPull(runner.run_scheduled_pull(state_root, tick, policy))
         }
@@ -1167,6 +1400,24 @@ enum MutatingRequest {
         mount_id: String,
         identifier: String,
         contents_base64: String,
+        respond_to: Sender<DaemonResponse>,
+    },
+    VirtualFsCreateFile {
+        mount_id: String,
+        parent_identifier: String,
+        filename: String,
+        respond_to: Sender<DaemonResponse>,
+    },
+    VirtualFsRename {
+        mount_id: String,
+        identifier: String,
+        new_parent_identifier: String,
+        new_filename: String,
+        respond_to: Sender<DaemonResponse>,
+    },
+    VirtualFsTrash {
+        mount_id: String,
+        identifier: String,
         respond_to: Sender<DaemonResponse>,
     },
 }
@@ -1240,6 +1491,32 @@ impl MutatingRequest {
                 ..
             } => (
                 "virtual_fs_commit_write".to_string(),
+                Some(format!("{mount_id}:{identifier}")),
+            ),
+            Self::VirtualFsCreateFile {
+                mount_id,
+                parent_identifier,
+                filename,
+                ..
+            } => (
+                "virtual_fs_create_file".to_string(),
+                Some(format!("{mount_id}:{parent_identifier}/{filename}")),
+            ),
+            Self::VirtualFsRename {
+                mount_id,
+                identifier,
+                new_filename,
+                ..
+            } => (
+                "virtual_fs_rename".to_string(),
+                Some(format!("{mount_id}:{identifier}->{new_filename}")),
+            ),
+            Self::VirtualFsTrash {
+                mount_id,
+                identifier,
+                ..
+            } => (
+                "virtual_fs_trash".to_string(),
                 Some(format!("{mount_id}:{identifier}")),
             ),
         }

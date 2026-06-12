@@ -21,9 +21,10 @@ pub use memory::InMemoryStateStore;
 pub use records::{
     ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
     HydrationJobRecord, MountConfig, ProjectionMode, ShadowBlockRecord, ShadowSnapshotRecord,
+    VirtualMutationKind, VirtualMutationRecord,
 };
 pub use repository::{
     ConnectionRepository, ConnectorProfileRepository, EntityRepository, HydrationJobRepository,
-    JournalRepository, MountRepository, ShadowRepository,
+    JournalRepository, MountRepository, ShadowRepository, VirtualMutationRepository,
 };
 pub use sqlite::SqliteStateStore;

@@ -11,7 +11,7 @@ use afs_core::model::EntityKind;
 use afsd::ipc::{DaemonRequest, DaemonResponse, send_request};
 use afsd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport, VirtualFsItem, VirtualFsItemKind,
-    VirtualFsItemReport, VirtualFsMaterializeReport, VirtualFsWriteReport,
+    VirtualFsItemReport, VirtualFsMaterializeReport, VirtualFsMutationReport, VirtualFsWriteReport,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -143,7 +143,48 @@ struct DaemonClient {
     mount_id: String,
 }
 
-impl DaemonClient {
+trait VirtualFsClient {
+    fn state_root(&self) -> &Path;
+
+    fn mount_id(&self) -> &str;
+
+    fn item(&self, identifier: &str) -> Result<VirtualFsItemReport, FuseError>;
+
+    fn children(&self, container_identifier: &str) -> Result<VirtualFsChildrenReport, FuseError>;
+
+    fn materialize(&self, identifier: &str) -> Result<VirtualFsMaterializeReport, FuseError>;
+
+    fn commit_write(
+        &self,
+        identifier: &str,
+        bytes: Vec<u8>,
+    ) -> Result<VirtualFsWriteReport, FuseError>;
+
+    fn create_file(
+        &self,
+        parent_identifier: &str,
+        filename: &str,
+    ) -> Result<VirtualFsMutationReport, FuseError>;
+
+    fn rename(
+        &self,
+        identifier: &str,
+        new_parent_identifier: &str,
+        new_filename: &str,
+    ) -> Result<VirtualFsMutationReport, FuseError>;
+
+    fn trash(&self, identifier: &str) -> Result<VirtualFsMutationReport, FuseError>;
+}
+
+impl VirtualFsClient for DaemonClient {
+    fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+
+    fn mount_id(&self) -> &str {
+        &self.mount_id
+    }
+
     fn item(&self, identifier: &str) -> Result<VirtualFsItemReport, FuseError> {
         self.request(&DaemonRequest::VirtualFsItem {
             mount_id: self.mount_id.clone(),
@@ -177,6 +218,41 @@ impl DaemonClient {
         })
     }
 
+    fn create_file(
+        &self,
+        parent_identifier: &str,
+        filename: &str,
+    ) -> Result<VirtualFsMutationReport, FuseError> {
+        self.request(&DaemonRequest::VirtualFsCreateFile {
+            mount_id: self.mount_id.clone(),
+            parent_identifier: parent_identifier.to_string(),
+            filename: filename.to_string(),
+        })
+    }
+
+    fn rename(
+        &self,
+        identifier: &str,
+        new_parent_identifier: &str,
+        new_filename: &str,
+    ) -> Result<VirtualFsMutationReport, FuseError> {
+        self.request(&DaemonRequest::VirtualFsRename {
+            mount_id: self.mount_id.clone(),
+            identifier: identifier.to_string(),
+            new_parent_identifier: new_parent_identifier.to_string(),
+            new_filename: new_filename.to_string(),
+        })
+    }
+
+    fn trash(&self, identifier: &str) -> Result<VirtualFsMutationReport, FuseError> {
+        self.request(&DaemonRequest::VirtualFsTrash {
+            mount_id: self.mount_id.clone(),
+            identifier: identifier.to_string(),
+        })
+    }
+}
+
+impl DaemonClient {
     fn request<T>(&self, request: &DaemonRequest) -> Result<T, FuseError>
     where
         T: DeserializeOwned,
@@ -230,8 +306,8 @@ impl From<FuseError> for fuse3::Errno {
     }
 }
 
-struct AgentFuse {
-    client: DaemonClient,
+struct AgentFuse<C = DaemonClient> {
+    client: C,
     cache: Mutex<BTreeMap<PathBuf, VirtualFsItem>>,
     handles: Mutex<BTreeMap<u64, OpenHandle>>,
     next_handle: AtomicU64,
@@ -246,8 +322,11 @@ struct OpenHandle {
     temp_path: Option<PathBuf>,
 }
 
-impl AgentFuse {
-    fn new(client: DaemonClient) -> Self {
+impl<C> AgentFuse<C>
+where
+    C: VirtualFsClient,
+{
+    fn new(client: C) -> Self {
         let mut cache = BTreeMap::new();
         if let Ok(report) = client.item(ROOT_CONTAINER_IDENTIFIER) {
             cache.insert(PathBuf::from(ROOT_PATH), report.item);
@@ -260,8 +339,27 @@ impl AgentFuse {
         }
     }
 
+    fn root_item(&self) -> Result<VirtualFsItem, FuseError> {
+        if let Some(item) = self
+            .cache
+            .lock()
+            .expect("fuse item cache")
+            .get(Path::new(ROOT_PATH))
+            .cloned()
+        {
+            return Ok(item);
+        }
+
+        let report = self.client.item(ROOT_CONTAINER_IDENTIFIER)?;
+        self.cache_item_at(PathBuf::from(ROOT_PATH), report.item.clone());
+        Ok(report.item)
+    }
+
     fn resolve_path(&self, path: &Path) -> Result<VirtualFsItem, FuseError> {
         let path = normalize_path(path);
+        if path == Path::new(ROOT_PATH) {
+            return self.root_item();
+        }
         if let Some(item) = self
             .cache
             .lock()
@@ -309,6 +407,20 @@ impl AgentFuse {
                 item.materialized_path = Some(materialized_path.to_string());
             }
         }
+    }
+
+    fn cache_item_at(&self, path: PathBuf, item: VirtualFsItem) {
+        self.cache
+            .lock()
+            .expect("fuse item cache")
+            .insert(normalize_path(&path), item);
+    }
+
+    fn remove_cached_path(&self, path: &Path) {
+        self.cache
+            .lock()
+            .expect("fuse item cache")
+            .remove(&normalize_path(path));
     }
 
     fn open_handle(&self, fh: u64) -> Result<OpenHandle, FuseError> {
@@ -377,7 +489,10 @@ impl AgentFuse {
     }
 }
 
-impl PathFilesystem for AgentFuse {
+impl<C> PathFilesystem for AgentFuse<C>
+where
+    C: VirtualFsClient + Send + Sync + 'static,
+{
     async fn init(&self, _req: Request) -> FuseResult<ReplyInit> {
         Ok(ReplyInit {
             max_write: NonZeroU32::new(1024 * 1024).expect("max write is non-zero"),
@@ -402,8 +517,8 @@ impl PathFilesystem for AgentFuse {
         _fh: Option<u64>,
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
-        let path = path.ok_or(FuseError::NotFound)?;
-        let item = self.resolve_path(Path::new(path))?;
+        let path = path.map(Path::new).unwrap_or_else(|| Path::new(ROOT_PATH));
+        let item = self.resolve_path(path)?;
         Ok(ReplyAttr {
             ttl: ATTR_TTL,
             attr: attr_for_item(&item),
@@ -415,15 +530,11 @@ impl PathFilesystem for AgentFuse {
         if item.kind != VirtualFsItemKind::File {
             return Err(FuseError::NotFile.into());
         }
-        if item
-            .entity_kind
-            .as_ref()
-            .is_some_and(|kind| *kind != EntityKind::Page)
-        {
-            return Err(FuseError::ReadOnly.into());
+        let writable = open_is_writable(flags);
+        if writable {
+            ensure_writable_item(&item)?;
         }
 
-        let writable = open_is_writable(flags);
         let truncating = flags & libc::O_TRUNC as u32 != 0;
         let materialized = if truncating && writable {
             PathBuf::new()
@@ -440,7 +551,7 @@ impl PathFilesystem for AgentFuse {
         };
 
         if writable {
-            let temp_path = staging_root(&self.client.state_root, &self.client.mount_id)
+            let temp_path = staging_root(self.client.state_root(), self.client.mount_id())
                 .join(format!("{fh}.tmp"));
             if truncating {
                 std::fs::write(&temp_path, []).map_err(|error| {
@@ -549,6 +660,7 @@ impl PathFilesystem for AgentFuse {
             } else {
                 let path = path.ok_or(FuseError::NotFound)?;
                 let item = self.resolve_path(Path::new(path))?;
+                ensure_writable_item(&item)?;
                 let materialized = self.materialized_path(&item)?;
                 let mut bytes = std::fs::read(&materialized).map_err(|error| {
                     FuseError::Io(format!("failed to read materialized file: {error}"))
@@ -618,6 +730,87 @@ impl PathFilesystem for AgentFuse {
         if let Some(handle) = handle.and_then(|handle| handle.temp_path) {
             let _ = std::fs::remove_file(handle);
         }
+        Ok(())
+    }
+
+    async fn create(
+        &self,
+        _req: Request,
+        parent: &OsStr,
+        name: &OsStr,
+        _mode: u32,
+        _flags: u32,
+    ) -> FuseResult<ReplyCreated> {
+        let parent_item = self.resolve_path(Path::new(parent))?;
+        if parent_item.kind != VirtualFsItemKind::Folder {
+            return Err(FuseError::NotDirectory.into());
+        }
+        let filename = name.to_str().ok_or(FuseError::Invalid)?;
+        let report = self.client.create_file(&parent_item.identifier, filename)?;
+        let path = child_path(Path::new(parent), filename);
+        self.cache_item_at(path.clone(), report.item.clone());
+
+        let fh = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let temp_path = staging_root(self.client.state_root(), self.client.mount_id())
+            .join(format!("{fh}.tmp"));
+        std::fs::write(&temp_path, [])
+            .map_err(|error| FuseError::Io(format!("failed to create write stage: {error}")))?;
+        self.handles.lock().expect("fuse handles").insert(
+            fh,
+            OpenHandle {
+                identifier: report.identifier,
+                path: temp_path.clone(),
+                writable: true,
+                dirty: false,
+                temp_path: Some(temp_path),
+            },
+        );
+
+        Ok(ReplyCreated {
+            ttl: ATTR_TTL,
+            attr: attr_for_item(&report.item),
+            generation: 0,
+            fh,
+            flags: 0,
+        })
+    }
+
+    async fn rename(
+        &self,
+        _req: Request,
+        origin_parent: &OsStr,
+        origin_name: &OsStr,
+        parent: &OsStr,
+        name: &OsStr,
+    ) -> FuseResult<()> {
+        let old_path = child_path(Path::new(origin_parent), &origin_name.to_string_lossy());
+        let item = self.resolve_path(&old_path)?;
+        if item.kind != VirtualFsItemKind::File {
+            return Err(FuseError::ReadOnly.into());
+        }
+        ensure_writable_item(&item)?;
+        let new_parent = self.resolve_path(Path::new(parent))?;
+        if new_parent.kind != VirtualFsItemKind::Folder {
+            return Err(FuseError::NotDirectory.into());
+        }
+        let filename = name.to_str().ok_or(FuseError::Invalid)?;
+        let report = self
+            .client
+            .rename(&item.identifier, &new_parent.identifier, filename)?;
+        self.remove_cached_path(&old_path);
+        self.cache_item_at(child_path(Path::new(parent), filename), report.item);
+        Ok(())
+    }
+
+    async fn unlink(&self, _req: Request, parent: &OsStr, name: &OsStr) -> FuseResult<()> {
+        let path = child_path(Path::new(parent), &name.to_string_lossy());
+        let item = self.resolve_path(&path)?;
+        if item.kind != VirtualFsItemKind::File {
+            return Err(FuseError::NotFile.into());
+        }
+        ensure_writable_item(&item)?;
+        self.client.trash(&item.identifier)?;
+        self.remove_cached_path(&path);
         Ok(())
     }
 
@@ -783,6 +976,20 @@ fn open_is_writable(flags: u32) -> bool {
     access == libc::O_WRONLY || access == libc::O_RDWR || flags & libc::O_TRUNC as u32 != 0
 }
 
+fn ensure_writable_item(item: &VirtualFsItem) -> Result<(), FuseError> {
+    if item.identifier.starts_with("schema:") {
+        return Err(FuseError::ReadOnly);
+    }
+    if item
+        .entity_kind
+        .as_ref()
+        .is_some_and(|kind| *kind != EntityKind::Page)
+    {
+        return Err(FuseError::ReadOnly);
+    }
+    Ok(())
+}
+
 fn file_type(item: &VirtualFsItem) -> FileType {
     match item.kind {
         VirtualFsItemKind::File => FileType::RegularFile,
@@ -792,18 +999,9 @@ fn file_type(item: &VirtualFsItem) -> FileType {
 
 fn attr_for_item(item: &VirtualFsItem) -> FileAttr {
     let now = SystemTime::now();
-    let size = item
-        .materialized_path
-        .as_ref()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    let size = file_size_for_attr(item);
     FileAttr {
-        size: if item.kind == VirtualFsItemKind::File {
-            size
-        } else {
-            0
-        },
+        size,
         blocks: size.div_ceil(512),
         atime: now,
         mtime: now,
@@ -827,5 +1025,195 @@ fn attr_for_item(item: &VirtualFsItem) -> FileAttr {
         #[cfg(target_os = "macos")]
         flags: 0,
         blksize: 4096,
+    }
+}
+
+fn file_size_for_attr(item: &VirtualFsItem) -> u64 {
+    if item.kind != VirtualFsItemKind::File {
+        return 0;
+    }
+    item.byte_size
+        .or_else(|| {
+            item.materialized_path
+                .as_ref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len())
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_attrs_do_not_stat_materialized_path() {
+        let path = std::env::temp_dir().join(format!(
+            "afs-fuse-folder-attr-{}-{}",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+        std::fs::write(&path, vec![0_u8; 900]).expect("write temp file");
+
+        let item = test_item(VirtualFsItemKind::Folder, Some(path.clone()), None);
+        let attr = attr_for_item(&item);
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(attr.size, 0);
+        assert_eq!(attr.blocks, 0);
+    }
+
+    #[test]
+    fn file_attrs_use_reported_byte_size() {
+        let path = std::env::temp_dir().join(format!(
+            "afs-fuse-file-attr-{}-{}",
+            std::process::id(),
+            unique_test_suffix()
+        ));
+        std::fs::write(&path, vec![0_u8; 900]).expect("write temp file");
+
+        let item = test_item(VirtualFsItemKind::File, Some(path.clone()), Some(1234));
+        let attr = attr_for_item(&item);
+
+        let _ = std::fs::remove_file(path);
+        assert_eq!(attr.size, 1234);
+        assert_eq!(attr.blocks, 3);
+    }
+
+    #[test]
+    fn resolve_root_fetches_root_item_when_startup_cache_is_empty() {
+        let root = test_root_item();
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+            },
+            cache: Mutex::new(BTreeMap::new()),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let item = fs.resolve_path(Path::new(ROOT_PATH)).expect("resolve root");
+
+        assert_eq!(item, root);
+        assert_eq!(
+            fs.cache
+                .lock()
+                .expect("fuse item cache")
+                .get(Path::new(ROOT_PATH)),
+            Some(&root)
+        );
+    }
+
+    fn test_item(
+        kind: VirtualFsItemKind,
+        materialized_path: Option<PathBuf>,
+        byte_size: Option<u64>,
+    ) -> VirtualFsItem {
+        VirtualFsItem {
+            identifier: "item".to_string(),
+            parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
+            filename: "Item".to_string(),
+            kind,
+            entity_kind: None,
+            remote_id: None,
+            path: "Item".to_string(),
+            hydration: None,
+            content_type: "public.data".to_string(),
+            remote_edited_at: None,
+            materialized_path: materialized_path.map(|path| path.display().to_string()),
+            byte_size,
+        }
+    }
+
+    fn test_root_item() -> VirtualFsItem {
+        VirtualFsItem {
+            identifier: ROOT_CONTAINER_IDENTIFIER.to_string(),
+            parent_identifier: None,
+            filename: String::new(),
+            kind: VirtualFsItemKind::Folder,
+            entity_kind: None,
+            remote_id: None,
+            path: String::new(),
+            hydration: None,
+            content_type: "public.folder".to_string(),
+            remote_edited_at: None,
+            materialized_path: None,
+            byte_size: None,
+        }
+    }
+
+    struct FakeClient {
+        state_root: PathBuf,
+        mount_id: String,
+        root: VirtualFsItem,
+    }
+
+    impl VirtualFsClient for FakeClient {
+        fn state_root(&self) -> &Path {
+            &self.state_root
+        }
+
+        fn mount_id(&self) -> &str {
+            &self.mount_id
+        }
+
+        fn item(&self, identifier: &str) -> Result<VirtualFsItemReport, FuseError> {
+            assert_eq!(identifier, ROOT_CONTAINER_IDENTIFIER);
+            Ok(VirtualFsItemReport {
+                mount_id: self.mount_id.clone(),
+                item: self.root.clone(),
+            })
+        }
+
+        fn children(
+            &self,
+            _container_identifier: &str,
+        ) -> Result<VirtualFsChildrenReport, FuseError> {
+            Err(FuseError::Daemon("unexpected children request".to_string()))
+        }
+
+        fn materialize(&self, _identifier: &str) -> Result<VirtualFsMaterializeReport, FuseError> {
+            Err(FuseError::Daemon(
+                "unexpected materialize request".to_string(),
+            ))
+        }
+
+        fn commit_write(
+            &self,
+            _identifier: &str,
+            _bytes: Vec<u8>,
+        ) -> Result<VirtualFsWriteReport, FuseError> {
+            Err(FuseError::Daemon("unexpected commit request".to_string()))
+        }
+
+        fn create_file(
+            &self,
+            _parent_identifier: &str,
+            _filename: &str,
+        ) -> Result<VirtualFsMutationReport, FuseError> {
+            Err(FuseError::Daemon("unexpected create request".to_string()))
+        }
+
+        fn rename(
+            &self,
+            _identifier: &str,
+            _new_parent_identifier: &str,
+            _new_filename: &str,
+        ) -> Result<VirtualFsMutationReport, FuseError> {
+            Err(FuseError::Daemon("unexpected rename request".to_string()))
+        }
+
+        fn trash(&self, _identifier: &str) -> Result<VirtualFsMutationReport, FuseError> {
+            Err(FuseError::Daemon("unexpected trash request".to_string()))
+        }
+    }
+
+    fn unique_test_suffix() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
     }
 }

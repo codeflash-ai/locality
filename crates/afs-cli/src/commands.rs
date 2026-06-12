@@ -45,7 +45,7 @@ use crate::local_oauth::{
     run_local_oauth_authorization,
 };
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
-use crate::pull::{PullError, PullReport, run_pull};
+use crate::pull::{PullError, PullReport, run_pull_with_state_root};
 use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
 use crate::resolve::{ResolveChoice, ResolveError, ResolveOptions, ResolveReport, run_resolve};
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
@@ -55,7 +55,8 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_INTERNAL: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 const EXIT_VALIDATION: i32 = 3;
-const DEFAULT_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_DAEMON_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_DAEMON_MUTATING_TIMEOUT: Duration = Duration::from_secs(60);
 
 const COMMANDS: &[&str] = &[
     "connect",
@@ -809,7 +810,7 @@ fn pull(args: &[String], json: bool) -> i32 {
     };
 
     let state_root = default_state_root();
-    match run_daemon_report::<PullReport>(
+    let fallback_reason = match run_daemon_report::<PullReport>(
         &state_root,
         &DaemonRequest::Pull {
             path: PathBuf::from(path),
@@ -825,7 +826,7 @@ fn pull(args: &[String], json: bool) -> i32 {
             print_pull_report(&report);
             return exit_code;
         }
-        DaemonReport::Unavailable(reason) => warn_daemon_fallback("pull", reason),
+        DaemonReport::Unavailable(reason) => reason,
         DaemonReport::Error(error) => {
             return command_error(
                 json,
@@ -833,6 +834,9 @@ fn pull(args: &[String], json: bool) -> i32 {
                 error.exit_code,
             );
         }
+    };
+    if let Some(error) = pull_direct_fallback_error(fallback_reason, None) {
+        return command_error(json, error, EXIT_INTERNAL);
     }
 
     let mut store = match SqliteStateStore::open(state_root.clone()) {
@@ -845,13 +849,24 @@ fn pull(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let fallback_mount = resolve_mount_target(&store, path).ok();
+    if let Some(error) = pull_direct_fallback_error(fallback_reason, fallback_mount.as_ref()) {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+    warn_daemon_fallback("pull", fallback_reason);
+
     let credentials = open_credential_store(&state_root);
     let connector = match resolve_notion_connector_for_path(&store, credentials.as_ref(), path) {
         Ok(connector) => connector,
         Err(error) => return connector_command_error("pull", json, error),
     };
 
-    match run_pull(&mut store, &connector, PathBuf::from(path)) {
+    match run_pull_with_state_root(
+        &mut store,
+        &connector,
+        PathBuf::from(path),
+        Some(&state_root),
+    ) {
         Ok(report) if json => {
             let exit_code = pull_report_exit_code(&report);
             print_json(&report);
@@ -1068,7 +1083,7 @@ fn push(args: &[String], json: bool) -> i32 {
                     "daemon_timeout",
                     format!(
                         "afsd did not respond within {}ms after the push request was submitted; refusing direct fallback to avoid duplicate remote writes",
-                        daemon_request_timeout().as_millis()
+                        daemon_mutating_request_timeout().as_millis()
                     ),
                 ),
                 EXIT_INTERNAL,
@@ -1564,47 +1579,12 @@ fn run_file_provider_helper(
 #[cfg(target_os = "linux")]
 fn run_linux_fuse_register(json: bool, mount: &MountConfig) -> i32 {
     let state_root = default_state_root();
-    if !daemon_is_running(&state_root) {
-        return command_error(
-            json,
-            CommandError::new(
-                "file-provider",
-                "daemon_not_running",
-                "afsd is not running; start it with `afs daemon start` before registering the FUSE mount",
-            ),
-            EXIT_INTERNAL,
-        );
-    }
-
-    let Some(afs_fuse) = afs_fuse_helper_path() else {
-        return command_error(
-            json,
-            CommandError::new(
-                "file-provider",
-                "helper_missing",
-                "afs-fuse was not found; build or install the afs-fuse binary",
-            ),
-            EXIT_INTERNAL,
-        );
+    let registration = match file_provider_helper::register_linux_fuse_mount(&state_root, mount) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(json, linux_fuse_command_error(error), EXIT_INTERNAL);
+        }
     };
-
-    let unit_name = linux_fuse_unit_name(&mount.mount_id.0);
-    let unit_path = match linux_fuse_unit_path(&unit_name) {
-        Ok(path) => path,
-        Err(error) => return command_error(json, error, EXIT_INTERNAL),
-    };
-    if let Err(error) = write_linux_fuse_unit(&unit_path, &afs_fuse, &state_root, mount) {
-        return command_error(json, error, EXIT_INTERNAL);
-    }
-    if let Err(error) = run_systemctl_user(&["daemon-reload"]) {
-        return command_error(json, error, EXIT_INTERNAL);
-    }
-    if let Err(error) = run_systemctl_user(&["enable", &unit_name]) {
-        return command_error(json, error, EXIT_INTERNAL);
-    }
-    if let Err(error) = run_systemctl_user(&["restart", &unit_name]) {
-        return command_error(json, error, EXIT_INTERNAL);
-    }
 
     let report = FileProviderCommandReport {
         ok: true,
@@ -1614,10 +1594,10 @@ fn run_linux_fuse_register(json: bool, mount: &MountConfig) -> i32 {
         helper: "systemctl --user".to_string(),
         helper_report: serde_json::json!({
             "message": format!("Linux FUSE mount registered for `{}`", mount.mount_id.0),
-            "service": unit_name,
-            "unit_path": unit_path.display().to_string(),
-            "mountpoint": mount.root.display().to_string(),
-            "afs_fuse": afs_fuse.display().to_string(),
+            "service": registration.service,
+            "unit_path": registration.unit_path.display().to_string(),
+            "mountpoint": registration.mountpoint.display().to_string(),
+            "afs_fuse": registration.afs_fuse.display().to_string(),
         }),
     };
     if json {
@@ -1700,13 +1680,13 @@ fn run_linux_fuse_unregister(json: bool, mount: Option<&MountConfig>, target: &s
     let mount_id = mount
         .map(|mount| mount.mount_id.0.clone())
         .unwrap_or_else(|| target.to_string());
-    let unit_name = linux_fuse_unit_name(&mount_id);
-    let unit_path = match linux_fuse_unit_path(&unit_name) {
+    let unit_name = file_provider_helper::linux_fuse_unit_name(&mount_id);
+    let unit_path = match file_provider_helper::linux_fuse_unit_path(&unit_name) {
         Ok(path) => path,
-        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+        Err(error) => return command_error(json, linux_fuse_command_error(error), EXIT_INTERNAL),
     };
 
-    let _ = run_systemctl_user(&["disable", "--now", &unit_name]);
+    let _ = file_provider_helper::run_systemctl_user(&["disable", "--now", &unit_name]);
     if let Some(mount) = mount {
         let _ = ProcessCommand::new("fusermount3")
             .arg("-uz")
@@ -1714,8 +1694,8 @@ fn run_linux_fuse_unregister(json: bool, mount: Option<&MountConfig>, target: &s
             .output();
     }
     let _ = std::fs::remove_file(&unit_path);
-    if let Err(error) = run_systemctl_user(&["daemon-reload"]) {
-        return command_error(json, error, EXIT_INTERNAL);
+    if let Err(error) = file_provider_helper::run_systemctl_user(&["daemon-reload"]) {
+        return command_error(json, linux_fuse_command_error(error), EXIT_INTERNAL);
     }
 
     let report = FileProviderCommandReport {
@@ -1752,162 +1732,10 @@ fn run_linux_fuse_unregister(json: bool, _mount: Option<&MountConfig>, target: &
 }
 
 #[cfg(target_os = "linux")]
-fn write_linux_fuse_unit(
-    unit_path: &Path,
-    afs_fuse: &Path,
-    state_root: &Path,
-    mount: &MountConfig,
-) -> Result<(), CommandError> {
-    let log_dir = state_root.join("logs");
-    std::fs::create_dir_all(unit_path.parent().unwrap_or_else(|| Path::new(".")))
-        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
-    std::fs::create_dir_all(&log_dir)
-        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
-    std::fs::create_dir_all(&mount.root)
-        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))?;
-
-    let log_path = log_dir.join(format!(
-        "afs-fuse.{}.log",
-        sanitize_systemd_fragment(&mount.mount_id.0)
-    ));
-    let unit = linux_fuse_unit_contents(afs_fuse, state_root, mount, &log_path);
-    std::fs::write(unit_path, unit)
-        .map_err(|error| CommandError::new("file-provider", "io_error", error.to_string()))
-}
-
-#[cfg(target_os = "linux")]
-fn linux_fuse_unit_contents(
-    afs_fuse: &Path,
-    state_root: &Path,
-    mount: &MountConfig,
-    log_path: &Path,
-) -> String {
-    format!(
-        "[Unit]\nDescription=AgentFS FUSE mount for {mount_id}\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={afs_fuse} --mount-id {mount_id_arg} --state-dir {state_root} --mountpoint {mountpoint}\nExecStop=/usr/bin/fusermount3 -uz {mountpoint}\nKillSignal=SIGINT\nTimeoutStopSec=10\nLimitCORE=0\nRestart=on-failure\nRestartSec=2\nStandardOutput=append:{log_path}\nStandardError=append:{log_path}\n\n[Install]\nWantedBy=default.target\n",
-        mount_id = mount.mount_id.0,
-        afs_fuse = systemd_quote(&afs_fuse.display().to_string()),
-        mount_id_arg = systemd_quote(&mount.mount_id.0),
-        state_root = systemd_quote(&state_root.display().to_string()),
-        mountpoint = systemd_quote(&mount.root.display().to_string()),
-        log_path = log_path.display(),
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn run_systemctl_user(args: &[&str]) -> Result<(), CommandError> {
-    let output = ProcessCommand::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .output()
-        .map_err(|error| {
-            CommandError::new("file-provider", "systemctl_failed", error.to_string())
-        })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    Err(CommandError::new(
-        "file-provider",
-        "systemctl_failed",
-        if message.is_empty() {
-            format!("systemctl --user exited with {}", output.status)
-        } else {
-            message
-        },
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn daemon_is_running(state_root: &Path) -> bool {
-    matches!(
-        send_request_with_timeout(state_root, &DaemonRequest::Ping, daemon_request_timeout()),
-        Ok(response) if response.ok
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn linux_fuse_unit_name(mount_id: &str) -> String {
-    format!(
-        "ai.codeflash.afs.fuse.{}.service",
-        sanitize_systemd_fragment(mount_id)
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn linux_fuse_unit_path(unit_name: &str) -> Result<PathBuf, CommandError> {
-    let home = home_dir_path()?;
-    Ok(home.join(".config/systemd/user").join(unit_name))
-}
-
-#[cfg(target_os = "linux")]
-fn sanitize_systemd_fragment(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn systemd_quote(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('$', "\\$")
-        .replace('`', "\\`");
-    format!("\"{escaped}\"")
-}
-
-#[cfg(target_os = "linux")]
-fn home_dir_path() -> Result<PathBuf, CommandError> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| CommandError::new("file-provider", "env_missing", "HOME is not set"))
-}
-
-#[cfg(target_os = "linux")]
-fn afs_fuse_helper_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("AFS_FUSE_BIN") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(dir) = current_exe.parent()
-    {
-        candidates.push(dir.join("afs-fuse"));
-    }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace = manifest_dir.join("../..");
-    candidates.push(workspace.join("target/debug/afs-fuse"));
-    candidates.push(workspace.join("target/release/afs-fuse"));
-
-    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
-        return Some(path);
-    }
-    find_on_path("afs-fuse")
-}
-
-#[cfg(target_os = "linux")]
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+fn linux_fuse_command_error(
+    error: file_provider_helper::LinuxFuseRegistrationError,
+) -> CommandError {
+    CommandError::new("file-provider", error.code(), error.message())
 }
 
 fn print_file_provider_report(report: &FileProviderCommandReport) {
@@ -2161,13 +1989,49 @@ fn warn_daemon_fallback(command: &str, reason: DaemonUnavailableReason) {
         match reason {
             DaemonUnavailableReason::TimedOut => eprintln!(
                 "afsd did not respond within {}ms; executing {command} directly",
-                daemon_request_timeout().as_millis()
+                daemon_mutating_request_timeout().as_millis()
             ),
             DaemonUnavailableReason::NotAvailable => eprintln!(
                 "afsd not running; executing {command} directly (start afsd for background hydration)"
             ),
             DaemonUnavailableReason::Disabled => {}
         }
+    }
+}
+
+fn pull_direct_fallback_error(
+    reason: DaemonUnavailableReason,
+    mount: Option<&MountConfig>,
+) -> Option<CommandError> {
+    match reason {
+        DaemonUnavailableReason::TimedOut => Some(
+            CommandError::new(
+                "pull",
+                "daemon_timeout",
+                format!(
+                    "afsd did not respond within {}ms after the pull request was submitted; refusing direct fallback to avoid racing daemon hydration",
+                    daemon_mutating_request_timeout().as_millis()
+                ),
+            )
+            .with_suggested_command("afs daemon restart"),
+        ),
+        DaemonUnavailableReason::NotAvailable
+            if mount.is_some_and(|mount| mount.projection.uses_virtual_filesystem()) =>
+        {
+            Some(
+                CommandError::new(
+                    "pull",
+                    "daemon_required",
+                    format!(
+                        "mount `{}` uses projection `{}`; pull for virtual projections must run through afsd so the provider cache stays serialized",
+                        mount.expect("checked mount").mount_id.0,
+                        mount.expect("checked mount").projection.as_str()
+                    ),
+                )
+                .with_suggested_command("afs daemon restart"),
+            )
+        }
+        DaemonUnavailableReason::Disabled | DaemonUnavailableReason::NotAvailable => None,
     }
 }
 
@@ -2296,22 +2160,23 @@ where
         return DaemonReport::Unavailable(DaemonUnavailableReason::Disabled);
     }
 
-    let response = match send_request_with_timeout(state_root, request, daemon_request_timeout()) {
-        Ok(response) => response,
-        Err(DaemonClientError::NotAvailable(_)) => {
-            return DaemonReport::Unavailable(DaemonUnavailableReason::NotAvailable);
-        }
-        Err(DaemonClientError::TimedOut(_)) => {
-            return DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut);
-        }
-        Err(error) => {
-            return DaemonReport::Error(DaemonCommandError {
-                code: "daemon_error".to_string(),
-                message: error.message().to_string(),
-                exit_code: EXIT_INTERNAL,
-            });
-        }
-    };
+    let response =
+        match send_request_with_timeout(state_root, request, daemon_request_timeout_for(request)) {
+            Ok(response) => response,
+            Err(DaemonClientError::NotAvailable(_)) => {
+                return DaemonReport::Unavailable(DaemonUnavailableReason::NotAvailable);
+            }
+            Err(DaemonClientError::TimedOut(_)) => {
+                return DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut);
+            }
+            Err(error) => {
+                return DaemonReport::Error(DaemonCommandError {
+                    code: "daemon_error".to_string(),
+                    message: error.message().to_string(),
+                    exit_code: EXIT_INTERNAL,
+                });
+            }
+        };
 
     if let Some(error) = response.error {
         let exit_code = daemon_error_exit_code(&error.code);
@@ -2346,7 +2211,25 @@ fn daemon_request_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_DAEMON_REQUEST_TIMEOUT)
+        .unwrap_or(DEFAULT_DAEMON_CONTROL_TIMEOUT)
+}
+
+fn daemon_mutating_request_timeout() -> Duration {
+    std::env::var("AFS_DAEMON_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_DAEMON_MUTATING_TIMEOUT)
+}
+
+fn daemon_request_timeout_for(request: &DaemonRequest) -> Duration {
+    match request {
+        DaemonRequest::Pull { .. } | DaemonRequest::Push { .. } => {
+            daemon_mutating_request_timeout()
+        }
+        _ => daemon_request_timeout(),
+    }
 }
 
 fn notify_daemon_mounts_changed(state_root: &std::path::Path) {
@@ -2852,9 +2735,10 @@ mod tests {
     use crate::push::PushReport;
 
     use super::{
-        EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration, diff_report_exit_code,
-        notion_oauth_broker_config, projection_mode_for_target,
-        projection_usage_options_for_target, validate_virtual_projection_registration,
+        DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
+        diff_report_exit_code, notion_oauth_broker_config, projection_mode_for_target,
+        projection_usage_options_for_target, pull_direct_fallback_error,
+        validate_virtual_projection_registration,
     };
 
     #[test]
@@ -2987,34 +2871,36 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn linux_fuse_systemd_unit_uses_mount_specific_helper_args() {
-        let mount = MountConfig::new(
-            MountId::new("notion/main"),
-            "notion",
-            "/home/example/afs notion",
-        )
-        .projection(ProjectionMode::LinuxFuse);
-        let unit_name = super::linux_fuse_unit_name(&mount.mount_id.0);
-        let unit = super::linux_fuse_unit_contents(
-            std::path::Path::new("/opt/agent fs/afs-fuse"),
-            std::path::Path::new("/home/example/.afs"),
-            &mount,
-            std::path::Path::new("/home/example/.afs/logs/afs-fuse.notion_main.log"),
+    fn pull_direct_fallback_refuses_timeout_and_virtual_mount_without_daemon() {
+        let virtual_mount =
+            MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/afs/notion")
+                .projection(ProjectionMode::LinuxFuse);
+        let plain_mount = MountConfig::new(MountId::new("plain"), "notion", "/tmp/afs/plain")
+            .projection(ProjectionMode::PlainFiles);
+
+        let timeout = pull_direct_fallback_error(DaemonUnavailableReason::TimedOut, None)
+            .expect("timed out daemon pull blocks fallback");
+        assert_eq!(timeout.code, "daemon_timeout");
+        assert!(
+            timeout
+                .message
+                .contains("refusing direct fallback to avoid racing daemon hydration")
         );
 
-        assert_eq!(unit_name, "ai.codeflash.afs.fuse.notion_main.service");
-        assert!(unit.contains("ExecStart=\"/opt/agent fs/afs-fuse\""));
-        assert!(unit.contains("--mount-id \"notion/main\""));
-        assert!(unit.contains("--state-dir \"/home/example/.afs\""));
-        assert!(unit.contains("--mountpoint \"/home/example/afs notion\""));
-        assert!(unit.contains("ExecStop=/usr/bin/fusermount3 -uz \"/home/example/afs notion\""));
-        assert!(unit.contains("TimeoutStopSec=10"));
-        assert!(unit.contains("LimitCORE=0"));
-        assert!(unit.contains("Restart=on-failure"));
+        let virtual_without_daemon =
+            pull_direct_fallback_error(DaemonUnavailableReason::NotAvailable, Some(&virtual_mount))
+                .expect("virtual projection requires daemon");
+        assert_eq!(virtual_without_daemon.code, "daemon_required");
+        assert!(virtual_without_daemon.message.contains("linux_fuse"));
+
         assert!(
-            unit.contains("StandardOutput=append:/home/example/.afs/logs/afs-fuse.notion_main.log")
+            pull_direct_fallback_error(DaemonUnavailableReason::NotAvailable, Some(&plain_mount))
+                .is_none()
+        );
+        assert!(
+            pull_direct_fallback_error(DaemonUnavailableReason::Disabled, Some(&virtual_mount))
+                .is_none()
         );
     }
 

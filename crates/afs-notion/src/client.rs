@@ -4,6 +4,7 @@
 //! can run against deterministic fixtures and live API calls stay isolated.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use afs_core::{AfsError, AfsResult};
 use reqwest::blocking::Client;
@@ -20,6 +21,7 @@ use crate::dto::{
 pub const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com";
 pub const DEFAULT_NOTION_VERSION: &str = "2026-03-11";
 pub const DEFAULT_NOTION_TOKEN_ENV: &str = "NOTION_TOKEN";
+const DEFAULT_NOTION_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub trait NotionApi: std::fmt::Debug + Send + Sync {
     fn retrieve_current_user(&self) -> AfsResult<serde_json::Value> {
@@ -86,10 +88,11 @@ pub struct HttpNotionApi {
 
 impl HttpNotionApi {
     pub fn new(config: NotionConfig) -> Self {
-        Self {
-            config,
-            client: Client::new(),
-        }
+        let client = Client::builder()
+            .timeout(notion_http_timeout())
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { config, client }
     }
 
     fn get_json<T>(&self, path: &str, query: &[(&str, String)]) -> AfsResult<T>
@@ -205,6 +208,15 @@ impl HttpNotionApi {
                 ))
             })
     }
+}
+
+fn notion_http_timeout() -> Duration {
+    std::env::var("AFS_NOTION_HTTP_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_NOTION_HTTP_TIMEOUT)
 }
 
 impl NotionApi for HttpNotionApi {

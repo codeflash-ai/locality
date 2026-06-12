@@ -9,15 +9,19 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{ApplyPlanRequest, ApplyPlanResult, Connector};
+use std::collections::BTreeMap;
+
 use afs_core::canonical::{
     CanonicalParseError, CanonicalParseErrorKind, parse_canonical_markdown,
     render_canonical_markdown,
 };
+use afs_core::diff::property_value_from_frontmatter;
 use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
 use afs_core::model::{EntityKind, HydrationState};
 use afs_core::planner::GuardrailDecision;
+use afs_core::planner::{GuardrailPolicy, PushOperation, PushPlan};
 use afs_core::push::{
     PushApplier, PushApplyRequest, PushApplyResult, PushApproval, PushConcurrencyCheck,
     PushConcurrencyRequest, PushExecutionRequest, PushExecutionResult, PushPipelineAction,
@@ -30,7 +34,8 @@ use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
-    ShadowRepository, StoreError,
+    ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +49,12 @@ pub fn execute_push_job<S, Source>(
     source: &Source,
 ) -> AfsResult<PushJobReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + JournalRepository + JournalStore,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
     execute_push_job_with_content_root(store, job, source, None)
@@ -57,7 +67,12 @@ pub fn execute_push_job_with_content_root<S, Source>(
     state_root: Option<&Path>,
 ) -> AfsResult<PushJobReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + JournalRepository + JournalStore,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
     let prepared = preflight_push(source, prepare_push(store, &job, state_root)?);
@@ -72,10 +87,22 @@ where
         remote_edited_at: prepared.entity.remote_edited_at.clone(),
     }]);
 
-    if let Some(shadow) = prepared.shadow.clone() {
-        execution_request =
-            execution_request.with_preimages(vec![JournalPreimage::from_shadow(shadow)]);
-    } else if prepared.pipeline.action == PushPipelineAction::ProceedToApply {
+    if !prepared.shadows.is_empty() {
+        execution_request = execution_request.with_preimages(
+            prepared
+                .shadows
+                .clone()
+                .into_iter()
+                .map(JournalPreimage::from_shadow)
+                .collect(),
+        );
+    } else if prepared.pipeline.action == PushPipelineAction::ProceedToApply
+        && !prepared.pipeline.plan.as_ref().is_some_and(|plan| {
+            plan.operations
+                .iter()
+                .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+        })
+    {
         return Err(AfsError::InvalidState(
             "push pipeline approved apply without a shadow preimage".to_string(),
         ));
@@ -155,13 +182,13 @@ struct PreparedPush {
     absolute_path: PathBuf,
     mount: MountConfig,
     entity: EntityRecord,
-    shadow: Option<ShadowDocument>,
+    shadows: Vec<ShadowDocument>,
     pipeline: PushPipelineResult,
 }
 
 fn prepare_push<S>(store: &S, job: &PushJob, state_root: Option<&Path>) -> AfsResult<PreparedPush>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
 {
     let absolute_path = absolute_path(&job.target_path)?;
     let mounts = store.load_mounts().map_err(AfsError::from)?;
@@ -173,19 +200,38 @@ where
     let relative_path = relative_entity_path(&mount, &absolute_path)?;
     let entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
-        .map_err(AfsError::from)?
-        .ok_or_else(|| StoreError::EntityPathMissing {
+        .map_err(AfsError::from)?;
+
+    let Some(entity) = entity else {
+        if let Some(pending) = store
+            .find_virtual_mutation_by_path(&mount.mount_id, &relative_path)
+            .map_err(AfsError::from)?
+        {
+            return prepare_pending_create(store, job, state_root, absolute_path, mount, pending);
+        }
+        if relative_path.as_os_str().is_empty() || absolute_path.is_dir() {
+            return prepare_pending_scope(
+                store,
+                job,
+                state_root,
+                absolute_path,
+                mount,
+                relative_path,
+            );
+        }
+        return Err(StoreError::EntityPathMissing {
             mount_id: mount.mount_id.clone(),
             path: relative_path.clone(),
-        })
-        .map_err(AfsError::from)?;
+        }
+        .into());
+    };
 
     if entity.hydration == HydrationState::Conflicted {
         return Ok(PreparedPush {
             absolute_path,
             mount,
             entity,
-            shadow: None,
+            shadows: Vec::new(),
             pipeline: validation_pipeline(ValidationIssue::new(
                 "entity_conflicted_requires_resolve",
                 relative_path,
@@ -205,7 +251,7 @@ where
                 absolute_path,
                 mount,
                 entity,
-                shadow: None,
+                shadows: Vec::new(),
                 pipeline: validation_pipeline(parse_error_issue(&relative_path, error)),
             });
         }
@@ -219,7 +265,7 @@ where
             absolute_path,
             mount,
             entity,
-            shadow: None,
+            shadows: Vec::new(),
             pipeline: validation_pipeline(ValidationIssue::new(
                 "frontmatter_remote_id_mismatch",
                 relative_path,
@@ -233,8 +279,14 @@ where
     let shadow = store
         .load_shadow(&mount.mount_id, &entity.remote_id)
         .map_err(AfsError::from)?;
-    let schema_validation =
-        notion_changed_row_schema_validation(store, &mount, &relative_path, &parsed, &shadow)?;
+    let schema_validation = notion_changed_row_schema_validation(
+        store,
+        state_root,
+        &mount,
+        &relative_path,
+        &parsed,
+        &shadow,
+    )?;
     let pipeline = if schema_validation.is_clean() {
         plan_push_pipeline(
             PushPipelineRequest::new(relative_path, &parsed, &shadow)
@@ -252,9 +304,325 @@ where
         absolute_path,
         mount,
         entity,
-        shadow: Some(shadow),
+        shadows: vec![shadow],
         pipeline,
     })
+}
+
+fn prepare_pending_create<S>(
+    store: &S,
+    job: &PushJob,
+    state_root: Option<&Path>,
+    absolute_path: PathBuf,
+    mount: MountConfig,
+    pending: VirtualMutationRecord,
+) -> AfsResult<PreparedPush>
+where
+    S: EntityRepository + ShadowRepository + VirtualMutationRepository,
+{
+    if pending.mutation_kind != VirtualMutationKind::Create {
+        return prepare_pending_scope(
+            store,
+            job,
+            state_root,
+            absolute_path,
+            mount,
+            pending.projected_path.clone(),
+        );
+    }
+    let parent_id = pending.parent_remote_id.clone().ok_or_else(|| {
+        AfsError::InvalidState(format!(
+            "pending create `{}` is missing a parent remote id",
+            pending.local_id
+        ))
+    })?;
+    let parent = store
+        .get_entity(&mount.mount_id, &parent_id)
+        .map_err(AfsError::from)?
+        .ok_or_else(|| StoreError::EntityMissing {
+            mount_id: mount.mount_id.clone(),
+            remote_id: parent_id.clone(),
+        })
+        .map_err(AfsError::from)?;
+    let read_path = pending
+        .content_path
+        .clone()
+        .or_else(|| {
+            state_root.map(|root| {
+                virtual_fs_content_root(root, &mount.mount_id).join(&pending.projected_path)
+            })
+        })
+        .ok_or_else(|| {
+            AfsError::InvalidState(format!(
+                "pending create `{}` has no cached content path",
+                pending.local_id
+            ))
+        })?;
+    let contents = read_to_string(&read_path)?;
+    let parsed = match parse_canonical_markdown(&contents) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Ok(PreparedPush {
+                absolute_path,
+                mount,
+                entity: parent,
+                shadows: Vec::new(),
+                pipeline: validation_pipeline(parse_error_issue(&pending.projected_path, error)),
+            });
+        }
+    };
+    let schema_validation = if parent.kind == EntityKind::Database {
+        match notion_schema_yaml_or_issue(state_root, &mount, &parent, &pending.projected_path) {
+            Ok(schema) => afs_notion::schema::validate_create_row_frontmatter(
+                &schema,
+                &parsed,
+                &pending.projected_path,
+            ),
+            Err(report) => report,
+        }
+    } else {
+        ValidationReport::clean()
+    };
+    let pipeline = create_entity_pipeline(
+        &pending.projected_path,
+        &parsed,
+        &parent,
+        &mount,
+        PushApproval {
+            assume_yes: job.assume_yes,
+            confirm_dangerous: job.confirm_dangerous,
+        },
+        schema_validation,
+    );
+    Ok(PreparedPush {
+        absolute_path,
+        mount,
+        entity: parent,
+        shadows: Vec::new(),
+        pipeline,
+    })
+}
+
+fn prepare_pending_scope<S>(
+    store: &S,
+    job: &PushJob,
+    state_root: Option<&Path>,
+    absolute_path: PathBuf,
+    mount: MountConfig,
+    relative_scope: PathBuf,
+) -> AfsResult<PreparedPush>
+where
+    S: EntityRepository + ShadowRepository + VirtualMutationRepository,
+{
+    let mutations = store
+        .list_virtual_mutations(&mount.mount_id)
+        .map_err(AfsError::from)?
+        .into_iter()
+        .filter(|mutation| {
+            relative_scope.as_os_str().is_empty()
+                || mutation.projected_path.starts_with(&relative_scope)
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = mutations.first() else {
+        return Err(StoreError::EntityPathMissing {
+            mount_id: mount.mount_id.clone(),
+            path: relative_scope,
+        }
+        .into());
+    };
+    let mut operations = Vec::new();
+    let mut affected = Vec::new();
+    let mut shadows = Vec::new();
+    let mut representative = None;
+    for mutation in &mutations {
+        match mutation.mutation_kind {
+            VirtualMutationKind::Delete => {
+                let Some(remote_id) = mutation.target_remote_id.clone() else {
+                    continue;
+                };
+                let entity = store
+                    .get_entity(&mount.mount_id, &remote_id)
+                    .map_err(AfsError::from)?
+                    .ok_or_else(|| StoreError::EntityMissing {
+                        mount_id: mount.mount_id.clone(),
+                        remote_id: remote_id.clone(),
+                    })
+                    .map_err(AfsError::from)?;
+                if representative.is_none() {
+                    representative = Some(entity);
+                }
+                if let Ok(shadow) = store.load_shadow(&mount.mount_id, &remote_id) {
+                    shadows.push(shadow);
+                }
+                operations.push(PushOperation::ArchiveEntity {
+                    entity_id: remote_id.clone(),
+                });
+                affected.push(remote_id);
+            }
+            VirtualMutationKind::Create => {
+                let pending_path = mount.root.join(&mutation.projected_path);
+                return prepare_pending_create(
+                    store,
+                    job,
+                    state_root,
+                    pending_path,
+                    mount,
+                    mutation.clone(),
+                );
+            }
+            VirtualMutationKind::Rename => {}
+        }
+    }
+    let entity = representative.ok_or_else(|| {
+        AfsError::InvalidState(format!(
+            "no pushable pending virtual filesystem mutations under `{}`",
+            first.projected_path.display()
+        ))
+    })?;
+    let plan = PushPlan::new(affected, operations);
+    let guardrail = afs_core::push::evaluate_guardrails(&plan, &GuardrailPolicy::default(), None);
+    let action = match &guardrail {
+        GuardrailDecision::Proceed if job.assume_yes => PushPipelineAction::ProceedToApply,
+        GuardrailDecision::Proceed => PushPipelineAction::ConfirmPlan,
+        GuardrailDecision::ConfirmRequired { .. } if job.confirm_dangerous => {
+            PushPipelineAction::ProceedToApply
+        }
+        GuardrailDecision::ConfirmRequired { .. } => PushPipelineAction::ConfirmDangerousPlan,
+    };
+    Ok(PreparedPush {
+        absolute_path,
+        mount,
+        entity,
+        shadows,
+        pipeline: PushPipelineResult {
+            validation: ValidationReport::clean(),
+            plan: Some(plan),
+            guardrail,
+            action,
+            completed_stages: vec![
+                PushStage::ParseAndValidate,
+                PushStage::Diff,
+                PushStage::PlanAndConfirm,
+            ],
+        },
+    })
+}
+
+fn create_entity_pipeline(
+    relative_path: &Path,
+    parsed: &afs_core::canonical::ParsedCanonicalDocument,
+    parent: &EntityRecord,
+    mount: &MountConfig,
+    approval: PushApproval,
+    schema_validation: ValidationReport,
+) -> PushPipelineResult {
+    if mount.read_only {
+        return PushPipelineResult {
+            validation: ValidationReport::clean(),
+            plan: None,
+            guardrail: GuardrailDecision::Proceed,
+            action: PushPipelineAction::ReadOnlyBlocked,
+            completed_stages: Vec::new(),
+        };
+    }
+
+    let mut validation = ValidationReport::clean();
+    validation.extend(schema_validation);
+    if parsed.remote_id().is_some() {
+        validation.push(ValidationIssue::new(
+            "create_entity_has_remote_id",
+            relative_path,
+            Some(1),
+            "new files must not carry an existing `afs.id`",
+            Some(
+                "remove the generated `afs.id`, or pull the existing page before editing"
+                    .to_string(),
+            ),
+        ));
+    }
+    if parsed
+        .frontmatter
+        .title
+        .as_ref()
+        .is_none_or(|title| title.trim().is_empty())
+    {
+        validation.push(ValidationIssue::new(
+            "create_entity_missing_title",
+            relative_path,
+            Some(1),
+            "new files require a non-empty `title` frontmatter value",
+            Some("add `title: \"...\"` to the YAML frontmatter".to_string()),
+        ));
+    }
+    if parsed.is_stub() {
+        validation.push(ValidationIssue::new(
+            "create_entity_stub_body",
+            relative_path,
+            None,
+            "new files cannot use the generated AFS stub marker as their body",
+            Some("replace the stub marker with the page body, or leave the body empty".to_string()),
+        ));
+    }
+    for directive in &parsed.directives {
+        validation.push(ValidationIssue::new(
+            "create_entity_directive_unsupported",
+            relative_path,
+            Some(directive.line),
+            "new page creation does not support pre-seeded AFS directive blocks",
+            Some(
+                "remove the directive and create only directly supported Markdown blocks"
+                    .to_string(),
+            ),
+        ));
+    }
+
+    let mut completed_stages = vec![PushStage::ParseAndValidate];
+    if !validation.is_clean() {
+        return PushPipelineResult {
+            validation,
+            plan: None,
+            guardrail: GuardrailDecision::Proceed,
+            action: PushPipelineAction::FixValidation,
+            completed_stages,
+        };
+    }
+
+    let properties = parsed
+        .frontmatter
+        .properties
+        .iter()
+        .map(|(key, value)| (key.clone(), property_value_from_frontmatter(value)))
+        .collect::<BTreeMap<_, _>>();
+    let plan = PushPlan::new(
+        vec![parent.remote_id.clone()],
+        vec![PushOperation::CreateEntity {
+            parent_id: parent.remote_id.clone(),
+            parent_kind: Some(parent.kind.clone()),
+            title: parsed.frontmatter.title.clone().unwrap_or_default(),
+            properties,
+            body: parsed.document.body.clone(),
+            source_path: relative_path.to_path_buf(),
+        }],
+    );
+    completed_stages.push(PushStage::Diff);
+    let guardrail = afs_core::push::evaluate_guardrails(&plan, &GuardrailPolicy::default(), None);
+    completed_stages.push(PushStage::PlanAndConfirm);
+    let action = match &guardrail {
+        GuardrailDecision::Proceed if approval.assume_yes => PushPipelineAction::ProceedToApply,
+        GuardrailDecision::Proceed => PushPipelineAction::ConfirmPlan,
+        GuardrailDecision::ConfirmRequired { .. } if approval.confirm_dangerous => {
+            PushPipelineAction::ProceedToApply
+        }
+        GuardrailDecision::ConfirmRequired { .. } => PushPipelineAction::ConfirmDangerousPlan,
+    };
+
+    PushPipelineResult {
+        validation,
+        plan: Some(plan),
+        guardrail,
+        action,
+        completed_stages,
+    }
 }
 
 fn projection_read_path(
@@ -337,7 +705,7 @@ where
 
 impl<S, Source> PushReconciler for DaemonPushHost<'_, S, Source>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
     Source: HydrationSource + ?Sized,
 {
     fn reconcile(&mut self, request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult> {
@@ -349,7 +717,73 @@ where
             .map_err(AfsError::from)?;
         let mut reconciled_remote_ids = Vec::new();
 
+        for effect in request.apply_effects {
+            match effect {
+                JournalApplyEffect::CreatedEntity {
+                    operation_index,
+                    entity_id,
+                    ..
+                } => {
+                    let Some(PushOperation::CreateEntity {
+                        title, source_path, ..
+                    }) = request.plan.operations.get(*operation_index)
+                    else {
+                        continue;
+                    };
+                    let mut entity = EntityRecord::new(
+                        request.mount_id.clone(),
+                        entity_id.clone(),
+                        EntityKind::Page,
+                        title.clone(),
+                        source_path.clone(),
+                    )
+                    .with_hydration(HydrationState::Stub);
+                    self.store
+                        .save_entity(entity.clone())
+                        .map_err(AfsError::from)?;
+                    let path =
+                        projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
+                    let rendered =
+                        self.source
+                            .fetch_render(&afs_core::hydration::HydrationRequest::new(
+                                request.mount_id.clone(),
+                                entity_id.clone(),
+                                path.clone(),
+                                HydrationState::Hydrated,
+                                afs_core::hydration::HydrationReason::ExplicitPull,
+                            ))?;
+                    accept_post_apply_remote(self.store, &mount, &mut entity, &path, rendered)?;
+                    if let Some(mutation) = self
+                        .store
+                        .find_virtual_mutation_by_path(request.mount_id, source_path)
+                        .map_err(AfsError::from)?
+                    {
+                        self.store
+                            .delete_virtual_mutation(request.mount_id, &mutation.local_id)
+                            .map_err(AfsError::from)?;
+                    }
+                    reconciled_remote_ids.push(entity_id.clone());
+                }
+                JournalApplyEffect::ArchivedEntity { entity_id, .. } => {
+                    self.store
+                        .delete_entity(request.mount_id, entity_id)
+                        .map_err(AfsError::from)?;
+                    self.store
+                        .delete_virtual_mutation(
+                            request.mount_id,
+                            &format!("delete:{}", entity_id.0),
+                        )
+                        .map_err(AfsError::from)?;
+                    reconciled_remote_ids.push(entity_id.clone());
+                }
+                _ => {}
+            }
+        }
+
         for remote_id in request.changed_remote_ids {
+            if reconciled_remote_ids.iter().any(|id| id == remote_id) {
+                continue;
+            }
             let mut entity = self
                 .store
                 .get_entity(request.mount_id, remote_id)
@@ -371,6 +805,9 @@ where
                     ))?;
 
             accept_post_apply_remote(self.store, &mount, &mut entity, &path, rendered)?;
+            self.store
+                .delete_virtual_mutation(request.mount_id, &format!("rename:{}", remote_id.0))
+                .map_err(AfsError::from)?;
             reconciled_remote_ids.push(remote_id.clone());
         }
 
@@ -473,6 +910,7 @@ fn validation_report_pipeline(validation: ValidationReport) -> PushPipelineResul
 
 fn notion_changed_row_schema_validation<S>(
     store: &S,
+    state_root: Option<&Path>,
     mount: &MountConfig,
     relative_path: &Path,
     parsed: &afs_core::canonical::ParsedCanonicalDocument,
@@ -489,7 +927,7 @@ where
     };
 
     Ok(
-        match notion_schema_yaml_or_issue(mount, &parent, relative_path) {
+        match notion_schema_yaml_or_issue(state_root, mount, &parent, relative_path) {
             Ok(schema) => afs_notion::schema::validate_changed_row_frontmatter(
                 &schema,
                 shadow,
@@ -526,11 +964,20 @@ where
 }
 
 fn notion_schema_yaml_or_issue(
+    state_root: Option<&Path>,
     mount: &MountConfig,
     database: &EntityRecord,
     relative_path: &Path,
 ) -> Result<String, ValidationReport> {
-    let schema_path = mount.root.join(&database.path).join("_schema.yaml");
+    let schema_path = if mount.projection.uses_virtual_filesystem() {
+        state_root
+            .map(|root| virtual_fs_content_root(root, &mount.mount_id))
+            .unwrap_or_else(|| mount.root.clone())
+            .join(&database.path)
+            .join("_schema.yaml")
+    } else {
+        mount.root.join(&database.path).join("_schema.yaml")
+    };
     match std::fs::read_to_string(&schema_path) {
         Ok(schema) => Ok(schema),
         Err(error) => {
