@@ -134,6 +134,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn reconcile_scheduled_pull_with_state_root<S, H, Source, Strategy>(
     store: &mut S,
     hydration: &mut H,

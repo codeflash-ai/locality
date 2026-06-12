@@ -196,7 +196,7 @@ fn locate_notion_page(url: String) -> Result<LocatedItem, String> {
         return Err("Paste a Notion page or database URL.".to_string());
     }
 
-    locate_notion_url(&url).ok_or_else(|| "This page is not in a mounted workspace.".to_string())
+    locate_notion_url(&url)
 }
 
 #[tauri::command]
@@ -558,26 +558,50 @@ fn health_state(
     }
 }
 
-fn locate_notion_url(url: &str) -> Option<LocatedItem> {
-    let store = SqliteStateStore::open(default_state_root()).ok()?;
-    let mounts = store.load_mounts().ok()?;
-    let notion_id = notion_id_from_url(url);
-
-    if let Some(mount) = mounts.into_iter().next() {
-        let entities = store.list_entities(&mount.mount_id).ok()?;
-        let entity = notion_id
-            .as_ref()
-            .and_then(|id| {
-                entities.iter().find(|entity| {
-                    compact_notion_id(&entity.remote_id.0) == *id
-                        || entity.path.to_string_lossy().replace('-', "").contains(id)
-                })
-            })
-            .or_else(|| entities.first())?;
-        return Some(located_item_for_entity(&mount, entity));
+fn locate_notion_url(url: &str) -> Result<LocatedItem, String> {
+    let store = SqliteStateStore::open(default_state_root())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load AFS mounts: {error}"))?
+        .into_iter()
+        .filter(|mount| mount.connector == "notion")
+        .collect::<Vec<_>>();
+    if mounts.is_empty() {
+        return Err("Create a Notion folder before locating pages.".to_string());
     }
 
-    None
+    let notion_id = notion_id_from_url(url)
+        .ok_or_else(|| "Paste a Notion page or database URL.".to_string())?;
+    for mount in &mounts {
+        if mount
+            .remote_root_id
+            .as_ref()
+            .is_some_and(|remote_id| compact_notion_id(&remote_id.0) == notion_id)
+        {
+            return Ok(LocatedItem {
+                title: "Notion workspace root".to_string(),
+                kind: "Workspace".to_string(),
+                local_path: display_path(&mount.root),
+                state: "ready".to_string(),
+            });
+        }
+
+        let entities = store
+            .list_entities(&mount.mount_id)
+            .map_err(|error| format!("Could not load indexed Notion pages: {error}"))?;
+        if let Some(entity) = entities.iter().find(|entity| {
+            compact_notion_id(&entity.remote_id.0) == notion_id
+                || compact_path_id(&entity.path) == notion_id
+        }) {
+            return Ok(located_item_for_entity(mount, entity));
+        }
+    }
+
+    Err(
+        "That Notion page is not in the mounted workspace yet. Make sure it was selected during Notion authorization, then sync the workspace."
+            .to_string(),
+    )
 }
 
 fn located_item_for_entity(mount: &MountConfig, entity: &EntityRecord) -> LocatedItem {
@@ -1070,7 +1094,22 @@ fn env_first(keys: &[&str]) -> Option<String> {
 }
 
 fn notion_id_from_url(url: &str) -> Option<String> {
-    let compact = url
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    for segment in without_query.rsplit('/') {
+        if let Some(candidate) = compact_notion_id_suffix(segment) {
+            return Some(candidate);
+        }
+    }
+
+    compact_notion_id_suffix(url)
+}
+
+fn compact_path_id(path: &Path) -> String {
+    compact_notion_id_suffix(&path.to_string_lossy()).unwrap_or_default()
+}
+
+fn compact_notion_id_suffix(value: &str) -> Option<String> {
+    let compact = value
         .chars()
         .filter(|character| character.is_ascii_hexdigit())
         .collect::<String>()
@@ -1079,12 +1118,7 @@ fn notion_id_from_url(url: &str) -> Option<String> {
         return None;
     }
 
-    compact
-        .as_bytes()
-        .windows(32)
-        .last()
-        .and_then(|window| std::str::from_utf8(window).ok())
-        .map(str::to_string)
+    Some(compact[compact.len() - 32..].to_string())
 }
 
 fn compact_notion_id(value: &str) -> String {
@@ -1093,6 +1127,33 @@ fn compact_notion_id(value: &str) -> String {
         .filter(|character| character.is_ascii_hexdigit())
         .collect::<String>()
         .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notion_id_from_url;
+
+    #[test]
+    fn extracts_id_from_notion_pretty_workspace_url() {
+        assert_eq!(
+            notion_id_from_url(
+                "https://app.notion.com/p/codeflash/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972",
+            )
+            .as_deref(),
+            Some("37b3ac0ebb88802cbcf4d53c9cfc4972")
+        );
+    }
+
+    #[test]
+    fn extracts_id_before_query_string() {
+        assert_eq!(
+            notion_id_from_url(
+                "https://www.notion.so/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972?pvs=4"
+            )
+            .as_deref(),
+            Some("37b3ac0ebb88802cbcf4d53c9cfc4972")
+        );
+    }
 }
 
 fn sample_snapshot() -> DesktopSnapshot {
