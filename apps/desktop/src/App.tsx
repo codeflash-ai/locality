@@ -88,6 +88,11 @@ type PushPlan = {
   files: PendingChange[];
 };
 
+type ActionReport = {
+  ok: boolean;
+  message: string;
+};
+
 const sampleSnapshot: DesktopSnapshot = {
   health: {
     state: "ready",
@@ -191,10 +196,13 @@ export default function App() {
   const route = window.location.hash;
   const [showOnboarding, setShowOnboarding] = useState(() => route !== "#app" && route !== "#tray");
 
+  async function refreshSnapshot() {
+    const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
+    setSnapshot(nextSnapshot);
+  }
+
   useEffect(() => {
-    void callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot)
-      .then(setSnapshot)
-      .catch(() => setSnapshot(sampleSnapshot));
+    void refreshSnapshot().catch(() => setSnapshot(sampleSnapshot));
   }, []);
 
   useEffect(() => {
@@ -224,6 +232,7 @@ export default function App() {
       <Onboarding
         snapshot={snapshot}
         onComplete={() => {
+          void refreshSnapshot().catch(() => undefined);
           setShowOnboarding(false);
           setView("home");
         }}
@@ -231,7 +240,7 @@ export default function App() {
     );
   }
 
-  return <MainShell snapshot={snapshot} view={view} onViewChange={setView} />;
+  return <MainShell snapshot={snapshot} view={view} onViewChange={setView} onRefresh={refreshSnapshot} />;
 }
 
 function Onboarding({
@@ -247,6 +256,7 @@ function Onboarding({
   const [locateUrl, setLocateUrl] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
+  const [mountError, setMountError] = useState("");
 
   async function startConnect() {
     await callCommand("connect_notion", undefined, { ok: true });
@@ -255,7 +265,16 @@ function Onboarding({
   }
 
   async function startMount() {
-    await callCommand("create_workspace_mount", { path: mountPath }, { ok: true });
+    setMountError("");
+    const report = await callCommand<ActionReport>(
+      "create_workspace_mount",
+      { path: mountPath },
+      { ok: true, message: "Created demo mount." },
+    );
+    if (!report.ok) {
+      setMountError(report.message);
+      return;
+    }
     setStep(4);
   }
 
@@ -346,6 +365,7 @@ function Onboarding({
             <PrimaryButton disabled={!mountPath.trim()} onClick={startMount}>
               Continue
             </PrimaryButton>
+            {mountError && <p className="field-error">{mountError}</p>}
             <p className="quiet-note">
               This folder will include AGENTS.md and CLAUDE.md to help your agents edit files
               natively.
@@ -420,10 +440,12 @@ function MainShell({
   snapshot,
   view,
   onViewChange,
+  onRefresh,
 }: {
   snapshot: DesktopSnapshot;
   view: AppView;
   onViewChange: (view: AppView) => void;
+  onRefresh: () => Promise<void>;
 }) {
   return (
     <main className="app-frame">
@@ -476,6 +498,7 @@ function MainShell({
               snapshot={snapshot}
               onMount={() => onViewChange("mount")}
               onReview={() => onViewChange("pending")}
+              onRefresh={onRefresh}
             />
           )}
           {view === "mount" && <MountDetailView snapshot={snapshot} onReview={() => onViewChange("pending")} />}
@@ -493,15 +516,32 @@ function HomeView({
   snapshot,
   onMount,
   onReview,
+  onRefresh,
 }: {
   snapshot: DesktopSnapshot;
   onMount: () => void;
   onReview: () => void;
+  onRefresh: () => Promise<void>;
 }) {
   const [url, setUrl] = useState("");
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
+  const [actionError, setActionError] = useState("");
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
+
+  async function createMount() {
+    setActionError("");
+    const report = await callCommand<ActionReport>(
+      "create_workspace_mount",
+      { path: snapshot.mount.localPath },
+      { ok: true, message: "Created demo mount." },
+    );
+    if (!report.ok) {
+      setActionError(report.message);
+      return;
+    }
+    await onRefresh();
+  }
 
   async function locatePage() {
     if (!url.trim()) {
@@ -553,12 +593,11 @@ function HomeView({
           </div>
           <PrimaryButton
             icon={<FolderOpen />}
-            onClick={() =>
-              void callCommand("create_workspace_mount", { path: snapshot.mount.localPath }, { ok: true })
-            }
+            onClick={() => void createMount()}
           >
             Create Notion Folder
           </PrimaryButton>
+          {actionError && <p className="field-error">{actionError}</p>}
         </section>
       ) : (
         <>

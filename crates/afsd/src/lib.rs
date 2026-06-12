@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use afs_core::AfsResult;
-use afs_core::pull::PullSchedulerConfig;
+use afs_core::pull::{PullMode, PullSchedulerConfig};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonConfig {
@@ -36,7 +36,7 @@ impl Default for DaemonConfig {
             tcp_addr: default_tcp_addr(),
             runtime_tick_interval: Duration::from_secs(1),
             hydration_retry_delay: Duration::from_secs(30),
-            pull_scheduler: PullSchedulerConfig::default(),
+            pull_scheduler: default_pull_scheduler_config(),
         }
     }
 }
@@ -82,4 +82,14 @@ fn default_tcp_addr() -> Option<SocketAddr> {
         ),
         Err(_) => Some(crate::ipc::default_tcp_addr()),
     }
+}
+
+fn default_pull_scheduler_config() -> PullSchedulerConfig {
+    let mut config = PullSchedulerConfig::default();
+    if let Ok(value) = std::env::var("AFS_DAEMON_PULL_MODE")
+        && matches!(value.as_str(), "relay" | "off" | "disabled")
+    {
+        config.mode = PullMode::Relay;
+    }
+    config
 }

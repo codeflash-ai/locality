@@ -1,5 +1,6 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ use crate::connector::{
 };
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff};
+use crate::file_provider as file_provider_helper;
 use crate::history::{
     HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
     undo_report_exit_code,
@@ -435,7 +437,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "file-provider",
                 "usage",
-                "usage: afs file-provider register|unregister <mount-id-or-path> [--json]",
+                "usage: afs file-provider register|open|unregister <mount-id-or-path> [--json]",
             ),
             EXIT_USAGE,
         );
@@ -443,6 +445,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
 
     match action {
         "register" => file_provider_register(args, json),
+        "open" => file_provider_open(args, json),
         "unregister" => file_provider_unregister(args, json),
         "list" => run_file_provider_helper(json, "list", Vec::new(), None),
         "reset" => run_file_provider_helper(json, "reset", Vec::new(), None),
@@ -451,7 +454,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "file-provider",
                 "usage",
-                "usage: afs file-provider register|unregister|list|reset",
+                "usage: afs file-provider register|open|unregister|list|reset",
             ),
             EXIT_USAGE,
         ),
@@ -514,6 +517,56 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
             )
         }
         VirtualProjectionRegistration::LinuxFuse => run_linux_fuse_register(json, &mount),
+    }
+}
+
+fn file_provider_open(args: &[String], json: bool) -> i32 {
+    let Some(target) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "usage",
+                "usage: afs file-provider open <mount-id-or-path> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let mount = match resolve_mount_target(&store, target) {
+        Ok(mount) => mount,
+        Err(message) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "mount_not_found", message),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let target_os = std::env::consts::OS;
+    let registration = match validate_virtual_projection_registration(&mount, target_os) {
+        Ok(registration) => registration,
+        Err(error) => return command_error(json, error, EXIT_USAGE),
+    };
+
+    match registration {
+        VirtualProjectionRegistration::MacosFileProvider => run_file_provider_helper(
+            json,
+            "open",
+            vec!["--mount-id".to_string(), mount.mount_id.0.clone()],
+            Some(mount.mount_id.0),
+        ),
+        VirtualProjectionRegistration::LinuxFuse => open_path_for_linux_fuse(json, &mount),
     }
 }
 
@@ -665,17 +718,30 @@ fn mount(args: &[String], json: bool) -> i32 {
             EXIT_USAGE,
         );
     };
-    let Some(root_page_id) = flag_value(args, "--root-page") else {
+    let root_page_id = flag_value(args, "--root-page");
+    let workspace_mount = has_flag(args, "--workspace");
+    if root_page_id.is_some() && workspace_mount {
         return command_error(
             json,
             CommandError::new(
                 "mount",
                 "usage",
-                "afs mount notion requires --root-page <page-id>",
+                "afs mount notion accepts either --workspace or --root-page <page-id>, not both",
             ),
             EXIT_USAGE,
         );
-    };
+    }
+    if root_page_id.is_none() && !workspace_mount {
+        return command_error(
+            json,
+            CommandError::new(
+                "mount",
+                "usage",
+                "afs mount notion requires --workspace or --root-page <page-id>",
+            ),
+            EXIT_USAGE,
+        );
+    }
 
     let projection = match projection_mode(args) {
         Ok(projection) => projection,
@@ -712,7 +778,7 @@ fn mount(args: &[String], json: bool) -> i32 {
         ),
         connector: "notion".to_string(),
         root: PathBuf::from(root),
-        remote_root_id: Some(RemoteId::new(root_page_id)),
+        remote_root_id: root_page_id.map(RemoteId::new),
         connection_id,
         read_only: has_flag(args, "--read-only"),
         projection,
@@ -1467,63 +1533,24 @@ fn run_file_provider_helper(
     args: Vec<String>,
     mount_id: Option<String>,
 ) -> i32 {
-    let helper = match file_provider_helper_path() {
-        Some(path) => path,
-        None => {
-            return command_error(
-                json,
-                CommandError::new(
-                    "file-provider",
-                    "helper_missing",
-                    "agentfs-file-providerctl was not found; build or install platform/macos/AgentFSFileProvider first",
-                ),
-                EXIT_INTERNAL,
-            );
-        }
-    };
-
-    let mut command = ProcessCommand::new(&helper);
-    command.arg(action);
-    command.args(args);
-    command.arg("--json");
-    let output = match command.output() {
-        Ok(output) => output,
+    let helper_report = match file_provider_helper::run_macos_file_provider_helper(action, args) {
+        Ok(report) => report,
         Err(error) => {
             return command_error(
                 json,
-                CommandError::new("file-provider", "helper_failed", error.to_string()),
+                CommandError::new("file-provider", error.code(), error.message()),
                 EXIT_INTERNAL,
             );
         }
     };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let helper_report =
-        serde_json::from_str::<Value>(&stdout).unwrap_or_else(|_| Value::String(stdout.clone()));
-
-    if !output.status.success() {
-        let message = helper_report
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .filter(|message| !message.is_empty())
-            .or_else(|| (!stderr.is_empty()).then_some(stderr))
-            .unwrap_or_else(|| format!("agentfs-file-providerctl exited with {}", output.status));
-        return command_error(
-            json,
-            CommandError::new("file-provider", "helper_failed", message),
-            EXIT_INTERNAL,
-        );
-    }
 
     let report = FileProviderCommandReport {
         ok: true,
         command: "file-provider",
         action: action.to_string(),
         mount_id,
-        helper: helper.display().to_string(),
-        helper_report,
+        helper: helper_report.helper.display().to_string(),
+        helper_report: helper_report.helper_report,
     };
 
     if json {
@@ -1610,6 +1637,52 @@ fn run_linux_fuse_register(json: bool, mount: &MountConfig) -> i32 {
             "unsupported_platform",
             format!(
                 "linux_fuse registration is only supported on Linux; mount `{}` cannot be registered here",
+                mount.mount_id.0
+            ),
+        ),
+        EXIT_USAGE,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn open_path_for_linux_fuse(json: bool, mount: &MountConfig) -> i32 {
+    match ProcessCommand::new("xdg-open").arg(&mount.root).spawn() {
+        Ok(_) => {
+            let report = FileProviderCommandReport {
+                ok: true,
+                command: "file-provider",
+                action: "open".to_string(),
+                mount_id: Some(mount.mount_id.0.clone()),
+                helper: "xdg-open".to_string(),
+                helper_report: serde_json::json!({
+                    "message": format!("opened {}", mount.root.display()),
+                    "mountpoint": mount.root.display().to_string(),
+                }),
+            };
+            if json {
+                print_json(&report);
+            } else {
+                print_file_provider_report(&report);
+            }
+            EXIT_SUCCESS
+        }
+        Err(error) => command_error(
+            json,
+            CommandError::new("file-provider", "helper_failed", error.to_string()),
+            EXIT_INTERNAL,
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_path_for_linux_fuse(json: bool, mount: &MountConfig) -> i32 {
+    command_error(
+        json,
+        CommandError::new(
+            "file-provider",
+            "unsupported_platform",
+            format!(
+                "linux_fuse open is only supported on Linux; mount `{}` cannot be opened here",
                 mount.mount_id.0
             ),
         ),
@@ -1915,41 +1988,6 @@ fn file_provider_display_name(mount: &MountConfig) -> String {
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| mount.mount_id.0.clone())
-}
-
-fn file_provider_helper_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("AFS_FILE_PROVIDERCTL") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(dir) = current_exe.parent()
-    {
-        candidates.push(dir.join("agentfs-file-providerctl"));
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let package_dir = manifest_dir.join("../../platform/macos/AgentFSFileProvider");
-    candidates.push(
-        package_dir.join(".build/dev-bundle/AgentFS.app/Contents/MacOS/agentfs-file-providerctl"),
-    );
-    candidates.push(PathBuf::from(
-        "/Applications/AgentFS.app/Contents/MacOS/agentfs-file-providerctl",
-    ));
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(
-            PathBuf::from(home)
-                .join("Applications/AgentFS.app/Contents/MacOS/agentfs-file-providerctl"),
-        );
-    }
-    candidates.push(package_dir.join(".build/debug/agentfs-file-providerctl"));
-    candidates.push(package_dir.join(".build/release/agentfs-file-providerctl"));
-
-    candidates.into_iter().find(|path| path.exists())
 }
 
 fn stub(command: &str, json: bool) -> i32 {
@@ -2653,7 +2691,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection {}] [--read-only] [--json]",
+        "usage: afs mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {}] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }

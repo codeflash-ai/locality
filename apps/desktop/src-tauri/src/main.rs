@@ -2,10 +2,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
+use afs_cli::daemon::{DaemonRunState, run_daemon_control};
+use afs_cli::file_provider::{
+    open_macos_file_provider_domain, register_macos_file_provider_domain,
+};
 use afs_cli::local_oauth::run_local_oauth_authorization;
+use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
 use afs_cli::status::{StatusOptions, StatusState, run_status};
 use afs_core::journal::{JournalEntry, JournalStatus};
+use afs_core::model::MountId;
 use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
@@ -14,6 +20,7 @@ use afs_store::{
     JournalRepository, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
     open_credential_store,
 };
+use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
 use afsd::ipc::{DaemonRequest, send_request};
 use afsd::notion::resolve_notion_connector_for_path;
 use serde::Serialize;
@@ -139,20 +146,12 @@ fn connect_notion() -> ActionReport {
 
 #[tauri::command]
 fn create_workspace_mount(path: String) -> ActionReport {
-    // Workspace-level Notion mounts need a CLI/API extension. For now this
-    // creates the requested folder so the desktop flow can hand off to the
-    // existing mount command once a root page/workspace API is available.
-    match expand_tilde(&path)
-        .and_then(|expanded| std::fs::create_dir_all(&expanded).map(|()| expanded))
-    {
-        Ok(expanded) => ActionReport {
+    match create_notion_workspace_mount(&path) {
+        Ok(report) => ActionReport {
             ok: true,
-            message: format!("Created local folder: {}", expanded.display()),
+            message: report,
         },
-        Err(error) => ActionReport {
-            ok: false,
-            message: format!("Could not create local folder: {error}"),
-        },
+        Err(message) => ActionReport { ok: false, message },
     }
 }
 
@@ -215,7 +214,7 @@ fn push_to_notion() -> ActionReport {
 #[tauri::command]
 fn open_path(path: String) -> ActionReport {
     let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
-    match open_in_file_manager(&expanded) {
+    match open_virtual_mount_or_path(&expanded) {
         Ok(()) => ActionReport {
             ok: true,
             message: format!("Opened {}", expanded.display()),
@@ -636,6 +635,244 @@ fn open_in_file_manager(path: &Path) -> Result<(), String> {
 
     command.spawn().map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
+    let state_root = default_state_root();
+    let root =
+        expand_tilde(path).map_err(|error| format!("Could not resolve mount path: {error}"))?;
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    let connection_id = preferred_notion_connection_id(&store)?;
+    let projection = desktop_projection_mode();
+
+    let mount_report = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root,
+            remote_root_id: None,
+            connection_id,
+            read_only: false,
+            projection: projection.clone(),
+        },
+    )
+    .map_err(|error| error.message())?;
+
+    ensure_daemon_running(&state_root)?;
+    reload_daemon_mounts(&state_root)?;
+
+    if projection.uses_virtual_filesystem() {
+        register_virtual_projection(&mount_report.mount_id, &mount_report.root)?;
+        prefetch_virtual_projection_root(&state_root, &mount_report.mount_id)?;
+    }
+
+    Ok(format!(
+        "Mounted Notion workspace at {} with {}.",
+        mount_report.root,
+        projection_label(&projection)
+    ))
+}
+
+fn preferred_notion_connection_id(
+    store: &SqliteStateStore,
+) -> Result<Option<ConnectionId>, String> {
+    let existing_mount_connection = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts: {error}"))?
+        .into_iter()
+        .find(|mount| mount.mount_id.0 == "notion-main" && mount.connector == "notion")
+        .and_then(|mount| mount.connection_id);
+    let active = store
+        .list_connections()
+        .map_err(|error| format!("Could not load connections: {error}"))?
+        .into_iter()
+        .filter(|connection| connection.connector == "notion" && connection.status == "active")
+        .collect::<Vec<_>>();
+
+    if let Some(existing) = existing_mount_connection
+        && active
+            .iter()
+            .any(|connection| connection.connection_id == existing)
+    {
+        return Ok(Some(existing));
+    }
+
+    if let Some(connection) = active.first() {
+        return Ok(Some(connection.connection_id.clone()));
+    }
+    if std::env::var("NOTION_TOKEN").is_ok() {
+        return Ok(None);
+    }
+    Err("Connect Notion before creating the workspace mount.".to_string())
+}
+
+fn desktop_projection_mode() -> ProjectionMode {
+    #[cfg(target_os = "macos")]
+    {
+        ProjectionMode::MacosFileProvider
+    }
+    #[cfg(target_os = "linux")]
+    {
+        ProjectionMode::LinuxFuse
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        ProjectionMode::PlainFiles
+    }
+}
+
+fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
+    if daemon_is_ready(state_root) {
+        return Ok(());
+    }
+
+    let mut args = vec![
+        "start".to_string(),
+        "--session".to_string(),
+        "--state-dir".to_string(),
+        state_root.display().to_string(),
+    ];
+    if let Ok(tcp_addr) = std::env::var("AFS_DAEMON_TCP_ADDR")
+        && !tcp_addr.is_empty()
+    {
+        args.push("--tcp-addr".to_string());
+        args.push(tcp_addr);
+    }
+
+    let report = run_daemon_control(&args)
+        .map_err(|error| format!("Could not start afsd: {}", error.message()))?;
+    if report.state == DaemonRunState::Running {
+        Ok(())
+    } else {
+        Err("afsd did not start.".to_string())
+    }
+}
+
+fn reload_daemon_mounts(state_root: &Path) -> Result<(), String> {
+    match send_request(state_root, &DaemonRequest::ReloadMounts) {
+        Ok(response) if response.ok => Ok(()),
+        Ok(response) => {
+            let message = response
+                .error
+                .map(|error| format!("{}: {}", error.code, error.message))
+                .unwrap_or_else(|| "daemon returned an unknown reload error".to_string());
+            Err(format!("Could not reload afsd mounts: {message}"))
+        }
+        Err(error) => Err(format!("Could not reload afsd mounts: {}", error.message())),
+    }
+}
+
+fn prefetch_virtual_projection_root(state_root: &Path, mount_id: &str) -> Result<(), String> {
+    match send_request(
+        state_root,
+        &DaemonRequest::FileProviderChildren {
+            mount_id: mount_id.to_string(),
+            container_identifier: ROOT_CONTAINER_IDENTIFIER.to_string(),
+        },
+    ) {
+        Ok(response) if response.ok => Ok(()),
+        Ok(response) => Err(response
+            .error
+            .map(|error| {
+                format!(
+                    "Could not load the top-level Notion folder: {}",
+                    error.message
+                )
+            })
+            .unwrap_or_else(|| "Could not load the top-level Notion folder.".to_string())),
+        Err(error) => Err(format!(
+            "Could not ask afsd to load the top-level Notion folder: {}",
+            error.message()
+        )),
+    }
+}
+
+fn daemon_is_ready(state_root: &Path) -> bool {
+    matches!(
+        send_request(state_root, &DaemonRequest::Ping),
+        Ok(response) if response.ok
+    )
+}
+
+fn register_virtual_projection(mount_id: &str, root: &str) -> Result<(), String> {
+    match desktop_projection_mode() {
+        ProjectionMode::MacosFileProvider => register_macos_virtual_projection(mount_id, root),
+        ProjectionMode::LinuxFuse => Ok(()),
+        ProjectionMode::PlainFiles => Ok(()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn register_macos_virtual_projection(mount_id: &str, root: &str) -> Result<(), String> {
+    register_macos_file_provider_domain(mount_id, &file_provider_display_name(root))
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Could not register macOS File Provider: {}",
+                error.message()
+            )
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_macos_virtual_projection(_mount_id: &str, _root: &str) -> Result<(), String> {
+    Ok(())
+}
+
+fn open_virtual_mount_or_path(path: &Path) -> Result<(), String> {
+    if let Some(mount) = virtual_mount_for_path(path)
+        && mount.projection.uses_virtual_filesystem()
+    {
+        return open_virtual_projection(&mount);
+    }
+
+    open_in_file_manager(path)
+}
+
+fn virtual_mount_for_path(path: &Path) -> Option<MountConfig> {
+    let store = SqliteStateStore::open(default_state_root()).ok()?;
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    store
+        .load_mounts()
+        .ok()?
+        .into_iter()
+        .filter(|mount| target.starts_with(&mount.root))
+        .max_by_key(|mount| mount.root.components().count())
+}
+
+fn open_virtual_projection(mount: &MountConfig) -> Result<(), String> {
+    match mount.projection {
+        ProjectionMode::MacosFileProvider => open_macos_virtual_projection(&mount.mount_id.0),
+        ProjectionMode::LinuxFuse | ProjectionMode::PlainFiles => open_in_file_manager(&mount.root),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_virtual_projection(mount_id: &str) -> Result<(), String> {
+    open_macos_file_provider_domain(mount_id)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Could not open macOS File Provider mount: {}",
+                error.message()
+            )
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_macos_virtual_projection(_mount_id: &str) -> Result<(), String> {
+    Err("macOS File Provider mounts can only be opened on macOS.".to_string())
+}
+
+fn file_provider_display_name(root: &str) -> String {
+    Path::new(root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Notion".to_string())
 }
 
 fn connect_notion_with_broker(state_root: PathBuf) -> Result<(), String> {

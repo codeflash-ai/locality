@@ -72,6 +72,7 @@ pub struct VirtualFsItem {
     pub content_type: String,
     pub remote_edited_at: Option<String>,
     pub materialized_path: Option<String>,
+    pub byte_size: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,7 +394,42 @@ where
 }
 
 pub fn virtual_fs_content_root(state_root: &Path, mount_id: &MountId) -> PathBuf {
-    state_root.join("content").join(&mount_id.0).join("files")
+    virtual_fs_content_base(state_root)
+        .join(&mount_id.0)
+        .join("files")
+}
+
+fn virtual_fs_content_base(state_root: &Path) -> PathBuf {
+    if let Ok(root) = std::env::var("AFS_VIRTUAL_FS_CONTENT_ROOT") {
+        return PathBuf::from(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    if is_default_state_root(state_root)
+        && let Some(group_container) = macos_app_group_container()
+    {
+        return group_container.join("content");
+    }
+
+    state_root.join("content")
+}
+
+#[cfg(target_os = "macos")]
+fn is_default_state_root(state_root: &Path) -> bool {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".afs") == state_root)
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_group_container() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(|home| {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Group Containers")
+            .join("group.ai.codeflash.afs")
+    })
 }
 
 pub fn virtual_fs_content_path(
@@ -460,6 +496,7 @@ fn root_item(mount: &MountConfig) -> VirtualFsItem {
         content_type: "public.folder".to_string(),
         remote_edited_at: None,
         materialized_path: None,
+        byte_size: None,
     }
 }
 
@@ -494,16 +531,15 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
         content_type: content_type.to_string(),
         remote_edited_at: entity.remote_edited_at.clone(),
         materialized_path,
+        byte_size: None,
     }
 }
 
 fn rewrite_item_materialized_path(content_root: &Path, item: &mut VirtualFsItem) -> AfsResult<()> {
     if item.kind == VirtualFsItemKind::File && item.hydration == Some(HydrationState::Hydrated) {
-        item.materialized_path = Some(
-            content_path_for_relative(content_root, Path::new(&item.path))?
-                .display()
-                .to_string(),
-        );
+        let path = content_path_for_relative(content_root, Path::new(&item.path))?;
+        item.byte_size = path.metadata().ok().map(|metadata| metadata.len());
+        item.materialized_path = Some(path.display().to_string());
     }
     Ok(())
 }
@@ -526,6 +562,7 @@ fn page_child_dir_item(
         content_type: "public.folder".to_string(),
         remote_edited_at: None,
         materialized_path: Some(mount.root.join(path).display().to_string()),
+        byte_size: None,
     }
 }
 
@@ -542,6 +579,7 @@ fn path_dir_item(mount: &MountConfig, path: &Path, index: &ProviderIndex) -> Vir
         content_type: "public.folder".to_string(),
         remote_edited_at: None,
         materialized_path: Some(mount.root.join(path).display().to_string()),
+        byte_size: None,
     }
 }
 

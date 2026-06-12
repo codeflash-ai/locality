@@ -94,7 +94,11 @@ pub struct DataSourceSummaryDto {
 pub struct DataSourceDto {
     pub id: String,
     #[serde(default)]
+    pub parent: Option<ParentDto>,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub title: Vec<RichTextDto>,
     #[serde(default)]
     pub created_time: Option<String>,
     #[serde(default)]
@@ -232,6 +236,7 @@ impl<T> Default for PaginatedListDto<T> {
 pub type BlockListDto = PaginatedListDto<BlockDto>;
 pub type PageListDto = PaginatedListDto<PageDto>;
 pub type DatabaseListDto = PaginatedListDto<DatabaseDto>;
+pub type DataSourceListDto = PaginatedListDto<DataSourceDto>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockDto {

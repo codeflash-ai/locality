@@ -116,6 +116,37 @@ fn mount_persists_connection_id() {
     );
 }
 
+#[test]
+fn mount_can_persist_workspace_root() {
+    let fixture = MountFixture::new("afs-cli-mount-workspace-root");
+    let mut store = InMemoryStateStore::new();
+
+    let report = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::MacosFileProvider,
+        },
+    )
+    .expect("mount");
+
+    assert_eq!(report.remote_root_id, None);
+    assert_eq!(report.projection, "macos_file_provider");
+    assert_eq!(
+        store
+            .get_mount(&MountId::new("notion-main"))
+            .expect("get mount")
+            .expect("mount")
+            .remote_root_id,
+        None
+    );
+}
+
 struct MountFixture {
     root: PathBuf,
 }

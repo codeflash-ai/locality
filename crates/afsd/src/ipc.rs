@@ -54,6 +54,10 @@ pub enum DaemonRequest {
         mount_id: String,
         identifier: String,
     },
+    FileProviderRead {
+        mount_id: String,
+        identifier: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,6 +342,22 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 identifier: "page-1".to_string(),
                 contents_base64: "SGVsbG8=".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn file_provider_read_command_decodes() {
+        let request: DaemonRequest = serde_json::from_str(
+            r#"{"command":"file_provider_read","mount_id":"notion-main","identifier":"page-1"}"#,
+        )
+        .expect("decode file provider read request");
+
+        assert_eq!(
+            request,
+            DaemonRequest::FileProviderRead {
+                mount_id: "notion-main".to_string(),
+                identifier: "page-1".to_string(),
             }
         );
     }

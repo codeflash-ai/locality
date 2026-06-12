@@ -68,6 +68,12 @@ pub struct DefaultFetchScheduleStrategy;
 
 impl FetchScheduleStrategy for DefaultFetchScheduleStrategy {
     fn mount_plan(&self, request: MountFetchSchedule<'_>) -> MountFetchPlan {
+        if request.mount.projection.uses_virtual_filesystem()
+            && request.mount.remote_root_id.is_none()
+        {
+            return MountFetchPlan::default();
+        }
+
         MountFetchPlan {
             enumerate: !request.tick.is_idle(),
         }

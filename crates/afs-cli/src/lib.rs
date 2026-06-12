@@ -3,6 +3,7 @@ pub mod connect;
 pub mod connector;
 pub mod daemon;
 pub mod diff;
+pub mod file_provider;
 pub mod history;
 pub mod info;
 pub mod local_oauth;

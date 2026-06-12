@@ -3,15 +3,18 @@
 //! The connector depends on this trait rather than directly on HTTP so tests
 //! can run against deterministic fixtures and live API calls stay isolated.
 
+use std::collections::BTreeSet;
+
 use afs_core::{AfsError, AfsResult};
 use reqwest::blocking::Client;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::NotionConfig;
 use crate::dto::{
-    BlockDto, BlockListDto, DataSourceDto, DatabaseDto, DatabaseListDto, PageDto, PageListDto,
+    BlockDto, BlockListDto, DataSourceDto, DataSourceListDto, DatabaseDto, DatabaseListDto,
+    PageDto, PageListDto,
 };
 
 pub const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com";
@@ -271,23 +274,28 @@ impl NotionApi for HttpNotionApi {
     }
 
     fn search_databases(&self, start_cursor: Option<&str>) -> AfsResult<DatabaseListDto> {
-        let mut body = json!({
-            "page_size": 100,
-            "filter": {
-                "property": "object",
-                "value": "database"
-            },
-            "sort": {
-                "direction": "descending",
-                "timestamp": "last_edited_time"
+        let data_sources: DataSourceListDto =
+            self.post_json("/v1/search", data_source_search_body(start_cursor))?;
+        let mut seen = BTreeSet::new();
+        let mut databases = Vec::new();
+        for data_source in data_sources.results {
+            let Some(database_id) = data_source
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.database_id.as_deref())
+            else {
+                continue;
+            };
+            if seen.insert(database_id.to_string()) {
+                databases.push(self.retrieve_database(database_id)?);
             }
-        });
-
-        if let Some(start_cursor) = start_cursor {
-            body["start_cursor"] = json!(start_cursor);
         }
 
-        self.post_json("/v1/search", body)
+        Ok(DatabaseListDto {
+            results: databases,
+            next_cursor: data_sources.next_cursor,
+            has_more: data_sources.has_more,
+        })
     }
 
     fn update_page(&self, page_id: &str, body: serde_json::Value) -> AfsResult<PageDto> {
@@ -324,6 +332,40 @@ impl NotionApi for HttpNotionApi {
 
     fn delete_block(&self, block_id: &str) -> AfsResult<BlockDto> {
         self.delete_json(&format!("/v1/blocks/{block_id}"))
+    }
+}
+
+fn data_source_search_body(start_cursor: Option<&str>) -> Value {
+    let mut body = json!({
+        "page_size": 100,
+        "filter": {
+            "property": "object",
+            "value": "data_source"
+        },
+        "sort": {
+            "direction": "descending",
+            "timestamp": "last_edited_time"
+        }
+    });
+
+    if let Some(start_cursor) = start_cursor {
+        body["start_cursor"] = json!(start_cursor);
+    }
+
+    body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::data_source_search_body;
+
+    #[test]
+    fn search_databases_uses_current_notion_data_source_filter() {
+        let body = data_source_search_body(Some("cursor-1"));
+
+        assert_eq!(body["filter"]["property"], "object");
+        assert_eq!(body["filter"]["value"], "data_source");
+        assert_eq!(body["start_cursor"], "cursor-1");
     }
 }
 

@@ -23,6 +23,7 @@ use afs_store::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use serde::Serialize;
 use serde_json::json;
 
 use crate::DaemonConfig;
@@ -39,8 +40,9 @@ use crate::reconcile::{
 };
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::virtual_fs::{
-    commit_virtual_fs_write, materialize_virtual_fs_item_with_content_root,
-    refresh_virtual_fs_children, virtual_fs_children_with_content_root, virtual_fs_content_root,
+    VirtualFsItem, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
+    materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
+    virtual_fs_children_with_content_root, virtual_fs_content_root,
     virtual_fs_item_with_content_root,
 };
 use crate::watcher::{FileEvent, FileEventKind};
@@ -252,6 +254,18 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
     ) -> DaemonResponse {
         self.run_virtual_fs_materialize(state_root, mount_id, identifier)
     }
+
+    fn run_file_provider_read(
+        &self,
+        _state_root: PathBuf,
+        _mount_id: String,
+        _identifier: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle File Provider file reads",
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -264,6 +278,18 @@ pub struct FileEventRuntimeReport {
 pub struct ScheduledPullRuntimeReport {
     pub report: ScheduledPullReport,
     pub queued_hydrations: Vec<HydrationRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct FileProviderReadPayload {
+    mount_id: String,
+    identifier: String,
+    remote_id: String,
+    path: String,
+    outcome: VirtualFsMaterializeOutcome,
+    hydration: HydrationState,
+    item: VirtualFsItem,
+    contents_base64: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -451,6 +477,60 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Ok(report) => DaemonResponse::ok(report),
             Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
         }
+    }
+
+    fn run_file_provider_read(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        identifier: String,
+    ) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        let mount_id = MountId::new(mount_id);
+        let credentials = open_credential_store(&state_root);
+        let connector =
+            match resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id) {
+                Ok(connector) => connector,
+                Err(error) => return DaemonResponse::error(error.code(), error.message()),
+            };
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        let materialized = match materialize_virtual_fs_item_with_content_root(
+            &mut store,
+            &connector,
+            &content_root,
+            &mount_id,
+            &identifier,
+        ) {
+            Ok(report) => report,
+            Err(error) => return DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        };
+        let contents = match std::fs::read(&materialized.path) {
+            Ok(contents) => contents,
+            Err(error) => return DaemonResponse::error("read_failed", error.to_string()),
+        };
+        let item = match virtual_fs_item_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            &identifier,
+        ) {
+            Ok(report) => report.item,
+            Err(error) => return DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        };
+
+        DaemonResponse::ok(FileProviderReadPayload {
+            mount_id: materialized.mount_id,
+            identifier: materialized.identifier,
+            remote_id: materialized.remote_id,
+            path: materialized.path,
+            outcome: materialized.outcome,
+            hydration: materialized.hydration,
+            item,
+            contents_base64: BASE64.encode(contents),
+        })
     }
 
     fn run_virtual_fs_commit_write(
@@ -676,6 +756,18 @@ impl RuntimeState {
             } => {
                 self.pending_requests
                     .push_front(MutatingRequest::VirtualFsMaterialize {
+                        mount_id,
+                        identifier,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
+            }
+            DaemonRequest::FileProviderRead {
+                mount_id,
+                identifier,
+            } => {
+                self.pending_requests
+                    .push_front(MutatingRequest::FileProviderRead {
                         mount_id,
                         identifier,
                         respond_to,
@@ -994,6 +1086,14 @@ fn run_job(
             response: runner.run_virtual_fs_materialize(state_root, mount_id, identifier),
             respond_to,
         },
+        MutatingJob::Request(MutatingRequest::FileProviderRead {
+            mount_id,
+            identifier,
+            respond_to,
+        }) => JobCompletion::Response {
+            response: runner.run_file_provider_read(state_root, mount_id, identifier),
+            respond_to,
+        },
         MutatingJob::Request(MutatingRequest::VirtualFsCommitWrite {
             mount_id,
             identifier,
@@ -1054,6 +1154,11 @@ enum MutatingRequest {
         respond_to: Sender<DaemonResponse>,
     },
     VirtualFsMaterialize {
+        mount_id: String,
+        identifier: String,
+        respond_to: Sender<DaemonResponse>,
+    },
+    FileProviderRead {
         mount_id: String,
         identifier: String,
         respond_to: Sender<DaemonResponse>,
@@ -1119,6 +1224,14 @@ impl MutatingRequest {
                 ..
             } => (
                 "virtual_fs_materialize".to_string(),
+                Some(format!("{mount_id}:{identifier}")),
+            ),
+            Self::FileProviderRead {
+                mount_id,
+                identifier,
+                ..
+            } => (
+                "file_provider_read".to_string(),
                 Some(format!("{mount_id}:{identifier}")),
             ),
             Self::VirtualFsCommitWrite {
