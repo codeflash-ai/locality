@@ -7,6 +7,7 @@ use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oaut
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
 #[cfg(target_os = "macos")]
 use afs_cli::file_provider::{
+    ensure_macos_file_provider_shortcut, macos_file_provider_domain_url,
     open_macos_file_provider_domain, register_macos_file_provider_domain,
 };
 use afs_cli::local_oauth::run_local_oauth_authorization;
@@ -26,7 +27,7 @@ use afs_store::{
 use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
 use afsd::ipc::{DaemonRequest, send_request};
 use afsd::notion::resolve_notion_connector_for_path;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindowBuilder,
     menu::{Menu, MenuItem, Submenu},
@@ -40,6 +41,7 @@ struct DesktopSnapshot {
     health: AppHealth,
     connection: ConnectionSummary,
     mount: MountSummary,
+    settings: DesktopSettings,
     pending_changes: Vec<PendingChange>,
     activity: Vec<ActivityItem>,
     suggestions: Vec<ConnectorSuggestion>,
@@ -70,6 +72,22 @@ struct MountSummary {
     projection: String,
     read_only: bool,
     status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSettings {
+    launch_at_login: bool,
+    show_menu_bar: bool,
+}
+
+impl Default for DesktopSettings {
+    fn default() -> Self {
+        Self {
+            launch_at_login: false,
+            show_menu_bar: true,
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -126,6 +144,13 @@ struct PushPlan {
 struct ActionReport {
     ok: bool,
     message: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSettingChange {
+    key: String,
+    enabled: bool,
 }
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -280,21 +305,18 @@ fn show_main_window(app: AppHandle, view: Option<String>) -> ActionReport {
 
 #[tauri::command]
 fn hide_menubar(app: AppHandle) -> ActionReport {
-    if let Some(tray) = app.tray_by_id("main")
-        && let Err(error) = tray.set_visible(false)
-    {
-        return ActionReport {
-            ok: false,
-            message: format!("Could not hide menu bar icon: {error}"),
-        };
-    }
-    if let Some(window) = app.get_webview_window("tray") {
-        let _ = window.hide();
-    }
+    set_menu_bar_visible(&app, false).unwrap_or_else(action_error)
+}
 
-    ActionReport {
-        ok: true,
-        message: "AFS hidden from the menu bar.".to_string(),
+#[tauri::command]
+fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> ActionReport {
+    match change.key.as_str() {
+        "launch_at_login" => set_launch_at_login(change.enabled).unwrap_or_else(action_error),
+        "show_menu_bar" => set_menu_bar_visible(&app, change.enabled).unwrap_or_else(action_error),
+        _ => ActionReport {
+            ok: false,
+            message: format!("Unknown desktop setting `{}`.", change.key),
+        },
     }
 }
 
@@ -342,6 +364,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
         },
         connection: connection_summary(connection.as_ref()),
         mount: mount_summary(mount.as_ref(), connection.as_ref()),
+        settings: desktop_settings(),
         pending_changes,
         activity: activity_from_journals(&journals, &store),
         suggestions: vec![ConnectorSuggestion {
@@ -422,7 +445,7 @@ fn mount_summary(
         workspace_name: connection
             .and_then(|connection| connection.workspace_name.clone())
             .unwrap_or_else(|| connector_label(&mount.connector).to_string()),
-        local_path: display_path(&mount.root),
+        local_path: display_path(&mount_access_root(mount)),
         projection: projection_label(&mount.projection).to_string(),
         read_only: mount.read_only,
         status: "ready".to_string(),
@@ -593,7 +616,7 @@ fn locate_notion_url(url: &str) -> Result<LocatedItem, String> {
             return Ok(LocatedItem {
                 title: "Notion workspace root".to_string(),
                 kind: "Workspace".to_string(),
-                local_path: display_path(&mount.root),
+                local_path: display_path(&mount_access_root(mount)),
                 state: "ready".to_string(),
             });
         }
@@ -619,9 +642,160 @@ fn located_item_for_entity(mount: &MountConfig, entity: &EntityRecord) -> Locate
     LocatedItem {
         title: entity.title.clone(),
         kind: format!("{:?}", entity.kind),
-        local_path: display_path(&mount.root.join(&entity.path)),
+        local_path: display_path(&mount_access_root(mount).join(&entity.path)),
         state: "ready".to_string(),
     }
+}
+
+fn desktop_settings() -> DesktopSettings {
+    let persisted = load_desktop_settings().unwrap_or_default();
+    DesktopSettings {
+        launch_at_login: launch_agent_path().is_some_and(|path| path.exists()),
+        show_menu_bar: persisted.show_menu_bar,
+    }
+}
+
+fn load_desktop_settings() -> Result<DesktopSettings, String> {
+    let path = desktop_settings_path();
+    if !path.exists() {
+        return Ok(DesktopSettings::default());
+    }
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read desktop settings: {error}"))?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("Could not parse desktop settings: {error}"))
+}
+
+fn save_desktop_settings(settings: &DesktopSettings) -> Result<(), String> {
+    let path = desktop_settings_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create desktop settings folder: {error}"))?;
+    }
+    let contents = serde_json::to_string_pretty(settings)
+        .map_err(|error| format!("Could not serialize desktop settings: {error}"))?;
+    fs::write(&path, contents).map_err(|error| format!("Could not write desktop settings: {error}"))
+}
+
+fn set_menu_bar_visible(app: &AppHandle, visible: bool) -> Result<ActionReport, String> {
+    if let Some(tray) = app.tray_by_id("main") {
+        tray.set_visible(visible)
+            .map_err(|error| format!("Could not update menu bar icon: {error}"))?;
+    }
+    if !visible && let Some(window) = app.get_webview_window("tray") {
+        let _ = window.hide();
+    }
+
+    let mut settings = load_desktop_settings().unwrap_or_default();
+    settings.show_menu_bar = visible;
+    save_desktop_settings(&settings)?;
+
+    Ok(ActionReport {
+        ok: true,
+        message: if visible {
+            "AFS is shown in the menu bar.".to_string()
+        } else {
+            "AFS is hidden from the menu bar.".to_string()
+        },
+    })
+}
+
+fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
+    if enabled {
+        install_launch_agent()?;
+    } else if let Some(path) = launch_agent_path()
+        && path.exists()
+    {
+        fs::remove_file(&path).map_err(|error| {
+            format!(
+                "Could not remove launch agent `{}`: {error}",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(ActionReport {
+        ok: true,
+        message: if enabled {
+            "AFS will launch at login.".to_string()
+        } else {
+            "AFS will not launch at login.".to_string()
+        },
+    })
+}
+
+fn install_launch_agent() -> Result<(), String> {
+    let Some(path) = launch_agent_path() else {
+        return Err("HOME is not set, so AFS cannot install a login item.".to_string());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create launch agent folder: {error}"))?;
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve the AFS app executable: {error}"))?;
+    let plist = launch_agent_plist(&executable);
+    fs::write(&path, plist)
+        .map_err(|error| format!("Could not write launch agent `{}`: {error}", path.display()))
+}
+
+fn launch_agent_plist(executable: &Path) -> String {
+    let executable = escape_xml(&executable.display().to_string());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.codeflash.afs.desktop</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{executable}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+"#
+    )
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn desktop_settings_path() -> PathBuf {
+    default_state_root().join("desktop.json")
+}
+
+fn launch_agent_path() -> Option<PathBuf> {
+    home_dir().ok().map(|home| {
+        home.join("Library")
+            .join("LaunchAgents")
+            .join("ai.codeflash.afs.desktop.plist")
+    })
+}
+
+fn action_error(message: String) -> ActionReport {
+    ActionReport { ok: false, message }
+}
+
+fn mount_access_root(mount: &MountConfig) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if mount.projection == ProjectionMode::MacosFileProvider
+            && let Ok(url) = macos_file_provider_domain_url(&mount.mount_id.0)
+        {
+            return url;
+        }
+    }
+
+    mount.root.clone()
 }
 
 fn default_state_root() -> PathBuf {
@@ -835,6 +1009,9 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
 
     if mount.projection.uses_virtual_filesystem() {
         register_virtual_projection(&state_root, &mount)?;
+        if let Err(error) = install_virtual_projection_shortcut(&mount) {
+            eprintln!("afs desktop could not create virtual projection shortcut: {error}");
+        }
         prefetch_virtual_projection_root(&state_root, &mount.mount_id.0)?;
     }
 
@@ -974,6 +1151,30 @@ fn register_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result
         ProjectionMode::LinuxFuse => register_linux_virtual_projection(state_root, mount),
         ProjectionMode::PlainFiles => Ok(()),
     }
+}
+
+fn install_virtual_projection_shortcut(mount: &MountConfig) -> Result<(), String> {
+    match mount.projection {
+        ProjectionMode::MacosFileProvider => install_macos_file_provider_shortcut(mount),
+        ProjectionMode::LinuxFuse | ProjectionMode::PlainFiles => Ok(()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_file_provider_shortcut(mount: &MountConfig) -> Result<(), String> {
+    ensure_macos_file_provider_shortcut(mount)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Could not create macOS File Provider shortcut: {}",
+                error.message()
+            )
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_macos_file_provider_shortcut(_mount: &MountConfig) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1314,6 +1515,10 @@ fn sample_snapshot() -> DesktopSnapshot {
             read_only: false,
             status: "ready".to_string(),
         },
+        settings: DesktopSettings {
+            launch_at_login: false,
+            show_menu_bar: true,
+        },
         pending_changes: sample_pending_changes(),
         activity: vec![
             ActivityItem {
@@ -1373,12 +1578,24 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && window.label() == "main"
+            {
+                api.prevent_close();
+                let _ = window.hide();
+                return;
+            }
             if should_hide_tray_popover(window.label(), event) {
                 let _ = window.hide();
             }
         })
         .setup(|app| {
             build_tray(app)?;
+            if !desktop_settings().show_menu_bar
+                && let Some(tray) = app.tray_by_id("main")
+            {
+                let _ = tray.set_visible(false);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1392,6 +1609,7 @@ fn main() {
             push_to_notion,
             open_path,
             show_main_window,
+            set_desktop_setting,
             hide_menubar,
             quit_completely,
         ])

@@ -29,14 +29,19 @@
   box-sizing: border-box;
 }
 
+html,
+#root {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+}
+
 body {
   margin: 0;
   min-width: 860px;
   min-height: 620px;
   overflow: hidden;
-  background:
-    radial-gradient(circle at 50% -12%, rgba(8, 123, 114, 0.12), transparent 36%),
-    linear-gradient(180deg, #f7faf9 0%, var(--bg) 100%);
+  background: transparent;
 }
 
 body[data-surface="tray"] {
@@ -77,6 +82,7 @@ p {
   min-height: 100vh;
   place-items: stretch;
   padding: 0;
+  background: transparent;
 }
 
 .setup-window,
@@ -91,10 +97,14 @@ p {
 .app-frame,
 .setup-window {
   width: 100vw;
+  height: 100vh;
   min-height: 100vh;
   border: 0;
-  border-radius: 0;
+  border-radius: 14px;
   box-shadow: none;
+  background:
+    radial-gradient(circle at 50% -12%, rgba(8, 123, 114, 0.12), transparent 36%),
+    linear-gradient(180deg, #f7faf9 0%, var(--bg) 100%);
 }
 
 .window-chrome {
@@ -116,32 +126,8 @@ p {
   text-align: right;
 }
 
-.traffic {
-  display: flex;
-  gap: 7px;
-}
-
-.traffic-dot {
-  width: 10px;
-  height: 10px;
-  min-height: 10px;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  border-radius: 50%;
-  box-shadow: inset 0 0 0 0.5px rgba(17, 24, 39, 0.16);
-}
-
-.traffic-dot.close {
-  background: #ff5f57;
-}
-
-.traffic-dot.minimize {
-  background: #ffbd2e;
-}
-
-.traffic-dot.zoom {
-  background: #28c840;
+.native-traffic-space {
+  min-height: 1px;
 }
 
 .setup-content {
@@ -189,12 +175,18 @@ p {
   width: fit-content;
   margin-bottom: 10px;
   padding: 6px 9px;
-  border: 1px solid rgba(31, 157, 104, 0.16);
+  border: 1px solid rgba(55, 95, 150, 0.18);
   border-radius: 999px;
-  background: rgba(229, 248, 239, 0.72);
-  color: #1d7f59;
+  background: rgba(232, 240, 247, 0.78);
+  color: #36506d;
   font-size: 11px;
   font-weight: 900;
+}
+
+.sync-note.connected {
+  border-color: rgba(31, 157, 104, 0.16);
+  background: rgba(229, 248, 239, 0.72);
+  color: #1d7f59;
 }
 
 .sync-note svg {
@@ -1101,6 +1093,7 @@ p {
   border: 0;
   border-radius: 999px;
   background: #d8e1e6;
+  transition: background-color 160ms ease;
 }
 
 .toggle i {
@@ -1112,6 +1105,11 @@ p {
   border-radius: 50%;
   background: #fff;
   box-shadow: 0 2px 6px rgba(20, 30, 43, 0.22);
+  transition: left 160ms ease;
+}
+
+.toggle:disabled {
+  opacity: 0.7;
 }
 
 .toggle.enabled {

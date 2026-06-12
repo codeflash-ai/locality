@@ -68,8 +68,15 @@ private enum Command {
   func run() throws -> FileProviderCtlReport {
     switch self {
     case .register(let mountId, let displayName):
+      let identifier = NSFileProviderDomainIdentifier(mountId)
+      if let existing = try getDomains().first(where: { $0.identifier == identifier }) {
+        try waitForVoid { completion in
+          NSFileProviderManager.remove(existing, completionHandler: completion)
+        }
+      }
+
       let domain = NSFileProviderDomain(
-        identifier: NSFileProviderDomainIdentifier(mountId),
+        identifier: identifier,
         displayName: displayName
       )
       if #available(macOS 13.0, *) {

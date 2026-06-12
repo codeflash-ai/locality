@@ -502,7 +502,7 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
     match registration {
         VirtualProjectionRegistration::MacosFileProvider => {
             let display_name = file_provider_display_name(&mount);
-            run_file_provider_helper(
+            let exit_code = run_file_provider_helper(
                 json,
                 "register",
                 vec![
@@ -512,7 +512,18 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
                     display_name,
                 ],
                 Some(mount_id),
-            )
+            );
+            if exit_code == EXIT_SUCCESS
+                && let Err(error) =
+                    file_provider_helper::ensure_macos_file_provider_shortcut(&mount)
+            {
+                return command_error(
+                    json,
+                    CommandError::new("file-provider", error.code(), error.message()),
+                    EXIT_INTERNAL,
+                );
+            }
+            exit_code
         }
         VirtualProjectionRegistration::LinuxFuse => run_linux_fuse_register(json, &mount),
     }

@@ -3,6 +3,8 @@ import Foundation
 import UniformTypeIdentifiers
 
 final class AgentFSFileProviderItem: NSObject, NSFileProviderItem {
+  private static let metadataSchemaVersion = "metadata-v2"
+
   let itemIdentifier: NSFileProviderItemIdentifier
   let parentItemIdentifier: NSFileProviderItemIdentifier
   let filename: String
@@ -27,7 +29,7 @@ final class AgentFSFileProviderItem: NSObject, NSFileProviderItem {
       metadata.kind == "folder"
       ? nil
       : NSNumber(value: metadata.byteSize ?? 1)
-    self.childItemCount = metadata.kind == "folder" ? 0 : nil
+    self.childItemCount = nil
     self.itemVersion = NSFileProviderItemVersion(
       contentVersion: Self.versionComponent([
         "content",
@@ -37,7 +39,7 @@ final class AgentFSFileProviderItem: NSObject, NSFileProviderItem {
         metadata.byteSize.map(String.init) ?? "",
       ]),
       metadataVersion: Self.versionComponent([
-        "metadata",
+        Self.metadataSchemaVersion,
         metadata.identifier,
         metadata.parentIdentifier ?? "",
         metadata.filename,

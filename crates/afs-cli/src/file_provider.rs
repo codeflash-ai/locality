@@ -11,6 +11,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use afs_store::MountConfig;
+#[cfg(target_os = "macos")]
+use afs_store::ProjectionMode;
 #[cfg(target_os = "linux")]
 use afsd::ipc::{DaemonRequest, send_request_with_timeout};
 use serde_json::Value;
@@ -150,6 +152,52 @@ pub fn register_linux_fuse_mount(
 pub fn open_macos_file_provider_domain(
     mount_id: &str,
 ) -> Result<FileProviderHelperReport, FileProviderHelperError> {
+    let (report, url) = resolve_macos_file_provider_domain(mount_id)?;
+    Command::new("open")
+        .arg(&url)
+        .spawn()
+        .map_err(|error| FileProviderHelperError::Failed(error.to_string()))?;
+    Ok(report)
+}
+
+pub fn macos_file_provider_domain_url(mount_id: &str) -> Result<PathBuf, FileProviderHelperError> {
+    resolve_macos_file_provider_domain(mount_id).map(|(_, url)| url)
+}
+
+pub fn ensure_macos_file_provider_shortcut(
+    mount: &MountConfig,
+) -> Result<Option<PathBuf>, FileProviderHelperError> {
+    #[cfg(target_os = "macos")]
+    {
+        if mount.projection != ProjectionMode::MacosFileProvider {
+            return Ok(None);
+        }
+        let access_root = macos_file_provider_domain_url(&mount.mount_id.0)?;
+        if access_root == mount.root {
+            return Ok(None);
+        }
+
+        let shortcut = mount
+            .root
+            .join(file_provider_shortcut_name(&mount.connector));
+        if shortcut.exists() || shortcut.symlink_metadata().is_ok() {
+            return Ok(Some(shortcut));
+        }
+        std::os::unix::fs::symlink(&access_root, &shortcut)
+            .map_err(|error| FileProviderHelperError::Failed(error.to_string()))?;
+        Ok(Some(shortcut))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = mount;
+        Ok(None)
+    }
+}
+
+fn resolve_macos_file_provider_domain(
+    mount_id: &str,
+) -> Result<(FileProviderHelperReport, PathBuf), FileProviderHelperError> {
     let report = run_macos_file_provider_helper(
         "open",
         vec!["--mount-id".to_string(), mount_id.to_string()],
@@ -159,16 +207,37 @@ pub fn open_macos_file_provider_domain(
         .get("url")
         .and_then(Value::as_str)
         .filter(|url| !url.is_empty())
+        .map(str::to_string)
         .ok_or_else(|| {
             FileProviderHelperError::Failed(
                 "agentfs-file-providerctl did not return a CloudStorage URL".to_string(),
             )
         })?;
-    Command::new("open")
-        .arg(url)
-        .spawn()
-        .map_err(|error| FileProviderHelperError::Failed(error.to_string()))?;
-    Ok(report)
+    Ok((report, PathBuf::from(url)))
+}
+
+#[cfg(target_os = "macos")]
+fn file_provider_shortcut_name(connector: &str) -> String {
+    match connector {
+        "notion" => "Notion Files".to_string(),
+        other => format!("{} Files", title_case_connector(other)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn title_case_connector(connector: &str) -> String {
+    connector
+        .split(['-', '_', ' '])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn run_macos_file_provider_helper(

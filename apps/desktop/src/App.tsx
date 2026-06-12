@@ -44,6 +44,10 @@ type DesktopSnapshot = {
     readOnly: boolean;
     status: string;
   };
+  settings: {
+    launchAtLogin: boolean;
+    showMenuBar: boolean;
+  };
   pendingChanges: PendingChange[];
   activity: ActivityItem[];
   suggestions: ConnectorSuggestion[];
@@ -111,6 +115,10 @@ const sampleSnapshot: DesktopSnapshot = {
     projection: "macOS File Provider",
     readOnly: false,
     status: "ready",
+  },
+  settings: {
+    launchAtLogin: false,
+    showMenuBar: true,
   },
   pendingChanges: [
     {
@@ -263,6 +271,7 @@ function Onboarding({
   const [oauthReady, setOauthReady] = useState(false);
   const [oauthInFlight, setOauthInFlight] = useState(false);
   const [oauthError, setOauthError] = useState("");
+  const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
   const [locateUrl, setLocateUrl] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
@@ -285,6 +294,12 @@ function Onboarding({
         setOauthError(report.message);
         return;
       }
+      const nextSnapshot = await callCommand<DesktopSnapshot>(
+        "desktop_snapshot",
+        undefined,
+        sampleSnapshot,
+      );
+      setConnectedWorkspace(nextSnapshot.connection.workspaceName);
       setOauthReady(true);
     } catch (error) {
       setOauthError(errorMessage(error));
@@ -304,6 +319,12 @@ function Onboarding({
       setMountError(report.message);
       return;
     }
+    const nextSnapshot = await callCommand<DesktopSnapshot>(
+      "desktop_snapshot",
+      undefined,
+      sampleSnapshot,
+    );
+    setMountPath(nextSnapshot.mount.localPath);
     setStep(4);
   }
 
@@ -383,12 +404,25 @@ function Onboarding({
         )}
 
         {step === 2 && (
-          <SetupContent mark={<BrandTile variant="notion">N</BrandTile>}>
+          <SetupContent
+            mark={
+              <BrandTile variant={oauthReady ? "ready" : "notion"}>
+                {oauthReady ? undefined : "N"}
+              </BrandTile>
+            }
+          >
             <div>
-              <h1>Finish connecting in Notion</h1>
+              <div className={`sync-note ${oauthReady ? "connected" : ""}`}>
+                {oauthReady ? <Check /> : <Loader2 className={oauthInFlight ? "spin" : ""} />}
+                {oauthReady ? "Notion connected" : "Waiting for Notion"}
+              </div>
+              <h1>{oauthReady ? "Your Notion workspace is connected" : "Finish connecting in Notion"}</h1>
               <p>
-                A browser window is open. Choose your workspace, pick the pages
-                AFS can use, then approve access.
+                {oauthReady
+                  ? `${
+                      connectedWorkspace || "Your workspace"
+                    } is ready. Next, choose where AFS should place the local folder.`
+                  : "A browser window is open. Choose your workspace, pick the pages AFS can use, then approve access."}
               </p>
             </div>
             <ProgressList
@@ -399,7 +433,7 @@ function Onboarding({
               ]}
             />
             <PrimaryButton disabled={!oauthReady} onClick={() => setStep(3)}>
-              {oauthReady ? "Continue" : oauthInFlight ? "Waiting for Notion" : "Continue"}
+              {oauthReady ? "Continue to folder setup" : oauthInFlight ? "Waiting for Notion" : "Continue"}
             </PrimaryButton>
             <TextButton disabled={oauthInFlight} onClick={() => void startConnect()}>
               Open browser again
@@ -413,7 +447,10 @@ function Onboarding({
           <SetupContent mark={<BrandTile variant="folder" />}>
             <div>
               <h1>Where should your Notion files appear?</h1>
-              <p>AFS keeps the folder visible in Documents and organized under its own directory.</p>
+              <p>
+                Choose a name for this workspace. macOS shows the live Notion folder in
+                CloudStorage and AFS keeps a shortcut here.
+              </p>
             </div>
             <div className="path-field">
               <input value={mountPath} onChange={(event) => setMountPath(event.target.value)} />
@@ -441,8 +478,8 @@ function Onboarding({
               </div>
               <h1>You’re ready to use AFS</h1>
               <p>
-                Your Notion folder is in Documents. AFS will keep syncing the workspace quietly in
-                the background.
+                Your Notion folder is ready. AFS will keep syncing the workspace quietly in the
+                background.
               </p>
             </div>
             <div className="ready-folder">
@@ -976,6 +1013,8 @@ function SettingsView({
   onRefresh: () => Promise<void>;
 }) {
   const [diagnosticMessage, setDiagnosticMessage] = useState("");
+  const [settingsMessage, setSettingsMessage] = useState("");
+  const [busySetting, setBusySetting] = useState("");
   const daemonStopped = snapshot.health.state === "stopped";
 
   async function repairRuntime() {
@@ -1005,6 +1044,24 @@ function SettingsView({
     setDiagnosticMessage("Copied diagnostics summary.");
   }
 
+  async function updateDesktopSetting(key: "launch_at_login" | "show_menu_bar", enabled: boolean) {
+    setBusySetting(key);
+    setSettingsMessage("");
+    try {
+      const report = await callCommand<ActionReport>(
+        "set_desktop_setting",
+        { change: { key, enabled } },
+        { ok: true, message: "Updated setting." },
+      );
+      setSettingsMessage(report.message);
+      await onRefresh().catch(() => undefined);
+    } catch (error) {
+      setSettingsMessage(errorMessage(error));
+    } finally {
+      setBusySetting("");
+    }
+  }
+
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Settings" title="AFS controls" />
@@ -1012,9 +1069,20 @@ function SettingsView({
       <section className="settings-grid">
         <div className="panel">
           <PanelTitle title="Startup" />
-          <ToggleRow title="Launch AFS at login" enabled />
-          <ToggleRow title="Show AFS in the menu bar" enabled />
+          <ToggleRow
+            title="Launch AFS at login"
+            enabled={snapshot.settings.launchAtLogin}
+            busy={busySetting === "launch_at_login"}
+            onToggle={(enabled) => void updateDesktopSetting("launch_at_login", enabled)}
+          />
+          <ToggleRow
+            title="Show AFS in the menu bar"
+            enabled={snapshot.settings.showMenuBar}
+            busy={busySetting === "show_menu_bar"}
+            onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
+          />
           <SettingRow title="Default folder" value="~/Documents/AFS" />
+          {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
         </div>
 
         <div className="panel">
@@ -1314,11 +1382,7 @@ function ViewHeader({
 function WindowChrome({ title, meta }: { title: string; meta?: string }) {
   return (
     <div className="window-chrome" onMouseDown={handleChromeMouseDown}>
-      <div className="traffic">
-        <button aria-label="Close window" className="traffic-dot close" onClick={() => void windowAction("hide")} />
-        <button aria-label="Minimize window" className="traffic-dot minimize" onClick={() => void windowAction("minimize")} />
-        <button aria-label="Toggle fullscreen" className="traffic-dot zoom" onClick={() => void windowAction("toggleMaximize")} />
-      </div>
+      <div className="native-traffic-space" aria-hidden="true" />
       <div data-tauri-drag-region>{title}</div>
       <div data-tauri-drag-region>{meta}</div>
     </div>
@@ -1337,21 +1401,6 @@ function handleChromeMouseDown(event: React.MouseEvent<HTMLDivElement>) {
 
   event.preventDefault();
   void getCurrentWindow().startDragging();
-}
-
-async function windowAction(action: "hide" | "minimize" | "toggleMaximize") {
-  if (!isTauriRuntime()) {
-    return;
-  }
-
-  const currentWindow = getCurrentWindow();
-  if (action === "hide") {
-    await currentWindow.hide();
-  } else if (action === "minimize") {
-    await currentWindow.minimize();
-  } else {
-    await currentWindow.toggleMaximize();
-  }
 }
 
 function SetupContent({
@@ -1511,11 +1560,27 @@ function SettingRow({ title, value }: { title: string; value: string }) {
   );
 }
 
-function ToggleRow({ title, enabled }: { title: string; enabled: boolean }) {
+function ToggleRow({
+  title,
+  enabled,
+  busy,
+  onToggle,
+}: {
+  title: string;
+  enabled: boolean;
+  busy?: boolean;
+  onToggle?: (enabled: boolean) => void;
+}) {
   return (
     <div className="setting-row">
       <span>{title}</span>
-      <button className={`toggle ${enabled ? "enabled" : ""}`} aria-label={title}>
+      <button
+        className={`toggle ${enabled ? "enabled" : ""}`}
+        aria-label={title}
+        aria-pressed={enabled}
+        disabled={busy}
+        onClick={() => onToggle?.(!enabled)}
+      >
         <i />
       </button>
     </div>
