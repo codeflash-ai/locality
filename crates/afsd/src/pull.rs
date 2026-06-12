@@ -4,22 +4,23 @@
 //! real file tree. Mount-root pulls enumerate the remote projection and write
 //! stubs; page-file pulls hydrate one entity and persist its shadow snapshot.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use afs_connector::{Connector, EnumerateRequest, FetchRequest};
+use afs_connector::EnumerateRequest;
 use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
 use afs_core::conflict::{
     has_unresolved_conflict_markers, render_inline_conflict_markdown_with_base,
 };
+use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, TreeEntry};
 use afs_core::shadow::ShadowDocument;
-use afs_notion::NotionConnector;
-use afs_notion::render::NotionRenderedEntity;
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::hydration::{HydratedAsset, HydratedEntity};
+use crate::source::SourceAdapter;
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,25 +45,27 @@ pub struct PullConflict {
     pub remote_id: String,
 }
 
-pub fn run_pull<S>(
+pub fn run_pull<S, Source>(
     store: &mut S,
-    connector: &NotionConnector,
+    source: &Source,
     target_path: impl AsRef<Path>,
 ) -> Result<PullReport, PullError>
 where
     S: MountRepository + EntityRepository + ShadowRepository,
+    Source: SourceAdapter + Clone,
 {
-    run_pull_with_state_root(store, connector, target_path, None)
+    run_pull_with_state_root(store, source, target_path, None)
 }
 
-pub fn run_pull_with_state_root<S>(
+pub fn run_pull_with_state_root<S, Source>(
     store: &mut S,
-    connector: &NotionConnector,
+    source: &Source,
     target_path: impl AsRef<Path>,
     state_root: Option<&Path>,
 ) -> Result<PullReport, PullError>
 where
     S: MountRepository + EntityRepository + ShadowRepository,
+    Source: SourceAdapter + Clone,
 {
     let target_path = absolute_path(target_path.as_ref())?;
     let mounts = store.load_mounts().map_err(PullError::Store)?;
@@ -70,17 +73,14 @@ where
         .cloned()
         .ok_or_else(|| PullError::MountNotFound(target_path.clone()))?;
     let relative_path = relative_target_path(&mount, &target_path)?;
-    let mounted_connector = match &mount.remote_root_id {
-        Some(root_page_id) => connector.with_root_page_id(root_page_id.clone()),
-        None => connector.clone(),
-    };
+    let source = source.scoped_to_mount(&mount);
 
     if should_pull_mount_root(&mount, &relative_path, &target_path) {
-        pull_mount_root(store, &mounted_connector, &mount, target_path, state_root)
+        pull_mount_root(store, &source, &mount, target_path, state_root)
     } else {
         pull_entity_path(
             store,
-            &mounted_connector,
+            &source,
             &mount,
             &relative_path,
             target_path,
@@ -89,17 +89,18 @@ where
     }
 }
 
-fn pull_mount_root<S>(
+fn pull_mount_root<S, Source>(
     store: &mut S,
-    connector: &NotionConnector,
+    source: &Source,
     mount: &MountConfig,
     target_path: PathBuf,
     state_root: Option<&Path>,
 ) -> Result<PullReport, PullError>
 where
     S: EntityRepository + ShadowRepository,
+    Source: SourceAdapter,
 {
-    let entries = connector
+    let entries = source
         .enumerate(EnumerateRequest {
             mount_id: mount.mount_id.clone(),
             cursor: None,
@@ -114,7 +115,7 @@ where
         let record = merged_entity_record(entry, existing.as_ref());
         store.save_entity(record).map_err(PullError::Store)?;
         rename_projection_if_needed(mount, existing.as_ref(), entry)?;
-        if write_stub_if_needed(connector, mount, entry, state_root)? {
+        if write_stub_if_needed(source, mount, entry, state_root)? {
             stubbed += 1;
         }
     }
@@ -134,7 +135,7 @@ where
                     remote_id: root_entry.remote_id.clone(),
                 })
             })?;
-        match hydrate_entity(store, connector, mount, root_entity, state_root)? {
+        match hydrate_entity(store, source, mount, root_entity, state_root)? {
             HydrationOutcome::Hydrated => hydrated += 1,
             HydrationOutcome::SkippedDirty => skipped_dirty += 1,
             HydrationOutcome::Conflicted(conflict) => {
@@ -159,9 +160,9 @@ where
     })
 }
 
-fn pull_entity_path<S>(
+fn pull_entity_path<S, Source>(
     store: &mut S,
-    connector: &NotionConnector,
+    source: &Source,
     mount: &MountConfig,
     relative_path: &Path,
     target_path: PathBuf,
@@ -169,6 +170,7 @@ fn pull_entity_path<S>(
 ) -> Result<PullReport, PullError>
 where
     S: EntityRepository + ShadowRepository,
+    Source: SourceAdapter,
 {
     let entity = store
         .find_entity_by_path(&mount.mount_id, relative_path)
@@ -180,7 +182,7 @@ where
             })
         })?;
 
-    let outcome = hydrate_entity(store, connector, mount, entity, state_root)?;
+    let outcome = hydrate_entity(store, source, mount, entity, state_root)?;
     let (hydrated, skipped_dirty, conflicts) = match outcome {
         HydrationOutcome::Hydrated => (1, 0, Vec::new()),
         HydrationOutcome::SkippedDirty => (0, 1, Vec::new()),
@@ -216,21 +218,26 @@ fn merged_entity_record(entry: &TreeEntry, existing: Option<&EntityRecord>) -> E
     record
 }
 
-fn write_stub_if_needed(
-    connector: &NotionConnector,
+fn write_stub_if_needed<Source>(
+    source: &Source,
     mount: &MountConfig,
     entry: &TreeEntry,
     state_root: Option<&Path>,
-) -> Result<bool, PullError> {
+) -> Result<bool, PullError>
+where
+    Source: SourceAdapter,
+{
     if mount.projection.uses_virtual_filesystem() {
         if entry.kind == EntityKind::Database
             && let Some(state_root) = state_root
         {
             let directory = virtual_fs_content_root(state_root, &mount.mount_id).join(&entry.path);
-            let schema = connector
+            if let Some(schema) = source
                 .database_schema_yaml(&entry.remote_id)
-                .map_err(PullError::Connector)?;
-            write_atomic(&directory.join("_schema.yaml"), schema)?;
+                .map_err(PullError::Connector)?
+            {
+                write_atomic(&directory.join("_schema.yaml"), schema)?;
+            }
         }
         return Ok(false);
     }
@@ -250,10 +257,12 @@ fn write_stub_if_needed(
                 path: directory.clone(),
                 message: error.to_string(),
             })?;
-            let schema = connector
+            if let Some(schema) = source
                 .database_schema_yaml(&entry.remote_id)
-                .map_err(PullError::Connector)?;
-            write_atomic(&directory.join("_schema.yaml"), schema)?;
+                .map_err(PullError::Connector)?
+            {
+                write_atomic(&directory.join("_schema.yaml"), schema)?;
+            }
             Ok(false)
         }
         EntityKind::Directory => {
@@ -309,30 +318,30 @@ fn rename_projection_if_needed(
     Ok(())
 }
 
-fn hydrate_entity<S>(
+fn hydrate_entity<S, Source>(
     store: &mut S,
-    connector: &NotionConnector,
+    source: &Source,
     mount: &MountConfig,
     entity: EntityRecord,
     state_root: Option<&Path>,
 ) -> Result<HydrationOutcome, PullError>
 where
     S: EntityRepository + ShadowRepository,
+    Source: SourceAdapter,
 {
     let path = projection_content_path(state_root, mount, &entity.path)?;
     let can_replace = can_replace_file(store, mount, &entity, &path)?;
-    let native = connector
-        .fetch(FetchRequest {
-            remote_id: entity.remote_id.clone(),
-        })
-        .map_err(PullError::Connector)?;
-    let rendered = connector
-        .render_native_entity_for_path(&native, &entity.path)
+    let rendered = source
+        .fetch_render(&HydrationRequest::new(
+            mount.mount_id.clone(),
+            entity.remote_id.clone(),
+            entity.path.clone(),
+            HydrationState::Hydrated,
+            HydrationReason::ExplicitPull,
+        ))
         .map_err(PullError::Connector)?;
     let media_root = projection_output_root(state_root, mount)?;
-    connector
-        .download_rendered_media(&rendered, &media_root)
-        .map_err(PullError::Connector)?;
+    write_assets(&media_root, &rendered.assets)?;
 
     if can_replace {
         accept_remote_projection(store, mount, entity, &path, rendered)?;
@@ -390,6 +399,14 @@ fn projection_output_root(
     Ok(mount.root.clone())
 }
 
+fn write_assets(root: &Path, assets: &[HydratedAsset]) -> Result<(), PullError> {
+    for asset in assets {
+        let path = mount_relative_path(root, &asset.path)?;
+        write_binary_atomic(&path, &asset.bytes)?;
+    }
+    Ok(())
+}
+
 fn should_pull_mount_root(mount: &MountConfig, relative_path: &Path, target_path: &Path) -> bool {
     if relative_path.as_os_str().is_empty() {
         return true;
@@ -406,7 +423,7 @@ fn accept_remote_projection<S>(
     mount: &MountConfig,
     entity: EntityRecord,
     path: &Path,
-    rendered: NotionRenderedEntity,
+    rendered: HydratedEntity,
 ) -> Result<(), PullError>
 where
     S: EntityRepository + ShadowRepository,
@@ -432,7 +449,7 @@ fn materialize_conflict<S>(
     mount: &MountConfig,
     entity: EntityRecord,
     path: &Path,
-    rendered: NotionRenderedEntity,
+    rendered: HydratedEntity,
 ) -> Result<(), PullError>
 where
     S: EntityRepository + ShadowRepository,
@@ -665,6 +682,46 @@ fn write_atomic(path: &Path, contents: String) -> Result<(), PullError> {
         message: error.to_string(),
     })?;
     Ok(())
+}
+
+fn write_binary_atomic(path: &Path, contents: &[u8]) -> Result<(), PullError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| PullError::WriteFile {
+            path: parent.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("afs-asset");
+    let temp_path = path.with_file_name(format!(".{file_name}.afs-tmp"));
+    std::fs::write(&temp_path, contents).map_err(|error| PullError::WriteFile {
+        path: temp_path.clone(),
+        message: error.to_string(),
+    })?;
+    std::fs::rename(&temp_path, path).map_err(|error| PullError::WriteFile {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    Ok(())
+}
+
+fn mount_relative_path(root: &Path, path: &Path) -> Result<PathBuf, PullError> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err(PullError::WriteFile {
+            path: path.to_path_buf(),
+            message: "hydrated asset path is not mount-relative".to_string(),
+        });
+    }
+
+    Ok(root.join(path))
 }
 
 fn rename_projected_path(from: &Path, to: &Path) -> Result<(), PullError> {

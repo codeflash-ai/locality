@@ -9,6 +9,7 @@ pub mod reconcile;
 pub mod runtime;
 pub mod scheduler;
 pub mod server;
+pub mod source;
 pub mod supervisor;
 pub mod virtual_fs;
 pub mod watcher;

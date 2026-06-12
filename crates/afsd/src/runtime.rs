@@ -30,15 +30,13 @@ use crate::DaemonConfig;
 use crate::execution::{DaemonEventReport, PushJob};
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationQueue};
 use crate::ipc::{DaemonActiveJobStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
-use crate::notion::{
-    ResolvedNotionSource, resolve_notion_connector_for_mount_id, resolve_notion_connector_for_path,
-};
 use crate::pull::run_pull_with_state_root;
 use crate::push::execute_push_job_with_content_root;
 use crate::reconcile::{
     DefaultFetchScheduleStrategy, ScheduledPullReport, reconcile_scheduled_pull_with_state_root,
 };
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
+use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
     VirtualFsItem, VirtualFsMaterializeOutcome, commit_virtual_fs_write, create_virtual_fs_file,
     materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
@@ -355,8 +353,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             }
         };
         let credentials = open_credential_store(&state_root);
-        let connector = match resolve_notion_connector_for_path(&store, credentials.as_ref(), &path)
-        {
+        let connector = match resolve_source_for_path(&store, credentials.as_ref(), &path) {
             Ok(connector) => connector,
             Err(error) => return DaemonResponse::error(error.code(), error.message()),
         };
@@ -379,8 +376,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         };
         let credentials = open_credential_store(&state_root);
         let connector =
-            match resolve_notion_connector_for_path(&store, credentials.as_ref(), &job.target_path)
-            {
+            match resolve_source_for_path(&store, credentials.as_ref(), &job.target_path) {
                 Ok(connector) => connector,
                 Err(error) => return DaemonResponse::error(error.code(), error.message()),
             };
@@ -400,7 +396,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let mut store = SqliteStateStore::open(state_root.clone()).map_err(AfsError::from)?;
         let mounts = store.load_mounts().map_err(AfsError::from)?;
         let credentials = open_credential_store(&state_root);
-        let source = ResolvedNotionSource::new(&store, credentials.as_ref(), &mounts)
+        let source = ResolvedSourceSet::new(&store, credentials.as_ref(), &mounts)
             .map_err(AfsError::from)?;
         let mut hydration = HydrationCollector::default();
         let report = reconcile_scheduled_pull_with_state_root(
@@ -429,7 +425,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let request = hydration_request_for_projection(&store, &state_root, request)?;
         let credentials = open_credential_store(&state_root);
         let connector =
-            resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &request.mount_id)
+            resolve_source_for_mount_id(&store, credentials.as_ref(), &request.mount_id)
                 .map_err(AfsError::from)?;
         let output_root = hydration_output_root_for_projection(&store, &state_root, &request)?;
         let mut executor = if let Some(output_root) = output_root {
@@ -509,9 +505,8 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             return Ok(0);
         }
         let credentials = open_credential_store(&state_root);
-        let connector =
-            resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id)
-                .map_err(AfsError::from)?;
+        let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id)
+            .map_err(AfsError::from)?;
         refresh_virtual_fs_children(&mut store, &connector, &mount_id, &container_identifier)
     }
 
@@ -530,11 +525,10 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             return response;
         }
         let credentials = open_credential_store(&state_root);
-        let connector =
-            match resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id) {
-                Ok(connector) => connector,
-                Err(error) => return DaemonResponse::error(error.code(), error.message()),
-            };
+        let connector = match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id) {
+            Ok(connector) => connector,
+            Err(error) => return DaemonResponse::error(error.code(), error.message()),
+        };
         let content_root = virtual_fs_content_root(&state_root, &mount_id);
         match materialize_virtual_fs_item_with_content_root(
             &mut store,
@@ -563,11 +557,10 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             return response;
         }
         let credentials = open_credential_store(&state_root);
-        let connector =
-            match resolve_notion_connector_for_mount_id(&store, credentials.as_ref(), &mount_id) {
-                Ok(connector) => connector,
-                Err(error) => return DaemonResponse::error(error.code(), error.message()),
-            };
+        let connector = match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id) {
+            Ok(connector) => connector,
+            Err(error) => return DaemonResponse::error(error.code(), error.message()),
+        };
         let content_root = virtual_fs_content_root(&state_root, &mount_id);
         let materialized = match materialize_virtual_fs_item_with_content_root(
             &mut store,

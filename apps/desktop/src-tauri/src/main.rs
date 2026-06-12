@@ -26,7 +26,7 @@ use afs_store::{
 };
 use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
 use afsd::ipc::{DaemonRequest, send_request};
-use afsd::notion::resolve_notion_connector_for_path;
+use afsd::source::{resolve_source_for_path, source_display_name};
 use afsd::virtual_fs::virtual_fs_content_root;
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -469,7 +469,7 @@ fn mount_summary(
         connector: mount.connector.clone(),
         workspace_name: connection
             .and_then(|connection| connection.workspace_name.clone())
-            .unwrap_or_else(|| connector_label(&mount.connector).to_string()),
+            .unwrap_or_else(|| connector_label(&mount.connector)),
         local_path: display_path(&mount_access_root(mount)),
         projection: projection_label(&mount.projection).to_string(),
         read_only: mount.read_only,
@@ -1084,12 +1084,8 @@ fn projection_label(projection: &ProjectionMode) -> &'static str {
     }
 }
 
-fn connector_label(connector: &str) -> &str {
-    match connector {
-        "notion" => "Notion",
-        "linear" => "Linear",
-        _ => "Workspace",
-    }
+fn connector_label(connector: &str) -> String {
+    source_display_name(connector)
 }
 
 fn open_in_file_manager(path: &Path) -> Result<(), String> {
@@ -1679,7 +1675,7 @@ fn push_target_direct(target: &Path) -> Result<PushReport, String> {
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open AFS state: {error}"))?;
     let credentials = open_credential_store(&state_root);
-    let connector = resolve_notion_connector_for_path(&store, credentials.as_ref(), target)
+    let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
         .map_err(|error| error.message())?;
 
     run_push_with_daemon(
