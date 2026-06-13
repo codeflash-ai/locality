@@ -720,6 +720,16 @@ fn current_block_rich_text(block: &BlockDto) -> AfsResult<Option<&[RichTextDto]>
             .map(|block| block.rich_text.as_slice()),
         "to_do" => block.to_do.as_ref().map(|block| block.rich_text.as_slice()),
         "code" => block.code.as_ref().map(|block| block.rich_text.as_slice()),
+        "bookmark" => block
+            .bookmark
+            .as_ref()
+            .map(|block| block.caption.as_slice()),
+        "embed" => block.embed.as_ref().map(|block| block.caption.as_slice()),
+        "image" => block.image.as_ref().map(|block| block.caption.as_slice()),
+        "video" => block.video.as_ref().map(|block| block.caption.as_slice()),
+        "file" => block.file.as_ref().map(|block| block.caption.as_slice()),
+        "pdf" => block.pdf.as_ref().map(|block| block.caption.as_slice()),
+        "audio" => block.audio.as_ref().map(|block| block.caption.as_slice()),
         "divider" | "equation" => return Ok(None),
         _ => return Ok(None),
     }
@@ -864,6 +874,28 @@ fn parse_supported_block(
             kind,
             json!({
                 "url": href,
+                "caption": rich_text_payload(label, preimage)?,
+            }),
+        ));
+    }
+
+    if let Some(kind @ ("image" | "video" | "file" | "pdf" | "audio")) = current_kind
+        && let Some((label, href)) = parse_media_markdown(kind, trimmed)
+    {
+        let kind = match kind {
+            "image" => "image",
+            "video" => "video",
+            "file" => "file",
+            "pdf" => "pdf",
+            "audio" => "audio",
+            _ => unreachable!("matched media block kind"),
+        };
+        return Ok(NotionBlockPatch::new(
+            kind,
+            json!({
+                "external": {
+                    "url": href,
+                },
                 "caption": rich_text_payload(label, preimage)?,
             }),
         ));
@@ -1277,6 +1309,9 @@ fn find_closing(input: &str, start: usize, marker: &str) -> Option<usize> {
 }
 
 fn parse_markdown_link(input: &str) -> Option<(&str, &str, usize)> {
+    if !input.starts_with('[') {
+        return None;
+    }
     let label_end = input.find("](")?;
     let href_start = label_end + 2;
     let href_end = input[href_start..]
@@ -1287,6 +1322,24 @@ fn parse_markdown_link(input: &str) -> Option<(&str, &str, usize)> {
         &input[href_start..href_end],
         href_end + 1,
     ))
+}
+
+fn parse_media_markdown<'a>(kind: &str, input: &'a str) -> Option<(&'a str, &'a str)> {
+    let (label, href, consumed) = match kind {
+        "image" => {
+            let link = input.strip_prefix('!')?;
+            let (label, href, consumed) = parse_markdown_link(link)?;
+            (label, href, consumed + 1)
+        }
+        "video" | "file" | "pdf" | "audio" => parse_markdown_link(input)?,
+        _ => return None,
+    };
+
+    if consumed == input.len() {
+        Some((label, href))
+    } else {
+        None
+    }
 }
 
 fn notion_page_id_from_href(href: &str) -> Option<String> {

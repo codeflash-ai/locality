@@ -347,6 +347,26 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
             "[Editable embed](https://example.com/editable-embed)",
             "[Editable embed changed](https://example.com/editable-embed-changed)",
         )
+        .replace(
+            "![Editable image](https://www.w3.org/Icons/w3c_home.png)",
+            "![Editable image changed](https://www.w3.org/Icons/w3c_home.png)",
+        )
+        .replace(
+            "[Editable video](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
+            "[Editable video changed](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
+        )
+        .replace(
+            "[Editable file](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
+            "[Editable file changed](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
+        )
+        .replace(
+            "[Editable PDF](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
+            "[Editable PDF changed](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
+        )
+        .replace(
+            "[Editable audio](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)",
+            "[Editable audio changed](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)",
+        )
         .replace("fn editable() {}", "fn editable_changed() {}")
         .replace("x+y=z", "x-y=z");
     fs::write(&page_path, edited).expect("write cyclic edits");
@@ -398,6 +418,11 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         "> [!NOTE]\n> Editable callout changed",
         "[Editable bookmark changed](https://example.com/editable-bookmark-changed)",
         "[Editable embed changed](https://example.com/editable-embed-changed)",
+        "![Editable image changed](https://www.w3.org/Icons/w3c_home.png)",
+        "[Editable video changed](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
+        "[Editable file changed](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
+        "[Editable PDF changed](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
+        "[Editable audio changed](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)",
         "fn editable_changed() {}",
         "x-y=z",
     ] {
@@ -1065,6 +1090,31 @@ fn supported_edit_children() -> Vec<Value> {
             "type": "embed",
             "embed": { "url": "https://example.com/editable-embed", "caption": rich_text_json("Editable embed") }
         }),
+        media_child(
+            "image",
+            "https://www.w3.org/Icons/w3c_home.png",
+            "Editable image",
+        ),
+        media_child(
+            "video",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "Editable video",
+        ),
+        media_child(
+            "file",
+            "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+            "Editable file",
+        ),
+        media_child(
+            "pdf",
+            "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+            "Editable PDF",
+        ),
+        media_child(
+            "audio",
+            "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
+            "Editable audio",
+        ),
         json!({
             "object": "block",
             "type": "code",

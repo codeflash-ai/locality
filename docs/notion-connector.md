@@ -111,7 +111,7 @@ Nested children are fetched recursively and rendered after their parent, except 
 The first Notion apply path is intentionally conservative:
 
 - supported operations: block update, block append, block archive, supported page property update, and database row creation;
-- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, and existing bookmark/embed URL blocks;
+- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, existing bookmark/embed URL blocks, and existing URL-backed media blocks;
 - supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, Notion page links, legacy `afs://` page links, and unchanged preimage mentions such as dates;
 - supported page property writes: title, rich text, number, select, status, multi-select, checkbox, date, URL, email, and phone;
 - new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug ~shortid.md` path;

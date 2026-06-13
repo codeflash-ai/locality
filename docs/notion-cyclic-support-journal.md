@@ -59,3 +59,22 @@ and what Markdown shape agents should expect.
 - **Verification:** Fixture apply tests assert the exact Notion update payloads,
   and the live mounted edit cycle updates bookmark/embed links then verifies the
   rendered Notion result through the API.
+
+### External Media URL Blocks
+
+- **Notion input:** `image`, `video`, `file`, `pdf`, and `audio` blocks with
+  `external.url` or Notion-hosted `file.url` plus optional captions.
+- **Markdown output:** Images render as Markdown image syntax; other media
+  blocks render as Markdown links:
+  - `![Image caption](https://example.com/image.png)`
+  - `[File caption](https://example.com/file.pdf)`
+- **Write behavior:** Existing media blocks can be edited by changing the
+  Markdown label or URL. Writes use Notion external media URLs; local uploads,
+  new media block appends, and local file attachment ownership remain deferred.
+- **Verification:** Fixture apply tests assert exact update payloads for every
+  media kind. The live mounted edit cycle updates media captions, pushes them,
+  and verifies the rendered Notion result through the API.
+- **Bug fixed during live testing:** The initial writer reused the create-block
+  media payload shape and sent `type: external` during block updates. The live
+  Notion update endpoint rejected that field, so the update payload now sends
+  only the nested `external.url` and `caption` fields for media block updates.

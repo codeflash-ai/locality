@@ -50,11 +50,11 @@ Sources used for the baseline:
 | `embed` | Markdown link | Yes for existing blocks | fixture, live read/write | Caption becomes link text; URL edits update the existing embed block. |
 | `bookmark` | Markdown link | Yes for existing blocks | fixture, live read/write | Caption becomes link text; URL edits update the existing bookmark block. |
 | `link_preview` | Directive | No | fixture | URL preserved when returned by the API; the current create-page API rejected it as a child block in live testing. |
-| `image` | Markdown image plus local image download | No | fixture, live read/download | Uses `external.url` or Notion-hosted `file.url`; URL-less payloads fall back to directives. |
-| `video` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |
-| `file` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |
-| `pdf` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |
-| `audio` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |
+| `image` | Markdown image plus local image download | Yes for existing URL blocks | fixture, live read/write/download | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. URL-less payloads fall back to directives. |
+| `video` | Markdown link | Yes for existing URL blocks | fixture, live read/write | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. Local download intentionally skipped for now. |
+| `file` | Markdown link | Yes for existing URL blocks | fixture, live read/write | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. Local download intentionally skipped for now. |
+| `pdf` | Markdown link | Yes for existing URL blocks | fixture, live read/write | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. Local download intentionally skipped for now. |
+| `audio` | Markdown link | Yes for existing URL blocks | fixture, live read/write | Uses `external.url` or Notion-hosted `file.url`; Markdown edits write external URLs. Local download intentionally skipped for now. |
 | `synced_block` | Directive wrapper; source block ID preserved when present | No | fixture | Rewriting synced blocks is lossy without source/copy semantics; live creation of an original synced block was rejected because Notion requires `synced_from`. |
 | `link_to_page` | Markdown link to Notion URL | Read/delete/move only | fixture, live read | Page/database target ID is preserved in the link target; direct retargeting is not a supported edit yet. |
 | `table_of_contents` | Directive | No | fixture, live read | Generated navigation block; no useful Markdown edit surface. |

@@ -38,7 +38,7 @@ Media blocks with a Notion `file.url` or `external.url` render as ordinary Markd
 
 When rendered through a filesystem-aware pull or reconcile path, image files are also downloaded into the mount-level `media/` directory so agents can open a local copy without cluttering the Markdown page directory. URL-less media payloads still render as directives, for example `::afs{id=image-id type=image title="Architecture diagram"}`.
 
-The first writer supports block bodies whose Markdown shape maps to one Notion block: paragraphs, headings, single list items, to-dos, quotes, code fences, dividers, display equations, and existing bookmark/embed URL blocks. It also parses the rich inline Markdown emitted by the renderer for bold, italic, strikethrough, underline, code, external links, equations, Notion page links, and legacy `afs://` page links. Unchanged preimage mentions, such as date mentions, are preserved during block updates; unsupported inline shapes fail rather than being flattened silently.
+The first writer supports block bodies whose Markdown shape maps to one Notion block: paragraphs, headings, single list items, to-dos, quotes, code fences, dividers, display equations, existing bookmark/embed URL blocks, and existing URL-backed media blocks. Media edits write external URLs; uploads and appending new media blocks are deferred. It also parses the rich inline Markdown emitted by the renderer for bold, italic, strikethrough, underline, code, external links, equations, Notion page links, and legacy `afs://` page links. Unchanged preimage mentions, such as date mentions, are preserved during block updates; unsupported inline shapes fail rather than being flattened silently.
 
 ## Database Rows
 

@@ -11,9 +11,10 @@ use afs_core::{AfsError, AfsResult};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
-    DatabaseDto, DateMentionDto, EquationBlockDto, LinkDto, MentionRichTextDto, PageDto,
-    PageListDto, PagePropertyDto, PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto,
-    RichTextDto, SelectOptionDto, TextRichTextDto, UrlBlockDto,
+    DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto, FileBlockDto, LinkDto,
+    MentionRichTextDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
+    RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto, TextRichTextDto,
+    UrlBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -831,6 +832,146 @@ fn apply_updates_bookmark_and_embed_blocks_from_markdown_links() {
 }
 
 #[test]
+fn apply_updates_external_media_blocks_from_markdown_links() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            media_block(
+                "image-1",
+                "image",
+                "https://example.com/original-image.png",
+                "Original image",
+            ),
+            media_block(
+                "video-1",
+                "video",
+                "https://example.com/original-video.mp4",
+                "Original video",
+            ),
+            media_block(
+                "file-1",
+                "file",
+                "https://example.com/original-file.pdf",
+                "Original file",
+            ),
+            media_block(
+                "pdf-1",
+                "pdf",
+                "https://example.com/original.pdf",
+                "Original PDF",
+            ),
+            media_block(
+                "audio-1",
+                "audio",
+                "https://example.com/original-audio.mp3",
+                "Original audio",
+            ),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("image-1"),
+                content: "![Updated image](https://example.com/updated-image.png)".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("video-1"),
+                content: "[Updated video](https://example.com/updated-video.mp4)".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("file-1"),
+                content: "[Updated file](https://example.com/updated-file.pdf)".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("pdf-1"),
+                content: "[Updated PDF](https://example.com/updated.pdf)".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("audio-1"),
+                content: "[Updated audio](https://example.com/updated-audio.mp3)".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply external media block updates");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "image-1".to_string(),
+                body: json!({
+                    "image": {
+                        "external": {
+                            "url": "https://example.com/updated-image.png",
+                        },
+                        "caption": rich_text_json("Updated image"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "video-1".to_string(),
+                body: json!({
+                    "video": {
+                        "external": {
+                            "url": "https://example.com/updated-video.mp4",
+                        },
+                        "caption": rich_text_json("Updated video"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "file-1".to_string(),
+                body: json!({
+                    "file": {
+                        "external": {
+                            "url": "https://example.com/updated-file.pdf",
+                        },
+                        "caption": rich_text_json("Updated file"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "pdf-1".to_string(),
+                body: json!({
+                    "pdf": {
+                        "external": {
+                            "url": "https://example.com/updated.pdf",
+                        },
+                        "caption": rich_text_json("Updated PDF"),
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "audio-1".to_string(),
+                body: json!({
+                    "audio": {
+                        "external": {
+                            "url": "https://example.com/updated-audio.mp3",
+                        },
+                        "caption": rich_text_json("Updated audio"),
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_updates_supported_page_properties() {
     let api = Arc::new(RecordingNotionApi::with_page_properties(
         "2026-06-10T00:00:00.000Z",
@@ -1494,6 +1635,27 @@ fn url_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
     match kind {
         "bookmark" => block.bookmark = payload,
         "embed" => block.embed = payload,
+        _ => {}
+    }
+    block
+}
+
+fn media_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
+    let mut block = block(id, kind);
+    let payload = Some(FileBlockDto {
+        kind: "external".to_string(),
+        external: Some(ExternalFileDto {
+            url: url.to_string(),
+        }),
+        file: None,
+        caption: rich_text(caption),
+    });
+    match kind {
+        "image" => block.image = payload,
+        "video" => block.video = payload,
+        "file" => block.file = payload,
+        "pdf" => block.pdf = payload,
+        "audio" => block.audio = payload,
         _ => {}
     }
     block
