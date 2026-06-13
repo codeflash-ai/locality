@@ -392,7 +392,10 @@ fn align_residual_by_order(
         .map(|(index, _)| index)
         .collect();
 
-    if residual_edited.len() > 1 && residual_shadow.len() > 1 {
+    if residual_edited.len() > 1
+        && residual_shadow.len() > 1
+        && !residual_kinds_match_in_order(shadow, edited_blocks, &residual_shadow, &residual_edited)
+    {
         return Some(PlanDegradation::new(
             PlanDegradationKind::AmbiguousBlockAlignment,
             "multiple edited and synced blocks could not be aligned safely; unmatched edited blocks will be appended and unmatched synced blocks archived",
@@ -405,6 +408,44 @@ fn align_residual_by_order(
     }
 
     None
+}
+
+fn residual_kinds_match_in_order(
+    shadow: &ShadowDocument,
+    edited_blocks: &[SegmentedBlock],
+    residual_shadow: &[usize],
+    residual_edited: &[usize],
+) -> bool {
+    residual_shadow.len() == residual_edited.len()
+        && residual_shadow
+            .iter()
+            .zip(residual_edited)
+            .all(|(shadow_index, edited_index)| {
+                same_alignment_kind(
+                    &shadow.blocks[*shadow_index].kind,
+                    &edited_blocks[*edited_index].kind,
+                )
+            })
+}
+
+fn same_alignment_kind(left: &MarkdownBlockKind, right: &MarkdownBlockKind) -> bool {
+    match (left, right) {
+        (
+            MarkdownBlockKind::TableWithRows {
+                has_column_header: left_column,
+                has_row_header: left_row,
+                ..
+            },
+            MarkdownBlockKind::TableWithRows {
+                has_column_header: right_column,
+                has_row_header: right_row,
+                ..
+            },
+        ) => left_column == right_column && left_row == right_row,
+        (MarkdownBlockKind::TableWithRows { .. }, MarkdownBlockKind::Table)
+        | (MarkdownBlockKind::Table, MarkdownBlockKind::TableWithRows { .. }) => true,
+        (left, right) => left == right,
+    }
 }
 
 fn should_move_block(

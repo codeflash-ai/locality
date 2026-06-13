@@ -84,7 +84,12 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
     assert!(rendered.document.body.contains("type=table_of_contents"));
     assert!(rendered.document.body.contains("type=breadcrumb"));
     assert!(rendered.document.body.contains("type=column_list"));
-    assert!(rendered.document.body.contains("type=link_to_page"));
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[Linked page](https://www.notion.so/")
+    );
     assert!(rendered.document.body.contains("type=child_page"));
     assert!(
         rendered.media_assets.iter().any(|asset| {

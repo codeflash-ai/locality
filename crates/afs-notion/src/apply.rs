@@ -1167,10 +1167,10 @@ impl InlineParser<'_> {
         if rest.starts_with('[')
             && let Some((label, href, consumed)) = parse_markdown_link(rest)
         {
-            if let Some(id) = href.strip_prefix("afs://") {
+            if let Some(id) = notion_page_id_from_href(href) {
                 return Ok(Some((
                     vec![RichTextWritePart::PageMention {
-                        id: id.to_string(),
+                        id,
                         annotations: InlineAnnotations::default(),
                     }],
                     consumed,
@@ -1248,6 +1248,59 @@ fn parse_markdown_link(input: &str) -> Option<(&str, &str, usize)> {
         &input[href_start..href_end],
         href_end + 1,
     ))
+}
+
+fn notion_page_id_from_href(href: &str) -> Option<String> {
+    if let Some(id) = href.strip_prefix("afs://") {
+        return Some(id.to_string());
+    }
+
+    let trimmed = href.trim();
+    if !is_notion_url(trimmed) {
+        return None;
+    }
+
+    let without_query = trimmed
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    without_query
+        .rsplit('/')
+        .find_map(notion_id_from_url_segment)
+}
+
+fn is_notion_url(href: &str) -> bool {
+    let lower = href.to_ascii_lowercase();
+    lower.starts_with("https://www.notion.so/")
+        || lower.starts_with("https://notion.so/")
+        || lower.starts_with("https://app.notion.com/")
+}
+
+fn notion_id_from_url_segment(segment: &str) -> Option<String> {
+    if segment.is_empty() {
+        return None;
+    }
+
+    let without_hyphens = segment.replace('-', "");
+    if without_hyphens.len() == 32
+        && without_hyphens
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Some(without_hyphens);
+    }
+
+    let trailing_hex = segment
+        .chars()
+        .rev()
+        .take_while(|character| character.is_ascii_hexdigit())
+        .collect::<Vec<_>>();
+    if trailing_hex.len() >= 32 {
+        return Some(trailing_hex.iter().take(32).rev().copied().collect());
+    }
+
+    None
 }
 
 fn unescape_markdown_text(value: &str) -> String {
@@ -1415,7 +1468,7 @@ fn mention_to_markdown(part: &RichTextDto) -> (String, bool) {
                 (
                     markdown_link_preserving_whitespace(
                         &mention_label(part),
-                        &format!("afs://{}", page.id),
+                        &notion_object_url(&page.id),
                     ),
                     true,
                 )
@@ -1428,7 +1481,7 @@ fn mention_to_markdown(part: &RichTextDto) -> (String, bool) {
                 (
                     markdown_link_preserving_whitespace(
                         &mention_label(part),
-                        &format!("afs://{}", database.id),
+                        &notion_object_url(&database.id),
                     ),
                     true,
                 )
@@ -1555,6 +1608,18 @@ fn markdown_link_preserving_whitespace(label: &str, href: &str) -> String {
     wrap_preserving_whitespace(label, |value| {
         format!("[{}]({href})", escape_markdown_link_label(value))
     })
+}
+
+fn notion_object_url(id: &str) -> String {
+    format!("https://www.notion.so/{}", notion_url_id(id))
+}
+
+fn notion_url_id(id: &str) -> String {
+    let hex = id
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    if hex.len() == 32 { hex } else { id.to_string() }
 }
 
 fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) -> String {

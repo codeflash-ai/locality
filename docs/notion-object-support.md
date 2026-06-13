@@ -56,7 +56,7 @@ Sources used for the baseline:
 | `pdf` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |
 | `audio` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |
 | `synced_block` | Directive wrapper; source block ID preserved when present | No | fixture | Rewriting synced blocks is lossy without source/copy semantics; live creation of an original synced block was rejected because Notion requires `synced_from`. |
-| `link_to_page` | Directive | No | fixture, live read | Page/database target ID preserved. |
+| `link_to_page` | Markdown link to Notion URL | Read/delete/move only | fixture, live read | Page/database target ID is preserved in the link target; direct retargeting is not a supported edit yet. |
 | `table_of_contents` | Directive | No | fixture, live read | Generated navigation block; no useful Markdown edit surface. |
 | `breadcrumb` | Directive | No | fixture, live read | Generated navigation block; no useful Markdown edit surface. |
 | `column_list` | Directive wrapper; children render below it | No | fixture, live read | Layout is anchored; child content remains readable. |
@@ -78,8 +78,8 @@ Sources used for the baseline:
 | External text link | Markdown link | Yes | fixture, live | Link URL is preserved. |
 | Equation span | Inline math | Yes | fixture, live | `$...$`. |
 | Bold, italic, strikethrough, underline, code | Markdown/HTML inline formatting | Yes for emitted shapes | fixture, live | Underline uses `<u>`. |
-| Page mention | `afs://` link | Read; write via supported `afs://` parsing path | fixture | Stable ID is preserved. |
-| Database mention | `afs://` link | Read only in current live suite | fixture | Stable ID is preserved. |
+| Page mention | Markdown link to Notion URL | Read; write via Notion-hosted URL or legacy `afs://` parsing path | fixture, live | Stable ID is preserved; external UUID-shaped links remain ordinary links. |
+| Database mention | Markdown link to Notion URL | Read only in current live suite | fixture | Stable ID is preserved. |
 | User mention | Plain `@name`/fallback | Read only | fixture | Needs identity lookup before safe writes. |
 | Date mention | Plain date/range text | Read only | fixture, live | Needs typed date mention parser before safe writes. |
 | Link preview mention | Markdown link | Read only | fixture | Preserves URL. |

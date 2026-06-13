@@ -406,17 +406,29 @@ fn synced_block_directive(block: &BlockDto, payload: Option<&SyncedBlockDto>) ->
 }
 
 fn link_to_page_directive(block: &BlockDto, payload: Option<&LinkToPageBlockDto>) -> RenderedBlock {
-    let attrs = payload
-        .and_then(|payload| match payload.kind.as_str() {
-            "page_id" => payload.page_id.clone().map(|id| vec![("page_id", id)]),
-            "database_id" => payload
-                .database_id
-                .clone()
-                .map(|id| vec![("database_id", id)]),
-            _ => None,
-        })
-        .unwrap_or_default();
-    directive_block_with_attrs(block, "link_to_page", attrs)
+    let Some(payload) = payload else {
+        return directive_block(block, "malformed_link_to_page", None);
+    };
+
+    let link = match payload.kind.as_str() {
+        "page_id" => payload
+            .page_id
+            .as_deref()
+            .map(|id| ("Linked page", notion_object_url(id))),
+        "database_id" => payload
+            .database_id
+            .as_deref()
+            .map(|id| ("Linked database", notion_object_url(id))),
+        _ => None,
+    };
+
+    match link {
+        Some((label, href)) => rendered_block(
+            markdown_link_preserving_whitespace(label, &href),
+            Some(RemoteId::new(block.id.clone())),
+        ),
+        None => directive_block(block, "malformed_link_to_page", None),
+    }
 }
 
 fn titled_directive(
@@ -695,7 +707,7 @@ fn mention_to_markdown(part: &RichTextDto) -> (String, bool) {
                 (
                     markdown_link_preserving_whitespace(
                         &mention_label(part),
-                        &format!("afs://{}", page.id),
+                        &notion_object_url(&page.id),
                     ),
                     true,
                 )
@@ -708,7 +720,7 @@ fn mention_to_markdown(part: &RichTextDto) -> (String, bool) {
                 (
                     markdown_link_preserving_whitespace(
                         &mention_label(part),
-                        &format!("afs://{}", database.id),
+                        &notion_object_url(&database.id),
                     ),
                     true,
                 )
@@ -830,6 +842,18 @@ fn markdown_link_preserving_whitespace(label: &str, href: &str) -> String {
     wrap_preserving_whitespace(label, |value| {
         format!("[{}]({href})", escape_markdown_link_label(value))
     })
+}
+
+fn notion_object_url(id: &str) -> String {
+    format!("https://www.notion.so/{}", notion_url_id(id))
+}
+
+fn notion_url_id(id: &str) -> String {
+    let hex = id
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    if hex.len() == 32 { hex } else { id.to_string() }
 }
 
 fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) -> String {

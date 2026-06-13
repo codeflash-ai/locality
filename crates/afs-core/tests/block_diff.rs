@@ -138,11 +138,8 @@ fn editing_a_directive_fails_validation_instead_of_planning() {
 
 #[test]
 fn ambiguous_residual_alignment_is_explicitly_degraded() {
-    let shadow = shadow(
-        "First paragraph.\n\nSecond paragraph.",
-        ["block-1", "block-2"],
-    );
-    let edited = CanonicalDocument::new("", "First rewrite.\n\nSecond rewrite.");
+    let shadow = shadow("First paragraph.\n\n- Second item", ["block-1", "block-2"]);
+    let edited = CanonicalDocument::new("", "- First rewrite.\n\nSecond rewrite.");
 
     let plan = BlockDiffEngine::new()
         .plan_push(&shadow, &edited)
@@ -155,6 +152,48 @@ fn ambiguous_residual_alignment_is_explicitly_degraded() {
     assert_eq!(
         plan.degradations[0].kind,
         PlanDegradationKind::AmbiguousBlockAlignment
+    );
+}
+
+#[test]
+fn residual_alignment_updates_same_kind_sequence_without_archive_recreate() {
+    let shadow = shadow(
+        "# Heading\n\nParagraph.\n\n- Item\n\n```rust\nfn old() {}\n```",
+        ["heading-1", "paragraph-1", "list-1", "code-1"],
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "# Heading changed\n\nParagraph changed.\n\n- Item changed\n\n```rust\nfn new() {}\n```",
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(plan.summary.blocks_updated, 4);
+    assert_eq!(plan.summary.blocks_created, 0);
+    assert_eq!(plan.summary.blocks_archived, 0);
+    assert!(plan.degradations.is_empty());
+    assert_eq!(
+        plan.operations,
+        vec![
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("heading-1"),
+                content: "# Heading changed".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("paragraph-1"),
+                content: "Paragraph changed.".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("list-1"),
+                content: "- Item changed".to_string(),
+            },
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("code-1"),
+                content: "```rust\nfn new() {}\n```".to_string(),
+            },
+        ]
     );
 }
 

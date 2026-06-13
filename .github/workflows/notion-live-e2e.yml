@@ -30,4 +30,4 @@ jobs:
       - name: Run connector live integrity tests
         run: cargo test -p afs-notion --test live_integrity -- --ignored --test-threads=1
       - name: Run mounted workflow live e2e
-        run: cargo test -p afs-cli --test e2e_push_workflow live_scratch_page_mount_edit_push_verifies_notion -- --ignored --exact --test-threads=1
+        run: cargo test -p afs-cli --test e2e_push_workflow live_ -- --ignored --test-threads=1

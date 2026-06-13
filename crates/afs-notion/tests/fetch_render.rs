@@ -257,7 +257,7 @@ fn render_richer_notion_block_coverage() {
             "::afs{id=bookmark-1 type=bookmark title=\"Bookmark caption\" url=\"https://example.com/bookmark\"}\n\n",
             "![Image caption](https://example.com/image.png)\n\n",
             "::afs{id=synced-1 type=synced_block source_block_id=\"source-block-1\"}\n\n",
-            "::afs{id=link-to-page-1 type=link_to_page page_id=\"target-page-1\"}\n\n",
+            "[Linked page](https://www.notion.so/target-page-1)\n\n",
             "::afs{id=toc-1 type=table_of_contents color=\"default\"}\n\n",
             "::afs{id=breadcrumb-1 type=breadcrumb}\n\n",
             "::afs{id=column-list-1 type=column_list}\n\n",
@@ -560,8 +560,8 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "[Audio](https://example.com/audio.mp3)",
         "::afs{id=synced-original-1 type=synced_block}",
         "::afs{id=synced-copy-1 type=synced_block source_block_id=\"source-block-1\"}",
-        "::afs{id=link-page-1 type=link_to_page page_id=\"target-page-1\"}",
-        "::afs{id=link-db-1 type=link_to_page database_id=\"target-db-1\"}",
+        "[Linked page](https://www.notion.so/target-page-1)",
+        "[Linked database](https://www.notion.so/target-db-1)",
         "::afs{id=toc-1 type=table_of_contents color=\"default\"}",
         "::afs{id=breadcrumb-1 type=breadcrumb}",
         "::afs{id=column-list-1 type=column_list}",
@@ -832,7 +832,7 @@ fn render_rich_text_annotations_links_mentions_and_equations() {
 
     assert_eq!(
         rendered.document.body,
-        "**Bold** _italic_ ~~strike~~ <u>underline</u> `code` [external link](https://example.com/) after link. 2026-06-10 and inline equation $E=mc^2$ plus page mention [Roadmap](afs://page-1) database mention [Tasks](afs://database-1) user mention @Ada preview [Example](https://example.com/preview) unknown Fallback\n"
+        "**Bold** _italic_ ~~strike~~ <u>underline</u> `code` [external link](https://example.com/) after link. 2026-06-10 and inline equation $E=mc^2$ plus page mention [Roadmap](https://www.notion.so/page-1) database mention [Tasks](https://www.notion.so/database-1) user mention @Ada preview [Example](https://example.com/preview) unknown Fallback\n"
     );
 }
 

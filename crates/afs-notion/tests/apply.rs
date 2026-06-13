@@ -605,7 +605,7 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
         vec![RemoteId::new("page-1")],
         vec![PushOperation::UpdateBlock {
             block_id: RemoteId::new("paragraph-1"),
-            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and $E=mc^2$ [Roadmap](afs://page-2)".to_string(),
+            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and $E=mc^2$ [Hex docs](https://example.com/22222222222222222222222222222222) [Roadmap](https://www.notion.so/Project-22222222222222222222222222222222)".to_string(),
         }],
     );
     let push_id = PushId("push-1".to_string());
@@ -694,11 +694,26 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
                             },
                         },
                         {
+                            "type": "text",
+                            "text": {
+                                "content": "Hex docs",
+                                "link": {
+                                    "url": "https://example.com/22222222222222222222222222222222",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " ",
+                            },
+                        },
+                        {
                             "type": "mention",
                             "mention": {
                                 "type": "page",
                                 "page": {
-                                    "id": "page-2",
+                                    "id": "22222222222222222222222222222222",
                                 },
                             },
                         },
