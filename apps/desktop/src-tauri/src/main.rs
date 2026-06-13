@@ -38,6 +38,10 @@ use tauri::{
 };
 use tauri_plugin_dialog::DialogExt;
 
+const DESKTOP_LAUNCHD_LABEL: &str = "ai.codeflash.afs.desktop";
+#[cfg(target_os = "macos")]
+const DESKTOP_DEV_LAUNCHD_LABEL: &str = "ai.codeflash.afs.desktop.dev";
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopSnapshot {
@@ -348,11 +352,53 @@ fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> ActionRe
 
 #[tauri::command]
 fn quit_completely(app: AppHandle) -> ActionReport {
-    app.exit(0);
+    quit_completely_for_app(&app);
     ActionReport {
         ok: true,
         message: "AFS is quitting.".to_string(),
     }
+}
+
+fn quit_completely_for_app(app: &AppHandle) {
+    prepare_complete_quit();
+    app.exit(0);
+}
+
+fn prepare_complete_quit() {
+    #[cfg(target_os = "macos")]
+    remove_current_desktop_launchd_job();
+}
+
+#[cfg(target_os = "macos")]
+fn remove_current_desktop_launchd_job() {
+    let Ok(service_name) = std::env::var("XPC_SERVICE_NAME") else {
+        return;
+    };
+    if !is_desktop_launchd_service(&service_name) {
+        return;
+    }
+
+    match Command::new("launchctl")
+        .arg("remove")
+        .arg(&service_name)
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("afs desktop could not remove launchd job `{service_name}`: {status}");
+        }
+        Err(error) => {
+            eprintln!("afs desktop could not remove launchd job `{service_name}`: {error}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_desktop_launchd_service(service_name: &str) -> bool {
+    matches!(
+        service_name,
+        DESKTOP_LAUNCHD_LABEL | DESKTOP_DEV_LAUNCHD_LABEL
+    )
 }
 
 fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
@@ -915,7 +961,7 @@ fn launch_agent_plist(executable: &Path) -> String {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>ai.codeflash.afs.desktop</string>
+  <string>{DESKTOP_LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
     <string>{executable}</string>
@@ -1742,6 +1788,8 @@ mod tests {
 
     use afs_store::{ConnectionId, ConnectionRecord};
 
+    #[cfg(target_os = "macos")]
+    use super::is_desktop_launchd_service;
     use super::{
         TrayVisualState, connection_metadata_changed, notion_id_from_url, should_hide_tray_popover,
         tray_icon_image, validate_mount_root,
@@ -1845,6 +1893,17 @@ mod tests {
         assert!(!connection_metadata_changed(
             Some(&previous),
             Some(&previous)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn desktop_launchd_service_detection_is_limited_to_desktop_jobs() {
+        assert!(is_desktop_launchd_service("ai.codeflash.afs.desktop"));
+        assert!(is_desktop_launchd_service("ai.codeflash.afs.desktop.dev"));
+        assert!(!is_desktop_launchd_service("ai.codeflash.afs.afsd"));
+        assert!(!is_desktop_launchd_service(
+            "application.ai.codeflash.afs.123.456"
         ));
     }
 
@@ -2086,7 +2145,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             "hide_menubar" => {
                 let _ = set_menu_bar_visible(app, false);
             }
-            "quit_completely" => app.exit(0),
+            "quit_completely" => quit_completely_for_app(app),
             _ => {}
         })
         .build(app)?;
