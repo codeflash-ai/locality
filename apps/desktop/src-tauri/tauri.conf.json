@@ -46,7 +46,8 @@
       "signingIdentity": "-",
       "files": {
         "PlugIns/AgentFSFileProvider.appex": "macos/AgentFSFileProvider/AgentFSFileProvider.appex",
-        "MacOS/agentfs-file-providerctl": "macos/AgentFSFileProvider/agentfs-file-providerctl"
+        "MacOS/agentfs-file-providerctl": "macos/AgentFSFileProvider/agentfs-file-providerctl",
+        "MacOS/afsd": "macos/afsd"
       },
       "dmg": {
         "windowSize": {

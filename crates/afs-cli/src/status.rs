@@ -14,6 +14,7 @@ use afs_store::{
     ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
     VirtualMutationRepository,
 };
+use afsd::file_provider as daemon_file_provider;
 use afsd::virtual_fs::virtual_fs_content_path;
 use serde::Serialize;
 
@@ -585,13 +586,6 @@ fn classify_virtual_page_state<S>(
 where
     S: ShadowRepository,
 {
-    if matches!(
-        entity.hydration,
-        HydrationState::Virtual | HydrationState::Stub
-    ) {
-        return (StatusState::Stub, Vec::new());
-    }
-
     let content_path = match virtual_fs_content_path(state_root, &mount.mount_id, &entity.path) {
         Ok(path) => path,
         Err(error) => {
@@ -604,6 +598,13 @@ where
             );
         }
     };
+    if matches!(
+        entity.hydration,
+        HydrationState::Virtual | HydrationState::Stub
+    ) && !content_path.exists()
+    {
+        return (StatusState::Stub, Vec::new());
+    }
     if !content_path.exists() {
         return (
             StatusState::Missing,
@@ -920,57 +921,13 @@ fn default_state_root() -> PathBuf {
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
-    mounts
-        .iter()
-        .filter(|mount| path_starts_with_mount(path, mount))
-        .max_by_key(|mount| mount.root.components().count())
-}
-
-fn path_starts_with_mount(path: &Path, mount: &MountConfig) -> bool {
-    if path.starts_with(&mount.root) {
-        return true;
-    }
-
-    let Some(canonical_path) = canonicalize_existing_prefix(path) else {
-        return false;
-    };
-    let Ok(canonical_root) = std::fs::canonicalize(&mount.root) else {
-        return false;
-    };
-
-    canonical_path.starts_with(canonical_root)
-}
-
-fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
-    let mut current = path;
-    let mut suffix = PathBuf::new();
-
-    loop {
-        if let Ok(canonical_current) = std::fs::canonicalize(current) {
-            return Some(canonical_current.join(suffix));
-        }
-
-        let file_name = current.file_name()?;
-        suffix = PathBuf::from(file_name).join(suffix);
-        current = current.parent()?;
-    }
+    daemon_file_provider::find_mount_for_path(mounts, path).map(|(mount, _)| mount)
 }
 
 fn relative_entity_path(mount: &MountConfig, absolute_path: &Path) -> Result<PathBuf, StatusError> {
-    if let Ok(relative_path) = absolute_path.strip_prefix(&mount.root) {
-        return Ok(relative_path.to_path_buf());
-    }
-
-    let Some(canonical_path) = canonicalize_existing_prefix(absolute_path) else {
-        return Err(StatusError::MountNotFound(absolute_path.to_path_buf()));
-    };
-    let canonical_root = std::fs::canonicalize(&mount.root)
-        .map_err(|_| StatusError::MountNotFound(absolute_path.to_path_buf()))?;
-
-    canonical_path
-        .strip_prefix(canonical_root)
-        .map(Path::to_path_buf)
-        .map_err(|_| StatusError::MountNotFound(absolute_path.to_path_buf()))
+    daemon_file_provider::match_mount_path(mount, absolute_path)
+        .map(|matched| matched.relative_path)
+        .ok_or_else(|| StatusError::MountNotFound(absolute_path.to_path_buf()))
 }
 
 fn entity_kind_name(kind: &EntityKind) -> &str {

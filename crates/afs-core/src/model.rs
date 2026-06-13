@@ -62,7 +62,11 @@ impl HydrationState {
         matches!(
             (self, next),
             (Virtual, Stub)
+                | (Virtual, Dirty)
+                | (Virtual, Conflicted)
                 | (Stub, Hydrated)
+                | (Stub, Dirty)
+                | (Stub, Conflicted)
                 | (Hydrated, Dirty)
                 | (Hydrated, Conflicted)
                 | (Dirty, Hydrated)

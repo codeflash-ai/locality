@@ -320,9 +320,16 @@ fn file_provider_helper_path() -> Option<PathBuf> {
     }
 
     candidates.push(PathBuf::from(
+        "/Applications/AFS.app/Contents/MacOS/agentfs-file-providerctl",
+    ));
+    candidates.push(PathBuf::from(
         "/Applications/AgentFS.app/Contents/MacOS/agentfs-file-providerctl",
     ));
     if let Ok(home) = std::env::var("HOME") {
+        candidates.push(
+            PathBuf::from(&home)
+                .join("Applications/AFS.app/Contents/MacOS/agentfs-file-providerctl"),
+        );
         candidates.push(
             PathBuf::from(home)
                 .join("Applications/AgentFS.app/Contents/MacOS/agentfs-file-providerctl"),

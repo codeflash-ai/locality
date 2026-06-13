@@ -516,20 +516,10 @@ where
         .is_some_and(has_unresolved_conflict_markers);
 
     if contains_conflict_markers {
-        if entity.hydration.can_transition_to(&HydrationState::Dirty) {
-            entity.hydration = HydrationState::Dirty;
-        }
-        if entity
-            .hydration
-            .can_transition_to(&HydrationState::Conflicted)
-        {
-            entity.hydration = HydrationState::Conflicted;
-        }
+        entity.hydration = HydrationState::Conflicted;
     } else if matches_shadow {
         entity.hydration = HydrationState::Hydrated;
-    } else if entity.hydration == HydrationState::Conflicted
-        || entity.hydration.can_transition_to(&HydrationState::Dirty)
-    {
+    } else {
         entity.hydration = HydrationState::Dirty;
     }
     store.save_entity(entity.clone()).map_err(AfsError::from)?;
@@ -1853,6 +1843,89 @@ mod tests {
                 .expect("entity")
                 .hydration,
             HydrationState::Dirty
+        );
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn commit_write_marks_stub_entity_dirty() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let state_root = temp_root("afs-virtual-fs-commit-stub");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save entity");
+
+        let report =
+            commit_virtual_fs_write(&mut store, &content_root, &mount_id, "page-1", b"edited")
+                .expect("commit write");
+
+        assert_eq!(report.hydration, HydrationState::Dirty);
+        assert_eq!(
+            store
+                .get_entity(&mount_id, &remote_id)
+                .expect("get entity")
+                .expect("entity")
+                .hydration,
+            HydrationState::Dirty
+        );
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn commit_write_marks_stub_conflict_conflicted() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let state_root = temp_root("afs-virtual-fs-commit-stub-conflict");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save entity");
+
+        let report = commit_virtual_fs_write(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "page-1",
+            b"<<<<<<< LOCAL\nlocal\n=======\nremote\n>>>>>>> REMOTE\n",
+        )
+        .expect("commit write");
+
+        assert_eq!(report.hydration, HydrationState::Conflicted);
+        assert_eq!(
+            store
+                .get_entity(&mount_id, &remote_id)
+                .expect("get entity")
+                .expect("entity")
+                .hydration,
+            HydrationState::Conflicted
         );
         let _ = std::fs::remove_dir_all(state_root);
     }

@@ -1,7 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
@@ -29,6 +33,7 @@ use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
 use afsd::ipc::{DaemonRequest, send_request};
 use afsd::source::{resolve_source_for_path, source_display_name};
 use afsd::virtual_fs::virtual_fs_content_root;
+use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindowBuilder,
@@ -87,7 +92,7 @@ struct DesktopSettings {
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
-            launch_at_login: false,
+            launch_at_login: true,
             show_menu_bar: true,
         }
     }
@@ -157,6 +162,7 @@ struct DesktopSettingChange {
 }
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 enum TrayVisualState {
@@ -166,8 +172,10 @@ enum TrayVisualState {
 }
 
 #[tauri::command]
-fn desktop_snapshot() -> DesktopSnapshot {
-    load_desktop_snapshot().unwrap_or_else(|_| sample_snapshot())
+fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
+    let snapshot = load_desktop_snapshot().unwrap_or_else(|_| sample_snapshot());
+    refresh_tray_icon_for_snapshot(&app, &snapshot);
+    snapshot
 }
 
 #[tauri::command]
@@ -179,6 +187,7 @@ async fn connect_notion(app: AppHandle) -> ActionReport {
                 .to_string(),
         };
     }
+    clear_notion_login_link();
 
     let state_root = default_state_root();
     let result =
@@ -198,6 +207,14 @@ async fn connect_notion(app: AppHandle) -> ActionReport {
         refresh_tray_icon(&app);
     }
     report
+}
+
+#[tauri::command]
+fn notion_login_link() -> Option<String> {
+    notion_login_link_slot()
+        .lock()
+        .ok()
+        .and_then(|link| link.clone())
 }
 
 #[tauri::command]
@@ -315,6 +332,18 @@ fn open_path(path: String) -> ActionReport {
         Ok(()) => ActionReport {
             ok: true,
             message: format!("Opened {}", expanded.display()),
+        },
+        Err(message) => ActionReport { ok: false, message },
+    }
+}
+
+#[tauri::command]
+fn reveal_path(path: String) -> ActionReport {
+    let expanded = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+    match reveal_in_file_manager(&expanded) {
+        Ok(()) => ActionReport {
+            ok: true,
+            message: format!("Revealed {}", expanded.display()),
         },
         Err(message) => ActionReport { ok: false, message },
     }
@@ -619,22 +648,34 @@ fn health_state(
 }
 
 fn refresh_tray_icon(app: &AppHandle) {
-    let (state, tooltip) = load_desktop_snapshot()
-        .map(|snapshot| {
-            (
-                tray_state_for_health(&snapshot.health.state),
-                tray_tooltip(&snapshot),
-            )
-        })
-        .unwrap_or((
-            TrayVisualState::Reconnect,
-            "AFS needs attention".to_string(),
-        ));
+    if let Ok(snapshot) = load_desktop_snapshot() {
+        refresh_tray_icon_for_snapshot(app, &snapshot);
+        return;
+    }
 
+    set_tray_icon_and_tooltip(app, TrayVisualState::Reconnect, "AFS needs attention");
+}
+
+fn refresh_tray_icon_for_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
+    set_tray_icon_and_tooltip(
+        app,
+        tray_state_for_health(&snapshot.health.state),
+        &tray_tooltip(snapshot),
+    );
+    sync_tray_visibility(app, &snapshot.settings);
+}
+
+fn set_tray_icon_and_tooltip(app: &AppHandle, state: TrayVisualState, tooltip: &str) {
     if let Some(tray) = app.tray_by_id("main") {
         let is_template = matches!(state, TrayVisualState::Ready);
         let _ = tray.set_icon_with_as_template(Some(tray_icon_image(state)), is_template);
-        let _ = tray.set_tooltip(Some(tooltip));
+        let _ = tray.set_tooltip(Some(tooltip.to_string()));
+    }
+}
+
+fn sync_tray_visibility(app: &AppHandle, settings: &DesktopSettings) {
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_visible(settings.show_menu_bar);
     }
 }
 
@@ -660,8 +701,6 @@ fn tray_tooltip(snapshot: &DesktopSnapshot) -> String {
 fn tray_icon_image(state: TrayVisualState) -> Image<'static> {
     let size = 36;
     let mut rgba = vec![0; size * size * 4];
-    let ink = [17, 24, 39, 255];
-    let stroke = 3.4;
     let paths = [
         ((8.6, 26.8), (5.8, 18.0)),
         ((5.8, 18.0), (8.6, 9.2)),
@@ -672,8 +711,14 @@ fn tray_icon_image(state: TrayVisualState) -> Image<'static> {
         ((15.1, 18.0), (20.9, 18.0)),
     ];
 
+    if matches!(state, TrayVisualState::Review | TrayVisualState::Reconnect) {
+        for (start, end) in paths {
+            draw_line(&mut rgba, size, start, end, 5.2, [255, 255, 255, 255]);
+        }
+    }
+
     for (start, end) in paths {
-        draw_line(&mut rgba, size, start, end, stroke, ink);
+        draw_line(&mut rgba, size, start, end, 3.4, [17, 24, 39, 255]);
     }
 
     match state {
@@ -776,6 +821,16 @@ fn locate_notion_url(url: &str) -> Result<LocatedItem, String> {
     let notion_id = notion_id_from_url(url)
         .ok_or_else(|| "Paste a Notion page or database URL.".to_string())?;
     for mount in &mounts {
+        let entities = store
+            .list_entities(&mount.mount_id)
+            .map_err(|error| format!("Could not load indexed Notion pages: {error}"))?;
+        if let Some(entity) = entities.iter().find(|entity| {
+            compact_notion_id(&entity.remote_id.0) == notion_id
+                || compact_path_id(&entity.path) == notion_id
+        }) {
+            return Ok(located_item_for_entity(mount, entity));
+        }
+
         if mount
             .remote_root_id
             .as_ref()
@@ -788,16 +843,6 @@ fn locate_notion_url(url: &str) -> Result<LocatedItem, String> {
                 state: "ready".to_string(),
             });
         }
-
-        let entities = store
-            .list_entities(&mount.mount_id)
-            .map_err(|error| format!("Could not load indexed Notion pages: {error}"))?;
-        if let Some(entity) = entities.iter().find(|entity| {
-            compact_notion_id(&entity.remote_id.0) == notion_id
-                || compact_path_id(&entity.path) == notion_id
-        }) {
-            return Ok(located_item_for_entity(mount, entity));
-        }
     }
 
     Err(
@@ -807,12 +852,27 @@ fn locate_notion_url(url: &str) -> Result<LocatedItem, String> {
 }
 
 fn located_item_for_entity(mount: &MountConfig, entity: &EntityRecord) -> LocatedItem {
+    let local_path = located_entity_path(entity);
     LocatedItem {
         title: entity.title.clone(),
         kind: format!("{:?}", entity.kind),
-        local_path: display_path(&mount_access_root(mount).join(&entity.path)),
+        local_path: display_path(&mount_access_root(mount).join(local_path)),
         state: "ready".to_string(),
     }
+}
+
+fn located_entity_path(entity: &EntityRecord) -> PathBuf {
+    if entity.kind == afs_core::model::EntityKind::Page
+        && entity
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("md")
+    {
+        return entity.path.with_extension("md");
+    }
+
+    entity.path.clone()
 }
 
 fn desktop_settings() -> DesktopSettings {
@@ -870,6 +930,9 @@ fn set_menu_bar_visible(app: &AppHandle, visible: bool) -> Result<ActionReport, 
 
 fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
     if enabled {
+        if running_from_read_only_volume()? {
+            return Err("Move AFS to Applications before enabling launch at login.".to_string());
+        }
         install_launch_agent()?;
     } else if let Some(path) = launch_agent_path()
         && path.exists()
@@ -882,6 +945,10 @@ fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
         })?;
     }
 
+    let mut settings = load_desktop_settings().unwrap_or_default();
+    settings.launch_at_login = enabled;
+    save_desktop_settings(&settings)?;
+
     Ok(ActionReport {
         ok: true,
         message: if enabled {
@@ -890,6 +957,105 @@ fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
             "AFS will not launch at login.".to_string()
         },
     })
+}
+
+fn apply_launch_at_login_preference() -> Result<(), String> {
+    let settings = load_desktop_settings().unwrap_or_default();
+    if settings.launch_at_login && !running_from_read_only_volume()? {
+        install_launch_agent()?;
+    }
+    Ok(())
+}
+
+fn start_state_change_watcher(app: AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state_root = default_state_root();
+        if let Err(error) = fs::create_dir_all(&state_root) {
+            eprintln!(
+                "afs desktop could not create state watch directory `{}`: {error}",
+                state_root.display()
+            );
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |event| {
+            let _ = tx.send(event);
+        }) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                eprintln!("afs desktop could not start state watcher: {error}");
+                return;
+            }
+        };
+
+        if let Err(error) = watcher.watch(&state_root, RecursiveMode::Recursive) {
+            eprintln!(
+                "afs desktop could not watch state directory `{}`: {error}",
+                state_root.display()
+            );
+            return;
+        }
+        watch_virtual_content_roots(&mut watcher, &state_root);
+
+        loop {
+            match rx.recv() {
+                Ok(Ok(_event)) => {
+                    debounce_state_events(&rx);
+                    refresh_desktop_surfaces(&app);
+                }
+                Ok(Err(error)) => eprintln!("afs desktop state watcher event failed: {error}"),
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn watch_virtual_content_roots(watcher: &mut notify::RecommendedWatcher, state_root: &Path) {
+    let Ok(store) = SqliteStateStore::open(state_root.to_path_buf()) else {
+        return;
+    };
+    let Ok(mounts) = store.load_mounts() else {
+        return;
+    };
+
+    for mount in mounts
+        .iter()
+        .filter(|mount| mount.projection.uses_virtual_filesystem())
+    {
+        let content_root = virtual_fs_content_root(state_root, &mount.mount_id);
+        if content_root.exists()
+            && let Err(error) = watcher.watch(&content_root, RecursiveMode::Recursive)
+        {
+            eprintln!(
+                "afs desktop could not watch virtual content root `{}`: {error}",
+                content_root.display()
+            );
+        }
+    }
+}
+
+fn debounce_state_events(rx: &mpsc::Receiver<notify::Result<notify::Event>>) {
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    while rx.try_recv().is_ok() {}
+}
+
+fn refresh_desktop_surfaces(app: &AppHandle) {
+    refresh_tray_icon(app);
+    for label in ["main", "tray"] {
+        if let Some(window) = app.get_webview_window(label) {
+            if label == "main" && !window.is_visible().unwrap_or(false) {
+                continue;
+            }
+            let _ = window.eval("window.dispatchEvent(new CustomEvent('afs-refresh-snapshot'));");
+        }
+    }
+}
+
+fn running_from_read_only_volume() -> Result<bool, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve the AFS app executable: {error}"))?;
+    Ok(executable.starts_with("/Volumes"))
 }
 
 fn install_launch_agent() -> Result<(), String> {
@@ -1115,6 +1281,40 @@ fn open_in_file_manager(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let target = reveal_target(path);
+        Command::new("open")
+            .arg("-R")
+            .arg(&target)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let target = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| path.to_path_buf())
+        };
+        open_in_file_manager(&target)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_target(path: &Path) -> PathBuf {
+    if path.exists() || path.extension().is_some() {
+        return path.to_path_buf();
+    }
+
+    path.with_extension("md")
+}
+
 fn choose_folder_with_dialog(
     app: &AppHandle,
     current: Option<String>,
@@ -1251,6 +1451,10 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
         args.push("--tcp-addr".to_string());
         args.push(tcp_addr);
     }
+    if let Some(afsd_bin) = bundled_afsd_binary() {
+        args.push("--afsd-bin".to_string());
+        args.push(afsd_bin.display().to_string());
+    }
 
     let report = run_daemon_control(&args)
         .map_err(|error| format!("Could not start afsd: {}", error.message()))?;
@@ -1259,6 +1463,12 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
     } else {
         Err("afsd did not start.".to_string())
     }
+}
+
+fn bundled_afsd_binary() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let candidate = executable.parent()?.join("afsd");
+    candidate.is_file().then_some(candidate)
 }
 
 fn reload_daemon_mounts(state_root: &Path) -> Result<(), String> {
@@ -1383,10 +1593,7 @@ fn open_virtual_mount_or_path(path: &Path) -> Result<(), String> {
     if let Some(mount) = virtual_mount_for_path(path)
         && mount.projection.uses_virtual_filesystem()
     {
-        if open_virtual_projection(&mount).is_ok() {
-            return Ok(());
-        }
-        return open_in_file_manager(&mount.root);
+        return open_virtual_projection(&mount);
     }
 
     open_in_file_manager(path)
@@ -1441,6 +1648,7 @@ fn connect_notion_with_broker(state_root: PathBuf) -> Result<String, String> {
             redirect_uri: redirect_uri.clone(),
         })
         .map_err(|error| format!("Could not start Notion OAuth broker flow: {error}"))?;
+    set_notion_login_link(start.authorization_url.clone());
     let authorization = run_local_oauth_authorization(
         "Notion",
         &start.authorization_url,
@@ -1479,6 +1687,22 @@ fn connect_notion_with_broker(state_root: PathBuf) -> Result<String, String> {
         _ => "Connected Notion workspace.".to_string(),
     };
     Ok(format!("{connected_message} {refresh_message}"))
+}
+
+fn notion_login_link_slot() -> &'static Mutex<Option<String>> {
+    NOTION_LOGIN_LINK.get_or_init(|| Mutex::new(None))
+}
+
+fn set_notion_login_link(url: String) {
+    if let Ok(mut link) = notion_login_link_slot().lock() {
+        *link = Some(url);
+    }
+}
+
+fn clear_notion_login_link() {
+    if let Ok(mut link) = notion_login_link_slot().lock() {
+        *link = None;
+    }
 }
 
 fn refresh_notion_mount_after_connect(
@@ -1919,7 +2143,7 @@ fn sample_snapshot() -> DesktopSnapshot {
             status: "ready".to_string(),
         },
         settings: DesktopSettings {
-            launch_at_login: false,
+            launch_at_login: true,
             show_menu_bar: true,
         },
         pending_changes: sample_pending_changes(),
@@ -1993,17 +2217,18 @@ fn main() {
             }
         })
         .setup(|app| {
-            build_tray(app)?;
-            if !desktop_settings().show_menu_bar
-                && let Some(tray) = app.tray_by_id("main")
-            {
-                let _ = tray.set_visible(false);
+            if let Err(error) = apply_launch_at_login_preference() {
+                eprintln!("afs desktop could not apply launch-at-login preference: {error}");
             }
+            build_tray(app)?;
+            sync_tray_visibility(app.app_handle(), &desktop_settings());
+            start_state_change_watcher(app.app_handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             desktop_snapshot,
             connect_notion,
+            notion_login_link,
             choose_mount_folder,
             ensure_runtime_ready,
             create_workspace_mount,
@@ -2011,6 +2236,7 @@ fn main() {
             review_push_plan,
             push_to_notion,
             open_path,
+            reveal_path,
             show_main_window,
             set_desktop_setting,
             hide_menubar,
@@ -2025,8 +2251,6 @@ fn should_hide_tray_popover(window_label: &str, event: &tauri::WindowEvent) -> b
 }
 
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
-    build_tray_popover(app)?;
-
     let open = MenuItem::with_id(app, "open", "Open AFS", true, None::<&str>)?;
     let open_folder =
         MenuItem::with_id(app, "open_folder", "Open Notion Folder", true, None::<&str>)?;
@@ -2091,6 +2315,9 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         })
         .build(app)?;
 
+    if let Err(error) = build_tray_popover(app) {
+        eprintln!("afs desktop could not build tray popover: {error}");
+    }
     refresh_tray_icon(app.app_handle());
 
     Ok(())

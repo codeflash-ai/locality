@@ -52,8 +52,9 @@ make build-tauri
 ```
 
 The build stages the macOS File Provider extension before Tauri bundles the
-app. See `docs/macos-distribution.md` for signing, notarization, and Homebrew
-cask notes.
+app, packages the `afsd` sidecar, and post-processes the DMG with a dedicated
+installer disk icon. See `docs/macos-distribution.md` for signing,
+notarization, and Homebrew cask notes.
 
 ## Current Scope
 

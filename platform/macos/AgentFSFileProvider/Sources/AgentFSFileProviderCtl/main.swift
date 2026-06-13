@@ -31,6 +31,7 @@ struct AgentFSFileProviderCtl {
 private enum Command {
   case register(mountId: String, displayName: String)
   case open(mountId: String)
+  case signal(mountId: String, identifier: String)
   case unregister(mountId: String)
   case list
   case reset
@@ -52,6 +53,11 @@ private enum Command {
       let mountId = try requiredValue(args, "--mount-id")
       try validateDomainIdentifier(mountId)
       return .open(mountId: mountId)
+    case "signal":
+      let mountId = try requiredValue(args, "--mount-id")
+      let identifier = value(args, "--identifier") ?? "root"
+      try validateDomainIdentifier(mountId)
+      return .signal(mountId: mountId, identifier: identifier)
     case "unregister":
       let mountId = try requiredValue(args, "--mount-id")
       try validateDomainIdentifier(mountId)
@@ -70,8 +76,19 @@ private enum Command {
     case .register(let mountId, let displayName):
       let identifier = NSFileProviderDomainIdentifier(mountId)
       if let existing = try getDomains().first(where: { $0.identifier == identifier }) {
-        try waitForVoid { completion in
-          NSFileProviderManager.remove(existing, completionHandler: completion)
+        if existing.displayName == displayName {
+          return FileProviderCtlReport(
+            ok: true,
+            action: "register",
+            domain: DomainReport(existing),
+            domains: nil,
+            url: nil,
+            message: "already registered \(mountId)"
+          )
+        } else {
+          try waitForVoid { completion in
+            NSFileProviderManager.remove(existing, completionHandler: completion)
+          }
         }
       }
 
@@ -97,6 +114,11 @@ private enum Command {
       guard let domain = try getDomains().first(where: { $0.identifier.rawValue == mountId }) else {
         throw UsageError("File Provider domain \(mountId) is not registered")
       }
+      guard domain.userEnabled else {
+        throw UsageError(
+          "The AFS File Provider is registered but not enabled. Enable AFS in Finder or System Settings, then try again."
+        )
+      }
       let url = try userVisibleDomainURL(for: domain)
       guard FileManager.default.fileExists(atPath: url.path) else {
         throw UsageError(
@@ -110,6 +132,27 @@ private enum Command {
         domains: nil,
         url: url.path,
         message: "resolved \(mountId)"
+      )
+    case .signal(let mountId, let identifier):
+      guard let domain = try getDomains().first(where: { $0.identifier.rawValue == mountId }) else {
+        throw UsageError("File Provider domain \(mountId) is not registered")
+      }
+      guard let manager = NSFileProviderManager(for: domain) else {
+        throw UsageError("No File Provider manager is available for domain \(mountId)")
+      }
+      try waitForVoid { completion in
+        manager.signalEnumerator(
+          for: fileProviderItemIdentifier(identifier),
+          completionHandler: completion
+        )
+      }
+      return FileProviderCtlReport(
+        ok: true,
+        action: "signal",
+        domain: DomainReport(domain),
+        domains: nil,
+        url: nil,
+        message: "signaled \(mountId):\(identifier)"
       )
     case .unregister(let mountId):
       let domain = NSFileProviderDomain(
@@ -151,6 +194,13 @@ private enum Command {
       )
     }
   }
+}
+
+private func fileProviderItemIdentifier(_ identifier: String) -> NSFileProviderItemIdentifier {
+  if identifier == "root" {
+    return .rootContainer
+  }
+  return NSFileProviderItemIdentifier(identifier)
 }
 
 private struct FileProviderCtlReport: Encodable {
@@ -208,10 +258,21 @@ private func getDomains() throws -> [NSFileProviderDomain] {
 }
 
 private func userVisibleDomainURL(for domain: NSFileProviderDomain) throws -> URL {
-  realHomeDirectoryURL()
+  if let url = try userVisibleDomainURLFromManager(for: domain) {
+    return url
+  }
+
+  let cloudStorage = realHomeDirectoryURL()
     .appendingPathComponent("Library", isDirectory: true)
     .appendingPathComponent("CloudStorage", isDirectory: true)
-    .appendingPathComponent(fileProviderDomainDirectoryName(domain.displayName), isDirectory: true)
+  let candidates = [
+    cloudStorage.appendingPathComponent("AFS-\(domain.displayName)", isDirectory: true),
+    cloudStorage.appendingPathComponent("AgentFS-\(domain.displayName)", isDirectory: true),
+  ]
+  if let existing = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+    return existing
+  }
+  return candidates[0]
 }
 
 private func realHomeDirectoryURL() -> URL {
@@ -221,8 +282,25 @@ private func realHomeDirectoryURL() -> URL {
   return FileManager.default.homeDirectoryForCurrentUser
 }
 
-private func fileProviderDomainDirectoryName(_ displayName: String) -> String {
-  "AgentFS-\(displayName)"
+private func userVisibleDomainURLFromManager(for domain: NSFileProviderDomain) throws -> URL? {
+  guard let manager = NSFileProviderManager(for: domain) else {
+    return nil
+  }
+
+  let result = AsyncResultBox<URL?>()
+  let semaphore = DispatchSemaphore(value: 0)
+  manager.getUserVisibleURL(for: .rootContainer) { url, error in
+    if let error {
+      result.complete(.failure(error))
+    } else if let url {
+      result.complete(.success(url))
+    } else {
+      result.complete(.success(nil))
+    }
+    semaphore.signal()
+  }
+  semaphore.wait()
+  return try result.get() ?? nil
 }
 
 private func waitForVoid(_ body: (@escaping @Sendable (Error?) -> Void) -> Void) throws {

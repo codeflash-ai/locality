@@ -492,6 +492,52 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         }
     }
 
+    fn run_file_provider_children(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
+        if matches!(
+            virtual_fs_children_refresh_needed(&store, &mount_id, &container_identifier),
+            Ok(true)
+        ) {
+            let credentials = open_credential_store(&state_root);
+            let connector =
+                match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id) {
+                    Ok(connector) => connector,
+                    Err(error) => return DaemonResponse::error(error.code(), error.message()),
+                };
+            if let Err(error) = refresh_virtual_fs_children(
+                &mut store,
+                &connector,
+                &mount_id,
+                &container_identifier,
+            ) {
+                return DaemonResponse::error(afs_error_code(&error), error.to_string());
+            }
+        }
+
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        match virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            &container_identifier,
+        ) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+
     fn run_virtual_fs_refresh_children(
         &self,
         state_root: PathBuf,
@@ -912,10 +958,6 @@ impl RuntimeState {
             DaemonRequest::VirtualFsChildren {
                 mount_id,
                 container_identifier,
-            }
-            | DaemonRequest::FileProviderChildren {
-                mount_id,
-                container_identifier,
             } => {
                 let response = self.runner.run_virtual_fs_children(
                     self.config.state_root.clone(),
@@ -927,6 +969,18 @@ impl RuntimeState {
                 if should_refresh {
                     self.queue_child_refresh(mount_id, container_identifier);
                 }
+            }
+            DaemonRequest::FileProviderChildren {
+                mount_id,
+                container_identifier,
+            } => {
+                self.pending_requests
+                    .push_front(MutatingRequest::FileProviderChildren {
+                        mount_id,
+                        container_identifier,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
             }
             DaemonRequest::VirtualFsMaterialize {
                 mount_id,
@@ -1343,6 +1397,14 @@ fn run_job(
             response: runner.run_file_provider_read(state_root, mount_id, identifier),
             respond_to,
         },
+        MutatingJob::Request(MutatingRequest::FileProviderChildren {
+            mount_id,
+            container_identifier,
+            respond_to,
+        }) => JobCompletion::Response {
+            response: runner.run_file_provider_children(state_root, mount_id, container_identifier),
+            respond_to,
+        },
         MutatingJob::Request(MutatingRequest::VirtualFsCommitWrite {
             mount_id,
             identifier,
@@ -1444,6 +1506,11 @@ enum MutatingRequest {
         identifier: String,
         respond_to: Sender<DaemonResponse>,
     },
+    FileProviderChildren {
+        mount_id: String,
+        container_identifier: String,
+        respond_to: Sender<DaemonResponse>,
+    },
     VirtualFsCommitWrite {
         mount_id: String,
         identifier: String,
@@ -1523,6 +1590,14 @@ impl MutatingRequest {
             } => (
                 "file_provider_read".to_string(),
                 Some(format!("{mount_id}:{identifier}")),
+            ),
+            Self::FileProviderChildren {
+                mount_id,
+                container_identifier,
+                ..
+            } => (
+                "file_provider_children".to_string(),
+                Some(format!("{mount_id}:{container_identifier}")),
             ),
             Self::VirtualFsCommitWrite {
                 mount_id,

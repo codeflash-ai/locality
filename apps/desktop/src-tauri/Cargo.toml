@@ -15,6 +15,7 @@ afs-core.workspace = true
 afs-notion.workspace = true
 afs-store.workspace = true
 afsd = { path = "../../../crates/afsd" }
+notify = "8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }

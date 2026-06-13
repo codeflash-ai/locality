@@ -7,6 +7,7 @@ APP="${BUILD_ROOT}/AgentFS.app"
 APPEX="${APP}/Contents/PlugIns/AgentFSFileProvider.appex"
 ARCH="$(uname -m)"
 TARGET="${ARCH}-apple-macos14.0"
+SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
 
 rm -rf "${APP}"
 mkdir -p \
@@ -50,16 +51,16 @@ swiftc \
   "${ROOT}"/Sources/AgentFSFileProvider/*.swift \
   -o "${APPEX}/Contents/MacOS/AgentFSFileProvider"
 
-codesign --force --sign - \
+codesign --force --sign "${SIGNING_IDENTITY}" --options runtime \
   --entitlements "${ROOT}/App/AgentFS.entitlements" \
   "${APP}/Contents/MacOS/agentfs-file-providerctl"
-codesign --force --sign - \
+codesign --force --sign "${SIGNING_IDENTITY}" --options runtime \
   --entitlements "${ROOT}/App/AgentFSFileProvider.entitlements" \
   "${APPEX}/Contents/MacOS/AgentFSFileProvider"
-codesign --force --sign - \
+codesign --force --sign "${SIGNING_IDENTITY}" --options runtime \
   --entitlements "${ROOT}/App/AgentFSFileProvider.entitlements" \
   "${APPEX}"
-codesign --force --sign - \
+codesign --force --sign "${SIGNING_IDENTITY}" --options runtime \
   --entitlements "${ROOT}/App/AgentFS.entitlements" \
   "${APP}"
 

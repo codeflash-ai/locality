@@ -33,16 +33,19 @@ The Tauri pre-bundle hook runs:
 apps/desktop/scripts/prepare-macos-file-provider.sh
 ```
 
-That script builds the Swift File Provider extension, stages
+That script builds `afsd` plus the Swift File Provider extension, stages
 `AgentFSFileProvider.appex` and `agentfs-file-providerctl` under
-`apps/desktop/src-tauri/macos/AgentFSFileProvider/`, and Tauri copies those
-files into the final app bundle.
+`apps/desktop/src-tauri/macos/AgentFSFileProvider/`, stages `afsd` under
+`apps/desktop/src-tauri/macos/`, and Tauri copies those files into the final
+app bundle. After the Tauri DMG is created, `build-tauri` runs
+`apps/desktop/scripts/postprocess-dmg-volume-icon.sh` so the mounted installer
+volume uses a disk-style AFS icon instead of the application icon.
 
 Expected local artifacts:
 
 ```text
-apps/desktop/src-tauri/target/release/bundle/macos/AFS.app
-apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+target/release/bundle/macos/AFS.app
+target/release/bundle/dmg/*.dmg
 ```
 
 ## Release Signing
@@ -84,22 +87,27 @@ make build-tauri
 developer builds are ad-hoc signed and can pass local `codesign --verify`
 without requiring every contributor to have CodeFlash's Developer ID
 certificate. Release automation should override that default with the real
-Developer ID identity.
+Developer ID identity. The File Provider staging script also reads
+`APPLE_SIGNING_IDENTITY`, so the nested File Provider extension, helper, and
+`afsd` sidecar are signed with the same release identity and hardened runtime.
 
 Recommended release sequence:
 
 ```sh
 make setup
 make build-tauri
-codesign --verify --deep --strict --verbose=2 \
-  apps/desktop/src-tauri/target/release/bundle/macos/AFS.app
-xcrun notarytool submit <dmg-path> --wait
-xcrun stapler staple <dmg-path>
-spctl --assess --type open --context context:primary-signature --verbose <dmg-path>
+DMG="$(find target/release/bundle/dmg -maxdepth 1 -name 'AFS_*.dmg' | sort | tail -n 1)"
+xcrun notarytool submit "$DMG" --wait \
+  --apple-id "$APPLE_ID" \
+  --password "$APPLE_PASSWORD" \
+  --team-id "$APPLE_TEAM_ID"
+xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
+spctl --assess --type open --context context:primary-signature --verbose "$DMG"
 ```
 
-The exact production signing script is still a follow-up because it needs the
-team ID, certificate identity, and final entitlement review.
+The exact production signing script still needs a final entitlement review
+before automated releases.
 
 ## Distribution Channels
 

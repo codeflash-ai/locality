@@ -28,6 +28,7 @@ use afs_store::{
     MountRepository,
 };
 
+use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
 use crate::notion::{ConnectorResolveError, resolve_notion_connector_for_mount};
 use crate::reconcile::ScheduledPullSource;
@@ -578,8 +579,5 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
-    mounts
-        .iter()
-        .filter(|mount| path.starts_with(&mount.root))
-        .max_by_key(|mount| mount.root.components().count())
+    file_provider::find_mount_for_path(mounts, path).map(|(mount, _)| mount)
 }

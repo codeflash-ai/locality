@@ -47,6 +47,7 @@ dependencies = [
  "afs-notion",
  "afs-store",
  "afsd",
+ "notify",
  "serde",
  "serde_json",
  "tauri",

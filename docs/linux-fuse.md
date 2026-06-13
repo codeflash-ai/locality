@@ -41,6 +41,24 @@ behavior as `macos_file_provider`.
 
 ## Smoke Test
 
+CI runs a credentialless real-mount smoke test on GitHub-hosted Ubuntu. The
+script creates a temporary AFS state directory, records a `linux_fuse` mount,
+seeds hydrated fixture pages in the daemon content cache, starts `afsd`, starts
+`afs-fuse`, and then verifies real filesystem operations through the mounted
+directory:
+
+```bash
+AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
+```
+
+The hosted test intentionally does not use Notion credentials. Live-provider
+e2e should use a disposable test workspace/account with narrowly scoped
+credentials. macOS File Provider e2e is not part of hosted CI; developers should
+run it on local Macs where the signed app/extension and user approval are
+available.
+
+### Existing Mount
+
 Build the daemon, CLI, and FUSE helper:
 
 ```bash
@@ -101,10 +119,11 @@ rm "$renamed"
 ```
 
 The same flow is available as an opt-in script for manual or CI-hosted FUSE
-hosts:
+hosts. By default the script creates its own seeded mount. To keep the temp
+state for debugging:
 
 ```bash
-AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_MOUNT=/path/to/mount tests/linux_fuse_smoke.sh
+AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_KEEP_TMP=1 tests/linux_fuse_smoke.sh
 ```
 
 If `ls` reports `Function not implemented`, rebuild the helper and restart the

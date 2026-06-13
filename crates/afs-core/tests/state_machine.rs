@@ -16,7 +16,11 @@ use afs_core::validation::{
 #[test]
 fn hydration_ladder_allows_expected_transitions() {
     assert!(HydrationState::Virtual.can_transition_to(&HydrationState::Stub));
+    assert!(HydrationState::Virtual.can_transition_to(&HydrationState::Dirty));
+    assert!(HydrationState::Virtual.can_transition_to(&HydrationState::Conflicted));
     assert!(HydrationState::Stub.can_transition_to(&HydrationState::Hydrated));
+    assert!(HydrationState::Stub.can_transition_to(&HydrationState::Dirty));
+    assert!(HydrationState::Stub.can_transition_to(&HydrationState::Conflicted));
     assert!(HydrationState::Hydrated.can_transition_to(&HydrationState::Dirty));
     assert!(HydrationState::Hydrated.can_transition_to(&HydrationState::Conflicted));
     assert!(HydrationState::Dirty.can_transition_to(&HydrationState::Conflicted));

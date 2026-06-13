@@ -332,6 +332,71 @@ fn status_reads_virtual_projection_from_content_cache() {
 }
 
 #[test]
+fn status_reports_stub_virtual_cache_edits_as_dirty() {
+    let fixture = StatusFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::MacosFileProvider),
+        )
+        .expect("save virtual mount");
+    fixture.stub_page(&mut store, "page-1", "Roadmap.md");
+    fixture.write_virtual_cache(
+        "Roadmap.md",
+        canonical_markdown("page-1", "# Roadmap\n\nChanged paragraph."),
+    );
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.clean);
+    assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Dirty);
+    assert_eq!(entry_issue(&report, "Roadmap.md"), "stub_content_changed");
+}
+
+#[test]
+fn status_reports_stub_virtual_cache_conflicts_as_conflicted() {
+    let fixture = StatusFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::MacosFileProvider),
+        )
+        .expect("save virtual mount");
+    fixture.stub_page(&mut store, "page-1", "Roadmap.md");
+    fixture.write_virtual_cache(
+        "Roadmap.md",
+        format!(
+            "{CONFLICT_LOCAL_MARKER}\nlocal\n{CONFLICT_SEPARATOR_MARKER}\nremote\n{CONFLICT_REMOTE_MARKER}\n"
+        ),
+    );
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.clean);
+    assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Conflicted);
+    assert_eq!(
+        entry_issue(&report, "Roadmap.md"),
+        "unresolved_conflict_markers"
+    );
+}
+
+#[test]
 fn status_reports_pending_virtual_creates_and_deletes() {
     let fixture = StatusFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -497,6 +562,17 @@ impl StatusFixture {
             fs::create_dir_all(parent).expect("fixture parent");
         }
         fs::write(&path, contents).expect("fixture file");
+        path
+    }
+
+    fn write_virtual_cache(&self, relative_path: &str, contents: impl AsRef<[u8]>) -> PathBuf {
+        let path =
+            virtual_fs_content_path(&self.state_root, &self.mount_id, Path::new(relative_path))
+                .expect("content path");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("content parent");
+        }
+        fs::write(&path, contents).expect("fixture content cache");
         path
     }
 }

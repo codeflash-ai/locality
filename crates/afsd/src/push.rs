@@ -41,6 +41,7 @@ use afs_store::{
 use serde::{Deserialize, Serialize};
 
 use crate::execution::{PushJob, PushJobError, PushJobReport};
+use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
 use crate::source::{LocalSourceValidator, SourcePushValidator, SourceValidationContext};
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
@@ -1142,20 +1143,16 @@ fn parse_error_issue(path: &Path, error: CanonicalParseError) -> ValidationIssue
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
-    mounts
-        .iter()
-        .filter(|mount| path.starts_with(&mount.root))
-        .max_by_key(|mount| mount.root.components().count())
+    file_provider::find_mount_for_path(mounts, path).map(|(mount, _)| mount)
 }
 
 fn relative_entity_path(
     mount: &MountConfig,
     absolute_path: &Path,
 ) -> Result<PathBuf, PushPrepareError> {
-    absolute_path
-        .strip_prefix(&mount.root)
-        .map(Path::to_path_buf)
-        .map_err(|_| PushPrepareError::MountNotFound(absolute_path.to_path_buf()))
+    file_provider::match_mount_path(mount, absolute_path)
+        .map(|matched| matched.relative_path)
+        .ok_or_else(|| PushPrepareError::MountNotFound(absolute_path.to_path_buf()))
 }
 
 fn read_to_string(path: &Path) -> Result<String, PushPrepareError> {
