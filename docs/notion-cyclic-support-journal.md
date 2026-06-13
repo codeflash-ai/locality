@@ -167,3 +167,20 @@ and what Markdown shape agents should expect.
   bot user through a mounted Markdown edit, and verifies the rendered Notion
   result. The live direct integrity test creates a people value and then clears
   it through the API writer.
+
+### Database Mentions As Markdown Links
+
+- **Notion input:** Rich-text database mentions and `link_to_page` blocks that
+  target databases.
+- **Markdown output:** Both render as normal Markdown links to Notion URLs,
+  matching page mention/link behavior.
+- **Write behavior:** When a rendered database mention link is edited only in
+  label text and the Notion target ID is unchanged, the rich-text parser writes
+  it back as a typed Notion database mention instead of accidentally converting
+  it to a page mention. Creating arbitrary new database mentions from a plain
+  Notion URL still needs an explicit typed-link syntax because Notion page and
+  database URLs are not distinguishable from the ID alone.
+- **Verification:** Fixture apply tests assert edited database mention links
+  produce `mention.database` payloads. The live diverse page cyclic test creates
+  both a rich-text database mention and a database `link_to_page` block, then
+  verifies the mounted read/no-op push does not mutate the Notion block JSON.

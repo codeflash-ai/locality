@@ -1327,6 +1327,10 @@ enum RichTextWritePart {
         id: String,
         annotations: InlineAnnotations,
     },
+    DatabaseMention {
+        id: String,
+        annotations: InlineAnnotations,
+    },
     Preimage(Box<RichTextDto>),
 }
 
@@ -1335,7 +1339,8 @@ impl RichTextWritePart {
         match self {
             Self::Text { annotations, .. }
             | Self::Equation { annotations, .. }
-            | Self::PageMention { annotations, .. } => apply(annotations),
+            | Self::PageMention { annotations, .. }
+            | Self::DatabaseMention { annotations, .. } => apply(annotations),
             Self::Preimage(part) => {
                 let mut annotations = InlineAnnotations::from(&part.annotations);
                 apply(&mut annotations);
@@ -1400,6 +1405,19 @@ impl RichTextWritePart {
                     "mention": {
                         "type": "page",
                         "page": {
+                            "id": id,
+                        },
+                    },
+                });
+                insert_annotations(&mut value, annotations);
+                Ok(value)
+            }
+            Self::DatabaseMention { id, annotations } => {
+                let mut value = json!({
+                    "type": "mention",
+                    "mention": {
+                        "type": "database",
+                        "database": {
                             "id": id,
                         },
                     },
@@ -1590,6 +1608,15 @@ impl InlineParser<'_> {
             && let Some((label, href, consumed)) = parse_markdown_link(rest)
         {
             if let Some(id) = notion_page_id_from_href(href) {
+                if self.preimage_has_mention("database", &id) {
+                    return Ok(Some((
+                        vec![RichTextWritePart::DatabaseMention {
+                            id,
+                            annotations: InlineAnnotations::default(),
+                        }],
+                        consumed,
+                    )));
+                }
                 return Ok(Some((
                     vec![RichTextWritePart::PageMention {
                         id,
@@ -1617,6 +1644,26 @@ impl InlineParser<'_> {
         }
 
         Ok(None)
+    }
+
+    fn preimage_has_mention(&self, kind: &str, id: &str) -> bool {
+        self.preimage_tokens.iter().any(|token| {
+            let Some(mention) = token.part.mention.as_ref() else {
+                return false;
+            };
+            if mention.kind != kind {
+                return false;
+            }
+            let preimage_id = match kind {
+                "page" => mention.page.as_ref().map(|page| page.id.as_str()),
+                "database" => mention
+                    .database
+                    .as_ref()
+                    .map(|database| database.id.as_str()),
+                _ => None,
+            };
+            preimage_id.is_some_and(|preimage_id| notion_ids_equal(preimage_id, id))
+        })
     }
 
     fn next_special_or_preimage(&self, start: usize, closing: Option<&str>) -> usize {
@@ -1744,6 +1791,18 @@ fn notion_id_from_url_segment(segment: &str) -> Option<String> {
     }
 
     None
+}
+
+fn notion_ids_equal(left: &str, right: &str) -> bool {
+    let left = left
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    let right = right
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    !left.is_empty() && left.eq_ignore_ascii_case(&right)
 }
 
 fn unescape_markdown_text(value: &str) -> String {

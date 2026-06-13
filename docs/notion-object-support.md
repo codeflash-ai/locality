@@ -79,7 +79,7 @@ Sources used for the baseline:
 | Equation span | Inline math | Yes | fixture, live | `$...$`. |
 | Bold, italic, strikethrough, underline, code | Markdown/HTML inline formatting | Yes for emitted shapes | fixture, live | Underline uses `<u>`. |
 | Page mention | Markdown link to Notion URL | Read; write via Notion-hosted URL or legacy `afs://` parsing path | fixture, live | Stable ID is preserved; external UUID-shaped links remain ordinary links. |
-| Database mention | Markdown link to Notion URL | Read only in current live suite | fixture | Stable ID is preserved. |
+| Database mention | Markdown link to Notion URL | Read; label edits preserve database type when target ID is unchanged | fixture, live read | Stable ID is preserved. Arbitrary new database-link creation needs an explicit typed link form. |
 | User mention | Plain `@name`/fallback | Read only | fixture | Needs identity lookup before safe writes. |
 | Date mention | Plain date/range text | Read only | fixture, live | Needs typed date mention parser before safe writes. |
 | Link preview mention | Markdown link | Read only | fixture | Preserves URL. |

@@ -11,8 +11,8 @@ use afs_core::{AfsError, AfsResult};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
-    DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto, FileBlockDto, LinkDto,
-    MentionRichTextDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
+    DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto, FileBlockDto, IdRefDto,
+    LinkDto, MentionRichTextDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
     RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto, TableBlockDto,
     TableRowBlockDto, TextRichTextDto, UrlBlockDto,
 };
@@ -631,6 +631,8 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
             date_mention("2026-06-10", "2026-06-10"),
             rich_text_part(" plus "),
             linked_text("Docs", "https://example.com/"),
+            rich_text_part(" and database "),
+            database_mention("Tasks", "33333333-3333-3333-3333-333333333333"),
             rich_text_part("."),
         ],
     ));
@@ -639,7 +641,7 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
         vec![RemoteId::new("page-1")],
         vec![PushOperation::UpdateBlock {
             block_id: RemoteId::new("paragraph-1"),
-            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and $E=mc^2$ [Hex docs](https://example.com/22222222222222222222222222222222) [Roadmap](https://www.notion.so/Project-22222222222222222222222222222222)".to_string(),
+            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and database [Tasks updated](https://www.notion.so/33333333333333333333333333333333) and $E=mc^2$ [Hex docs](https://example.com/22222222222222222222222222222222) [Roadmap](https://www.notion.so/Project-22222222222222222222222222222222)".to_string(),
         }],
     );
     let push_id = PushId("push-1".to_string());
@@ -706,6 +708,21 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
                                 "content": "Docs",
                                 "link": {
                                     "url": "https://example.com/",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " and database ",
+                            },
+                        },
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "database",
+                                "database": {
+                                    "id": "33333333333333333333333333333333",
                                 },
                             },
                         },
@@ -1931,6 +1948,19 @@ fn date_mention(text: &str, start: &str) -> RichTextDto {
                 end: None,
                 time_zone: None,
             }),
+            ..Default::default()
+        }),
+        plain_text: text.to_string(),
+        ..Default::default()
+    }
+}
+
+fn database_mention(text: &str, id: &str) -> RichTextDto {
+    RichTextDto {
+        kind: "mention".to_string(),
+        mention: Some(MentionRichTextDto {
+            kind: "database".to_string(),
+            database: Some(IdRefDto { id: id.to_string() }),
             ..Default::default()
         }),
         plain_text: text.to_string(),

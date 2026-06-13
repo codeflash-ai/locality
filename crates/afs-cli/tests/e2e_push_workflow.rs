@@ -222,10 +222,14 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
         &format!("AFS cyclic link target {}", unique_suffix()),
         vec![paragraph_child("Target page for live link checks.")],
     );
+    let linked_database = cleanup.create_database(
+        &env.parent_page_id,
+        &format!("AFS cyclic linked database {}", unique_suffix()),
+    );
     let source = cleanup.create_page(
         &env.parent_page_id,
         &format!("AFS cyclic diverse read {}", unique_suffix()),
-        diverse_page_children(&target.id),
+        diverse_page_children(&target.id, &linked_database.id),
     );
     cleanup.create_page(
         &source.id,
@@ -254,7 +258,9 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
         "$$\na^2+b^2=c^2\n$$",
         "| Left | Right |",
         "[Linked page](https://www.notion.so/",
+        "[Linked database](https://www.notion.so/",
         "target mention [AFS cyclic link target",
+        "database mention [AFS cyclic linked database",
         "[Cyclic bookmark](https://example.com/cyclic-bookmark)",
         "[Cyclic embed](https://example.com/cyclic-embed)",
         "![Cyclic image](https://www.w3.org/Icons/w3c_home.png)",
@@ -1063,7 +1069,7 @@ fn render_live_markdown(connector: &NotionConnector, page_id: &str, page_path: &
     render_canonical_markdown(&document)
 }
 
-fn diverse_page_children(target_page_id: &str) -> Vec<Value> {
+fn diverse_page_children(target_page_id: &str, database_id: &str) -> Vec<Value> {
     vec![
         json!({
             "object": "block",
@@ -1074,6 +1080,8 @@ fn diverse_page_children(target_page_id: &str) -> Vec<Value> {
                     annotated_text("bold", "bold"),
                     text_part(" and a target mention "),
                     page_mention_part("Target page", target_page_id),
+                    text_part(" and database mention "),
+                    database_mention_part("Linked database", database_id),
                     text_part(" plus inline math "),
                     equation_part("a^2+b^2=c^2")
                 ]
@@ -1154,6 +1162,11 @@ fn diverse_page_children(target_page_id: &str) -> Vec<Value> {
             "object": "block",
             "type": "link_to_page",
             "link_to_page": { "type": "page_id", "page_id": target_page_id }
+        }),
+        json!({
+            "object": "block",
+            "type": "link_to_page",
+            "link_to_page": { "type": "database_id", "database_id": database_id }
         }),
         media_child(
             "image",
@@ -1331,6 +1344,17 @@ fn page_mention_part(label: &str, page_id: &str) -> Value {
         "mention": {
             "type": "page",
             "page": { "id": page_id }
+        },
+        "plain_text": label
+    })
+}
+
+fn database_mention_part(label: &str, database_id: &str) -> Value {
+    json!({
+        "type": "mention",
+        "mention": {
+            "type": "database",
+            "database": { "id": database_id }
         },
         "plain_text": label
     })
