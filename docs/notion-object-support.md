@@ -80,7 +80,7 @@ Sources used for the baseline:
 | Bold, italic, strikethrough, underline, code | Markdown/HTML inline formatting | Yes for emitted shapes | fixture, live | Underline uses `<u>`. |
 | Page mention | Markdown link to Notion URL | Read; write via Notion-hosted URL or legacy `afs://` parsing path | fixture, live | Stable ID is preserved; external UUID-shaped links remain ordinary links. |
 | Database mention | Markdown link to Notion URL | Read; label edits preserve database type when target ID is unchanged | fixture, live read | Stable ID is preserved. Arbitrary new database-link creation needs an explicit typed link form. |
-| User mention | Plain `@name`/fallback | Read only | fixture | Needs identity lookup before safe writes. |
+| User mention | Plain `@name`/fallback; explicit `@user(...)` write syntax | Yes through explicit ID syntax | fixture, live read/write | Agents can write `@user(11111111-1111-1111-1111-111111111111)` or `@user(Name <11111111-1111-1111-1111-111111111111>)`; name/email lookup is deferred. |
 | Date mention | Plain date/range text; explicit `@date(...)` write syntax | Yes through explicit syntax | fixture, live read/write | Agents can write `@date(2026-06-14)` or `@date(2026-06-14 to 2026-06-21, tz=America/Chicago)` when the result must remain a typed Notion date mention. Plain dates stay plain text unless preserved from the preimage. |
 | Link preview mention | Markdown link | Read only | fixture | Preserves URL. |
 | Unknown mention variants | Plain text fallback | No | fixture | Avoids losing visible content while blocking typed edits. |

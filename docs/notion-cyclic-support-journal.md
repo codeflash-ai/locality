@@ -203,3 +203,17 @@ and what Markdown shape agents should expect.
   `mention.date` request payload. The live supported-edit cycle edits a Notion
   date mention through the mounted Markdown file and verifies the fresh Notion
   render shows the updated date.
+
+### Explicit User Mention Writes
+
+- **Notion input:** Rich-text user mentions.
+- **Markdown output:** User mentions continue to render as readable
+  `@name`/fallback text.
+- **Write behavior:** Unchanged rendered user mentions preserve their typed
+  Notion mention payload through the preimage. When an agent needs to create or
+  reassert a typed user mention, it can use `@user(<notion-user-id>)` or
+  `@user(Name <notion-user-id>)`. Name/email lookup remains deferred.
+- **Verification:** Fixture apply tests assert `@user(...)` produces a typed
+  `mention.user` request payload. The live supported-edit cycle rewrites a
+  real Notion user mention through mounted Markdown and verifies the fresh
+  Notion render still contains the user mention line.

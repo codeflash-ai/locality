@@ -314,10 +314,11 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
     let mut cleanup = LiveCleanup::new(api);
+    let user_id = cleanup.current_user_id();
     let source = cleanup.create_page(
         &env.parent_page_id,
         &format!("AFS cyclic supported edits {}", unique_suffix()),
-        supported_edit_children(),
+        supported_edit_children(&user_id),
     );
 
     let connector = NotionConnector::new(NotionConfig::default());
@@ -380,6 +381,11 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         )
         .replace("fn editable() {}", "fn editable_changed() {}")
         .replace("x+y=z", "x-y=z");
+    let edited = replace_line_with_prefix(
+        edited,
+        "Editable user ",
+        &format!("Editable user @user({user_id})"),
+    );
     fs::write(&page_path, edited).expect("write cyclic edits");
 
     let dirty_status = run_status(
@@ -419,6 +425,7 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
     for expected in [
         "Editable paragraph changed.",
         "Editable date 2026-06-14",
+        "Editable user ",
         "# Editable heading one changed",
         "## Editable heading two changed",
         "### Editable heading three changed",
@@ -1198,7 +1205,7 @@ fn diverse_page_children(target_page_id: &str, database_id: &str) -> Vec<Value> 
     ]
 }
 
-fn supported_edit_children() -> Vec<Value> {
+fn supported_edit_children(user_id: &str) -> Vec<Value> {
     vec![
         paragraph_child("Editable paragraph original."),
         json!({
@@ -1206,6 +1213,13 @@ fn supported_edit_children() -> Vec<Value> {
             "type": "paragraph",
             "paragraph": {
                 "rich_text": [text_part("Editable date "), date_mention_part("2026-06-13")]
+            }
+        }),
+        json!({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [text_part("Editable user "), user_mention_part(user_id)]
             }
         }),
         rich_text_child("heading_1", "Editable heading one"),
@@ -1377,6 +1391,17 @@ fn date_mention_part(start: &str) -> Value {
             "date": { "start": start }
         },
         "plain_text": start
+    })
+}
+
+fn user_mention_part(user_id: &str) -> Value {
+    json!({
+        "type": "mention",
+        "mention": {
+            "type": "user",
+            "user": { "id": user_id }
+        },
+        "plain_text": "@user"
     })
 }
 
@@ -1723,6 +1748,29 @@ fn normalize_notion_id(input: &str) -> String {
     } else {
         candidate.to_string()
     }
+}
+
+fn replace_line_with_prefix(markdown: String, prefix: &str, replacement: &str) -> String {
+    let mut replaced = false;
+    let lines = markdown
+        .lines()
+        .map(|line| {
+            if !replaced && line.starts_with(prefix) {
+                replaced = true;
+                replacement.to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        replaced,
+        "expected line starting with `{prefix}` in:\n{markdown}"
+    );
+
+    let trailing_newline = if markdown.ends_with('\n') { "\n" } else { "" };
+    format!("{}{trailing_newline}", lines.join("\n"))
 }
 
 fn unique_suffix() -> String {

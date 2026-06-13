@@ -641,7 +641,7 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
         vec![RemoteId::new("page-1")],
         vec![PushOperation::UpdateBlock {
             block_id: RemoteId::new("paragraph-1"),
-            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and database [Tasks updated](https://www.notion.so/33333333333333333333333333333333) and @date(2026-06-11 to 2026-06-12, tz=America/Chicago) and $E=mc^2$ [Hex docs](https://example.com/22222222222222222222222222222222) [Roadmap](https://www.notion.so/Project-22222222222222222222222222222222)".to_string(),
+            content: "**Boldly** and 2026-06-10 plus [Docs](https://example.com/) and database [Tasks updated](https://www.notion.so/33333333333333333333333333333333) and @date(2026-06-11 to 2026-06-12, tz=America/Chicago) and @user(Ada <55555555-5555-5555-5555-555555555555>) and $E=mc^2$ [Hex docs](https://example.com/22222222222222222222222222222222) [Roadmap](https://www.notion.so/Project-22222222222222222222222222222222)".to_string(),
         }],
     );
     let push_id = PushId("push-1".to_string());
@@ -740,6 +740,21 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
                                     "start": "2026-06-11",
                                     "end": "2026-06-12",
                                     "time_zone": "America/Chicago",
+                                },
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " and ",
+                            },
+                        },
+                        {
+                            "type": "mention",
+                            "mention": {
+                                "type": "user",
+                                "user": {
+                                    "id": "55555555-5555-5555-5555-555555555555",
                                 },
                             },
                         },
