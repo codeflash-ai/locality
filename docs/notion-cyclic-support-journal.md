@@ -174,22 +174,29 @@ and what Markdown shape agents should expect.
   result. The live direct integrity test creates a people value and then clears
   it through the API writer.
 
-### Database Mentions As Markdown Links
+### Page And Database Mention Writes
 
 - **Notion input:** Rich-text database mentions and `link_to_page` blocks that
-  target databases.
-- **Markdown output:** Both render as normal Markdown links to Notion URLs,
-  matching page mention/link behavior.
+  target databases; rich-text page mentions and page `link_to_page` blocks use
+  the same URL shape.
+- **Markdown output:** Page and database mentions render as normal Markdown
+  links to Notion URLs.
 - **Write behavior:** When a rendered database mention link is edited only in
   label text and the Notion target ID is unchanged, the rich-text parser writes
   it back as a typed Notion database mention instead of accidentally converting
-  it to a page mention. Creating arbitrary new database mentions from a plain
-  Notion URL still needs an explicit typed-link syntax because Notion page and
-  database URLs are not distinguishable from the ID alone.
+  it to a page mention. Agents can create or reassert typed page/database
+  mentions with `@page(<notion-page-id>)` and
+  `@database(<notion-database-id>)`; both forms also accept
+  `Name <id>` labels for readability. Plain Notion URLs are still ambiguous
+  without a preimage, so the explicit database form is the canonical way to
+  create a new database mention.
 - **Verification:** Fixture apply tests assert edited database mention links
-  produce `mention.database` payloads. The live diverse page cyclic test creates
-  both a rich-text database mention and a database `link_to_page` block, then
-  verifies the mounted read/no-op push does not mutate the Notion block JSON.
+  and explicit page/database mention syntax produce typed request payloads. The
+  live diverse page cyclic test creates both a rich-text database mention and a
+  database `link_to_page` block, then verifies the mounted read/no-op push does
+  not mutate the Notion block JSON. The live supported-edit cycle rewrites a
+  paragraph with `@page(...)` and `@database(...)`, pushes it, and verifies the
+  fresh Notion render includes the target object links.
 
 ### Explicit Date Mention Writes
 

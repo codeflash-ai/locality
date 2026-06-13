@@ -101,7 +101,7 @@ Inline rich text is represented with Notion DTOs first, then rendered through on
 - `RichTextDto` mirrors Notion's `text`, `mention`, and `equation` variants plus shared annotations and links.
 - `TextRichTextDto`, `MentionRichTextDto`, and `EquationRichTextDto` keep variant-specific payloads out of renderer control flow.
 - The renderer preserves whitespace around annotated spans so text like ` bold ` becomes ` **bold** ` instead of pulling spaces into Markdown delimiters.
-- Page and database mentions render as normal Markdown links to Notion object URLs. Unchanged mention preimages still preserve typed Notion mentions during block updates.
+- Page and database mentions render as normal Markdown links to Notion object URLs. Unchanged mention preimages still preserve typed Notion mentions during block updates, and agents can create or reassert typed links with `@page(<notion-page-id>)` and `@database(<notion-database-id>)`.
 - Unknown or partially populated rich text falls back to `plain_text` so live API additions remain readable.
 
 Nested children are fetched recursively and rendered after their parent, except valid table rows, which are folded into their parent table's Markdown block. This preserves content and block IDs for the first read path, but it does not yet preserve every Notion nesting/layout nuance. Layout-rich blocks should stay directive-backed until the renderer can round-trip them safely.
@@ -112,7 +112,7 @@ The first Notion apply path is intentionally conservative:
 
 - supported operations: block update, block append, block archive, supported page property update, and database row creation;
 - supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, existing stable-width/header-mode tables including row add/delete, existing bookmark/embed URL blocks, and existing URL-backed media blocks;
-- supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, Notion page links, database links whose target ID matches a rendered database mention, explicit `@date(...)` date mentions, explicit `@user(...)` user mentions, legacy `afs://` page links, and unchanged preimage mentions such as dates/users;
+- supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, Notion page links, database links whose target ID matches a rendered database mention, explicit `@page(...)` page mentions, explicit `@database(...)` database mentions, explicit `@date(...)` date mentions, explicit `@user(...)` user mentions, legacy `afs://` page links, and unchanged preimage mentions such as dates/users;
 - supported page property writes: title, rich text, number, select, status, multi-select, checkbox, date, URL, email, phone, external file URLs, explicit people user IDs, and explicit relation page IDs;
 - new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug ~shortid.md` path;
 - unsupported write forms fail before API mutation, including table width or header-mode changes, page/database creation outside database-row files, computed/read-only properties, hosted file uploads/rewrites, multi-data-source row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
@@ -120,7 +120,7 @@ The first Notion apply path is intentionally conservative:
 - before apply, the connector re-reads the page and compares the current Notion edit timestamp against the last-synced timestamp carried by the push executor;
 - after apply, the CLI reconciler fetches changed and created pages, rewrites local files atomically, saves refreshed shadows, updates `remote_edited_at`, and removes the temporary source filename when a created row moves into its projected path.
 
-This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is widening the inline parser to cover additional mention types, nested annotation/link combinations, and relative-file link resolution.
+This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is widening the inline parser to cover nested annotation/link combinations, local relative-file link resolution, and remaining specialized Notion mention variants.
 
 ## Schema-Backed Property Validation
 

@@ -1704,6 +1704,32 @@ impl InlineParser<'_> {
             )));
         }
 
+        if rest.starts_with("@page(")
+            && let Some(end) = find_closing(rest, 6, ")")
+        {
+            let id = parse_page_mention_arg(&rest[6..end])?;
+            return Ok(Some((
+                vec![RichTextWritePart::PageMention {
+                    id,
+                    annotations: InlineAnnotations::default(),
+                }],
+                end + 1,
+            )));
+        }
+
+        if rest.starts_with("@database(")
+            && let Some(end) = find_closing(rest, 10, ")")
+        {
+            let id = parse_database_mention_arg(&rest[10..end])?;
+            return Ok(Some((
+                vec![RichTextWritePart::DatabaseMention {
+                    id,
+                    annotations: InlineAnnotations::default(),
+                }],
+                end + 1,
+            )));
+        }
+
         if rest.starts_with("@user(")
             && let Some(end) = find_closing(rest, 6, ")")
         {
@@ -1781,7 +1807,19 @@ impl InlineParser<'_> {
 
     fn next_special_or_preimage(&self, start: usize, closing: Option<&str>) -> usize {
         let mut next = self.input.len();
-        for marker in ["**", "~~", "<u>", "`", "$", "@date(", "@user(", "[", "_"] {
+        for marker in [
+            "**",
+            "~~",
+            "<u>",
+            "`",
+            "$",
+            "@date(",
+            "@page(",
+            "@database(",
+            "@user(",
+            "[",
+            "_",
+        ] {
             if let Some(offset) = self.input[start..].find(marker) {
                 next = next.min(start + offset);
             }
@@ -1883,6 +1921,28 @@ fn parse_user_mention_arg(input: &str) -> AfsResult<String> {
     } else {
         Err(AfsError::Unsupported(
             "user mention syntax; use @user(<notion-user-id>)",
+        ))
+    }
+}
+
+fn parse_page_mention_arg(input: &str) -> AfsResult<String> {
+    let id = parse_named_id_entry(input).trim();
+    if valid_notion_id(id) {
+        Ok(id.to_string())
+    } else {
+        Err(AfsError::Unsupported(
+            "page mention syntax; use @page(<notion-page-id>)",
+        ))
+    }
+}
+
+fn parse_database_mention_arg(input: &str) -> AfsResult<String> {
+    let id = parse_named_id_entry(input).trim();
+    if valid_notion_id(id) {
+        Ok(id.to_string())
+    } else {
+        Err(AfsError::Unsupported(
+            "database mention syntax; use @database(<notion-database-id>)",
         ))
     }
 }

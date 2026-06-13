@@ -315,10 +315,19 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
     let api = HttpNotionApi::new(NotionConfig::default());
     let mut cleanup = LiveCleanup::new(api);
     let user_id = cleanup.current_user_id();
+    let target = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS cyclic supported link target {}", unique_suffix()),
+        vec![paragraph_child("Target page for supported edit links.")],
+    );
+    let linked_database = cleanup.create_database(
+        &env.parent_page_id,
+        &format!("AFS cyclic supported linked database {}", unique_suffix()),
+    );
     let source = cleanup.create_page(
         &env.parent_page_id,
         &format!("AFS cyclic supported edits {}", unique_suffix()),
-        supported_edit_children(&user_id),
+        supported_edit_children(&user_id, &target.id, &linked_database.id),
     );
 
     let connector = NotionConnector::new(NotionConfig::default());
@@ -386,6 +395,14 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         "Editable user ",
         &format!("Editable user @user({user_id})"),
     );
+    let edited = replace_line_with_prefix(
+        edited,
+        "Editable typed links ",
+        &format!(
+            "Editable typed links @page({}) and @database({})",
+            target.id, linked_database.id
+        ),
+    );
     fs::write(&page_path, edited).expect("write cyclic edits");
 
     let dirty_status = run_status(
@@ -422,10 +439,15 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
     assert!(clean_status.clean, "{clean_status:#?}");
 
     let verified = render_live_page(&connector, &source.id, &page_path);
+    let target_url = notion_object_url(&target.id);
+    let linked_database_url = notion_object_url(&linked_database.id);
     for expected in [
         "Editable paragraph changed.",
         "Editable date 2026-06-14",
         "Editable user ",
+        "Editable typed links ",
+        target_url.as_str(),
+        linked_database_url.as_str(),
         "# Editable heading one changed",
         "## Editable heading two changed",
         "### Editable heading three changed",
@@ -1206,7 +1228,11 @@ fn diverse_page_children(target_page_id: &str, database_id: &str) -> Vec<Value> 
     ]
 }
 
-fn supported_edit_children(user_id: &str) -> Vec<Value> {
+fn supported_edit_children(
+    user_id: &str,
+    target_page_id: &str,
+    linked_database_id: &str,
+) -> Vec<Value> {
     vec![
         paragraph_child("Editable paragraph original."),
         json!({
@@ -1221,6 +1247,18 @@ fn supported_edit_children(user_id: &str) -> Vec<Value> {
             "type": "paragraph",
             "paragraph": {
                 "rich_text": [text_part("Editable user "), user_mention_part(user_id)]
+            }
+        }),
+        json!({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [
+                    text_part("Editable typed links "),
+                    page_mention_part("Target page", target_page_id),
+                    text_part(" and "),
+                    database_mention_part("Linked database", linked_database_id),
+                ]
             }
         }),
         rich_text_child("heading_1", "Editable heading one"),
@@ -1749,6 +1787,10 @@ fn normalize_notion_id(input: &str) -> String {
     } else {
         candidate.to_string()
     }
+}
+
+fn notion_object_url(id: &str) -> String {
+    format!("https://www.notion.so/{}", normalize_notion_id(id))
 }
 
 fn replace_line_with_prefix(markdown: String, prefix: &str, replacement: &str) -> String {
