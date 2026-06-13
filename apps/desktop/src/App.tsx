@@ -204,13 +204,16 @@ function errorMessage(error: unknown) {
 
 export default function App() {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>(sampleSnapshot);
+  const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
   const route = window.location.hash;
   const [showOnboarding, setShowOnboarding] = useState(() => route !== "#app" && route !== "#tray");
+  const setupIsComplete = setupComplete(snapshot);
 
   async function refreshSnapshot() {
     const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
     setSnapshot(nextSnapshot);
+    setSnapshotLoaded(true);
   }
 
   useEffect(() => {
@@ -219,8 +222,20 @@ export default function App() {
         await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
       }
       await refreshSnapshot();
-    })().catch(() => setSnapshot(sampleSnapshot));
+    })().catch(() => {
+      setSnapshot(sampleSnapshot);
+      setSnapshotLoaded(true);
+    });
   }, []);
+
+  useEffect(() => {
+    if (!snapshotLoaded || route === "#app" || route === "#tray" || route === "#onboarding-ready") {
+      return;
+    }
+    if (setupIsComplete) {
+      setShowOnboarding(false);
+    }
+  }, [route, setupIsComplete, snapshotLoaded]);
 
   useEffect(() => {
     const handleOpenView = (event: Event) => {
@@ -259,6 +274,7 @@ export default function App() {
     return (
       <Onboarding
         snapshot={snapshot}
+        snapshotLoaded={snapshotLoaded}
         onComplete={() => {
           void refreshSnapshot().catch(() => undefined);
           setShowOnboarding(false);
@@ -273,9 +289,11 @@ export default function App() {
 
 function Onboarding({
   snapshot,
+  snapshotLoaded,
   onComplete,
 }: {
   snapshot: DesktopSnapshot;
+  snapshotLoaded: boolean;
   onComplete: () => void;
 }) {
   const [step, setStep] = useState(() => (window.location.hash === "#onboarding-ready" ? 4 : 1));
@@ -300,6 +318,20 @@ function Onboarding({
       setMountPath(snapshot.mount.localPath);
     }
   }, [mountPathDirty, snapshot.mount.localPath]);
+
+  useEffect(() => {
+    if (!snapshotLoaded || window.location.hash === "#onboarding-ready" || connectionMissing(snapshot)) {
+      return;
+    }
+
+    setOauthReady(true);
+    setStep((current) => {
+      if (mountMissing(snapshot)) {
+        return current < 3 ? 3 : current;
+      }
+      return current < 4 ? 4 : current;
+    });
+  }, [snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
 
   async function startConnect() {
     setOauthError("");
@@ -1641,6 +1673,10 @@ function connectionMissing(snapshot: DesktopSnapshot) {
 
 function mountMissing(snapshot: DesktopSnapshot) {
   return snapshot.mount.status === "not_mounted";
+}
+
+function setupComplete(snapshot: DesktopSnapshot) {
+  return !connectionMissing(snapshot) && !mountMissing(snapshot);
 }
 
 function isAppView(value: string): value is AppView {
