@@ -481,6 +481,7 @@ impl LiveCleanup {
     }
 
     fn create_database(&mut self, parent_page_id: &str, title: &str) -> DatabaseDto {
+        let unique_prefix = unique_id_prefix();
         let database = self
             .api
             .create_database(json!({
@@ -519,7 +520,7 @@ impl LiveCleanup {
                         "Phone": { "phone_number": {} },
                         "Files": { "files": {} },
                         "People": { "people": {} },
-                        "Unique": { "unique_id": { "prefix": "AFS" } }
+                        "Unique": { "unique_id": { "prefix": unique_prefix } }
                     }
                 }
             }))
@@ -921,4 +922,19 @@ fn unique_suffix() -> String {
         .expect("clock")
         .as_nanos();
     format!("{}-{nanos}", std::process::id())
+}
+
+fn unique_id_prefix() -> String {
+    let mut value = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut prefix = String::new();
+    for _ in 0..6 {
+        let index = (value % alphabet.len() as u128) as usize;
+        prefix.push(alphabet[index] as char);
+        value /= alphabet.len() as u128;
+    }
+    prefix
 }

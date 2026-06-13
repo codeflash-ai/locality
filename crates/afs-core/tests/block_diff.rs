@@ -197,6 +197,33 @@ fn residual_alignment_updates_same_kind_sequence_without_archive_recreate() {
     );
 }
 
+#[test]
+fn editing_a_rendered_table_produces_table_block_update() {
+    let mut shadow = shadow(
+        "| Name | Status |\n| --- | --- |\n| Old task | Todo |",
+        ["table-1"],
+    );
+    shadow.blocks[0].kind = MarkdownBlockKind::TableWithRows {
+        row_ids: vec![RemoteId::new("row-1"), RemoteId::new("row-2")],
+        has_column_header: true,
+        has_row_header: false,
+    };
+    let edited =
+        CanonicalDocument::new("", "| Name | Status |\n| --- | --- |\n| New task | Done |");
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("table-1"),
+            content: "| Name | Status |\n| --- | --- |\n| New task | Done |".to_string(),
+        }]
+    );
+}
+
 fn shadow<const N: usize>(body: &str, ids: [&str; N]) -> ShadowDocument {
     ShadowDocument::from_synced_body(
         RemoteId::new("page-1"),

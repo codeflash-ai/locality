@@ -13,8 +13,8 @@ use afs_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
     DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto, FileBlockDto, LinkDto,
     MentionRichTextDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto,
-    RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto, TextRichTextDto,
-    UrlBlockDto,
+    RichTextAnnotationsDto, RichTextBlockDto, RichTextDto, SelectOptionDto, TableBlockDto,
+    TableRowBlockDto, TextRichTextDto, UrlBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -972,6 +972,68 @@ fn apply_updates_external_media_blocks_from_markdown_links() {
 }
 
 #[test]
+fn apply_updates_simple_table_rows_from_markdown_table() {
+    let api = Arc::new(RecordingNotionApi::with_table(
+        "2026-06-10T00:00:00.000Z",
+        table_block("table-1", 2, true),
+        vec![
+            table_row_block("row-1", &["Name", "Status"]),
+            table_row_block("row-2", &["Old task", "Todo"]),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("table-1"),
+            content: "| Name | Status |\n| --- | --- |\n| New task | Done |".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+        })
+        .expect("apply table row updates");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Update {
+                block_id: "row-1".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("Name"),
+                            rich_text_json("Status"),
+                        ],
+                    },
+                }),
+            },
+            WriteCall::Update {
+                block_id: "row-2".to_string(),
+                body: json!({
+                    "table_row": {
+                        "cells": [
+                            rich_text_json("New task"),
+                            rich_text_json("Done"),
+                        ],
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_updates_supported_page_properties() {
     let api = Arc::new(RecordingNotionApi::with_page_properties(
         "2026-06-10T00:00:00.000Z",
@@ -1336,6 +1398,57 @@ impl RecordingNotionApi {
         Self::with_page_and_block_results(page, blocks)
     }
 
+    fn with_table(last_edited_time: &str, table: BlockDto, rows: Vec<BlockDto>) -> Self {
+        let page = PageDto {
+            id: "page-1".to_string(),
+            parent: None,
+            created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+            last_edited_time: Some(last_edited_time.to_string()),
+            archived: false,
+            in_trash: false,
+            properties: BTreeMap::new(),
+        };
+        let children = BTreeMap::from([
+            (
+                ("page-1".to_string(), None),
+                PaginatedListDto {
+                    results: vec![table.clone()],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            (
+                (table.id, None),
+                PaginatedListDto {
+                    results: rows,
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+        ]);
+        Self {
+            page,
+            database: DatabaseDto {
+                id: "database-1".to_string(),
+                data_sources: vec![DataSourceSummaryDto {
+                    id: "source-1".to_string(),
+                    name: Some("Tasks".to_string()),
+                }],
+                last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                ..Default::default()
+            },
+            data_source: DataSourceDto {
+                id: "source-1".to_string(),
+                name: Some("Tasks".to_string()),
+                properties: BTreeMap::new(),
+                ..Default::default()
+            },
+            children,
+            writes: Mutex::new(Vec::new()),
+            append_count: Mutex::new(0),
+        }
+    }
+
     fn with_page_and_children(page: PageDto, rich_text: Vec<RichTextDto>) -> Self {
         Self::with_page_and_block_results(
             page,
@@ -1658,6 +1771,25 @@ fn media_block(id: &str, kind: &str, url: &str, caption: &str) -> BlockDto {
         "audio" => block.audio = payload,
         _ => {}
     }
+    block
+}
+
+fn table_block(id: &str, width: u16, has_column_header: bool) -> BlockDto {
+    let mut block = block(id, "table");
+    block.has_children = true;
+    block.table = Some(TableBlockDto {
+        table_width: width,
+        has_column_header,
+        has_row_header: false,
+    });
+    block
+}
+
+fn table_row_block(id: &str, cells: &[&str]) -> BlockDto {
+    let mut block = block(id, "table_row");
+    block.table_row = Some(TableRowBlockDto {
+        cells: cells.iter().map(|cell| rich_text(cell)).collect(),
+    });
     block
 }
 

@@ -340,6 +340,10 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
             "> [!NOTE]\n> Editable callout changed",
         )
         .replace(
+            "| Editable table item | Editable table state |",
+            "| Editable table item changed | Editable table state done |",
+        )
+        .replace(
             "[Editable bookmark](https://example.com/editable-bookmark)",
             "[Editable bookmark changed](https://example.com/editable-bookmark-changed)",
         )
@@ -416,6 +420,7 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         "- [x] Editable todo changed",
         "> Editable quote changed",
         "> [!NOTE]\n> Editable callout changed",
+        "| Editable table item changed | Editable table state done |",
         "[Editable bookmark changed](https://example.com/editable-bookmark-changed)",
         "[Editable embed changed](https://example.com/editable-embed-changed)",
         "![Editable image changed](https://www.w3.org/assets/logos/w3c-2025-transitional/w3c-72x48.png)",
@@ -767,6 +772,7 @@ impl LiveCleanup {
     }
 
     fn create_database(&mut self, parent_page_id: &str, title: &str) -> DatabaseDto {
+        let unique_prefix = unique_id_prefix();
         let database = self
             .api
             .create_database(json!({
@@ -805,7 +811,7 @@ impl LiveCleanup {
                         "Phone": { "phone_number": {} },
                         "Files": { "files": {} },
                         "People": { "people": {} },
-                        "Unique": { "unique_id": { "prefix": "AFS" } }
+                        "Unique": { "unique_id": { "prefix": unique_prefix } }
                     }
                 }
             }))
@@ -1089,6 +1095,19 @@ fn supported_edit_children() -> Vec<Value> {
             "object": "block",
             "type": "embed",
             "embed": { "url": "https://example.com/editable-embed", "caption": rich_text_json("Editable embed") }
+        }),
+        json!({
+            "object": "block",
+            "type": "table",
+            "table": {
+                "table_width": 2,
+                "has_column_header": true,
+                "has_row_header": false,
+                "children": [
+                    table_row_child("Editable table name", "Editable table status"),
+                    table_row_child("Editable table item", "Editable table state")
+                ]
+            }
         }),
         media_child(
             "image",
@@ -1516,6 +1535,21 @@ fn unique_suffix() -> String {
         .expect("clock")
         .as_nanos();
     format!("{}-{nanos}", std::process::id())
+}
+
+fn unique_id_prefix() -> String {
+    let mut value = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut prefix = String::new();
+    for _ in 0..6 {
+        let index = (value % alphabet.len() as u128) as usize;
+        prefix.push(alphabet[index] as char);
+        value /= alphabet.len() as u128;
+    }
+    prefix
 }
 
 fn file_name(path: &Path) -> &str {

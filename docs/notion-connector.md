@@ -111,11 +111,11 @@ Nested children are fetched recursively and rendered after their parent, except 
 The first Notion apply path is intentionally conservative:
 
 - supported operations: block update, block append, block archive, supported page property update, and database row creation;
-- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, existing bookmark/embed URL blocks, and existing URL-backed media blocks;
+- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, same-shape existing tables, existing bookmark/embed URL blocks, and existing URL-backed media blocks;
 - supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, Notion page links, legacy `afs://` page links, and unchanged preimage mentions such as dates;
 - supported page property writes: title, rich text, number, select, status, multi-select, checkbox, date, URL, email, and phone;
 - new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug ~shortid.md` path;
-- unsupported write forms fail before API mutation, including tables, page/database creation outside database-row files, computed/read-only properties, multi-data-source row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
+- unsupported write forms fail before API mutation, including table row add/delete or width changes, page/database creation outside database-row files, computed/read-only properties, multi-data-source row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
 - appends use Notion's current position object, with `start` for prepends and `after_block` for inserts after a known block;
 - before apply, the connector re-reads the page and compares the current Notion edit timestamp against the last-synced timestamp carried by the push executor;
 - after apply, the CLI reconciler fetches changed and created pages, rewrites local files atomically, saves refreshed shadows, updates `remote_edited_at`, and removes the temporary source filename when a created row moves into its projected path.

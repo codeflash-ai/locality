@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 use crate::client::NotionApi;
 use crate::dto::{
     BlockDto, BlockTreeDto, DataSourceDto, NotionPageBundle, PageDto, PagePropertyDto,
-    RichTextAnnotationsDto, RichTextDto,
+    RichTextAnnotationsDto, RichTextDto, TableBlockDto,
 };
 use crate::fetch::fetch_page_bundle;
 
@@ -69,6 +69,15 @@ pub fn apply_plan(
         match operation {
             PushOperation::UpdateBlock { block_id, content } => {
                 let current = current_block(&current_blocks, block_id)?;
+                if current.kind == "table" && looks_like_markdown_table(content) {
+                    apply_table_update(api, &bundles, block_id, current, content)?;
+                    effects.push(JournalApplyEffect::UpdatedBlock {
+                        operation_id: request.operation_ids[operation_index].clone(),
+                        operation_index,
+                        block_id: block_id.clone(),
+                    });
+                    continue;
+                }
                 let patch = parse_supported_block(
                     content,
                     Some(current.kind.as_str()),
@@ -221,6 +230,21 @@ pub fn apply_undo(
     for operation in &request.plan.operations {
         match operation {
             UndoOperation::RestoreBlockContent { block_id, content } => {
+                if looks_like_markdown_table(content) {
+                    let create_parent_ids = BTreeSet::new();
+                    let bundles = fetch_affected_bundles(
+                        api,
+                        &request.plan.affected_entities,
+                        &create_parent_ids,
+                    )?;
+                    let current_blocks = block_map(&bundles);
+                    if let Ok(current) = current_block(&current_blocks, block_id)
+                        && current.kind == "table"
+                    {
+                        apply_table_update(api, &bundles, block_id, current, content)?;
+                        continue;
+                    }
+                }
                 let patch = parse_supported_block(content, None, None)?;
                 api.update_block(block_id.as_str(), patch.update_body())?;
             }
@@ -325,6 +349,102 @@ fn collect_blocks<'a>(trees: &'a [BlockTreeDto], blocks: &mut BTreeMap<RemoteId,
         blocks.insert(RemoteId::new(tree.block.id.clone()), &tree.block);
         collect_blocks(&tree.children, blocks);
     }
+}
+
+fn apply_table_update(
+    api: &dyn NotionApi,
+    bundles: &[NotionPageBundle],
+    table_id: &RemoteId,
+    current: &BlockDto,
+    markdown: &str,
+) -> AfsResult<()> {
+    let table = current.table.as_ref().ok_or_else(|| {
+        AfsError::InvalidState(format!(
+            "notion table block `{}` is missing its `table` payload",
+            current.id
+        ))
+    })?;
+    let current_rows = current_table_rows(bundles, table_id)?;
+    let parsed = parse_markdown_table(markdown, table)?;
+
+    if parsed.rows.len() != current_rows.len() {
+        return Err(AfsError::Unsupported(
+            "writing Notion table row additions or deletions",
+        ));
+    }
+
+    for (row_block, cells) in current_rows.iter().zip(parsed.rows) {
+        let current_row = row_block.table_row.as_ref().ok_or_else(|| {
+            AfsError::InvalidState(format!(
+                "notion table row block `{}` is missing its `table_row` payload",
+                row_block.id
+            ))
+        })?;
+        if cells.len() != current_row.cells.len() {
+            return Err(AfsError::Unsupported("writing Notion table width changes"));
+        }
+
+        let cells = cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                rich_text_payload(
+                    cell,
+                    current_row.cells.get(index).map(|cell| cell.as_slice()),
+                )
+            })
+            .collect::<AfsResult<Vec<_>>>()?;
+        api.update_block(
+            &row_block.id,
+            json!({
+                "table_row": {
+                    "cells": cells,
+                },
+            }),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn current_table_rows<'a>(
+    bundles: &'a [NotionPageBundle],
+    table_id: &RemoteId,
+) -> AfsResult<Vec<&'a BlockDto>> {
+    let tree = bundles
+        .iter()
+        .find_map(|bundle| find_block_tree(&bundle.blocks, table_id))
+        .ok_or_else(|| {
+            AfsError::InvalidState(format!(
+                "push referenced table `{}` that is absent from current Notion page content",
+                table_id.0
+            ))
+        })?;
+
+    tree.children
+        .iter()
+        .map(|child| {
+            if child.block.kind == "table_row" && child.children.is_empty() {
+                Ok(&child.block)
+            } else {
+                Err(AfsError::Unsupported(
+                    "writing Notion tables with non-row children",
+                ))
+            }
+        })
+        .collect()
+}
+
+fn find_block_tree<'a>(trees: &'a [BlockTreeDto], block_id: &RemoteId) -> Option<&'a BlockTreeDto> {
+    for tree in trees {
+        if tree.block.id == block_id.0 {
+            return Some(tree);
+        }
+        if let Some(found) = find_block_tree(&tree.children, block_id) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn current_block<'a>(
@@ -765,6 +885,95 @@ impl NotionBlockPatch {
         object.insert(self.kind.to_string(), self.payload.clone());
         Value::Object(object)
     }
+}
+
+struct ParsedMarkdownTable {
+    rows: Vec<Vec<String>>,
+}
+
+fn parse_markdown_table(
+    markdown: &str,
+    current_table: &TableBlockDto,
+) -> AfsResult<ParsedMarkdownTable> {
+    let lines = markdown
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() < 2 {
+        return Err(AfsError::Unsupported("writing malformed Notion tables"));
+    }
+
+    let header = parse_markdown_table_row(lines[0])?;
+    validate_markdown_table_separator(lines[1], header.len())?;
+    let mut data_rows = lines[2..]
+        .iter()
+        .map(|line| parse_markdown_table_row(line))
+        .collect::<AfsResult<Vec<_>>>()?;
+    let width = usize::from(current_table.table_width);
+    if width == 0 || header.len() != width || data_rows.iter().any(|row| row.len() != width) {
+        return Err(AfsError::Unsupported("writing Notion table width changes"));
+    }
+
+    let rows = if current_table.has_column_header {
+        let mut rows = Vec::with_capacity(data_rows.len() + 1);
+        rows.push(header);
+        rows.append(&mut data_rows);
+        rows
+    } else {
+        if header.iter().any(|cell| !cell.trim().is_empty()) {
+            return Err(AfsError::Unsupported(
+                "writing Notion table header-mode changes",
+            ));
+        }
+        data_rows
+    };
+
+    Ok(ParsedMarkdownTable { rows })
+}
+
+fn parse_markdown_table_row(line: &str) -> AfsResult<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') || !trimmed.ends_with('|') || trimmed.len() < 2 {
+        return Err(AfsError::Unsupported("writing malformed Notion tables"));
+    }
+
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if ch == '|' && !escaped {
+            cells.push(unescape_markdown_table_cell(current.trim()));
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+        escaped = ch == '\\' && !escaped;
+        if ch != '\\' {
+            escaped = false;
+        }
+    }
+    cells.push(unescape_markdown_table_cell(current.trim()));
+
+    Ok(cells)
+}
+
+fn validate_markdown_table_separator(line: &str, width: usize) -> AfsResult<()> {
+    let cells = parse_markdown_table_row(line)?;
+    let valid = cells.len() == width
+        && cells.iter().all(|cell| {
+            let trimmed = cell.trim();
+            trimmed.contains('-') && trimmed.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(AfsError::Unsupported("writing malformed Notion tables"))
+    }
+}
+
+fn unescape_markdown_table_cell(cell: &str) -> String {
+    cell.replace("\\|", "|").replace("<br>", "\n")
 }
 
 fn parse_supported_block(
