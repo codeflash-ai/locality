@@ -18,7 +18,7 @@ jobs:
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       AFS_NOTION_LIVE_PARENT_PAGE: ${{ secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
-      AFS_NOTION_LIVE_DIR: ${{ runner.temp }}/afs-notion-live
+      AFS_NOTION_LIVE_DIR: /tmp/afs-notion-live
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
