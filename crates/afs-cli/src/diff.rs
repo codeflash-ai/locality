@@ -4,33 +4,29 @@
 //! `afs-store`, reads the canonical file from disk, and delegates validation,
 //! diffing, and guardrail evaluation to `afs-core`.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use afs_core::canonical::{
-    CanonicalParseError, CanonicalParseErrorKind, ParsedCanonicalDocument, parse_canonical_markdown,
-};
-use afs_core::conflict::unresolved_conflict_marker_line;
-use afs_core::diff::property_value_from_frontmatter;
-use afs_core::model::{EntityKind, RemoteId};
+use afs_core::AfsError;
+use afs_core::model::RemoteId;
 use afs_core::planner::{
-    GuardrailDecision, GuardrailPolicy, PlanDegradation, PlanDegradationKind, PlanSummary,
-    PropertyValue, PushOperation, PushPlan,
+    GuardrailDecision, PlanDegradation, PlanDegradationKind, PlanSummary, PropertyValue,
+    PushOperation, PushPlan,
 };
-use afs_core::push::{
-    PushApproval, PushPipelineAction, PushPipelineRequest, PushPipelineResult, PushStage,
-    evaluate_guardrails, plan_push_pipeline,
-};
+use afs_core::push::{PushApproval, PushPipelineAction, PushPipelineResult, PushStage};
 use afs_core::shadow::ShadowDocument;
-use afs_core::validation::{ValidationIssue, ValidationReport};
+use afs_core::validation::ValidationIssue;
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
+    VirtualMutationRepository,
 };
+use afsd::execution::PushJob;
+use afsd::push::{PushPrepareError, prepare_push};
+use afsd::source::LocalSourceValidator;
 use serde::Serialize;
 
 pub fn run_diff<S>(store: &S, target_path: impl AsRef<Path>) -> Result<DiffReport, DiffError>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
 {
     run_preview(store, target_path, PreviewOptions::new("diff"))
 }
@@ -41,7 +37,7 @@ pub fn run_preview<S>(
     options: PreviewOptions,
 ) -> Result<DiffReport, DiffError>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
 {
     run_preview_artifacts(store, target_path, options).map(|artifacts| artifacts.report)
 }
@@ -52,524 +48,34 @@ pub fn run_preview_artifacts<S>(
     options: PreviewOptions,
 ) -> Result<PreviewArtifacts, DiffError>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
 {
-    let target_path = target_path.as_ref();
-    let absolute_path = absolute_path(target_path)?;
-    let mounts = store.load_mounts().map_err(DiffError::Store)?;
-    let mount = find_mount_for_path(&mounts, &absolute_path)
-        .ok_or_else(|| DiffError::MountNotFound(absolute_path.clone()))?;
-    let relative_path = relative_entity_path(mount, &absolute_path)?;
-    let entity = store
-        .find_entity_by_path(&mount.mount_id, &relative_path)
-        .map_err(DiffError::Store)?;
-    let file = std::fs::read_to_string(&absolute_path).map_err(|error| DiffError::ReadFile {
-        path: absolute_path.clone(),
-        message: error.to_string(),
-    })?;
-
-    let Some(entity) = entity else {
-        return create_entity_preview(store, absolute_path, mount, relative_path, file, options);
+    let job = PushJob {
+        target_path: target_path.as_ref().to_path_buf(),
+        assume_yes: options.approval.assume_yes,
+        confirm_dangerous: options.approval.confirm_dangerous,
     };
-
-    if let Some(line) = unresolved_conflict_marker_line(&file) {
-        let report = DiffReport::validation_failure(
-            options.command,
-            absolute_path,
-            mount,
-            entity.remote_id.clone(),
-            vec![unresolved_conflict_marker_issue(&relative_path, line)],
-        );
-        return Ok(PreviewArtifacts::report_only(report));
-    }
-
-    let parsed = match parse_canonical_markdown(&file) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            let report = DiffReport::validation_failure(
-                options.command,
-                absolute_path,
-                mount,
-                entity.remote_id,
-                vec![parse_error_issue(&relative_path, error)],
-            );
-            return Ok(PreviewArtifacts::report_only(report));
-        }
-    };
-
-    if parsed
-        .remote_id()
-        .is_some_and(|remote_id| remote_id != &entity.remote_id)
-    {
-        let report = DiffReport::validation_failure(
-            options.command,
-            absolute_path,
-            mount,
-            entity.remote_id.clone(),
-            vec![ValidationIssue::new(
-                "frontmatter_remote_id_mismatch",
-                relative_path,
-                Some(1),
-                "frontmatter `afs.id` does not match the entity mapped to this path",
-                Some("restore the generated `afs.id` for this file before pushing".to_string()),
-            )],
-        );
-        return Ok(PreviewArtifacts::report_only(report));
-    }
-
-    let shadow = store
-        .load_shadow(&mount.mount_id, &entity.remote_id)
-        .map_err(DiffError::Store)?;
-    let schema_validation =
-        notion_changed_row_schema_validation(store, mount, &relative_path, &parsed, &shadow)?;
-    let output = if schema_validation.is_clean() {
-        plan_push_pipeline(
-            PushPipelineRequest::new(relative_path, &parsed, &shadow)
-                .with_approval(options.approval)
-                .read_only(mount.read_only),
-        )
-    } else {
-        validation_pipeline(schema_validation)
-    };
-
+    let validator = LocalSourceValidator;
+    let prepared = prepare_push(store, &job, None, &validator).map_err(DiffError::from)?;
+    let entity_id = prepared.entity.remote_id.clone();
+    let pipeline = prepared.pipeline.clone();
     let report = DiffReport::from_pipeline(
         options.command,
-        absolute_path,
-        mount,
-        entity.remote_id.clone(),
-        output.clone(),
-    );
-
-    Ok(PreviewArtifacts {
-        report,
-        mount: Some(mount.clone()),
-        entity_id: Some(entity.remote_id.clone()),
-        entity: Some(entity),
-        shadow: Some(shadow),
-        pipeline: Some(output),
-    })
-}
-
-fn create_entity_preview<S>(
-    store: &S,
-    absolute_path: PathBuf,
-    mount: &MountConfig,
-    relative_path: PathBuf,
-    file: String,
-    options: PreviewOptions,
-) -> Result<PreviewArtifacts, DiffError>
-where
-    S: EntityRepository,
-{
-    let parent = create_parent_entity(store, mount, &relative_path)?;
-    if parent.kind != EntityKind::Database {
-        let report = DiffReport::validation_failure(
-            options.command,
-            absolute_path,
-            mount,
-            parent.remote_id.clone(),
-            vec![ValidationIssue::new(
-                "create_entity_parent_not_database",
-                relative_path,
-                None,
-                "new files can currently be pushed only as rows inside a projected database directory",
-                Some(
-                    "move the file into a database directory or pull the target page first"
-                        .to_string(),
-                ),
-            )],
-        );
-        return Ok(PreviewArtifacts::report_only(report));
-    }
-
-    if let Some(line) = unresolved_conflict_marker_line(&file) {
-        let report = DiffReport::validation_failure(
-            options.command,
-            absolute_path,
-            mount,
-            parent.remote_id.clone(),
-            vec![unresolved_conflict_marker_issue(&relative_path, line)],
-        );
-        return Ok(PreviewArtifacts::report_only(report));
-    }
-
-    let parsed = match parse_canonical_markdown(&file) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            let report = DiffReport::validation_failure(
-                options.command,
-                absolute_path,
-                mount,
-                parent.remote_id.clone(),
-                vec![parse_error_issue(&relative_path, error)],
-            );
-            return Ok(PreviewArtifacts::report_only(report));
-        }
-    };
-
-    let schema_validation =
-        notion_create_row_schema_validation(mount, &parent, &relative_path, &parsed);
-    let pipeline = create_entity_pipeline(
-        &relative_path,
-        &parsed,
-        &parent,
-        mount,
-        options.approval,
-        schema_validation,
-    );
-    let report = DiffReport::from_pipeline(
-        options.command,
-        absolute_path,
-        mount,
-        parent.remote_id.clone(),
+        prepared.absolute_path.clone(),
+        &prepared.mount,
+        entity_id.clone(),
         pipeline.clone(),
     );
+    let shadow = prepared.shadows.first().cloned();
 
     Ok(PreviewArtifacts {
         report,
-        mount: Some(mount.clone()),
-        entity_id: Some(parent.remote_id.clone()),
-        entity: None,
-        shadow: None,
+        mount: Some(prepared.mount),
+        entity_id: Some(entity_id),
+        entity: Some(prepared.entity),
+        shadow,
         pipeline: Some(pipeline),
     })
-}
-
-fn create_parent_entity<S>(
-    store: &S,
-    mount: &MountConfig,
-    relative_path: &Path,
-) -> Result<EntityRecord, DiffError>
-where
-    S: EntityRepository,
-{
-    let Some(parent_path) = relative_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    else {
-        return Err(DiffError::Store(StoreError::EntityPathMissing {
-            mount_id: mount.mount_id.clone(),
-            path: relative_path.to_path_buf(),
-        }));
-    };
-
-    store
-        .find_entity_by_path(&mount.mount_id, parent_path)
-        .map_err(DiffError::Store)?
-        .ok_or_else(|| {
-            DiffError::Store(StoreError::EntityPathMissing {
-                mount_id: mount.mount_id.clone(),
-                path: relative_path.to_path_buf(),
-            })
-        })
-}
-
-fn create_entity_pipeline(
-    relative_path: &Path,
-    parsed: &ParsedCanonicalDocument,
-    parent: &EntityRecord,
-    mount: &MountConfig,
-    approval: PushApproval,
-    schema_validation: ValidationReport,
-) -> PushPipelineResult {
-    if mount.read_only {
-        return PushPipelineResult {
-            validation: ValidationReport::clean(),
-            plan: None,
-            guardrail: GuardrailDecision::Proceed,
-            action: PushPipelineAction::ReadOnlyBlocked,
-            completed_stages: Vec::new(),
-        };
-    }
-
-    let mut validation = ValidationReport::clean();
-    validation.extend(schema_validation);
-    if parsed.remote_id().is_some() {
-        validation.push(ValidationIssue::new(
-            "create_entity_has_remote_id",
-            relative_path,
-            Some(1),
-            "new row files must not carry an existing `afs.id`",
-            Some(
-                "remove the generated `afs.id`, or pull the existing row before editing"
-                    .to_string(),
-            ),
-        ));
-    }
-    if parsed
-        .frontmatter
-        .afs
-        .as_ref()
-        .and_then(|afs| afs.entity_type.as_ref())
-        .is_some_and(|kind| kind != &EntityKind::Page)
-    {
-        validation.push(ValidationIssue::new(
-            "create_entity_type_not_page",
-            relative_path,
-            Some(1),
-            "database row creation requires `afs.type: page` when an `afs` block is present",
-            Some("remove the `afs` block or set `afs.type` to `page`".to_string()),
-        ));
-    }
-    if parsed
-        .frontmatter
-        .title
-        .as_ref()
-        .is_none_or(|title| title.trim().is_empty())
-    {
-        validation.push(ValidationIssue::new(
-            "create_entity_missing_title",
-            relative_path,
-            Some(1),
-            "new row files require a non-empty `title` frontmatter value",
-            Some("add `title: \"...\"` to the YAML frontmatter".to_string()),
-        ));
-    }
-    if parsed.is_stub() {
-        validation.push(ValidationIssue::new(
-            "create_entity_stub_body",
-            relative_path,
-            None,
-            "new row files cannot use the generated AFS stub marker as their body",
-            Some("replace the stub marker with the row body, or leave the body empty".to_string()),
-        ));
-    }
-    for directive in &parsed.directives {
-        validation.push(ValidationIssue::new(
-            "create_entity_directive_unsupported",
-            relative_path,
-            Some(directive.line),
-            "new row creation does not support pre-seeded AFS directive blocks",
-            Some(
-                "remove the directive and create only directly supported Markdown blocks"
-                    .to_string(),
-            ),
-        ));
-    }
-
-    let mut completed_stages = vec![PushStage::ParseAndValidate];
-    if !validation.is_clean() {
-        return PushPipelineResult {
-            validation,
-            plan: None,
-            guardrail: GuardrailDecision::Proceed,
-            action: PushPipelineAction::FixValidation,
-            completed_stages,
-        };
-    }
-
-    let properties = parsed
-        .frontmatter
-        .properties
-        .iter()
-        .map(|(key, value)| (key.clone(), property_value_from_frontmatter(value)))
-        .collect::<BTreeMap<_, _>>();
-    let plan = PushPlan::new(
-        vec![parent.remote_id.clone()],
-        vec![PushOperation::CreateEntity {
-            parent_id: parent.remote_id.clone(),
-            parent_kind: Some(parent.kind.clone()),
-            title: parsed.frontmatter.title.clone().unwrap_or_default(),
-            properties,
-            body: parsed.document.body.clone(),
-            source_path: relative_path.to_path_buf(),
-        }],
-    );
-    completed_stages.push(PushStage::Diff);
-
-    let guardrail = evaluate_guardrails(&plan, &GuardrailPolicy::default(), None);
-    completed_stages.push(PushStage::PlanAndConfirm);
-
-    let action = match &guardrail {
-        GuardrailDecision::Proceed if approval.assume_yes => PushPipelineAction::ProceedToApply,
-        GuardrailDecision::Proceed => PushPipelineAction::ConfirmPlan,
-        GuardrailDecision::ConfirmRequired { .. } if approval.confirm_dangerous => {
-            PushPipelineAction::ProceedToApply
-        }
-        GuardrailDecision::ConfirmRequired { .. } => PushPipelineAction::ConfirmDangerousPlan,
-    };
-
-    PushPipelineResult {
-        validation,
-        plan: Some(plan),
-        guardrail,
-        action,
-        completed_stages,
-    }
-}
-
-fn notion_changed_row_schema_validation<S>(
-    store: &S,
-    mount: &MountConfig,
-    relative_path: &Path,
-    parsed: &ParsedCanonicalDocument,
-    shadow: &ShadowDocument,
-) -> Result<ValidationReport, DiffError>
-where
-    S: EntityRepository,
-{
-    if mount.read_only {
-        return Ok(ValidationReport::clean());
-    }
-    let Some(parent) = notion_database_parent(store, mount, relative_path)? else {
-        return Ok(ValidationReport::clean());
-    };
-    Ok(
-        match notion_schema_yaml_or_issue(mount, &parent, relative_path) {
-            Ok(schema) => afs_notion::schema::validate_changed_row_frontmatter(
-                &schema,
-                shadow,
-                parsed,
-                relative_path,
-            ),
-            Err(report) => report,
-        },
-    )
-}
-
-fn notion_create_row_schema_validation(
-    mount: &MountConfig,
-    parent: &EntityRecord,
-    relative_path: &Path,
-    parsed: &ParsedCanonicalDocument,
-) -> ValidationReport {
-    if !is_notion_database(mount, parent) {
-        return ValidationReport::clean();
-    }
-
-    match notion_schema_yaml_or_issue(mount, parent, relative_path) {
-        Ok(schema) => {
-            afs_notion::schema::validate_create_row_frontmatter(&schema, parsed, relative_path)
-        }
-        Err(report) => report,
-    }
-}
-
-fn notion_database_parent<S>(
-    store: &S,
-    mount: &MountConfig,
-    relative_path: &Path,
-) -> Result<Option<EntityRecord>, DiffError>
-where
-    S: EntityRepository,
-{
-    if mount.connector != "notion" {
-        return Ok(None);
-    }
-    let Some(parent_path) = relative_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    else {
-        return Ok(None);
-    };
-
-    let parent = store
-        .find_entity_by_path(&mount.mount_id, parent_path)
-        .map_err(DiffError::Store)?;
-    Ok(parent.filter(|entity| entity.kind == EntityKind::Database))
-}
-
-fn is_notion_database(mount: &MountConfig, entity: &EntityRecord) -> bool {
-    mount.connector == "notion" && entity.kind == EntityKind::Database
-}
-
-fn notion_schema_yaml_or_issue(
-    mount: &MountConfig,
-    database: &EntityRecord,
-    relative_path: &Path,
-) -> Result<String, ValidationReport> {
-    let schema_path = mount.root.join(&database.path).join("_schema.yaml");
-    match std::fs::read_to_string(&schema_path) {
-        Ok(schema) => Ok(schema),
-        Err(error) => {
-            let code = if error.kind() == std::io::ErrorKind::NotFound {
-                "notion_schema_missing"
-            } else {
-                "notion_schema_unreadable"
-            };
-            let mut report = ValidationReport::clean();
-            report.push(ValidationIssue::new(
-                code,
-                relative_path,
-                Some(1),
-                format!(
-                    "Notion database row writes require readable schema file `{}`",
-                    schema_path.display()
-                ),
-                Some(
-                    "run `afs pull` on the database directory to regenerate `_schema.yaml`"
-                        .to_string(),
-                ),
-            ));
-            Err(report)
-        }
-    }
-}
-
-fn validation_pipeline(validation: ValidationReport) -> PushPipelineResult {
-    PushPipelineResult {
-        validation,
-        plan: None,
-        guardrail: GuardrailDecision::Proceed,
-        action: PushPipelineAction::FixValidation,
-        completed_stages: vec![PushStage::ParseAndValidate],
-    }
-}
-
-fn absolute_path(path: &Path) -> Result<PathBuf, DiffError> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .map_err(|error| DiffError::ReadFile {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })
-    }
-}
-
-fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
-    mounts
-        .iter()
-        .filter(|mount| path.starts_with(&mount.root))
-        .max_by_key(|mount| mount.root.components().count())
-}
-
-fn relative_entity_path(mount: &MountConfig, absolute_path: &Path) -> Result<PathBuf, DiffError> {
-    absolute_path
-        .strip_prefix(&mount.root)
-        .map(Path::to_path_buf)
-        .map_err(|_| DiffError::MountNotFound(absolute_path.to_path_buf()))
-}
-
-fn parse_error_issue(path: &Path, error: CanonicalParseError) -> ValidationIssue {
-    let code = match error.kind {
-        CanonicalParseErrorKind::MissingFrontmatter => "canonical_missing_frontmatter",
-        CanonicalParseErrorKind::UnterminatedFrontmatter => "canonical_unterminated_frontmatter",
-        CanonicalParseErrorKind::InvalidFrontmatterYaml => "canonical_invalid_frontmatter_yaml",
-    };
-
-    ValidationIssue::new(
-        code,
-        path.to_path_buf(),
-        error.line,
-        error.message,
-        Some("restore the generated canonical Markdown frontmatter".to_string()),
-    )
-}
-
-fn unresolved_conflict_marker_issue(path: &Path, line: usize) -> ValidationIssue {
-    ValidationIssue::new(
-        "unresolved_conflict_markers",
-        path,
-        Some(line),
-        "file contains unresolved conflict markers",
-        Some(
-            "edit the file to choose the intended content, remove every conflict marker line, then rerun `afs diff` or `afs push`"
-                .to_string(),
-        ),
-    )
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -586,19 +92,6 @@ pub struct PreviewArtifacts {
     pub entity: Option<EntityRecord>,
     pub shadow: Option<ShadowDocument>,
     pub pipeline: Option<PushPipelineResult>,
-}
-
-impl PreviewArtifacts {
-    fn report_only(report: DiffReport) -> Self {
-        Self {
-            report,
-            mount: None,
-            entity_id: None,
-            entity: None,
-            shadow: None,
-            pipeline: None,
-        }
-    }
 }
 
 impl PreviewOptions {
@@ -620,6 +113,7 @@ pub enum DiffError {
     MountNotFound(PathBuf),
     ReadFile { path: PathBuf, message: String },
     Store(StoreError),
+    Prepare(AfsError),
 }
 
 impl DiffError {
@@ -631,6 +125,13 @@ impl DiffError {
             Self::Store(StoreError::ShadowMissing { .. }) => "shadow_missing",
             Self::Store(StoreError::EntityPathMissing { .. }) => "entity_path_missing",
             Self::Store(_) => "store_error",
+            Self::Prepare(AfsError::NotImplemented(_)) => "not_implemented",
+            Self::Prepare(AfsError::Validation(_)) => "validation_failed",
+            Self::Prepare(AfsError::Conflict(_)) => "conflict",
+            Self::Prepare(AfsError::Guardrail(_)) => "guardrail",
+            Self::Prepare(AfsError::InvalidState(_)) => "invalid_state",
+            Self::Prepare(AfsError::Unsupported(_)) => "unsupported",
+            Self::Prepare(AfsError::Io(_)) => "io_error",
         }
     }
 
@@ -643,6 +144,18 @@ impl DiffError {
                 format!("failed to read `{}`: {message}", path.display())
             }
             Self::Store(error) => error.to_string(),
+            Self::Prepare(error) => error.to_string(),
+        }
+    }
+}
+
+impl From<PushPrepareError> for DiffError {
+    fn from(value: PushPrepareError) -> Self {
+        match value {
+            PushPrepareError::MountNotFound(path) => Self::MountNotFound(path),
+            PushPrepareError::ReadFile { path, message } => Self::ReadFile { path, message },
+            PushPrepareError::Store(error) => Self::Store(error),
+            PushPrepareError::Core(error) => Self::Prepare(error),
         }
     }
 }
@@ -665,33 +178,6 @@ pub struct DiffReport {
 }
 
 impl DiffReport {
-    fn validation_failure(
-        command: &'static str,
-        absolute_path: PathBuf,
-        mount: &MountConfig,
-        entity_id: RemoteId,
-        issues: Vec<ValidationIssue>,
-    ) -> Self {
-        Self {
-            ok: false,
-            command,
-            path: absolute_path.display().to_string(),
-            mount_id: mount.mount_id.0.clone(),
-            entity_id: entity_id.0,
-            validation: issues
-                .into_iter()
-                .map(ValidationIssueOutput::from)
-                .collect(),
-            plan: None,
-            guardrail: GuardrailOutput::proceed(),
-            action: action_name(&PushPipelineAction::FixValidation).to_string(),
-            unsupported: Vec::new(),
-            message: None,
-            suggested_fix: None,
-            completed_stages: vec![stage_name(&PushStage::ParseAndValidate).to_string()],
-        }
-    }
-
     fn from_pipeline(
         command: &'static str,
         absolute_path: PathBuf,

@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::source::{LocalSourceValidator, SourcePushValidator, SourceValidationContext};
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
 pub fn execute_push_job<S, Source>(
@@ -76,7 +77,8 @@ where
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
-    let prepared = preflight_push(source, prepare_push(store, &job, state_root)?);
+    let validator = LocalSourceValidator;
+    let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
     let push_id = generate_push_id();
     let mut execution_request = PushExecutionRequest::new(
         push_id.clone(),
@@ -179,36 +181,83 @@ where
 }
 
 #[derive(Clone, Debug)]
-struct PreparedPush {
-    absolute_path: PathBuf,
-    mount: MountConfig,
-    entity: EntityRecord,
-    shadows: Vec<ShadowDocument>,
-    pipeline: PushPipelineResult,
+pub struct PreparedPush {
+    pub absolute_path: PathBuf,
+    pub mount: MountConfig,
+    pub entity: EntityRecord,
+    pub shadows: Vec<ShadowDocument>,
+    pub pipeline: PushPipelineResult,
 }
 
-fn prepare_push<S>(store: &S, job: &PushJob, state_root: Option<&Path>) -> AfsResult<PreparedPush>
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PushPrepareError {
+    MountNotFound(PathBuf),
+    ReadFile { path: PathBuf, message: String },
+    Store(StoreError),
+    Core(AfsError),
+}
+
+impl From<StoreError> for PushPrepareError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+impl From<AfsError> for PushPrepareError {
+    fn from(value: AfsError) -> Self {
+        Self::Core(value)
+    }
+}
+
+impl From<PushPrepareError> for AfsError {
+    fn from(value: PushPrepareError) -> Self {
+        match value {
+            PushPrepareError::MountNotFound(path) => {
+                Self::InvalidState(format!("no mount contains `{}`", path.display()))
+            }
+            PushPrepareError::ReadFile { path, message } => {
+                Self::Io(format!("failed to read `{}`: {message}", path.display()))
+            }
+            PushPrepareError::Store(error) => error.into(),
+            PushPrepareError::Core(error) => error,
+        }
+    }
+}
+
+pub fn prepare_push<S, Validator>(
+    store: &S,
+    job: &PushJob,
+    state_root: Option<&Path>,
+    validator: &Validator,
+) -> Result<PreparedPush, PushPrepareError>
 where
     S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+    Validator: SourcePushValidator + ?Sized,
 {
     let absolute_path = absolute_path(&job.target_path)?;
-    let mounts = store.load_mounts().map_err(AfsError::from)?;
+    let mounts = store.load_mounts().map_err(PushPrepareError::Store)?;
     let mount = find_mount_for_path(&mounts, &absolute_path)
         .cloned()
-        .ok_or_else(|| {
-            AfsError::InvalidState(format!("no mount contains `{}`", absolute_path.display()))
-        })?;
+        .ok_or_else(|| PushPrepareError::MountNotFound(absolute_path.clone()))?;
     let relative_path = relative_entity_path(&mount, &absolute_path)?;
     let entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
-        .map_err(AfsError::from)?;
+        .map_err(PushPrepareError::Store)?;
 
     let Some(entity) = entity else {
         if let Some(pending) = store
             .find_virtual_mutation_by_path(&mount.mount_id, &relative_path)
-            .map_err(AfsError::from)?
+            .map_err(PushPrepareError::Store)?
         {
-            return prepare_pending_create(store, job, state_root, absolute_path, mount, pending);
+            return prepare_pending_create(
+                store,
+                job,
+                state_root,
+                absolute_path,
+                mount,
+                pending,
+                validator,
+            );
         }
         if relative_path.as_os_str().is_empty() || absolute_path.is_dir() {
             return prepare_pending_scope(
@@ -218,13 +267,18 @@ where
                 absolute_path,
                 mount,
                 relative_path,
+                validator,
             );
         }
-        return Err(StoreError::EntityPathMissing {
-            mount_id: mount.mount_id.clone(),
-            path: relative_path.clone(),
-        }
-        .into());
+        return prepare_direct_create(
+            store,
+            job,
+            state_root,
+            absolute_path,
+            mount,
+            relative_path,
+            validator,
+        );
     };
 
     let read_path = projection_read_path(state_root, &mount, &relative_path, &absolute_path)?;
@@ -273,15 +327,16 @@ where
 
     let shadow = store
         .load_shadow(&mount.mount_id, &entity.remote_id)
-        .map_err(AfsError::from)?;
-    let schema_validation = notion_changed_row_schema_validation(
-        store,
+        .map_err(PushPrepareError::Store)?;
+    let parent = parent_entity(store, &mount, &relative_path)?;
+    let schema_validation = validator.validate_changed_frontmatter(SourceValidationContext {
         state_root,
-        &mount,
-        &relative_path,
-        &parsed,
-        &shadow,
-    )?;
+        mount: &mount,
+        parent: parent.as_ref(),
+        relative_path: &relative_path,
+        parsed: &parsed,
+        shadow: Some(&shadow),
+    })?;
     let pipeline = if schema_validation.is_clean() {
         plan_push_pipeline(
             PushPipelineRequest::new(relative_path, &parsed, &shadow)
@@ -304,16 +359,82 @@ where
     })
 }
 
-fn prepare_pending_create<S>(
+fn prepare_direct_create<S, Validator>(
+    store: &S,
+    job: &PushJob,
+    state_root: Option<&Path>,
+    absolute_path: PathBuf,
+    mount: MountConfig,
+    relative_path: PathBuf,
+    validator: &Validator,
+) -> Result<PreparedPush, PushPrepareError>
+where
+    S: EntityRepository,
+    Validator: SourcePushValidator + ?Sized,
+{
+    let contents = read_to_string(&absolute_path)?;
+    let parent = required_parent_entity(store, &mount, &relative_path)?;
+    if let Some(line) = unresolved_conflict_marker_line(&contents) {
+        return Ok(PreparedPush {
+            absolute_path,
+            mount,
+            entity: parent,
+            shadows: Vec::new(),
+            pipeline: validation_pipeline(unresolved_conflict_marker_issue(&relative_path, line)),
+        });
+    }
+    let parsed = match parse_canonical_markdown(&contents) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Ok(PreparedPush {
+                absolute_path,
+                mount,
+                entity: parent,
+                shadows: Vec::new(),
+                pipeline: validation_pipeline(parse_error_issue(&relative_path, error)),
+            });
+        }
+    };
+    let schema_validation = validator.validate_create_frontmatter(SourceValidationContext {
+        state_root,
+        mount: &mount,
+        parent: Some(&parent),
+        relative_path: &relative_path,
+        parsed: &parsed,
+        shadow: None,
+    })?;
+    let pipeline = create_entity_pipeline(
+        &relative_path,
+        &parsed,
+        &parent,
+        &mount,
+        PushApproval {
+            assume_yes: job.assume_yes,
+            confirm_dangerous: job.confirm_dangerous,
+        },
+        schema_validation,
+    );
+    Ok(PreparedPush {
+        absolute_path,
+        mount,
+        entity: parent,
+        shadows: Vec::new(),
+        pipeline,
+    })
+}
+
+fn prepare_pending_create<S, Validator>(
     store: &S,
     job: &PushJob,
     state_root: Option<&Path>,
     absolute_path: PathBuf,
     mount: MountConfig,
     pending: VirtualMutationRecord,
-) -> AfsResult<PreparedPush>
+    validator: &Validator,
+) -> Result<PreparedPush, PushPrepareError>
 where
     S: EntityRepository + ShadowRepository + VirtualMutationRepository,
+    Validator: SourcePushValidator + ?Sized,
 {
     if pending.mutation_kind != VirtualMutationKind::Create {
         return prepare_pending_scope(
@@ -323,22 +444,23 @@ where
             absolute_path,
             mount,
             pending.projected_path.clone(),
+            validator,
         );
     }
     let parent_id = pending.parent_remote_id.clone().ok_or_else(|| {
-        AfsError::InvalidState(format!(
+        PushPrepareError::Core(AfsError::InvalidState(format!(
             "pending create `{}` is missing a parent remote id",
             pending.local_id
-        ))
+        )))
     })?;
     let parent = store
         .get_entity(&mount.mount_id, &parent_id)
-        .map_err(AfsError::from)?
+        .map_err(PushPrepareError::Store)?
         .ok_or_else(|| StoreError::EntityMissing {
             mount_id: mount.mount_id.clone(),
             remote_id: parent_id.clone(),
         })
-        .map_err(AfsError::from)?;
+        .map_err(PushPrepareError::Store)?;
     let read_path = pending
         .content_path
         .clone()
@@ -348,10 +470,10 @@ where
             })
         })
         .ok_or_else(|| {
-            AfsError::InvalidState(format!(
+            PushPrepareError::Core(AfsError::InvalidState(format!(
                 "pending create `{}` has no cached content path",
                 pending.local_id
-            ))
+            )))
         })?;
     let contents = read_to_string(&read_path)?;
     if let Some(line) = unresolved_conflict_marker_line(&contents) {
@@ -378,18 +500,14 @@ where
             });
         }
     };
-    let schema_validation = if parent.kind == EntityKind::Database {
-        match notion_schema_yaml_or_issue(state_root, &mount, &parent, &pending.projected_path) {
-            Ok(schema) => afs_notion::schema::validate_create_row_frontmatter(
-                &schema,
-                &parsed,
-                &pending.projected_path,
-            ),
-            Err(report) => report,
-        }
-    } else {
-        ValidationReport::clean()
-    };
+    let schema_validation = validator.validate_create_frontmatter(SourceValidationContext {
+        state_root,
+        mount: &mount,
+        parent: Some(&parent),
+        relative_path: &pending.projected_path,
+        parsed: &parsed,
+        shadow: None,
+    })?;
     let pipeline = create_entity_pipeline(
         &pending.projected_path,
         &parsed,
@@ -410,20 +528,22 @@ where
     })
 }
 
-fn prepare_pending_scope<S>(
+fn prepare_pending_scope<S, Validator>(
     store: &S,
     job: &PushJob,
     state_root: Option<&Path>,
     absolute_path: PathBuf,
     mount: MountConfig,
     relative_scope: PathBuf,
-) -> AfsResult<PreparedPush>
+    validator: &Validator,
+) -> Result<PreparedPush, PushPrepareError>
 where
     S: EntityRepository + ShadowRepository + VirtualMutationRepository,
+    Validator: SourcePushValidator + ?Sized,
 {
     let mutations = store
         .list_virtual_mutations(&mount.mount_id)
-        .map_err(AfsError::from)?
+        .map_err(PushPrepareError::Store)?
         .into_iter()
         .filter(|mutation| {
             relative_scope.as_os_str().is_empty()
@@ -449,12 +569,12 @@ where
                 };
                 let entity = store
                     .get_entity(&mount.mount_id, &remote_id)
-                    .map_err(AfsError::from)?
+                    .map_err(PushPrepareError::Store)?
                     .ok_or_else(|| StoreError::EntityMissing {
                         mount_id: mount.mount_id.clone(),
                         remote_id: remote_id.clone(),
                     })
-                    .map_err(AfsError::from)?;
+                    .map_err(PushPrepareError::Store)?;
                 if representative.is_none() {
                     representative = Some(entity);
                 }
@@ -475,16 +595,17 @@ where
                     pending_path,
                     mount,
                     mutation.clone(),
+                    validator,
                 );
             }
             VirtualMutationKind::Rename => {}
         }
     }
     let entity = representative.ok_or_else(|| {
-        AfsError::InvalidState(format!(
+        PushPrepareError::Core(AfsError::InvalidState(format!(
             "no pushable pending virtual filesystem mutations under `{}`",
             first.projected_path.display()
-        ))
+        )))
     })?;
     let plan = PushPlan::new(affected, operations);
     let guardrail = afs_core::push::evaluate_guardrails(&plan, &GuardrailPolicy::default(), None);
@@ -545,6 +666,21 @@ fn create_entity_pipeline(
                 "remove the generated `afs.id`, or pull the existing page before editing"
                     .to_string(),
             ),
+        ));
+    }
+    if parsed
+        .frontmatter
+        .afs
+        .as_ref()
+        .and_then(|afs| afs.entity_type.as_ref())
+        .is_some_and(|kind| kind != &EntityKind::Page)
+    {
+        validation.push(ValidationIssue::new(
+            "create_entity_type_not_page",
+            relative_path,
+            Some(1),
+            "new files require `afs.type: page` when an `afs` block is present",
+            Some("remove the `afs` block or set `afs.type` to `page`".to_string()),
         ));
     }
     if parsed
@@ -928,48 +1064,14 @@ fn validation_report_pipeline(validation: ValidationReport) -> PushPipelineResul
     }
 }
 
-fn notion_changed_row_schema_validation<S>(
-    store: &S,
-    state_root: Option<&Path>,
-    mount: &MountConfig,
-    relative_path: &Path,
-    parsed: &afs_core::canonical::ParsedCanonicalDocument,
-    shadow: &ShadowDocument,
-) -> AfsResult<ValidationReport>
-where
-    S: EntityRepository,
-{
-    if mount.read_only {
-        return Ok(ValidationReport::clean());
-    }
-    let Some(parent) = notion_database_parent(store, mount, relative_path)? else {
-        return Ok(ValidationReport::clean());
-    };
-
-    Ok(
-        match notion_schema_yaml_or_issue(state_root, mount, &parent, relative_path) {
-            Ok(schema) => afs_notion::schema::validate_changed_row_frontmatter(
-                &schema,
-                shadow,
-                parsed,
-                relative_path,
-            ),
-            Err(report) => report,
-        },
-    )
-}
-
-fn notion_database_parent<S>(
+fn parent_entity<S>(
     store: &S,
     mount: &MountConfig,
     relative_path: &Path,
-) -> AfsResult<Option<EntityRecord>>
+) -> Result<Option<EntityRecord>, PushPrepareError>
 where
     S: EntityRepository,
 {
-    if mount.connector != "notion" {
-        return Ok(None);
-    }
     let Some(parent_path) = relative_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -979,49 +1081,36 @@ where
 
     let parent = store
         .find_entity_by_path(&mount.mount_id, parent_path)
-        .map_err(AfsError::from)?;
-    Ok(parent.filter(|entity| entity.kind == EntityKind::Database))
+        .map_err(PushPrepareError::Store)?;
+    Ok(parent)
 }
 
-fn notion_schema_yaml_or_issue(
-    state_root: Option<&Path>,
+fn required_parent_entity<S>(
+    store: &S,
     mount: &MountConfig,
-    database: &EntityRecord,
     relative_path: &Path,
-) -> Result<String, ValidationReport> {
-    let schema_path = if mount.projection.uses_virtual_filesystem() {
-        state_root
-            .map(|root| virtual_fs_content_root(root, &mount.mount_id))
-            .unwrap_or_else(|| mount.root.clone())
-            .join(&database.path)
-            .join("_schema.yaml")
+) -> Result<EntityRecord, PushPrepareError>
+where
+    S: EntityRepository,
+{
+    parent_entity(store, mount, relative_path)?.ok_or_else(|| {
+        PushPrepareError::Store(StoreError::EntityPathMissing {
+            mount_id: mount.mount_id.clone(),
+            path: relative_path.to_path_buf(),
+        })
+    })
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, PushPrepareError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
     } else {
-        mount.root.join(&database.path).join("_schema.yaml")
-    };
-    match std::fs::read_to_string(&schema_path) {
-        Ok(schema) => Ok(schema),
-        Err(error) => {
-            let code = if error.kind() == std::io::ErrorKind::NotFound {
-                "notion_schema_missing"
-            } else {
-                "notion_schema_unreadable"
-            };
-            let mut report = ValidationReport::clean();
-            report.push(ValidationIssue::new(
-                code,
-                relative_path,
-                Some(1),
-                format!(
-                    "Notion database row writes require readable schema file `{}`",
-                    schema_path.display()
-                ),
-                Some(
-                    "run `afs pull` on the database directory to regenerate `_schema.yaml`"
-                        .to_string(),
-                ),
-            ));
-            Err(report)
-        }
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|error| PushPrepareError::ReadFile {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })
     }
 }
 
@@ -1052,16 +1141,6 @@ fn parse_error_issue(path: &Path, error: CanonicalParseError) -> ValidationIssue
     )
 }
 
-fn absolute_path(path: &Path) -> AfsResult<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .map_err(|error| AfsError::Io(format!("failed to resolve current directory: {error}")))
-    }
-}
-
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
     mounts
         .iter()
@@ -1069,18 +1148,21 @@ fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a
         .max_by_key(|mount| mount.root.components().count())
 }
 
-fn relative_entity_path(mount: &MountConfig, absolute_path: &Path) -> AfsResult<PathBuf> {
+fn relative_entity_path(
+    mount: &MountConfig,
+    absolute_path: &Path,
+) -> Result<PathBuf, PushPrepareError> {
     absolute_path
         .strip_prefix(&mount.root)
         .map(Path::to_path_buf)
-        .map_err(|_| {
-            AfsError::InvalidState(format!("no mount contains `{}`", absolute_path.display()))
-        })
+        .map_err(|_| PushPrepareError::MountNotFound(absolute_path.to_path_buf()))
 }
 
-fn read_to_string(path: &Path) -> AfsResult<String> {
-    std::fs::read_to_string(path)
-        .map_err(|error| AfsError::Io(format!("failed to read `{}`: {error}", path.display())))
+fn read_to_string(path: &Path) -> Result<String, PushPrepareError> {
+    std::fs::read_to_string(path).map_err(|error| PushPrepareError::ReadFile {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })
 }
 
 fn write_atomic(path: &Path, contents: String) -> AfsResult<()> {

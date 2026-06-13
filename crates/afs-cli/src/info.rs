@@ -11,6 +11,7 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository, StoreError,
 };
+use afsd::source::source_display_name;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -449,11 +450,7 @@ fn source_name(connector: &str, entity: Option<&EntityRecord>) -> String {
 }
 
 fn connector_label(connector: &str) -> String {
-    if connector.eq_ignore_ascii_case("notion") {
-        "Notion".to_string()
-    } else {
-        connector.to_string()
-    }
+    source_display_name(connector)
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, InfoError> {

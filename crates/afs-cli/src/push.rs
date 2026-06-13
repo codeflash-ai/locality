@@ -30,7 +30,7 @@ pub fn run_push<S>(
     options: PushOptions,
 ) -> Result<PushReport, DiffError>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
 {
     let preview = run_preview(
         store,
