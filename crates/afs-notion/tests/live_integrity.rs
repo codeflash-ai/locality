@@ -80,7 +80,18 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
     assert!(rendered.document.body.contains(
         "[External audio](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)"
     ));
-    assert!(rendered.document.body.contains("type=embed"));
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[https://example.com/embed](https://example.com/embed)")
+    );
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[https://example.com/](https://example.com/)")
+    );
     assert!(rendered.document.body.contains("type=table_of_contents"));
     assert!(rendered.document.body.contains("type=breadcrumb"));
     assert!(rendered.document.body.contains("type=column_list"));

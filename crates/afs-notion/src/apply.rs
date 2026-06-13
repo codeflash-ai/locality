@@ -851,6 +851,24 @@ fn parse_supported_block(
         ));
     }
 
+    if let Some(kind @ ("bookmark" | "embed")) = current_kind
+        && let Some((label, href, consumed)) = parse_markdown_link(trimmed)
+        && consumed == trimmed.len()
+    {
+        let kind = match kind {
+            "bookmark" => "bookmark",
+            "embed" => "embed",
+            _ => unreachable!("matched URL block kind"),
+        };
+        return Ok(NotionBlockPatch::new(
+            kind,
+            json!({
+                "url": href,
+                "caption": rich_text_payload(label, preimage)?,
+            }),
+        ));
+    }
+
     if looks_like_markdown_table(trimmed) {
         return Err(AfsError::Unsupported("writing Notion tables"));
     }

@@ -47,8 +47,8 @@ Sources used for the baseline:
 | `child_page` | Directive and structural enumeration | No direct block write | fixture, live read | New child pages are created through page/entity creation, not block edits. |
 | `child_database` | Directive and structural enumeration | No direct block write | fixture, live read | Databases are created through the database API, not Markdown block writes. |
 | `toggle` | Directive wrapper; children render below it | No | fixture, live read | Toggle wrapper state is anchored to avoid flattening nested content. |
-| `embed` | Directive | No | fixture, live read | URL preserved. |
-| `bookmark` | Directive | No | fixture, live read | URL preserved. |
+| `embed` | Markdown link | Yes for existing blocks | fixture, live read/write | Caption becomes link text; URL edits update the existing embed block. |
+| `bookmark` | Markdown link | Yes for existing blocks | fixture, live read/write | Caption becomes link text; URL edits update the existing bookmark block. |
 | `link_preview` | Directive | No | fixture | URL preserved when returned by the API; the current create-page API rejected it as a child block in live testing. |
 | `image` | Markdown image plus local image download | No | fixture, live read/download | Uses `external.url` or Notion-hosted `file.url`; URL-less payloads fall back to directives. |
 | `video` | Markdown link | No | fixture, live read | Uses `external.url` or Notion-hosted `file.url`; local download intentionally skipped for now. |

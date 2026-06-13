@@ -255,6 +255,8 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
         "| Left | Right |",
         "[Linked page](https://www.notion.so/",
         "target mention [AFS cyclic link target",
+        "[Cyclic bookmark](https://example.com/cyclic-bookmark)",
+        "[Cyclic embed](https://example.com/cyclic-embed)",
         "![Cyclic image](https://www.w3.org/Icons/w3c_home.png)",
         "[Cyclic video](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
         "[Cyclic file](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
@@ -337,6 +339,14 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
             "> [!NOTE]\n> Editable callout",
             "> [!NOTE]\n> Editable callout changed",
         )
+        .replace(
+            "[Editable bookmark](https://example.com/editable-bookmark)",
+            "[Editable bookmark changed](https://example.com/editable-bookmark-changed)",
+        )
+        .replace(
+            "[Editable embed](https://example.com/editable-embed)",
+            "[Editable embed changed](https://example.com/editable-embed-changed)",
+        )
         .replace("fn editable() {}", "fn editable_changed() {}")
         .replace("x+y=z", "x-y=z");
     fs::write(&page_path, edited).expect("write cyclic edits");
@@ -386,6 +396,8 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         "- [x] Editable todo changed",
         "> Editable quote changed",
         "> [!NOTE]\n> Editable callout changed",
+        "[Editable bookmark changed](https://example.com/editable-bookmark-changed)",
+        "[Editable embed changed](https://example.com/editable-embed-changed)",
         "fn editable_changed() {}",
         "x-y=z",
     ] {
@@ -1043,6 +1055,16 @@ fn supported_edit_children() -> Vec<Value> {
         }),
         rich_text_child("quote", "Editable quote"),
         rich_text_child("callout", "Editable callout"),
+        json!({
+            "object": "block",
+            "type": "bookmark",
+            "bookmark": { "url": "https://example.com/editable-bookmark", "caption": rich_text_json("Editable bookmark") }
+        }),
+        json!({
+            "object": "block",
+            "type": "embed",
+            "embed": { "url": "https://example.com/editable-embed", "caption": rich_text_json("Editable embed") }
+        }),
         json!({
             "object": "block",
             "type": "code",

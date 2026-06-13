@@ -18,10 +18,11 @@ The current implementation is a live-capable read, pull, and narrow write projec
   equations, display equations, and heading levels 1-4 render to Markdown where there is a
   stable textual representation;
 - simple Notion tables render as Markdown tables with table-row IDs retained in shadow metadata;
-- toggles, embeds, bookmarks, synced blocks, column layouts, tabs, meeting notes,
+- toggles, synced blocks, column layouts, tabs, meeting notes,
   AI/custom blocks, URL-less media payloads, and unsupported or lossy blocks render as `::afs{...}` directives so they
   retain remote identity and useful metadata such as title, URL, source block ID, or target page ID
   when the API exposes it.
+- bookmark/embed URL blocks render as ordinary Markdown links.
 - media blocks with a Notion URL render as ordinary Markdown image or link syntax, while still
   keeping local media download metadata in the rendered entity for filesystem-aware callers.
 - `afs push -y` can update, append, and archive simple Notion blocks, update supported page
@@ -93,7 +94,7 @@ GitHub Actions has a manual `notion-live-e2e` workflow for these tests. The work
 
 ## Initial Block Rendering
 
-The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, and media blocks with URLs as Markdown. It renders child pages/databases, toggles, embeds, bookmarks, synced blocks, column layouts, tabs, table of contents, breadcrumbs, link-to-page blocks, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
+The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, bookmark/embed URL blocks, and media blocks with URLs as Markdown. It renders child pages/databases, toggles, synced blocks, column layouts, tabs, table of contents, breadcrumbs, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
 
 Inline rich text is represented with Notion DTOs first, then rendered through one Markdown path:
 
@@ -110,7 +111,7 @@ Nested children are fetched recursively and rendered after their parent, except 
 The first Notion apply path is intentionally conservative:
 
 - supported operations: block update, block append, block archive, supported page property update, and database row creation;
-- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, and display equations;
+- supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, and existing bookmark/embed URL blocks;
 - supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, Notion page links, legacy `afs://` page links, and unchanged preimage mentions such as dates;
 - supported page property writes: title, rich text, number, select, status, multi-select, checkbox, date, URL, email, and phone;
 - new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug ~shortid.md` path;

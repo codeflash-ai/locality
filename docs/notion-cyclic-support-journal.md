@@ -46,3 +46,16 @@ and what Markdown shape agents should expect.
 - **Create cycle:** The test writes a new Markdown file under the database
   directory, pushes it as a new Notion row, and verifies the created row's
   properties and body through the Notion API.
+
+### Bookmark And Embed URL Blocks
+
+- **Notion input:** `bookmark` and `embed` blocks with URL and optional caption.
+- **Markdown output:** Valid blocks render as normal Markdown links:
+  - `[Bookmark caption](https://example.com/bookmark)`
+  - `[Embed caption](https://example.com/embed)`
+- **Write behavior:** Existing bookmark/embed blocks can be edited by changing
+  the Markdown link label or URL. A malformed URL block with no URL still falls
+  back to an AFS directive instead of becoming lossy Markdown.
+- **Verification:** Fixture apply tests assert the exact Notion update payloads,
+  and the live mounted edit cycle updates bookmark/embed links then verifies the
+  rendered Notion result through the API.

@@ -257,8 +257,8 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
             "toggle",
         ),
         "equation" => equation_block(block, block.equation.as_ref()),
-        "embed" => url_directive_block(block, "embed", block.embed.as_ref()),
-        "bookmark" => url_directive_block(block, "bookmark", block.bookmark.as_ref()),
+        "embed" => url_markdown_block(block, "embed", block.embed.as_ref()),
+        "bookmark" => url_markdown_block(block, "bookmark", block.bookmark.as_ref()),
         "link_preview" => url_directive_block(block, "link_preview", block.link_preview.as_ref()),
         "image" => file_media_block(block, "image", block.image.as_ref(), options),
         "video" => file_media_block(block, "video", block.video.as_ref(), options),
@@ -341,6 +341,27 @@ fn url_directive_block(
         })
         .unwrap_or_default();
     directive_block_with_attrs(block, directive_type, attrs)
+}
+
+fn url_markdown_block(
+    block: &BlockDto,
+    malformed_type: &'static str,
+    payload: Option<&UrlBlockDto>,
+) -> RenderedBlock {
+    let Some(payload) = payload else {
+        return directive_block(block, &format!("malformed_{malformed_type}"), None);
+    };
+    if payload.url.trim().is_empty() {
+        return directive_block(block, &format!("malformed_{malformed_type}"), None);
+    }
+
+    let label = rich_text_list_title(&payload.caption)
+        .filter(|caption| !caption.trim().is_empty())
+        .unwrap_or_else(|| payload.url.clone());
+    rendered_block(
+        markdown_link_preserving_whitespace(&label, &payload.url),
+        Some(RemoteId::new(block.id.clone())),
+    )
 }
 
 fn file_media_block(
