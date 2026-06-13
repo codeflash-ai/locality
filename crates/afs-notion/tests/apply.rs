@@ -1313,6 +1313,7 @@ fn apply_updates_supported_page_properties() {
             ("Tags".to_string(), page_property("multi_select")),
             ("Done".to_string(), page_property("checkbox")),
             ("Points".to_string(), page_property("number")),
+            ("Notes".to_string(), page_property("rich_text")),
             ("Due".to_string(), page_property("date")),
             ("URL".to_string(), page_property("url")),
             ("Files".to_string(), page_property("files")),
@@ -1340,6 +1341,10 @@ fn apply_updates_supported_page_properties() {
                 ),
                 ("Done".to_string(), PropertyValue::Bool(false)),
                 ("Points".to_string(), PropertyValue::Number("3".to_string())),
+                (
+                    "Notes".to_string(),
+                    PropertyValue::String("**Updated** notes and @date(2026-06-14)".to_string()),
+                ),
                 (
                     "Due".to_string(),
                     PropertyValue::String("2026-06-10".to_string()),
@@ -1398,6 +1403,7 @@ fn apply_updates_supported_page_properties() {
                 "Done".to_string(),
                 "Due".to_string(),
                 "Files".to_string(),
+                "Notes".to_string(),
                 "People".to_string(),
                 "Points".to_string(),
                 "Relation".to_string(),
@@ -1434,6 +1440,39 @@ fn apply_updates_supported_page_properties() {
                     },
                     "Points": {
                         "number": 3.0,
+                    },
+                    "Notes": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": "Updated",
+                                },
+                                "annotations": {
+                                    "bold": true,
+                                    "italic": false,
+                                    "strikethrough": false,
+                                    "underline": false,
+                                    "code": false,
+                                    "color": "default",
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": " notes and ",
+                                },
+                            },
+                            {
+                                "type": "mention",
+                                "mention": {
+                                    "type": "date",
+                                    "date": {
+                                        "start": "2026-06-14",
+                                    },
+                                },
+                            },
+                        ],
                     },
                     "Due": {
                         "date": {
@@ -1488,6 +1527,7 @@ fn apply_creates_database_row_with_properties_and_children() {
             ("Tags".to_string(), data_source_property("multi_select")),
             ("Done".to_string(), data_source_property("checkbox")),
             ("Points".to_string(), data_source_property("number")),
+            ("Notes".to_string(), data_source_property("rich_text")),
             ("Files".to_string(), data_source_property("files")),
             ("People".to_string(), data_source_property("people")),
             ("Relation".to_string(), data_source_property("relation")),
@@ -1511,6 +1551,10 @@ fn apply_creates_database_row_with_properties_and_children() {
                 ),
                 ("Done".to_string(), PropertyValue::Bool(false)),
                 ("Points".to_string(), PropertyValue::Number("5".to_string())),
+                (
+                    "Notes".to_string(),
+                    PropertyValue::String("Created **rich** notes".to_string()),
+                ),
                 (
                     "Files".to_string(),
                     PropertyValue::List(vec![
@@ -1585,6 +1629,36 @@ fn apply_creates_database_row_with_properties_and_children() {
                     },
                     "Done": {
                         "checkbox": false,
+                    },
+                    "Notes": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": "Created ",
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": "rich",
+                                },
+                                "annotations": {
+                                    "bold": true,
+                                    "italic": false,
+                                    "strikethrough": false,
+                                    "underline": false,
+                                    "code": false,
+                                    "color": "default",
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": " notes",
+                                },
+                            },
+                        ],
                     },
                     "Points": {
                         "number": 5.0,

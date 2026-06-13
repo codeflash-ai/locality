@@ -918,7 +918,7 @@ fn append_property_frontmatter(out: &mut String, page: &PageDto) {
 fn property_frontmatter_value(property: &PagePropertyDto) -> Option<FrontmatterValue> {
     match property.kind.as_str() {
         "rich_text" => Some(FrontmatterValue::Scalar(yaml_string(
-            &rich_text_plain_text(&property.rich_text),
+            &rich_text_to_markdown(&property.rich_text),
         ))),
         "number" => Some(number_value(property.number.as_ref())),
         "select" => Some(option_name(property.select.as_ref())),

@@ -620,7 +620,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
     let edited = original
         .replace(
             "\"Notes\": \"Initial row notes\"",
-            "\"Notes\": \"Updated row notes\"",
+            "\"Notes\": \"**Updated** row notes and @date(2026-06-14)\"",
         )
         .replace("\"Points\": 7", "\"Points\": 8")
         .replace("\"Status\": \"Todo\"", "\"Status\": \"Done\"")
@@ -668,7 +668,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
 
     let verified = render_live_markdown(&connector, &existing_row.id, &row_path);
     for expected in [
-        "\"Notes\": \"Updated row notes\"",
+        "\"Notes\": \"**Updated** row notes and 2026-06-14\"",
         "\"Points\": 8",
         "\"Status\": \"Done\"",
         "\"State\": \"In progress\"",
@@ -690,7 +690,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
     fs::write(
         &new_row_path,
         &format!(
-            "---\ntitle: AFS cyclic created row\nNotes: Created row notes\nPoints: 13\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\nDone: false\nDue: \"2026-06-13\"\nURL: https://example.com/afs-created-row\nEmail: cyclic@example.com\nPhone: \"+1 415 555 0199\"\nFiles:\n  - Created file <https://example.com/created.pdf>\nPeople:\n  - \"{}\"\nRelated:\n  - \"{}\"\n---\n# Created row body\n\nCreated from mounted markdown.\n",
+            "---\ntitle: AFS cyclic created row\nNotes: \"Created **row** notes and [docs](https://example.com/created-notes)\"\nPoints: 13\nStatus: Todo\nState: Not started\nTags:\n  - Alpha\nDone: false\nDue: \"2026-06-13\"\nURL: https://example.com/afs-created-row\nEmail: cyclic@example.com\nPhone: \"+1 415 555 0199\"\nFiles:\n  - Created file <https://example.com/created.pdf>\nPeople:\n  - \"{}\"\nRelated:\n  - \"{}\"\n---\n# Created row body\n\nCreated from mounted markdown.\n",
             people_user_id, related_row.id
         ),
     )
@@ -719,7 +719,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
     let created = render_live_markdown(&connector, &created_row_id, &new_row_path);
     for expected in [
         "title: \"AFS cyclic created row\"",
-        "\"Notes\": \"Created row notes\"",
+        "\"Notes\": \"Created **row** notes and [docs](https://example.com/created-notes)\"",
         "\"Points\": 13",
         "\"Status\": \"Todo\"",
         "\"State\": \"Not started\"",

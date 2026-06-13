@@ -90,7 +90,7 @@ Sources used for the baseline:
 | Property type | Read/frontmatter | Write | Tests | Notes |
 |---|---:|---:|---|---|
 | `title` | Yes | Yes | fixture, live, mounted live, schema | Title is the canonical `title` frontmatter field. |
-| `rich_text` | Yes | Yes | fixture, live, mounted live, schema | Written as plain rich text today. |
+| `rich_text` | Yes with inline Markdown | Yes with the body rich-text Markdown parser | fixture, live, mounted live, schema | Frontmatter preserves supported annotations, external links, equations, and explicit typed mention syntax instead of flattening to plain text. |
 | `number` | Yes | Yes | fixture, live, mounted live, schema | Numeric validation happens before API call. |
 | `select` | Yes | Yes | fixture, live, mounted live, schema | Option names must exist in `_schema.yaml`. |
 | `status` | Yes | Yes | fixture, live, mounted live, schema | Option names must exist in `_schema.yaml`. |

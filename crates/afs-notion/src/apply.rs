@@ -662,13 +662,16 @@ fn property_update_value(
     value: &PropertyValue,
     key: &str,
 ) -> AfsResult<Value> {
-    property_value_for_kind(&property.kind, value, key)
+    match property.kind.as_str() {
+        "rich_text" => rich_text_property(value, key, Some(property.rich_text.as_slice())),
+        _ => property_value_for_kind(&property.kind, value, key),
+    }
 }
 
 fn property_value_for_kind(kind: &str, value: &PropertyValue, key: &str) -> AfsResult<Value> {
     match kind {
         "title" => Ok(json!({ "title": rich_text(&required_string(value, key)?) })),
-        "rich_text" => Ok(json!({ "rich_text": rich_text(&required_string(value, key)?) })),
+        "rich_text" => rich_text_property(value, key, None),
         "number" => number_property(value, key),
         "select" => option_property("select", value, key),
         "status" => option_property("status", value, key),
@@ -681,6 +684,15 @@ fn property_value_for_kind(kind: &str, value: &PropertyValue, key: &str) -> AfsR
         "relation" => relation_property(value, key),
         _ => Err(AfsError::Unsupported("updating this Notion property type")),
     }
+}
+
+fn rich_text_property(
+    value: &PropertyValue,
+    key: &str,
+    preimage: Option<&[RichTextDto]>,
+) -> AfsResult<Value> {
+    let content = required_string(value, key)?;
+    Ok(json!({ "rich_text": rich_text_payload(&content, preimage)? }))
 }
 
 fn number_property(value: &PropertyValue, key: &str) -> AfsResult<Value> {

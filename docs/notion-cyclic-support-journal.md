@@ -227,3 +227,19 @@ and what Markdown shape agents should expect.
   `mention.user` request payload. The live supported-edit cycle rewrites a
   real Notion user mention through mounted Markdown and verifies the fresh
   Notion render still contains the user mention line.
+
+### Rich-Text Property Markdown
+
+- **Notion input:** Page and data-source row `rich_text` properties.
+- **Markdown output:** Rich-text properties render in frontmatter with the same
+  inline Markdown contract as page bodies, including annotations, external
+  links, equations, and supported mentions.
+- **Write behavior:** Frontmatter rich-text property edits now use the shared
+  rich-text parser instead of flattening values to a single plain text span.
+  Existing property preimages are passed to the parser during updates so typed
+  mention payloads can be preserved when their rendered text is unchanged.
+- **Verification:** Fixture render tests cover annotated/link-rich
+  frontmatter. Fixture apply tests cover rich-text property updates and database
+  row creation. The live mounted database-row cycle edits and creates rich-text
+  properties with bold text, a typed date mention, and an external text link,
+  then verifies the fresh Notion render.

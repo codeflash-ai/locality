@@ -42,7 +42,7 @@ The first writer supports block bodies whose Markdown shape maps to one Notion b
 
 ## Database Rows
 
-A Notion database row renders as the same page document shape with row properties flattened into frontmatter keys:
+A Notion database row renders as the same page document shape with row properties flattened into frontmatter keys. Rich-text properties use the same inline Markdown contract as page bodies, so annotations, links, equations, and supported explicit mention syntax can be edited from frontmatter:
 
 ```markdown
 ---

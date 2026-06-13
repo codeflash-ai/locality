@@ -921,12 +921,21 @@ fn render_database_row_properties_as_frontmatter() {
 #[test]
 fn render_all_supported_page_property_values_as_frontmatter() {
     let mut row = page("row-1", "Property Coverage");
+    let mut rich_property = rich_text("Notes");
+    rich_property.annotations = RichTextAnnotationsDto {
+        bold: true,
+        ..Default::default()
+    };
     row.properties.extend(BTreeMap::from([
         (
             "Rich Text".to_string(),
             PagePropertyDto {
                 kind: "rich_text".to_string(),
-                rich_text: vec![rich_text("Notes")],
+                rich_text: vec![
+                    rich_property,
+                    rich_text(" and "),
+                    linked_text("docs", "https://example.com/docs"),
+                ],
                 ..Default::default()
             },
         ),
@@ -1178,7 +1187,7 @@ fn render_all_supported_page_property_values_as_frontmatter() {
     let frontmatter = &rendered.document.frontmatter;
 
     for expected in [
-        "\"Rich Text\": \"Notes\"",
+        "\"Rich Text\": \"**Notes** and [docs](https://example.com/docs)\"",
         "\"Number\": 7",
         "\"Select\": \"Selected\"",
         "\"Multi Select\":\n  - \"Alpha\"\n  - \"Beta\"",
