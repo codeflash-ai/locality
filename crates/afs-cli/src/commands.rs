@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command as ProcessCommand;
@@ -47,7 +47,9 @@ use crate::local_oauth::{
 };
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
 use crate::pull::{PullError, PullReport, run_pull_with_state_root};
-use crate::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
+use crate::push::{
+    PushOptions, PushReport, push_report_exit_code, run_push_with_daemon, select_push_targets,
+};
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::status::{StatusError, StatusOptions, StatusReport, run_status};
 
@@ -1010,51 +1012,6 @@ fn push(args: &[String], json: bool) -> i32 {
         confirm_dangerous: has_flag(args, "--confirm"),
     };
     let state_root = default_state_root();
-
-    match run_daemon_report::<PushJobReport>(
-        &state_root,
-        &DaemonRequest::Push {
-            path: PathBuf::from(path),
-            assume_yes: options.assume_yes,
-            confirm_dangerous: options.confirm_dangerous,
-        },
-    ) {
-        DaemonReport::Report(report) if json => {
-            let report = PushReport::from_daemon(report);
-            let exit_code = push_report_exit_code(&report);
-            print_json(&report);
-            return exit_code;
-        }
-        DaemonReport::Report(report) => {
-            let report = PushReport::from_daemon(report);
-            let exit_code = push_report_exit_code(&report);
-            print_push_report(&report);
-            return exit_code;
-        }
-        DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut) => {
-            return command_error(
-                json,
-                CommandError::new(
-                    "push",
-                    "daemon_timeout",
-                    format!(
-                        "afsd did not respond within {}ms after the push request was submitted; refusing direct fallback to avoid duplicate remote writes",
-                        daemon_mutating_request_timeout().as_millis()
-                    ),
-                ),
-                EXIT_INTERNAL,
-            );
-        }
-        DaemonReport::Unavailable(reason) => warn_daemon_fallback("push", reason),
-        DaemonReport::Error(error) => {
-            return command_error(
-                json,
-                CommandError::new("push", error.code, error.message),
-                error.exit_code,
-            );
-        }
-    }
-
     let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
@@ -1065,33 +1022,258 @@ fn push(args: &[String], json: bool) -> i32 {
             );
         }
     };
-
-    let credentials = open_credential_store(&state_root);
-    let connector = match resolve_source_for_path(&store, credentials.as_ref(), path) {
-        Ok(connector) => connector,
-        Err(error) => return connector_command_error("push", json, error),
+    let selection = match select_push_targets(&store, PathBuf::from(path), Some(state_root.clone()))
+    {
+        Ok(selection) => selection,
+        Err(error) => return push_target_error(json, error),
     };
 
-    match run_push_with_daemon(&mut store, &connector, PathBuf::from(path), options) {
-        Ok(report) if json => {
-            let exit_code = push_report_exit_code(&report);
-            print_json(&report);
-            exit_code
+    if selection.scoped && selection.targets.is_empty() {
+        if json {
+            print_json(&PushBatchReport::empty(&selection));
+        } else {
+            println!("nothing to push");
         }
-        Ok(report) => {
-            let exit_code = push_report_exit_code(&report);
-            print_push_report(&report);
-            exit_code
+        return EXIT_SUCCESS;
+    }
+
+    let mut reports = Vec::new();
+    for target in &selection.targets {
+        let report =
+            match run_push_target_command(&mut store, &state_root, target.clone(), options.clone())
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    return command_error(json, error.payload, error.exit_code);
+                }
+            };
+
+        let report = if should_prompt_for_push_confirmation(
+            &report,
+            &options,
+            json,
+            io::stdin().is_terminal(),
+        ) {
+            print_diff_report_fields(&report.validation, report.plan.as_ref());
+            match prompt_for_push_confirmation(&mut io::stdin().lock(), &mut io::stdout()) {
+                Ok(true) => {
+                    let mut approved = options.clone();
+                    approved.assume_yes = true;
+                    match run_push_target_command(&mut store, &state_root, target.clone(), approved)
+                    {
+                        Ok(report) => report,
+                        Err(error) => {
+                            return command_error(json, error.payload, error.exit_code);
+                        }
+                    }
+                }
+                Ok(false) => {
+                    if !json {
+                        println!("push cancelled");
+                    }
+                    return push_report_exit_code(&report);
+                }
+                Err(error) => {
+                    return command_error(
+                        json,
+                        CommandError::new("push", "stdin_read_failed", error.to_string()),
+                        EXIT_INTERNAL,
+                    );
+                }
+            }
+        } else {
+            report
+        };
+
+        reports.push(report);
+    }
+
+    let exit_code = push_reports_exit_code(&reports);
+    if json {
+        if !selection.scoped && reports.len() == 1 {
+            print_json(&reports[0]);
+        } else {
+            print_json(&PushBatchReport::from_reports(&selection, reports));
         }
-        Err(error) => {
-            let exit_code = afs_error_exit_code(&error);
-            command_error(
-                json,
-                CommandError::new("push", afs_error_code(&error), error.to_string()),
-                exit_code,
-            )
+    } else {
+        for report in &reports {
+            if selection.scoped && reports.len() > 1 {
+                println!("pushing {}", report.path);
+            }
+            print_push_report(report);
         }
     }
+
+    exit_code
+}
+
+#[derive(Debug)]
+struct PushCommandError {
+    payload: CommandError,
+    exit_code: i32,
+}
+
+impl PushCommandError {
+    fn new(code: impl Into<String>, message: impl Into<String>, exit_code: i32) -> Self {
+        Self {
+            payload: CommandError::new("push", code, message),
+            exit_code,
+        }
+    }
+
+    fn from_connector(error: ConnectorResolveError) -> Self {
+        let exit_code = match error.code() {
+            "mount_not_found" => EXIT_USAGE,
+            "missing_connection"
+            | "auth_required"
+            | "connection_revoked"
+            | "auth_profile_unavailable"
+            | "credential_store_unavailable" => EXIT_INTERNAL,
+            _ => EXIT_INTERNAL,
+        };
+        let mut payload = CommandError::new("push", error.code(), error.message());
+        if let Some(suggested_command) = error.suggested_command() {
+            payload = payload.with_suggested_command(suggested_command);
+        }
+        Self { payload, exit_code }
+    }
+
+    fn from_afs(error: AfsError) -> Self {
+        Self::new(
+            afs_error_code(&error),
+            error.to_string(),
+            afs_error_exit_code(&error),
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct PushBatchReport {
+    ok: bool,
+    command: &'static str,
+    path: String,
+    scoped: bool,
+    target_count: usize,
+    reports: Vec<PushReport>,
+}
+
+impl PushBatchReport {
+    fn empty(selection: &crate::push::PushTargetSelection) -> Self {
+        Self {
+            ok: true,
+            command: "push",
+            path: selection.requested_path.display().to_string(),
+            scoped: selection.scoped,
+            target_count: 0,
+            reports: Vec::new(),
+        }
+    }
+
+    fn from_reports(
+        selection: &crate::push::PushTargetSelection,
+        reports: Vec<PushReport>,
+    ) -> Self {
+        Self {
+            ok: reports.iter().all(|report| report.ok),
+            command: "push",
+            path: selection.requested_path.display().to_string(),
+            scoped: selection.scoped,
+            target_count: reports.len(),
+            reports,
+        }
+    }
+}
+
+fn run_push_target_command(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    target_path: PathBuf,
+    options: PushOptions,
+) -> Result<PushReport, PushCommandError> {
+    match run_daemon_report::<PushJobReport>(
+        state_root,
+        &DaemonRequest::Push {
+            path: target_path.clone(),
+            assume_yes: options.assume_yes,
+            confirm_dangerous: options.confirm_dangerous,
+        },
+    ) {
+        DaemonReport::Report(report) => return Ok(PushReport::from_daemon(report)),
+        DaemonReport::Unavailable(DaemonUnavailableReason::TimedOut) => {
+            return Err(PushCommandError::new(
+                "daemon_timeout",
+                format!(
+                    "afsd did not respond within {}ms after the push request was submitted; refusing direct fallback to avoid duplicate remote writes",
+                    daemon_mutating_request_timeout().as_millis()
+                ),
+                EXIT_INTERNAL,
+            ));
+        }
+        DaemonReport::Unavailable(reason) => warn_daemon_fallback("push", reason),
+        DaemonReport::Error(error) => {
+            return Err(PushCommandError {
+                payload: CommandError::new("push", error.code, error.message),
+                exit_code: error.exit_code,
+            });
+        }
+    }
+
+    let credentials = open_credential_store(state_root);
+    let connector = resolve_source_for_path(store, credentials.as_ref(), &target_path)
+        .map_err(PushCommandError::from_connector)?;
+    run_push_with_daemon(store, &connector, target_path, options)
+        .map_err(PushCommandError::from_afs)
+}
+
+fn should_prompt_for_push_confirmation(
+    report: &PushReport,
+    options: &PushOptions,
+    json: bool,
+    stdin_is_terminal: bool,
+) -> bool {
+    report.action == "confirm_plan" && !options.assume_yes && !json && stdin_is_terminal
+}
+
+fn prompt_for_push_confirmation<R, W>(input: &mut R, output: &mut W) -> io::Result<bool>
+where
+    R: BufRead,
+    W: Write,
+{
+    loop {
+        write!(output, "Proceed with push? [y/N] ")?;
+        output.flush()?;
+
+        let mut answer = String::new();
+        input.read_line(&mut answer)?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => return Ok(false),
+            _ => {
+                writeln!(output, "Please answer y or n.")?;
+            }
+        }
+    }
+}
+
+fn push_reports_exit_code(reports: &[PushReport]) -> i32 {
+    reports
+        .iter()
+        .map(push_report_exit_code)
+        .find(|exit_code| *exit_code != EXIT_SUCCESS)
+        .unwrap_or(EXIT_SUCCESS)
+}
+
+fn push_target_error(json: bool, error: StatusError) -> i32 {
+    let exit_code = match &error {
+        StatusError::MountNotFound(_)
+        | StatusError::Store(afs_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
+        StatusError::CurrentDir(_) | StatusError::Store(_) => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("push", error.code(), error.message()),
+        exit_code,
+    )
 }
 
 fn diff(args: &[String], json: bool) -> i32 {
@@ -2714,6 +2896,8 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use afs_core::model::MountId;
     use afs_store::{MountConfig, ProjectionMode};
 
@@ -2724,7 +2908,8 @@ mod tests {
     use super::{
         DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
         diff_report_exit_code, notion_oauth_broker_config, projection_mode_for_target,
-        projection_usage_options_for_target, pull_direct_fallback_error,
+        projection_usage_options_for_target, prompt_for_push_confirmation,
+        pull_direct_fallback_error, should_prompt_for_push_confirmation,
         validate_virtual_projection_registration,
     };
 
@@ -2756,6 +2941,56 @@ mod tests {
             crate::push::push_report_exit_code(&push_report("apply_not_implemented")),
             5
         );
+    }
+
+    #[test]
+    fn push_confirmation_prompt_accepts_yes_and_rejects_no() {
+        let mut yes_output = Vec::new();
+        let yes = prompt_for_push_confirmation(&mut Cursor::new(b"y\n"), &mut yes_output)
+            .expect("yes prompt");
+        assert!(yes);
+        assert_eq!(
+            String::from_utf8(yes_output).expect("yes utf8"),
+            "Proceed with push? [y/N] "
+        );
+
+        let mut no_output = Vec::new();
+        let no = prompt_for_push_confirmation(&mut Cursor::new(b"n\n"), &mut no_output)
+            .expect("no prompt");
+        assert!(!no);
+    }
+
+    #[test]
+    fn push_confirmation_prompt_is_only_for_interactive_safe_plans() {
+        let options = crate::push::PushOptions {
+            assume_yes: false,
+            confirm_dangerous: false,
+        };
+
+        assert!(should_prompt_for_push_confirmation(
+            &push_report("confirm_plan"),
+            &options,
+            false,
+            true
+        ));
+        assert!(!should_prompt_for_push_confirmation(
+            &push_report("confirm_plan"),
+            &options,
+            true,
+            true
+        ));
+        assert!(!should_prompt_for_push_confirmation(
+            &push_report("confirm_plan"),
+            &options,
+            false,
+            false
+        ));
+        assert!(!should_prompt_for_push_confirmation(
+            &push_report("confirm_dangerous_plan"),
+            &options,
+            false,
+            true
+        ));
     }
 
     #[test]

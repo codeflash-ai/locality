@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_cli::push::{PushOptions, push_report_exit_code, run_push, run_push_with_daemon};
+use afs_cli::push::{
+    PushOptions, push_report_exit_code, run_push, run_push_with_daemon, select_push_targets,
+};
 use afs_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, NativeEntity,
@@ -22,7 +24,8 @@ use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, ShadowRepository, SqliteStateStore,
+    MountRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use afsd::hydration::{HydratedEntity, HydrationSource};
 
@@ -382,6 +385,98 @@ fn push_runner_works_with_sqlite_state_store() {
     assert_eq!(report.action, "apply_not_implemented");
 }
 
+#[test]
+fn push_directory_targets_only_pending_page_changes_under_scope() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store();
+    let clean_path = fixture.write_raw(
+        "Team/Clean.md",
+        &canonical_markdown("page-clean", "# Clean\n\nSame paragraph."),
+    );
+    let dirty_path = fixture.write_raw(
+        "Team/Dirty.md",
+        &canonical_markdown("page-dirty", "# Dirty\n\nChanged paragraph."),
+    );
+    let outside_path = fixture.write_raw(
+        "Other.md",
+        &canonical_markdown("page-outside", "# Outside\n\nChanged paragraph."),
+    );
+    let pending_path = fixture.root.join("Team/Draft.md");
+
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-clean"),
+                EntityKind::Page,
+                "Clean",
+                "Team/Clean.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save clean entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow_for("page-clean", "# Clean\n\nSame paragraph."),
+        )
+        .expect("save clean shadow");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-dirty"),
+                EntityKind::Page,
+                "Dirty",
+                "Team/Dirty.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save dirty entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow_for("page-dirty", "# Dirty\n\nOld paragraph."),
+        )
+        .expect("save dirty shadow");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-outside"),
+                EntityKind::Page,
+                "Outside",
+                "Other.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save outside entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow_for("page-outside", "# Outside\n\nOld paragraph."),
+        )
+        .expect("save outside shadow");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "create:draft",
+            VirtualMutationKind::Create,
+            "Team/Draft.md",
+            "Draft",
+        ))
+        .expect("save pending create");
+
+    let team_scope = fixture.root.join("Team");
+    let selection = select_push_targets(&store, &team_scope, None).expect("select scoped targets");
+
+    assert!(selection.scoped);
+    assert_eq!(selection.requested_path, team_scope);
+    assert_eq!(selection.targets, vec![dirty_path, pending_path]);
+    assert!(clean_path.exists());
+    assert!(outside_path.exists());
+}
+
 struct PushFixture {
     root: PathBuf,
     mount_id: MountId,
@@ -572,8 +667,12 @@ fn canonical_markdown(remote_id: &str, body: &str) -> String {
 }
 
 fn shadow(body: &str) -> ShadowDocument {
+    shadow_for("page-1", body)
+}
+
+fn shadow_for(remote_id: &str, body: &str) -> ShadowDocument {
     ShadowDocument::from_synced_body(
-        RemoteId::new("page-1"),
+        RemoteId::new(remote_id),
         body,
         9,
         [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
@@ -591,4 +690,26 @@ fn large_shadow() -> ShadowDocument {
         .collect::<Vec<_>>();
 
     ShadowDocument::from_synced_body(RemoteId::new("page-1"), body, 9, block_ids).expect("shadow")
+}
+
+fn virtual_mutation(
+    mount_id: &MountId,
+    local_id: &str,
+    kind: VirtualMutationKind,
+    path: &str,
+    title: &str,
+) -> VirtualMutationRecord {
+    VirtualMutationRecord {
+        mount_id: mount_id.clone(),
+        local_id: local_id.to_string(),
+        mutation_kind: kind,
+        target_remote_id: None,
+        parent_remote_id: Some(RemoteId::new("parent-1")),
+        original_path: None,
+        projected_path: path.into(),
+        title: title.to_string(),
+        content_path: None,
+        created_at: "now".to_string(),
+        updated_at: "now".to_string(),
+    }
 }

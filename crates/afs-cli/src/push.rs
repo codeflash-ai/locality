@@ -3,18 +3,19 @@
 //! This push surface renders daemon execution reports into CLI output. The
 //! apply/reconcile path itself lives in `afsd`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use afs_connector::Connector;
 use afs_core::AfsResult;
 use afs_core::journal::{JournalStatus, JournalStore};
-use afs_core::model::RemoteId;
+use afs_core::model::{EntityKind, RemoteId};
 use afs_core::push::{PushApproval, PushExecutionAction, PushExecutionResult};
 use afs_store::{
     EntityRepository, JournalRepository, MountRepository, ShadowRepository,
     VirtualMutationRepository,
 };
 use afsd::execution::{PushJob, PushJobError, PushJobReport};
+use afsd::file_provider;
 use afsd::hydration::HydrationSource;
 use afsd::push::{PushJobAction, execute_push_job};
 use serde::Serialize;
@@ -23,6 +24,7 @@ use crate::diff::{
     DiffError, GuardrailOutput, PreviewOptions, PushPlanOutput, ValidationIssueOutput, action_name,
     run_preview, unsupported_action_fields,
 };
+use crate::status::{StatusError, StatusOptions, StatusState, run_status};
 
 pub fn run_push<S>(
     store: &S,
@@ -71,6 +73,71 @@ where
 pub struct PushOptions {
     pub assume_yes: bool,
     pub confirm_dangerous: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushTargetSelection {
+    pub requested_path: PathBuf,
+    pub scoped: bool,
+    pub targets: Vec<PathBuf>,
+}
+
+pub fn select_push_targets<S>(
+    store: &S,
+    target_path: impl AsRef<Path>,
+    state_root: Option<PathBuf>,
+) -> Result<PushTargetSelection, StatusError>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + VirtualMutationRepository,
+{
+    let requested_path = absolute_push_target_path(target_path.as_ref())?;
+    if !push_target_is_scope(store, &requested_path)? {
+        return Ok(PushTargetSelection {
+            requested_path: requested_path.clone(),
+            scoped: false,
+            targets: vec![requested_path],
+        });
+    }
+
+    let status = match run_status(
+        store,
+        StatusOptions {
+            path: Some(requested_path.clone()),
+            state_root,
+        },
+    ) {
+        Ok(status) => status,
+        Err(StatusError::Store(afs_store::StoreError::EntityPathMissing { .. }))
+            if requested_path.is_dir() =>
+        {
+            return Ok(PushTargetSelection {
+                requested_path,
+                scoped: true,
+                targets: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let mut targets = status
+        .mounts
+        .into_iter()
+        .flat_map(|mount| mount.entries)
+        .filter(|entry| entry.kind == "page")
+        .filter(|entry| matches!(entry.state, StatusState::Dirty | StatusState::Conflicted))
+        .map(|entry| PathBuf::from(entry.absolute_path))
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+
+    Ok(PushTargetSelection {
+        requested_path,
+        scoped: true,
+        targets,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -229,6 +296,64 @@ impl PushReport {
             .map(str::to_string)
             .collect();
         self
+    }
+}
+
+fn push_target_is_scope<S>(store: &S, absolute_path: &Path) -> Result<bool, StatusError>
+where
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
+{
+    let mounts = store.load_mounts().map_err(StatusError::Store)?;
+    let mount = file_provider::find_mount_for_path(&mounts, absolute_path)
+        .map(|(mount, _)| mount)
+        .ok_or_else(|| StatusError::MountNotFound(absolute_path.to_path_buf()))?;
+    let relative_path = file_provider::match_mount_path(mount, absolute_path)
+        .map(|matched| matched.relative_path)
+        .ok_or_else(|| StatusError::MountNotFound(absolute_path.to_path_buf()))?;
+
+    if relative_path.as_os_str().is_empty() {
+        return Ok(true);
+    }
+
+    if let Some(entity) = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(StatusError::Store)?
+    {
+        return Ok(matches!(
+            entity.kind,
+            EntityKind::Database | EntityKind::Directory
+        ));
+    }
+
+    if store
+        .find_virtual_mutation_by_path(&mount.mount_id, &relative_path)
+        .map_err(StatusError::Store)?
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    let has_child_entities = store
+        .list_entities(&mount.mount_id)
+        .map_err(StatusError::Store)?
+        .iter()
+        .any(|entity| entity.path.starts_with(&relative_path));
+    let has_child_mutations = store
+        .list_virtual_mutations(&mount.mount_id)
+        .map_err(StatusError::Store)?
+        .iter()
+        .any(|mutation| mutation.projected_path.starts_with(&relative_path));
+
+    Ok(has_child_entities || has_child_mutations || absolute_path.is_dir())
+}
+
+fn absolute_push_target_path(path: &Path) -> Result<PathBuf, StatusError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|error| StatusError::CurrentDir(error.to_string()))
     }
 }
 
