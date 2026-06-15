@@ -320,6 +320,7 @@ fn align_blocks(
 
     align_directives(shadow, edited_blocks, &mut matches, &mut used_shadow);
     align_exact_hashes(shadow, edited_blocks, &mut matches, &mut used_shadow);
+    align_balanced_duplicate_hashes(shadow, edited_blocks, &mut matches, &mut used_shadow);
     let degradation =
         align_residual_by_order(shadow, edited_blocks, &mut matches, &mut used_shadow);
 
@@ -368,6 +369,49 @@ fn align_exact_hashes(
             && used_shadow.insert(*shadow_index)
         {
             matches[edited_index] = Some(*shadow_index);
+        }
+    }
+}
+
+fn align_balanced_duplicate_hashes(
+    shadow: &ShadowDocument,
+    edited_blocks: &[SegmentedBlock],
+    matches: &mut [Option<usize>],
+    used_shadow: &mut BTreeSet<usize>,
+) {
+    let mut shadow_by_hash: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, block) in shadow.blocks.iter().enumerate() {
+        if used_shadow.contains(&index) || block.kind.is_directive() {
+            continue;
+        }
+        shadow_by_hash
+            .entry(block.content_hash.as_str())
+            .or_default()
+            .push(index);
+    }
+
+    let mut edited_by_hash: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, block) in edited_blocks.iter().enumerate() {
+        if matches[index].is_some() || block.is_directive() {
+            continue;
+        }
+        edited_by_hash
+            .entry(block.content_hash.as_str())
+            .or_default()
+            .push(index);
+    }
+
+    for (hash, shadow_indexes) in shadow_by_hash {
+        let Some(edited_indexes) = edited_by_hash.get(hash) else {
+            continue;
+        };
+        if shadow_indexes.len() < 2 || shadow_indexes.len() != edited_indexes.len() {
+            continue;
+        }
+
+        for (edited_index, shadow_index) in edited_indexes.iter().zip(shadow_indexes.iter()) {
+            matches[*edited_index] = Some(*shadow_index);
+            used_shadow.insert(*shadow_index);
         }
     }
 }

@@ -198,6 +198,34 @@ fn residual_alignment_updates_same_kind_sequence_without_archive_recreate() {
 }
 
 #[test]
+fn appending_after_duplicate_unchanged_native_blocks_does_not_recreate_them() {
+    let shadow = shadow(
+        "Intro.\n\n---\n\nMiddle.\n\n---\n\nOutro.",
+        ["intro", "divider-1", "middle", "divider-2", "outro"],
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "Intro.\n\n---\n\nMiddle.\n\n---\n\nOutro.\n\nNew paragraph.",
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("outro")),
+            content: "New paragraph.".to_string(),
+        }]
+    );
+    assert_eq!(plan.summary.blocks_created, 1);
+    assert_eq!(plan.summary.blocks_archived, 0);
+    assert!(plan.degradations.is_empty());
+}
+
+#[test]
 fn editing_a_rendered_table_produces_table_block_update() {
     let mut shadow = shadow(
         "| Name | Status |\n| --- | --- |\n| Old task | Todo |",
