@@ -2,6 +2,8 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::Command as ProcessCommand;
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use afs_connector::ConnectorUndoApplier;
@@ -79,6 +81,88 @@ const COMMANDS: &[&str] = &[
     "config",
     "file-provider",
 ];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpinnerConfig {
+    enabled: bool,
+    label: String,
+}
+
+fn spinner_enabled(json: bool, stderr_is_terminal: bool) -> bool {
+    !json && stderr_is_terminal
+}
+
+fn spinner_config_for_command(
+    command: &str,
+    path: &str,
+    json: bool,
+    stderr_is_terminal: bool,
+) -> SpinnerConfig {
+    let verb = match command {
+        "pull" => "pulling",
+        "push" => "pushing",
+        other => other,
+    };
+    SpinnerConfig {
+        enabled: spinner_enabled(json, stderr_is_terminal),
+        label: format!("{verb} {path}"),
+    }
+}
+
+fn with_terminal_spinner<T>(config: SpinnerConfig, operation: impl FnOnce() -> T) -> T {
+    let _spinner = TerminalSpinner::start(config);
+    operation()
+}
+
+struct TerminalSpinner {
+    stop: Option<Sender<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TerminalSpinner {
+    fn start(config: SpinnerConfig) -> Option<Self> {
+        if !config.enabled {
+            return None;
+        }
+
+        let (stop, stop_rx) = mpsc::channel();
+        let label = config.label;
+        let handle = thread::spawn(move || {
+            let frames = ["-", "\\", "|", "/"];
+            let mut index = 0;
+            loop {
+                let mut stderr = io::stderr().lock();
+                let _ = write!(stderr, "\r{} {}", frames[index % frames.len()], label);
+                let _ = stderr.flush();
+                drop(stderr);
+                index += 1;
+                match stop_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        });
+
+        Some(Self {
+            stop: Some(stop),
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for TerminalSpinner {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let mut stderr = io::stderr().lock();
+        let _ = write!(stderr, "\r\x1b[2K");
+        let _ = stderr.flush();
+    }
+}
 
 pub fn dispatch(args: &[String]) -> i32 {
     if args.is_empty() || has_flag(args, "--help") || has_flag(args, "-h") {
@@ -771,12 +855,17 @@ fn pull(args: &[String], json: bool) -> i32 {
     };
 
     let state_root = default_state_root();
-    let fallback_reason = match run_daemon_report::<PullReport>(
-        &state_root,
-        &DaemonRequest::Pull {
-            path: PathBuf::from(path),
-        },
-    ) {
+    let stderr_is_terminal = io::stderr().is_terminal();
+    let spinner_config = spinner_config_for_command("pull", path, json, stderr_is_terminal);
+    let daemon_report = with_terminal_spinner(spinner_config.clone(), || {
+        run_daemon_report::<PullReport>(
+            &state_root,
+            &DaemonRequest::Pull {
+                path: PathBuf::from(path),
+            },
+        )
+    });
+    let fallback_reason = match daemon_report {
         DaemonReport::Report(report) if json => {
             let exit_code = pull_report_exit_code(&report);
             print_json(&report);
@@ -822,12 +911,14 @@ fn pull(args: &[String], json: bool) -> i32 {
         Err(error) => return connector_command_error("pull", json, error),
     };
 
-    match run_pull_with_state_root(
-        &mut store,
-        &connector,
-        PathBuf::from(path),
-        Some(&state_root),
-    ) {
+    match with_terminal_spinner(spinner_config, || {
+        run_pull_with_state_root(
+            &mut store,
+            &connector,
+            PathBuf::from(path),
+            Some(&state_root),
+        )
+    }) {
         Ok(report) if json => {
             let exit_code = pull_report_exit_code(&report);
             print_json(&report);
@@ -1038,15 +1129,19 @@ fn push(args: &[String], json: bool) -> i32 {
     }
 
     let mut reports = Vec::new();
+    let stderr_is_terminal = io::stderr().is_terminal();
     for target in &selection.targets {
-        let report =
-            match run_push_target_command(&mut store, &state_root, target.clone(), options.clone())
-            {
-                Ok(report) => report,
-                Err(error) => {
-                    return command_error(json, error.payload, error.exit_code);
-                }
-            };
+        let target_label = target.display().to_string();
+        let spinner_config =
+            spinner_config_for_command("push", &target_label, json, stderr_is_terminal);
+        let report = match with_terminal_spinner(spinner_config.clone(), || {
+            run_push_target_command(&mut store, &state_root, target.clone(), options.clone())
+        }) {
+            Ok(report) => report,
+            Err(error) => {
+                return command_error(json, error.payload, error.exit_code);
+            }
+        };
 
         let report = if should_prompt_for_push_confirmation(
             &report,
@@ -1059,8 +1154,9 @@ fn push(args: &[String], json: bool) -> i32 {
                 Ok(true) => {
                     let mut approved = options.clone();
                     approved.assume_yes = true;
-                    match run_push_target_command(&mut store, &state_root, target.clone(), approved)
-                    {
+                    match with_terminal_spinner(spinner_config, || {
+                        run_push_target_command(&mut store, &state_root, target.clone(), approved)
+                    }) {
                         Ok(report) => report,
                         Err(error) => {
                             return command_error(json, error.payload, error.exit_code);
@@ -2910,7 +3006,7 @@ mod tests {
         diff_report_exit_code, notion_oauth_broker_config, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, should_prompt_for_push_confirmation,
-        validate_virtual_projection_registration,
+        spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
     };
 
     #[test]
@@ -2991,6 +3087,33 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn spinner_is_only_enabled_for_human_terminal_output() {
+        assert!(spinner_enabled(false, true));
+        assert!(!spinner_enabled(true, true));
+        assert!(!spinner_enabled(false, false));
+        assert!(!spinner_enabled(true, false));
+    }
+
+    #[test]
+    fn spinner_config_uses_command_specific_loading_labels() {
+        let pull = spinner_config_for_command("pull", "Roadmap.md", false, true);
+        assert!(pull.enabled);
+        assert_eq!(pull.label, "pulling Roadmap.md");
+
+        let push = spinner_config_for_command("push", "Roadmap.md", false, true);
+        assert!(push.enabled);
+        assert_eq!(push.label, "pushing Roadmap.md");
+    }
+
+    #[test]
+    fn spinner_config_is_disabled_for_json() {
+        let config = spinner_config_for_command("pull", "Roadmap.md", true, true);
+
+        assert!(!config.enabled);
+        assert_eq!(config.label, "pulling Roadmap.md");
     }
 
     #[test]
