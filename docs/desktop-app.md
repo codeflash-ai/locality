@@ -148,20 +148,26 @@ user should be able to paste a Notion URL immediately into a text field with
 placeholder guidance, and AFS should prioritize that page's local file
 preparation instead of waiting for the rest of the workspace to finish.
 
-## Locate By Notion URL
+## Locate And Search
 
-Pasting a Notion URL should be a locate workflow, not the start of onboarding.
-It is useful after the workspace is mounted.
+Finding work should feel closer to Notion search than filesystem browsing. AFS
+should support direct URL locate, title search, and path-fragment search from the
+same input so users do not need to remember whether they are holding a Notion URL
+or only a page name. This is especially important once a workspace has hundreds
+or thousands of pages.
 
 User story:
 
-1. User pastes a Notion page or database URL.
-2. AFS resolves the remote ID through the mounted workspace.
-3. AFS prioritizes that item if it is still being prepared locally.
-4. The app shows the corresponding local file or directory path.
-5. The user can copy the path for an agent or reveal it in Finder.
-6. If the item is not yet present locally, AFS updates the projection and then
-   reveals or copies the path when ready.
+1. User pastes a Notion page/database URL or types a page title/path fragment.
+2. AFS searches the local SQLite entity index first.
+3. If the input contains a Notion ID, AFS resolves that ID exactly through the
+   mounted workspace.
+4. If the item is present but online-only, AFS prioritizes it for local
+   preparation.
+5. The app shows the corresponding local file or directory path.
+6. The user can copy the path for an agent or reveal it in Finder.
+7. If the item is not yet present locally, AFS explains that the page must be
+   granted in Notion and synced before it can appear.
 
 This should be available from:
 
@@ -174,11 +180,66 @@ Suggested command/API shape:
 
 ```text
 afs locate notion <url> --json
+afs search notion <query> --json
 ```
 
 The response should include the mount, local path, entity type, whether the file
 already existed, whether any projection update was needed, and whether the file
 was prioritized for local preparation.
+
+Initial desktop implementation can search metadata already stored in SQLite:
+remote ID, title, and projected path. The next step is a dedicated local search
+index that also covers Markdown body text, frontmatter properties, breadcrumbs,
+recently opened pages, and aliases from Notion mentions. That index should be
+updated by daemon reconciliation and virtual filesystem mutations, not by reading
+every file in the mounted folder.
+
+## Large Workspace Navigation
+
+The product should assume a normal workspace can contain 1,000+ accessible
+Notion pages and databases. The virtual filesystem should stay useful without
+forcing users to manually browse deep directory trees.
+
+Required behavior:
+
+- Projection is metadata-first: directory listings come from SQLite and remain
+  fast even when bodies are not hydrated.
+- Search is local-first: title/path results should appear instantly from the
+  entity index; body search can be eventually consistent.
+- Hydration is intent-driven: opening, searching, pinning, or agent-targeting a
+  page should raise its priority above background sync.
+- Navigation preserves hierarchy: search results should show enough path context
+  to distinguish pages with the same title.
+- Recent and important pages should be promoted: recently opened, recently
+  edited, dirty, conflicted, and pending-push files deserve first-class surfaces.
+- Missing access is explicit: if a URL cannot be found, the app should say
+  whether the likely issue is missing Notion permission, no sync yet, or no
+  mounted workspace.
+
+The "magical" behavior is not a large first sync. It is that the user can paste
+or search for the thing they care about and AFS makes the right local file ready
+without asking them to understand hydration, indexing, or daemon queues.
+
+## Local Index Roadmap
+
+Use progressive indexing so AFS remains reliable while becoming more useful:
+
+1. Metadata index: mount ID, remote ID, kind, title, projected path, hydration
+   state, remote edited time, dirty/conflict/pending-push flags.
+2. Breadcrumb index: parent chain, database name, teamspace/workspace labels,
+   and stable display path independent of current filename.
+3. Body FTS index: extracted Markdown body, headings, list items, table text,
+   frontmatter values, and Notion mentions. Store tokenized/searchable text in a
+   local SQLite FTS table, never in credential storage.
+4. Activity index: recent opens, copies, reveals, pushes, restores, failed
+   pushes, and access changes.
+5. Agent handoff index: a compact "best file targets" API that can answer
+   agent-oriented queries like "find the Q4 launch plan" with ranked local paths.
+
+Index updates should be event-sourced from daemon-owned state transitions:
+enumerate, fetch/render, scheduled pull, virtual create/rename/delete, push
+reconcile, restore, and conflict creation. Rebuilding the index should be safe
+and deterministic from the durable store plus content cache.
 
 ## Tray And Mini-Dashboard
 

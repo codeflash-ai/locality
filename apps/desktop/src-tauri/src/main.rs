@@ -134,6 +134,15 @@ struct LocatedItem {
     state: String,
 }
 
+#[derive(Clone)]
+struct IndexedEntityMatch {
+    item: LocatedItem,
+    score: i64,
+    title_key: String,
+    path_key: String,
+    remote_key: String,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PushPlan {
@@ -327,11 +336,17 @@ fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
 
 #[tauri::command]
 fn locate_notion_page(url: String) -> Result<LocatedItem, String> {
-    if !url.contains("notion.") && !url.contains("notion.so") {
-        return Err("Paste a Notion page or database URL.".to_string());
+    let query = url.trim();
+    if query.is_empty() {
+        return Err("Paste a Notion page URL or search your local Notion index.".to_string());
     }
 
-    locate_notion_url(&url)
+    locate_notion_query(query)
+}
+
+#[tauri::command]
+fn search_notion_pages(query: String) -> Result<Vec<LocatedItem>, String> {
+    search_notion_index(&query, 8)
 }
 
 #[tauri::command]
@@ -918,7 +933,25 @@ fn blend_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4],
     rgba[idx + 3] = (out_alpha * 255.0).round() as u8;
 }
 
-fn locate_notion_url(url: &str) -> Result<LocatedItem, String> {
+fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
+    let results = search_notion_index(query, 1)?;
+    results.into_iter().next().ok_or_else(|| {
+        if notion_id_from_url(query).is_some() {
+            "That Notion page is not in the mounted workspace yet. Make sure it was selected during Notion authorization, then sync the workspace."
+                .to_string()
+        } else {
+            "No local Notion page matched that search yet. Try a page title, path fragment, or Notion URL."
+                .to_string()
+        }
+    })
+}
+
+fn search_notion_index(query: &str, limit: usize) -> Result<Vec<LocatedItem>, String> {
+    let query = query.trim();
+    if query.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let store = SqliteStateStore::open(default_state_root())
         .map_err(|error| format!("Could not open AFS state: {error}"))?;
     let mounts = store
@@ -931,37 +964,146 @@ fn locate_notion_url(url: &str) -> Result<LocatedItem, String> {
         return Err("Create a Notion folder before locating pages.".to_string());
     }
 
-    let notion_id = notion_id_from_url(url)
-        .ok_or_else(|| "Paste a Notion page or database URL.".to_string())?;
+    let notion_id = notion_id_from_url(query);
+    let mut matches = Vec::new();
     for mount in &mounts {
         let entities = store
             .list_entities(&mount.mount_id)
             .map_err(|error| format!("Could not load indexed Notion pages: {error}"))?;
-        if let Some(entity) = entities.iter().find(|entity| {
-            compact_notion_id(&entity.remote_id.0) == notion_id
-                || compact_path_id(&entity.path) == notion_id
-        }) {
-            return Ok(located_item_for_entity(mount, entity));
-        }
+        matches.extend(search_indexed_entities(
+            mount,
+            &entities,
+            query,
+            notion_id.as_deref(),
+        ));
 
-        if mount
-            .remote_root_id
-            .as_ref()
-            .is_some_and(|remote_id| compact_notion_id(&remote_id.0) == notion_id)
-        {
-            return Ok(LocatedItem {
-                title: "Notion workspace root".to_string(),
-                kind: "Workspace".to_string(),
-                local_path: display_path(&mount_access_root(mount)),
-                state: "ready".to_string(),
+        if mount.remote_root_id.as_ref().is_some_and(|remote_id| {
+            notion_id
+                .as_ref()
+                .is_some_and(|id| compact_notion_id(&remote_id.0) == *id)
+        }) {
+            matches.push(IndexedEntityMatch {
+                item: LocatedItem {
+                    title: "Notion workspace root".to_string(),
+                    kind: "Workspace".to_string(),
+                    local_path: display_path(&mount_access_root(mount)),
+                    state: "ready".to_string(),
+                },
+                score: 120_000,
+                title_key: "notion workspace root".to_string(),
+                path_key: mount_access_root(mount).display().to_string(),
+                remote_key: notion_id.clone().unwrap_or_default(),
             });
         }
     }
 
-    Err(
-        "That Notion page is not in the mounted workspace yet. Make sure it was selected during Notion authorization, then sync the workspace."
-            .to_string(),
-    )
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.title_key.cmp(&right.title_key))
+            .then_with(|| left.path_key.cmp(&right.path_key))
+            .then_with(|| left.remote_key.cmp(&right.remote_key))
+    });
+
+    Ok(matches
+        .into_iter()
+        .take(limit)
+        .map(|matched| matched.item)
+        .collect())
+}
+
+fn search_indexed_entities(
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+    query: &str,
+    notion_id: Option<&str>,
+) -> Vec<IndexedEntityMatch> {
+    entities
+        .iter()
+        .filter_map(|entity| {
+            let score = indexed_entity_score(entity, query, notion_id)?;
+            Some(IndexedEntityMatch {
+                item: located_item_for_entity(mount, entity),
+                score,
+                title_key: normalize_search_text(&entity.title),
+                path_key: normalize_search_text(&entity.path.to_string_lossy()),
+                remote_key: compact_notion_id(&entity.remote_id.0),
+            })
+        })
+        .collect()
+}
+
+fn indexed_entity_score(
+    entity: &EntityRecord,
+    query: &str,
+    notion_id: Option<&str>,
+) -> Option<i64> {
+    if let Some(notion_id) = notion_id
+        && (compact_notion_id(&entity.remote_id.0) == notion_id
+            || compact_path_id(&entity.path) == notion_id)
+    {
+        return Some(100_000);
+    }
+    if notion_id.is_some() {
+        return None;
+    }
+
+    let normalized_query = normalize_search_text(query);
+    let phrase = normalized_query.trim();
+    if phrase.len() < 2 {
+        return None;
+    }
+
+    let title = normalize_search_text(&entity.title);
+    let path = normalize_search_text(&entity.path.to_string_lossy());
+    let haystack = format!("{title} {path}");
+    let tokens = phrase
+        .split_whitespace()
+        .filter(|token| token.len() >= 2)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    if title == phrase {
+        return Some(90_000);
+    }
+    if path == phrase {
+        return Some(86_000);
+    }
+    if title.starts_with(phrase) {
+        return Some(82_000);
+    }
+    if path.starts_with(phrase) {
+        return Some(78_000);
+    }
+    if title.contains(phrase) {
+        return Some(74_000);
+    }
+    if path.contains(phrase) {
+        return Some(70_000);
+    }
+
+    let matched_tokens = tokens
+        .iter()
+        .filter(|token| haystack.contains(**token))
+        .count();
+    if matched_tokens == 0 {
+        return None;
+    }
+
+    let all_tokens_matched = matched_tokens == tokens.len();
+    let title_bonus = tokens
+        .iter()
+        .filter(|token| title.contains(**token))
+        .count() as i64
+        * 500;
+    Some(if all_tokens_matched {
+        60_000 + title_bonus + matched_tokens as i64
+    } else {
+        30_000 + title_bonus + matched_tokens as i64
+    })
 }
 
 fn located_item_for_entity(mount: &MountConfig, entity: &EntityRecord) -> LocatedItem {
@@ -970,7 +1112,17 @@ fn located_item_for_entity(mount: &MountConfig, entity: &EntityRecord) -> Locate
         title: entity.title.clone(),
         kind: format!("{:?}", entity.kind),
         local_path: display_path(&mount_access_root(mount).join(local_path)),
-        state: "ready".to_string(),
+        state: hydration_label(&entity.hydration).to_string(),
+    }
+}
+
+fn hydration_label(hydration: &afs_core::model::HydrationState) -> &'static str {
+    match hydration {
+        afs_core::model::HydrationState::Virtual => "online_only",
+        afs_core::model::HydrationState::Stub => "online_only",
+        afs_core::model::HydrationState::Hydrated => "ready",
+        afs_core::model::HydrationState::Dirty => "pending_changes",
+        afs_core::model::HydrationState::Conflicted => "conflict",
     }
 }
 
@@ -2151,20 +2303,37 @@ fn compact_notion_id(value: &str) -> String {
         .to_lowercase()
 }
 
+fn normalize_search_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use afs_store::{ConnectionId, ConnectionRecord};
+    use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+    use afs_store::{ConnectionId, ConnectionRecord, EntityRecord, MountConfig};
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
         DESKTOP_ACTIVITY_LIMIT, ScreenBounds, TrayVisualState, connection_metadata_changed,
         is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
-        record_desktop_activity, should_hide_tray_popover, tray_icon_image, tray_popover_position,
-        validate_mount_root,
+        record_desktop_activity, search_indexed_entities, should_hide_tray_popover,
+        tray_icon_image, tray_popover_position, validate_mount_root,
     };
 
     #[test]
@@ -2327,6 +2496,67 @@ mod tests {
         assert!(!is_unsupported_schema_version_message(
             "reload_mounts_failed: io error: database is locked"
         ));
+    }
+
+    #[test]
+    fn local_notion_search_ranks_title_path_and_remote_id_matches() {
+        let temp = TestTempDir::new("notion-search");
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(mount_id.clone(), "notion", temp.path());
+        let entities = vec![
+            EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("37b3ac0ebb88802cbcf4d53c9cfc4972"),
+                EntityKind::Page,
+                "Initial Idea",
+                "Product/Initial Idea ~37b3ac.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+            EntityRecord::new(
+                mount_id,
+                RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                EntityKind::Page,
+                "Roadmap 2026",
+                "Engineering/Roadmap 2026 ~aaaaaa.md",
+            ),
+        ];
+
+        let title_matches = search_indexed_entities(&mount, &entities, "roadmap", None);
+        assert_eq!(
+            title_matches
+                .first()
+                .map(|matched| matched.item.title.as_str()),
+            Some("Roadmap 2026")
+        );
+
+        let path_matches = search_indexed_entities(&mount, &entities, "product", None);
+        assert_eq!(
+            path_matches
+                .first()
+                .map(|matched| matched.item.title.as_str()),
+            Some("Initial Idea")
+        );
+
+        let id_matches = search_indexed_entities(
+            &mount,
+            &entities,
+            "https://app.notion.com/p/codeflash/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972",
+            Some("37b3ac0ebb88802cbcf4d53c9cfc4972"),
+        );
+        assert_eq!(
+            id_matches
+                .first()
+                .map(|matched| matched.item.state.as_str()),
+            Some("ready")
+        );
+
+        let inaccessible_url_matches = search_indexed_entities(
+            &mount,
+            &entities,
+            "https://app.notion.com/p/codeflash/Initial-Idea-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        );
+        assert!(inaccessible_url_matches.is_empty());
     }
 
     #[test]
@@ -2519,6 +2749,7 @@ fn main() {
             ensure_runtime_ready,
             create_workspace_mount,
             locate_notion_page,
+            search_notion_pages,
             review_push_plan,
             push_to_notion,
             open_path,

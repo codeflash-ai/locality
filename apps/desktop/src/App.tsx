@@ -1436,7 +1436,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
           <Search />
           <input
             value={url}
-            placeholder="Paste Notion URL"
+            placeholder="Paste URL or search title"
             onChange={(event) => setUrl(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") {
@@ -1448,7 +1448,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
             {locateState === "preparing" ? "..." : "Open"}
           </button>
         </div>
-        {locateState === "error" && <p className="field-error">{locateError || "Paste a Notion page or database URL."}</p>}
+        {locateState === "error" && <p className="field-error">{locateError || "Paste a Notion URL or search title."}</p>}
         {locatedItem && (
           <div className="tray-result">
             <strong>{locatedItem.title}</strong>
@@ -1558,7 +1558,7 @@ function LocateBox({
         <Search />
         <input
           value={value}
-          placeholder="Paste a Notion URL to get the local file path"
+          placeholder="Paste a Notion URL or search by title/path"
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter") {
@@ -1570,7 +1570,7 @@ function LocateBox({
           {state === "preparing" ? "Preparing" : "Open Page"}
         </PrimaryButton>
       </div>
-      {state === "error" && <p className="field-error">{error || "Paste a Notion page or database URL."}</p>}
+      {state === "error" && <p className="field-error">{error || "Paste a Notion URL or search title/path."}</p>}
     </div>
   );
 }
