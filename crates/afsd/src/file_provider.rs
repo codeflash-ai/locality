@@ -71,7 +71,10 @@ pub struct MountPathMatch {
 }
 
 pub fn mount_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
     let mut roots = vec![mount.root.clone()];
+    #[cfg(not(target_os = "macos"))]
+    let roots = vec![mount.root.clone()];
 
     #[cfg(target_os = "macos")]
     if mount.projection == ProjectionMode::MacosFileProvider {
