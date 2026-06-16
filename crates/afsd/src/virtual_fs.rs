@@ -823,7 +823,7 @@ pub fn virtual_fs_content_root(state_root: &Path, mount_id: &MountId) -> PathBuf
         .join("files")
 }
 
-fn virtual_fs_content_base(state_root: &Path) -> PathBuf {
+pub fn virtual_fs_content_base(state_root: &Path) -> PathBuf {
     if let Ok(root) = std::env::var("AFS_VIRTUAL_FS_CONTENT_ROOT") {
         return PathBuf::from(root);
     }

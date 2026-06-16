@@ -36,8 +36,10 @@ use afs_store::{
 use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
 use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
 use afsd::source::{resolve_source_for_path, source_display_name};
-use afsd::virtual_fs::virtual_fs_content_root;
-use afsd::virtual_fs::{source_root_directory_name, source_root_identifier};
+use afsd::virtual_fs::{
+    source_root_directory_name, source_root_identifier, virtual_fs_content_base,
+    virtual_fs_content_root,
+};
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -191,12 +193,20 @@ const TRAY_POPOVER_HEIGHT: f64 = 520.0;
 const TRAY_POPOVER_EDGE_MARGIN: f64 = 8.0;
 const TRAY_POPOVER_ANCHOR_OFFSET: f64 = 12.0;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum TrayVisualState {
     Ready,
     Review,
     Reconnect,
 }
+
+#[derive(Clone, PartialEq, Eq)]
+struct TrayRenderState {
+    state: TrayVisualState,
+    tooltip: String,
+}
+
+static LAST_TRAY_RENDER: OnceLock<Mutex<Option<TrayRenderState>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ScreenBounds {
@@ -870,6 +880,26 @@ fn refresh_tray_icon_for_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
 
 fn set_tray_icon_and_tooltip(app: &AppHandle, state: TrayVisualState, tooltip: &str) {
     if let Some(tray) = app.tray_by_id("main") {
+        let next = TrayRenderState {
+            state,
+            tooltip: tooltip.to_string(),
+        };
+        let should_update = {
+            let mut last_render = LAST_TRAY_RENDER
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("tray render lock poisoned");
+            if last_render.as_ref() == Some(&next) {
+                false
+            } else {
+                *last_render = Some(next);
+                true
+            }
+        };
+        if !should_update {
+            return;
+        }
+
         let is_template = matches!(state, TrayVisualState::Ready);
         let _ = tray.set_icon_with_as_template(Some(tray_icon_image(state)), is_template);
         let _ = tray.set_tooltip(Some(tooltip.to_string()));
@@ -1393,12 +1423,19 @@ fn start_state_change_watcher(app: AppHandle) {
             );
             return;
         }
-        watch_virtual_content_roots(&mut watcher, &state_root);
+        let content_roots = watch_virtual_content_roots(&mut watcher, &state_root);
 
         loop {
             match rx.recv() {
-                Ok(Ok(_event)) => {
-                    debounce_state_events(&rx);
+                Ok(Ok(event)) => {
+                    if !debounce_state_events_require_refresh(
+                        &rx,
+                        &state_root,
+                        &content_roots,
+                        event,
+                    ) {
+                        continue;
+                    }
                     refresh_desktop_surfaces(&app);
                 }
                 Ok(Err(error)) => eprintln!("afs desktop state watcher event failed: {error}"),
@@ -1408,36 +1445,96 @@ fn start_state_change_watcher(app: AppHandle) {
     });
 }
 
-fn watch_virtual_content_roots(watcher: &mut notify::RecommendedWatcher, state_root: &Path) {
-    if !state_root.join("state.sqlite3").exists() {
-        return;
+fn watch_virtual_content_roots(
+    watcher: &mut notify::RecommendedWatcher,
+    state_root: &Path,
+) -> Vec<PathBuf> {
+    let content_root = virtual_fs_content_base(state_root);
+    if let Err(error) = fs::create_dir_all(&content_root) {
+        eprintln!(
+            "afs desktop could not create virtual content watch directory `{}`: {error}",
+            content_root.display()
+        );
+        return Vec::new();
     }
-    let Ok(store) = SqliteStateStore::open(state_root.to_path_buf()) else {
-        return;
-    };
-    let Ok(mounts) = store.load_mounts() else {
-        return;
-    };
 
-    for mount in mounts
-        .iter()
-        .filter(|mount| mount.projection.uses_virtual_filesystem())
-    {
-        let content_root = virtual_fs_content_root(state_root, &mount.mount_id);
-        if content_root.exists()
-            && let Err(error) = watcher.watch(&content_root, RecursiveMode::Recursive)
-        {
-            eprintln!(
-                "afs desktop could not watch virtual content root `{}`: {error}",
-                content_root.display()
-            );
+    if let Err(error) = watcher.watch(&content_root, RecursiveMode::Recursive) {
+        eprintln!(
+            "afs desktop could not watch virtual content root `{}`: {error}",
+            content_root.display()
+        );
+        return Vec::new();
+    }
+
+    vec![content_root]
+}
+
+fn debounce_state_events_require_refresh(
+    rx: &mpsc::Receiver<notify::Result<notify::Event>>,
+    state_root: &Path,
+    content_roots: &[PathBuf],
+    first_event: notify::Event,
+) -> bool {
+    let mut should_refresh = state_event_requires_refresh(&first_event, state_root, content_roots);
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            Ok(event) => {
+                should_refresh |= state_event_requires_refresh(&event, state_root, content_roots);
+            }
+            Err(error) => eprintln!("afs desktop state watcher event failed: {error}"),
         }
+    }
+    should_refresh
+}
+
+fn state_event_requires_refresh(
+    event: &notify::Event,
+    state_root: &Path,
+    content_roots: &[PathBuf],
+) -> bool {
+    event
+        .paths
+        .iter()
+        .any(|path| state_event_path_requires_refresh(path, state_root, content_roots))
+}
+
+fn state_event_path_requires_refresh(
+    path: &Path,
+    state_root: &Path,
+    content_roots: &[PathBuf],
+) -> bool {
+    if content_roots.iter().any(|root| path.starts_with(root)) {
+        return !is_virtual_content_temp_path(path);
+    }
+
+    let Ok(relative) = path.strip_prefix(state_root) else {
+        return false;
+    };
+    if relative.as_os_str().is_empty() {
+        return false;
+    }
+
+    let file_name = relative.file_name().and_then(|name| name.to_str());
+    if file_name.is_some_and(|name| name.starts_with("state.sqlite3")) {
+        return false;
+    }
+
+    match relative.components().next() {
+        Some(std::path::Component::Normal(component)) => match component.to_str() {
+            Some("content") => !is_virtual_content_temp_path(relative),
+            Some("desktop-activity.json") => true,
+            Some("credentials" | "desktop.json" | "desktop-install.json" | "logs") => false,
+            _ => false,
+        },
+        _ => false,
     }
 }
 
-fn debounce_state_events(rx: &mpsc::Receiver<notify::Result<notify::Event>>) {
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    while rx.try_recv().is_ok() {}
+fn is_virtual_content_temp_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.') && name.ends_with(".afs-tmp"))
 }
 
 fn refresh_desktop_surfaces(app: &AppHandle) {
@@ -2541,7 +2638,8 @@ mod tests {
         connection_metadata_changed, inspect_install_state, is_unsupported_schema_version_message,
         load_desktop_activity, notion_id_from_url, record_current_install_marker,
         record_desktop_activity, should_hide_tray_popover, should_prioritize_located_result,
-        tray_icon_image, tray_popover_position, validate_mount_root,
+        state_event_path_requires_refresh, tray_icon_image, tray_popover_position,
+        validate_mount_root,
     };
 
     #[test]
@@ -2788,6 +2886,53 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn state_watcher_ignores_sqlite_and_settings_churn() {
+        let temp = TestTempDir::new("state-watch-ignore");
+        let state_root = temp.path().join(".afs");
+        let content_root = temp.path().join("group-content");
+        let content_roots = vec![content_root];
+
+        for path in [
+            state_root.join("state.sqlite3"),
+            state_root.join("state.sqlite3-wal"),
+            state_root.join("state.sqlite3-shm"),
+            state_root.join("desktop.json"),
+            state_root.join("desktop-install.json"),
+            state_root.join("logs/afsd.log"),
+        ] {
+            assert!(
+                !state_event_path_requires_refresh(&path, &state_root, &content_roots),
+                "{} should not refresh desktop surfaces",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn state_watcher_refreshes_for_user_visible_state_changes() {
+        let temp = TestTempDir::new("state-watch-refresh");
+        let state_root = temp.path().join(".afs");
+        let content_root = temp.path().join("group-content");
+        let content_roots = vec![content_root.clone()];
+
+        assert!(state_event_path_requires_refresh(
+            &state_root.join("desktop-activity.json"),
+            &state_root,
+            &content_roots
+        ));
+        assert!(state_event_path_requires_refresh(
+            &content_root.join("notion-main/files/Roadmap.md"),
+            &state_root,
+            &content_roots
+        ));
+        assert!(!state_event_path_requires_refresh(
+            &content_root.join("notion-main/files/.Roadmap.md.afs-tmp"),
+            &state_root,
+            &content_roots
+        ));
     }
 
     #[test]
