@@ -113,7 +113,7 @@ pub struct ApplyPlanRequest<'a> {
     pub plan: &'a PushPlan,
     /// Stable idempotency keys aligned to `plan.operations`.
     pub operation_ids: &'a [afs_core::journal::PushOperationId],
-    /// Last-synced remote timestamps for compare-and-swap checks.
+    /// Synced Tree remote versions for compare-and-swap checks.
     pub remote_preconditions: &'a [RemotePrecondition],
 }
 
@@ -169,8 +169,8 @@ pub trait Connector {
     fn fetch(&self, request: FetchRequest) -> AfsResult<NativeEntity>;
     fn render(&self, entity: &NativeEntity) -> AfsResult<CanonicalDocument>;
     fn parse(&self, document: &CanonicalDocument) -> AfsResult<ParsedEntity>;
-    /// Re-read source metadata immediately before apply and fail if the remote
-    /// moved past the synced preimage.
+    /// Re-read source metadata immediately before apply and fail if the Remote
+    /// Tree moved past the Synced Tree preimage.
     fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> AfsResult<()>;
     /// Apply an approved push plan using source-specific API operations.
     fn apply(&self, request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult>;

@@ -147,6 +147,12 @@ pub struct EntityRecord {
     pub path: PathBuf,
     pub hydration: HydrationState,
     pub content_hash: Option<String>,
+    /// Remote version represented by the Synced Tree shadow.
+    ///
+    /// The field name stays `remote_edited_at` for schema/frontmatter
+    /// compatibility with existing Notion mounts. New sync code should use the
+    /// `synced_tree_remote_version` helpers so this is not confused with the
+    /// latest Remote Tree observation.
     pub remote_edited_at: Option<String>,
 }
 
@@ -173,6 +179,10 @@ pub struct VirtualMutationRecord {
     pub updated_at: String,
 }
 
+/// Latest known metadata for the Nucleus Remote Tree.
+///
+/// This is intentionally separate from `EntityRecord::remote_edited_at`, which
+/// belongs to the Synced Tree. Observation updates must not advance shadows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteObservationRecord {
     pub mount_id: MountId,
@@ -329,9 +339,21 @@ impl EntityRecord {
         self
     }
 
-    pub fn with_remote_edited_at(mut self, remote_edited_at: impl Into<String>) -> Self {
-        self.remote_edited_at = Some(remote_edited_at.into());
+    pub fn synced_tree_remote_version(&self) -> Option<&str> {
+        self.remote_edited_at.as_deref()
+    }
+
+    pub fn set_synced_tree_remote_version(&mut self, version: Option<String>) {
+        self.remote_edited_at = version;
+    }
+
+    pub fn with_synced_tree_remote_version(mut self, version: impl Into<String>) -> Self {
+        self.set_synced_tree_remote_version(Some(version.into()));
         self
+    }
+
+    pub fn with_remote_edited_at(self, remote_edited_at: impl Into<String>) -> Self {
+        self.with_synced_tree_remote_version(remote_edited_at)
     }
 }
 

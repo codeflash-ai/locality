@@ -36,7 +36,8 @@ pub struct InspectReport {
     pub mount_id: String,
     pub entity_id: String,
     pub title: String,
-    pub remote_version: Option<String>,
+    pub synced_tree_version: Option<String>,
+    pub remote_tree_version: Option<String>,
     pub explanation: RemoteChangeExplanation,
 }
 
@@ -114,7 +115,8 @@ where
         mount_id: mount.mount_id.0,
         entity_id: entity.remote_id.0,
         title: entity.title,
-        remote_version: remote.remote_edited_at,
+        synced_tree_version: entity.remote_edited_at,
+        remote_tree_version: remote.remote_edited_at,
         explanation,
     })
 }

@@ -17,6 +17,15 @@ Linear, Google Drive, GitHub, Slack, and custom internal systems.
 
 ## Core Concepts
 
+AFS uses the same high-level Nucleus vocabulary throughout the sync engine:
+
+- **Remote Tree**: latest known source-side state.
+- **Local Tree**: latest known local filesystem or provider-cache state.
+- **Synced Tree**: last known fully synced state shared by Remote Tree and Local
+  Tree.
+- **Planner**: deterministic decision code that compares those three trees and
+  chooses no-op, pull, push, auto-merge, or conflict.
+
 ### Entity
 
 An `Entity` is any remote object AFS knows about. Examples include a Notion page,
@@ -39,10 +48,11 @@ Examples:
 - GitHub-like APIs: revision SHA
 - Custom APIs: sequence number or content version
 
-### RemoteObservation
+### Remote Tree Observation
 
-A `RemoteObservation` is a cheap metadata snapshot. It should be much cheaper
-than full hydration and should not fetch full document bodies.
+A `RemoteObservation` is a cheap metadata snapshot for the Remote Tree. It
+should be much cheaper than full hydration and should not fetch full document
+bodies.
 
 Typical fields:
 
@@ -55,32 +65,36 @@ Typical fields:
 - deleted or moved markers
 - raw connector metadata when needed for debugging or later reconciliation
 
-### Shadow
+### Synced Tree Shadow
 
 A `Shadow` is the last accepted full rendered version of an entity. For a
 Markdown-backed page, this is the canonical Markdown render that local files are
-compared against.
+compared against. In Nucleus terminology, this shadow is AFS's Synced Tree entry
+for that entity.
 
 ### Clean File
 
-A clean file is a local file whose content still matches its stored shadow:
+A clean file is a Local Tree file whose content still matches its Synced Tree
+shadow:
 
 ```text
-local file == stored shadow
+Local Tree == Synced Tree
 ```
 
-A file can be clean even if the remote has changed since that shadow was stored.
-That means the local copy has no local edits and can usually be fast-forwarded.
+A file can be clean even if the Remote Tree has changed since that shadow was
+stored. That means the local copy has no local edits and can usually be
+fast-forwarded.
 
 ### Pending Local File
 
-A pending local file has been changed by a human, agent, or local tool:
+A pending local file has been changed in the Local Tree by a human, agent, or
+local tool:
 
 ```text
-local file != stored shadow
+Local Tree != Synced Tree
 ```
 
-AFS must not overwrite pending local files with remote content.
+AFS must not overwrite pending Local Tree files with Remote Tree content.
 
 ### ChangeHint
 
@@ -134,10 +148,11 @@ the current remote version immediately before applying remote mutations.
 
 Each entity conceptually tracks:
 
-- base remote version: the version represented by the stored shadow
-- observed remote version: the newest cheap remote version AFS has seen
-- local file hash or local state
-- stored shadow
+- Synced Tree remote version: the source version represented by the Synced Tree
+  shadow
+- Remote Tree version: the newest cheap source version AFS has observed
+- Local Tree file hash or local state
+- Synced Tree shadow
 - freshness tier
 - last checked/opened/modified times
 - remote hint pending flag
@@ -146,20 +161,20 @@ Main states:
 
 ```text
 Clean
-  local == shadow
-  observed remote == base remote
+  Local Tree == Synced Tree
+  Remote Tree == Synced Tree
 
 Remote changed
-  local == shadow
-  observed remote != base remote
+  Local Tree == Synced Tree
+  Remote Tree != Synced Tree
 
 Local pending
-  local != shadow
-  observed remote == base remote
+  Local Tree != Synced Tree
+  Remote Tree == Synced Tree
 
 Diverged
-  local != shadow
-  observed remote != base remote
+  Local Tree != Synced Tree
+  Remote Tree != Synced Tree
 ```
 
 ## Freshness Scheduling
@@ -263,8 +278,8 @@ Define the connector-neutral model in this document.
 
 ### Stage 2: Remote Observation And Freshness Storage
 
-Persist latest observed remote metadata separately from last accepted synced
-state.
+Persist latest observed Remote Tree metadata separately from last accepted
+Synced Tree state.
 
 ```text
 remote_observations
@@ -274,7 +289,7 @@ remote_observations
   title
   parent_remote_id
   projected_path
-  remote_version_observed
+  remote_tree_version
   observed_at
   deleted
   raw_connector_metadata_json
@@ -293,9 +308,9 @@ freshness_states
 This separates:
 
 ```text
-last synced base
-latest observed remote
-current local projection
+Synced Tree state
+latest observed Remote Tree
+current Local Tree projection
 ```
 
 ### Stage 3: Generic Connector Observation API
@@ -363,9 +378,10 @@ CLI commands such as `afs status --json`, `afs inspect <path> --json`, or
 
 Current implementation:
 
-- `afs status --json` now exposes both local `state` and higher-level
+- `afs status --json` now exposes both Local Tree `state` and higher-level
   `sync_state` for each entry.
-- Entries include a `remote` object with base version, observed version,
+- Entries include a `remote` object with Synced Tree version, Remote Tree
+  version,
   observation time, freshness tier, remote-hint flag, deletion flag, and whether
   a freshness check is pending.
 - Desktop pending-change and tray health derive from the same `sync_state`
@@ -382,9 +398,9 @@ Current implementation:
 
 - Remote observation jobs and scheduled pull enumeration can enqueue
   `remote_fast_forward` hydration for changed hydrated pages.
-- Before queueing that hydration, the daemon verifies the local file/cache still
-  matches the stored shadow and that the freshness state has an unresolved
-  remote hint.
+- Before queueing that hydration, the daemon verifies the Local Tree file/cache
+  still matches the Synced Tree shadow and that the freshness state has an
+  unresolved remote hint.
 - Recently opened or locally touched files get a short working-copy lease; AFS
   re-observes after the lease instead of replacing the file immediately.
 - If a local file becomes pending before the auto hydration runs, the hydration
@@ -397,9 +413,9 @@ Current implementation:
 When metadata says remote changed, lazily compare:
 
 ```text
-old shadow
-new remote render
-local file
+Synced Tree shadow
+new Remote Tree render
+Local Tree file
 ```
 
 Produce machine-readable states such as remote-changed-only, local-changed-only,
@@ -407,9 +423,9 @@ both-changed, safe-to-fast-forward, and needs-review.
 
 Current implementation:
 
-- `afs-core::explain` compares the stored shadow against an available local
-  render and an available remote render, or records side-specific issues when a
-  render is unavailable.
+- `afs-core::explain` compares the Synced Tree shadow against an available
+  Local Tree render and an available Remote Tree render, or records
+  side-specific issues when a render is unavailable.
 - The output separates state from recommended action: for example,
   `remote_changed_only` maps to `safe_to_fast_forward`, while `both_changed`
   maps to `review_before_push`.
@@ -417,6 +433,10 @@ Current implementation:
   plain file or virtual projection content cache, fetches the current remote
   render through the connector, and returns the full machine-readable
   explanation without mutating local or remote state.
+- The daemon push path also uses the same tree distinction as a final
+  pre-apply safety check: connector metadata checks run first, then AFS fetches
+  the affected Remote Tree render and verifies that it still matches the Synced
+  Tree shadow before applying Local Tree edits.
 
 ### Stage 9: Webhook / Relay Hints
 

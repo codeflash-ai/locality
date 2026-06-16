@@ -131,9 +131,9 @@ impl StatusSyncState {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct StatusRemoteState {
-    pub base_version: Option<String>,
-    pub observed_version: Option<String>,
-    pub observed_at: Option<String>,
+    pub synced_tree_version: Option<String>,
+    pub remote_tree_version: Option<String>,
+    pub remote_tree_observed_at: Option<String>,
     pub freshness_tier: Option<String>,
     pub last_checked_at: Option<String>,
     pub remote_hint_pending: bool,
@@ -597,7 +597,7 @@ where
     let mut remote = remote_state(entity, freshness.as_ref(), observation.as_ref());
     remote.changed = remote.remote_hint_pending
         || remote.deleted
-        || observed_version_differs(entity.remote_edited_at.as_deref(), observation.as_ref());
+        || remote_tree_version_differs(entity.synced_tree_remote_version(), observation.as_ref());
     remote.checking = !remote.changed && freshness_check_pending(freshness.as_ref(), &remote);
 
     if remote.deleted {
@@ -636,11 +636,11 @@ fn remote_state(
     observation: Option<&RemoteObservationRecord>,
 ) -> StatusRemoteState {
     StatusRemoteState {
-        base_version: entity.remote_edited_at.clone(),
-        observed_version: observation
+        synced_tree_version: entity.remote_edited_at.clone(),
+        remote_tree_version: observation
             .and_then(|observation| observation.remote_version.as_ref())
             .map(|remote_version| remote_version.as_str().to_string()),
-        observed_at: observation.map(|observation| observation.observed_at.clone()),
+        remote_tree_observed_at: observation.map(|observation| observation.observed_at.clone()),
         freshness_tier: freshness.map(|freshness| freshness_tier_name(&freshness.tier).to_string()),
         last_checked_at: freshness.and_then(|freshness| freshness.last_checked_at.clone()),
         remote_hint_pending: freshness.is_some_and(|freshness| freshness.remote_hint_pending),
@@ -650,17 +650,17 @@ fn remote_state(
     }
 }
 
-fn observed_version_differs(
-    base_version: Option<&str>,
+fn remote_tree_version_differs(
+    synced_tree_version: Option<&str>,
     observation: Option<&RemoteObservationRecord>,
 ) -> bool {
     match (
-        base_version,
+        synced_tree_version,
         observation
             .and_then(|observation| observation.remote_version.as_ref())
             .map(|remote_version| remote_version.as_str()),
     ) {
-        (Some(base), Some(observed)) => base != observed,
+        (Some(synced_tree), Some(remote_tree)) => synced_tree != remote_tree,
         _ => false,
     }
 }
@@ -673,7 +673,7 @@ fn freshness_check_pending(
         return false;
     };
 
-    remote.observed_at.is_none()
+    remote.remote_tree_observed_at.is_none()
         && freshness.last_checked_at.is_none()
         && (freshness.last_opened_at.is_some()
             || freshness.last_local_change_at.is_some()
@@ -1030,7 +1030,7 @@ where
                 StatusState::Error,
                 vec![StatusIssue::new(
                     "shadow_missing",
-                    "stored shadow snapshot is missing",
+                    "Synced Tree shadow snapshot is missing",
                 )],
             );
         }
@@ -1039,7 +1039,7 @@ where
                 StatusState::Error,
                 vec![StatusIssue::new(
                     "shadow_read_failed",
-                    format!("failed to read stored shadow: {error}"),
+                    format!("failed to read Synced Tree shadow: {error}"),
                 )],
             );
         }

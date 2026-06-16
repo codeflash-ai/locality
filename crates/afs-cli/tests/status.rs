@@ -480,6 +480,27 @@ fn status_reports_remote_update_available_for_clean_file() {
         entry_sync_state(&report, "Roadmap.md"),
         StatusSyncState::RemoteUpdateAvailable
     );
+    assert_eq!(
+        status_entry(&report, "Roadmap.md")
+            .remote
+            .synced_tree_version
+            .as_deref(),
+        Some("remote-v1")
+    );
+    assert_eq!(
+        status_entry(&report, "Roadmap.md")
+            .remote
+            .remote_tree_version
+            .as_deref(),
+        Some("remote-v2")
+    );
+    assert_eq!(
+        status_entry(&report, "Roadmap.md")
+            .remote
+            .remote_tree_observed_at
+            .as_deref(),
+        Some("unix_ms:2")
+    );
     assert_eq!(entry_issue(&report, "Roadmap.md"), "remote_changed");
 }
 
@@ -855,23 +876,23 @@ fn virtual_mutation(
 }
 
 fn entry_state(report: &afs_cli::status::StatusReport, path: &str) -> StatusState {
+    status_entry(report, path).state
+}
+
+fn status_entry<'a>(
+    report: &'a afs_cli::status::StatusReport,
+    path: &str,
+) -> &'a afs_cli::status::StatusEntry {
     report
         .mounts
         .iter()
         .flat_map(|mount| &mount.entries)
         .find(|entry| entry.path == path)
         .expect("status entry")
-        .state
 }
 
 fn entry_sync_state(report: &afs_cli::status::StatusReport, path: &str) -> StatusSyncState {
-    report
-        .mounts
-        .iter()
-        .flat_map(|mount| &mount.entries)
-        .find(|entry| entry.path == path)
-        .expect("status entry")
-        .sync_state
+    status_entry(report, path).sync_state
 }
 
 fn entry_issue(report: &afs_cli::status::StatusReport, path: &str) -> String {

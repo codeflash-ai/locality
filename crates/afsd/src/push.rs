@@ -5,11 +5,11 @@
 //! mutation happen through one host so journal, apply, and reconcile cannot
 //! drift across different store handles.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{ApplyPlanRequest, ApplyPlanResult, Connector};
-use std::collections::BTreeMap;
 
 use afs_core::canonical::{
     CanonicalParseError, CanonicalParseErrorKind, parse_canonical_markdown,
@@ -17,10 +17,11 @@ use afs_core::canonical::{
 };
 use afs_core::conflict::unresolved_conflict_marker_line;
 use afs_core::diff::property_value_from_frontmatter;
+use afs_core::freshness::RemoteVersion;
 use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
-use afs_core::model::{EntityKind, HydrationState};
+use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::GuardrailDecision;
 use afs_core::planner::{GuardrailPolicy, PushOperation, PushPlan};
 use afs_core::push::{
@@ -34,9 +35,9 @@ use afs_core::shadow::ShadowDocument;
 use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
-    ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
-    VirtualMutationRepository,
+    EntityRecord, EntityRepository, FreshnessStateRepository, JournalRepository, MountConfig,
+    MountRepository, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
+    StoreError, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,8 @@ where
         + ShadowRepository
         + JournalRepository
         + JournalStore
+        + RemoteObservationRepository
+        + FreshnessStateRepository
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
@@ -75,21 +78,26 @@ where
         + ShadowRepository
         + JournalRepository
         + JournalStore
+        + RemoteObservationRepository
+        + FreshnessStateRepository
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
     let validator = LocalSourceValidator;
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
     let push_id = generate_push_id();
+    let remote_preconditions = remote_preconditions_for_plan(
+        store,
+        &prepared.mount,
+        &prepared.entity,
+        &prepared.pipeline,
+    )?;
     let mut execution_request = PushExecutionRequest::new(
         push_id.clone(),
         prepared.mount.mount_id.clone(),
         prepared.pipeline.clone(),
     )
-    .with_remote_preconditions(vec![RemotePrecondition {
-        remote_id: prepared.entity.remote_id.clone(),
-        remote_edited_at: prepared.entity.remote_edited_at.clone(),
-    }]);
+    .with_remote_preconditions(remote_preconditions);
 
     if !prepared.shadows.is_empty() {
         execution_request = execution_request.with_preimages(
@@ -179,6 +187,41 @@ where
     }
 
     prepared
+}
+
+fn remote_preconditions_for_plan<S>(
+    store: &S,
+    mount: &MountConfig,
+    prepared_entity: &EntityRecord,
+    pipeline: &PushPipelineResult,
+) -> AfsResult<Vec<RemotePrecondition>>
+where
+    S: EntityRepository,
+{
+    let remote_ids = pipeline
+        .plan
+        .as_ref()
+        .map(|plan| plan.affected_entities.iter().collect::<BTreeSet<_>>())
+        .unwrap_or_else(|| BTreeSet::from([&prepared_entity.remote_id]));
+    let mut preconditions = Vec::with_capacity(remote_ids.len());
+
+    for remote_id in remote_ids {
+        let entity = if remote_id == &prepared_entity.remote_id {
+            Some(prepared_entity.clone())
+        } else {
+            store
+                .get_entity(&mount.mount_id, remote_id)
+                .map_err(AfsError::from)?
+        };
+        if let Some(entity) = entity {
+            preconditions.push(RemotePrecondition {
+                remote_id: remote_id.clone(),
+                remote_edited_at: entity.synced_tree_remote_version().map(str::to_string),
+            });
+        }
+    }
+
+    Ok(preconditions)
 }
 
 #[derive(Clone, Debug)]
@@ -830,7 +873,8 @@ where
 
 impl<S, Source> PushConcurrencyCheck for DaemonPushHost<'_, S, Source>
 where
-    Source: Connector + ?Sized,
+    S: MountRepository + EntityRepository + ShadowRepository,
+    Source: Connector + HydrationSource + ?Sized,
 {
     fn check(&mut self, request: PushConcurrencyRequest<'_>) -> AfsResult<()> {
         self.source.check_concurrency(ApplyPlanRequest {
@@ -839,8 +883,69 @@ where
             plan: request.plan,
             operation_ids: request.operation_ids,
             remote_preconditions: request.remote_preconditions,
-        })
+        })?;
+        self.check_remote_tree_content(request)
     }
+}
+
+impl<S, Source> DaemonPushHost<'_, S, Source>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+    Source: HydrationSource + ?Sized,
+{
+    fn check_remote_tree_content(&mut self, request: PushConcurrencyRequest<'_>) -> AfsResult<()> {
+        let mount = self
+            .store
+            .get_mount(request.mount_id)
+            .map_err(AfsError::from)?
+            .ok_or_else(|| StoreError::MountMissing(request.mount_id.clone()))
+            .map_err(AfsError::from)?;
+
+        for precondition in request.remote_preconditions {
+            let Some(entity) = self
+                .store
+                .get_entity(request.mount_id, &precondition.remote_id)
+                .map_err(AfsError::from)?
+            else {
+                continue;
+            };
+            let synced_tree_shadow = match self
+                .store
+                .load_shadow(request.mount_id, &precondition.remote_id)
+            {
+                Ok(shadow) => shadow,
+                Err(StoreError::ShadowMissing { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let path = projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
+            let remote_tree_render =
+                self.source
+                    .fetch_render(&afs_core::hydration::HydrationRequest::new(
+                        request.mount_id.clone(),
+                        precondition.remote_id.clone(),
+                        path,
+                        HydrationState::Hydrated,
+                        afs_core::hydration::HydrationReason::ExplicitPull,
+                    ))?;
+
+            if !remote_tree_matches_synced_tree(&synced_tree_shadow, &remote_tree_render.shadow) {
+                return Err(AfsError::Guardrail(format!(
+                    "remote entity `{}` changed since the Synced Tree shadow; inspect or pull before pushing local edits",
+                    precondition.remote_id.0
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn remote_tree_matches_synced_tree(
+    synced_tree_shadow: &ShadowDocument,
+    remote_tree_shadow: &ShadowDocument,
+) -> bool {
+    synced_tree_shadow.frontmatter == remote_tree_shadow.frontmatter
+        && synced_tree_shadow.rendered_body == remote_tree_shadow.rendered_body
 }
 
 impl<S, Source> PushApplier for DaemonPushHost<'_, S, Source>
@@ -865,7 +970,12 @@ where
 
 impl<S, Source> PushReconciler for DaemonPushHost<'_, S, Source>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + VirtualMutationRepository,
     Source: HydrationSource + ?Sized,
 {
     fn reconcile(&mut self, request: PushReconcileRequest<'_>) -> AfsResult<PushReconcileResult> {
@@ -985,7 +1095,7 @@ fn accept_post_apply_remote<S>(
     rendered: HydratedEntity,
 ) -> AfsResult<()>
 where
-    S: EntityRepository + ShadowRepository,
+    S: EntityRepository + ShadowRepository + RemoteObservationRepository + FreshnessStateRepository,
 {
     write_atomic(path, render_canonical_markdown(&rendered.document))?;
     store
@@ -993,11 +1103,57 @@ where
         .map_err(AfsError::from)?;
 
     entity.hydration = HydrationState::Hydrated;
-    entity.content_hash = Some(rendered.shadow.body_hash);
-    if rendered.remote_edited_at.is_some() {
-        entity.remote_edited_at = rendered.remote_edited_at;
+    entity.content_hash = Some(rendered.shadow.body_hash.clone());
+    let remote_edited_at = rendered.remote_edited_at.clone();
+    if let Some(remote_edited_at) = remote_edited_at.clone() {
+        entity.set_synced_tree_remote_version(Some(remote_edited_at));
     }
     store.save_entity(entity.clone()).map_err(AfsError::from)?;
+    record_post_apply_remote_tree_observation(store, mount, entity, remote_edited_at)?;
+    clear_remote_hint(store, &mount.mount_id, &entity.remote_id)?;
+    Ok(())
+}
+
+fn record_post_apply_remote_tree_observation<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    remote_edited_at: Option<String>,
+) -> AfsResult<()>
+where
+    S: RemoteObservationRepository,
+{
+    let mut observation = RemoteObservationRecord::new(
+        mount.mount_id.clone(),
+        entity.remote_id.clone(),
+        entity.kind.clone(),
+        entity.title.clone(),
+        entity.path.clone(),
+        push_timestamp(),
+    );
+    if let Some(remote_edited_at) = remote_edited_at {
+        observation = observation.with_remote_version(RemoteVersion::new(remote_edited_at));
+    }
+
+    store
+        .save_remote_observation(observation)
+        .map_err(AfsError::from)
+}
+
+fn clear_remote_hint<S>(store: &mut S, mount_id: &MountId, remote_id: &RemoteId) -> AfsResult<()>
+where
+    S: FreshnessStateRepository,
+{
+    if let Some(mut freshness) = store
+        .get_freshness_state(mount_id, remote_id)
+        .map_err(AfsError::from)?
+    {
+        freshness.remote_hint_pending = false;
+        freshness.last_checked_at = Some(push_timestamp());
+        store
+            .save_freshness_state(freshness)
+            .map_err(AfsError::from)?;
+    }
     Ok(())
 }
 
@@ -1200,4 +1356,11 @@ fn generate_push_id() -> PushId {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     PushId(format!("push-{timestamp}-{}", std::process::id()))
+}
+
+fn push_timestamp() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!("unix_ms:{}", duration.as_millis()),
+        Err(_) => "unix_ms:0".to_string(),
+    }
 }

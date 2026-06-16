@@ -2250,8 +2250,11 @@ fn print_inspect_report(report: &InspectReport) {
     println!("inspect {}", report.path);
     println!("  mount: {}  entity: {}", report.mount_id, report.entity_id);
     println!("  title: {}", report.title);
-    if let Some(remote_version) = &report.remote_version {
-        println!("  remote version: {remote_version}");
+    if let Some(version) = &report.synced_tree_version {
+        println!("  Synced Tree version: {version}");
+    }
+    if let Some(version) = &report.remote_tree_version {
+        println!("  Remote Tree version: {version}");
     }
     if report.local_read_path != report.path {
         println!("  local cache: {}", report.local_read_path);
@@ -2310,7 +2313,7 @@ fn print_info_report(report: &InfoReport) {
         println!("Entity path: {}", entity.path);
         println!("Hydration: {}", entity.hydration);
         if let Some(remote_edited_at) = &entity.remote_edited_at {
-            println!("Remote edited: {remote_edited_at}");
+            println!("Synced Tree version: {remote_edited_at}");
         }
     }
     if let Some(schema_path) = &report.subject.schema_path {

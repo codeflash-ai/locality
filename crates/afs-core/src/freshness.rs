@@ -277,7 +277,8 @@ pub struct ChangeHint {
     pub observed_at: String,
 }
 
-/// User- and agent-facing state derived from local and observed remote facts.
+/// User- and agent-facing state derived from Local Tree and Remote Tree facts
+/// relative to the Synced Tree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkingCopyState {

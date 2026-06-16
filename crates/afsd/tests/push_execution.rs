@@ -61,7 +61,10 @@ fn daemon_push_job_applies_and_reconciles_through_single_store_owner() {
     let mut supervisor = fixture.supervisor("Old body.");
     fixture.write_page("New body.");
     supervisor.start().expect("start supervisor");
-    let source = FakePushSource::with_remote(rendered_entity("page-1", "New body."));
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "New body."),
+    );
 
     let report = supervisor
         .execute_push(fixture.push_job(true), &source)
@@ -92,6 +95,34 @@ fn daemon_push_job_applies_and_reconciles_through_single_store_owner() {
     let journal = supervisor.store().list_journal().expect("journal");
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].status, JournalStatus::Reconciled);
+}
+
+#[test]
+fn daemon_push_job_blocks_when_remote_tree_content_changed_before_apply() {
+    let fixture = PushFixture::new();
+    let mut supervisor = fixture.supervisor("Old body.");
+    fixture.write_page("New body.");
+    supervisor.start().expect("start supervisor");
+    let source = FakePushSource::with_remote(rendered_entity("page-1", "Remote body."));
+
+    let report = supervisor
+        .execute_push(fixture.push_job(true), &source)
+        .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::Failed);
+    assert_eq!(source.applied_count(), 0);
+    assert_eq!(report.error.as_ref().expect("error").code, "guardrail");
+    assert!(
+        report
+            .error
+            .as_ref()
+            .expect("error")
+            .message
+            .contains("changed since the Synced Tree shadow")
+    );
+    let journal = supervisor.store().list_journal().expect("journal");
+    assert_eq!(journal.len(), 1);
+    assert!(matches!(journal[0].status, JournalStatus::Failed(_)));
 }
 
 #[test]
@@ -580,7 +611,8 @@ impl FileWatcher for RecordingWatcher {
 
 #[derive(Default)]
 struct FakePushSource {
-    remote: Option<HydratedEntity>,
+    remote_before_apply: Option<HydratedEntity>,
+    remote_after_apply: Option<HydratedEntity>,
     applied: std::cell::Cell<usize>,
     supported_operations: Option<BTreeSet<PushOperationKind>>,
 }
@@ -588,7 +620,20 @@ struct FakePushSource {
 impl FakePushSource {
     fn with_remote(remote: HydratedEntity) -> Self {
         Self {
-            remote: Some(remote),
+            remote_before_apply: Some(remote.clone()),
+            remote_after_apply: Some(remote),
+            applied: std::cell::Cell::new(0),
+            supported_operations: None,
+        }
+    }
+
+    fn with_remote_transition(
+        remote_before_apply: HydratedEntity,
+        remote_after_apply: HydratedEntity,
+    ) -> Self {
+        Self {
+            remote_before_apply: Some(remote_before_apply),
+            remote_after_apply: Some(remote_after_apply),
             applied: std::cell::Cell::new(0),
             supported_operations: None,
         }
@@ -616,9 +661,12 @@ impl HydrationSource for FakePushSource {
             return Err(AfsError::InvalidState("unexpected remote id".to_string()));
         }
 
-        self.remote
-            .clone()
-            .ok_or_else(|| AfsError::InvalidState("missing remote fixture".to_string()))
+        let remote = if self.applied.get() == 0 {
+            self.remote_before_apply.clone()
+        } else {
+            self.remote_after_apply.clone()
+        };
+        remote.ok_or_else(|| AfsError::InvalidState("missing remote fixture".to_string()))
     }
 }
 

@@ -1,9 +1,9 @@
 //! Durable state boundary for AgentFS.
 //!
 //! `afs-store` owns the repository contracts used by the daemon and CLI to load
-//! mount configuration, locate projected entities, read last-synced shadows, and
-//! journal pushes. The crate provides a deterministic in-memory implementation
-//! for tests and a SQLite implementation for local durable state.
+//! mount configuration, locate projected entities, read Synced Tree shadows,
+//! and journal pushes. The crate provides a deterministic in-memory
+//! implementation for tests and a SQLite implementation for local durable state.
 
 pub mod credentials;
 pub mod error;

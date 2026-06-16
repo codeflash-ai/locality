@@ -1,10 +1,10 @@
 //! Remote change explanation.
 //!
-//! Freshness metadata can tell AFS that the remote version moved, but it cannot
-//! explain what changed. This module compares the three useful rendered views:
-//! the stored shadow, the current local document, and a freshly rendered remote
-//! document. The result is connector-neutral and suitable for CLI, desktop, and
-//! daemon review flows.
+//! Freshness metadata can tell AFS that the Remote Tree moved, but it cannot
+//! explain what changed. This module compares the three Nucleus views: the
+//! Synced Tree shadow, the current Local Tree document, and a freshly rendered
+//! Remote Tree document. The result is connector-neutral and suitable for CLI,
+//! desktop, and daemon review flows.
 
 use serde::{Deserialize, Serialize};
 

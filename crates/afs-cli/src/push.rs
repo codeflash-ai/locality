@@ -58,6 +58,8 @@ where
         + ShadowRepository
         + JournalRepository
         + JournalStore
+        + RemoteObservationRepository
+        + FreshnessStateRepository
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
