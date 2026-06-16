@@ -97,9 +97,13 @@ verify_signed_app_in_dmg() (
   hdiutil attach "${dmg}" -readonly -noverify -noautoopen -mountpoint "${mountpoint}" -quiet
   app="${mountpoint}/${PRODUCT_NAME}.app"
   codesign --verify --deep --strict --verbose=2 "${app}"
-  codesign -dv --verbose=4 "${app}" 2>&1 | grep -q "Developer ID Application"
-  codesign -dv --verbose=4 "${app}/Contents/PlugIns/AgentFSFileProvider.appex" 2>&1 \
-    | grep -q "Developer ID Application"
+  local app_signature appex_signature
+  app_signature="$(codesign -dv --verbose=4 "${app}" 2>&1)"
+  appex_signature="$(codesign -dv --verbose=4 "${app}/Contents/PlugIns/AgentFSFileProvider.appex" 2>&1)"
+  [[ "${app_signature}" == *"Developer ID Application"* ]] \
+    || fail "${PRODUCT_NAME}.app is not signed with a Developer ID Application identity"
+  [[ "${appex_signature}" == *"Developer ID Application"* ]] \
+    || fail "AgentFSFileProvider.appex is not signed with a Developer ID Application identity"
   grep -a -F -q "${expected_build}" "${app}/Contents/MacOS/afsd"
 )
 
