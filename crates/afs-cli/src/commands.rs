@@ -1289,16 +1289,19 @@ fn mount(args: &[String], json: bool) -> i32 {
         read_only: has_flag(args, "--read-only"),
         projection,
     };
+    let mount_id = options.mount_id.clone();
 
     match run_mount(&mut store, options) {
-        Ok(report) if json => {
-            notify_daemon_mounts_changed(&state_root);
-            print_json(&report);
-            EXIT_SUCCESS
-        }
         Ok(report) => {
             notify_daemon_mounts_changed(&state_root);
-            print_mount_report(&report);
+            if let Err(error) = auto_register_mounted_projection(&state_root, &store, &mount_id) {
+                return command_error(json, error, EXIT_INTERNAL);
+            }
+            if json {
+                print_json(&report);
+            } else {
+                print_mount_report(&report);
+            }
             EXIT_SUCCESS
         }
         Err(error) => mount_command_error(json, error),
@@ -3510,6 +3513,64 @@ fn virtual_projection_registration_for_target(
     }
 }
 
+fn auto_registration_for_mounted_projection(
+    projection: ProjectionMode,
+    target_os: &str,
+) -> Option<VirtualProjectionRegistration> {
+    match (projection, target_os) {
+        (ProjectionMode::LinuxFuse, "linux") => Some(VirtualProjectionRegistration::LinuxFuse),
+        _ => None,
+    }
+}
+
+fn auto_register_mounted_projection(
+    state_root: &Path,
+    store: &SqliteStateStore,
+    mount_id: &MountId,
+) -> Result<(), CommandError> {
+    let mount = store
+        .get_mount(mount_id)
+        .map_err(|error| CommandError::new("mount", "store_error", error.to_string()))?
+        .ok_or_else(|| {
+            CommandError::new(
+                "mount",
+                "mount_not_found",
+                format!(
+                    "mount `{}` was not found after mount registration",
+                    mount_id.0
+                ),
+            )
+        })?;
+    let Some(registration) =
+        auto_registration_for_mounted_projection(mount.projection.clone(), std::env::consts::OS)
+    else {
+        return Ok(());
+    };
+
+    match registration {
+        VirtualProjectionRegistration::LinuxFuse => {
+            file_provider_helper::register_linux_fuse_mount(state_root, &mount)
+                .map(|_| ())
+                .map_err(|error| {
+                    CommandError::new(
+                        "mount",
+                        error.code(),
+                        format!(
+                            "mounted `{}` but Linux FUSE registration failed: {}",
+                            mount.mount_id.0,
+                            error.message()
+                        ),
+                    )
+                    .with_suggested_command(format!(
+                        "afs file-provider register {}",
+                        mount.root.display()
+                    ))
+                })
+        }
+        VirtualProjectionRegistration::MacosFileProvider => Ok(()),
+    }
+}
+
 fn takes_value(arg: &str) -> bool {
     matches!(
         arg,
@@ -3604,11 +3665,11 @@ mod tests {
 
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
-        diff_report_exit_code, legacy_args_for_command, notion_oauth_broker_config,
-        projection_mode_for_target, projection_usage_options_for_target,
-        prompt_for_push_confirmation, pull_direct_fallback_error,
-        should_prompt_for_push_confirmation, spinner_config_for_command, spinner_enabled,
-        validate_virtual_projection_registration,
+        auto_registration_for_mounted_projection, diff_report_exit_code, legacy_args_for_command,
+        notion_oauth_broker_config, projection_mode_for_target,
+        projection_usage_options_for_target, prompt_for_push_confirmation,
+        pull_direct_fallback_error, should_prompt_for_push_confirmation,
+        spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
     };
 
     #[test]
@@ -4060,6 +4121,22 @@ mod tests {
             unsupported_platform
                 .message
                 .contains("no virtual filesystem registration is implemented")
+        );
+    }
+
+    #[test]
+    fn mount_auto_registration_runs_for_linux_fuse_on_linux_only() {
+        assert_eq!(
+            auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux"),
+            Some(VirtualProjectionRegistration::LinuxFuse)
+        );
+        assert_eq!(
+            auto_registration_for_mounted_projection(ProjectionMode::PlainFiles, "linux"),
+            None
+        );
+        assert_eq!(
+            auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "macos"),
+            None
         );
     }
 

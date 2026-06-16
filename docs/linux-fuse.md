@@ -15,8 +15,9 @@ behavior as `macos_file_provider`.
   jobs through the runtime queue.
 - `afs-fuse` mounts a virtual tree and translates kernel filesystem callbacks
   into daemon IPC.
-- `afs file-provider register <mount>` creates and starts a per-mount systemd
-  user service for `afs-fuse`.
+- `afs mount ... --projection linux-fuse` creates and starts a per-mount systemd
+  user service for `afs-fuse`; `afs file-provider register <mount>` can repair
+  or restart that registration.
 - Hydrated and edited contents for virtual projections live under
   `~/.afs/content/<mount-id>/files/`; the mounted root remains virtual.
 - Plain-directory projection remains the fallback for tests, unsupported systems,
@@ -71,7 +72,6 @@ Create or reuse a Linux FUSE mount:
 ./target/debug/afs daemon start --session --afsd-bin "$PWD/target/debug/afsd"
 ./target/debug/afs mount notion /path/to/mount --root-page <notion-page-id> --mount-id notion-test --projection linux-fuse
 ./target/debug/afs pull /path/to/mount
-./target/debug/afs file-provider register /path/to/mount
 ```
 
 Verify the mount and directory listing:

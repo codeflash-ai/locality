@@ -84,7 +84,7 @@ Projection choices are platform-specific. Linux binaries accept `plain-files` an
 `linux-fuse`; macOS binaries accept `plain-files` and `macos-file-provider`;
 Windows currently accepts `plain-files` only.
 
-`afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. `--projection linux-fuse` records the equivalent Linux virtual projection for the FUSE helper. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension lists dataless files from the daemon and materializes a file on open.
+`afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. On Linux, `--projection linux-fuse` records the equivalent virtual projection and registers the per-mount FUSE service. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension lists dataless files from the daemon and materializes a file on open.
 
 Linux should expose the same online-only behavior through a FUSE projection
 helper rather than through inotify-triggered placeholder files. The daemon API for
@@ -95,11 +95,11 @@ compatibility aliases over it.
 current platform's virtual projection: `macos_file_provider` on macOS and
 `linux_fuse` on Linux. The macOS path shells out to the signed app-bundle helper
 at `AgentFS.app/Contents/MacOS/agentfs-file-providerctl`; `AFS_FILE_PROVIDERCTL`
-can override the helper path for development. The Linux path writes and starts a
-per-mount systemd user service for `afs-fuse`; `AFS_FUSE_BIN` can override the
-helper binary path for development. `afs file-provider unregister <mount>` stops
-and removes that Linux service. `list` and `reset` still target the macOS File
-Provider helper.
+can override the helper path for development. On Linux this command can be rerun
+to repair or restart the per-mount systemd user service for `afs-fuse`;
+`AFS_FUSE_BIN` can override the helper binary path for development. `afs
+file-provider unregister <mount>` stops and removes that Linux service. `list`
+and `reset` still target the macOS File Provider helper.
 
 `afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page Synced Tree shadow snapshot. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the Synced Tree shadow, returning a dirty skip instead.
 
