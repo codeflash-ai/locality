@@ -9,10 +9,12 @@ use afs_cli::diff::run_diff;
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::pull::run_pull;
 use afs_cli::push::{PushOptions, run_push_with_daemon};
+use afs_cli::search::{SearchOptions, run_search};
 use afs_cli::status::{StatusOptions, run_status};
 use afs_connector::{Connector, FetchRequest};
 use afs_core::canonical::render_canonical_markdown;
-use afs_core::model::{MountId, RemoteId};
+use afs_core::hydration::{HydrationReason, HydrationRequest};
+use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::client::{HttpNotionApi, NotionApi};
 use afs_notion::dto::{
     BlockDto, BlockListDto, DatabaseDto, NotionPageBundle, PageDto, PageListDto, PagePropertyDto,
@@ -20,8 +22,15 @@ use afs_notion::dto::{
     TextRichTextDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
-use afs_store::{ConnectionId, InMemoryStateStore, ProjectionMode};
+use afs_store::{ConnectionId, EntityRepository, InMemoryStateStore, ProjectionMode};
+use afsd::hydration::{HydrationExecutor, HydrationOutcome};
+use afsd::virtual_fs::{
+    ROOT_CONTAINER_IDENTIFIER, materialize_virtual_fs_item_with_content_root,
+    refresh_virtual_fs_children, source_root_identifier, virtual_fs_children_with_content_root,
+    virtual_fs_content_root,
+};
 use serde_json::{Value, json};
+use std::time::Duration;
 
 const LIVE_PARENT_ENV: &str = "AFS_NOTION_LIVE_PARENT_PAGE";
 const TOKEN_ENV: &str = "NOTION_TOKEN";
@@ -209,6 +218,278 @@ fn live_scratch_page_mount_edit_push_verifies_notion() {
         "{}",
         verified_render.document.body
     );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live lazy root {}", unique_suffix()),
+        vec![paragraph_child(
+            "Root page body should not materialize during directory listing.",
+        )],
+    );
+    let child = cleanup.create_page(
+        &scratch.id,
+        &format!("AFS live lazy child {}", unique_suffix()),
+        vec![paragraph_child(
+            "Lazy child body materialized only on open.",
+        )],
+    );
+    let connector = NotionConnector::new(
+        NotionConfig::default().with_root_page_id(RemoteId::new(scratch.id.clone())),
+    );
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    mount_virtual_workspace(&fixture, &mut store, &scratch.id);
+    let content_root = fixture.content_root();
+
+    let root_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        ROOT_CONTAINER_IDENTIFIER,
+    )
+    .expect("list virtual root");
+    assert!(
+        root_children
+            .children
+            .iter()
+            .any(|item| item.filename == "notion"),
+        "{root_children:#?}"
+    );
+
+    let source_root = source_root_identifier("notion");
+    assert_eq!(
+        refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
+            .expect("refresh source root metadata"),
+        1
+    );
+    let source_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &source_root,
+    )
+    .expect("list source root");
+    let scratch_file = find_virtual_file(&source_children.children, &scratch.id);
+    assert!(
+        !content_root.join(&scratch_file.path).exists(),
+        "listing the source root must not hydrate the root page body"
+    );
+    let scratch_folder = find_virtual_folder(&source_children.children, &scratch.id);
+
+    assert_eq!(
+        refresh_virtual_fs_children(
+            &mut store,
+            &connector,
+            &fixture.mount_id,
+            &scratch_folder.identifier,
+        )
+        .expect("refresh page children metadata"),
+        1
+    );
+    let nested_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &scratch_folder.identifier,
+    )
+    .expect("list nested page children");
+    let child_file = find_virtual_file(&nested_children.children, &child.id);
+    assert!(
+        !content_root.join(&child_file.path).exists(),
+        "listing a page directory must not hydrate nested page bodies"
+    );
+
+    let materialized = materialize_virtual_fs_item_with_content_root(
+        &mut store,
+        &connector,
+        &content_root,
+        &fixture.mount_id,
+        &child.id,
+    )
+    .expect("open child page");
+    assert_eq!(materialized.hydration, HydrationState::Hydrated);
+    let materialized_path = PathBuf::from(materialized.path);
+    let markdown = fs::read_to_string(&materialized_path).expect("read hydrated virtual file");
+    assert!(markdown.contains("Lazy child body materialized only on open."));
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_drift_preflight_blocks_push_before_overwriting_remote() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live drift {}", unique_suffix()),
+        vec![paragraph_child("Base body before local and remote drift.")],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    let local_marker = format!("Local pending edit {}", unique_suffix());
+    let remote_marker = format!("Remote competing edit {}", unique_suffix());
+    fs::write(
+        &page_path,
+        original.replace("Base body before local and remote drift.", &local_marker),
+    )
+    .expect("write local drift edit");
+
+    std::thread::sleep(Duration::from_millis(1200));
+    append_remote_paragraph(&cleanup.api, &scratch.id, &remote_marker);
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push drifted page");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "apply_failed", "{push:#?}");
+    let drift_message = format!(
+        "{} {}",
+        push.message.as_deref().unwrap_or_default(),
+        push.suggested_fix.as_deref().unwrap_or_default()
+    );
+    assert!(drift_message.contains("changed since"), "{push:#?}");
+
+    let verified = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(verified.contains(&remote_marker), "{verified}");
+    assert!(
+        !verified.contains(&local_marker),
+        "remote content should not be overwritten by a blocked push:\n{verified}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_remote_fast_forward_updates_clean_file_and_preserves_pending_file() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live fast forward {}", unique_suffix()),
+        vec![paragraph_child("Fast forward base body.")],
+    );
+    let connector = NotionConnector::new(
+        NotionConfig::default().with_root_page_id(RemoteId::new(scratch.id.clone())),
+    );
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    mount_virtual_workspace(&fixture, &mut store, &scratch.id);
+    let content_root = fixture.content_root();
+    hydrate_virtual_root_page(&fixture, &mut store, &connector, &content_root, &scratch.id);
+    let page_path = content_root.join(
+        store
+            .get_entity(&fixture.mount_id, &RemoteId::new(scratch.id.clone()))
+            .expect("get entity")
+            .expect("entity")
+            .path,
+    );
+
+    let clean_remote_marker = format!("Clean remote update {}", unique_suffix());
+    append_remote_paragraph(&cleanup.api, &scratch.id, &clean_remote_marker);
+    let clean_outcome =
+        HydrationExecutor::new_with_output_root(&mut store, &connector, content_root.clone())
+            .hydrate_request(HydrationRequest::new(
+                fixture.mount_id.clone(),
+                RemoteId::new(scratch.id.clone()),
+                page_path.clone(),
+                HydrationState::Hydrated,
+                HydrationReason::RemoteFastForward,
+            ))
+            .expect("fast-forward clean file");
+    assert_eq!(clean_outcome, HydrationOutcome::Hydrated);
+    let clean_contents = fs::read_to_string(&page_path).expect("read fast-forwarded file");
+    assert!(clean_contents.contains(&clean_remote_marker));
+
+    let local_marker = format!("Local pending protected {}", unique_suffix());
+    let remote_marker = format!("Remote update while pending {}", unique_suffix());
+    fs::write(&page_path, format!("{clean_contents}\n\n{local_marker}\n"))
+        .expect("write pending local edit");
+    append_remote_paragraph(&cleanup.api, &scratch.id, &remote_marker);
+    let protected_outcome =
+        HydrationExecutor::new_with_output_root(&mut store, &connector, content_root.clone())
+            .hydrate_request(HydrationRequest::new(
+                fixture.mount_id.clone(),
+                RemoteId::new(scratch.id.clone()),
+                page_path.clone(),
+                HydrationState::Hydrated,
+                HydrationReason::RemoteFastForward,
+            ))
+            .expect("skip pending file");
+    assert_eq!(protected_outcome, HydrationOutcome::SkippedDirty);
+    let protected_contents = fs::read_to_string(&page_path).expect("read protected file");
+    assert!(protected_contents.contains(&local_marker));
+    assert!(
+        !protected_contents.contains(&remote_marker),
+        "pending local content must not be overwritten by remote fast-forward"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_locate_notion_url_returns_markdown_path_and_can_prioritize_hydration() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live locate {}", unique_suffix()),
+        vec![paragraph_child(
+            "Located page body should hydrate after URL lookup.",
+        )],
+    );
+    let connector = NotionConnector::new(
+        NotionConfig::default().with_root_page_id(RemoteId::new(scratch.id.clone())),
+    );
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    mount_virtual_workspace(&fixture, &mut store, &scratch.id);
+    let content_root = fixture.content_root();
+    let source_root = source_root_identifier("notion");
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
+        .expect("index source root");
+
+    let url = notion_object_url(&scratch.id);
+    let search = run_search(&store, SearchOptions::new(url)).expect("locate by Notion URL");
+    let located = search
+        .results
+        .iter()
+        .find(|result| compact_notion_id(&result.remote_id) == compact_notion_id(&scratch.id))
+        .expect("located scratch page");
+    assert_eq!(located.kind, "page");
+    assert_eq!(located.state, "online_only");
+    assert!(
+        located.path.ends_with(".md"),
+        "locate should return the Markdown file path, not only a page directory: {located:#?}"
+    );
+    assert!(
+        located.absolute_path.ends_with(&located.path),
+        "{located:#?}"
+    );
+
+    let materialized = materialize_virtual_fs_item_with_content_root(
+        &mut store,
+        &connector,
+        &content_root,
+        &fixture.mount_id,
+        &scratch.id,
+    )
+    .expect("hydrate located page");
+    let markdown = fs::read_to_string(materialized.path).expect("read hydrated located page");
+    assert!(markdown.contains("Located page body should hydrate after URL lookup."));
 }
 
 #[test]
@@ -743,6 +1024,7 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
 
 struct E2eFixture {
     root: PathBuf,
+    state_root: PathBuf,
     mount_id: MountId,
 }
 
@@ -758,10 +1040,19 @@ impl E2eFixture {
             "afs-cli-e2e-push-{}-{unique}-{suffix}",
             std::process::id()
         ));
+        let state_root = std::env::temp_dir().join(format!(
+            "afs-cli-e2e-push-state-{}-{unique}-{suffix}",
+            std::process::id()
+        ));
         Self {
             root,
+            state_root,
             mount_id: MountId::new("notion-main"),
         }
+    }
+
+    fn content_root(&self) -> PathBuf {
+        virtual_fs_content_root(&self.state_root, &self.mount_id)
     }
 
     fn page_file(&self) -> PathBuf {
@@ -819,7 +1110,70 @@ impl E2eFixture {
 impl Drop for E2eFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.state_root);
     }
+}
+
+fn mount_virtual_workspace(fixture: &E2eFixture, store: &mut InMemoryStateStore, root_id: &str) {
+    run_mount(
+        store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(root_id.to_string())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect("mount virtual live workspace");
+}
+
+fn hydrate_virtual_root_page(
+    fixture: &E2eFixture,
+    store: &mut InMemoryStateStore,
+    connector: &NotionConnector,
+    content_root: &Path,
+    page_id: &str,
+) {
+    let source_root = source_root_identifier("notion");
+    refresh_virtual_fs_children(store, connector, &fixture.mount_id, &source_root)
+        .expect("refresh virtual source root");
+    materialize_virtual_fs_item_with_content_root(
+        store,
+        connector,
+        content_root,
+        &fixture.mount_id,
+        page_id,
+    )
+    .expect("hydrate virtual root page");
+}
+
+fn find_virtual_file<'a>(
+    items: &'a [afsd::virtual_fs::VirtualFsItem],
+    remote_id: &str,
+) -> &'a afsd::virtual_fs::VirtualFsItem {
+    items
+        .iter()
+        .find(|item| {
+            item.remote_id.as_deref() == Some(remote_id)
+                && item.kind == afsd::virtual_fs::VirtualFsItemKind::File
+        })
+        .unwrap_or_else(|| panic!("missing virtual file for {remote_id}: {items:#?}"))
+}
+
+fn find_virtual_folder<'a>(
+    items: &'a [afsd::virtual_fs::VirtualFsItem],
+    remote_id: &str,
+) -> &'a afsd::virtual_fs::VirtualFsItem {
+    items
+        .iter()
+        .find(|item| {
+            item.remote_id.as_deref() == Some(remote_id)
+                && item.kind == afsd::virtual_fs::VirtualFsItemKind::Folder
+        })
+        .unwrap_or_else(|| panic!("missing virtual folder for {remote_id}: {items:#?}"))
 }
 
 #[derive(Debug)]
@@ -1099,6 +1453,16 @@ fn render_live_markdown(connector: &NotionConnector, page_id: &str, page_path: &
         .expect("render live page")
         .document;
     render_canonical_markdown(&document)
+}
+
+fn append_remote_paragraph(api: &HttpNotionApi, page_id: &str, text: &str) {
+    api.append_block_children(
+        page_id,
+        json!({
+            "children": [paragraph_child(text)]
+        }),
+    )
+    .expect("append live remote paragraph");
 }
 
 fn diverse_page_children(target_page_id: &str, database_id: &str) -> Vec<Value> {
@@ -1787,6 +2151,14 @@ fn normalize_notion_id(input: &str) -> String {
     } else {
         candidate.to_string()
     }
+}
+
+fn compact_notion_id(input: &str) -> String {
+    input
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
 
 fn notion_object_url(id: &str) -> String {
