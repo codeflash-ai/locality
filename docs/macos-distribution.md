@@ -91,42 +91,56 @@ Use the `Developer ID Application: ... (TEAMID)` identity. If the command prints
 `0 valid identities found`, install the Developer ID Application certificate
 from the Apple Developer account into the login keychain first.
 
-For local release testing, prefer environment variables over hardcoding the
-production identity in `tauri.conf.json`:
+For local release testing, use the publish target:
 
 ```sh
-export APPLE_SIGNING_IDENTITY="Developer ID Application: Example, Inc. (TEAMID)"
-export APPLE_ID="developer@example.com"
-export APPLE_PASSWORD="app-specific-password"
-export APPLE_TEAM_ID="TEAMID"
-make build-tauri
+make publish
 ```
 
 `tauri.conf.json` uses `signingIdentity: "-"` as the checked-in default so local
 developer builds are ad-hoc signed and can pass local `codesign --verify`
 without requiring every contributor to have CodeFlash's Developer ID
-certificate. Release automation should override that default with the real
-Developer ID identity. The File Provider staging script also reads
+certificate. `make publish` overrides that default with a Developer ID identity.
+If exactly one `Developer ID Application` identity is installed locally, the
+script uses it automatically. Otherwise set:
+
+```sh
+export APPLE_SIGNING_IDENTITY="Developer ID Application: Example, Inc. (TEAMID)"
+```
+
+The File Provider staging script also reads
 `APPLE_SIGNING_IDENTITY`, so the nested File Provider extension, helper, and
 `afsd` sidecar are signed with the same release identity and hardened runtime.
 
-Recommended release sequence:
+Notarization uses a keychain profile named `afs-notary` by default:
 
 ```sh
-make setup
-make build-tauri
-DMG="$(find target/release/bundle/dmg -maxdepth 1 -name 'AFS_*.dmg' | sort | tail -n 1)"
-xcrun notarytool submit "$DMG" --wait \
+xcrun notarytool store-credentials afs-notary \
   --apple-id "$APPLE_ID" \
   --password "$APPLE_PASSWORD" \
   --team-id "$APPLE_TEAM_ID"
-xcrun stapler staple "$DMG"
-xcrun stapler validate "$DMG"
-spctl --assess --type open --context context:primary-signature --verbose "$DMG"
 ```
 
-The exact production signing script still needs a final entitlement review
-before automated releases.
+Set `APPLE_NOTARY_KEYCHAIN_PROFILE` or `NOTARY_KEYCHAIN_PROFILE` to use a
+different profile. If no keychain profile is available, `make publish` falls
+back to `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` from the environment.
+
+The publish script requires a clean git working tree by default because the
+embedded daemon build ID is derived from `HEAD`. Use `PUBLISH_ALLOW_DIRTY=1`
+only for local throwaway builds.
+
+The final artifact is copied to:
+
+```text
+target/release/bundle/dmg/AFS-beta-YYYYMMDD-<commit>-notarized-<arch>.dmg
+```
+
+Useful overrides:
+
+```sh
+PUBLISH_CHANNEL=release make publish
+PUBLISH_DMG_NAME=AFS-beta-custom-notarized-aarch64.dmg make publish
+```
 
 ## Distribution Channels
 

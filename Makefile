@@ -41,6 +41,10 @@ build-desktop: $(DESKTOP_NODE_MODULES_STAMP) ## Build the desktop frontend asset
 build-tauri: ## Build the packaged Tauri desktop app.
 	$(DESKTOP_NPM) run build:mac
 
+.PHONY: publish
+publish: setup ## Build, sign, notarize, staple, and validate a macOS DMG.
+	scripts/publish-macos.sh
+
 .PHONY: prepare-macos-file-provider
 prepare-macos-file-provider: ## Stage the macOS File Provider extension for Tauri packaging.
 	$(DESKTOP_DIR)/scripts/prepare-macos-file-provider.sh
