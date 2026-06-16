@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/clean-start.sh [--yes] [--keep-credentials] [--state-dir PATH] [--app-path PATH]
+
+Reset this machine to a clean AFS testing state.
+
+By default this is a dry run. Pass --yes to actually stop processes, unregister
+File Provider domains, remove local AFS state, remove the installed app, and
+delete AFS keychain connection credentials.
+
+Options:
+  --yes               Execute the cleanup. Without this flag, only print actions.
+  --keep-credentials  Do not delete AFS connection secrets from the keychain.
+  --state-dir PATH    State directory to delete. Defaults to AFS_STATE_DIR or ~/.afs.
+  --app-path PATH     Installed app bundle to delete. Defaults to /Applications/AFS.app.
+  -h, --help          Show this help.
+USAGE
+}
+
+DRY_RUN=1
+KEEP_CREDENTIALS=0
+STATE_DIR="${AFS_STATE_DIR:-${HOME}/.afs}"
+APP_PATH="/Applications/AFS.app"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yes)
+      DRY_RUN=0
+      shift
+      ;;
+    --keep-credentials)
+      KEEP_CREDENTIALS=1
+      shift
+      ;;
+    --state-dir)
+      STATE_DIR="${2:?--state-dir requires a path}"
+      shift 2
+      ;;
+    --app-path)
+      APP_PATH="${2:?--app-path requires a path}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "clean-start: unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE_DIR="${STATE_DIR/#\~/${HOME}}"
+APP_PATH="${APP_PATH/#\~/${HOME}}"
+DB_PATH="${STATE_DIR}/state.sqlite3"
+
+log() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf 'clean-start: warning: %s\n' "$*" >&2
+}
+
+print_cmd() {
+  printf '+'
+  for arg in "$@"; do
+    printf ' %q' "$arg"
+  done
+  printf '\n'
+}
+
+run() {
+  print_cmd "$@"
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    "$@" || warn "command failed: $*"
+  fi
+}
+
+run_quiet() {
+  print_cmd "$@"
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    "$@" >/dev/null 2>&1 || true
+  fi
+}
+
+remove_path() {
+  local path="$1"
+  [[ -e "${path}" || -L "${path}" ]] || return 0
+  run rm -rf "${path}"
+}
+
+append_unique() {
+  local array_name="$1"
+  local value="$2"
+  local existing
+  eval "set -- \"\${${array_name}[@]:-}\""
+  for existing in "$@"; do
+    [[ -n "${existing}" ]] || continue
+    [[ "${existing}" == "${value}" ]] && return 0
+  done
+  eval "${array_name}+=(\"\${value}\")"
+}
+
+read_mount_roots() {
+  [[ -f "${DB_PATH}" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  sqlite3 -noheader -cmd '.timeout 5000' "${DB_PATH}" \
+    "select root from mounts where root is not null and root <> '';" 2>/dev/null || true
+}
+
+read_keychain_accounts() {
+  [[ -f "${DB_PATH}" ]] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  sqlite3 -noheader -cmd '.timeout 5000' "${DB_PATH}" \
+    "select secret_ref from connections where secret_ref like 'connection:%';" 2>/dev/null || true
+}
+
+is_safe_mount_root_to_remove() {
+  local path="$1"
+  case "${path}" in
+    "${HOME}/Documents/AFS"|\
+    "${HOME}/Documents/AFS/"*|\
+    "${HOME}/Library/CloudStorage/AFS"|\
+    "${HOME}/Library/CloudStorage/AFS/"*|\
+    "${HOME}/Library/CloudStorage/AFS-"*|\
+    "${HOME}/Library/CloudStorage/AgentFS-"*|\
+    /tmp/afs|\
+    /tmp/afs/*|\
+    /tmp/AFS|\
+    /tmp/AFS/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+unmount_if_mounted() {
+  local path="$1"
+  [[ -n "${path}" ]] || return 0
+  if mount | grep -F " on ${path} (" >/dev/null 2>&1; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      run_quiet diskutil unmount force "${path}"
+    fi
+    run_quiet umount -f "${path}"
+  fi
+}
+
+delete_keychain_account() {
+  local account="$1"
+  [[ -n "${account}" ]] || return 0
+  if command -v security >/dev/null 2>&1; then
+    run_quiet security delete-generic-password -s afs -a "${account}"
+  fi
+}
+
+installed_helper() {
+  local helper="${APP_PATH}/Contents/MacOS/agentfs-file-providerctl"
+  [[ -x "${helper}" ]] && printf '%s\n' "${helper}"
+}
+
+repo_helper() {
+  local helper="${ROOT}/apps/desktop/src-tauri/macos/AgentFSFileProvider/agentfs-file-providerctl"
+  [[ -x "${helper}" ]] && printf '%s\n' "${helper}"
+}
+
+reset_file_provider_domains() {
+  [[ "$(uname -s)" == "Darwin" ]] || return 0
+
+  local helper=""
+  helper="$(installed_helper || true)"
+  if [[ -z "${helper}" ]]; then
+    helper="$(repo_helper || true)"
+  fi
+
+  if [[ -n "${helper}" ]]; then
+    run_quiet "${helper}" reset --json
+  else
+    warn "agentfs-file-providerctl not found; skipping File Provider domain reset"
+  fi
+}
+
+stop_processes() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    run_quiet osascript -e 'tell application id "ai.codeflash.afs" to quit'
+    run_quiet launchctl bootout "gui/${UID}/ai.codeflash.afs.afsd"
+    run_quiet launchctl bootout "gui/${UID}" "${HOME}/Library/LaunchAgents/ai.codeflash.afs.afsd.plist"
+  fi
+
+  run_quiet pkill -x afs-desktop
+  run_quiet pkill -x AFS
+  run_quiet pkill -x AgentFSFileProvider
+  run_quiet pkill -x afsd
+  run_quiet pkill -f "${ROOT}/target/.*/afs-desktop"
+  run_quiet pkill -f "${ROOT}/target/.*/afsd"
+  if [[ -n "${APP_PATH}" ]]; then
+    run_quiet pkill -f "${APP_PATH}/Contents"
+  fi
+}
+
+remove_mount_roots() {
+  local roots=()
+  local root
+
+  while IFS= read -r root; do
+    [[ -n "${root}" ]] && roots+=("${root}")
+  done < <(read_mount_roots)
+
+  roots+=(
+    "${HOME}/Documents/AFS"
+    "${HOME}/Library/CloudStorage/AFS"
+    "${HOME}/Library/CloudStorage/AFS-Notion"
+    "${HOME}/Library/CloudStorage/AgentFS-Notion"
+  )
+
+  local unique_roots=()
+  for root in "${roots[@]}"; do
+    root="${root/#\~/${HOME}}"
+    append_unique unique_roots "${root}"
+  done
+
+  for root in "${unique_roots[@]}"; do
+    unmount_if_mounted "${root}"
+    if is_safe_mount_root_to_remove "${root}"; then
+      remove_path "${root}"
+    elif [[ -e "${root}" || -L "${root}" ]]; then
+      warn "not removing non-standard mount root: ${root}"
+    fi
+  done
+}
+
+remove_credentials() {
+  [[ "${KEEP_CREDENTIALS}" -eq 0 ]] || return 0
+
+  local accounts=()
+  local account
+  while IFS= read -r account; do
+    [[ -n "${account}" ]] && accounts+=("${account}")
+  done < <(read_keychain_accounts)
+
+  accounts+=(
+    "connection:notion-default"
+    "connection:notion-main"
+    "connection:notion-test"
+  )
+
+  local unique_accounts=()
+  for account in "${accounts[@]}"; do
+    append_unique unique_accounts "${account}"
+  done
+
+  for account in "${unique_accounts[@]}"; do
+    delete_keychain_account "${account}"
+  done
+}
+
+remove_support_files() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    remove_path "${HOME}/Library/LaunchAgents/ai.codeflash.afs.afsd.plist"
+    remove_path "${HOME}/Library/Group Containers/group.ai.codeflash.afs"
+    remove_path "${HOME}/Library/Application Support/ai.codeflash.afs"
+    remove_path "${HOME}/Library/Caches/ai.codeflash.afs"
+    remove_path "${HOME}/Library/HTTPStorages/ai.codeflash.afs"
+    remove_path "${HOME}/Library/Preferences/ai.codeflash.afs.plist"
+    remove_path "${HOME}/Library/Saved Application State/ai.codeflash.afs.savedState"
+  fi
+  remove_path "${STATE_DIR}"
+}
+
+remove_app() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    run_quiet pluginkit -r "${APP_PATH}"
+  fi
+  remove_path "${APP_PATH}"
+}
+
+log "AFS clean-start"
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  log "Mode: dry run. Re-run with --yes to execute."
+else
+  log "Mode: executing cleanup."
+fi
+log "State dir: ${STATE_DIR}"
+log "App path:  ${APP_PATH}"
+if [[ "${KEEP_CREDENTIALS}" -eq 1 ]]; then
+  log "Credentials: preserving keychain entries."
+else
+  log "Credentials: deleting AFS connection keychain entries."
+fi
+log ""
+
+stop_processes
+reset_file_provider_domains
+remove_mount_roots
+remove_credentials
+remove_support_files
+remove_app
+
+log ""
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  log "Dry run complete. No changes were made."
+else
+  log "Clean-start reset complete."
+fi

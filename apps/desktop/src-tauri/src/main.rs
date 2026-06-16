@@ -11,14 +11,13 @@ use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oaut
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
 #[cfg(target_os = "macos")]
 use afs_cli::file_provider::{
-    ensure_macos_file_provider_shortcut, macos_file_provider_display_name,
-    macos_file_provider_domain_url, open_macos_file_provider_domain,
-    register_macos_file_provider_domain,
+    macos_file_provider_display_name, macos_file_provider_domain_url,
+    open_macos_file_provider_domain, register_macos_file_provider_domain,
 };
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
-use afs_cli::status::{StatusOptions, StatusState, run_status};
+use afs_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
 use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::MountId;
 use afs_notion::oauth::{
@@ -33,6 +32,7 @@ use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
 use afsd::ipc::{DaemonRequest, send_request};
 use afsd::source::{resolve_source_for_path, source_display_name};
 use afsd::virtual_fs::virtual_fs_content_root;
+use afsd::virtual_fs::{source_root_directory_name, source_root_identifier};
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -299,8 +299,9 @@ async fn choose_mount_folder(
     let selected = choose_folder_with_dialog(&app, current)?;
     selected
         .map(|path| {
-            validate_mount_root(&path, &default_state_root())?;
-            Ok(display_path(&path))
+            let root = normalize_desktop_mount_root(&path)?;
+            validate_desktop_mount_root(&root, &default_state_root(), &desktop_projection_mode())?;
+            Ok(display_path(&root))
         })
         .transpose()
 }
@@ -494,7 +495,12 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let daemon_ready = send_request(&state_root, &DaemonRequest::Ping)
         .map(|response| response.ok)
         .unwrap_or(false);
-    let health_state = health_state(&pending_changes, connection.as_ref(), daemon_ready);
+    let health_state = health_state(
+        &pending_changes,
+        connection.as_ref(),
+        daemon_ready,
+        status.as_ref(),
+    );
 
     Ok(DesktopSnapshot {
         health: AppHealth {
@@ -572,7 +578,7 @@ fn mount_summary(
             workspace_name: connection
                 .and_then(|connection| connection.workspace_name.clone())
                 .unwrap_or_else(|| "No Notion folder".to_string()),
-            local_path: "~/Documents/AFS/Notion".to_string(),
+            local_path: display_path(&default_notion_mount_root()),
             projection: "macOS File Provider".to_string(),
             read_only: false,
             status: "not_mounted".to_string(),
@@ -603,6 +609,12 @@ fn pending_changes_from_status(status: &afs_cli::status::StatusReport) -> Vec<Pe
                     | StatusState::Conflicted
                     | StatusState::Missing
                     | StatusState::Error
+            ) || matches!(
+                entry.sync_state,
+                StatusSyncState::RemoteUpdateAvailable
+                    | StatusSyncState::PendingLocalChanges
+                    | StatusSyncState::ReviewNeeded
+                    | StatusSyncState::Conflicted
             ) || entry.pending_journal_count > 0
                 || entry.failed_journal_count > 0
         })
@@ -616,12 +628,17 @@ fn pending_changes_from_status(status: &afs_cli::status::StatusReport) -> Vec<Pe
 }
 
 fn pending_state_for_entry(entry: &afs_cli::status::StatusEntry) -> &'static str {
-    if matches!(entry.state, StatusState::Conflicted) {
+    if matches!(entry.sync_state, StatusSyncState::Conflicted) {
         "conflict"
     } else if matches!(entry.state, StatusState::Error | StatusState::Missing)
         || entry.failed_journal_count > 0
     {
         "blocked"
+    } else if matches!(
+        entry.sync_state,
+        StatusSyncState::RemoteUpdateAvailable | StatusSyncState::ReviewNeeded
+    ) {
+        "needs_review"
     } else if entry
         .issues
         .iter()
@@ -642,6 +659,17 @@ fn status_summary_for_entry(entry: &afs_cli::status::StatusEntry) -> String {
     }
     if matches!(entry.state, StatusState::Conflicted) {
         return "conflict".to_string();
+    }
+    if matches!(entry.sync_state, StatusSyncState::RemoteUpdateAvailable) {
+        return "remote update available".to_string();
+    }
+    if matches!(entry.sync_state, StatusSyncState::ReviewNeeded)
+        && entry
+            .issues
+            .iter()
+            .any(|issue| issue.code.starts_with("remote_"))
+    {
+        return "remote changed while local edits are pending".to_string();
     }
     if let Some(issue) = entry.issues.first() {
         return issue.message.clone();
@@ -763,6 +791,7 @@ fn health_state(
     pending_changes: &[PendingChange],
     connection: Option<&ConnectionRecord>,
     daemon_ready: bool,
+    status: Option<&afs_cli::status::StatusReport>,
 ) -> &'static str {
     if connection.is_some_and(|connection| connection.status != "active") {
         "reconnect_needed"
@@ -770,6 +799,8 @@ fn health_state(
         "stopped"
     } else if !pending_changes.is_empty() {
         "needs_review"
+    } else if status.is_some_and(|status| status.summary.checking_freshness > 0) {
+        "checking_freshness"
     } else {
         "ready"
     }
@@ -820,6 +851,7 @@ fn tray_state_for_health(state: &str) -> TrayVisualState {
 fn tray_tooltip(snapshot: &DesktopSnapshot) -> String {
     match snapshot.health.state.as_str() {
         "needs_review" => format!("AFS: {} pending changes", snapshot.health.attention_count),
+        "checking_freshness" => "AFS: checking freshness".to_string(),
         "reconnect_needed" => "AFS: reconnect Notion".to_string(),
         "stopped" => "AFS: daemon stopped".to_string(),
         _ => "AFS: ready".to_string(),
@@ -1394,7 +1426,7 @@ fn mount_access_root(mount: &MountConfig) -> PathBuf {
         if mount.projection == ProjectionMode::MacosFileProvider
             && let Ok(url) = macos_file_provider_domain_url(&mount.mount_id.0)
         {
-            return url;
+            return url.join(source_root_directory_name(&mount.connector));
         }
     }
 
@@ -1442,6 +1474,34 @@ fn display_path(path: &Path) -> String {
     path.display().to_string()
 }
 
+fn default_notion_mount_root() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        return macos_afs_cloud_storage_root().join(source_root_directory_name("notion"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(home) = home_dir() {
+            return home.join("Documents").join("AFS").join("Notion");
+        }
+        PathBuf::from("AFS").join("Notion")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cloud_storage_dir() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("Library")
+        .join("CloudStorage")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_afs_cloud_storage_root() -> PathBuf {
+    macos_cloud_storage_dir().join("AFS")
+}
+
 fn resolve_mount_root(path: &str) -> Result<PathBuf, String> {
     let path = path.trim();
     if path.is_empty() {
@@ -1460,6 +1520,60 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
     std::env::current_dir()
         .map(|current_dir| current_dir.join(path))
         .map_err(|error| format!("Could not resolve current directory: {error}"))
+}
+
+fn resolve_desktop_mount_root(path: &str) -> Result<PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("Choose a CloudStorage folder for the Notion mount.".to_string());
+        }
+        if !path.contains('/') && !path.starts_with('~') {
+            return Ok(macos_afs_cloud_storage_root().join(source_root_directory_name(path)));
+        }
+    }
+
+    let root = resolve_mount_root(path)?;
+    normalize_desktop_mount_root(&root)
+}
+
+fn normalize_desktop_mount_root(root: &Path) -> Result<PathBuf, String> {
+    let root = absolute_path(root)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        if root == macos_cloud_storage_dir() || root == macos_afs_cloud_storage_root() {
+            return Ok(default_notion_mount_root());
+        }
+    }
+
+    Ok(root)
+}
+
+fn validate_desktop_mount_root(
+    root: &Path,
+    state_root: &Path,
+    projection: &ProjectionMode,
+) -> Result<(), String> {
+    validate_mount_root(root, state_root)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        if *projection == ProjectionMode::MacosFileProvider {
+            let afs_root = absolute_path(&macos_afs_cloud_storage_root())?;
+            let root = absolute_path(root)?;
+            if !root.starts_with(&afs_root) || root == afs_root {
+                return Err(format!(
+                    "Choose a source folder inside the AFS CloudStorage root, for example {}.",
+                    display_path(&default_notion_mount_root())
+                ));
+            }
+        }
+    }
+
+    let _ = projection;
+    Ok(())
 }
 
 fn validate_mount_root(root: &Path, state_root: &Path) -> Result<(), String> {
@@ -1598,6 +1712,19 @@ fn choose_folder_with_dialog(
         .filter(|path| path.exists())
     {
         dialog = dialog.set_directory(directory);
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            let afs_root = macos_afs_cloud_storage_root();
+            if afs_root.exists() {
+                dialog = dialog.set_directory(afs_root);
+            } else {
+                let cloud_storage = macos_cloud_storage_dir();
+                if cloud_storage.exists() {
+                    dialog = dialog.set_directory(cloud_storage);
+                }
+            }
+        }
     }
 
     dialog
@@ -1611,12 +1738,12 @@ fn choose_folder_with_dialog(
 
 fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
     let state_root = default_state_root();
-    let root = resolve_mount_root(path)?;
-    validate_mount_root(&root, &state_root)?;
+    let projection = desktop_projection_mode();
+    let root = resolve_desktop_mount_root(path)?;
+    validate_desktop_mount_root(&root, &state_root, &projection)?;
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open AFS state: {error}"))?;
     let connection_id = preferred_notion_connection_id(&store)?;
-    let projection = desktop_projection_mode();
 
     let mount_report = run_mount(
         &mut store,
@@ -1642,15 +1769,12 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
 
     if mount.projection.uses_virtual_filesystem() {
         register_virtual_projection(&state_root, &mount)?;
-        if let Err(error) = install_virtual_projection_shortcut(&mount) {
-            eprintln!("afs desktop could not create virtual projection shortcut: {error}");
-        }
-        prefetch_virtual_projection_root(&state_root, &mount.mount_id.0)?;
+        prefetch_virtual_projection_root(&state_root, &mount)?;
     }
 
     Ok(format!(
         "Mounted Notion workspace at {} with {}.",
-        mount_report.root,
+        display_path(&mount_access_root(&mount)),
         projection_label(&mount.projection)
     ))
 }
@@ -1808,12 +1932,29 @@ fn is_unsupported_schema_version_message(message: &str) -> bool {
     message.contains("unsupported schema version") && message.contains("supports up to")
 }
 
-fn prefetch_virtual_projection_root(state_root: &Path, mount_id: &str) -> Result<(), String> {
+fn prefetch_virtual_projection_root(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
+    prefetch_virtual_projection_container(
+        state_root,
+        &mount.mount_id.0,
+        ROOT_CONTAINER_IDENTIFIER,
+    )?;
+    prefetch_virtual_projection_container(
+        state_root,
+        &mount.mount_id.0,
+        &source_root_identifier(&mount.connector),
+    )
+}
+
+fn prefetch_virtual_projection_container(
+    state_root: &Path,
+    mount_id: &str,
+    container_identifier: &str,
+) -> Result<(), String> {
     match send_request(
         state_root,
         &DaemonRequest::FileProviderChildren {
             mount_id: mount_id.to_string(),
-            container_identifier: ROOT_CONTAINER_IDENTIFIER.to_string(),
+            container_identifier: container_identifier.to_string(),
         },
     ) {
         Ok(response) if response.ok => Ok(()),
@@ -1848,30 +1989,6 @@ fn register_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result
         ProjectionMode::LinuxFuse => register_linux_virtual_projection(state_root, mount),
         ProjectionMode::PlainFiles => Ok(()),
     }
-}
-
-fn install_virtual_projection_shortcut(mount: &MountConfig) -> Result<(), String> {
-    match mount.projection {
-        ProjectionMode::MacosFileProvider => install_macos_file_provider_shortcut(mount),
-        ProjectionMode::LinuxFuse | ProjectionMode::PlainFiles => Ok(()),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn install_macos_file_provider_shortcut(mount: &MountConfig) -> Result<(), String> {
-    ensure_macos_file_provider_shortcut(mount)
-        .map(|_| ())
-        .map_err(|error| {
-            format!(
-                "Could not create macOS File Provider shortcut: {}",
-                error.message()
-            )
-        })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn install_macos_file_provider_shortcut(_mount: &MountConfig) -> Result<(), String> {
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1958,10 +2075,6 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
                 eprintln!("afs desktop could not re-register macOS File Provider domain: {error}");
             } else if open_macos_file_provider_domain(&mount.mount_id.0).is_ok() {
                 return Ok(());
-            }
-
-            if let Err(error) = install_virtual_projection_shortcut(mount) {
-                eprintln!("afs desktop could not refresh File Provider shortcut: {error}");
             }
 
             open_in_file_manager(&mount.root).map_err(|fallback_error| {
@@ -2089,13 +2202,9 @@ fn refresh_notion_mount_after_connect(
     reload_daemon_mounts(state_root)?;
 
     if mount.projection.uses_virtual_filesystem() {
-        prefetch_virtual_projection_root(state_root, &mount.mount_id.0)?;
+        prefetch_virtual_projection_root(state_root, &mount)?;
         wait_for_mount_entities(state_root, &mount.mount_id)?;
         register_virtual_projection(state_root, &mount)?;
-        let _ = mount_access_root(&mount);
-        if let Err(error) = install_virtual_projection_shortcut(&mount) {
-            eprintln!("afs desktop could not refresh virtual projection shortcut: {error}");
-        }
     }
 
     if connection_changed {
@@ -2389,6 +2498,30 @@ mod tests {
         validate_mount_root(&root, &temp.path().join(".afs")).expect("valid child path");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_desktop_mount_resolves_bare_name_under_cloudstorage() {
+        let root = super::resolve_desktop_mount_root("Notion").expect("resolve mount root");
+
+        assert_eq!(root, super::macos_afs_cloud_storage_root().join("notion"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_desktop_mount_rejects_paths_outside_cloudstorage() {
+        let temp = TestTempDir::new("desktop-mount-outside-cloudstorage");
+        let root = temp.path().join("Notion");
+
+        let error = super::validate_desktop_mount_root(
+            &root,
+            &temp.path().join(".afs"),
+            &afs_store::ProjectionMode::MacosFileProvider,
+        )
+        .expect_err("non-CloudStorage path rejected");
+
+        assert!(error.contains("inside the AFS CloudStorage root"));
+    }
+
     #[test]
     fn tray_popover_hides_only_when_tray_window_loses_focus() {
         assert!(should_hide_tray_popover(
@@ -2652,7 +2785,7 @@ fn sample_snapshot() -> DesktopSnapshot {
         mount: MountSummary {
             connector: "notion".to_string(),
             workspace_name: "CodeFlash".to_string(),
-            local_path: "~/Documents/AFS/Notion".to_string(),
+            local_path: display_path(&default_notion_mount_root()),
             projection: "macOS File Provider".to_string(),
             read_only: false,
             status: "ready".to_string(),

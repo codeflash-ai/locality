@@ -189,7 +189,10 @@ fn push_safe_plan_with_daemon_journals_applies_and_reconciles() {
     store
         .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph."))
         .expect("save shadow");
-    let source = FakePushSource::with_remote(rendered_entity("Changed paragraph."));
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("Old paragraph."),
+        rendered_entity("Changed paragraph."),
+    );
 
     let report = run_push_with_daemon(
         &mut store,
@@ -535,7 +538,8 @@ impl Drop for PushFixture {
 
 #[derive(Debug, Default)]
 struct FakePushSource {
-    remote: Option<HydratedEntity>,
+    remote_before_apply: Option<HydratedEntity>,
+    remote_after_apply: Option<HydratedEntity>,
     checks: Cell<usize>,
     applies: Cell<usize>,
     concurrency_failure: Option<AfsError>,
@@ -544,7 +548,21 @@ struct FakePushSource {
 impl FakePushSource {
     fn with_remote(remote: HydratedEntity) -> Self {
         Self {
-            remote: Some(remote),
+            remote_before_apply: Some(remote.clone()),
+            remote_after_apply: Some(remote),
+            checks: Cell::new(0),
+            applies: Cell::new(0),
+            concurrency_failure: None,
+        }
+    }
+
+    fn with_remote_transition(
+        remote_before_apply: HydratedEntity,
+        remote_after_apply: HydratedEntity,
+    ) -> Self {
+        Self {
+            remote_before_apply: Some(remote_before_apply),
+            remote_after_apply: Some(remote_after_apply),
             checks: Cell::new(0),
             applies: Cell::new(0),
             concurrency_failure: None,
@@ -563,9 +581,12 @@ impl HydrationSource for FakePushSource {
             return Err(AfsError::InvalidState("unexpected remote id".to_string()));
         }
 
-        self.remote
-            .clone()
-            .ok_or_else(|| AfsError::InvalidState("missing remote fixture".to_string()))
+        let remote = if self.applies.get() == 0 {
+            self.remote_before_apply.clone()
+        } else {
+            self.remote_after_apply.clone()
+        };
+        remote.ok_or_else(|| AfsError::InvalidState("missing remote fixture".to_string()))
     }
 }
 
@@ -579,6 +600,7 @@ impl Connector for FakePushSource {
             supports_block_updates: true,
             supports_databases: false,
             supports_oauth: false,
+            ..ConnectorCapabilities::default()
         }
     }
 

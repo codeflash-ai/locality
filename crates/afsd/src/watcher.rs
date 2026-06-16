@@ -38,7 +38,7 @@ pub trait FileWatcher {
 
 pub struct NotifyFileWatcher {
     watcher: RecommendedWatcher,
-    watched_roots: BTreeSet<PathBuf>,
+    watched_roots: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl NotifyFileWatcher {
@@ -55,32 +55,33 @@ impl NotifyFileWatcher {
 
         Ok(Self {
             watcher,
-            watched_roots: BTreeSet::new(),
+            watched_roots: BTreeMap::new(),
         })
     }
 }
 
 impl FileWatcher for NotifyFileWatcher {
     fn watch_mount(&mut self, root: PathBuf) -> AfsResult<()> {
-        if self.watched_roots.contains(&root) {
+        if self.watched_roots.contains_key(&root) {
             return Ok(());
         }
+        let watch_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
         self.watcher
-            .watch(&root, RecursiveMode::Recursive)
+            .watch(&watch_root, RecursiveMode::Recursive)
             .map_err(watcher_error)?;
-        self.watched_roots.insert(root);
+        self.watched_roots.insert(root, watch_root);
         Ok(())
     }
 
     fn unwatch_mount(&mut self, root: &Path) -> AfsResult<()> {
-        if !self.watched_roots.remove(root) {
+        let Some(watch_root) = self.watched_roots.remove(root) else {
             return Ok(());
-        }
-        self.watcher.unwatch(root).map_err(watcher_error)
+        };
+        self.watcher.unwatch(&watch_root).map_err(watcher_error)
     }
 
     fn watched_roots(&self) -> Vec<PathBuf> {
-        self.watched_roots.iter().cloned().collect()
+        self.watched_roots.keys().cloned().collect()
     }
 }
 

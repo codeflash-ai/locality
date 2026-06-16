@@ -36,8 +36,8 @@ use afsd::push::{PushJobAction, execute_push_job_with_content_root};
 use afsd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, commit_virtual_fs_write,
     materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
-    virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
-    virtual_fs_content_path, virtual_fs_content_root,
+    source_root_identifier, virtual_fs_children_refresh_needed,
+    virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_content_root,
 };
 
 #[test]
@@ -55,15 +55,24 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
         ROOT_CONTAINER_IDENTIFIER,
     )
     .expect("browse mount root");
+    assert_folder(&root_children.children, "notion");
+
+    let source_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &source_root_identifier("notion"),
+    )
+    .expect("browse notion source root");
     assert_child(
-        &root_children.children,
+        &source_children.children,
         "Teamspace Home.md",
         EntityKind::Page,
     );
-    assert_folder(&root_children.children, "Teamspace Home");
+    assert_folder(&source_children.children, "Teamspace Home");
     assert!(
         !fixture.content_path("Teamspace Home.md").exists(),
-        "browsing the root must not hydrate page bodies"
+        "browsing the source root must not hydrate page bodies"
     );
 
     let parent_container = "children:page-1";
@@ -328,6 +337,9 @@ impl Connector for FakeSource {
             supports_block_updates: true,
             supports_databases: true,
             supports_oauth: false,
+            supports_remote_observation: true,
+            supports_lazy_child_enumeration: true,
+            ..ConnectorCapabilities::default()
         }
     }
 

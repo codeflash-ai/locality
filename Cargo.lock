@@ -28,6 +28,8 @@ name = "afs-connector"
 version = "0.1.0"
 dependencies = [
  "afs-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

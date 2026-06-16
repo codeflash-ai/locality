@@ -60,6 +60,7 @@ pub enum HydrationReason {
     ExplicitPull,
     FileOpen,
     Policy,
+    RemoteFastForward,
     StubRead,
     Prefetch,
 }

@@ -6,26 +6,54 @@
 //! and apply calls.
 
 use afs_core::AfsResult;
+use afs_core::freshness::RemoteObservation;
 use afs_core::journal::PushId;
 use afs_core::model::{CanonicalDocument, MountId, RemoteId, TreeEntry};
 use afs_core::planner::{PushOperationKind, PushPlan};
 use afs_core::push::RemotePrecondition;
 use afs_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult, UndoPlan};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectorKind(pub &'static str);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorCapabilities {
     pub supports_block_updates: bool,
     pub supports_databases: bool,
     pub supports_oauth: bool,
+    pub supports_remote_observation: bool,
+    pub supports_lazy_child_enumeration: bool,
+    pub supports_media_download: bool,
+    pub supports_undo: bool,
+    pub supports_batch_observation: bool,
+}
+
+impl ConnectorCapabilities {
+    pub fn read_only() -> Self {
+        Self {
+            supports_remote_observation: true,
+            supports_lazy_child_enumeration: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn supports_local_only_stage10(&self) -> bool {
+        self.supports_remote_observation || self.supports_lazy_child_enumeration
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnumerateRequest {
     pub mount_id: MountId,
     pub cursor: Option<String>,
+}
+
+/// Cheap metadata request for one known source object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObserveRequest {
+    pub mount_id: MountId,
+    pub remote_id: RemoteId,
 }
 
 /// A source-side container whose immediate children can be listed lazily.
@@ -85,7 +113,7 @@ pub struct ApplyPlanRequest<'a> {
     pub plan: &'a PushPlan,
     /// Stable idempotency keys aligned to `plan.operations`.
     pub operation_ids: &'a [afs_core::journal::PushOperationId],
-    /// Last-synced remote timestamps for compare-and-swap checks.
+    /// Synced Tree remote versions for compare-and-swap checks.
     pub remote_preconditions: &'a [RemotePrecondition],
 }
 
@@ -117,6 +145,17 @@ pub trait Connector {
         PushOperationKind::all().into_iter().collect()
     }
     fn enumerate(&self, request: EnumerateRequest) -> AfsResult<Vec<TreeEntry>>;
+    /// Observe one entity without hydrating its body.
+    ///
+    /// Implementations should return identity, display metadata, parent/path
+    /// hints, deletion state, and an opaque remote version when available.
+    /// Hosts use this for freshness scheduling; push preflight still performs
+    /// authoritative connector-specific concurrency checks.
+    fn observe(&self, _request: ObserveRequest) -> AfsResult<RemoteObservation> {
+        Err(afs_core::AfsError::Unsupported(
+            "connector does not support remote observation",
+        ))
+    }
     /// List immediate child metadata for a single filesystem container.
     ///
     /// This must not fetch full document bodies. Returning metadata only lets
@@ -130,8 +169,8 @@ pub trait Connector {
     fn fetch(&self, request: FetchRequest) -> AfsResult<NativeEntity>;
     fn render(&self, entity: &NativeEntity) -> AfsResult<CanonicalDocument>;
     fn parse(&self, document: &CanonicalDocument) -> AfsResult<ParsedEntity>;
-    /// Re-read source metadata immediately before apply and fail if the remote
-    /// moved past the synced preimage.
+    /// Re-read source metadata immediately before apply and fail if the Remote
+    /// Tree moved past the Synced Tree preimage.
     fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> AfsResult<()>;
     /// Apply an approved push plan using source-specific API operations.
     fn apply(&self, request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult>;

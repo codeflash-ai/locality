@@ -14,11 +14,13 @@ use afs_core::shadow::ShadowDocument;
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
-    HydrationJobRecord, MountConfig, ShadowSnapshotRecord, VirtualMutationRecord,
+    FreshnessStateRecord, HydrationJobRecord, MountConfig, RemoteObservationRecord,
+    ShadowSnapshotRecord, VirtualMutationRecord,
 };
 use crate::repository::{
-    ConnectionRepository, ConnectorProfileRepository, EntityRepository, HydrationJobRepository,
-    JournalRepository, MountRepository, ShadowRepository, VirtualMutationRepository,
+    ConnectionRepository, ConnectorProfileRepository, EntityRepository, FreshnessStateRepository,
+    HydrationJobRepository, JournalRepository, MountRepository, RemoteObservationRepository,
+    ShadowRepository, VirtualMutationRepository,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -26,6 +28,8 @@ type PathKey = (MountId, PathBuf);
 type ShadowKey = (MountId, RemoteId);
 type HydrationJobKey = (MountId, RemoteId);
 type VirtualMutationKey = (MountId, String);
+type RemoteObservationKey = (MountId, RemoteId);
+type FreshnessStateKey = (MountId, RemoteId);
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
@@ -37,6 +41,8 @@ pub struct InMemoryStateStore {
     shadows: BTreeMap<ShadowKey, ShadowSnapshotRecord>,
     hydration_jobs: BTreeMap<HydrationJobKey, HydrationJobRecord>,
     virtual_mutations: BTreeMap<VirtualMutationKey, VirtualMutationRecord>,
+    remote_observations: BTreeMap<RemoteObservationKey, RemoteObservationRecord>,
+    freshness_states: BTreeMap<FreshnessStateKey, FreshnessStateRecord>,
     journals: BTreeMap<String, JournalEntry>,
 }
 
@@ -63,6 +69,14 @@ impl InMemoryStateStore {
 
     fn virtual_mutation_key(mount_id: &MountId, local_id: &str) -> VirtualMutationKey {
         (mount_id.clone(), local_id.to_string())
+    }
+
+    fn remote_observation_key(mount_id: &MountId, remote_id: &RemoteId) -> RemoteObservationKey {
+        (mount_id.clone(), remote_id.clone())
+    }
+
+    fn freshness_state_key(mount_id: &MountId, remote_id: &RemoteId) -> FreshnessStateKey {
+        (mount_id.clone(), remote_id.clone())
     }
 }
 
@@ -273,6 +287,89 @@ impl VirtualMutationRepository for InMemoryStateStore {
     fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()> {
         self.virtual_mutations
             .remove(&Self::virtual_mutation_key(mount_id, local_id));
+        Ok(())
+    }
+}
+
+impl RemoteObservationRepository for InMemoryStateStore {
+    fn save_remote_observation(&mut self, observation: RemoteObservationRecord) -> StoreResult<()> {
+        self.remote_observations.insert(
+            Self::remote_observation_key(&observation.mount_id, &observation.remote_id),
+            observation,
+        );
+        Ok(())
+    }
+
+    fn get_remote_observation(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<Option<RemoteObservationRecord>> {
+        Ok(self
+            .remote_observations
+            .get(&Self::remote_observation_key(mount_id, remote_id))
+            .cloned())
+    }
+
+    fn list_remote_observations(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<RemoteObservationRecord>> {
+        Ok(self
+            .remote_observations
+            .values()
+            .filter(|observation| observation.mount_id == *mount_id)
+            .cloned()
+            .collect())
+    }
+
+    fn delete_remote_observation(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<()> {
+        self.remote_observations
+            .remove(&Self::remote_observation_key(mount_id, remote_id));
+        Ok(())
+    }
+}
+
+impl FreshnessStateRepository for InMemoryStateStore {
+    fn save_freshness_state(&mut self, state: FreshnessStateRecord) -> StoreResult<()> {
+        self.freshness_states.insert(
+            Self::freshness_state_key(&state.mount_id, &state.remote_id),
+            state,
+        );
+        Ok(())
+    }
+
+    fn get_freshness_state(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<Option<FreshnessStateRecord>> {
+        Ok(self
+            .freshness_states
+            .get(&Self::freshness_state_key(mount_id, remote_id))
+            .cloned())
+    }
+
+    fn list_freshness_states(&self, mount_id: &MountId) -> StoreResult<Vec<FreshnessStateRecord>> {
+        Ok(self
+            .freshness_states
+            .values()
+            .filter(|state| state.mount_id == *mount_id)
+            .cloned()
+            .collect())
+    }
+
+    fn delete_freshness_state(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<()> {
+        self.freshness_states
+            .remove(&Self::freshness_state_key(mount_id, remote_id));
         Ok(())
     }
 }

@@ -1,6 +1,9 @@
 name: notion-live-e2e
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 concurrency:
@@ -23,11 +26,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Verify live Notion secrets
+      - name: Check live Notion secrets
+        id: live-secrets
         run: |
-          test -n "$NOTION_TOKEN"
-          test -n "$AFS_NOTION_LIVE_PARENT_PAGE"
+          if [ -n "$NOTION_TOKEN" ] && [ -n "$AFS_NOTION_LIVE_PARENT_PAGE" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Skipping live Notion e2e because NOTION_TOKEN or AFS_NOTION_LIVE_PARENT_PAGE is not configured."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Run connector live integrity tests
+        if: steps.live-secrets.outputs.configured == 'true'
         run: cargo test -p afs-notion --test live_integrity -- --ignored --test-threads=1
       - name: Run mounted workflow live e2e
+        if: steps.live-secrets.outputs.configured == 'true'
         run: cargo test -p afs-cli --test e2e_push_workflow live_ -- --ignored --test-threads=1

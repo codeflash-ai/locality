@@ -112,7 +112,7 @@ Layout:
 │                                                              │
 │ Let your agents edit Notion as local files.                  │
 │                                                              │
-│ AFS mounts your Notion workspace in Documents. Agents edit   │
+│ AFS mounts your Notion workspace in CloudStorage. Agents edit│
 │ local files, then AFS syncs reviewed changes back to Notion. │
 │                                                              │
 │ [ Connect Notion ]                                           │
@@ -178,7 +178,7 @@ Goal: choose where the workspace appears locally.
 Default value:
 
 ```text
-~/Documents/AFS/Notion
+~/Library/CloudStorage/AFS/notion
 ```
 
 Primary action: `Continue`
@@ -194,7 +194,7 @@ Layout:
 │ Where should your Notion files appear?                       │
 │                                                              │
 │ ┌──────────────────────────────────────────────────────────┐ │
-│ │ ~/Documents/AFS/Notion                              [... ]│ │
+│ │ ~/Library/CloudStorage/AFS/notion                              [... ]│ │
 │ └──────────────────────────────────────────────────────────┘ │
 │                                                              │
 │ [ Continue ]                                                 │
@@ -231,12 +231,12 @@ Layout:
 │  ✦  Setup complete                                           │
 │                                                              │
 │ You're ready to use AFS                                      │
-│ Your Notion folder is in Documents. AFS will keep syncing the │
+│ Your Notion folder is ready. AFS will keep syncing the        │
 │ workspace quietly in the background.                         │
 │                                                              │
 │ ┌──────────────────────────────────────────────────────────┐ │
 │ │ Notion folder                         [ Copy ]           │ │
-│ │ ~/Documents/AFS/Notion                                  │ │
+│ │ ~/Library/CloudStorage/AFS/notion                                  │ │
 │ └──────────────────────────────────────────────────────────┘ │
 │                                                              │
 │ [ Open Notion Folder ]                                      │
@@ -324,7 +324,7 @@ Layout:
 │                                      │
 │ Notion                               │
 │ CodeFlash                            │
-│ ~/Documents/AFS/Notion               │
+│ ~/Library/CloudStorage/AFS/notion               │
 │                                      │
 │ [ Open Notion Folder ]               │
 │                                      │
@@ -426,7 +426,7 @@ Home
 
 Notion workspace
 CodeFlash
-~/Documents/AFS/Notion
+~/Library/CloudStorage/AFS/notion
 
 Open a Notion page
 ┌──────────────────────────────────────────────────────────────┐
@@ -472,7 +472,7 @@ Preparing this page
 AFS is making the local file available now.
 
 Roadmap 2026
-~/Documents/AFS/Notion/Engineering/Roadmap 2026 ~a3f2.md
+~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2.md
 
 [ Copy Path ]    Reveal in Finder
 ```
@@ -484,7 +484,7 @@ Roadmap 2026
 Page
 
 ┌──────────────────────────────────────────────────────────────┐
-│ ~/Documents/AFS/Notion/Engineering/Roadmap 2026 ~a3f2.md     │
+│ ~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2.md     │
 └──────────────────────────────────────────────────────────────┘
 
 [ Copy Path ]    Reveal in Finder
@@ -627,10 +627,10 @@ Layout:
 Notion
 
 CodeFlash
-~/Documents/AFS/Notion
+~/Library/CloudStorage/AFS/notion
 
 Location
-~/Documents/AFS/Notion        [ Move... ]
+~/Library/CloudStorage/AFS/notion        [ Move... ]
 
 [ Open Folder ]
 
@@ -717,7 +717,7 @@ Settings
 General
 [x] Launch AFS at login
 [x] Show AFS in the menu bar
-Default folder: ~/Documents/AFS
+Default folder: ~/Library/CloudStorage/AFS
 
 Connections
 Notion        CodeFlash        [ Manage ]

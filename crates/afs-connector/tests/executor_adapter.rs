@@ -49,6 +49,21 @@ fn connector_adapter_forwards_undo_plan() {
     );
 }
 
+#[test]
+fn connector_capabilities_are_serializable_stage10_flags() {
+    let capabilities = ConnectorCapabilities {
+        supports_remote_observation: true,
+        supports_lazy_child_enumeration: true,
+        ..ConnectorCapabilities::default()
+    };
+
+    assert!(capabilities.supports_local_only_stage10());
+    let json = serde_json::to_string(&capabilities).expect("serialize capabilities");
+
+    assert!(json.contains("supports_remote_observation"));
+    assert!(json.contains("supports_lazy_child_enumeration"));
+}
+
 #[derive(Debug, Default)]
 struct FakeConnector {
     undo_push_ids: RefCell<Vec<PushId>>,
@@ -65,6 +80,8 @@ impl Connector for FakeConnector {
             supports_block_updates: true,
             supports_databases: false,
             supports_oauth: false,
+            supports_undo: true,
+            ..ConnectorCapabilities::default()
         }
     }
 

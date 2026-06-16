@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use afs_core::freshness::{FreshnessTier, RemoteVersion};
 use afs_core::hydration::HydrationReason;
 use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, PushId, PushOperationId,
@@ -14,12 +15,15 @@ use afs_core::undo::{UndoOperation, UndoPlanStatus, plan_journal_undo};
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, EntityRecord, EntityRepository,
-    HydrationJobRecord, HydrationJobRepository, JournalRepository, MountConfig, MountRepository,
-    ProjectionMode, ShadowRepository, SqliteStateStore, StoreError, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository,
+    FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
+    JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
+    RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
+    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
+
+const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
 
 #[test]
 fn sqlite_store_initializes_idempotently() {
@@ -37,7 +41,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 10);
+    assert_eq!(user_version, 11);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -57,7 +61,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 10,
+            supported: 11,
         }
     );
 }
@@ -73,12 +77,20 @@ fn persisted_json_uses_stable_snake_case_names() {
         "\"file_open\""
     );
     assert_eq!(
+        serde_json::to_string(&HydrationReason::RemoteFastForward).expect("hydration reason json"),
+        "\"remote_fast_forward\""
+    );
+    assert_eq!(
         serde_json::to_string(&ProjectionMode::MacosFileProvider).expect("projection json"),
         "\"macos_file_provider\""
     );
     assert_eq!(
         serde_json::to_string(&ProjectionMode::LinuxFuse).expect("projection json"),
         "\"linux_fuse\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FreshnessTier::Hot).expect("freshness tier json"),
+        "\"hot\""
     );
     assert_eq!(
         serde_json::to_string(&MarkdownBlockKind::Paragraph).expect("block kind json"),
@@ -168,6 +180,84 @@ fn virtual_mutations_round_trip_and_delete_after_reopen() {
     assert!(
         reopened
             .list_virtual_mutations(&fixture.mount_id)
+            .expect("list after delete")
+            .is_empty()
+    );
+}
+
+#[test]
+fn remote_observations_round_trip_and_delete_after_reopen() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    let observation = remote_observation_record();
+
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .save_remote_observation(observation.clone())
+        .expect("save observation");
+    drop(store);
+
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_remote_observation(&fixture.mount_id, &RemoteId::new("page-1"))
+            .expect("get observation"),
+        Some(observation.clone())
+    );
+    assert_eq!(
+        reopened
+            .list_remote_observations(&fixture.mount_id)
+            .expect("list observations"),
+        vec![observation]
+    );
+
+    reopened
+        .delete_remote_observation(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("delete observation");
+    assert!(
+        reopened
+            .list_remote_observations(&fixture.mount_id)
+            .expect("list after delete")
+            .is_empty()
+    );
+}
+
+#[test]
+fn freshness_state_round_trips_and_delete_after_reopen() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    let state = freshness_state_record();
+
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .save_freshness_state(state.clone())
+        .expect("save freshness");
+    drop(store);
+
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_freshness_state(&fixture.mount_id, &RemoteId::new("page-1"))
+            .expect("get freshness"),
+        Some(state.clone())
+    );
+    assert_eq!(
+        reopened
+            .list_freshness_states(&fixture.mount_id)
+            .expect("list freshness"),
+        vec![state]
+    );
+
+    reopened
+        .delete_freshness_state(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("delete freshness");
+    assert!(
+        reopened
+            .list_freshness_states(&fixture.mount_id)
             .expect("list after delete")
             .is_empty()
     );
@@ -320,7 +410,7 @@ fn sqlite_store_migrates_v5_projection_and_connections_schema() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 10);
+    assert_eq!(user_version, 11);
     assert_eq!(connection_column_count, 1);
     assert_eq!(projection_column_count, 1);
     assert_eq!(connection_table_count, 1);
@@ -395,7 +485,7 @@ fn sqlite_store_migrates_v6_projection_schema_to_connections() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 10);
+    assert_eq!(user_version, 11);
     assert_eq!(connection_column_count, 1);
     assert_eq!(connection_table_count, 1);
     assert_eq!(
@@ -480,7 +570,7 @@ fn sqlite_store_migrates_v7_hydration_jobs_schema() {
         )
         .expect("hydration_jobs table");
 
-    assert_eq!(user_version, 10);
+    assert_eq!(user_version, 11);
     assert_eq!(hydration_jobs_table_count, 1);
     assert!(
         store
@@ -567,7 +657,7 @@ fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
         )
         .expect("profile_id column");
 
-    assert_eq!(user_version, 10);
+    assert_eq!(user_version, 11);
     assert_eq!(profile_column_count, 1);
     let migrated_connection = store
         .get_connection(&ConnectionId::new("notion-work"))
@@ -921,7 +1011,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 10);
+    assert_eq!(user_version, 11);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -992,7 +1082,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 10);
+    assert_eq!(user_version, 11);
     assert!(entry.apply_effects.is_empty());
 }
 
@@ -1086,6 +1176,33 @@ fn virtual_mutation_record() -> VirtualMutationRecord {
     }
 }
 
+fn remote_observation_record() -> RemoteObservationRecord {
+    RemoteObservationRecord::new(
+        MountId::new("notion-main"),
+        RemoteId::new("page-1"),
+        EntityKind::Page,
+        "Roadmap",
+        "Roadmap.md",
+        "2026-06-15T00:00:00Z",
+    )
+    .with_parent(RemoteId::new("root-page"))
+    .with_remote_version(RemoteVersion::new("remote-v1"))
+    .with_raw_metadata_json("{\"source\":\"test\"}")
+}
+
+fn freshness_state_record() -> FreshnessStateRecord {
+    FreshnessStateRecord::new(
+        MountId::new("notion-main"),
+        RemoteId::new("page-1"),
+        FreshnessTier::Hot,
+    )
+    .checked_at("2026-06-15T00:00:00Z")
+    .next_check_at("2026-06-15T00:01:00Z")
+    .opened_at("2026-06-15T00:00:05Z")
+    .local_change_at("2026-06-15T00:00:10Z")
+    .remote_hint_pending(true)
+}
+
 fn connection_record(connection_id: &str) -> ConnectionRecord {
     ConnectionRecord {
         connection_id: ConnectionId::new(connection_id),
@@ -1113,7 +1230,7 @@ fn default_profile() -> ConnectorProfileRecord {
         display_name: "Notion token auth".to_string(),
         auth_kind: "token".to_string(),
         scopes: vec![],
-        capabilities_json: "{}".to_string(),
+        capabilities_json: DEFAULT_NOTION_CAPABILITIES_JSON.to_string(),
         enabled_actions_json: "[\"read\",\"write\"]".to_string(),
         connector_version: "notion.v1".to_string(),
         status: "active".to_string(),

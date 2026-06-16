@@ -40,7 +40,7 @@
 - Remote deletion deletes the local projection only when the local file is clean.
 - Directive lines may move unchanged or be removed as a delete signal, but edits and invented directive anchors fail validation.
 - Push guardrails require confirmation when archives exceed the threshold or the plan touches more than the configured mount percentage.
-- `TreeEntry.stub_frontmatter` is transient enumeration data. It lets connectors write complete stubs with source metadata, such as Notion database row properties, while the durable entity store keeps only identity, path, hydration, hashes, and remote timestamps.
+- `TreeEntry.stub_frontmatter` is transient enumeration data. It lets connectors write complete stubs with source metadata, such as Notion database row properties, while the durable entity store keeps only identity, path, hydration, hashes, and Synced Tree remote versions.
 
 ## Canonical Document Layer
 

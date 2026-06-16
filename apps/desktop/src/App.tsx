@@ -111,7 +111,7 @@ const sampleSnapshot: DesktopSnapshot = {
   mount: {
     connector: "notion",
     workspaceName: "CodeFlash",
-    localPath: "~/Documents/AFS/Notion",
+    localPath: "~/Library/CloudStorage/AFS/notion",
     projection: "macOS File Provider",
     readOnly: false,
     status: "ready",
@@ -187,13 +187,13 @@ const sampleSearchResults: LocatedItem[] = [
   {
     title: "Roadmap 2026",
     kind: "Page",
-    localPath: "~/Documents/AFS/Notion/Engineering/Roadmap 2026 ~a3f2.md",
+    localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2.md",
     state: "ready",
   },
   {
     title: "Launch Plan",
     kind: "Page",
-    localPath: "~/Documents/AFS/Notion/Marketing/Launch Plan ~8841.md",
+    localPath: "~/Library/CloudStorage/AFS/notion/Marketing/Launch Plan ~8841.md",
     state: "online_only",
   },
 ];
@@ -531,7 +531,7 @@ function Onboarding({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Documents/AFS/Notion/Engineering/Roadmap 2026 ~a3f2.md",
+          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2.md",
           state: "ready",
         },
       );
@@ -553,7 +553,7 @@ function Onboarding({
             <div>
               <h1>Let your agents edit Notion as local files.</h1>
               <p>
-                Mount your Notion workspace in Documents. Agents edit local
+                Mount your Notion workspace in CloudStorage. Agents edit local
                 files, then AFS syncs reviewed changes back to Notion.
               </p>
             </div>
@@ -608,8 +608,8 @@ function Onboarding({
             <div>
               <h1>Where should your Notion files appear?</h1>
               <p>
-                Choose a name for this workspace. macOS shows the live Notion folder in
-                CloudStorage and AFS keeps a shortcut here.
+                AFS keeps every source under one CloudStorage root. Notion will appear as the
+                live folder Finder and agents open.
               </p>
             </div>
             <div className="path-field">
@@ -872,7 +872,7 @@ function HomeView({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Documents/AFS/Notion/Engineering/Roadmap 2026 ~a3f2.md",
+          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2.md",
           state: "ready",
         },
       );
@@ -908,7 +908,7 @@ function HomeView({
           <BrandTile variant="folder" />
           <div>
             <h2>Create your Notion folder</h2>
-            <p>Use the default visible location under Documents, or choose a different folder.</p>
+            <p>Use the default source folder under the shared AFS CloudStorage root.</p>
           </div>
           <PrimaryButton
             icon={<FolderOpen />}
@@ -1404,7 +1404,7 @@ function SettingsView({
             busy={busySetting === "show_menu_bar"}
             onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
           />
-          <SettingRow title="Default folder" value="~/Documents/AFS" />
+          <SettingRow title="Default folder" value="~/Library/CloudStorage/AFS" />
           {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
         </div>
 
@@ -1473,7 +1473,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Documents/AFS/Notion/Engineering/Roadmap 2026 ~a3f2.md",
+          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2.md",
           state: "ready",
         },
       );
@@ -2023,6 +2023,9 @@ function healthLabel(state: string) {
   }
   if (state === "stopped") {
     return "Stopped";
+  }
+  if (state === "checking_freshness") {
+    return "Checking";
   }
   return "Ready";
 }

@@ -5,16 +5,21 @@
 //! decision by enumerating, refreshing local projections, and queueing hydration.
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_connector::{Connector, EnumerateRequest};
 use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
+use afs_core::freshness::{FreshnessTier, RemoteVersion};
 use afs_core::hydration::{
     HydrationPolicy, HydrationReason, HydrationRequest, should_eager_hydrate,
 };
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::NotionConnector;
-use afs_store::{EntityRecord, EntityRepository, MountConfig};
+use afs_store::{
+    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository, MountConfig,
+    RemoteObservationRecord, RemoteObservationRepository,
+};
 
 use crate::hydration::HydrationEngine;
 use crate::scheduler::PullSchedulerTick;
@@ -97,7 +102,7 @@ impl FetchScheduleStrategy for DefaultFetchScheduleStrategy {
             .existing
             .is_some_and(|existing| should_refresh_hydrated_entity(existing, request.entry))
         {
-            return policy_hydration();
+            return remote_fast_forward_hydration();
         }
 
         EntityFetchPlan::default()
@@ -124,7 +129,7 @@ pub fn reconcile_scheduled_pull<S, H, Source, Strategy>(
     policy: &HydrationPolicy,
 ) -> AfsResult<ScheduledPullReport>
 where
-    S: EntityRepository,
+    S: EntityRepository + RemoteObservationRepository + FreshnessStateRepository,
     H: HydrationEngine,
     Source: ScheduledPullSource + ?Sized,
     Strategy: FetchScheduleStrategy + ?Sized,
@@ -146,7 +151,7 @@ pub fn reconcile_scheduled_pull_with_state_root<S, H, Source, Strategy>(
     state_root: Option<&Path>,
 ) -> AfsResult<ScheduledPullReport>
 where
-    S: EntityRepository,
+    S: EntityRepository + RemoteObservationRepository + FreshnessStateRepository,
     H: HydrationEngine,
     Source: ScheduledPullSource + ?Sized,
     Strategy: FetchScheduleStrategy + ?Sized,
@@ -176,6 +181,8 @@ where
 
         for entry in &entries {
             let existing = store.get_entity(&entry.mount_id, &entry.remote_id)?;
+            let observed_at = observation_timestamp();
+            record_remote_observation(store, entry, existing.as_ref(), &observed_at)?;
             let entity_plan = strategy.entity_plan(EntityFetchSchedule {
                 mount,
                 entry,
@@ -209,6 +216,70 @@ where
     }
 
     Ok(report)
+}
+
+fn record_remote_observation<S>(
+    store: &mut S,
+    entry: &TreeEntry,
+    existing: Option<&EntityRecord>,
+    observed_at: &str,
+) -> AfsResult<()>
+where
+    S: RemoteObservationRepository + FreshnessStateRepository,
+{
+    let mut observation = RemoteObservationRecord::new(
+        entry.mount_id.clone(),
+        entry.remote_id.clone(),
+        entry.kind.clone(),
+        entry.title.clone(),
+        entry.path.clone(),
+        observed_at,
+    );
+    if let Some(remote_version) = entry.remote_edited_at.clone() {
+        observation = observation.with_remote_version(RemoteVersion::new(remote_version));
+    }
+    store.save_remote_observation(observation)?;
+
+    let mut freshness = store
+        .get_freshness_state(&entry.mount_id, &entry.remote_id)?
+        .unwrap_or_else(|| {
+            FreshnessStateRecord::new(
+                entry.mount_id.clone(),
+                entry.remote_id.clone(),
+                initial_freshness_tier(existing),
+            )
+        });
+    freshness.last_checked_at = Some(observed_at.to_string());
+    freshness.remote_hint_pending =
+        freshness.remote_hint_pending || remote_version_changed(existing, entry);
+    store.save_freshness_state(freshness)?;
+
+    Ok(())
+}
+
+fn initial_freshness_tier(existing: Option<&EntityRecord>) -> FreshnessTier {
+    match existing.map(|entity| &entity.hydration) {
+        Some(HydrationState::Dirty | HydrationState::Conflicted) => FreshnessTier::Hot,
+        Some(HydrationState::Hydrated) => FreshnessTier::Warm,
+        Some(HydrationState::Virtual | HydrationState::Stub) | None => FreshnessTier::Cold,
+    }
+}
+
+fn remote_version_changed(existing: Option<&EntityRecord>, entry: &TreeEntry) -> bool {
+    match (
+        existing.and_then(|record| record.remote_edited_at.as_ref()),
+        entry.remote_edited_at.as_ref(),
+    ) {
+        (Some(base), Some(observed)) => base != observed,
+        _ => false,
+    }
+}
+
+fn observation_timestamp() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!("unix_ms:{}", duration.as_millis()),
+        Err(_) => "unix_ms:0".to_string(),
+    }
 }
 
 impl ScheduledPullSource for NotionConnector {
@@ -347,6 +418,12 @@ fn rename_projection_if_needed(
 fn policy_hydration() -> EntityFetchPlan {
     EntityFetchPlan {
         queue_hydration: Some(HydrationReason::Policy),
+    }
+}
+
+fn remote_fast_forward_hydration() -> EntityFetchPlan {
+    EntityFetchPlan {
+        queue_hydration: Some(HydrationReason::RemoteFastForward),
     }
 }
 

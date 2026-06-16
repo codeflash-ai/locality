@@ -72,20 +72,21 @@ The app should explain the security model in plain terms:
 Default mount base:
 
 ```text
-~/Documents
+~/Library/CloudStorage/AFS
 ```
 
 Suggested concrete folder:
 
 ```text
-~/Documents/AFS/Notion
+~/Library/CloudStorage/AFS/notion
 ```
 
-The mount should live under `~/Documents` because it is visible and familiar to
-normal users. The app can still keep the folder organized under an `AFS`
-subdirectory to avoid cluttering `Documents` directly. The user can change this,
-but the default should be good enough for most users. This step should be framed
-as "Where should your Notion files appear?" rather than "configure mount root."
+On macOS, the real AFS root should live at `~/Library/CloudStorage/AFS` because
+that is the user-visible location controlled by File Provider. Each connector
+gets a stable child folder such as `notion`, `linear`, or `gmail`. AFS should not
+create a Documents alias or symlink; the app should show the CloudStorage folder
+directly. This step should be framed as "Where should your Notion files appear?"
+rather than "configure mount root."
 
 ### 4. Create Workspace Mount
 

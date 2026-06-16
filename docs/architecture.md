@@ -2,6 +2,9 @@
 
 AgentFS v1 is a local-first Rust system with seven implementation surfaces:
 
+For a clickable subsystem diagram grounded in code entry points, see
+[`architecture-diagram.html`](architecture-diagram.html).
+
 1. `afs` CLI: stable command and exit-code surface for humans and agents.
 2. `afsd` daemon: one per user, supervising many mounts.
 3. Sync core: connector-agnostic correctness layer.

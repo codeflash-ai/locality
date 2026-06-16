@@ -13,6 +13,8 @@ pub mod canonical;
 pub mod conflict;
 pub mod diff;
 pub mod error;
+pub mod explain;
+pub mod freshness;
 pub mod hydration;
 pub mod journal;
 pub mod model;

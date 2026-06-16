@@ -35,7 +35,7 @@
 - SQLite migrates v1 journal rows to v2 by adding empty preimage snapshots.
 - SQLite migrates v2 journal rows to v3 by adding empty apply-effect lists.
 - SQLite migrates v3 mount rows to v4 by adding optional remote root IDs.
-- SQLite migrates v8 connection rows to v9 by adding `profile_id` and seeding the built-in `notion-token-default` profile.
+- SQLite migrates v8 connection rows to v9 by adding `profile_id` and seeding the built-in `notion-token-default` profile with connector capability flags.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
 
 ## SQLite Schema

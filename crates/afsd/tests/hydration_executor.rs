@@ -13,8 +13,8 @@ use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, Re
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ShadowRepository,
+    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+    InMemoryStateStore, MountConfig, MountRepository, ShadowRepository,
 };
 use afsd::hydration::{
     HydratedAsset, HydratedEntity, HydrationExecutor, HydrationOutcome, HydrationQueue,
@@ -61,6 +61,16 @@ fn executor_replaces_clean_hydrated_file() {
     store
         .save_shadow(&fixture.mount_id, old.shadow.clone())
         .expect("save old shadow");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                afs_core::freshness::FreshnessTier::Hot,
+            )
+            .remote_hint_pending(true),
+        )
+        .expect("save freshness");
     fixture.write_markdown(&old.document);
     let new = rendered_entity("New body.");
     let source = FakeHydrationSource::with_entity("page-1", new.clone());
@@ -79,6 +89,13 @@ fn executor_replaces_clean_hydrated_file() {
             .expect("load shadow")
             .body_hash,
         new.shadow.body_hash
+    );
+    assert!(
+        !store
+            .get_freshness_state(&fixture.mount_id, &fixture.remote_id)
+            .expect("get freshness")
+            .expect("freshness")
+            .remote_hint_pending
     );
 }
 
@@ -178,6 +195,36 @@ fn executor_skips_dirty_file_and_marks_entity_dirty_when_remote_matches_shadow()
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Dirty);
     assert!(!fixture.page_path().with_extension("remote.md").exists());
+}
+
+#[test]
+fn executor_remote_fast_forward_skips_dirty_file_without_materializing_conflict() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Hydrated);
+    let old = rendered_entity("Old body.");
+    store
+        .save_shadow(&fixture.mount_id, old.shadow.clone())
+        .expect("save old shadow");
+    fixture.write_raw("---\nafs:\n  id: page-1\n  type: page\ntitle: Roadmap\n---\nLocal edit.\n");
+    let source = FakeHydrationSource::with_entity("page-1", rendered_entity("Remote body."));
+    let mut request = fixture.request();
+    request.reason = HydrationReason::RemoteFastForward;
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(request)
+        .expect("skip dirty auto fast-forward");
+
+    assert_eq!(outcome, HydrationOutcome::SkippedDirty);
+    let contents = fs::read_to_string(fixture.page_path()).expect("dirty file");
+    assert!(contents.contains("Local edit."));
+    assert!(!contents.contains("Remote body."));
+    assert!(!contents.contains(CONFLICT_LOCAL_MARKER));
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Dirty);
 }
 
 #[test]

@@ -9,7 +9,8 @@ use afs_core::model::MountId;
 #[cfg(target_os = "macos")]
 use afs_store::ProjectionMode;
 use afs_store::{
-    EntityRepository, MountConfig, MountRepository, ShadowRepository, VirtualMutationRepository,
+    EntityRepository, FreshnessStateRepository, MountConfig, MountRepository, ShadowRepository,
+    VirtualMutationRepository,
 };
 use std::path::{Path, PathBuf};
 
@@ -53,7 +54,11 @@ pub fn materialize_file_provider_item<S, Source>(
     identifier: &str,
 ) -> AfsResult<FileProviderMaterializeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + VirtualMutationRepository
+        + FreshnessStateRepository,
     Source: HydrationSource + ?Sized,
 {
     virtual_fs::materialize_virtual_fs_item(store, source, mount_id, identifier)
@@ -66,7 +71,10 @@ pub struct MountPathMatch {
 }
 
 pub fn mount_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
     let mut roots = vec![mount.root.clone()];
+    #[cfg(not(target_os = "macos"))]
+    let roots = vec![mount.root.clone()];
 
     #[cfg(target_os = "macos")]
     if mount.projection == ProjectionMode::MacosFileProvider {
@@ -144,20 +152,56 @@ fn macos_file_provider_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
     let display_name = macos_file_provider_display_name(mount);
     let cloud_storage = home.join("Library").join("CloudStorage");
     vec![
-        cloud_storage.join(format!("AFS-{display_name}")),
+        cloud_storage.join(macos_file_provider_directory_name(&display_name)),
         cloud_storage.join(format!("AgentFS-{display_name}")),
     ]
 }
 
 #[cfg(target_os = "macos")]
+fn macos_file_provider_directory_name(display_name: &str) -> String {
+    if display_name == "AFS" || display_name.starts_with("AFS-") {
+        display_name.to_string()
+    } else {
+        format!("AFS-{display_name}")
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn macos_file_provider_display_name(mount: &MountConfig) -> String {
-    mount
-        .root
+    macos_file_provider_domain_path(&mount.root)
         .file_name()
         .and_then(|name| name.to_str())
+        .map(strip_file_provider_directory_prefix)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| mount.mount_id.0.clone())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_domain_path(root: &Path) -> &Path {
+    let Some(parent) = root.parent() else {
+        return root;
+    };
+    let Some(grandparent_name) = parent
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return root;
+    };
+    if grandparent_name == "CloudStorage" {
+        parent
+    } else {
+        root
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn strip_file_provider_directory_prefix(name: &str) -> &str {
+    name.strip_prefix("AgentFS-")
+        .or_else(|| name.strip_prefix("AFS-"))
+        .filter(|stripped| !stripped.is_empty())
+        .unwrap_or(name)
 }
 
 #[cfg(test)]
@@ -190,25 +234,28 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_file_provider_access_roots_include_current_and_legacy_domain_names() {
+    fn macos_file_provider_access_roots_strip_cloudstorage_domain_prefix() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            "/Users/test/Documents/AFS/Notion",
+            "/Users/test/Library/CloudStorage/AFS/notion",
         )
         .projection(ProjectionMode::MacosFileProvider);
+        assert_eq!(macos_file_provider_display_name(&mount), "AFS");
         let roots = mount_access_roots(&mount);
+        let home = std::env::var_os("HOME").map(PathBuf::from).expect("home");
 
-        assert!(roots.contains(&PathBuf::from("/Users/test/Documents/AFS/Notion")));
+        assert!(roots.contains(&PathBuf::from(
+            "/Users/test/Library/CloudStorage/AFS/notion"
+        )));
+        assert!(roots.contains(&home.join("Library").join("CloudStorage").join("AFS")));
         assert!(
-            roots
-                .iter()
-                .any(|path| path.ends_with("Library/CloudStorage/AFS-Notion"))
-        );
-        assert!(
-            roots
-                .iter()
-                .any(|path| path.ends_with("Library/CloudStorage/AgentFS-Notion"))
+            roots.contains(
+                &home
+                    .join("Library")
+                    .join("CloudStorage")
+                    .join("AgentFS-AFS")
+            )
         );
     }
 }

@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use afs_core::freshness::FreshnessTier;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ProjectionMode, ShadowRepository,
+    EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
+    MountRepository, ProjectionMode, ShadowRepository,
 };
 use afsd::execution::{DaemonExecutor, HydrationDrainJob, HydrationRequestJob};
 use afsd::hydration::{HydratedEntity, HydrationQueue, HydrationSource};
@@ -122,6 +123,13 @@ fn read_event_on_stub_queues_hydration() {
     assert_eq!(request.path, PathBuf::from("/tmp/afs/notion/Roadmap.md"));
     assert_eq!(request.reason, HydrationReason::StubRead);
     assert_eq!(request.target_state, HydrationState::Hydrated);
+    let freshness = supervisor
+        .store()
+        .get_freshness_state(&MountId::new("notion-main"), &RemoteId::new("page-1"))
+        .expect("get freshness")
+        .expect("freshness");
+    assert_eq!(freshness.tier, FreshnessTier::Hot);
+    assert!(freshness.last_opened_at.is_some());
 }
 
 #[test]
@@ -135,6 +143,13 @@ fn read_event_on_hydrated_file_is_ignored() {
 
     assert_eq!(report.ignored_events, 1);
     assert!(supervisor.hydration().is_empty());
+    let freshness = supervisor
+        .store()
+        .get_freshness_state(&MountId::new("notion-main"), &RemoteId::new("page-1"))
+        .expect("get freshness")
+        .expect("freshness");
+    assert_eq!(freshness.tier, FreshnessTier::Hot);
+    assert!(freshness.last_opened_at.is_some());
 }
 
 #[test]
@@ -156,6 +171,13 @@ fn write_event_on_hydrated_file_marks_entity_dirty() {
         .expect("get entity")
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Dirty);
+    let freshness = supervisor
+        .store()
+        .get_freshness_state(&MountId::new("notion-main"), &RemoteId::new("page-1"))
+        .expect("get freshness")
+        .expect("freshness");
+    assert_eq!(freshness.tier, FreshnessTier::Hot);
+    assert!(freshness.last_local_change_at.is_some());
 }
 
 #[test]

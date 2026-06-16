@@ -151,19 +151,23 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
       progress.completedUnitCount = 2
       return progress
     }
-    guard let newContents else {
-      completionHandler(
-        nil,
-        changedFields,
-        false,
-        unsupportedWriteError("Only file content edits are supported right now.")
-      )
-      progress.completedUnitCount = 2
-      return progress
-    }
-
     DispatchQueue.global(qos: .userInitiated).async {
       do {
+        guard let newContents else {
+          let refreshed = try client.item(
+            mountId: mountId,
+            identifier: daemonIdentifier
+          )
+          completion.value(
+            AgentFSFileProviderItem(metadata: refreshed.item),
+            [],
+            false,
+            nil
+          )
+          progressHandle.value.completedUnitCount = 2
+          return
+        }
+
         let data = try Data(contentsOf: newContents)
         _ = try client.write(
           mountId: mountId,

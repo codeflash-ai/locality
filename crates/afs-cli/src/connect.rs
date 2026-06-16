@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use afs_connector::ConnectorCapabilities;
 use afs_notion::NotionConfig;
 use afs_notion::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use afs_notion::oauth::{
@@ -221,7 +222,7 @@ where
         auth_kind: "token".to_string(),
         secret_ref,
         scopes: vec![],
-        capabilities_json: "{}".to_string(),
+        capabilities_json: notion_capabilities_json()?,
         status: "active".to_string(),
         created_at: now.clone(),
         updated_at: now,
@@ -303,7 +304,7 @@ where
         auth_kind: "oauth".to_string(),
         secret_ref,
         scopes: vec![],
-        capabilities_json: "{}".to_string(),
+        capabilities_json: notion_capabilities_json()?,
         status: "active".to_string(),
         created_at: now.clone(),
         updated_at: now,
@@ -385,7 +386,7 @@ where
         auth_kind: "oauth".to_string(),
         secret_ref,
         scopes: vec![],
-        capabilities_json: "{}".to_string(),
+        capabilities_json: notion_capabilities_json()?,
         status: "active".to_string(),
         created_at: now.clone(),
         updated_at: now,
@@ -592,7 +593,7 @@ fn default_notion_token_profile(now: String) -> ConnectorProfileRecord {
         display_name: "Notion token auth".to_string(),
         auth_kind: "token".to_string(),
         scopes: vec![],
-        capabilities_json: "{}".to_string(),
+        capabilities_json: notion_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
         enabled_actions_json: "[\"read\",\"write\"]".to_string(),
         connector_version: "notion.v1".to_string(),
         status: "active".to_string(),
@@ -608,13 +609,28 @@ fn default_notion_oauth_profile(now: String) -> ConnectorProfileRecord {
         display_name: "Notion OAuth".to_string(),
         auth_kind: "oauth".to_string(),
         scopes: vec![],
-        capabilities_json: "{}".to_string(),
+        capabilities_json: notion_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
         enabled_actions_json: "[\"read\",\"write\"]".to_string(),
         connector_version: "notion.v1".to_string(),
         status: "active".to_string(),
         created_at: now.clone(),
         updated_at: now,
     }
+}
+
+fn notion_capabilities_json() -> Result<String, ConnectError> {
+    let capabilities = ConnectorCapabilities {
+        supports_block_updates: true,
+        supports_databases: true,
+        supports_oauth: true,
+        supports_remote_observation: true,
+        supports_lazy_child_enumeration: true,
+        supports_media_download: true,
+        supports_undo: true,
+        supports_batch_observation: false,
+    };
+    serde_json::to_string(&capabilities)
+        .map_err(|error| ConnectError::CredentialEncode(error.to_string()))
 }
 
 fn default_connection_id<S>(store: &S) -> Result<ConnectionId, ConnectError>

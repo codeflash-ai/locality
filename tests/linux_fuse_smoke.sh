@@ -37,7 +37,8 @@ fuse_bin="${AFS_FUSE_BIN:-./target/debug/afs-fuse}"
 mount_id="${AFS_FUSE_SMOKE_MOUNT_ID:-notion-fuse-smoke}"
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/afs-fuse-smoke.XXXXXX")"
 state_root="${AFS_FUSE_SMOKE_STATE:-$tmp_root/state}"
-mount_root="${AFS_FUSE_SMOKE_MOUNT:-$tmp_root/mount}"
+afs_root="${AFS_FUSE_SMOKE_ROOT:-$tmp_root/afs}"
+mount_root="${AFS_FUSE_SMOKE_MOUNT:-$afs_root/notion}"
 daemon_log="$tmp_root/afsd.log"
 fuse_log="$tmp_root/afs-fuse.log"
 afsd_pid=""
@@ -54,8 +55,8 @@ on_error() {
 
 cleanup() {
   set +e
-  if mountpoint -q "$mount_root"; then
-    fusermount3 -uz "$mount_root" >/dev/null 2>&1
+  if mountpoint -q "$afs_root"; then
+    fusermount3 -uz "$afs_root" >/dev/null 2>&1
   fi
   if [[ -n "$fuse_pid" ]] && kill -0 "$fuse_pid" >/dev/null 2>&1; then
     kill "$fuse_pid" >/dev/null 2>&1
@@ -79,7 +80,7 @@ if [[ ! -x "$afs_bin" || ! -x "$afsd_bin" || ! -x "$fuse_bin" ]]; then
 fi
 
 seed_fixture() {
-  mkdir -p "$state_root" "$mount_root"
+  mkdir -p "$state_root" "$afs_root" "$mount_root"
   AFS_STATE_DIR="$state_root" NOTION_TOKEN="ci-fuse-smoke-token" \
     "$afs_bin" mount notion "$mount_root" \
       --workspace \
@@ -147,7 +148,7 @@ wait_for_daemon() {
 
 wait_for_mount() {
   for _ in {1..80}; do
-    if mountpoint -q "$mount_root"; then
+    if mountpoint -q "$afs_root"; then
       return 0
     fi
     if [[ -n "$fuse_pid" ]] && ! kill -0 "$fuse_pid" >/dev/null 2>&1; then
@@ -184,12 +185,12 @@ wait_for_daemon
 AFS_STATE_DIR="$state_root" "$fuse_bin" \
   --mount-id "$mount_id" \
   --state-dir "$state_root" \
-  --mountpoint "$mount_root" >"$fuse_log" 2>&1 &
+  --mountpoint "$afs_root" >"$fuse_log" 2>&1 &
 fuse_pid="$!"
 wait_for_mount
 
-findmnt -R "$mount_root" >/dev/null
-ls -la "$mount_root" >/dev/null
+findmnt -R "$afs_root" >/dev/null
+ls -la "$afs_root" >/dev/null
 
 home_file="$mount_root/Teamspace Home.md"
 child_dir="$mount_root/Teamspace Home"

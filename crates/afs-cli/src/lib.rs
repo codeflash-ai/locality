@@ -6,6 +6,7 @@ pub mod diff;
 pub mod file_provider;
 pub mod history;
 pub mod info;
+pub mod inspect;
 pub mod local_oauth;
 pub mod mount;
 pub mod pull;

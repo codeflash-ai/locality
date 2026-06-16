@@ -310,8 +310,8 @@ pub struct PushExecutionRequest {
     pub pipeline: PushPipelineResult,
     /// Pre-push canonical snapshots used by future resume and undo flows.
     pub preimages: Vec<JournalPreimage>,
-    /// Last-synced remote edit timestamps for entities that the connector
-    /// should compare immediately before apply.
+    /// Synced Tree remote versions for entities that the connector should
+    /// compare immediately before apply.
     pub remote_preconditions: Vec<RemotePrecondition>,
 }
 
@@ -382,7 +382,7 @@ pub struct PushConcurrencyRequest<'a> {
     pub operation_ids: &'a [PushOperationId],
     /// Remote entities covered by the journal entry.
     pub remote_ids: &'a [RemoteId],
-    /// Last-synced remote timestamps for compare-and-swap checks.
+    /// Synced Tree remote versions for compare-and-swap checks.
     pub remote_preconditions: &'a [RemotePrecondition],
 }
 
@@ -403,7 +403,7 @@ pub struct PushApplyRequest<'a> {
     pub operation_ids: &'a [PushOperationId],
     /// Remote entities covered by the journal entry.
     pub remote_ids: &'a [RemoteId],
-    /// Last-synced remote timestamps available to source-specific apply code.
+    /// Synced Tree remote versions available to source-specific apply code.
     pub remote_preconditions: &'a [RemotePrecondition],
 }
 

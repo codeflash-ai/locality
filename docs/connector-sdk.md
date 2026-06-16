@@ -20,6 +20,12 @@ the secret itself lives in the credential store. Implementations should treat a
 missing or inactive profile as an auth/setup problem before attempting remote
 I/O.
 
+Capabilities are explicit connector-neutral booleans. The current contract
+tracks block updates, databases, OAuth, cheap remote observation, lazy child
+enumeration, media download, undo, and future batch observation. Hosts should use
+capabilities for scheduling and preflight decisions, not for bypassing
+authoritative push concurrency checks.
+
 Apply requests include the core `push_id`, mount ID, approved push plan, and deterministic operation IDs aligned with `plan.operations`. Connectors should use those operation IDs as source-side idempotency keys for block-level API calls when the source supports idempotent writes.
 
 Apply results include changed remote IDs plus operation-level journal effects. Created-block and created-entity effects must include the remote IDs assigned by the source, because reconcile and undo use those IDs to read back, materialize, and reverse appends and creates safely.

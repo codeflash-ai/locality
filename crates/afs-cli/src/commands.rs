@@ -44,6 +44,7 @@ use crate::history::{
     undo_report_exit_code,
 };
 use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
+use crate::inspect::{InspectError, InspectOptions, InspectReport, run_inspect};
 use crate::local_oauth::{
     LocalOAuthAuthorization, LocalOAuthError, local_redirect, notion_authorize_url, random_state,
     run_local_oauth_authorization,
@@ -54,7 +55,7 @@ use crate::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon, select_push_targets,
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
-use crate::status::{StatusError, StatusOptions, StatusReport, run_status};
+use crate::status::{StatusError, StatusOptions, StatusReport, StatusSyncState, run_status};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_INTERNAL: i32 = 1;
@@ -114,6 +115,8 @@ enum AfsCommand {
     Info(PathArg),
     #[command(about = "Show local sync state for mounts or paths")]
     Status(PathArg),
+    #[command(about = "Explain local and remote sync state for a path")]
+    Inspect(PathArg),
     #[command(about = "Pull remote content into the local projection")]
     Pull(RequiredPathArg),
     #[command(about = "Push local changes back to the remote source")]
@@ -456,6 +459,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         AfsCommand::Mount { .. } => mount(&legacy_args[1..], json),
         AfsCommand::Info(_) => info(&legacy_args[1..], json),
         AfsCommand::Status(_) => status(&legacy_args[1..], json),
+        AfsCommand::Inspect(_) => inspect(&legacy_args[1..], json),
         AfsCommand::Pull(_) => pull(&legacy_args[1..], json),
         AfsCommand::Push(_) => push(&legacy_args[1..], json),
         AfsCommand::Diff(_) => diff(&legacy_args[1..], json),
@@ -573,6 +577,10 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
         }
         AfsCommand::Status(options) => {
             args.push("status".to_string());
+            push_optional_positional(&mut args, options.path.as_deref());
+        }
+        AfsCommand::Inspect(options) => {
+            args.push("inspect".to_string());
             push_optional_positional(&mut args, options.path.as_deref());
         }
         AfsCommand::Pull(options) => {
@@ -1052,7 +1060,7 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
     match registration {
         VirtualProjectionRegistration::MacosFileProvider => {
             let display_name = file_provider_display_name(&mount);
-            let exit_code = run_file_provider_helper(
+            run_file_provider_helper(
                 json,
                 "register",
                 vec![
@@ -1062,18 +1070,7 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
                     display_name,
                 ],
                 Some(mount_id),
-            );
-            if exit_code == EXIT_SUCCESS
-                && let Err(error) =
-                    file_provider_helper::ensure_macos_file_provider_shortcut(&mount)
-            {
-                return command_error(
-                    json,
-                    CommandError::new("file-provider", error.code(), error.message()),
-                    EXIT_INTERNAL,
-                );
-            }
-            exit_code
+            )
         }
         VirtualProjectionRegistration::LinuxFuse => run_linux_fuse_register(json, &mount),
     }
@@ -1423,6 +1420,49 @@ fn status(args: &[String], json: bool) -> i32 {
             EXIT_SUCCESS
         }
         Err(error) => status_command_error(json, error, state_root),
+    }
+}
+
+fn inspect(args: &[String], json: bool) -> i32 {
+    let Some(path) = first_positional(args) else {
+        return command_error(
+            json,
+            CommandError::new("inspect", "usage", "usage: afs inspect <path> [--json]"),
+            EXIT_USAGE,
+        );
+    };
+
+    let state_root = default_state_root();
+    let store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("inspect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let connector = match resolve_source_for_path(&store, credentials.as_ref(), path) {
+        Ok(connector) => connector,
+        Err(error) => return connector_command_error("inspect", json, error),
+    };
+    let options = InspectOptions {
+        path: PathBuf::from(path),
+        state_root: Some(state_root),
+    };
+
+    match run_inspect(&store, &connector, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_inspect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => inspect_command_error(json, error),
     }
 }
 
@@ -2123,8 +2163,10 @@ fn print_status_report(report: &StatusReport) {
     let mut printed_entries = 0;
     for mount in &report.mounts {
         for entry in &mount.entries {
-            if entry.state.as_str() == "clean"
-                && entry.pending_journal_count == 0
+            if matches!(
+                entry.sync_state,
+                StatusSyncState::AllSynced | StatusSyncState::CheckingFreshness
+            ) && entry.pending_journal_count == 0
                 && entry.failed_journal_count == 0
             {
                 continue;
@@ -2133,8 +2175,9 @@ fn print_status_report(report: &StatusReport) {
             printed_entries += 1;
             println!("{}  {}", mount.mount_id, entry.path);
             println!(
-                "  state: {}  hydration: {}",
+                "  state: {}  sync: {}  hydration: {}",
                 entry.state.as_str(),
+                entry.sync_state.as_str(),
                 entry.hydration
             );
             for issue in &entry.issues {
@@ -2148,14 +2191,28 @@ fn print_status_report(report: &StatusReport) {
     }
 
     if printed_entries == 0 {
+        let checking = if report.summary.checking_freshness > 0 {
+            format!(
+                " (checking freshness for {} entr{})",
+                report.summary.checking_freshness,
+                if report.summary.checking_freshness == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "status clean: {} tracked entr{}",
+            "status clean: {} tracked entr{}{}",
             report.summary.total,
             if report.summary.total == 1 {
                 "y"
             } else {
                 "ies"
-            }
+            },
+            checking
         );
     } else {
         println!(
@@ -2167,7 +2224,63 @@ fn print_status_report(report: &StatusReport) {
             report.summary.missing,
             report.summary.error
         );
+        println!(
+            "sync: {} remote updates, {} pending local, {} review needed, {} conflicted, {} checking",
+            report.summary.remote_update_available,
+            report.summary.pending_local_changes,
+            report.summary.review_needed,
+            report.summary.sync_conflicted,
+            report.summary.checking_freshness
+        );
     }
+}
+
+fn print_inspect_report(report: &InspectReport) {
+    println!("inspect {}", report.path);
+    println!("  mount: {}  entity: {}", report.mount_id, report.entity_id);
+    println!("  title: {}", report.title);
+    if let Some(version) = &report.synced_tree_version {
+        println!("  Synced Tree version: {version}");
+    }
+    if let Some(version) = &report.remote_tree_version {
+        println!("  Remote Tree version: {version}");
+    }
+    if report.local_read_path != report.path {
+        println!("  local cache: {}", report.local_read_path);
+    }
+    println!(
+        "  state: {}  action: {}",
+        report.explanation.state.as_str(),
+        report.explanation.action.as_str()
+    );
+    println!(
+        "  local: {}",
+        inspect_side_summary(&report.explanation.local)
+    );
+    println!(
+        "  remote: {}",
+        inspect_side_summary(&report.explanation.remote)
+    );
+    for issue in &report.explanation.issues {
+        println!("  issue: {} - {}", issue.code, issue.message);
+    }
+}
+
+fn inspect_side_summary(side: &afs_core::explain::RemoteChangeSide) -> String {
+    if let Some(issue) = &side.issue {
+        return format!("needs review ({} - {})", issue.code, issue.message);
+    }
+
+    let operations = side
+        .plan
+        .as_ref()
+        .map(|plan| plan.operations.len())
+        .unwrap_or(0);
+    format!(
+        "{} ({operations} operation{})",
+        if side.changed { "changed" } else { "unchanged" },
+        plural(operations)
+    )
 }
 
 fn print_info_report(report: &InfoReport) {
@@ -2189,7 +2302,7 @@ fn print_info_report(report: &InfoReport) {
         println!("Entity path: {}", entity.path);
         println!("Hydration: {}", entity.hydration);
         if let Some(remote_edited_at) = &entity.remote_edited_at {
-            println!("Remote edited: {remote_edited_at}");
+            println!("Synced Tree version: {remote_edited_at}");
         }
     }
     if let Some(schema_path) = &report.subject.schema_path {
@@ -2246,10 +2359,18 @@ fn print_daemon_report(report: &DaemonControlReport) {
     if let Some(status) = &report.daemon_status {
         println!("  watched mounts: {}", status.watches.watched_mounts);
         println!(
-            "  jobs: active={}, pending={}, hydration={}",
+            "  jobs: active={}, pending={}, hydration={}, freshness={}",
             status.runtime.active_job,
             status.runtime.pending_requests,
-            status.runtime.pending_hydrations
+            status.runtime.pending_hydrations,
+            status.runtime.pending_freshness
+        );
+        println!(
+            "  freshness: ready={}, deferred={}, ready_budget={}, total_budget={}",
+            status.runtime.ready_freshness,
+            status.runtime.deferred_freshness,
+            status.runtime.ready_freshness_budget_units,
+            status.runtime.freshness_budget_units
         );
         if let Some(active) = &status.runtime.active_job_detail {
             println!(
@@ -3118,6 +3239,24 @@ fn status_command_error(json: bool, error: StatusError, state_root: PathBuf) -> 
     command_error(
         json,
         CommandError::new("status", error.code(), message),
+        exit_code,
+    )
+}
+
+fn inspect_command_error(json: bool, error: InspectError) -> i32 {
+    let exit_code = match &error {
+        InspectError::MountNotFound(_)
+        | InspectError::Store(afs_store::StoreError::EntityPathMissing { .. })
+        | InspectError::UnsupportedEntity { .. } => EXIT_USAGE,
+        InspectError::CurrentDir(_)
+        | InspectError::ProjectionReadPath { .. }
+        | InspectError::ReadFile { .. }
+        | InspectError::Store(_)
+        | InspectError::RemoteFetch(_) => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("inspect", error.code(), error.message()),
         exit_code,
     )
 }

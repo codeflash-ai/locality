@@ -45,6 +45,14 @@ build-tauri: ## Build the packaged Tauri desktop app.
 prepare-macos-file-provider: ## Stage the macOS File Provider extension for Tauri packaging.
 	$(DESKTOP_DIR)/scripts/prepare-macos-file-provider.sh
 
+.PHONY: clean-start-plan
+clean-start-plan: ## Print the local AFS clean-start reset actions without deleting anything.
+	scripts/clean-start.sh
+
+.PHONY: clean-start
+clean-start: ## Stop AFS and remove local app/state/mounts/credentials for fresh manual testing.
+	scripts/clean-start.sh --yes
+
 .PHONY: check
 check: check-rust check-desktop ## Run Rust checks and desktop type/build checks.
 

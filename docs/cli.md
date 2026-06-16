@@ -13,6 +13,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs daemon status [--json]`
 - `afs info [path] [--json]`
 - `afs status [path] [--json]`
+- `afs inspect <path> [--json]`
 - `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
 - `afs daemon start|stop|status|reload|restart [--session|--launchd] [--afsd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>] [--json]`
@@ -100,7 +101,7 @@ helper binary path for development. `afs file-provider unregister <mount>` stops
 and removes that Linux service. `list` and `reset` still target the macOS File
 Provider helper.
 
-`afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page shadow snapshot. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the stored shadow, returning a dirty skip instead.
+`afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page Synced Tree shadow snapshot. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the Synced Tree shadow, returning a dirty skip instead.
 
 The JSON report includes `via`, `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts. `via` is `daemon` when the Unix socket handled the job and `cli` when the command executed directly.
 
@@ -155,31 +156,91 @@ Human output is a compact path summary for people and agents working in nested d
 
 ## Initial `afs status --json` Shape
 
-`afs status [path]` inspects local mount state only. It resolves the target path through the stored mount/entity mapping, compares hydrated page bodies against their stored shadow snapshots, reports stubs, conflicted files with unresolved inline markers, dirty files, missing projections, and pending or failed push journals touching each entity. It does not call remote connectors.
+`afs status [path]` inspects Local Tree state and the latest Remote Tree metadata
+the daemon has already observed. It resolves the target path through the stored
+mount/entity mapping, compares hydrated page bodies against their Synced Tree
+shadow snapshots, reports stubs, conflicted files with unresolved inline markers,
+dirty files, missing projections, and pending or failed push journals touching
+each entity. It does not call remote connectors itself.
 
 The production state directory defaults to `~/.afs`; `AFS_STATE_DIR` is a developer/test override for isolated runs. When no path is supplied, `afs status` first checks the current working directory: inside a mount it scopes to that subtree, and outside all mounts it reports every registered mount in the active state directory.
 
 The JSON report includes:
 
 - `clean`: false when any entry is stubbed, dirty, conflicted, missing, errored, or has pending/failed journals;
-- `summary`: counts by state plus pending/failed journal counts;
-- `mounts[].entries[]`: path, entity ID, kind, title, hydration state, status state, issues, and journal counts.
+- `summary`: counts by local state, pending/failed journal counts, and sync safety states;
+- `mounts[].entries[]`: path, entity ID, kind, title, hydration state, Local Tree status state, sync safety state, latest Remote Tree observation metadata, issues, and journal counts.
 
-Human output lists only non-clean entries and ends with a compact summary, or prints a clean line when every tracked entry is clean.
+`state` is the Local Tree file/projection state: `clean`, `stub`, `dirty`,
+`conflicted`, `missing`, or `error`. `sync_state` is the higher-level safety
+state for humans and agents:
+
+- `all_synced`: no known Local Tree pending change or Remote Tree drift;
+- `checking_freshness`: AFS has Local Tree activity and is checking Remote Tree metadata;
+- `remote_update_available`: Remote Tree metadata moved while the Local Tree file is clean;
+- `pending_local_changes`: Local Tree edits are waiting for review/push;
+- `review_needed`: both Local Tree and Remote Tree changed, or the projection needs manual attention;
+- `conflicted`: unresolved conflict markers or conflicted entity state.
+
+The summary stores the conflicted sync-state count as `sync_conflicted` because
+`conflicted` already names the local file/projection state count.
+
+Human output lists entries that need attention and ends with a compact summary,
+or prints a clean line when every tracked entry is safe. If AFS is only checking
+freshness in the background, the clean line includes the number of entries being
+checked instead of listing each file.
 
 Non-clean human entries are multi-line so failed journals expose their recovery context:
 
 ```text
 notion-main  initial-idea ~37b3ac.md
-  state: dirty  hydration: dirty
+  state: dirty  sync: pending_local_changes  hydration: dirty
   issue: entity_dirty - entity is marked dirty
   issue: failed_journal - 2 push journal(s) failed
   last_failure: unsupported feature: moving Notion blocks
 ```
 
+## Initial `afs inspect --json` Shape
+
+`afs inspect <path>` is an explicit Remote Tree change explanation barrier for one
+hydrated page. Unlike `afs status`, it is allowed to call the connector. It
+compares:
+
+- the Synced Tree shadow;
+- the current Local Tree Markdown file or virtual projection content cache;
+- a freshly rendered Remote Tree document.
+
+The command does not mutate local files, shadows, freshness metadata, or remote
+content. It is intended for review flows where status already says a remote
+update may exist, or where a human/agent wants an authoritative explanation
+before deciding whether to push, pull, or manually merge.
+
+JSON output includes:
+
+- `state`: `all_synced`, `local_changed_only`, `remote_changed_only`,
+  `both_changed`, or `needs_review`;
+- `action`: `none`, `push_local_changes`, `safe_to_fast_forward`, or
+  `review_before_push`;
+- `local` and `remote`: whether each tree changed relative to the Synced Tree shadow, plus
+  the connector-neutral plan when planning succeeds;
+- `issues`: parse, path, or planning problems that require manual review.
+
+Human output is a compact summary:
+
+```text
+inspect /Users/alice/Library/CloudStorage/AFS/notion/Roadmap.md
+  mount: notion-main  entity: page-1
+  title: Roadmap
+  Synced Tree version: 2026-06-10T00:00:00Z
+  Remote Tree version: 2026-06-11T00:00:00Z
+  state: remote_changed_only  action: safe_to_fast_forward
+  local: unchanged (0 operations)
+  remote: changed (1 operation)
+```
+
 ## Initial `afs diff --json` Shape
 
-The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its shadow snapshot, and returns the core push-pipeline decision without applying anything. If the file contains unresolved inline conflict markers, validation returns `unresolved_conflict_markers` before planning. If the path is a new Markdown file directly inside a projected database directory, it plans a `create_entity` operation for a new database row instead of requiring an existing shadow. The JSON report includes:
+The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its Synced Tree shadow snapshot, and returns the core push-pipeline decision without applying anything. If the file contains unresolved inline conflict markers, validation returns `unresolved_conflict_markers` before planning. If the path is a new Markdown file directly inside a projected database directory, it plans a `create_entity` operation for a new database row instead of requiring an existing shadow. The JSON report includes:
 
 - `validation`: machine-readable issues with file, line, message, and suggested fix;
 - `plan.summary`: block/entity/property counts;
@@ -206,7 +267,7 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 - `apply_not_implemented`;
 - `apply_failed`.
 
-Reports also include `via`, `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset, block moves, and new database-row creation through the live API. Connector capability preflight runs before journaling, so unsupported operations return `unsupported_operations` without appending a journal.
+Reports also include `via`, `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset, block moves, and new database-row creation through the live API. Connector capability preflight runs before journaling, so unsupported operations return `unsupported_operations` without appending a journal. Once a journaled push starts, the daemon performs connector metadata checks and verifies the current Remote Tree render still matches the Synced Tree shadow before applying Local Tree edits.
 
 Unsupported-operation JSON shape:
 
@@ -223,7 +284,7 @@ Unsupported-operation JSON shape:
 
 ## `afs restore`
 
-`afs restore <path> [--force] [--json]` is a local recovery command. It resolves the path to a mounted entity, loads the last stored shadow, rewrites the file atomically from canonical frontmatter plus the shadow body, refreshes the entity content hash, and marks hydration back to `hydrated`. It removes inline conflict markers by overwriting the file from shadow. It does not call Notion and does not delete failed journals, so `afs log` remains an audit trail.
+`afs restore <path> [--force] [--json]` is a local recovery command. It resolves the path to a mounted entity, loads the Synced Tree shadow, rewrites the file atomically from canonical frontmatter plus the shadow body, refreshes the entity content hash, and marks hydration back to `hydrated`. It removes inline conflict markers by overwriting the file from shadow. It does not call Notion and does not delete failed journals, so `afs log` remains an audit trail.
 
 `afs restore` refuses legacy conflicted entities unless `--force` is supplied.
 
@@ -238,6 +299,10 @@ afs status ~/afs/notion
 ## `afs daemon status`
 
 `afs daemon status [--json]` checks the configured Unix socket and, when the daemon is running, requests a daemon status snapshot. JSON output includes process-manager state, runtime queue counts, scheduler mode, watched mount count, and watched roots.
+Runtime queue counts include mutating requests, hydration work, scheduled pulls,
+and freshness work. Freshness metrics report pending/ready/deferred jobs plus
+ready and total budget units, which helps diagnose sync pressure without
+requiring a full workspace scan.
 
 `afs daemon reload [--json]` tells a running daemon to reconcile its watched mount roots with the current SQLite mount table. `afs mount` sends the same IPC request after saving a new mount, so a persistent daemon starts watching newly mounted directories without a restart.
 

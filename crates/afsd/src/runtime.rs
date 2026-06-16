@@ -12,22 +12,29 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use afs_connector::{Connector, ObserveRequest};
 use afs_core::AfsError;
 use afs_core::canonical::parse_canonical_markdown;
+use afs_core::freshness::{ChangeHintKind, RemoteObservation, SyncJob, SyncJobKind};
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
-use afs_core::model::{EntityKind, HydrationState, MountId};
+use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::pull::PullMode;
 use afs_store::{
-    EntityRecord, EntityRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
-    MountRepository, ShadowRepository, SqliteStateStore, open_credential_store,
+    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+    HydrationJobRecord, HydrationJobRepository, MountConfig, MountRepository,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    open_credential_store,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::DaemonConfig;
 use crate::execution::{DaemonEventReport, PushJob};
+use crate::freshness::{
+    FreshnessQueue, freshness_timestamp, record_file_opened, record_local_change,
+};
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationQueue};
 use crate::ipc::{DaemonActiveJobStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use crate::pull::run_pull_with_state_root;
@@ -38,11 +45,11 @@ use crate::reconcile::{
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
-    VirtualFsItem, VirtualFsMaterializeOutcome, commit_virtual_fs_write, create_virtual_fs_file,
-    materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
-    rename_virtual_fs_item, trash_virtual_fs_item, virtual_fs_children_refresh_needed,
-    virtual_fs_children_with_content_root, virtual_fs_content_root,
-    virtual_fs_item_with_content_root,
+    ROOT_CONTAINER_IDENTIFIER, VirtualFsItem, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
+    create_virtual_fs_file, materialize_virtual_fs_item_with_content_root,
+    refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
+    virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
+    virtual_fs_content_root, virtual_fs_item_with_content_root,
 };
 use crate::watcher::{FileEvent, FileEventKind};
 
@@ -52,6 +59,8 @@ pub struct DaemonRuntimeHandle {
 }
 
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const FRESHNESS_JOB_BUDGET_UNITS: u16 = 5;
+const AUTO_FAST_FORWARD_ACTIVE_LEASE_MS: u64 = 30_000;
 
 impl DaemonRuntimeHandle {
     pub fn request(&self, request: DaemonRequest) -> DaemonResponse {
@@ -175,6 +184,16 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
     ) -> afs_core::AfsResult<FileEventRuntimeReport> {
         Err(AfsError::Unsupported(
             "runtime runner does not handle file events",
+        ))
+    }
+
+    fn run_freshness_job(
+        &self,
+        _state_root: PathBuf,
+        _job: SyncJob,
+    ) -> afs_core::AfsResult<FreshnessRuntimeReport> {
+        Err(AfsError::Unsupported(
+            "runtime runner does not handle freshness jobs",
         ))
     }
 
@@ -321,12 +340,21 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
 pub struct FileEventRuntimeReport {
     pub report: DaemonEventReport,
     pub queued_hydrations: Vec<HydrationRequest>,
+    pub freshness_jobs: Vec<SyncJob>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScheduledPullRuntimeReport {
     pub report: ScheduledPullReport,
     pub queued_hydrations: Vec<HydrationRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshnessRuntimeReport {
+    pub job: SyncJob,
+    pub remote_hint_pending: bool,
+    pub queued_hydrations: Vec<HydrationRequest>,
+    pub follow_up_jobs: Vec<SyncJob>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -443,6 +471,19 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
     ) -> afs_core::AfsResult<FileEventRuntimeReport> {
         let mut store = SqliteStateStore::open(state_root).map_err(AfsError::from)?;
         execute_file_event(&mut store, event)
+    }
+
+    fn run_freshness_job(
+        &self,
+        state_root: PathBuf,
+        job: SyncJob,
+    ) -> afs_core::AfsResult<FreshnessRuntimeReport> {
+        let mut store = SqliteStateStore::open(state_root.clone()).map_err(AfsError::from)?;
+        let credentials = open_credential_store(&state_root);
+        let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &job.mount_id)
+            .map_err(AfsError::from)?;
+
+        execute_freshness_job(&mut store, &connector, job)
     }
 
     fn run_virtual_fs_item(
@@ -813,6 +854,7 @@ struct RuntimeState {
     pending_requests: VecDeque<MutatingRequest>,
     pending_child_refreshes: BTreeSet<(String, String)>,
     hydration: HydrationQueue,
+    freshness: FreshnessQueue,
     deferred_hydration: Vec<HydrationRequest>,
     next_hydration_retry: Option<Instant>,
     pending_scheduled_tick: Option<PullSchedulerTick>,
@@ -881,6 +923,7 @@ impl RuntimeState {
             pending_requests: VecDeque::new(),
             pending_child_refreshes: BTreeSet::new(),
             hydration,
+            freshness: FreshnessQueue::new(),
             deferred_hydration: Vec::new(),
             next_hydration_retry: None,
             pending_scheduled_tick: None,
@@ -1086,12 +1129,18 @@ impl RuntimeState {
             | JobCompletion::Push {
                 response,
                 respond_to,
-            }
-            | JobCompletion::Response {
-                response,
-                respond_to,
             } => {
                 let _ = respond_to.send(response);
+            }
+            JobCompletion::Response {
+                response,
+                respond_to,
+                freshness_jobs,
+            } => {
+                let _ = respond_to.send(response);
+                for job in freshness_jobs {
+                    self.queue_freshness(job);
+                }
             }
             JobCompletion::VirtualFsRefreshChildren {
                 mount_id,
@@ -1130,8 +1179,22 @@ impl RuntimeState {
                     for request in result.queued_hydrations {
                         self.queue_hydration(request);
                     }
+                    for job in result.freshness_jobs {
+                        self.queue_freshness(job);
+                    }
                 }
                 Err(error) => eprintln!("afsd file event failed: {error}"),
+            },
+            JobCompletion::Freshness(result) => match result {
+                Ok(result) => {
+                    for request in result.queued_hydrations {
+                        self.queue_hydration(request);
+                    }
+                    for job in result.follow_up_jobs {
+                        self.queue_freshness(job);
+                    }
+                }
+                Err(error) => eprintln!("afsd freshness job failed: {error}"),
             },
         }
 
@@ -1172,6 +1235,11 @@ impl RuntimeState {
             Some(MutatingJob::Request(request))
         } else if let Some(request) = self.hydration.pop_ready() {
             Some(MutatingJob::Hydration { request })
+        } else if let Some(job) = self
+            .freshness
+            .pop_ready_at(Some(&freshness_timestamp()), FRESHNESS_JOB_BUDGET_UNITS)
+        {
+            Some(MutatingJob::Freshness { job })
         } else {
             self.pending_scheduled_tick
                 .take()
@@ -1214,6 +1282,24 @@ impl RuntimeState {
     }
 
     fn queue_hydration(&mut self, request: HydrationRequest) {
+        if request.reason == HydrationReason::RemoteFastForward {
+            match self.auto_fast_forward_queue_decision(&request) {
+                Ok(AutoFastForwardQueueDecision::Queue) => {}
+                Ok(AutoFastForwardQueueDecision::Skip) => return,
+                Ok(AutoFastForwardQueueDecision::Delay(job)) => {
+                    self.queue_freshness(job);
+                    return;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "afsd skipped remote fast-forward for `{}`: {error}",
+                        request.path.display()
+                    );
+                    return;
+                }
+            }
+        }
+
         self.hydration.queue_request(request.clone());
 
         match SqliteStateStore::open(self.config.state_root.clone())
@@ -1222,6 +1308,19 @@ impl RuntimeState {
             Ok(()) => {}
             Err(error) => eprintln!("afsd failed to persist hydration request: {error}"),
         }
+    }
+
+    fn queue_freshness(&mut self, job: SyncJob) {
+        self.freshness.upsert(job);
+    }
+
+    fn auto_fast_forward_queue_decision(
+        &self,
+        request: &HydrationRequest,
+    ) -> afs_core::AfsResult<AutoFastForwardQueueDecision> {
+        let store =
+            SqliteStateStore::open(self.config.state_root.clone()).map_err(AfsError::from)?;
+        auto_fast_forward_queue_decision(&store, &self.config.state_root, request)
     }
 
     fn queue_child_refresh(&mut self, mount_id: String, container_identifier: String) {
@@ -1256,12 +1355,18 @@ impl RuntimeState {
     }
 
     fn status(&self) -> DaemonRuntimeStatus {
+        let freshness_metrics = self.freshness.metrics(Some(&freshness_timestamp()));
         DaemonRuntimeStatus {
             active_job: self.active_job.is_some(),
             active_job_detail: self.active_job.as_ref().map(ActiveRuntimeJob::status),
             pending_requests: self.pending_requests.len(),
             pending_hydrations: self.hydration.len(),
             deferred_hydrations: self.deferred_hydration.len(),
+            pending_freshness: freshness_metrics.total_jobs,
+            ready_freshness: freshness_metrics.ready_jobs,
+            deferred_freshness: freshness_metrics.deferred_jobs,
+            freshness_budget_units: freshness_metrics.total_budget_units,
+            ready_freshness_budget_units: freshness_metrics.ready_budget_units,
             pending_scheduled_pull: self.pending_scheduled_tick.is_some(),
             scheduler_mode: match self.scheduler.config.mode {
                 PullMode::Polling => "polling",
@@ -1348,6 +1453,97 @@ where
         .then(|| virtual_fs_content_root(state_root, &mount.mount_id)))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AutoFastForwardQueueDecision {
+    Queue,
+    Skip,
+    Delay(SyncJob),
+}
+
+fn auto_fast_forward_queue_decision<S>(
+    store: &S,
+    state_root: &Path,
+    request: &HydrationRequest,
+) -> afs_core::AfsResult<AutoFastForwardQueueDecision>
+where
+    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
+{
+    let Some(entity) = store
+        .get_entity(&request.mount_id, &request.remote_id)
+        .map_err(AfsError::from)?
+    else {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    };
+    if entity.kind != EntityKind::Page || entity.hydration != HydrationState::Hydrated {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    }
+
+    let Some(freshness) = store
+        .get_freshness_state(&request.mount_id, &request.remote_id)
+        .map_err(AfsError::from)?
+    else {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    };
+    if !freshness.remote_hint_pending {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    }
+
+    let Some(mount) = store.get_mount(&request.mount_id).map_err(AfsError::from)? else {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    };
+    let path = projection_content_path(state_root, &mount, &entity);
+    if !hydrated_file_matches_shadow(store, &mount, &entity, &path)? {
+        return Ok(AutoFastForwardQueueDecision::Skip);
+    }
+
+    let now = freshness_timestamp();
+    if let Some(next_eligible_at) = active_lease_until(&freshness, &now) {
+        return Ok(AutoFastForwardQueueDecision::Delay(
+            SyncJob::new(
+                request.mount_id.clone(),
+                Some(request.remote_id.clone()),
+                SyncJobKind::ObserveEntity,
+                ChangeHintKind::RemoteMaybeChanged,
+            )
+            .next_eligible_at(next_eligible_at),
+        ));
+    }
+
+    Ok(AutoFastForwardQueueDecision::Queue)
+}
+
+fn projection_content_path(
+    state_root: &Path,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+) -> PathBuf {
+    if mount.projection.uses_virtual_filesystem() {
+        virtual_fs_content_root(state_root, &mount.mount_id).join(&entity.path)
+    } else {
+        mount.root.join(&entity.path)
+    }
+}
+
+fn active_lease_until(freshness: &FreshnessStateRecord, now: &str) -> Option<String> {
+    let now_ms = parse_unix_ms(now)?;
+    let active_until = [
+        freshness.last_opened_at.as_deref(),
+        freshness.last_local_change_at.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(parse_unix_ms)
+    .map(|timestamp| timestamp.saturating_add(AUTO_FAST_FORWARD_ACTIVE_LEASE_MS))
+    .filter(|active_until| *active_until > now_ms)
+    .max()?;
+
+    Some(format!("unix_ms:{active_until}"))
+}
+
+fn parse_unix_ms(value: &str) -> Option<u64> {
+    value.strip_prefix("unix_ms:")?.parse().ok()
+}
+
 fn run_job(
     runner: Arc<dyn RuntimeJobRunner>,
     state_root: PathBuf,
@@ -1385,18 +1581,28 @@ fn run_job(
             mount_id,
             identifier,
             respond_to,
-        }) => JobCompletion::Response {
-            response: runner.run_virtual_fs_materialize(state_root, mount_id, identifier),
-            respond_to,
-        },
+        }) => {
+            let response = runner.run_virtual_fs_materialize(state_root, mount_id, identifier);
+            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::FileOpened);
+            JobCompletion::Response {
+                response,
+                respond_to,
+                freshness_jobs,
+            }
+        }
         MutatingJob::Request(MutatingRequest::FileProviderRead {
             mount_id,
             identifier,
             respond_to,
-        }) => JobCompletion::Response {
-            response: runner.run_file_provider_read(state_root, mount_id, identifier),
-            respond_to,
-        },
+        }) => {
+            let response = runner.run_file_provider_read(state_root, mount_id, identifier);
+            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::FileOpened);
+            JobCompletion::Response {
+                response,
+                respond_to,
+                freshness_jobs,
+            }
+        }
         MutatingJob::Request(MutatingRequest::FileProviderChildren {
             mount_id,
             container_identifier,
@@ -1404,59 +1610,80 @@ fn run_job(
         }) => JobCompletion::Response {
             response: runner.run_file_provider_children(state_root, mount_id, container_identifier),
             respond_to,
+            freshness_jobs: Vec::new(),
         },
         MutatingJob::Request(MutatingRequest::VirtualFsCommitWrite {
             mount_id,
             identifier,
             contents_base64,
             respond_to,
-        }) => JobCompletion::Response {
-            response: runner.run_virtual_fs_commit_write(
+        }) => {
+            let response = runner.run_virtual_fs_commit_write(
                 state_root,
                 mount_id,
                 identifier,
                 contents_base64,
-            ),
-            respond_to,
-        },
+            );
+            let freshness_jobs = response_local_edit_observe_jobs(&response);
+            JobCompletion::Response {
+                response,
+                respond_to,
+                freshness_jobs,
+            }
+        }
         MutatingJob::Request(MutatingRequest::VirtualFsCreateFile {
             mount_id,
             parent_identifier,
             filename,
             respond_to,
-        }) => JobCompletion::Response {
-            response: runner.run_virtual_fs_create_file(
+        }) => {
+            let response = runner.run_virtual_fs_create_file(
                 state_root,
                 mount_id,
                 parent_identifier,
                 filename,
-            ),
-            respond_to,
-        },
+            );
+            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::LocalEdited);
+            JobCompletion::Response {
+                response,
+                respond_to,
+                freshness_jobs,
+            }
+        }
         MutatingJob::Request(MutatingRequest::VirtualFsRename {
             mount_id,
             identifier,
             new_parent_identifier,
             new_filename,
             respond_to,
-        }) => JobCompletion::Response {
-            response: runner.run_virtual_fs_rename(
+        }) => {
+            let response = runner.run_virtual_fs_rename(
                 state_root,
                 mount_id,
                 identifier,
                 new_parent_identifier,
                 new_filename,
-            ),
-            respond_to,
-        },
+            );
+            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::LocalEdited);
+            JobCompletion::Response {
+                response,
+                respond_to,
+                freshness_jobs,
+            }
+        }
         MutatingJob::Request(MutatingRequest::VirtualFsTrash {
             mount_id,
             identifier,
             respond_to,
-        }) => JobCompletion::Response {
-            response: runner.run_virtual_fs_trash(state_root, mount_id, identifier),
-            respond_to,
-        },
+        }) => {
+            let response = runner.run_virtual_fs_trash(state_root, mount_id, identifier);
+            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::LocalEdited);
+            JobCompletion::Response {
+                response,
+                respond_to,
+                freshness_jobs,
+            }
+        }
         MutatingJob::ScheduledPull { tick } => {
             JobCompletion::ScheduledPull(runner.run_scheduled_pull(state_root, tick, policy))
         }
@@ -1464,7 +1691,65 @@ fn run_job(
             let result = runner.run_hydration(state_root, request.clone());
             JobCompletion::Hydration { request, result }
         }
+        MutatingJob::Freshness { job } => {
+            JobCompletion::Freshness(runner.run_freshness_job(state_root, job))
+        }
     }
+}
+
+fn response_local_edit_observe_jobs(response: &DaemonResponse) -> Vec<SyncJob> {
+    if response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("hydration"))
+        .and_then(Value::as_str)
+        == Some("hydrated")
+    {
+        return Vec::new();
+    }
+
+    response_observe_jobs(response, ChangeHintKind::LocalEdited)
+}
+
+fn response_observe_jobs(response: &DaemonResponse, reason: ChangeHintKind) -> Vec<SyncJob> {
+    if !response.ok {
+        return Vec::new();
+    }
+
+    let Some(payload) = response.payload.as_ref() else {
+        return Vec::new();
+    };
+    let Some(mount_id) = payload.get("mount_id").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let identifier = payload.get("identifier").and_then(Value::as_str);
+    let remote_id = payload
+        .get("remote_id")
+        .and_then(Value::as_str)
+        .or(identifier);
+    let Some(remote_id) = remote_id.filter(|remote_id| {
+        identifier.is_none_or(observable_remote_identifier)
+            && observable_remote_identifier(remote_id)
+    }) else {
+        return Vec::new();
+    };
+
+    vec![SyncJob::new(
+        MountId::new(mount_id),
+        Some(RemoteId::new(remote_id)),
+        SyncJobKind::ObserveEntity,
+        reason,
+    )]
+}
+
+fn observable_remote_identifier(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && !identifier.starts_with("local:")
+        && !identifier.starts_with("schema:")
+        && !identifier.starts_with("children:")
+        && !identifier.starts_with("path:")
+        && !identifier.starts_with("source:")
+        && identifier != ROOT_CONTAINER_IDENTIFIER
 }
 
 enum RuntimeMessage {
@@ -1541,6 +1826,7 @@ enum MutatingJob {
     Request(MutatingRequest),
     ScheduledPull { tick: PullSchedulerTick },
     Hydration { request: HydrationRequest },
+    Freshness { job: SyncJob },
 }
 
 impl MutatingJob {
@@ -1551,6 +1837,13 @@ impl MutatingJob {
             Self::Hydration { request } => (
                 "hydration".to_string(),
                 Some(request.path.display().to_string()),
+            ),
+            Self::Freshness { job } => (
+                "freshness".to_string(),
+                Some(match job.remote_id.as_ref() {
+                    Some(remote_id) => format!("{}:{}", job.mount_id.as_str(), remote_id.as_str()),
+                    None => job.mount_id.as_str().to_string(),
+                }),
             ),
         }
     }
@@ -1649,6 +1942,7 @@ enum JobCompletion {
     Response {
         response: DaemonResponse,
         respond_to: Sender<DaemonResponse>,
+        freshness_jobs: Vec<SyncJob>,
     },
     VirtualFsRefreshChildren {
         mount_id: String,
@@ -1661,6 +1955,7 @@ enum JobCompletion {
         result: afs_core::AfsResult<HydrationOutcome>,
     },
     FileEvent(afs_core::AfsResult<FileEventRuntimeReport>),
+    Freshness(afs_core::AfsResult<FreshnessRuntimeReport>),
 }
 
 fn execute_file_event<S>(
@@ -1668,7 +1963,7 @@ fn execute_file_event<S>(
     event: FileEvent,
 ) -> afs_core::AfsResult<FileEventRuntimeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
 {
     let mut runtime_report = FileEventRuntimeReport::default();
     let Some((mount, entity)) = resolve_event_entity(store, &event.path)? else {
@@ -1678,10 +1973,10 @@ where
 
     match event.kind {
         FileEventKind::Read => {
-            handle_read_event(mount, entity, &mut runtime_report);
+            handle_read_event(store, mount, entity, &mut runtime_report)?;
         }
         FileEventKind::Write => {
-            handle_write_event(store, mount, entity, event.path, &mut runtime_report.report)?;
+            handle_write_event(store, mount, entity, event.path, &mut runtime_report)?;
         }
         FileEventKind::Rename | FileEventKind::Remove => runtime_report.report.ignored_events = 1,
     }
@@ -1689,14 +1984,27 @@ where
     Ok(runtime_report)
 }
 
-fn handle_read_event(
+fn handle_read_event<S>(
+    store: &mut S,
     mount: MountConfig,
     entity: EntityRecord,
     runtime_report: &mut FileEventRuntimeReport,
-) {
+) -> afs_core::AfsResult<()>
+where
+    S: FreshnessStateRepository,
+{
+    if entity.kind == EntityKind::Page {
+        record_file_opened(store, &entity)?;
+        runtime_report
+            .freshness_jobs
+            .push(observe_entity_job(&entity, ChangeHintKind::FileOpened));
+    }
+
     if !should_hydrate_on_read(&entity) {
-        runtime_report.report.ignored_events = 1;
-        return;
+        if runtime_report.freshness_jobs.is_empty() {
+            runtime_report.report.ignored_events = 1;
+        }
+        return Ok(());
     }
 
     runtime_report.queued_hydrations.push(HydrationRequest::new(
@@ -1707,6 +2015,7 @@ fn handle_read_event(
         HydrationReason::StubRead,
     ));
     runtime_report.report.queued_hydrations = 1;
+    Ok(())
 }
 
 fn handle_write_event<S>(
@@ -1714,25 +2023,191 @@ fn handle_write_event<S>(
     mount: MountConfig,
     mut entity: EntityRecord,
     event_path: PathBuf,
-    report: &mut DaemonEventReport,
+    runtime_report: &mut FileEventRuntimeReport,
 ) -> afs_core::AfsResult<()>
 where
-    S: EntityRepository + ShadowRepository,
+    S: EntityRepository + ShadowRepository + FreshnessStateRepository,
 {
     if entity.hydration != HydrationState::Hydrated {
-        report.ignored_events = 1;
+        if matches!(
+            entity.hydration,
+            HydrationState::Dirty | HydrationState::Conflicted
+        ) {
+            record_local_change(store, &entity)?;
+            runtime_report
+                .freshness_jobs
+                .push(observe_entity_job(&entity, ChangeHintKind::LocalEdited));
+        } else {
+            runtime_report.report.ignored_events = 1;
+        }
         return Ok(());
     }
 
     if hydrated_file_matches_shadow(store, &mount, &entity, &event_path)? {
-        report.ignored_events = 1;
+        runtime_report.report.ignored_events = 1;
         return Ok(());
     }
 
     entity.hydration = HydrationState::Dirty;
-    store.save_entity(entity).map_err(AfsError::from)?;
-    report.marked_dirty = 1;
+    store.save_entity(entity.clone()).map_err(AfsError::from)?;
+    record_local_change(store, &entity)?;
+    runtime_report
+        .freshness_jobs
+        .push(observe_entity_job(&entity, ChangeHintKind::LocalEdited));
+    runtime_report.report.marked_dirty = 1;
     Ok(())
+}
+
+fn observe_entity_job(entity: &EntityRecord, reason: ChangeHintKind) -> SyncJob {
+    SyncJob::new(
+        entity.mount_id.clone(),
+        Some(entity.remote_id.clone()),
+        SyncJobKind::ObserveEntity,
+        reason,
+    )
+}
+
+fn execute_freshness_job<S, C>(
+    store: &mut S,
+    connector: &C,
+    job: SyncJob,
+) -> afs_core::AfsResult<FreshnessRuntimeReport>
+where
+    S: EntityRepository + RemoteObservationRepository + FreshnessStateRepository,
+    C: Connector,
+{
+    if job.kind != SyncJobKind::ObserveEntity {
+        return Err(AfsError::Unsupported(
+            "only observe_entity freshness jobs are wired into the daemon runtime",
+        ));
+    }
+    execute_observe_entity_job(store, connector, job)
+}
+
+fn execute_observe_entity_job<S, C>(
+    store: &mut S,
+    connector: &C,
+    job: SyncJob,
+) -> afs_core::AfsResult<FreshnessRuntimeReport>
+where
+    S: EntityRepository + RemoteObservationRepository + FreshnessStateRepository,
+    C: Connector,
+{
+    let Some(remote_id) = job.remote_id.clone() else {
+        return Err(AfsError::InvalidState(
+            "observe_entity freshness jobs require a remote id".to_string(),
+        ));
+    };
+
+    let observation = connector.observe(ObserveRequest {
+        mount_id: job.mount_id.clone(),
+        remote_id: remote_id.clone(),
+    })?;
+    let existing = store
+        .get_entity(&job.mount_id, &remote_id)
+        .map_err(AfsError::from)?;
+    let remote_hint_pending = observed_remote_version_changed(existing.as_ref(), &observation);
+    let observed_at = freshness_timestamp();
+
+    store
+        .save_remote_observation(remote_observation_record(&observation, &observed_at))
+        .map_err(AfsError::from)?;
+
+    let mut freshness = store
+        .get_freshness_state(&job.mount_id, &remote_id)
+        .map_err(AfsError::from)?
+        .unwrap_or_else(|| {
+            FreshnessStateRecord::new(job.mount_id.clone(), remote_id.clone(), job.tier.clone())
+        });
+    if job.tier.is_more_urgent_than(&freshness.tier) {
+        freshness.tier = job.tier.clone();
+    }
+    freshness.last_checked_at = Some(observed_at);
+    freshness.remote_hint_pending = freshness.remote_hint_pending || remote_hint_pending;
+    store
+        .save_freshness_state(freshness)
+        .map_err(AfsError::from)?;
+
+    let queued_hydrations = auto_fast_forward_requests_from_observation(
+        existing.as_ref(),
+        &observation,
+        remote_hint_pending,
+    );
+
+    Ok(FreshnessRuntimeReport {
+        job,
+        remote_hint_pending,
+        queued_hydrations,
+        follow_up_jobs: Vec::new(),
+    })
+}
+
+fn auto_fast_forward_requests_from_observation(
+    existing: Option<&EntityRecord>,
+    observation: &RemoteObservation,
+    remote_hint_pending: bool,
+) -> Vec<HydrationRequest> {
+    let Some(entity) = existing else {
+        return Vec::new();
+    };
+    if !remote_hint_pending
+        || observation.deleted
+        || observation.kind != EntityKind::Page
+        || entity.hydration != HydrationState::Hydrated
+    {
+        return Vec::new();
+    }
+
+    vec![HydrationRequest::new(
+        observation.mount_id.clone(),
+        observation.remote_id.clone(),
+        entity.path.clone(),
+        HydrationState::Hydrated,
+        HydrationReason::RemoteFastForward,
+    )]
+}
+
+fn remote_observation_record(
+    observation: &RemoteObservation,
+    observed_at: &str,
+) -> RemoteObservationRecord {
+    let mut record = RemoteObservationRecord::new(
+        observation.mount_id.clone(),
+        observation.remote_id.clone(),
+        observation.kind.clone(),
+        observation.title.clone(),
+        observation.projected_path.clone(),
+        observed_at,
+    );
+    if let Some(parent_remote_id) = observation.parent_remote_id.clone() {
+        record = record.with_parent(parent_remote_id);
+    }
+    if let Some(remote_version) = observation.remote_version.clone() {
+        record = record.with_remote_version(remote_version);
+    }
+    record
+        .deleted(observation.deleted)
+        .with_raw_metadata_json(observation.raw_metadata_json.clone())
+}
+
+fn observed_remote_version_changed(
+    existing: Option<&EntityRecord>,
+    observation: &RemoteObservation,
+) -> bool {
+    if observation.deleted {
+        return true;
+    }
+
+    match (
+        existing.and_then(|record| record.remote_edited_at.as_ref()),
+        observation
+            .remote_version
+            .as_ref()
+            .map(|remote_version| remote_version.as_str()),
+    ) {
+        (Some(base), Some(observed)) => base != observed,
+        _ => false,
+    }
 }
 
 fn hydrated_file_matches_shadow<S>(

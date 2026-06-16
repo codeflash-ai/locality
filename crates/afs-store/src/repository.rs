@@ -13,7 +13,8 @@ use afs_core::shadow::ShadowDocument;
 use crate::error::StoreResult;
 use crate::records::{
     ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
-    HydrationJobRecord, MountConfig, ShadowSnapshotRecord, VirtualMutationRecord,
+    FreshnessStateRecord, HydrationJobRecord, MountConfig, RemoteObservationRecord,
+    ShadowSnapshotRecord, VirtualMutationRecord,
 };
 
 pub trait MountRepository {
@@ -70,6 +71,39 @@ pub trait VirtualMutationRepository {
     fn list_virtual_mutations(&self, mount_id: &MountId)
     -> StoreResult<Vec<VirtualMutationRecord>>;
     fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()>;
+}
+
+pub trait RemoteObservationRepository {
+    fn save_remote_observation(&mut self, observation: RemoteObservationRecord) -> StoreResult<()>;
+    fn get_remote_observation(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<Option<RemoteObservationRecord>>;
+    fn list_remote_observations(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<RemoteObservationRecord>>;
+    fn delete_remote_observation(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<()>;
+}
+
+pub trait FreshnessStateRepository {
+    fn save_freshness_state(&mut self, state: FreshnessStateRecord) -> StoreResult<()>;
+    fn get_freshness_state(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<Option<FreshnessStateRecord>>;
+    fn list_freshness_states(&self, mount_id: &MountId) -> StoreResult<Vec<FreshnessStateRecord>>;
+    fn delete_freshness_state(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<()>;
 }
 
 pub trait HydrationJobRepository {

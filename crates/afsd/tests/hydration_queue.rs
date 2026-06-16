@@ -20,6 +20,10 @@ fn hydration_reasons_map_to_expected_priorities() {
         HydrationPriority::Normal
     );
     assert_eq!(
+        hydration_priority(&HydrationReason::RemoteFastForward),
+        HydrationPriority::Normal
+    );
+    assert_eq!(
         hydration_priority(&HydrationReason::Prefetch),
         HydrationPriority::Low
     );

@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use afs_connector::ChildContainer;
+use afs_core::freshness::{RemoteObservation, RemoteVersion};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 use afs_core::{AfsError, AfsResult};
 
@@ -132,6 +133,23 @@ pub fn list_container_children(
             let database = api.retrieve_database(database_id.as_str())?;
             list_database_rows(api, &mount_id, &database, parent_path, &mut used_paths)
         }
+    }
+}
+
+pub fn observe_entity(
+    api: &dyn NotionApi,
+    mount_id: MountId,
+    remote_id: &RemoteId,
+) -> AfsResult<RemoteObservation> {
+    match api.retrieve_page(remote_id.as_str()) {
+        Ok(page) => return Ok(page_observation(mount_id, &page)),
+        Err(page_error) => match api.retrieve_database(remote_id.as_str()) {
+            Ok(database) => Ok(database_observation(mount_id, &database)),
+            Err(database_error) => Err(AfsError::InvalidState(format!(
+                "notion object `{}` could not be observed as page ({page_error}) or database ({database_error})",
+                remote_id.as_str()
+            ))),
+        },
     }
 }
 
@@ -500,6 +518,30 @@ fn page_entry(mount_id: MountId, page: &PageDto, title: String, path: PathBuf) -
     }
 }
 
+fn page_observation(mount_id: MountId, page: &PageDto) -> RemoteObservation {
+    let title = page_title(page);
+    let mut used_paths = BTreeSet::new();
+    let path = allocate_page_path(Path::new(""), &title, &page.id, &mut used_paths);
+    let mut observation = RemoteObservation::new(
+        mount_id,
+        RemoteId::new(page.id.clone()),
+        EntityKind::Page,
+        title,
+        path,
+    )
+    .deleted(page.archived || page.in_trash)
+    .with_raw_metadata_json(metadata_json(page));
+
+    if let Some(parent_id) = parent_remote_id(page.parent.as_ref()) {
+        observation = observation.with_parent(parent_id);
+    }
+    if let Some(remote_version) = &page.last_edited_time {
+        observation = observation.with_remote_version(RemoteVersion::new(remote_version.clone()));
+    }
+
+    observation
+}
+
 fn database_entry(
     mount_id: MountId,
     database: &DatabaseDto,
@@ -517,6 +559,48 @@ fn database_entry(
         remote_edited_at: database.last_edited_time.clone(),
         stub_frontmatter: None,
     }
+}
+
+fn database_observation(mount_id: MountId, database: &DatabaseDto) -> RemoteObservation {
+    let title = database_title(database).unwrap_or_else(|| "Untitled database".to_string());
+    let mut used_paths = BTreeSet::new();
+    let path = allocate_directory_path(Path::new(""), &title, &database.id, &mut used_paths);
+    let mut observation = RemoteObservation::new(
+        mount_id,
+        RemoteId::new(database.id.clone()),
+        EntityKind::Database,
+        title,
+        path,
+    )
+    .deleted(database.archived || database.in_trash)
+    .with_raw_metadata_json(metadata_json(database));
+
+    if let Some(parent_id) = parent_remote_id(database.parent.as_ref()) {
+        observation = observation.with_parent(parent_id);
+    }
+    if let Some(remote_version) = &database.last_edited_time {
+        observation = observation.with_remote_version(RemoteVersion::new(remote_version.clone()));
+    }
+
+    observation
+}
+
+fn parent_remote_id(parent: Option<&ParentDto>) -> Option<RemoteId> {
+    let parent = parent?;
+    parent
+        .page_id
+        .as_ref()
+        .or(parent.database_id.as_ref())
+        .or(parent.data_source_id.as_ref())
+        .or(parent.block_id.as_ref())
+        .map(|id| RemoteId::new(id.clone()))
+}
+
+fn metadata_json<T>(value: &T) -> String
+where
+    T: serde::Serialize,
+{
+    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn database_title(database: &DatabaseDto) -> Option<String> {

@@ -117,8 +117,8 @@ The first Notion apply path is intentionally conservative:
 - new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug ~shortid.md` path;
 - unsupported write forms fail before API mutation, including table width or header-mode changes, page/database creation outside database-row files, computed/read-only properties, hosted file uploads/rewrites, multi-data-source row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
 - appends use Notion's current position object, with `start` for prepends and `after_block` for inserts after a known block;
-- before apply, the connector re-reads the page and compares the current Notion edit timestamp against the last-synced timestamp carried by the push executor;
-- after apply, the CLI reconciler fetches changed and created pages, rewrites local files atomically, saves refreshed shadows, updates `remote_edited_at`, and removes the temporary source filename when a created row moves into its projected path.
+- before apply, the connector re-reads the page and compares the current Notion edit timestamp against the Synced Tree version carried by the push executor;
+- after apply, the daemon reconciler fetches changed and created pages, rewrites local files atomically, saves refreshed Synced Tree shadows, updates `remote_edited_at`, and removes the temporary source filename when a created row moves into its projected path.
 
 This gives the end-to-end write loop while preserving the rich inline shapes that the renderer emits. The next fidelity step is widening the inline parser to cover nested annotation/link combinations, local relative-file link resolution, and remaining specialized Notion mention variants.
 

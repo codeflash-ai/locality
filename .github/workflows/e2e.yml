@@ -1,0 +1,48 @@
+name: e2e
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  local-behavior:
+    name: Local e2e behavior
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run architecture behavior e2e
+        run: cargo test -p afs-cli --test architecture_behavior -- --test-threads=1
+      - name: Run local push workflow e2e
+        run: cargo test -p afs-cli --test e2e_push_workflow -- --test-threads=1
+
+  linux-fuse:
+    name: Linux FUSE e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config sqlite3
+      - name: Verify hosted runner exposes FUSE
+        run: |
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse is not present. Real online-only FUSE mount e2e cannot run on this runner."
+            exit 1
+          fi
+      - name: Run real Linux FUSE smoke test
+        run: AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh

@@ -73,6 +73,22 @@ the same time.
 
 ## Operator Guide
 
+Reset a local macOS test machine to a clean AFS install state:
+
+```bash
+make clean-start-plan
+make clean-start
+```
+
+`make clean-start-plan` is a dry run. `make clean-start` stops the desktop app,
+daemon, and File Provider extension; unregisters File Provider domains; removes
+safe AFS mount roots such as `~/Documents/AFS`, `~/Library/CloudStorage/AFS`,
+and `~/Library/CloudStorage/AFS-*`;
+deletes `~/.afs`; removes the installed `/Applications/AFS.app`; and deletes AFS
+connection credentials from the keychain. Run
+`scripts/clean-start.sh --yes --keep-credentials` when testing app install state
+without clearing OAuth/PAT credentials.
+
 Start the daemon in the foreground:
 
 ```bash
@@ -202,11 +218,11 @@ when the platform reports them, and remove/rename notifications are delivered
 but ignored until delete/rename planning is wired.
 
 Write events for hydrated pages are resolved back to stored entities inside the
-runtime. If the file body still matches the stored shadow, the event is treated
-as a daemon-authored projection write and ignored. If the body differs from the
-shadow, the entity transitions to `dirty`. This suppresses feedback from
-hydration, scheduled pull, and explicit pull without relying on fragile timing
-windows or global path ignore lists.
+runtime. If the Local Tree body still matches the Synced Tree shadow, the event
+is treated as a daemon-authored projection write and ignored. If the body
+differs from the shadow, the entity transitions to `dirty`. This suppresses
+feedback from hydration, scheduled pull, and explicit pull without relying on
+fragile timing windows or global path ignore lists.
 
 The daemon also runs a stub access watcher. It scans only stored `virtual` and
 `stub` entity paths under watched mounts and emits a `Read` event when a stub's
@@ -271,13 +287,13 @@ request:
 2. verify the local file is safe to replace;
 3. fetch and render through a `HydrationSource`;
 4. write the rendered Markdown with temp-file-plus-rename;
-5. persist the shadow snapshot;
+5. persist the Synced Tree shadow snapshot;
 6. mark the entity `hydrated` and store the rendered body hash.
 
-Dirty local files are not overwritten. If a non-stub file no longer matches the
-stored shadow body, the executor skips that request and marks the entity `dirty`
-when the hydration ladder allows it. Source or I/O failures leave the request in
-the queue so a later daemon tick can retry.
+Dirty local files are not overwritten. If a non-stub Local Tree file no longer
+matches the Synced Tree shadow body, the executor skips that request and marks
+the entity `dirty` when the hydration ladder allows it. Source or I/O failures
+leave the request in the queue so a later daemon tick can retry.
 
 `afsd::notion` wires `NotionConnector` into this source boundary. It uses the
 Notion connector's fetch path and path-aware render method so daemon hydration
@@ -300,14 +316,14 @@ policy itself:
 The default strategy is intentionally conservative: due scheduler ticks
 enumerate mounts, remote-root pages hydrate so the mounted entry point stays
 usable, small eager-sync workspaces can hydrate through `HydrationPolicy`, and
-already hydrated pages with changed remote timestamps are queued for refresh.
+already hydrated pages with changed Remote Tree versions are queued for refresh.
 Project- or mount-specific strategies can dispatch on `MountConfig` without
 changing the reconciliation mechanics.
 
-For hydrated, dirty, or conflicted entities, enumeration preserves the stored
-remote timestamp until hydration writes a new shadow. That timestamp is the push
-precondition for the current local file, so it must advance with the shadow, not
-with a metadata-only poll.
+For hydrated, dirty, or conflicted entities, enumeration preserves the Synced
+Tree remote version until hydration writes a new shadow. That version is the
+push precondition for the current Local Tree file, so it must advance with the
+shadow, not with a metadata-only poll.
 
 ## Supervisor Events
 
@@ -319,9 +335,10 @@ stateful operations:
 - scheduled pull ticks can enumerate mounts, refresh projections, and queue
   strategy-selected hydration;
 - queued hydration can be drained through a source-specific executor;
-- push jobs can apply connector mutations, refresh shadows, and advance journals;
-- writing a `hydrated` entity marks it `dirty` when the file body differs from
-  the stored shadow;
+- push jobs can apply connector mutations, refresh Synced Tree shadows, and
+  advance journals;
+- writing a `hydrated` entity marks it `dirty` when the Local Tree body differs
+  from the Synced Tree shadow;
 - remove and rename events are ignored until conflict/delete planning is wired.
 
 Conflict materialization remains a later daemon stage.

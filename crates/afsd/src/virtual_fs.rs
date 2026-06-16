@@ -6,22 +6,54 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use afs_connector::{ChildContainer, Connector, ListChildrenRequest};
 use afs_core::canonical::parse_canonical_markdown;
 use afs_core::conflict::has_unresolved_conflict_markers;
+use afs_core::freshness::FreshnessTier;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
-    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    EntityRecord, EntityRepository, FreshnessStateRepository, MountConfig, MountRepository,
+    ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::hydration::{HydrationExecutor, HydrationOutcome, HydrationSource};
 
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
+pub const SOURCE_ROOT_PREFIX: &str = "source:";
 const CHILDREN_PREFIX: &str = "children:";
 const PATH_PREFIX: &str = "path:";
 const LOCAL_PREFIX: &str = "local:";
 const SCHEMA_PREFIX: &str = "schema:";
+
+pub fn source_root_identifier(connector: &str) -> String {
+    format!(
+        "{SOURCE_ROOT_PREFIX}{}",
+        source_root_directory_name(connector)
+    )
+}
+
+pub fn source_root_directory_name(connector: &str) -> String {
+    let normalized = connector
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() {
+                Some(character.to_ascii_lowercase())
+            } else if matches!(character, '-' | '_') {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if normalized.is_empty() {
+        "source".to_string()
+    } else {
+        normalized
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VirtualFsItemReport {
@@ -145,7 +177,15 @@ where
         .list_virtual_mutations(mount_id)
         .map_err(AfsError::from)?;
     let index = ProviderIndex::new(&entities);
-    let container_path = container_path(&entities, container_identifier)?;
+    if container_identifier == ROOT_CONTAINER_IDENTIFIER {
+        return Ok(VirtualFsChildrenReport {
+            mount_id: mount_id.0.clone(),
+            container_identifier: container_identifier.to_string(),
+            children: vec![source_root_item(&mount)],
+        });
+    }
+
+    let container_path = container_path(&mount, &entities, container_identifier)?;
     let mut children = Vec::new();
     let deleted_remote_ids = pending_deleted_remote_ids(&mutations);
 
@@ -232,12 +272,13 @@ where
 {
     let mount = require_virtual_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
-    let parent_path = container_path(&entities, container_identifier)?;
+    let parent_path = container_path(&mount, &entities, container_identifier)?;
     if has_known_entity_child(&entities, &parent_path) {
         return Ok(0);
     }
 
-    let Some(container) = child_container_for_identifier(&entities, container_identifier)? else {
+    let Some(container) = child_container_for_identifier(&mount, &entities, container_identifier)?
+    else {
         return Ok(0);
     };
 
@@ -268,14 +309,14 @@ pub fn virtual_fs_children_refresh_needed<S>(
 where
     S: MountRepository + EntityRepository,
 {
-    require_virtual_mount(store, mount_id)?;
+    let mount = require_virtual_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
-    let parent_path = container_path(&entities, container_identifier)?;
+    let parent_path = container_path(&mount, &entities, container_identifier)?;
     if has_known_entity_child(&entities, &parent_path) {
         return Ok(false);
     }
 
-    child_container_for_identifier(&entities, container_identifier)
+    child_container_for_identifier(&mount, &entities, container_identifier)
         .map(|container| container.is_some())
 }
 
@@ -286,7 +327,7 @@ pub fn materialize_virtual_fs_item<S, Source>(
     identifier: &str,
 ) -> AfsResult<VirtualFsMaterializeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
     Source: HydrationSource + ?Sized,
 {
     let mount = require_virtual_mount(store, mount_id)?;
@@ -342,7 +383,11 @@ pub fn materialize_virtual_fs_item_with_content_root<S, Source>(
     identifier: &str,
 ) -> AfsResult<VirtualFsMaterializeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + VirtualMutationRepository
+        + FreshnessStateRepository,
     Source: HydrationSource + ?Sized,
 {
     let mount = require_virtual_mount(store, mount_id)?;
@@ -452,7 +497,11 @@ pub fn commit_virtual_fs_write<S>(
     contents: &[u8],
 ) -> AfsResult<VirtualFsWriteReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + VirtualMutationRepository
+        + FreshnessStateRepository,
 {
     let mount = require_virtual_mount(store, mount_id)?;
     if mount.read_only {
@@ -523,6 +572,12 @@ where
         entity.hydration = HydrationState::Dirty;
     }
     store.save_entity(entity.clone()).map_err(AfsError::from)?;
+    if matches!(
+        entity.hydration,
+        HydrationState::Dirty | HydrationState::Conflicted
+    ) {
+        record_virtual_local_change(store, &entity)?;
+    }
 
     Ok(VirtualFsWriteReport {
         mount_id: mount_id.0.clone(),
@@ -542,7 +597,7 @@ pub fn create_virtual_fs_file<S>(
     filename: &str,
 ) -> AfsResult<VirtualFsMutationReport>
 where
-    S: MountRepository + EntityRepository + VirtualMutationRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository + FreshnessStateRepository,
 {
     let mount = require_virtual_mount(store, mount_id)?;
     if mount.read_only {
@@ -556,8 +611,8 @@ where
         ));
     }
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
-    let parent_path = container_path(&entities, parent_identifier)?;
-    let parent_remote_id = create_parent_remote_id(&entities, parent_identifier)?;
+    let parent_path = container_path(&mount, &entities, parent_identifier)?;
+    let parent_remote_id = create_parent_remote_id(&mount, &entities, parent_identifier)?;
     let projected_path = parent_path.join(filename);
     ensure_virtual_path_available(store, mount_id, &projected_path)?;
     let path = content_path_for_relative(content_root, &projected_path)?;
@@ -599,7 +654,7 @@ pub fn rename_virtual_fs_item<S>(
     new_filename: &str,
 ) -> AfsResult<VirtualFsMutationReport>
 where
-    S: MountRepository + EntityRepository + VirtualMutationRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository + FreshnessStateRepository,
 {
     let mount = require_virtual_mount(store, mount_id)?;
     if mount.read_only {
@@ -613,7 +668,7 @@ where
         ));
     }
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
-    let new_parent_path = container_path(&entities, new_parent_identifier)?;
+    let new_parent_path = container_path(&mount, &entities, new_parent_identifier)?;
     let new_path = new_parent_path.join(new_filename);
     ensure_virtual_path_available_for_rename(store, mount_id, identifier, &new_path)?;
 
@@ -667,6 +722,7 @@ where
         entity.hydration = HydrationState::Dirty;
     }
     store.save_entity(entity.clone()).map_err(AfsError::from)?;
+    record_virtual_local_change(store, &entity)?;
     let now = now_string();
     let mutation = VirtualMutationRecord {
         mount_id: mount_id.clone(),
@@ -702,7 +758,7 @@ pub fn trash_virtual_fs_item<S>(
     identifier: &str,
 ) -> AfsResult<VirtualFsMutationReport>
 where
-    S: MountRepository + EntityRepository + VirtualMutationRepository,
+    S: MountRepository + EntityRepository + VirtualMutationRepository + FreshnessStateRepository,
 {
     let mount = require_virtual_mount(store, mount_id)?;
     if mount.read_only {
@@ -750,6 +806,7 @@ where
     store
         .save_virtual_mutation(mutation.clone())
         .map_err(AfsError::from)?;
+    record_virtual_local_change(store, &entity)?;
     let index = ProviderIndex::new(&entities);
     let item = entity_item(&mount, &entity, &index);
     Ok(VirtualFsMutationReport {
@@ -841,6 +898,7 @@ fn schema_item_for_container(
     container_identifier: &str,
 ) -> AfsResult<Option<VirtualFsItem>> {
     if container_identifier == ROOT_CONTAINER_IDENTIFIER
+        || container_identifier == source_root_identifier(&mount.connector)
         || container_identifier.starts_with(CHILDREN_PREFIX)
         || container_identifier.starts_with(PATH_PREFIX)
     {
@@ -860,13 +918,16 @@ fn schema_item_for_container(
 }
 
 fn create_parent_remote_id(
+    mount: &MountConfig,
     entities: &[EntityRecord],
     parent_identifier: &str,
 ) -> AfsResult<RemoteId> {
     if let Some(remote_id) = parent_identifier.strip_prefix(CHILDREN_PREFIX) {
         return Ok(RemoteId::new(remote_id));
     }
-    if parent_identifier == ROOT_CONTAINER_IDENTIFIER || parent_identifier.starts_with(PATH_PREFIX)
+    if parent_identifier == ROOT_CONTAINER_IDENTIFIER
+        || parent_identifier == source_root_identifier(&mount.connector)
+        || parent_identifier.starts_with(PATH_PREFIX)
     {
         return Err(AfsError::Unsupported(
             "new virtual filesystem files must be created inside a page or database directory",
@@ -965,6 +1026,27 @@ fn new_local_id() -> String {
     format!("{}{}", LOCAL_PREFIX, unique_suffix())
 }
 
+fn record_virtual_local_change<S>(store: &mut S, entity: &EntityRecord) -> AfsResult<()>
+where
+    S: FreshnessStateRepository,
+{
+    let mut state = store
+        .get_freshness_state(&entity.mount_id, &entity.remote_id)
+        .map_err(AfsError::from)?
+        .unwrap_or_else(|| {
+            afs_store::FreshnessStateRecord::new(
+                entity.mount_id.clone(),
+                entity.remote_id.clone(),
+                FreshnessTier::Hot,
+            )
+        });
+    if FreshnessTier::Hot.is_more_urgent_than(&state.tier) {
+        state.tier = FreshnessTier::Hot;
+    }
+    state.last_local_change_at = Some(now_string());
+    store.save_freshness_state(state).map_err(AfsError::from)
+}
+
 fn unique_suffix() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -989,6 +1071,9 @@ fn resolve_item(
 ) -> AfsResult<VirtualFsItem> {
     if identifier == ROOT_CONTAINER_IDENTIFIER {
         return Ok(root_item(mount));
+    }
+    if identifier == source_root_identifier(&mount.connector) {
+        return Ok(source_root_item(mount));
     }
 
     if let Some(remote_id) = identifier.strip_prefix(CHILDREN_PREFIX) {
@@ -1060,6 +1145,24 @@ fn root_item(mount: &MountConfig) -> VirtualFsItem {
     }
 }
 
+fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
+    let filename = source_root_directory_name(&mount.connector);
+    VirtualFsItem {
+        identifier: source_root_identifier(&mount.connector),
+        parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
+        filename: filename.clone(),
+        kind: VirtualFsItemKind::Folder,
+        entity_kind: None,
+        remote_id: None,
+        path: filename,
+        hydration: None,
+        content_type: "public.folder".to_string(),
+        remote_edited_at: None,
+        materialized_path: Some(mount.root.display().to_string()),
+        byte_size: None,
+    }
+}
+
 fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex) -> VirtualFsItem {
     let kind = match &entity.kind {
         EntityKind::Page | EntityKind::Asset | EntityKind::Unknown(_) => VirtualFsItemKind::File,
@@ -1079,6 +1182,7 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
     VirtualFsItem {
         identifier: entity.remote_id.0.clone(),
         parent_identifier: Some(container_identifier_for_path(
+            mount,
             parent_path(&entity.path),
             index,
         )),
@@ -1096,13 +1200,14 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
 }
 
 fn pending_item(
-    _mount: &MountConfig,
+    mount: &MountConfig,
     mutation: &VirtualMutationRecord,
     index: &ProviderIndex,
 ) -> VirtualFsItem {
     VirtualFsItem {
         identifier: mutation.local_id.clone(),
         parent_identifier: Some(container_identifier_for_path(
+            mount,
             parent_path(&mutation.projected_path),
             index,
         )),
@@ -1179,7 +1284,11 @@ fn page_child_dir_item(
 ) -> VirtualFsItem {
     VirtualFsItem {
         identifier: format!("{CHILDREN_PREFIX}{}", remote_id.0),
-        parent_identifier: Some(container_identifier_for_path(parent_path(path), index)),
+        parent_identifier: Some(container_identifier_for_path(
+            mount,
+            parent_path(path),
+            index,
+        )),
         filename: filename(path),
         kind: VirtualFsItemKind::Folder,
         entity_kind: None,
@@ -1196,7 +1305,11 @@ fn page_child_dir_item(
 fn path_dir_item(mount: &MountConfig, path: &Path, index: &ProviderIndex) -> VirtualFsItem {
     VirtualFsItem {
         identifier: format!("{PATH_PREFIX}{}", path_string(path)),
-        parent_identifier: Some(container_identifier_for_path(parent_path(path), index)),
+        parent_identifier: Some(container_identifier_for_path(
+            mount,
+            parent_path(path),
+            index,
+        )),
         filename: filename(path),
         kind: VirtualFsItemKind::Folder,
         entity_kind: None,
@@ -1210,8 +1323,15 @@ fn path_dir_item(mount: &MountConfig, path: &Path, index: &ProviderIndex) -> Vir
     }
 }
 
-fn container_path(entities: &[EntityRecord], identifier: &str) -> AfsResult<PathBuf> {
+fn container_path(
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+    identifier: &str,
+) -> AfsResult<PathBuf> {
     if identifier == ROOT_CONTAINER_IDENTIFIER {
+        return Ok(PathBuf::new());
+    }
+    if identifier == source_root_identifier(&mount.connector) {
         return Ok(PathBuf::new());
     }
 
@@ -1245,10 +1365,15 @@ fn container_path(entities: &[EntityRecord], identifier: &str) -> AfsResult<Path
 }
 
 fn child_container_for_identifier(
+    mount: &MountConfig,
     entities: &[EntityRecord],
     identifier: &str,
 ) -> AfsResult<Option<ChildContainer>> {
     if identifier == ROOT_CONTAINER_IDENTIFIER {
+        return Ok(None);
+    }
+
+    if identifier == source_root_identifier(&mount.connector) {
         return Ok(Some(ChildContainer::Root));
     }
 
@@ -1304,6 +1429,7 @@ fn entity_identifier(identifier: &str) -> AfsResult<String> {
     if identifier == ROOT_CONTAINER_IDENTIFIER
         || identifier.starts_with(CHILDREN_PREFIX)
         || identifier.starts_with(PATH_PREFIX)
+        || identifier.starts_with(SOURCE_ROOT_PREFIX)
     {
         return Err(AfsError::InvalidState(format!(
             "virtual filesystem identifier `{identifier}` is not a materializable file"
@@ -1438,9 +1564,13 @@ fn write_binary_atomic(path: &Path, contents: &[u8]) -> AfsResult<()> {
     })
 }
 
-fn container_identifier_for_path(path: &Path, index: &ProviderIndex) -> String {
+fn container_identifier_for_path(
+    mount: &MountConfig,
+    path: &Path,
+    index: &ProviderIndex,
+) -> String {
     if path.as_os_str().is_empty() {
-        return ROOT_CONTAINER_IDENTIFIER.to_string();
+        return source_root_identifier(&mount.connector);
     }
 
     if let Some(entity) = index.entities_by_path.get(path)
@@ -1490,12 +1620,13 @@ mod tests {
     };
     use afs_core::{
         AfsError,
+        freshness::FreshnessTier,
         hydration::HydrationRequest,
         model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry},
     };
     use afs_store::{
-        EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-        ProjectionMode, VirtualMutationKind, VirtualMutationRepository,
+        EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
+        MountRepository, ProjectionMode, VirtualMutationKind, VirtualMutationRepository,
     };
 
     use crate::hydration::{HydratedEntity, HydrationSource};
@@ -1540,8 +1671,15 @@ mod tests {
             })
             .expect("save child page");
 
-        let report = virtual_fs_children(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER)
+        let root = virtual_fs_children(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER)
             .expect("root children");
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].filename, "notion");
+        assert_eq!(root.children[0].kind, VirtualFsItemKind::Folder);
+        assert_eq!(root.children[0].identifier, "source:notion");
+
+        let report =
+            virtual_fs_children(&store, &mount_id, "source:notion").expect("source children");
 
         assert_eq!(report.children.len(), 2);
         assert_eq!(report.children[0].filename, "Home");
@@ -1612,30 +1750,20 @@ mod tests {
             expected_parent_path: PathBuf::new(),
         };
 
-        let saved = refresh_virtual_fs_children(
-            &mut store,
-            &connector,
-            &mount_id,
-            ROOT_CONTAINER_IDENTIFIER,
-        )
-        .expect("refresh children");
+        let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "source:notion")
+            .expect("refresh children");
         assert_eq!(saved, 1);
 
-        let report = virtual_fs_children(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER)
-            .expect("root children");
+        let report =
+            virtual_fs_children(&store, &mount_id, "source:notion").expect("source children");
         assert_eq!(report.children.len(), 2);
         assert_eq!(report.children[0].identifier, "children:page-root");
         assert_eq!(report.children[0].kind, VirtualFsItemKind::Folder);
         assert_eq!(report.children[1].identifier, "page-root");
         assert_eq!(report.children[1].kind, VirtualFsItemKind::File);
 
-        let saved = refresh_virtual_fs_children(
-            &mut store,
-            &connector,
-            &mount_id,
-            ROOT_CONTAINER_IDENTIFIER,
-        )
-        .expect("refresh cached children");
+        let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "source:notion")
+            .expect("refresh cached children");
         assert_eq!(saved, 0);
     }
 
@@ -1821,6 +1949,8 @@ mod tests {
                 supports_block_updates: false,
                 supports_databases: false,
                 supports_oauth: false,
+                supports_lazy_child_enumeration: true,
+                ..ConnectorCapabilities::default()
             }
         }
 
@@ -2022,6 +2152,12 @@ mod tests {
                 .hydration,
             HydrationState::Dirty
         );
+        let freshness = store
+            .get_freshness_state(&mount_id, &remote_id)
+            .expect("get freshness")
+            .expect("freshness");
+        assert_eq!(freshness.tier, FreshnessTier::Hot);
+        assert!(freshness.last_local_change_at.is_some());
         let _ = std::fs::remove_dir_all(state_root);
     }
 

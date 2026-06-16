@@ -4,14 +4,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use afs_core::freshness::{FreshnessTier, RemoteVersion};
 use afs_core::hydration::HydrationReason;
 use afs_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ProjectionMode,
+    EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
+    MountRepository, ProjectionMode, RemoteObservationRepository,
 };
 use afsd::execution::{AdvanceScheduledPullJob, DaemonExecutor};
 use afsd::hydration::HydrationQueue;
@@ -85,6 +86,24 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
         .expect("child entity");
     assert_eq!(entity.path, PathBuf::from("Home/Child.md"));
     assert_eq!(entity.hydration, HydrationState::Stub);
+
+    let observation = supervisor
+        .store()
+        .get_remote_observation(&mount_id, &RemoteId::new("child-page"))
+        .expect("get child observation")
+        .expect("child observation");
+    assert_eq!(observation.projected_path, PathBuf::from("Home/Child.md"));
+    assert_eq!(
+        observation.remote_version,
+        Some(RemoteVersion::new("2026-06-10T00:00:00Z"))
+    );
+    let freshness = supervisor
+        .store()
+        .get_freshness_state(&mount_id, &RemoteId::new("child-page"))
+        .expect("get child freshness")
+        .expect("child freshness");
+    assert_eq!(freshness.tier, FreshnessTier::Cold);
+    assert!(!freshness.remote_hint_pending);
 
     let request = supervisor
         .hydration()
@@ -309,6 +328,14 @@ fn scheduled_pull_preserves_hydrated_files_and_queues_changed_remote_refresh() {
 
     assert_eq!(report.stubbed, 0);
     assert_eq!(report.queued_hydrations, 1);
+    assert_eq!(
+        supervisor
+            .hydration()
+            .peek_ready()
+            .expect("remote refresh hydration")
+            .reason,
+        HydrationReason::RemoteFastForward
+    );
     let contents = std::fs::read_to_string(root.join("Roadmap.md")).expect("hydrated file");
     assert!(contents.contains("Local hydrated body."));
     assert!(!contents.contains(CanonicalDocument::STUB_MARKER));
@@ -322,6 +349,13 @@ fn scheduled_pull_preserves_hydrated_files_and_queues_changed_remote_refresh() {
         entity.remote_edited_at,
         Some("2026-06-10T00:00:00Z".to_string())
     );
+    let freshness = supervisor
+        .store()
+        .get_freshness_state(&mount_id, &RemoteId::new("page-1"))
+        .expect("get freshness")
+        .expect("freshness");
+    assert_eq!(freshness.tier, FreshnessTier::Warm);
+    assert!(freshness.remote_hint_pending);
 }
 
 #[test]

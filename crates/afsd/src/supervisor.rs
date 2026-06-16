@@ -1,14 +1,15 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use afs_core::AfsResult;
 use afs_core::conflict::has_unresolved_conflict_markers;
+use afs_core::freshness::FreshnessTier;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::journal::JournalStore;
 use afs_core::model::{EntityKind, HydrationState};
 use afs_store::{
-    EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
-    ShadowRepository, VirtualMutationRepository,
+    EntityRecord, EntityRepository, FreshnessStateRepository, JournalRepository, MountConfig,
+    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 
 use crate::execution::{
@@ -34,7 +35,7 @@ pub struct DaemonSupervisor<S, W, H> {
 
 impl<S, W, H> DaemonSupervisor<S, W, H>
 where
-    S: MountRepository + EntityRepository,
+    S: MountRepository + EntityRepository + FreshnessStateRepository,
     W: FileWatcher,
     H: HydrationEngine,
 {
@@ -72,6 +73,7 @@ where
 
         match event.kind {
             FileEventKind::Read => {
+                record_file_opened(&mut self.store, &entity)?;
                 if should_hydrate_on_read(&entity) {
                     let request = HydrationRequest::new(
                         mount.mount_id.clone(),
@@ -91,7 +93,8 @@ where
                 if entity.hydration.can_transition_to(&next_state) {
                     let mut updated = entity;
                     updated.hydration = next_state;
-                    self.store.save_entity(updated)?;
+                    self.store.save_entity(updated.clone())?;
+                    record_local_change(&mut self.store, &updated)?;
                     report.marked_dirty = 1;
                 } else {
                     report.ignored_events = 1;
@@ -178,10 +181,72 @@ fn write_event_hydration_state(path: &Path, entity: &EntityRecord) -> HydrationS
     }
 }
 
+fn record_file_opened<S>(store: &mut S, entity: &EntityRecord) -> AfsResult<()>
+where
+    S: FreshnessStateRepository,
+{
+    update_freshness_state(store, entity, |state, now| {
+        promote_tier(state, FreshnessTier::Hot);
+        state.last_opened_at = Some(now);
+    })
+}
+
+fn record_local_change<S>(store: &mut S, entity: &EntityRecord) -> AfsResult<()>
+where
+    S: FreshnessStateRepository,
+{
+    update_freshness_state(store, entity, |state, now| {
+        promote_tier(state, FreshnessTier::Hot);
+        state.last_local_change_at = Some(now);
+    })
+}
+
+fn update_freshness_state<S, F>(store: &mut S, entity: &EntityRecord, update: F) -> AfsResult<()>
+where
+    S: FreshnessStateRepository,
+    F: FnOnce(&mut afs_store::FreshnessStateRecord, String),
+{
+    let mut state = store
+        .get_freshness_state(&entity.mount_id, &entity.remote_id)?
+        .unwrap_or_else(|| {
+            afs_store::FreshnessStateRecord::new(
+                entity.mount_id.clone(),
+                entity.remote_id.clone(),
+                default_freshness_tier(entity),
+            )
+        });
+    update(&mut state, freshness_timestamp());
+    store.save_freshness_state(state)?;
+    Ok(())
+}
+
+fn promote_tier(state: &mut afs_store::FreshnessStateRecord, tier: FreshnessTier) {
+    if tier.is_more_urgent_than(&state.tier) {
+        state.tier = tier;
+    }
+}
+
+fn default_freshness_tier(entity: &EntityRecord) -> FreshnessTier {
+    match entity.hydration {
+        HydrationState::Dirty | HydrationState::Conflicted => FreshnessTier::Hot,
+        HydrationState::Hydrated => FreshnessTier::Warm,
+        HydrationState::Virtual | HydrationState::Stub => FreshnessTier::Cold,
+    }
+}
+
+fn freshness_timestamp() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!("unix_ms:{}", duration.as_millis()),
+        Err(_) => "unix_ms:0".to_string(),
+    }
+}
+
 impl<S, W> DaemonExecutor for DaemonSupervisor<S, W, HydrationQueue>
 where
     S: MountRepository
         + EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
         + ShadowRepository
         + JournalRepository
         + JournalStore

@@ -4,18 +4,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_cli::status::{StatusError, StatusOptions, StatusState, run_status};
+use afs_cli::status::{StatusError, StatusOptions, StatusState, StatusSyncState, run_status};
 use afs_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
 };
+use afs_core::freshness::{FreshnessTier, RemoteVersion};
 use afs_core::journal::{JournalEntry, JournalStatus, PushId};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
-    EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository,
+    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+    InMemoryStateStore, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
 use afsd::virtual_fs::virtual_fs_content_path;
 
@@ -162,6 +164,7 @@ fn status_reports_missing_and_conflicted_entities() {
 
     assert_eq!(report.summary.missing, 1);
     assert_eq!(report.summary.conflicted, 1);
+    assert_eq!(report.summary.sync_conflicted, 1);
     assert_eq!(entry_state(&report, "Missing.md"), StatusState::Missing);
     assert_eq!(
         entry_issue(&report, "Missing.md"),
@@ -449,6 +452,133 @@ fn status_reports_pending_virtual_creates_and_deletes() {
     assert_eq!(entry_issue(&report, "Roadmap.md"), "pending_virtual_delete");
 }
 
+#[test]
+fn status_reports_remote_update_available_for_clean_file() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nSame paragraph.");
+    fixture.remote_observation(&mut store, "page-1", "remote-v2", true);
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.clean);
+    assert_eq!(report.summary.remote_update_available, 1);
+    assert_eq!(
+        entry_sync_state(&report, "Roadmap.md"),
+        StatusSyncState::RemoteUpdateAvailable
+    );
+    assert_eq!(
+        status_entry(&report, "Roadmap.md")
+            .remote
+            .synced_tree_version
+            .as_deref(),
+        Some("remote-v1")
+    );
+    assert_eq!(
+        status_entry(&report, "Roadmap.md")
+            .remote
+            .remote_tree_version
+            .as_deref(),
+        Some("remote-v2")
+    );
+    assert_eq!(
+        status_entry(&report, "Roadmap.md")
+            .remote
+            .remote_tree_observed_at
+            .as_deref(),
+        Some("unix_ms:2")
+    );
+    assert_eq!(entry_issue(&report, "Roadmap.md"), "remote_changed");
+}
+
+#[test]
+fn status_reports_review_needed_when_local_and_remote_changed() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nChanged paragraph.");
+    fixture.remote_observation(&mut store, "page-1", "remote-v2", true);
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert_eq!(report.summary.review_needed, 1);
+    assert_eq!(
+        entry_sync_state(&report, "Roadmap.md"),
+        StatusSyncState::ReviewNeeded
+    );
+    assert!(entry_has_issue(&report, "Roadmap.md", "local_body_changed"));
+    assert!(entry_has_issue(
+        &report,
+        "Roadmap.md",
+        "remote_changed_with_local_pending"
+    ));
+}
+
+#[test]
+fn status_reports_checking_freshness_without_attention() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nSame paragraph.");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                FreshnessTier::Hot,
+            )
+            .opened_at("unix_ms:1"),
+        )
+        .expect("save freshness state");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(report.clean);
+    assert_eq!(report.summary.checking_freshness, 1);
+    assert_eq!(
+        entry_sync_state(&report, "Roadmap.md"),
+        StatusSyncState::CheckingFreshness
+    );
+    assert_eq!(entry_issue(&report, "Roadmap.md"), "checking_freshness");
+}
+
 struct StatusFixture {
     root: PathBuf,
     state_root: PathBuf,
@@ -575,6 +705,41 @@ impl StatusFixture {
         fs::write(&path, contents).expect("fixture content cache");
         path
     }
+
+    fn remote_observation<S>(
+        &self,
+        store: &mut S,
+        remote_id: &str,
+        remote_version: &str,
+        remote_hint_pending: bool,
+    ) where
+        S: RemoteObservationRepository + FreshnessStateRepository,
+    {
+        store
+            .save_remote_observation(
+                RemoteObservationRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new(remote_id),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                    "unix_ms:2",
+                )
+                .with_remote_version(RemoteVersion::new(remote_version)),
+            )
+            .expect("save remote observation");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new(remote_id),
+                    FreshnessTier::Hot,
+                )
+                .checked_at("unix_ms:2")
+                .remote_hint_pending(remote_hint_pending),
+            )
+            .expect("save freshness state");
+    }
 }
 
 impl Drop for StatusFixture {
@@ -634,6 +799,7 @@ fn entity_record(
         path,
     )
     .with_hydration(hydration)
+    .with_remote_edited_at("remote-v1")
 }
 
 fn cwd_lock() -> &'static Mutex<()> {
@@ -710,13 +876,23 @@ fn virtual_mutation(
 }
 
 fn entry_state(report: &afs_cli::status::StatusReport, path: &str) -> StatusState {
+    status_entry(report, path).state
+}
+
+fn status_entry<'a>(
+    report: &'a afs_cli::status::StatusReport,
+    path: &str,
+) -> &'a afs_cli::status::StatusEntry {
     report
         .mounts
         .iter()
         .flat_map(|mount| &mount.entries)
         .find(|entry| entry.path == path)
         .expect("status entry")
-        .state
+}
+
+fn entry_sync_state(report: &afs_cli::status::StatusReport, path: &str) -> StatusSyncState {
+    status_entry(report, path).sync_state
 }
 
 fn entry_issue(report: &afs_cli::status::StatusReport, path: &str) -> String {
@@ -731,4 +907,16 @@ fn entry_issue(report: &afs_cli::status::StatusReport, path: &str) -> String {
         .expect("issue")
         .code
         .clone()
+}
+
+fn entry_has_issue(report: &afs_cli::status::StatusReport, path: &str, code: &str) -> bool {
+    report
+        .mounts
+        .iter()
+        .flat_map(|mount| &mount.entries)
+        .find(|entry| entry.path == path)
+        .expect("status entry")
+        .issues
+        .iter()
+        .any(|issue| issue.code == code)
 }

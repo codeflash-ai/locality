@@ -10,7 +10,8 @@ use afs_core::model::{CanonicalDocument, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
+    EntityRecord, EntityRepository, FreshnessStateRepository, MountConfig, MountRepository,
+    ShadowRepository, StoreError,
 };
 
 pub trait HydrationEngine {
@@ -56,7 +57,7 @@ pub struct HydrationExecutor<'a, S, Source: ?Sized> {
 
 impl<'a, S, Source> HydrationExecutor<'a, S, Source>
 where
-    S: MountRepository + EntityRepository + ShadowRepository,
+    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
     Source: HydrationSource + ?Sized,
 {
     pub fn new(store: &'a mut S, source: &'a Source) -> Self {
@@ -95,6 +96,11 @@ where
             .to_path_buf();
         let path = request_path(&mount, &request.path);
         let can_replace = self.can_replace_file(&mount, &entity, &path)?;
+        if !can_replace && request.reason == HydrationReason::RemoteFastForward {
+            self.mark_dirty_if_allowed(entity)?;
+            return Ok(HydrationOutcome::SkippedDirty);
+        }
+
         let rendered = self.source.fetch_render(&request)?;
         if rendered.shadow.entity_id != request.remote_id {
             return Err(AfsError::InvalidState(format!(
@@ -129,6 +135,7 @@ where
                 rendered.remote_edited_at,
             ))
             .map_err(AfsError::from)?;
+        self.clear_remote_hint(&request.mount_id, &request.remote_id)?;
 
         Ok(HydrationOutcome::Hydrated)
     }
@@ -267,6 +274,20 @@ where
         Ok(shadow.frontmatter == rendered.frontmatter
             && shadow.rendered_body == rendered.rendered_body)
     }
+
+    fn clear_remote_hint(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> AfsResult<()> {
+        let Some(mut freshness) = self
+            .store
+            .get_freshness_state(mount_id, remote_id)
+            .map_err(AfsError::from)?
+        else {
+            return Ok(());
+        };
+        freshness.remote_hint_pending = false;
+        self.store
+            .save_freshness_state(freshness)
+            .map_err(AfsError::from)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -386,7 +407,7 @@ pub fn hydration_priority(reason: &HydrationReason) -> HydrationPriority {
         HydrationReason::ExplicitPull | HydrationReason::FileOpen | HydrationReason::StubRead => {
             HydrationPriority::High
         }
-        HydrationReason::Policy => HydrationPriority::Normal,
+        HydrationReason::Policy | HydrationReason::RemoteFastForward => HydrationPriority::Normal,
         HydrationReason::Prefetch => HydrationPriority::Low,
     }
 }

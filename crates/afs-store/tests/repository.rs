@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use afs_core::freshness::{FreshnessTier, RemoteVersion};
 use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalStatus, JournalStore, PushId, PushOperationId,
 };
@@ -7,8 +8,9 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
-    EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, ShadowRepository, StoreError,
+    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+    InMemoryStateStore, JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
+    RemoteObservationRepository, ShadowRepository, StoreError,
 };
 
 #[test]
@@ -121,6 +123,67 @@ fn shadow_document_round_trips_through_snapshot_record() {
             .blocks
             .len(),
         2
+    );
+}
+
+#[test]
+fn remote_observations_track_latest_seen_remote_metadata() {
+    let mut store = InMemoryStateStore::new();
+    let observation = RemoteObservationRecord::new(
+        mount_id(),
+        RemoteId::new("page-1"),
+        EntityKind::Page,
+        "Roadmap",
+        "Roadmap.md",
+        "2026-06-15T00:00:00Z",
+    )
+    .with_parent(RemoteId::new("root"))
+    .with_remote_version(RemoteVersion::new("remote-v1"))
+    .with_raw_metadata_json("{\"source\":\"test\"}");
+
+    store
+        .save_remote_observation(observation.clone())
+        .expect("save observation");
+
+    assert_eq!(
+        store
+            .get_remote_observation(&mount_id(), &RemoteId::new("page-1"))
+            .expect("get observation"),
+        Some(observation.clone())
+    );
+    assert_eq!(
+        store
+            .list_remote_observations(&mount_id())
+            .expect("list observations"),
+        vec![observation]
+    );
+}
+
+#[test]
+fn freshness_state_tracks_scheduling_priority_and_hints() {
+    let mut store = InMemoryStateStore::new();
+    let state = FreshnessStateRecord::new(mount_id(), RemoteId::new("page-1"), FreshnessTier::Hot)
+        .checked_at("2026-06-15T00:00:00Z")
+        .next_check_at("2026-06-15T00:01:00Z")
+        .opened_at("2026-06-15T00:00:05Z")
+        .local_change_at("2026-06-15T00:00:10Z")
+        .remote_hint_pending(true);
+
+    store
+        .save_freshness_state(state.clone())
+        .expect("save freshness");
+
+    assert_eq!(
+        store
+            .get_freshness_state(&mount_id(), &RemoteId::new("page-1"))
+            .expect("get freshness"),
+        Some(state.clone())
+    );
+    assert_eq!(
+        store
+            .list_freshness_states(&mount_id())
+            .expect("list freshness"),
+        vec![state]
     );
 }
 

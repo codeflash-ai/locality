@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use afs_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
-    ListChildrenResult, NativeEntity, ParsedEntity,
+    ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
 };
 use afs_core::canonical::ParsedCanonicalDocument;
+use afs_core::freshness::RemoteObservation;
 use afs_core::hydration::HydrationRequest;
 use afs_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId, TreeEntry};
 use afs_core::planner::PushOperationKind;
@@ -236,6 +237,12 @@ impl Connector for ResolvedSource {
     fn enumerate(&self, request: EnumerateRequest) -> AfsResult<Vec<TreeEntry>> {
         match self {
             Self::Notion(source) => source.enumerate(request),
+        }
+    }
+
+    fn observe(&self, request: ObserveRequest) -> AfsResult<RemoteObservation> {
+        match self {
+            Self::Notion(source) => source.observe(request),
         }
     }
 
