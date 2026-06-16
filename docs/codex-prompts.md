@@ -2,6 +2,7 @@
 
 ## Changelog
 
+- 2026-06-16: Added a rebuildable SQLite FTS candidate index for local metadata search while preserving the shared CLI/desktop search report contract.
 - 2026-06-16: Added hydration-on-locate plumbing: explicit daemon hydration requests and desktop locate prioritization for online-only pages.
 - 2026-06-16: Queued the next implementation slices after local metadata search: desktop shared-search adoption, hydration-on-locate, SQLite FTS, knowledge bundles, security labels, MCP, and templates.
 - 2026-06-16: Added local metadata search direction with `afs search`, connector filtering, remote-observation safety labels, and regression coverage.
@@ -22,9 +23,10 @@ and clippy when the workspace is already clippy-clean.
 2. **Hydration on locate** — when search/locate finds an online-only entity,
    enqueue or request high-priority hydration without waiting for a full
    workspace sync.
-3. **Search index hardening** — add a derived SQLite search index for metadata,
-   breadcrumbs, aliases, recent activity, and frontmatter fields. It must be
-   rebuildable and must not store secrets.
+3. **Search index hardening follow-up** — extend the derived SQLite search
+   index beyond entity/remote-observation metadata into breadcrumbs, aliases,
+   recent activity, and safe frontmatter fields. It must remain rebuildable and
+   must not store secrets.
 4. **Markdown body FTS** — add eventually consistent full-text search over
    hydrated Markdown bodies, with sensitivity/trust filters before agent use.
 5. **Knowledge bundles** — introduce an OKF-inspired, file-native

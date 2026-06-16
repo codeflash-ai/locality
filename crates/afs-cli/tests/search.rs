@@ -8,7 +8,7 @@ use afs_core::freshness::RemoteVersion;
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    RemoteObservationRecord, RemoteObservationRepository,
+    RemoteObservationRecord, RemoteObservationRepository, SqliteStateStore,
 };
 
 #[test]
@@ -113,6 +113,36 @@ fn search_does_not_treat_equal_versionless_observation_as_changed() {
 }
 
 #[test]
+fn search_uses_sqlite_candidate_index_without_changing_report() {
+    let fixture = SearchFixture::new();
+    let mut store = fixture.sqlite_store();
+    fixture.seed_entities(&mut store);
+    store
+        .save_remote_observation(
+            RemoteObservationRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                EntityKind::Page,
+                "Launch Plan",
+                "Engineering/Launch Plan ~aaaaaa.md",
+                "2026-06-16T00:00:00Z",
+            )
+            .with_remote_version(RemoteVersion("remote-v2".to_string())),
+        )
+        .expect("save observation");
+
+    let report = run_search(&store, SearchOptions::new("launch")).expect("search");
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].title, "Roadmap 2026");
+    assert_eq!(report.results[0].state, "remote_update_available");
+    assert_eq!(
+        report.results[0].remote.observed_title.as_deref(),
+        Some("Launch Plan")
+    );
+}
+
+#[test]
 fn search_filters_connectors_and_rejects_empty_queries() {
     let fixture = SearchFixture::new();
     let mut store = fixture.store();
@@ -167,13 +197,20 @@ impl SearchFixture {
 
     fn store(&self) -> InMemoryStateStore {
         let mut store = InMemoryStateStore::new();
+        store.save_mount(self.mount_config()).expect("save mount");
         store
-            .save_mount(
-                MountConfig::new(self.mount_id.clone(), "notion", self.root.join("notion"))
-                    .with_remote_root_id(RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
-            )
-            .expect("save mount");
+    }
+
+    fn sqlite_store(&self) -> SqliteStateStore {
+        let mut store =
+            SqliteStateStore::open(self.root.join("state")).expect("open sqlite search store");
+        store.save_mount(self.mount_config()).expect("save mount");
         store
+    }
+
+    fn mount_config(&self) -> MountConfig {
+        MountConfig::new(self.mount_id.clone(), "notion", self.root.join("notion"))
+            .with_remote_root_id(RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
     }
 
     fn seed_entities<S>(&self, store: &mut S)

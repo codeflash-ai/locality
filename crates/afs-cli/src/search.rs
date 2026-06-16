@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use afs_core::model::{EntityKind, HydrationState, RemoteId};
 use afs_store::{
-    EntityRecord, EntityRepository, MountConfig, MountRepository, RemoteObservationRecord,
-    RemoteObservationRepository, StoreError,
+    EntityRecord, EntityRepository, EntitySearchCandidate, EntitySearchRepository, MountConfig,
+    MountRepository, RemoteObservationRecord, RemoteObservationRepository, StoreError,
 };
 use serde::Serialize;
 
@@ -94,7 +94,7 @@ impl SearchError {
 
 pub fn run_search<S>(store: &S, options: SearchOptions) -> Result<SearchReport, SearchError>
 where
-    S: MountRepository + EntityRepository + RemoteObservationRepository,
+    S: MountRepository + EntityRepository + EntitySearchRepository + RemoteObservationRepository,
 {
     run_search_with_access_roots(store, options, |mount| mount.root.clone())
 }
@@ -105,7 +105,7 @@ pub fn run_search_with_access_roots<S, F>(
     mount_access_root: F,
 ) -> Result<SearchReport, SearchError>
 where
-    S: MountRepository + EntityRepository + RemoteObservationRepository,
+    S: MountRepository + EntityRepository + EntitySearchRepository + RemoteObservationRepository,
     F: Fn(&MountConfig) -> PathBuf,
 {
     let query = options.query.trim().to_string();
@@ -124,25 +124,32 @@ where
         .into_iter()
         .filter(|mount| connector_matches(mount, options.connector.as_deref()))
     {
-        let observations = store
-            .list_remote_observations(&mount.mount_id)
-            .map_err(SearchError::Store)?
-            .into_iter()
-            .map(|observation| (observation.remote_id.clone(), observation))
-            .collect::<BTreeMap<_, _>>();
-        let entities = store
-            .list_entities(&mount.mount_id)
-            .map_err(SearchError::Store)?;
         let access_root = mount_access_root(&mount);
 
-        matches.extend(search_indexed_entities(
-            &mount,
-            &access_root,
-            &entities,
-            &observations,
-            &query,
-            notion_id.as_deref(),
-        ));
+        let mut mount_matches = if let Some(candidates) = store
+            .list_entity_search_candidates(&mount.mount_id, &query, notion_id.as_deref())
+            .map_err(SearchError::Store)?
+        {
+            search_entity_candidates(
+                &mount,
+                &access_root,
+                &candidates,
+                &query,
+                notion_id.as_deref(),
+            )
+        } else {
+            search_all_indexed_entities(store, &mount, &access_root, &query, notion_id.as_deref())?
+        };
+        if mount_matches.len() < options.limit {
+            mount_matches = search_all_indexed_entities(
+                store,
+                &mount,
+                &access_root,
+                &query,
+                notion_id.as_deref(),
+            )?;
+        }
+        matches.extend(mount_matches);
 
         if mount.remote_root_id.as_ref().is_some_and(|remote_id| {
             notion_id
@@ -195,6 +202,36 @@ where
     })
 }
 
+fn search_all_indexed_entities<S>(
+    store: &S,
+    mount: &MountConfig,
+    access_root: &Path,
+    query: &str,
+    notion_id: Option<&str>,
+) -> Result<Vec<SearchResult>, SearchError>
+where
+    S: EntityRepository + RemoteObservationRepository,
+{
+    let observations = store
+        .list_remote_observations(&mount.mount_id)
+        .map_err(SearchError::Store)?
+        .into_iter()
+        .map(|observation| (observation.remote_id.clone(), observation))
+        .collect::<BTreeMap<_, _>>();
+    let entities = store
+        .list_entities(&mount.mount_id)
+        .map_err(SearchError::Store)?;
+
+    Ok(search_indexed_entities(
+        mount,
+        access_root,
+        &entities,
+        &observations,
+        query,
+        notion_id,
+    ))
+}
+
 pub fn notion_id_from_url(url: &str) -> Option<String> {
     let without_query = url.split(['?', '#']).next().unwrap_or(url);
     for segment in without_query.rsplit('/') {
@@ -235,6 +272,53 @@ pub fn search_indexed_entities(
             })
         })
         .collect()
+}
+
+pub fn search_entity_candidates(
+    mount: &MountConfig,
+    access_root: &Path,
+    candidates: &[EntitySearchCandidate],
+    query: &str,
+    notion_id: Option<&str>,
+) -> Vec<SearchResult> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            search_entity_result(
+                mount,
+                access_root,
+                &candidate.entity,
+                candidate.observation.as_ref(),
+                query,
+                notion_id,
+            )
+        })
+        .collect()
+}
+
+fn search_entity_result(
+    mount: &MountConfig,
+    access_root: &Path,
+    entity: &EntityRecord,
+    observation: Option<&RemoteObservationRecord>,
+    query: &str,
+    notion_id: Option<&str>,
+) -> Option<SearchResult> {
+    let score = indexed_entity_score(entity, observation, query, notion_id)?;
+    let remote = remote_state(entity, observation);
+    let result_path = located_entity_path(entity);
+    Some(SearchResult {
+        mount_id: mount.mount_id.0.clone(),
+        connector: mount.connector.clone(),
+        title: entity.title.clone(),
+        kind: entity_kind_name(&entity.kind).to_string(),
+        remote_id: entity.remote_id.0.clone(),
+        path: result_path.display().to_string(),
+        absolute_path: access_root.join(&result_path).display().to_string(),
+        state: search_state(&entity.hydration, &remote).to_string(),
+        remote,
+        score,
+    })
 }
 
 fn indexed_entity_score(

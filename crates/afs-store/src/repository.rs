@@ -56,6 +56,21 @@ pub trait EntityRepository {
     fn delete_entity(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> StoreResult<()>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntitySearchCandidate {
+    pub entity: EntityRecord,
+    pub observation: Option<RemoteObservationRecord>,
+}
+
+pub trait EntitySearchRepository {
+    fn list_entity_search_candidates(
+        &self,
+        mount_id: &MountId,
+        query: &str,
+        compact_remote_id: Option<&str>,
+    ) -> StoreResult<Option<Vec<EntitySearchCandidate>>>;
+}
+
 pub trait VirtualMutationRepository {
     fn save_virtual_mutation(&mut self, mutation: VirtualMutationRecord) -> StoreResult<()>;
     fn get_virtual_mutation(

@@ -24,8 +24,8 @@ pub use records::{
     ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
 };
 pub use repository::{
-    ConnectionRepository, ConnectorProfileRepository, EntityRepository, FreshnessStateRepository,
-    HydrationJobRepository, JournalRepository, MountRepository, RemoteObservationRepository,
-    ShadowRepository, VirtualMutationRepository,
+    ConnectionRepository, ConnectorProfileRepository, EntityRepository, EntitySearchCandidate,
+    EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository, JournalRepository,
+    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 pub use sqlite::SqliteStateStore;
