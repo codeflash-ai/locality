@@ -15,10 +15,10 @@ use afs_core::undo::{UndoOperation, UndoPlanStatus, plan_journal_undo};
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, EntityRecord, EntityRepository,
-    FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
-    JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
-    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    EntitySearchRepository, FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord,
+    HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    StoreError, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -41,7 +41,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 11);
+    assert_eq!(user_version, 12);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -61,7 +61,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 11,
+            supported: 12,
         }
     );
 }
@@ -137,6 +137,75 @@ fn mount_entity_and_shadow_round_trip_after_reopen() {
             .load_shadow(&fixture.mount_id, &RemoteId::new("page-1"))
             .expect("load shadow"),
         shadow
+    );
+}
+
+#[test]
+fn entity_search_candidates_use_sqlite_index() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store.save_entity(entity_record()).expect("save entity");
+
+    let title_matches = store
+        .list_entity_search_candidates(&fixture.mount_id, "road", None)
+        .expect("search title")
+        .expect("sqlite search");
+    assert_eq!(title_matches.len(), 1);
+    assert_eq!(title_matches[0].entity.remote_id, RemoteId::new("page-1"));
+    assert!(title_matches[0].observation.is_none());
+
+    store
+        .save_remote_observation(RemoteObservationRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Launch Plan",
+            "Planning/Launch Plan.md",
+            "2026-06-16T00:00:00Z",
+        ))
+        .expect("save observation");
+    let observed_matches = store
+        .list_entity_search_candidates(&fixture.mount_id, "launch", None)
+        .expect("search observed title")
+        .expect("sqlite search");
+    assert_eq!(observed_matches.len(), 1);
+    assert_eq!(
+        observed_matches[0]
+            .observation
+            .as_ref()
+            .map(|observation| observation.title.as_str()),
+        Some("Launch Plan")
+    );
+
+    store
+        .delete_remote_observation(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("delete observation");
+    assert!(
+        store
+            .list_entity_search_candidates(&fixture.mount_id, "launch", None)
+            .expect("search stale observed title")
+            .expect("sqlite search")
+            .is_empty()
+    );
+
+    let id_matches = store
+        .list_entity_search_candidates(&fixture.mount_id, "ignored", Some("page1"))
+        .expect("search compact id")
+        .expect("sqlite search");
+    assert_eq!(id_matches.len(), 1);
+
+    store
+        .delete_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("delete entity");
+    assert!(
+        store
+            .list_entity_search_candidates(&fixture.mount_id, "road", None)
+            .expect("search deleted entity")
+            .expect("sqlite search")
+            .is_empty()
     );
 }
 
@@ -410,7 +479,7 @@ fn sqlite_store_migrates_v5_projection_and_connections_schema() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 11);
+    assert_eq!(user_version, 12);
     assert_eq!(connection_column_count, 1);
     assert_eq!(projection_column_count, 1);
     assert_eq!(connection_table_count, 1);
@@ -485,7 +554,7 @@ fn sqlite_store_migrates_v6_projection_schema_to_connections() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 11);
+    assert_eq!(user_version, 12);
     assert_eq!(connection_column_count, 1);
     assert_eq!(connection_table_count, 1);
     assert_eq!(
@@ -570,7 +639,7 @@ fn sqlite_store_migrates_v7_hydration_jobs_schema() {
         )
         .expect("hydration_jobs table");
 
-    assert_eq!(user_version, 11);
+    assert_eq!(user_version, 12);
     assert_eq!(hydration_jobs_table_count, 1);
     assert!(
         store
@@ -657,7 +726,7 @@ fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
         )
         .expect("profile_id column");
 
-    assert_eq!(user_version, 11);
+    assert_eq!(user_version, 12);
     assert_eq!(profile_column_count, 1);
     let migrated_connection = store
         .get_connection(&ConnectionId::new("notion-work"))
@@ -672,6 +741,123 @@ fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
             .get_connector_profile(&ConnectorProfileId::new("notion-token-default"))
             .expect("get profile"),
         Some(default_profile())
+    );
+}
+
+#[test]
+fn sqlite_store_migrates_v11_entity_search_index() {
+    let fixture = SqliteFixture::new();
+    fs::create_dir_all(&fixture.state_root).expect("state root");
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "
+            PRAGMA user_version = 11;
+            CREATE TABLE mounts (
+                mount_id TEXT PRIMARY KEY,
+                connector TEXT NOT NULL,
+                root TEXT NOT NULL,
+                remote_root_id TEXT,
+                read_only INTEGER NOT NULL CHECK (read_only IN (0, 1)),
+                projection_json TEXT NOT NULL DEFAULT '\"plain_files\"',
+                connection_id TEXT
+            );
+            CREATE TABLE entities (
+                mount_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                kind_json TEXT NOT NULL,
+                title TEXT NOT NULL,
+                path TEXT NOT NULL,
+                hydration_json TEXT NOT NULL,
+                content_hash TEXT,
+                remote_edited_at TEXT,
+                PRIMARY KEY (mount_id, remote_id),
+                UNIQUE (mount_id, path)
+            );
+            CREATE TABLE remote_observations (
+                mount_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                kind_json TEXT NOT NULL,
+                title TEXT NOT NULL,
+                parent_remote_id TEXT,
+                projected_path TEXT NOT NULL,
+                remote_version_json TEXT NOT NULL DEFAULT 'null',
+                observed_at TEXT NOT NULL,
+                deleted INTEGER NOT NULL CHECK (deleted IN (0, 1)),
+                raw_metadata_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (mount_id, remote_id)
+            );
+            ",
+        )
+        .expect("create v11 schema");
+    connection
+        .execute(
+            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id)
+             VALUES (?1, 'notion', ?2, 'root-page', 0, ?3, NULL)",
+            params![
+                fixture.mount_id.0.as_str(),
+                fixture.mount_root.to_string_lossy(),
+                serde_json::to_string(&ProjectionMode::MacosFileProvider).expect("projection json"),
+            ],
+        )
+        .expect("insert mount");
+    connection
+        .execute(
+            "INSERT INTO entities (
+                mount_id, remote_id, kind_json, title, path, hydration_json,
+                content_hash, remote_edited_at
+             )
+             VALUES (?1, 'page-1', ?2, 'Roadmap', 'Roadmap.md', ?3, NULL, NULL)",
+            params![
+                fixture.mount_id.0.as_str(),
+                serde_json::to_string(&EntityKind::Page).expect("kind json"),
+                serde_json::to_string(&HydrationState::Stub).expect("hydration json"),
+            ],
+        )
+        .expect("insert entity");
+    connection
+        .execute(
+            "INSERT INTO remote_observations (
+                mount_id, remote_id, kind_json, title, parent_remote_id,
+                projected_path, remote_version_json, observed_at, deleted, raw_metadata_json
+             )
+             VALUES (?1, 'page-1', ?2, 'Launch Plan', NULL, 'Planning/Launch Plan.md',
+                     'null', '2026-06-16T00:00:00Z', 0, '{}')",
+            params![
+                fixture.mount_id.0.as_str(),
+                serde_json::to_string(&EntityKind::Page).expect("kind json"),
+            ],
+        )
+        .expect("insert observation");
+    drop(connection);
+
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw reopened connection");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    let search_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'entity_search_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("entity search table");
+
+    assert_eq!(user_version, 12);
+    assert_eq!(search_table_count, 1);
+    let matches = store
+        .list_entity_search_candidates(&fixture.mount_id, "launch", None)
+        .expect("search migrated index")
+        .expect("sqlite search");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(
+        matches[0]
+            .observation
+            .as_ref()
+            .map(|observation| observation.title.as_str()),
+        Some("Launch Plan")
     );
 }
 
@@ -1011,7 +1197,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 11);
+    assert_eq!(user_version, 12);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -1082,7 +1268,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 11);
+    assert_eq!(user_version, 12);
     assert!(entry.apply_effects.is_empty());
 }
 

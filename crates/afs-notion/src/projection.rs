@@ -142,7 +142,7 @@ pub fn observe_entity(
     remote_id: &RemoteId,
 ) -> AfsResult<RemoteObservation> {
     match api.retrieve_page(remote_id.as_str()) {
-        Ok(page) => return Ok(page_observation(mount_id, &page)),
+        Ok(page) => Ok(page_observation(mount_id, &page)),
         Err(page_error) => match api.retrieve_database(remote_id.as_str()) {
             Ok(database) => Ok(database_observation(mount_id, &database)),
             Err(database_error) => Err(AfsError::InvalidState(format!(

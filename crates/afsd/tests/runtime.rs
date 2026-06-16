@@ -516,6 +516,42 @@ fn runtime_drains_hydration_queued_by_read_event() {
 }
 
 #[test]
+fn runtime_queues_explicit_hydration_request() {
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("explicit-hydration"),
+        ReadHydrationRunner {
+            hydrated: hydrated_tx,
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::Hydrate {
+        mount_id: "notion-main".to_string(),
+        remote_id: "page-1".to_string(),
+        path: PathBuf::from("Roadmap.md"),
+    });
+
+    assert!(response.ok);
+    assert_eq!(
+        response
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("queued"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    let request = hydrated_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("hydration drained");
+    assert_eq!(request.mount_id, MountId::new("notion-main"));
+    assert_eq!(request.remote_id, RemoteId::new("page-1"));
+    assert_eq!(request.path, PathBuf::from("Roadmap.md"));
+    assert_eq!(request.reason, HydrationReason::FileOpen);
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_drains_freshness_queued_by_file_event() {
     let (freshness_tx, freshness_rx) = mpsc::channel();
     let runtime = DaemonRuntime::spawn_with_runner(

@@ -2,10 +2,47 @@
 
 ## Changelog
 
+- 2026-06-17: Added the first local template-pack foundation with bundled Founder Proof of Work and Focused Inbox packs plus `afs templates list|validate|new`.
+- 2026-06-16: Added search-result safety labels so future MCP/agent readers can distinguish clean hydrated content from metadata-only, stale, dirty, conflicted, or deleted results.
+- 2026-06-16: Added a rebuildable SQLite FTS candidate index for local metadata search while preserving the shared CLI/desktop search report contract.
+- 2026-06-16: Added hydration-on-locate plumbing: explicit daemon hydration requests and desktop locate prioritization for online-only pages.
+- 2026-06-16: Queued the next implementation slices after local metadata search: desktop shared-search adoption, hydration-on-locate, SQLite FTS, knowledge bundles, security labels, MCP, and templates.
+- 2026-06-16: Added local metadata search direction with `afs search`, connector filtering, remote-observation safety labels, and regression coverage.
 - 2026-06-11: Added end-to-end local Notion OAuth connect flow with localhost callback, OAuth credential bundles in the credential store, PAT fallback, refresh support, and docs.
 - 2026-06-11: Started state-of-the-art connector/auth hardening by adding connector profiles/auth-config records, SQLite v9 migration, profile-aware Notion connections, and `afs profiles`.
 - 2026-06-11: Added first block-support follow-up: callout write/apply support, Tier 1 append regression coverage, and updated Notion block support docs.
 - 2026-06-11: Completed production-hardening sprint phases A-E: Notion block move apply, push preflight, restore/status recovery UX, local provider connections, daemon status/via reporting, and E2E push workflow regression coverage.
+
+## Implementation Queue
+
+Keep this queue ordered by user-visible value and risk. Each slice should remain
+small enough to ship with `cargo fmt --all -- --check`, `cargo test --workspace`,
+and clippy when the workspace is already clippy-clean.
+
+1. **Desktop shared search backend** — make the desktop locate/typeahead path use
+   `afs_cli::search` so CLI, app, and future agent surfaces share one ranking
+   and state-label contract.
+2. **Hydration on locate** — when search/locate finds an online-only entity,
+   enqueue or request high-priority hydration without waiting for a full
+   workspace sync.
+3. **Search index hardening follow-up** — extend the derived SQLite search
+   index beyond entity/remote-observation metadata into breadcrumbs, aliases,
+   recent activity, and safe frontmatter fields. It must remain rebuildable and
+   must not store secrets.
+4. **Markdown body FTS** — add eventually consistent full-text search over
+   hydrated Markdown bodies, with sensitivity/trust filters before agent use.
+5. **Knowledge bundles** — introduce an OKF-inspired, file-native
+   `index.md`/`log.md` bundle pattern for agent memory, source catalogs, and
+   workflow handoff.
+6. **Security labels and quarantine follow-up** — persist trust/sensitivity
+   metadata for generated, external, private, and reviewed content before broad
+   MCP exposure. Search results now expose derived read-safety labels; this
+   follow-up should make them policy-backed and user-editable.
+7. **Read-first MCP server** — expose safe search, locate, status, inspect, and
+   diff tools. Keep push/write operations approval-gated.
+8. **Template/workflow store follow-up** — the local pack foundation exists.
+   Next: add install-from-git, pack checksums/signatures, desktop gallery, and
+   marketplace index metadata.
 
 Actionable prompts from manual E2E testing (June 2026). Each prompt is self-contained for a Codex session. Read `plan.md` and `docs/` before starting any task.
 

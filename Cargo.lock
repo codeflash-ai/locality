@@ -21,6 +21,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "yaml_serde",
 ]
 
 [[package]]

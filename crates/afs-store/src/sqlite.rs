@@ -27,13 +27,14 @@ use crate::records::{
     ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
 };
 use crate::repository::{
-    ConnectionRepository, ConnectorProfileRepository, EntityRepository, FreshnessStateRepository,
-    HydrationJobRepository, JournalRepository, MountRepository, RemoteObservationRepository,
-    ShadowRepository, VirtualMutationRepository,
+    ConnectionRepository, ConnectorProfileRepository, EntityRepository, EntitySearchCandidate,
+    EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository, JournalRepository,
+    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
+const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
 const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
 
 #[derive(Clone, Debug)]
@@ -302,6 +303,8 @@ impl EntityRepository for SqliteStateStore {
     fn save_entity(&mut self, entity: EntityRecord) -> StoreResult<()> {
         let connection = self.connection()?;
         let path = path_to_text(&entity.path);
+        let kind_json = to_json(&entity.kind)?;
+        let hydration_json = to_json(&entity.hydration)?;
         let existing_remote_id: Option<String> = connection
             .query_row(
                 "SELECT remote_id
@@ -342,16 +345,17 @@ impl EntityRepository for SqliteStateStore {
                 content_hash = excluded.content_hash,
                 remote_edited_at = excluded.remote_edited_at",
             params![
-                entity.mount_id.0,
-                entity.remote_id.0,
-                to_json(&entity.kind)?,
-                entity.title,
-                path,
-                to_json(&entity.hydration)?,
-                entity.content_hash,
-                entity.remote_edited_at,
+                &entity.mount_id.0,
+                &entity.remote_id.0,
+                &kind_json,
+                &entity.title,
+                &path,
+                &hydration_json,
+                &entity.content_hash,
+                &entity.remote_edited_at,
             ],
         )?;
+        upsert_entity_search_index(&connection, &entity.mount_id, &entity.remote_id)?;
         Ok(())
     }
 
@@ -399,7 +403,63 @@ impl EntityRepository for SqliteStateStore {
             "DELETE FROM entities WHERE mount_id = ?1 AND remote_id = ?2",
             params![mount_id.0, remote_id.0],
         )?;
+        delete_entity_search_index(&connection, mount_id, remote_id)?;
         Ok(())
+    }
+}
+
+impl EntitySearchRepository for SqliteStateStore {
+    fn list_entity_search_candidates(
+        &self,
+        mount_id: &MountId,
+        query: &str,
+        compact_remote_id: Option<&str>,
+    ) -> StoreResult<Option<Vec<EntitySearchCandidate>>> {
+        let connection = self.connection()?;
+        let remote_ids = if let Some(compact_remote_id) = compact_remote_id {
+            let mut statement = connection.prepare(
+                "SELECT remote_id
+                 FROM entities
+                 WHERE mount_id = ?1
+                   AND replace(lower(remote_id), '-', '') = ?2
+                 LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                params![mount_id.0, compact_remote_id, ENTITY_SEARCH_CANDIDATE_LIMIT],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let Some(match_query) = entity_search_match_query(query) else {
+                return Ok(Some(Vec::new()));
+            };
+            let mut statement = connection.prepare(
+                "SELECT remote_id
+                 FROM entity_search_fts
+                 WHERE entity_search_fts MATCH ?1
+                   AND mount_id = ?2
+                 ORDER BY bm25(entity_search_fts)
+                 LIMIT ?3",
+            )?;
+            let rows = statement.query_map(
+                params![match_query, mount_id.0, ENTITY_SEARCH_CANDIDATE_LIMIT],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut candidates = Vec::with_capacity(remote_ids.len());
+        for remote_id in remote_ids {
+            let remote_id = RemoteId(remote_id);
+            if let Some(entity) = self.get_entity(mount_id, &remote_id)? {
+                candidates.push(EntitySearchCandidate {
+                    entity,
+                    observation: self.get_remote_observation(mount_id, &remote_id)?,
+                });
+            }
+        }
+
+        Ok(Some(candidates))
     }
 }
 
@@ -650,6 +710,13 @@ impl VirtualMutationRepository for SqliteStateStore {
 impl RemoteObservationRepository for SqliteStateStore {
     fn save_remote_observation(&mut self, observation: RemoteObservationRecord) -> StoreResult<()> {
         let connection = self.connection()?;
+        let kind_json = to_json(&observation.kind)?;
+        let remote_version_json = to_json(&observation.remote_version)?;
+        let parent_remote_id = observation
+            .parent_remote_id
+            .as_ref()
+            .map(|remote_id| remote_id.0.as_str());
+        let projected_path = path_to_text(&observation.projected_path);
         connection.execute(
             "INSERT INTO remote_observations (
                 mount_id,
@@ -674,18 +741,19 @@ impl RemoteObservationRepository for SqliteStateStore {
                 deleted = excluded.deleted,
                 raw_metadata_json = excluded.raw_metadata_json",
             params![
-                observation.mount_id.0,
-                observation.remote_id.0,
-                to_json(&observation.kind)?,
-                observation.title,
-                observation.parent_remote_id.map(|remote_id| remote_id.0),
-                path_to_text(&observation.projected_path),
-                to_json(&observation.remote_version)?,
-                observation.observed_at,
+                &observation.mount_id.0,
+                &observation.remote_id.0,
+                &kind_json,
+                &observation.title,
+                parent_remote_id,
+                &projected_path,
+                &remote_version_json,
+                &observation.observed_at,
                 bool_to_int(observation.deleted),
-                observation.raw_metadata_json,
+                &observation.raw_metadata_json,
             ],
         )?;
+        upsert_entity_search_index(&connection, &observation.mount_id, &observation.remote_id)?;
         Ok(())
     }
 
@@ -732,6 +800,7 @@ impl RemoteObservationRepository for SqliteStateStore {
             "DELETE FROM remote_observations WHERE mount_id = ?1 AND remote_id = ?2",
             params![mount_id.0, remote_id.0],
         )?;
+        upsert_entity_search_index(&connection, mount_id, remote_id)?;
         Ok(())
     }
 }
@@ -1192,6 +1261,15 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
 
+        CREATE VIRTUAL TABLE IF NOT EXISTS entity_search_fts USING fts5(
+            mount_id UNINDEXED,
+            remote_id UNINDEXED,
+            title,
+            path,
+            observed_title,
+            observed_path
+        );
+
         CREATE TABLE IF NOT EXISTS journals (
             push_id TEXT PRIMARY KEY,
             mount_id TEXT NOT NULL,
@@ -1350,6 +1428,11 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
                 FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
             );",
         )?;
+    }
+
+    if user_version < 12 {
+        create_entity_search_index(connection)?;
+        rebuild_entity_search_index(connection)?;
     }
 
     if user_version < SCHEMA_VERSION {
@@ -1759,6 +1842,121 @@ fn seed_default_notion_profile(connection: &Connection) -> StoreResult<()> {
         ],
     )?;
     Ok(())
+}
+
+fn create_entity_search_index(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS entity_search_fts USING fts5(
+            mount_id UNINDEXED,
+            remote_id UNINDEXED,
+            title,
+            path,
+            observed_title,
+            observed_path
+        );",
+    )?;
+    Ok(())
+}
+
+fn rebuild_entity_search_index(connection: &Connection) -> StoreResult<()> {
+    create_entity_search_index(connection)?;
+    connection.execute("DELETE FROM entity_search_fts", [])?;
+
+    let entity_ids = {
+        let mut statement = connection.prepare("SELECT mount_id, remote_id FROM entities")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for (mount_id, remote_id) in entity_ids {
+        upsert_entity_search_index(connection, &MountId(mount_id), &RemoteId(remote_id))?;
+    }
+
+    Ok(())
+}
+
+fn upsert_entity_search_index(
+    connection: &Connection,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+) -> StoreResult<()> {
+    delete_entity_search_index(connection, mount_id, remote_id)?;
+
+    let indexed: Option<(String, String, Option<String>, Option<String>)> = connection
+        .query_row(
+            "SELECT e.title, e.path, o.title, o.projected_path
+             FROM entities e
+             LEFT JOIN remote_observations o
+               ON o.mount_id = e.mount_id AND o.remote_id = e.remote_id
+             WHERE e.mount_id = ?1 AND e.remote_id = ?2",
+            params![mount_id.0, remote_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+
+    if let Some((title, path, observed_title, observed_path)) = indexed {
+        connection.execute(
+            "INSERT INTO entity_search_fts (
+                mount_id,
+                remote_id,
+                title,
+                path,
+                observed_title,
+                observed_path
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                mount_id.0,
+                remote_id.0,
+                title,
+                path,
+                observed_title,
+                observed_path,
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn delete_entity_search_index(
+    connection: &Connection,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+) -> StoreResult<()> {
+    create_entity_search_index(connection)?;
+    connection.execute(
+        "DELETE FROM entity_search_fts WHERE mount_id = ?1 AND remote_id = ?2",
+        params![mount_id.0, remote_id.0],
+    )?;
+    Ok(())
+}
+
+fn entity_search_match_query(query: &str) -> Option<String> {
+    let normalized = query
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    let tokens = normalized
+        .split_whitespace()
+        .filter(|token| token.len() >= 2)
+        .take(16)
+        .map(|token| format!("{token}*"))
+        .collect::<Vec<_>>();
+
+    if tokens.is_empty() {
+        return None;
+    }
+
+    Some(tokens.join(" AND "))
 }
 
 fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreResult<bool> {

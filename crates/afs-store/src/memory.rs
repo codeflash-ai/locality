@@ -18,9 +18,9 @@ use crate::records::{
     ShadowSnapshotRecord, VirtualMutationRecord,
 };
 use crate::repository::{
-    ConnectionRepository, ConnectorProfileRepository, EntityRepository, FreshnessStateRepository,
-    HydrationJobRepository, JournalRepository, MountRepository, RemoteObservationRepository,
-    ShadowRepository, VirtualMutationRepository,
+    ConnectionRepository, ConnectorProfileRepository, EntityRepository, EntitySearchRepository,
+    FreshnessStateRepository, HydrationJobRepository, JournalRepository, MountRepository,
+    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -208,6 +208,17 @@ impl EntityRepository for InMemoryStateStore {
                 .remove(&Self::path_key(&entity.mount_id, &entity.path));
         }
         Ok(())
+    }
+}
+
+impl EntitySearchRepository for InMemoryStateStore {
+    fn list_entity_search_candidates(
+        &self,
+        _mount_id: &MountId,
+        _query: &str,
+        _compact_remote_id: Option<&str>,
+    ) -> StoreResult<Option<Vec<crate::repository::EntitySearchCandidate>>> {
+        Ok(None)
     }
 }
 

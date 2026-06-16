@@ -55,7 +55,12 @@ use crate::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon, select_push_targets,
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
+use crate::search::{SearchError, SearchOptions, SearchReport, run_search};
 use crate::status::{StatusError, StatusOptions, StatusReport, StatusSyncState, run_status};
+use crate::templates::{
+    TemplateListReport, TemplateNewOptions, TemplateNewReport, TemplatePackError,
+    TemplateValidateReport, run_template_list, run_template_new, run_template_validate,
+};
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_INTERNAL: i32 = 1;
@@ -115,6 +120,13 @@ enum AfsCommand {
     Info(PathArg),
     #[command(about = "Show local sync state for mounts or paths")]
     Status(PathArg),
+    #[command(about = "Search local mount metadata without contacting remote sources")]
+    Search(SearchArgs),
+    #[command(about = "List, validate, and create local template pack workspaces")]
+    Templates {
+        #[command(subcommand)]
+        command: TemplatesCommand,
+    },
     #[command(about = "Explain local and remote sync state for a path")]
     Inspect(PathArg),
     #[command(about = "Pull remote content into the local projection")]
@@ -327,6 +339,58 @@ struct RestoreCliArgs {
     force: bool,
 }
 
+#[derive(Debug, Args)]
+struct SearchArgs {
+    #[arg(
+        value_name = "query",
+        num_args = 1..,
+        help = "Title, path fragment, remote id, or source URL to find locally."
+    )]
+    query: Vec<String>,
+    #[arg(
+        long,
+        value_name = "connector",
+        help = "Limit search to one connector."
+    )]
+    connector: Option<String>,
+    #[arg(
+        long,
+        value_name = "n",
+        default_value_t = 10,
+        help = "Maximum results."
+    )]
+    limit: usize,
+}
+
+#[derive(Debug, Subcommand)]
+enum TemplatesCommand {
+    #[command(about = "List bundled template packs")]
+    List,
+    #[command(about = "Validate a template pack directory")]
+    Validate(TemplateValidateArgs),
+    #[command(about = "Create a local workspace from a template pack")]
+    New(TemplateNewArgs),
+}
+
+#[derive(Debug, Args)]
+struct TemplateValidateArgs {
+    #[arg(
+        value_name = "path",
+        help = "Template pack directory or manifest path."
+    )]
+    path: String,
+}
+
+#[derive(Debug, Args)]
+struct TemplateNewArgs {
+    #[arg(value_name = "pack", help = "Bundled pack id or local pack path.")]
+    pack: String,
+    #[arg(value_name = "path", help = "Directory to create.")]
+    path: String,
+    #[arg(long, help = "Allow writing into a non-empty target directory.")]
+    force: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum FileProviderCommand {
     #[command(about = "Register a virtual filesystem provider for a mount")]
@@ -459,6 +523,8 @@ pub fn dispatch(args: &[String]) -> i32 {
         AfsCommand::Mount { .. } => mount(&legacy_args[1..], json),
         AfsCommand::Info(_) => info(&legacy_args[1..], json),
         AfsCommand::Status(_) => status(&legacy_args[1..], json),
+        AfsCommand::Search(_) => search(&legacy_args[1..], json),
+        AfsCommand::Templates { .. } => templates(&legacy_args[1..], json),
         AfsCommand::Inspect(_) => inspect(&legacy_args[1..], json),
         AfsCommand::Pull(_) => pull(&legacy_args[1..], json),
         AfsCommand::Push(_) => push(&legacy_args[1..], json),
@@ -578,6 +644,30 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
         AfsCommand::Status(options) => {
             args.push("status".to_string());
             push_optional_positional(&mut args, options.path.as_deref());
+        }
+        AfsCommand::Search(options) => {
+            args.push("search".to_string());
+            for query_part in &options.query {
+                args.push(query_part.clone());
+            }
+            push_optional_flag_value(&mut args, "--connector", options.connector.as_deref());
+            push_flag_value(&mut args, "--limit", &options.limit.to_string());
+        }
+        AfsCommand::Templates { command } => {
+            args.push("templates".to_string());
+            match command {
+                TemplatesCommand::List => args.push("list".to_string()),
+                TemplatesCommand::Validate(options) => {
+                    args.push("validate".to_string());
+                    args.push(options.path.clone());
+                }
+                TemplatesCommand::New(options) => {
+                    args.push("new".to_string());
+                    args.push(options.pack.clone());
+                    args.push(options.path.clone());
+                    push_flag(&mut args, "--force", options.force);
+                }
+            }
         }
         AfsCommand::Inspect(options) => {
             args.push("inspect".to_string());
@@ -1426,6 +1516,142 @@ fn status(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn search(args: &[String], json: bool) -> i32 {
+    let query = positional_args(args).join(" ");
+    let limit = match flag_value(args, "--limit") {
+        Some(value) => match value.parse::<usize>() {
+            Ok(limit) => limit,
+            Err(_) => {
+                return command_error(
+                    json,
+                    CommandError::new(
+                        "search",
+                        "invalid_limit",
+                        "--limit must be a positive integer",
+                    ),
+                    EXIT_USAGE,
+                );
+            }
+        },
+        None => 10,
+    };
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("search", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = SearchOptions {
+        query,
+        connector: flag_value(args, "--connector").map(str::to_string),
+        limit,
+    };
+
+    match run_search(&store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_search_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => search_command_error(json, error),
+    }
+}
+
+fn templates(args: &[String], json: bool) -> i32 {
+    match first_positional(args) {
+        Some("list") => match run_template_list() {
+            Ok(report) if json => {
+                print_json(&report);
+                EXIT_SUCCESS
+            }
+            Ok(report) => {
+                print_template_list_report(&report);
+                EXIT_SUCCESS
+            }
+            Err(error) => template_command_error("templates", json, error),
+        },
+        Some("validate") => {
+            let Some(path) = nth_positional(args, 1) else {
+                return command_error(
+                    json,
+                    CommandError::new(
+                        "templates",
+                        "usage",
+                        "usage: afs templates validate <path> [--json]",
+                    ),
+                    EXIT_USAGE,
+                );
+            };
+            match run_template_validate(PathBuf::from(path)) {
+                Ok(report) if json => {
+                    print_json(&report);
+                    EXIT_SUCCESS
+                }
+                Ok(report) => {
+                    print_template_validate_report(&report);
+                    EXIT_SUCCESS
+                }
+                Err(error) => template_command_error("templates", json, error),
+            }
+        }
+        Some("new") => {
+            let Some(pack) = nth_positional(args, 1) else {
+                return command_error(
+                    json,
+                    CommandError::new(
+                        "templates",
+                        "usage",
+                        "usage: afs templates new <pack> <path> [--force] [--json]",
+                    ),
+                    EXIT_USAGE,
+                );
+            };
+            let Some(path) = nth_positional(args, 2) else {
+                return command_error(
+                    json,
+                    CommandError::new(
+                        "templates",
+                        "usage",
+                        "usage: afs templates new <pack> <path> [--force] [--json]",
+                    ),
+                    EXIT_USAGE,
+                );
+            };
+            match run_template_new(TemplateNewOptions {
+                pack: pack.to_string(),
+                path: PathBuf::from(path),
+                force: has_flag(args, "--force"),
+            }) {
+                Ok(report) if json => {
+                    print_json(&report);
+                    EXIT_SUCCESS
+                }
+                Ok(report) => {
+                    print_template_new_report(&report);
+                    EXIT_SUCCESS
+                }
+                Err(error) => template_command_error("templates", json, error),
+            }
+        }
+        _ => command_error(
+            json,
+            CommandError::new(
+                "templates",
+                "usage",
+                "usage: afs templates list|validate|new [--json]",
+            ),
+            EXIT_USAGE,
+        ),
+    }
+}
+
 fn inspect(args: &[String], json: bool) -> i32 {
     let Some(path) = first_positional(args) else {
         return command_error(
@@ -2236,6 +2462,78 @@ fn print_status_report(report: &StatusReport) {
             report.summary.checking_freshness
         );
     }
+}
+
+fn print_search_report(report: &SearchReport) {
+    if report.results.is_empty() {
+        println!("no local matches for {:?}", report.query);
+        return;
+    }
+
+    for result in &report.results {
+        println!(
+            "{}  {}  {}  {}",
+            result.title, result.kind, result.state, result.path
+        );
+        println!(
+            "  mount: {}  connector: {}  remote: {}",
+            result.mount_id, result.connector, result.remote_id
+        );
+        println!("  path: {}", result.absolute_path);
+        if !result.safety.agent_readable {
+            println!("  safety: {}", result.safety.labels.join(", "));
+        }
+        if result.remote.changed {
+            let state = if result.remote.deleted {
+                "deleted"
+            } else {
+                "changed"
+            };
+            println!("  remote: {state}");
+        }
+    }
+}
+
+fn print_template_list_report(report: &TemplateListReport) {
+    if report.packs.is_empty() {
+        println!("no template packs available");
+        return;
+    }
+
+    for pack in &report.packs {
+        println!("{}  {}  {}", pack.id, pack.version, pack.name);
+        if let Some(description) = &pack.description {
+            println!("  {description}");
+        }
+        if !pack.requires.connectors.is_empty() {
+            println!("  connectors: {}", pack.requires.connectors.join(", "));
+        }
+        if !pack.outputs.is_empty() {
+            println!("  outputs: {}", pack.outputs.join(", "));
+        }
+    }
+}
+
+fn print_template_validate_report(report: &TemplateValidateReport) {
+    println!(
+        "template pack valid: {} {}",
+        report.pack.id, report.pack.version
+    );
+    println!("  path: {}", report.path);
+    if !report.pack.requires.connectors.is_empty() {
+        println!(
+            "  connectors: {}",
+            report.pack.requires.connectors.join(", ")
+        );
+    }
+}
+
+fn print_template_new_report(report: &TemplateNewReport) {
+    println!(
+        "created template workspace {} from {} {}",
+        report.path, report.pack.id, report.pack.version
+    );
+    println!("  files: {}", report.files_written.len());
 }
 
 fn print_inspect_report(report: &InspectReport) {
@@ -3246,6 +3544,38 @@ fn status_command_error(json: bool, error: StatusError, state_root: PathBuf) -> 
     )
 }
 
+fn search_command_error(json: bool, error: SearchError) -> i32 {
+    let exit_code = match &error {
+        SearchError::EmptyQuery | SearchError::InvalidLimit => EXIT_USAGE,
+        SearchError::Store(_) => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("search", error.code(), error.message()),
+        exit_code,
+    )
+}
+
+fn template_command_error(command: &'static str, json: bool, error: TemplatePackError) -> i32 {
+    let exit_code = match &error {
+        TemplatePackError::PackNotFound(_)
+        | TemplatePackError::ManifestMissing(_)
+        | TemplatePackError::ManifestInvalid { .. }
+        | TemplatePackError::InvalidPackId(_)
+        | TemplatePackError::InvalidRelativePath(_)
+        | TemplatePackError::TargetNotDirectory(_)
+        | TemplatePackError::TargetNotEmpty(_)
+        | TemplatePackError::FileExists(_)
+        | TemplatePackError::SymlinkUnsupported(_) => EXIT_USAGE,
+        TemplatePackError::Io(_) => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new(command, error.code(), error.message()),
+        exit_code,
+    )
+}
+
 fn inspect_command_error(json: bool, error: InspectError) -> i32 {
     let exit_code = match &error {
         InspectError::MountNotFound(_)
@@ -3372,6 +3702,28 @@ fn pull_report_exit_code(report: &PullReport) -> i32 {
 
 fn first_positional(args: &[String]) -> Option<&str> {
     nth_positional(args, 0)
+}
+
+fn positional_args(args: &[String]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut skip_next = false;
+
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if takes_value(arg) {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        values.push(arg.clone());
+    }
+
+    values
 }
 
 fn nth_positional(args: &[String], index: usize) -> Option<&str> {
@@ -3583,6 +3935,8 @@ fn takes_value(arg: &str) -> bool {
             | "--display-name"
             | "--redirect-uri"
             | "--broker-url"
+            | "--connector"
+            | "--limit"
     )
 }
 
@@ -3781,6 +4135,33 @@ mod tests {
                 ],
             ),
             (
+                vec!["search", "--help"],
+                vec![
+                    "Usage: afs search",
+                    "Search local mount metadata",
+                    "--connector",
+                    "--limit",
+                ],
+            ),
+            (
+                vec!["templates", "--help"],
+                vec![
+                    "Usage: afs templates",
+                    "Commands:",
+                    "list",
+                    "validate",
+                    "new",
+                ],
+            ),
+            (
+                vec!["templates", "new", "--help"],
+                vec![
+                    "Usage: afs templates new",
+                    "Create a local workspace",
+                    "--force",
+                ],
+            ),
+            (
                 vec!["pull", "--help"],
                 vec!["Usage: afs pull", "Pull remote content", "path", "--json"],
             ),
@@ -3913,6 +4294,46 @@ mod tests {
                 "/tmp/afs-state",
                 "--include-env",
                 "NOTION_TOKEN"
+            ]
+        );
+
+        let cli = parse_cli([
+            "search",
+            "initial",
+            "idea",
+            "--connector",
+            "notion",
+            "--limit",
+            "5",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "search",
+                "initial",
+                "idea",
+                "--connector",
+                "notion",
+                "--limit",
+                "5"
+            ]
+        );
+
+        let cli = parse_cli([
+            "templates",
+            "new",
+            "founder-proof-of-work",
+            "/tmp/founder",
+            "--force",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "templates",
+                "new",
+                "founder-proof-of-work",
+                "/tmp/founder",
+                "--force"
             ]
         );
     }

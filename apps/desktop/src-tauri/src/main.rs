@@ -17,14 +17,18 @@ use afs_cli::file_provider::{
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::push::{PushOptions, PushReport, push_report_exit_code, run_push_with_daemon};
+use afs_cli::search::{
+    SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
+};
 use afs_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
+use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::journal::{JournalEntry, JournalStatus};
-use afs_core::model::MountId;
+use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
 use afs_store::{
-    ConnectionId, ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
+    ConnectionId, ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
     SqliteStateStore, VirtualMutationRepository, open_credential_store,
 };
@@ -132,15 +136,6 @@ struct LocatedItem {
     kind: String,
     local_path: String,
     state: String,
-}
-
-#[derive(Clone)]
-struct IndexedEntityMatch {
-    item: LocatedItem,
-    score: i64,
-    title_key: String,
-    path_key: String,
-    remote_key: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -637,9 +632,7 @@ fn pending_state_for_entry(entry: &afs_cli::status::StatusEntry) -> &'static str
     } else if matches!(
         entry.sync_state,
         StatusSyncState::RemoteUpdateAvailable | StatusSyncState::ReviewNeeded
-    ) {
-        "needs_review"
-    } else if entry
+    ) || entry
         .issues
         .iter()
         .any(|issue| issue.code.contains("large"))
@@ -966,8 +959,8 @@ fn blend_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4],
 }
 
 fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
-    let results = search_notion_index(query, 1)?;
-    results.into_iter().next().ok_or_else(|| {
+    let results = search_notion_results(query, 1)?;
+    let result = results.into_iter().next().ok_or_else(|| {
         if notion_id_from_url(query).is_some() {
             "That Notion page is not in the mounted workspace yet. Make sure it was selected during Notion authorization, then sync the workspace."
                 .to_string()
@@ -975,10 +968,19 @@ fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
             "No local Notion page matched that search yet. Try a page title, path fragment, or Notion URL."
                 .to_string()
         }
-    })
+    })?;
+    prioritize_located_notion_result(&result);
+    Ok(located_item_for_search_result(result))
 }
 
 fn search_notion_index(query: &str, limit: usize) -> Result<Vec<LocatedItem>, String> {
+    Ok(search_notion_results(query, limit)?
+        .into_iter()
+        .map(located_item_for_search_result)
+        .collect::<Vec<_>>())
+}
+
+fn search_notion_results(query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
     let query = query.trim();
     if query.is_empty() || limit == 0 {
         return Ok(Vec::new());
@@ -996,180 +998,71 @@ fn search_notion_index(query: &str, limit: usize) -> Result<Vec<LocatedItem>, St
         return Err("Create a Notion folder before locating pages.".to_string());
     }
 
-    let notion_id = notion_id_from_url(query);
-    let mut matches = Vec::new();
-    for mount in &mounts {
-        let entities = store
-            .list_entities(&mount.mount_id)
-            .map_err(|error| format!("Could not load indexed Notion pages: {error}"))?;
-        matches.extend(search_indexed_entities(
-            mount,
-            &entities,
-            query,
-            notion_id.as_deref(),
-        ));
+    Ok(run_search_with_access_roots(
+        &store,
+        SearchOptions {
+            query: query.to_string(),
+            connector: Some("notion".to_string()),
+            limit,
+        },
+        mount_access_root,
+    )
+    .map_err(|error| format!("Could not search local Notion index: {}", error.message()))?
+    .results)
+}
 
-        if mount.remote_root_id.as_ref().is_some_and(|remote_id| {
-            notion_id
-                .as_ref()
-                .is_some_and(|id| compact_notion_id(&remote_id.0) == *id)
-        }) {
-            matches.push(IndexedEntityMatch {
-                item: LocatedItem {
-                    title: "Notion workspace root".to_string(),
-                    kind: "Workspace".to_string(),
-                    local_path: display_path(&mount_access_root(mount)),
-                    state: "ready".to_string(),
-                },
-                score: 120_000,
-                title_key: "notion workspace root".to_string(),
-                path_key: mount_access_root(mount).display().to_string(),
-                remote_key: notion_id.clone().unwrap_or_default(),
-            });
-        }
+fn prioritize_located_notion_result(result: &SearchResult) {
+    if !should_prioritize_located_result(result) {
+        return;
     }
 
-    matches.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.title_key.cmp(&right.title_key))
-            .then_with(|| left.path_key.cmp(&right.path_key))
-            .then_with(|| left.remote_key.cmp(&right.remote_key))
-    });
-
-    Ok(matches
-        .into_iter()
-        .take(limit)
-        .map(|matched| matched.item)
-        .collect())
-}
-
-fn search_indexed_entities(
-    mount: &MountConfig,
-    entities: &[EntityRecord],
-    query: &str,
-    notion_id: Option<&str>,
-) -> Vec<IndexedEntityMatch> {
-    entities
-        .iter()
-        .filter_map(|entity| {
-            let score = indexed_entity_score(entity, query, notion_id)?;
-            Some(IndexedEntityMatch {
-                item: located_item_for_entity(mount, entity),
-                score,
-                title_key: normalize_search_text(&entity.title),
-                path_key: normalize_search_text(&entity.path.to_string_lossy()),
-                remote_key: compact_notion_id(&entity.remote_id.0),
-            })
-        })
-        .collect()
-}
-
-fn indexed_entity_score(
-    entity: &EntityRecord,
-    query: &str,
-    notion_id: Option<&str>,
-) -> Option<i64> {
-    if let Some(notion_id) = notion_id
-        && (compact_notion_id(&entity.remote_id.0) == notion_id
-            || compact_path_id(&entity.path) == notion_id)
+    let path = PathBuf::from(&result.absolute_path);
+    let request = DaemonRequest::Hydrate {
+        mount_id: result.mount_id.clone(),
+        remote_id: result.remote_id.clone(),
+        path: path.clone(),
+    };
+    if send_request(&default_state_root(), &request)
+        .map(|response| response.ok)
+        .unwrap_or(false)
     {
-        return Some(100_000);
-    }
-    if notion_id.is_some() {
-        return None;
+        return;
     }
 
-    let normalized_query = normalize_search_text(query);
-    let phrase = normalized_query.trim();
-    if phrase.len() < 2 {
-        return None;
+    let hydration = HydrationRequest::new(
+        MountId::new(result.mount_id.clone()),
+        RemoteId::new(result.remote_id.clone()),
+        path,
+        HydrationState::Hydrated,
+        HydrationReason::FileOpen,
+    );
+    if let Ok(mut store) = SqliteStateStore::open(default_state_root()) {
+        let _ = store.upsert_hydration_job(HydrationJobRecord::from(hydration));
     }
-
-    let title = normalize_search_text(&entity.title);
-    let path = normalize_search_text(&entity.path.to_string_lossy());
-    let haystack = format!("{title} {path}");
-    let tokens = phrase
-        .split_whitespace()
-        .filter(|token| token.len() >= 2)
-        .collect::<Vec<_>>();
-    if tokens.is_empty() {
-        return None;
-    }
-
-    if title == phrase {
-        return Some(90_000);
-    }
-    if path == phrase {
-        return Some(86_000);
-    }
-    if title.starts_with(phrase) {
-        return Some(82_000);
-    }
-    if path.starts_with(phrase) {
-        return Some(78_000);
-    }
-    if title.contains(phrase) {
-        return Some(74_000);
-    }
-    if path.contains(phrase) {
-        return Some(70_000);
-    }
-
-    let matched_tokens = tokens
-        .iter()
-        .filter(|token| haystack.contains(**token))
-        .count();
-    if matched_tokens == 0 {
-        return None;
-    }
-
-    let all_tokens_matched = matched_tokens == tokens.len();
-    let title_bonus = tokens
-        .iter()
-        .filter(|token| title.contains(**token))
-        .count() as i64
-        * 500;
-    Some(if all_tokens_matched {
-        60_000 + title_bonus + matched_tokens as i64
-    } else {
-        30_000 + title_bonus + matched_tokens as i64
-    })
 }
 
-fn located_item_for_entity(mount: &MountConfig, entity: &EntityRecord) -> LocatedItem {
-    let local_path = located_entity_path(entity);
+fn should_prioritize_located_result(result: &SearchResult) -> bool {
+    result.kind == "page" && result.state == "online_only"
+}
+
+fn located_item_for_search_result(result: SearchResult) -> LocatedItem {
     LocatedItem {
-        title: entity.title.clone(),
-        kind: format!("{:?}", entity.kind),
-        local_path: display_path(&mount_access_root(mount).join(local_path)),
-        state: hydration_label(&entity.hydration).to_string(),
+        title: result.title,
+        kind: search_kind_label(&result.kind).to_string(),
+        local_path: display_path(Path::new(&result.absolute_path)),
+        state: result.state,
     }
 }
 
-fn hydration_label(hydration: &afs_core::model::HydrationState) -> &'static str {
-    match hydration {
-        afs_core::model::HydrationState::Virtual => "online_only",
-        afs_core::model::HydrationState::Stub => "online_only",
-        afs_core::model::HydrationState::Hydrated => "ready",
-        afs_core::model::HydrationState::Dirty => "pending_changes",
-        afs_core::model::HydrationState::Conflicted => "conflict",
+fn search_kind_label(kind: &str) -> &str {
+    match kind {
+        "page" => "Page",
+        "database" => "Database",
+        "directory" => "Directory",
+        "asset" => "Asset",
+        "workspace" => "Workspace",
+        _ => "Item",
     }
-}
-
-fn located_entity_path(entity: &EntityRecord) -> PathBuf {
-    if entity.kind == afs_core::model::EntityKind::Page
-        && entity
-            .path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("md")
-    {
-        return entity.path.with_extension("md");
-    }
-
-    entity.path.clone()
 }
 
 fn desktop_settings() -> DesktopSettings {
@@ -1477,7 +1370,7 @@ fn display_path(path: &Path) -> String {
 fn default_notion_mount_root() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        return macos_afs_cloud_storage_root().join(source_root_directory_name("notion"));
+        macos_afs_cloud_storage_root().join(source_root_directory_name("notion"))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2376,72 +2269,20 @@ fn env_first(keys: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn notion_id_from_url(url: &str) -> Option<String> {
-    let without_query = url.split(['?', '#']).next().unwrap_or(url);
-    for segment in without_query.rsplit('/') {
-        if let Some(candidate) = compact_notion_id_suffix(segment) {
-            return Some(candidate);
-        }
-    }
-
-    compact_notion_id_suffix(url)
-}
-
-fn compact_path_id(path: &Path) -> String {
-    compact_notion_id_suffix(&path.to_string_lossy()).unwrap_or_default()
-}
-
-fn compact_notion_id_suffix(value: &str) -> Option<String> {
-    let compact = value
-        .chars()
-        .filter(|character| character.is_ascii_hexdigit())
-        .collect::<String>()
-        .to_lowercase();
-    if compact.len() < 32 {
-        return None;
-    }
-
-    Some(compact[compact.len() - 32..].to_string())
-}
-
-fn compact_notion_id(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| character.is_ascii_hexdigit())
-        .collect::<String>()
-        .to_lowercase()
-}
-
-fn normalize_search_text(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-    use afs_store::{ConnectionId, ConnectionRecord, EntityRecord, MountConfig};
+    use afs_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
+    use afs_store::{ConnectionId, ConnectionRecord};
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
         DESKTOP_ACTIVITY_LIMIT, ScreenBounds, TrayVisualState, connection_metadata_changed,
         is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
-        record_desktop_activity, search_indexed_entities, should_hide_tray_popover,
+        record_desktop_activity, should_hide_tray_popover, should_prioritize_located_result,
         tray_icon_image, tray_popover_position, validate_mount_root,
     };
 
@@ -2632,64 +2473,14 @@ mod tests {
     }
 
     #[test]
-    fn local_notion_search_ranks_title_path_and_remote_id_matches() {
-        let temp = TestTempDir::new("notion-search");
-        let mount_id = MountId::new("notion-main");
-        let mount = MountConfig::new(mount_id.clone(), "notion", temp.path());
-        let entities = vec![
-            EntityRecord::new(
-                mount_id.clone(),
-                RemoteId::new("37b3ac0ebb88802cbcf4d53c9cfc4972"),
-                EntityKind::Page,
-                "Initial Idea",
-                "Product/Initial Idea ~37b3ac.md",
-            )
-            .with_hydration(HydrationState::Hydrated),
-            EntityRecord::new(
-                mount_id,
-                RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                EntityKind::Page,
-                "Roadmap 2026",
-                "Engineering/Roadmap 2026 ~aaaaaa.md",
-            ),
-        ];
+    fn locate_prioritizes_only_online_only_pages() {
+        let online_page = search_result("page", "online_only");
+        let hydrated_page = search_result("page", "ready");
+        let online_database = search_result("database", "online_only");
 
-        let title_matches = search_indexed_entities(&mount, &entities, "roadmap", None);
-        assert_eq!(
-            title_matches
-                .first()
-                .map(|matched| matched.item.title.as_str()),
-            Some("Roadmap 2026")
-        );
-
-        let path_matches = search_indexed_entities(&mount, &entities, "product", None);
-        assert_eq!(
-            path_matches
-                .first()
-                .map(|matched| matched.item.title.as_str()),
-            Some("Initial Idea")
-        );
-
-        let id_matches = search_indexed_entities(
-            &mount,
-            &entities,
-            "https://app.notion.com/p/codeflash/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972",
-            Some("37b3ac0ebb88802cbcf4d53c9cfc4972"),
-        );
-        assert_eq!(
-            id_matches
-                .first()
-                .map(|matched| matched.item.state.as_str()),
-            Some("ready")
-        );
-
-        let inaccessible_url_matches = search_indexed_entities(
-            &mount,
-            &entities,
-            "https://app.notion.com/p/codeflash/Initial-Idea-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        );
-        assert!(inaccessible_url_matches.is_empty());
+        assert!(should_prioritize_located_result(&online_page));
+        assert!(!should_prioritize_located_result(&hydrated_page));
+        assert!(!should_prioritize_located_result(&online_database));
     }
 
     #[test]
@@ -2766,6 +2557,25 @@ mod tests {
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
             expires_at: None,
+        }
+    }
+
+    fn search_result(kind: &str, state: &str) -> SearchResult {
+        SearchResult {
+            mount_id: "notion-main".to_string(),
+            connector: "notion".to_string(),
+            title: "Roadmap".to_string(),
+            kind: kind.to_string(),
+            remote_id: "page-1".to_string(),
+            path: "Roadmap.md".to_string(),
+            absolute_path: "/tmp/afs/Roadmap.md".to_string(),
+            state: state.to_string(),
+            safety: SearchSafety {
+                agent_readable: state == "ready",
+                labels: vec![state.to_string()],
+            },
+            remote: SearchRemoteState::default(),
+            score: 0,
         }
     }
 }

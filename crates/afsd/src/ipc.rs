@@ -25,6 +25,11 @@ pub enum DaemonRequest {
         assume_yes: bool,
         confirm_dangerous: bool,
     },
+    Hydrate {
+        mount_id: String,
+        remote_id: String,
+        path: PathBuf,
+    },
     VirtualFsItem {
         mount_id: String,
         identifier: String,

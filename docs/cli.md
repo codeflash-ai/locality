@@ -13,6 +13,8 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs daemon status [--json]`
 - `afs info [path] [--json]`
 - `afs status [path] [--json]`
+- `afs search <query> [--connector <connector>] [--limit <n>] [--json]`
+- `afs templates list|validate|new [args] [--json]`
 - `afs inspect <path> [--json]`
 - `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
@@ -75,6 +77,98 @@ Auth error JSON uses stable codes:
 - `connection_probe_failed`: Notion rejected the token during `connect`.
 
 Auth failures exit `1` and include `suggested_command` when there is an obvious recovery command.
+
+## Local Search
+
+`afs search <query>` searches local mount metadata only. It reads SQLite mount,
+entity, and remote-observation records; it does not call Notion or any other
+remote connector. This makes search safe for desktop typeahead, large-workspace
+navigation, and future agent/MCP surfaces.
+
+Examples:
+
+```bash
+afs search roadmap
+afs search "Initial Idea"
+afs search https://app.notion.com/p/codeflash/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972
+afs search roadmap --connector notion --limit 5 --json
+```
+
+Human output lists title, entity kind, local state, projected path, mount,
+connector, and remote id. Results that are not safe for direct agent reads also
+print compact safety labels. JSON output is stable enough for tools:
+
+```json
+{
+  "ok": true,
+  "command": "search",
+  "query": "roadmap",
+  "connector": "notion",
+  "count": 1,
+  "results": [
+    {
+      "mount_id": "notion-main",
+      "connector": "notion",
+      "title": "Roadmap 2026",
+      "kind": "page",
+      "remote_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "path": "Engineering/Roadmap 2026 ~aaaaaa.md",
+      "absolute_path": "/Users/alice/afs/notion/Engineering/Roadmap 2026 ~aaaaaa.md",
+      "state": "ready",
+      "safety": {
+        "agent_readable": true,
+        "labels": ["ready"]
+      },
+      "remote": {
+        "observed_title": null,
+        "observed_path": null,
+        "observed_at": null,
+        "changed": false,
+        "deleted": false
+      }
+    }
+  ]
+}
+```
+
+`state` is derived from local hydration plus the latest cheap remote observation:
+`online_only`, `ready`, `pending_changes`, `conflict`,
+`remote_update_available`, `remote_deleted`, or `review_needed`. Because search
+is local-only, run `afs pull`, `afs inspect`, or use the daemon freshness queue
+when you need the newest remote facts.
+
+`safety.agent_readable` is true only for clean hydrated results. Online-only,
+dirty, conflicted, stale, or remotely deleted results are still returned for
+navigation, but future agent/MCP readers should treat their `safety.labels` as
+review or hydration requirements before reading file content.
+
+## Template Packs
+
+`afs templates` manages local-first workflow packs. A pack is a directory with
+`.agentfs-pack.yaml` plus Markdown templates, workflows, policies, and output
+folders. Packs are copied into local workspaces only; the command does not call
+connectors or a remote marketplace.
+
+Examples:
+
+```bash
+afs templates list
+afs templates validate ./templates/packs/founder-proof-of-work
+afs templates new founder-proof-of-work ~/afs/founder-proof
+afs templates new focused-inbox ~/afs/focused-inbox --json
+```
+
+Bundled packs today:
+
+- `founder-proof-of-work`: progress log, user evidence, investor/YC drafts,
+  proof-of-work site draft, and deck workflow notes.
+- `focused-inbox`: local queue for replies, decisions, waiting-on items, and
+  noise-cutting source filters.
+
+`afs templates new <pack> <path>` requires an empty target directory by default.
+Use `--force` to write into a non-empty target and overwrite matching files.
+The manifest records required connectors as metadata only; installing a pack
+does not connect or mount those sources.
 
 ## Initial `afs mount` and `afs pull`
 

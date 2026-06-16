@@ -1,0 +1,13 @@
+id: founder-proof-of-work
+name: Founder Proof of Work
+version: 0.1.0
+description: Local workspace for tracking shipped work, user evidence, updates, decks, and public proof-of-work artifacts.
+requires:
+  connectors: []
+outputs:
+  - markdown
+  - html
+  - pptx
+safety:
+  default_visibility: private
+  requires_review: true

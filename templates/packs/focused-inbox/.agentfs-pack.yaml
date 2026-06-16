@@ -1,0 +1,11 @@
+id: focused-inbox
+name: Focused Inbox
+version: 0.1.0
+description: Local workspace for cutting social and notification noise into reviewed decisions, replies, and next actions.
+requires:
+  connectors: []
+outputs:
+  - markdown
+safety:
+  default_visibility: private
+  requires_review: true

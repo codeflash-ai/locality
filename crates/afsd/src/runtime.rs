@@ -983,6 +983,26 @@ impl RuntimeState {
                 });
                 self.maybe_start_next_job();
             }
+            DaemonRequest::Hydrate {
+                mount_id,
+                remote_id,
+                path,
+            } => {
+                self.queue_hydration(HydrationRequest::new(
+                    MountId::new(mount_id.clone()),
+                    RemoteId::new(remote_id.clone()),
+                    path.clone(),
+                    HydrationState::Hydrated,
+                    HydrationReason::FileOpen,
+                ));
+                let _ = respond_to.send(DaemonResponse::ok(json!({
+                    "queued": true,
+                    "mount_id": mount_id,
+                    "remote_id": remote_id,
+                    "path": path,
+                })));
+                self.maybe_start_next_job();
+            }
             DaemonRequest::VirtualFsItem {
                 mount_id,
                 identifier,

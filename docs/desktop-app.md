@@ -181,7 +181,7 @@ Suggested command/API shape:
 
 ```text
 afs locate notion <url> --json
-afs search notion <query> --json
+afs search <query> --connector notion --json
 ```
 
 The response should include the mount, local path, entity type, whether the file
