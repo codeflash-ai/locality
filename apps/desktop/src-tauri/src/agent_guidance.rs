@@ -1,13 +1,16 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::{Map, Value, json};
 
 const MANAGED_START: &str = "<!-- AFS_AGENT_GUIDANCE_START -->";
 const MANAGED_END: &str = "<!-- AFS_AGENT_GUIDANCE_END -->";
 const DEFAULT_NOTION_MOUNT: &str = "~/Library/CloudStorage/AFS/notion";
+const MCP_SERVER_NAME: &str = "afs";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,10 +36,25 @@ enum InstallKind {
     ManagedInstructions,
 }
 
+#[derive(Clone, Copy)]
+enum McpInstallKind {
+    CodexToml,
+    McpServersJson,
+    CopilotServersJson,
+}
+
 struct AgentTargetSpec {
     agent: &'static str,
     path: PathBuf,
     kind: InstallKind,
+    detected: bool,
+    detail: &'static str,
+}
+
+struct McpTargetSpec {
+    agent: &'static str,
+    path: PathBuf,
+    kind: McpInstallKind,
     detected: bool,
     detail: &'static str,
 }
@@ -66,6 +84,7 @@ pub fn install_agent_guidance(mount_path: Option<&str>) -> AgentGuidanceInstallR
         }
         targets.push(install_target(&spec, &mount_path));
     }
+    targets.extend(install_mcp_targets(&home));
 
     if targets.is_empty() {
         targets.push(AgentGuidanceTarget {
@@ -82,6 +101,35 @@ pub fn install_agent_guidance(mount_path: Option<&str>) -> AgentGuidanceInstallR
         targets,
         prompt,
     }
+}
+
+fn install_mcp_targets(home: &Path) -> Vec<AgentGuidanceTarget> {
+    let specs = mcp_target_specs(home)
+        .into_iter()
+        .filter(|spec| spec.detected)
+        .collect::<Vec<_>>();
+    if specs.is_empty() {
+        return Vec::new();
+    }
+
+    let token = match afsd::mcp::ensure_mcp_token(&default_state_root()) {
+        Ok(token) => token,
+        Err(error) => {
+            return vec![AgentGuidanceTarget {
+                agent: "AFS MCP".to_string(),
+                status: "failed".to_string(),
+                path: Some(display_path(&afsd::mcp::mcp_token_path(
+                    &default_state_root(),
+                ))),
+                detail: error,
+            }];
+        }
+    };
+
+    specs
+        .iter()
+        .map(|spec| install_mcp_target(spec, &token))
+        .collect()
 }
 
 fn agent_target_specs(home: &Path) -> Vec<AgentTargetSpec> {
@@ -157,6 +205,64 @@ fn agent_target_specs(home: &Path) -> Vec<AgentTargetSpec> {
     ]
 }
 
+fn mcp_target_specs(home: &Path) -> Vec<McpTargetSpec> {
+    let claude_detected = path_exists(home.join(".claude"))
+        || path_exists(home.join(".claude.json"))
+        || command_exists("claude")
+        || mac_app_exists(home, "Claude.app");
+    let codex_detected = path_exists(home.join(".codex"))
+        || command_exists("codex")
+        || mac_app_exists(home, "Codex.app");
+    let cursor_detected = cursor_detected(home);
+    let windsurf_detected = windsurf_detected(home);
+    let copilot_detected = gh_copilot_extension_exists(home) || path_exists(home.join(".copilot"));
+
+    vec![
+        McpTargetSpec {
+            agent: "Claude MCP",
+            path: home.join(".claude.json"),
+            kind: McpInstallKind::McpServersJson,
+            detected: claude_detected,
+            detail: "Configured the AFS MCP fallback for Claude local agents.",
+        },
+        McpTargetSpec {
+            agent: "Claude Desktop MCP",
+            path: home.join("Library/Application Support/Claude/claude_desktop_config.json"),
+            kind: McpInstallKind::McpServersJson,
+            detected: mac_app_exists(home, "Claude.app"),
+            detail: "Configured the AFS MCP fallback for Claude Desktop.",
+        },
+        McpTargetSpec {
+            agent: "Codex MCP",
+            path: home.join(".codex/config.toml"),
+            kind: McpInstallKind::CodexToml,
+            detected: codex_detected,
+            detail: "Configured the AFS MCP fallback for Codex.",
+        },
+        McpTargetSpec {
+            agent: "Cursor MCP",
+            path: home.join(".cursor/mcp.json"),
+            kind: McpInstallKind::McpServersJson,
+            detected: cursor_detected,
+            detail: "Configured the AFS MCP fallback for Cursor.",
+        },
+        McpTargetSpec {
+            agent: "Windsurf MCP",
+            path: home.join(".windsurf/mcp.json"),
+            kind: McpInstallKind::McpServersJson,
+            detected: windsurf_detected,
+            detail: "Configured the AFS MCP fallback for Windsurf.",
+        },
+        McpTargetSpec {
+            agent: "GitHub Copilot MCP",
+            path: home.join(".config/github-copilot/intellij/mcp.json"),
+            kind: McpInstallKind::CopilotServersJson,
+            detected: copilot_detected,
+            detail: "Configured the AFS MCP fallback for GitHub Copilot.",
+        },
+    ]
+}
+
 fn install_target(spec: &AgentTargetSpec, mount_path: &str) -> AgentGuidanceTarget {
     let contents = match spec.kind {
         InstallKind::Skill => skill_markdown(mount_path),
@@ -165,6 +271,31 @@ fn install_target(spec: &AgentTargetSpec, mount_path: &str) -> AgentGuidanceTarg
     let result = match spec.kind {
         InstallKind::Skill => write_if_changed(&spec.path, &contents),
         InstallKind::ManagedInstructions => write_managed_section(&spec.path, &contents),
+    };
+
+    match result {
+        Ok(action) => AgentGuidanceTarget {
+            agent: spec.agent.to_string(),
+            status: action.to_string(),
+            path: Some(display_path(&spec.path)),
+            detail: spec.detail.to_string(),
+        },
+        Err(error) => AgentGuidanceTarget {
+            agent: spec.agent.to_string(),
+            status: "failed".to_string(),
+            path: Some(display_path(&spec.path)),
+            detail: error,
+        },
+    }
+}
+
+fn install_mcp_target(spec: &McpTargetSpec, token: &str) -> AgentGuidanceTarget {
+    let result = match spec.kind {
+        McpInstallKind::CodexToml => install_codex_mcp_config(&spec.path, token),
+        McpInstallKind::McpServersJson => install_mcp_servers_json_config(&spec.path, token),
+        McpInstallKind::CopilotServersJson => {
+            install_copilot_servers_json_config(&spec.path, token)
+        }
     };
 
     match result {
@@ -209,6 +340,18 @@ AFS projects connected company sources, including Notion, into the local filesys
 5. If an AFS CLI is available, use `afs status` only when you need to inspect pending changes; regular clean files hydrate automatically on open.
 6. Only push when the user explicitly asks. Run `afs diff <file>` first, then `afs push <file> -y` for safe plans.
 7. If push says the remote changed since last sync, run `afs pull <file>`, resolve any inline conflict markers in the Markdown, rerun `afs diff <file>`, then push again.
+
+## MCP fallback
+
+If your sandbox cannot run the host `afs` CLI, use the MCP tool named `afs`.
+Pass the same CLI arguments as JSON `argv`, for example:
+
+```json
+{{"argv":["status","{mount_path}","--json"]}}
+```
+
+AFS configures this fallback automatically for supported local agents. Prefer
+direct CLI execution whenever it is available.
 
 ## Suggested user prompt
 
@@ -263,6 +406,173 @@ fn write_managed_section(path: &Path, block: &str) -> Result<&'static str, Strin
     Ok("installed")
 }
 
+fn install_codex_mcp_config(path: &Path, token: &str) -> Result<&'static str, String> {
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let stripped = remove_toml_table(&existing, "mcp_servers.afs");
+    let block = format!(
+        "[mcp_servers.{MCP_SERVER_NAME}]\nurl = \"{}\"\nhttp_headers = {{ Authorization = \"Bearer {token}\" }}\n",
+        mcp_endpoint()
+    );
+    let next = append_toml_block(&stripped, &block);
+    write_private_if_changed(path, &next)
+}
+
+fn remove_toml_table(contents: &str, table: &str) -> String {
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for line in contents.lines() {
+        if let Some(name) = toml_table_name(line) {
+            if name == table || name.starts_with(&format!("{table}.")) {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                skipping = false;
+            }
+        }
+        if !skipping {
+            out.push(line);
+        }
+    }
+    let mut next = out.join("\n");
+    if contents.ends_with('\n') && !next.is_empty() {
+        next.push('\n');
+    }
+    next
+}
+
+fn toml_table_name(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        Some(trimmed.trim_start_matches('[').trim_end_matches(']').trim())
+    } else {
+        None
+    }
+}
+
+fn append_toml_block(existing: &str, block: &str) -> String {
+    let trimmed = existing.trim_end();
+    if trimmed.is_empty() {
+        block.to_string()
+    } else {
+        format!("{trimmed}\n\n{block}")
+    }
+}
+
+fn install_mcp_servers_json_config(path: &Path, token: &str) -> Result<&'static str, String> {
+    let mut root = read_json_config(path)?;
+    let object = ensure_object(&mut root);
+    let servers = object
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| json!({}));
+    let servers = ensure_object(servers);
+    servers.insert(MCP_SERVER_NAME.to_string(), mcp_server_json(token));
+    write_json_config(path, &root)
+}
+
+fn install_copilot_servers_json_config(path: &Path, token: &str) -> Result<&'static str, String> {
+    let mut root = read_json_config(path)?;
+    let object = ensure_object(&mut root);
+    let servers = object
+        .entry("servers".to_string())
+        .or_insert_with(|| json!({}));
+    let servers = ensure_object(servers);
+    servers.insert(
+        MCP_SERVER_NAME.to_string(),
+        json!({
+            "url": mcp_endpoint(),
+            "requestInit": {
+                "headers": {
+                    "Authorization": format!("Bearer {token}")
+                }
+            }
+        }),
+    );
+    write_json_config(path, &root)
+}
+
+fn mcp_server_json(token: &str) -> Value {
+    json!({
+        "type": "http",
+        "url": mcp_endpoint(),
+        "headers": {
+            "Authorization": format!("Bearer {token}")
+        }
+    })
+}
+
+fn read_json_config(path: &Path) -> Result<Value, String> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("Could not read `{}`: {error}", path.display()))?;
+    if contents.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    let without_line_comments = strip_json_line_comments(&contents);
+    serde_json::from_str(&without_line_comments)
+        .map_err(|error| format!("Could not parse `{}` as JSON: {error}", path.display()))
+}
+
+fn strip_json_line_comments(contents: &str) -> String {
+    contents
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    value.as_object_mut().expect("JSON value is object")
+}
+
+fn write_json_config(path: &Path, value: &Value) -> Result<&'static str, String> {
+    let contents = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("Could not serialize `{}`: {error}", path.display()))?;
+    write_private_if_changed(path, &(contents + "\n"))
+}
+
+fn write_private_if_changed(path: &Path, contents: &str) -> Result<&'static str, String> {
+    if let Ok(existing) = fs::read_to_string(path)
+        && existing == contents
+    {
+        protect_private_file(path)?;
+        return Ok("installed");
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create `{}`: {error}", parent.display()))?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("Could not write `{}`: {error}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| format!("Could not write `{}`: {error}", path.display()))?;
+    protect_private_file(path)?;
+    Ok("installed")
+}
+
+fn protect_private_file(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("Could not protect `{}`: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn replace_managed_section(existing: &str, block: &str) -> String {
     let Some(start) = existing.find(MANAGED_START) else {
         let trimmed = existing.trim_end();
@@ -306,6 +616,22 @@ fn normalized_mount_path(mount_path: Option<&str>) -> String {
 
 fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
+}
+
+fn default_state_root() -> PathBuf {
+    if let Ok(value) = env::var("AFS_STATE_DIR") {
+        return PathBuf::from(value);
+    }
+
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home).join(".afs");
+    }
+
+    PathBuf::from(".afs")
+}
+
+fn mcp_endpoint() -> String {
+    format!("http://{}/mcp", afsd::mcp::DEFAULT_MCP_ADDR)
 }
 
 fn command_exists(command: &str) -> bool {
@@ -402,6 +728,7 @@ mod tests {
         assert!(skill.contains("pending for AFS review"));
         assert!(skill.contains("afs diff <file>"));
         assert!(skill.contains("remote changed since last sync"));
+        assert!(skill.contains("AFS configures this fallback automatically"));
     }
 
     #[test]
@@ -455,6 +782,74 @@ mod tests {
             .expect("create gh copilot extension");
         assert!(gh_copilot_extension_exists(&temp));
 
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn codex_mcp_config_replaces_existing_afs_table() {
+        let temp = temp_root("afs-agent-guidance-codex-mcp");
+        let config = temp.join("config.toml");
+        fs::write(
+            &config,
+            "model = \"gpt\"\n\n[mcp_servers.afs]\nurl = \"old\"\n\n[mcp_servers.other]\nurl = \"keep\"\n",
+        )
+        .expect("write config");
+
+        install_codex_mcp_config(&config, "secret-token").expect("install config");
+        let contents = fs::read_to_string(&config).expect("read config");
+
+        assert!(contents.contains("model = \"gpt\""));
+        assert!(contents.contains("[mcp_servers.other]"));
+        assert!(contents.contains("[mcp_servers.afs]"));
+        assert!(contents.contains("Authorization = \"Bearer secret-token\""));
+        assert!(!contents.contains("url = \"old\""));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn mcp_json_config_preserves_other_servers() {
+        let temp = temp_root("afs-agent-guidance-json-mcp");
+        let config = temp.join("mcp.json");
+        fs::write(
+            &config,
+            r#"{"mcpServers":{"other":{"url":"https://example.test/mcp"}}}"#,
+        )
+        .expect("write config");
+
+        install_mcp_servers_json_config(&config, "secret-token").expect("install config");
+        let contents = fs::read_to_string(&config).expect("read config");
+        let json: Value = serde_json::from_str(&contents).expect("json");
+
+        assert_eq!(
+            json["mcpServers"]["other"]["url"],
+            "https://example.test/mcp"
+        );
+        assert_eq!(json["mcpServers"]["afs"]["type"], "http");
+        assert_eq!(
+            json["mcpServers"]["afs"]["headers"]["Authorization"],
+            "Bearer secret-token"
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn copilot_json_config_accepts_comment_only_template() {
+        let temp = temp_root("afs-agent-guidance-copilot-mcp");
+        let config = temp.join("mcp.json");
+        fs::write(
+            &config,
+            "{\n  \"servers\": {\n    // add your servers here\n  }\n}\n",
+        )
+        .expect("write config");
+
+        install_copilot_servers_json_config(&config, "secret-token").expect("install config");
+        let contents = fs::read_to_string(&config).expect("read config");
+        let json: Value = serde_json::from_str(&contents).expect("json");
+
+        assert_eq!(
+            json["servers"]["afs"]["requestInit"]["headers"]["Authorization"],
+            "Bearer secret-token"
+        );
         let _ = fs::remove_dir_all(temp);
     }
 

@@ -106,6 +106,7 @@ dependencies = [
  "afs-notion",
  "afs-store",
  "base64 0.22.1",
+ "getrandom 0.3.4",
  "notify",
  "serde",
  "serde_json",

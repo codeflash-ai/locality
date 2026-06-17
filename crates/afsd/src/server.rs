@@ -43,7 +43,21 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
         let server = server.clone();
         thread::spawn(move || accept_tcp_connections(listener, server));
     }
-
+    if let Some(addr) = config.mcp_addr {
+        match TcpListener::bind(addr) {
+            Ok(listener) => match crate::mcp::McpServerConfig::discover(&config.state_root) {
+                Ok(mcp_config) => {
+                    println!("afsd MCP listening on http://{addr}/mcp");
+                    thread::spawn(move || crate::mcp::serve_http(listener, mcp_config));
+                }
+                Err(error) => {
+                    eprintln!("afsd MCP disabled: {error}");
+                    drop(listener);
+                }
+            },
+            Err(error) => eprintln!("afsd MCP disabled: failed to bind {addr}: {error}"),
+        }
+    }
     let socket_path = crate::ipc::socket_path(&config.state_root);
     remove_stale_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
@@ -391,6 +405,7 @@ mod tests {
             state_root: temp_root(name),
             runtime_tick_interval: Duration::from_millis(10),
             tcp_addr: None,
+            mcp_addr: None,
             ..Default::default()
         };
         config.pull_scheduler.mode = PullMode::Relay;

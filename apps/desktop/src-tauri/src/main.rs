@@ -4627,6 +4627,7 @@ fn main() {
             build_tray(app)?;
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());
+            start_agent_guidance_refresher();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4665,6 +4666,40 @@ fn main() {
 
 fn should_hide_tray_popover(window_label: &str, event: &tauri::WindowEvent) -> bool {
     window_label == "tray" && matches!(event, tauri::WindowEvent::Focused(false))
+}
+
+fn start_agent_guidance_refresher() {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        loop {
+            refresh_agent_guidance_best_effort();
+            std::thread::sleep(std::time::Duration::from_secs(10 * 60));
+        }
+    });
+}
+
+fn refresh_agent_guidance_best_effort() {
+    let Some(mount_path) = agent_guidance_mount_path() else {
+        return;
+    };
+    let report = install_guidance_files(Some(&mount_path));
+    if !report.ok {
+        let failed = report
+            .targets
+            .iter()
+            .filter(|target| target.status == "failed")
+            .map(|target| target.detail.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        eprintln!("afs desktop could not refresh agent guidance: {failed}");
+    }
+}
+
+fn agent_guidance_mount_path() -> Option<String> {
+    let store = SqliteStateStore::open(default_state_root()).ok()?;
+    let mounts = store.load_mounts().ok()?;
+    let mount = choose_mount(&mounts)?;
+    Some(display_path(&mount_access_root(&mount)))
 }
 
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {

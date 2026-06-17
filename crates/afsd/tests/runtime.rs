@@ -1323,6 +1323,8 @@ fn polling_config(name: &str) -> DaemonConfig {
 fn test_config(name: &str) -> DaemonConfig {
     DaemonConfig {
         state_root: temp_root(name),
+        tcp_addr: None,
+        mcp_addr: None,
         runtime_tick_interval: Duration::from_millis(10),
         hydration_retry_delay: Duration::from_millis(25),
         ..Default::default()

@@ -53,15 +53,29 @@ storage instead of plist environment variables.
 
 `afsd` now runs a foreground Unix-socket server at `AFS_STATE_DIR/afsd.sock`
 or `~/.afs/afsd.sock`, plus a localhost TCP listener at `127.0.0.1:38567` by
-default. CLI `pull` and `push` try the Unix socket first. If the socket is
-unavailable, they fall back to the same in-process executor; if the daemon
-accepts a request but does not answer within the CLI timeout, `pull` falls back
-to direct execution while `push` fails closed to avoid duplicate remote writes.
-The macOS File Provider extension uses the TCP listener because the extension is
-sandboxed. Set `AFS_DAEMON_TCP_ADDR=off` to disable TCP, or set it to
-`host:port` to move the listener. Setting `AFS_DAEMON_DISABLE=1` forces the CLI
-fallback path, which is useful for tests and recovery. Set
-`AFS_DAEMON_REQUEST_TIMEOUT_MS` to tune the CLI daemon request timeout.
+default. It also serves a lightweight MCP-over-HTTP endpoint at
+`http://127.0.0.1:38568/mcp` by default. CLI `pull` and `push` try the Unix
+socket first. If the socket is unavailable, they fall back to the same
+in-process executor; if the daemon accepts a request but does not answer within
+the CLI timeout, `pull` falls back to direct execution while `push` fails closed
+to avoid duplicate remote writes. The macOS File Provider extension uses the TCP
+listener because the extension is sandboxed. Set `AFS_DAEMON_TCP_ADDR=off` to
+disable daemon TCP, or set it to `host:port` to move the listener. Set
+`AFS_MCP_ADDR=off` to disable the MCP endpoint, or set it to `host:port` to move
+the endpoint. Setting `AFS_DAEMON_DISABLE=1` forces the CLI fallback path, which
+is useful for tests and recovery. Set `AFS_DAEMON_REQUEST_TIMEOUT_MS` to tune the
+CLI daemon request timeout.
+
+The MCP endpoint exposes one tool named `afs`. The tool accepts CLI-style
+arguments as `argv`, plus optional `cwd` and `timeoutMs`. It is a fallback for
+agent sandboxes that cannot run the host `afs` binary directly; agents that can
+run `afs` should keep using the CLI. The endpoint requires a per-install bearer
+token stored at `AFS_STATE_DIR/mcp-token` or `~/.afs/mcp-token`; the desktop
+agent installer writes that token into supported local agent MCP config files.
+The endpoint does not do work while idle; the listener thread blocks on accept
+and only spawns the host `afs` binary for actual MCP tool calls. To avoid
+exposing this host bridge to arbitrary browser origins, requests with an
+`Origin` header are accepted only from localhost origins.
 
 The socket accept loop does not run connector calls directly. It reads one JSON
 request, submits it to `DaemonRuntime`, and waits for the runtime response.

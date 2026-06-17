@@ -20,6 +20,7 @@ afs-store.workspace = true
 afs-connector.workspace = true
 afs-notion.workspace = true
 base64 = "0.22"
+getrandom = "0.3"
 notify = "8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

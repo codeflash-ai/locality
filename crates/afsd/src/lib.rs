@@ -3,6 +3,7 @@ pub mod file_provider;
 pub mod freshness;
 pub mod hydration;
 pub mod ipc;
+pub mod mcp;
 pub mod notion;
 pub mod pull;
 pub mod push;
@@ -26,6 +27,7 @@ use afs_core::pull::{PullMode, PullSchedulerConfig};
 pub struct DaemonConfig {
     pub state_root: PathBuf,
     pub tcp_addr: Option<SocketAddr>,
+    pub mcp_addr: Option<SocketAddr>,
     pub runtime_tick_interval: Duration,
     pub hydration_retry_delay: Duration,
     pub pull_scheduler: PullSchedulerConfig,
@@ -36,6 +38,7 @@ impl Default for DaemonConfig {
         Self {
             state_root: default_state_root(),
             tcp_addr: default_tcp_addr(),
+            mcp_addr: default_mcp_addr(),
             runtime_tick_interval: Duration::from_secs(1),
             hydration_retry_delay: Duration::from_secs(30),
             pull_scheduler: default_pull_scheduler_config(),
@@ -83,6 +86,18 @@ fn default_tcp_addr() -> Option<SocketAddr> {
                 .expect("AFS_DAEMON_TCP_ADDR must be host:port, or off"),
         ),
         Err(_) => Some(crate::ipc::default_tcp_addr()),
+    }
+}
+
+fn default_mcp_addr() -> Option<SocketAddr> {
+    match std::env::var("AFS_MCP_ADDR") {
+        Ok(value) if matches!(value.as_str(), "0" | "off" | "none" | "disabled") => None,
+        Ok(value) => Some(
+            value
+                .parse()
+                .expect("AFS_MCP_ADDR must be host:port, or off"),
+        ),
+        Err(_) => Some(crate::mcp::default_mcp_addr()),
     }
 }
 
