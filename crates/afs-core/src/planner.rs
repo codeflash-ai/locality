@@ -154,6 +154,7 @@ pub struct PlanSummary {
     pub blocks_created: usize,
     pub blocks_updated: usize,
     pub blocks_moved: usize,
+    #[serde(default)]
     pub media_updated: usize,
     pub blocks_archived: usize,
     pub entities_created: usize,

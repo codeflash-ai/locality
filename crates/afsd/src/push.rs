@@ -1031,8 +1031,7 @@ where
     Source: HydrationSource + ?Sized,
 {
     fn check_remote_tree_content(&mut self, request: PushConcurrencyRequest<'_>) -> AfsResult<()> {
-        let mount = self
-            .store
+        self.store
             .get_mount(request.mount_id)
             .map_err(AfsError::from)?
             .ok_or_else(|| StoreError::MountMissing(request.mount_id.clone()))
@@ -1054,13 +1053,12 @@ where
                 Err(StoreError::ShadowMissing { .. }) => continue,
                 Err(error) => return Err(error.into()),
             };
-            let path = projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
             let remote_tree_render =
                 self.source
                     .fetch_render(&afs_core::hydration::HydrationRequest::new(
                         request.mount_id.clone(),
                         precondition.remote_id.clone(),
-                        path,
+                        entity.path.clone(),
                         HydrationState::Hydrated,
                         afs_core::hydration::HydrationReason::ExplicitPull,
                     ))?;
@@ -1165,7 +1163,7 @@ where
                             .fetch_render(&afs_core::hydration::HydrationRequest::new(
                                 request.mount_id.clone(),
                                 entity_id.clone(),
-                                path.clone(),
+                                entity.path.clone(),
                                 HydrationState::Hydrated,
                                 afs_core::hydration::HydrationReason::ExplicitPull,
                             ))?;
@@ -1224,7 +1222,7 @@ where
                     .fetch_render(&afs_core::hydration::HydrationRequest::new(
                         request.mount_id.clone(),
                         remote_id.clone(),
-                        path.clone(),
+                        entity.path.clone(),
                         HydrationState::Hydrated,
                         afs_core::hydration::HydrationReason::ExplicitPull,
                     ))?;

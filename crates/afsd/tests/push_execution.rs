@@ -76,6 +76,10 @@ fn daemon_push_job_applies_and_reconciles_through_single_store_owner() {
         Some(JournalStatus::Reconciled)
     );
     assert_eq!(source.applied_count(), 1);
+    assert_eq!(
+        source.requested_paths(),
+        vec![PathBuf::from("Roadmap.md"), PathBuf::from("Roadmap.md")]
+    );
 
     let entity = supervisor
         .store()
@@ -614,6 +618,7 @@ struct FakePushSource {
     remote_before_apply: Option<HydratedEntity>,
     remote_after_apply: Option<HydratedEntity>,
     applied: std::cell::Cell<usize>,
+    requested_paths: std::cell::RefCell<Vec<PathBuf>>,
     supported_operations: Option<BTreeSet<PushOperationKind>>,
 }
 
@@ -623,6 +628,7 @@ impl FakePushSource {
             remote_before_apply: Some(remote.clone()),
             remote_after_apply: Some(remote),
             applied: std::cell::Cell::new(0),
+            requested_paths: std::cell::RefCell::new(Vec::new()),
             supported_operations: None,
         }
     }
@@ -635,12 +641,17 @@ impl FakePushSource {
             remote_before_apply: Some(remote_before_apply),
             remote_after_apply: Some(remote_after_apply),
             applied: std::cell::Cell::new(0),
+            requested_paths: std::cell::RefCell::new(Vec::new()),
             supported_operations: None,
         }
     }
 
     fn applied_count(&self) -> usize {
         self.applied.get()
+    }
+
+    fn requested_paths(&self) -> Vec<PathBuf> {
+        self.requested_paths.borrow().clone()
     }
 
     fn with_supported_operations(
@@ -660,6 +671,7 @@ impl HydrationSource for FakePushSource {
         if request.remote_id != RemoteId::new("page-1") {
             return Err(AfsError::InvalidState("unexpected remote id".to_string()));
         }
+        self.requested_paths.borrow_mut().push(request.path.clone());
 
         let remote = if self.applied.get() == 0 {
             self.remote_before_apply.clone()
