@@ -42,6 +42,7 @@ type DesktopSnapshot = {
     connector: string;
     workspaceName: string;
     localPath: string;
+    notionUrl?: string | null;
     projection: string;
     readOnly: boolean;
     status: string;
@@ -138,6 +139,7 @@ const sampleSnapshot: DesktopSnapshot = {
     connector: "notion",
     workspaceName: "CodeFlash",
     localPath: "~/Library/CloudStorage/AFS/notion",
+    notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
     projection: "macOS File Provider",
     readOnly: false,
     status: "ready",
@@ -1039,9 +1041,17 @@ function MainShell({
   onRefresh: () => Promise<void>;
   onResetComplete: () => void;
 }) {
+  const meta = snapshot.health.attentionCount > 0 ? "Pending Changes" : "Ready";
+  const statusTitle = healthDescription(snapshot.health.state, snapshot.health.attentionCount);
+
   return (
     <main className="app-frame">
-      <WindowChrome title="AFS" meta={snapshot.health.attentionCount > 0 ? "Pending Changes" : "Ready"} />
+      <WindowChrome
+        title="AFS"
+        meta={meta}
+        metaTitle={statusTitle}
+        onMetaClick={snapshot.health.attentionCount > 0 ? () => onViewChange("pending") : undefined}
+      />
       <div className="app-shell">
         <aside className="sidebar">
           <div className="sidebar-brand">
@@ -1078,9 +1088,15 @@ function MainShell({
             </SidebarButton>
           </nav>
           <div className="sidebar-status">
-            <StatusPill tone={snapshot.health.attentionCount > 0 ? "warn" : "ready"}>
-              {snapshot.health.attentionCount > 0 ? "Pending Changes" : "Notion Ready"}
-            </StatusPill>
+            <button
+              className="status-button"
+              title={statusTitle}
+              onClick={() => onViewChange(snapshot.health.attentionCount > 0 ? "pending" : "mount")}
+            >
+              <StatusPill tone={snapshot.health.attentionCount > 0 ? "warn" : "ready"} title={statusTitle}>
+                {snapshot.health.attentionCount > 0 ? "Pending Changes" : "Notion Ready"}
+              </StatusPill>
+            </button>
           </div>
         </aside>
 
@@ -1100,7 +1116,13 @@ function MainShell({
               onReview={() => onViewChange("pending")}
             />
           )}
-          {view === "pending" && <PendingView snapshot={snapshot} onReview={() => onViewChange("review")} />}
+          {view === "pending" && (
+            <PendingView
+              snapshot={snapshot}
+              onReview={() => onViewChange("review")}
+              onRefresh={onRefresh}
+            />
+          )}
           {view === "review" && (
             <ReviewView
               snapshot={snapshot}
@@ -1209,7 +1231,12 @@ function HomeView({
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Home" title="Notion workspace">
-        <StatusPill tone={healthTone(snapshot.health.state)}>{healthLabel(snapshot.health.state)}</StatusPill>
+        <StatusPill
+          tone={healthTone(snapshot.health.state)}
+          title={healthDescription(snapshot.health.state, snapshot.health.attentionCount)}
+        >
+          {healthLabel(snapshot.health.state)}
+        </StatusPill>
       </ViewHeader>
 
       {connectionMissing(snapshot) ? (
@@ -1368,7 +1395,12 @@ function MountDetailView({
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Mount" title={snapshot.mount.workspaceName}>
-        <StatusPill tone={healthTone(snapshot.health.state)}>{healthLabel(snapshot.health.state)}</StatusPill>
+        <StatusPill
+          tone={healthTone(snapshot.health.state)}
+          title={healthDescription(snapshot.health.state, snapshot.health.attentionCount)}
+        >
+          {healthLabel(snapshot.health.state)}
+        </StatusPill>
       </ViewHeader>
 
       <section className="mount-hero">
@@ -1413,6 +1445,12 @@ function MountDetailView({
           <SettingRow title="Source" value="Notion" />
           <SettingRow title="Workspace" value={snapshot.connection.workspaceName} />
           <SettingRow title="Account" value={snapshot.connection.accountLabel || "Connected"} />
+          <SettingRow
+            title="Mounted root"
+            value={snapshot.mount.notionUrl ? "Open in Notion" : "Not available"}
+            href={snapshot.mount.notionUrl ?? undefined}
+          />
+          <SettingRow title="Notion access" value="Selected pages and databases" />
           <SettingRow title="Access" value={snapshot.mount.readOnly ? "Read Only" : "Edit enabled"} />
         </div>
 
@@ -1459,16 +1497,68 @@ function MountDetailView({
   );
 }
 
-function PendingView({ snapshot, onReview }: { snapshot: DesktopSnapshot; onReview: () => void }) {
+function PendingView({
+  snapshot,
+  onReview,
+  onRefresh,
+}: {
+  snapshot: DesktopSnapshot;
+  onReview: () => void;
+  onRefresh: () => Promise<void>;
+}) {
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
+  const [pushState, setPushState] = useState<"idle" | "pushing" | "success" | "error">("idle");
+  const [pushMessage, setPushMessage] = useState("");
+
+  async function pushAll() {
+    if (!hasPendingChanges || pushState === "pushing") {
+      return;
+    }
+
+    setPushState("pushing");
+    setPushMessage("");
+    try {
+      const report = await callCommand<ActionReport>("push_to_notion", undefined, {
+        ok: true,
+        message: "Pushed changes to Notion.",
+      });
+      if (!report.ok) {
+        setPushState("error");
+        setPushMessage(report.message);
+        return;
+      }
+      setPushState("success");
+      setPushMessage(report.message || "Pushed changes to Notion.");
+      await onRefresh().catch(() => undefined);
+    } catch (error) {
+      setPushState("error");
+      setPushMessage(errorMessage(error));
+    }
+  }
+
+  const isPushing = pushState === "pushing";
 
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Pending" title="Pending Changes">
-        <PrimaryButton disabled={!hasPendingChanges} icon={<ListChecks />} onClick={onReview}>
-          Review Push
-        </PrimaryButton>
+        <div className="button-row">
+          <SecondaryButton
+            disabled={!hasPendingChanges || isPushing}
+            icon={isPushing ? <Loader2 className="spin-icon" /> : <ShieldCheck />}
+            onClick={() => void pushAll()}
+          >
+            {isPushing ? "Pushing..." : "Push All"}
+          </SecondaryButton>
+          <PrimaryButton disabled={!hasPendingChanges || isPushing} icon={<ListChecks />} onClick={onReview}>
+            Review Push
+          </PrimaryButton>
+        </div>
       </ViewHeader>
+      {pushMessage && (
+        <p className={pushState === "error" ? "field-error" : "success-note inline-note"}>
+          {pushMessage}
+        </p>
+      )}
       {hasPendingChanges ? (
         <>
           <p className="view-copy">{snapshot.pendingChanges.length} files have pending changes.</p>
@@ -1561,7 +1651,10 @@ function ReviewView({
   return (
     <div className="view-stack">
       <ViewHeader eyebrow="Review Push" title={plan.title}>
-        <StatusPill tone={pushState === "error" ? "danger" : isPushing ? "warn" : "ready"}>
+        <StatusPill
+          tone={pushState === "error" ? "danger" : isPushing ? "warn" : "ready"}
+          title={isPushing ? "AFS is writing the approved local changes to Notion." : "This push is ready for review."}
+        >
           {pushState === "error" ? "Needs Attention" : isPushing ? "Pushing" : pushSucceeded ? "Pushed" : "Safe"}
         </StatusPill>
       </ViewHeader>
@@ -1912,7 +2005,12 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
           <ApertureIcon state={healthIconState(snapshot.health.state)} />
           <strong>AFS</strong>
         </div>
-        <StatusPill tone={healthTone(snapshot.health.state)}>{healthLabel(snapshot.health.state)}</StatusPill>
+        <StatusPill
+          tone={healthTone(snapshot.health.state)}
+          title={healthDescription(snapshot.health.state, snapshot.health.attentionCount)}
+        >
+          {healthLabel(snapshot.health.state)}
+        </StatusPill>
       </header>
 
       <section className="tray-section tray-workspace">
@@ -2180,12 +2278,30 @@ function ViewHeader({
   );
 }
 
-function WindowChrome({ title, meta }: { title: string; meta?: string }) {
+function WindowChrome({
+  title,
+  meta,
+  metaTitle,
+  onMetaClick,
+}: {
+  title: string;
+  meta?: string;
+  metaTitle?: string;
+  onMetaClick?: () => void;
+}) {
   return (
     <div className="window-chrome" onMouseDown={handleChromeMouseDown}>
       <div className="native-traffic-space" aria-hidden="true" />
       <div data-tauri-drag-region>{title}</div>
-      <div data-tauri-drag-region>{meta}</div>
+      <div data-tauri-drag-region={!onMetaClick || undefined}>
+        {onMetaClick ? (
+          <button className="window-meta-button" title={metaTitle} onClick={onMetaClick}>
+            {meta}
+          </button>
+        ) : (
+          <span title={metaTitle}>{meta}</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -2329,8 +2445,16 @@ function TextButton({
   );
 }
 
-function StatusPill({ children, tone }: { children: React.ReactNode; tone: "ready" | "warn" | "danger" }) {
-  return <span className={`status-pill ${tone}`}>{children}</span>;
+function StatusPill({
+  children,
+  tone,
+  title,
+}: {
+  children: React.ReactNode;
+  tone: "ready" | "warn" | "danger";
+  title?: string;
+}) {
+  return <span className={`status-pill ${tone}`} title={title}>{children}</span>;
 }
 
 function ApertureIcon({ state = "default" }: { state?: "default" | "review" | "reconnect" }) {
@@ -2352,11 +2476,19 @@ function PanelTitle({ title }: { title: string }) {
   return <h3 className="panel-title">{title}</h3>;
 }
 
-function SettingRow({ title, value }: { title: string; value: string }) {
+function SettingRow({ title, value, href }: { title: string; value: string; href?: string }) {
   return (
     <div className="setting-row">
       <span>{title}</span>
-      <strong>{value}</strong>
+      <strong>
+        {href ? (
+          <a className="setting-link" href={href} target="_blank" rel="noreferrer">
+            {value}
+          </a>
+        ) : (
+          value
+        )}
+      </strong>
     </div>
   );
 }
@@ -2436,6 +2568,22 @@ function healthLabel(state: string) {
     return "Checking";
   }
   return "Ready";
+}
+
+function healthDescription(state: string, attentionCount: number) {
+  if (state === "needs_review") {
+    return `${attentionCount} local change${attentionCount === 1 ? "" : "s"} waiting for review or push.`;
+  }
+  if (state === "reconnect_needed") {
+    return "Notion needs to be reconnected before AFS can sync this workspace.";
+  }
+  if (state === "stopped") {
+    return "The AFS daemon is stopped; the app can still run direct actions when needed.";
+  }
+  if (state === "checking_freshness") {
+    return "AFS is checking the local mount and Notion freshness state.";
+  }
+  return "Notion is connected, the mount is ready, and remote writes remain explicit.";
 }
 
 function healthTone(state: string): "ready" | "warn" | "danger" {

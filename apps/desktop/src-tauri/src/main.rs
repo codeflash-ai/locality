@@ -34,7 +34,7 @@ use afs_store::{
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
     SqliteStateStore, VirtualMutationRepository, open_credential_store,
 };
-use afsd::file_provider::ROOT_CONTAINER_IDENTIFIER;
+use afsd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
 use afsd::source::{resolve_source_for_path, source_display_name};
 use afsd::virtual_fs::{
@@ -92,6 +92,7 @@ struct MountSummary {
     connector: String,
     workspace_name: String,
     local_path: String,
+    notion_url: Option<String>,
     projection: String,
     read_only: bool,
     status: String,
@@ -474,24 +475,40 @@ fn push_to_notion_blocking() -> ActionReport {
             message: "No AFS mount is available to push.".to_string(),
         };
     };
-    let Some(change) = snapshot.pending_changes.first() else {
+    if snapshot.pending_changes.is_empty() {
         return ActionReport {
             ok: true,
             message: "No pending changes to push.".to_string(),
         };
     };
-    let target = expand_tilde(&format!(
-        "{}/{}",
-        snapshot.mount.local_path, change.local_path
-    ))
-    .unwrap_or_else(|_| PathBuf::from(&change.local_path));
 
-    match push_target_direct(&target) {
-        Ok(report) => ActionReport {
-            ok: push_report_exit_code(&report) == 0,
-            message: push_report_message(&report),
-        },
-        Err(message) => ActionReport { ok: false, message },
+    let mut pushed = 0usize;
+    for change in &snapshot.pending_changes {
+        let target = expand_tilde(&join_mount_path(
+            &snapshot.mount.local_path,
+            &change.local_path,
+        ))
+        .unwrap_or_else(|_| PathBuf::from(&change.local_path));
+        match push_target_direct(&target) {
+            Ok(report) if push_report_exit_code(&report) == 0 => {
+                pushed += 1;
+            }
+            Ok(report) => {
+                return ActionReport {
+                    ok: false,
+                    message: push_report_message(&report),
+                };
+            }
+            Err(message) => return ActionReport { ok: false, message },
+        }
+    }
+
+    ActionReport {
+        ok: true,
+        message: format!(
+            "Pushed {pushed} pending change{} to Notion.",
+            if pushed == 1 { "" } else { "s" }
+        ),
     }
 }
 
@@ -664,6 +681,7 @@ fn mount_summary(
                 .and_then(|connection| connection.workspace_name.clone())
                 .unwrap_or_else(|| "No Notion folder".to_string()),
             local_path: display_path(&default_notion_mount_root()),
+            notion_url: None,
             projection: "macOS File Provider".to_string(),
             read_only: false,
             status: "not_mounted".to_string(),
@@ -676,6 +694,10 @@ fn mount_summary(
             .and_then(|connection| connection.workspace_name.clone())
             .unwrap_or_else(|| connector_label(&mount.connector)),
         local_path: display_path(&mount_access_root(mount)),
+        notion_url: mount
+            .remote_root_id
+            .as_ref()
+            .map(|remote_id| notion_object_url(&remote_id.0)),
         projection: projection_label(&mount.projection).to_string(),
         read_only: mount.read_only,
         status: "ready".to_string(),
@@ -1072,8 +1094,7 @@ fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
     let results = search_notion_results(query, 1)?;
     let result = results.into_iter().next().ok_or_else(|| {
         if notion_id_from_url(query).is_some() {
-            "That Notion page is not in the mounted workspace yet. Make sure it was selected during Notion authorization, then sync the workspace."
-                .to_string()
+            notion_access_miss_message()
         } else {
             "No local Notion page matched that search yet. Try a page title, path fragment, or Notion URL."
                 .to_string()
@@ -1081,6 +1102,48 @@ fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
     })?;
     prioritize_located_notion_result(&result);
     Ok(located_item_for_search_result(result))
+}
+
+fn notion_access_miss_message() -> String {
+    let Ok(store) = SqliteStateStore::open(default_state_root()) else {
+        return "That Notion page is not in the mounted Notion workspace yet. Make sure it was selected during Notion authorization, then sync the workspace.".to_string();
+    };
+    let mounts = store.load_mounts().unwrap_or_default();
+    let connections = store.list_connections().unwrap_or_default();
+    let mount = choose_mount(&mounts);
+    let connection = choose_connection(&connections, mount.as_ref());
+    let workspace = connection
+        .as_ref()
+        .and_then(|connection| connection.workspace_name.clone())
+        .or_else(|| {
+            mount
+                .as_ref()
+                .map(|mount| connector_label(&mount.connector))
+        })
+        .unwrap_or_else(|| "the connected Notion workspace".to_string());
+    let root_url = mount
+        .as_ref()
+        .and_then(|mount| mount.remote_root_id.as_ref())
+        .map(|remote_id| notion_object_url(&remote_id.0));
+
+    match root_url {
+        Some(url) => format!(
+            "That Notion page is not available in workspace `{workspace}` yet. Open the mounted root ({url}), make sure the page was selected for this Notion connection, then sync the workspace."
+        ),
+        None => format!(
+            "That Notion page is not available in workspace `{workspace}` yet. Make sure it was selected for this Notion connection, then sync the workspace."
+        ),
+    }
+}
+
+fn notion_object_url(id: &str) -> String {
+    format!("https://www.notion.so/{}", notion_url_id(id))
+}
+
+fn notion_url_id(id: &str) -> String {
+    id.chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>()
 }
 
 fn search_notion_index(query: &str, limit: usize) -> Result<Vec<LocatedItem>, String> {
@@ -2698,12 +2761,8 @@ fn open_virtual_mount_or_path(path: &Path) -> Result<(), String> {
 fn virtual_mount_for_path(path: &Path) -> Option<MountConfig> {
     let store = SqliteStateStore::open(default_state_root()).ok()?;
     let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    store
-        .load_mounts()
-        .ok()?
-        .into_iter()
-        .filter(|mount| target.starts_with(&mount.root))
-        .max_by_key(|mount| mount.root.components().count())
+    let mounts = store.load_mounts().ok()?;
+    daemon_file_provider::find_mount_for_path(&mounts, &target).map(|(mount, _)| mount.clone())
 }
 
 fn open_virtual_projection(mount: &MountConfig) -> Result<(), String> {
@@ -3022,6 +3081,17 @@ fn push_report_message(report: &PushReport) -> String {
         _ if report.ok => "Pushed changes to Notion.".to_string(),
         _ => format!("Push stopped: {}", report.action),
     }
+}
+
+fn join_mount_path(mount_path: &str, relative_path: &str) -> String {
+    if relative_path.starts_with('/') || relative_path.starts_with("~/") {
+        return relative_path.to_string();
+    }
+    format!(
+        "{}/{}",
+        mount_path.trim_end_matches('/'),
+        relative_path.trim_start_matches('/')
+    )
 }
 
 fn env_first(keys: &[&str]) -> Option<String> {
@@ -3629,6 +3699,7 @@ fn sample_snapshot() -> DesktopSnapshot {
             connector: "notion".to_string(),
             workspace_name: "CodeFlash".to_string(),
             local_path: display_path(&default_notion_mount_root()),
+            notion_url: Some("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972".to_string()),
             projection: "macOS File Provider".to_string(),
             read_only: false,
             status: "ready".to_string(),

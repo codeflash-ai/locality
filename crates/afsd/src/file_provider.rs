@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 use crate::hydration::HydrationSource;
 use crate::virtual_fs;
+#[cfg(target_os = "macos")]
+use crate::virtual_fs::source_root_directory_name;
 
 pub use crate::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport as FileProviderChildrenReport,
@@ -151,10 +153,16 @@ fn macos_file_provider_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
     };
     let display_name = macos_file_provider_display_name(mount);
     let cloud_storage = home.join("Library").join("CloudStorage");
-    vec![
+    let domain_roots = vec![
         cloud_storage.join(macos_file_provider_directory_name(&display_name)),
+        cloud_storage.join(format!("AFS-{display_name}")),
         cloud_storage.join(format!("AgentFS-{display_name}")),
-    ]
+    ];
+    let source_directory = source_root_directory_name(&mount.connector);
+    domain_roots
+        .into_iter()
+        .flat_map(|domain_root| [domain_root.join(&source_directory), domain_root])
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -254,8 +262,37 @@ mod tests {
                 &home
                     .join("Library")
                     .join("CloudStorage")
+                    .join("AFS")
+                    .join("notion")
+            )
+        );
+        assert!(
+            roots.contains(
+                &home
+                    .join("Library")
+                    .join("CloudStorage")
+                    .join("AFS-AFS")
+                    .join("notion")
+            )
+        );
+        assert!(
+            roots.contains(
+                &home
+                    .join("Library")
+                    .join("CloudStorage")
                     .join("AgentFS-AFS")
             )
         );
+        let matched = match_mount_path(
+            &mount,
+            &home
+                .join("Library")
+                .join("CloudStorage")
+                .join("AFS-AFS")
+                .join("notion")
+                .join("Page.md"),
+        )
+        .expect("AFS-AFS connector path matches");
+        assert_eq!(matched.relative_path, PathBuf::from("Page.md"));
     }
 }

@@ -126,6 +126,21 @@ p {
   text-align: right;
 }
 
+.window-meta-button {
+  min-height: 24px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 800;
+}
+
+.window-meta-button:hover {
+  background: rgba(148, 163, 184, 0.16);
+}
+
 .native-traffic-space {
   min-height: 1px;
 }
@@ -729,6 +744,12 @@ p {
   padding: 0 9px;
 }
 
+.status-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
 .content {
   min-width: 0;
   max-height: calc(100vh - 38px);
@@ -1254,6 +1275,15 @@ p {
   font-size: 12px;
   font-weight: 800;
   text-align: right;
+}
+
+.setting-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.setting-link:hover {
+  text-decoration: underline;
 }
 
 .path-row {

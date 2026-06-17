@@ -2,6 +2,7 @@
 
 ## Changelog
 
+- 2026-06-17: Added template apply drafts, broader macOS File Provider path matching, and desktop status/push affordances for pending Notion changes.
 - 2026-06-17: Added the first local template-pack foundation with bundled Founder Proof of Work and Focused Inbox packs plus `afs templates list|validate|new`.
 - 2026-06-16: Added search-result safety labels so future MCP/agent readers can distinguish clean hydrated content from metadata-only, stale, dirty, conflicted, or deleted results.
 - 2026-06-16: Added a rebuildable SQLite FTS candidate index for local metadata search while preserving the shared CLI/desktop search report contract.

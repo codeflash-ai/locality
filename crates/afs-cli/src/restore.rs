@@ -11,6 +11,7 @@ use afs_core::model::{CanonicalDocument, EntityKind, HydrationState};
 use afs_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
 };
+use afsd::file_provider;
 use afsd::virtual_fs::virtual_fs_content_path;
 use serde::Serialize;
 
@@ -159,20 +160,16 @@ fn absolute_path(path: &Path) -> Result<PathBuf, RestoreError> {
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
-    mounts
-        .iter()
-        .filter(|mount| path.starts_with(&mount.root))
-        .max_by_key(|mount| mount.root.components().count())
+    file_provider::find_mount_for_path(mounts, path).map(|(mount, _)| mount)
 }
 
 fn relative_entity_path(
     mount: &MountConfig,
     absolute_path: &Path,
 ) -> Result<PathBuf, RestoreError> {
-    absolute_path
-        .strip_prefix(&mount.root)
-        .map(Path::to_path_buf)
-        .map_err(|_| RestoreError::MountNotFound(absolute_path.to_path_buf()))
+    file_provider::match_mount_path(mount, absolute_path)
+        .map(|matched| matched.relative_path)
+        .ok_or_else(|| RestoreError::MountNotFound(absolute_path.to_path_buf()))
 }
 
 fn restore_write_path(

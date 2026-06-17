@@ -58,8 +58,9 @@ use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::search::{SearchError, SearchOptions, SearchReport, run_search};
 use crate::status::{StatusError, StatusOptions, StatusReport, StatusSyncState, run_status};
 use crate::templates::{
-    TemplateListReport, TemplateNewOptions, TemplateNewReport, TemplatePackError,
-    TemplateValidateReport, run_template_list, run_template_new, run_template_validate,
+    TemplateApplyOptions, TemplateApplyReport, TemplateListReport, TemplateNewOptions,
+    TemplateNewReport, TemplatePackError, TemplateValidateReport, run_template_apply,
+    run_template_list, run_template_new, run_template_validate,
 };
 
 const EXIT_SUCCESS: i32 = 0;
@@ -370,6 +371,8 @@ enum TemplatesCommand {
     Validate(TemplateValidateArgs),
     #[command(about = "Create a local workspace from a template pack")]
     New(TemplateNewArgs),
+    #[command(about = "Apply one template into a local or mounted folder")]
+    Apply(TemplateApplyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -388,6 +391,28 @@ struct TemplateNewArgs {
     #[arg(value_name = "path", help = "Directory to create.")]
     path: String,
     #[arg(long, help = "Allow writing into a non-empty target directory.")]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct TemplateApplyArgs {
+    #[arg(value_name = "pack", help = "Bundled pack id or local pack path.")]
+    pack: String,
+    #[arg(value_name = "template", help = "Template name, e.g. weekly-update.")]
+    template: String,
+    #[arg(
+        long,
+        value_name = "dir",
+        help = "Directory to write the Markdown draft into."
+    )]
+    to: String,
+    #[arg(
+        long,
+        value_name = "title",
+        help = "Override frontmatter title and output filename."
+    )]
+    title: Option<String>,
+    #[arg(long, help = "Overwrite an existing generated draft.")]
     force: bool,
 }
 
@@ -665,6 +690,14 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
                     args.push("new".to_string());
                     args.push(options.pack.clone());
                     args.push(options.path.clone());
+                    push_flag(&mut args, "--force", options.force);
+                }
+                TemplatesCommand::Apply(options) => {
+                    args.push("apply".to_string());
+                    args.push(options.pack.clone());
+                    args.push(options.template.clone());
+                    push_flag_value(&mut args, "--to", &options.to);
+                    push_optional_flag_value(&mut args, "--title", options.title.as_deref());
                     push_flag(&mut args, "--force", options.force);
                 }
             }
@@ -1640,12 +1673,64 @@ fn templates(args: &[String], json: bool) -> i32 {
                 Err(error) => template_command_error("templates", json, error),
             }
         }
+        Some("apply") => {
+            let Some(pack) = nth_positional(args, 1) else {
+                return command_error(
+                    json,
+                    CommandError::new(
+                        "templates",
+                        "usage",
+                        "usage: afs templates apply <pack> <template> --to <dir> [--title <title>] [--force] [--json]",
+                    ),
+                    EXIT_USAGE,
+                );
+            };
+            let Some(template) = nth_positional(args, 2) else {
+                return command_error(
+                    json,
+                    CommandError::new(
+                        "templates",
+                        "usage",
+                        "usage: afs templates apply <pack> <template> --to <dir> [--title <title>] [--force] [--json]",
+                    ),
+                    EXIT_USAGE,
+                );
+            };
+            let Some(target_dir) = flag_value(args, "--to") else {
+                return command_error(
+                    json,
+                    CommandError::new(
+                        "templates",
+                        "usage",
+                        "usage: afs templates apply <pack> <template> --to <dir> [--title <title>] [--force] [--json]",
+                    ),
+                    EXIT_USAGE,
+                );
+            };
+            match run_template_apply(TemplateApplyOptions {
+                pack: pack.to_string(),
+                template: template.to_string(),
+                target_dir: PathBuf::from(target_dir),
+                title: flag_value(args, "--title").map(str::to_string),
+                force: has_flag(args, "--force"),
+            }) {
+                Ok(report) if json => {
+                    print_json(&report);
+                    EXIT_SUCCESS
+                }
+                Ok(report) => {
+                    print_template_apply_report(&report);
+                    EXIT_SUCCESS
+                }
+                Err(error) => template_command_error("templates", json, error),
+            }
+        }
         _ => command_error(
             json,
             CommandError::new(
                 "templates",
                 "usage",
-                "usage: afs templates list|validate|new [--json]",
+                "usage: afs templates list|validate|new|apply [--json]",
             ),
             EXIT_USAGE,
         ),
@@ -2534,6 +2619,16 @@ fn print_template_new_report(report: &TemplateNewReport) {
         report.path, report.pack.id, report.pack.version
     );
     println!("  files: {}", report.files_written.len());
+}
+
+fn print_template_apply_report(report: &TemplateApplyReport) {
+    println!(
+        "created draft {} from {}/{}",
+        report.path, report.pack.id, report.template
+    );
+    for next in &report.suggested_next {
+        println!("  next: {next}");
+    }
 }
 
 fn print_inspect_report(report: &InspectReport) {
@@ -3563,6 +3658,7 @@ fn search_command_error(json: bool, error: SearchError) -> i32 {
 fn template_command_error(command: &'static str, json: bool, error: TemplatePackError) -> i32 {
     let exit_code = match &error {
         TemplatePackError::PackNotFound(_)
+        | TemplatePackError::TemplateNotFound { .. }
         | TemplatePackError::ManifestMissing(_)
         | TemplatePackError::ManifestInvalid { .. }
         | TemplatePackError::InvalidPackId(_)
@@ -4162,6 +4258,7 @@ mod tests {
                     "list",
                     "validate",
                     "new",
+                    "apply",
                 ],
             ),
             (
@@ -4171,6 +4268,10 @@ mod tests {
                     "Create a local workspace",
                     "--force",
                 ],
+            ),
+            (
+                vec!["templates", "apply", "--help"],
+                vec!["Usage: afs templates apply", "--to", "--title", "--force"],
             ),
             (
                 vec!["pull", "--help"],

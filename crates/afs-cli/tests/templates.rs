@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::templates::{
-    TemplateNewOptions, TemplatePackError, run_template_list, run_template_new,
-    run_template_validate,
+    TemplateApplyOptions, TemplateNewOptions, TemplatePackError, run_template_apply,
+    run_template_list, run_template_new, run_template_validate,
 };
 
 #[test]
@@ -64,6 +64,55 @@ fn template_new_refuses_non_empty_target_without_force() {
     .expect_err("non-empty target");
 
     assert!(matches!(error, TemplatePackError::TargetNotEmpty(path) if path == target));
+}
+
+#[test]
+fn template_apply_writes_bundled_template_with_title() {
+    let temp = TestTempDir::new("afs-template-apply");
+    let target = temp.path("notion");
+
+    let report = run_template_apply(TemplateApplyOptions {
+        pack: "founder-proof-of-work".to_string(),
+        template: "weekly-update".to_string(),
+        target_dir: target.clone(),
+        title: Some("Week 26 Update".to_string()),
+        force: false,
+    })
+    .expect("apply template");
+
+    let draft = target.join("Week 26 Update.md");
+    assert_eq!(report.command, "templates_apply");
+    assert_eq!(report.template, "templates/weekly-update.md");
+    assert_eq!(report.path, draft.display().to_string());
+    assert!(
+        report
+            .suggested_next
+            .iter()
+            .any(|next| next.contains("afs diff"))
+    );
+    let body = fs::read_to_string(draft).expect("draft body");
+    assert!(body.contains("title: \"Week 26 Update\""));
+    assert!(body.contains("# Weekly Update"));
+}
+
+#[test]
+fn template_apply_refuses_existing_file_without_force() {
+    let temp = TestTempDir::new("afs-template-apply-existing");
+    let target = temp.path("notion");
+    fs::create_dir_all(&target).expect("target");
+    let draft = target.join("needs-reply.md");
+    fs::write(&draft, "keep").expect("existing draft");
+
+    let error = run_template_apply(TemplateApplyOptions {
+        pack: "focused-inbox".to_string(),
+        template: "needs-reply.md".to_string(),
+        target_dir: target,
+        title: None,
+        force: false,
+    })
+    .expect_err("existing file");
+
+    assert!(matches!(error, TemplatePackError::FileExists(path) if path == draft));
 }
 
 #[test]

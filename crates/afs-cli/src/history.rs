@@ -15,6 +15,7 @@ use afs_core::undo::{
     UnsupportedUndoOperation, plan_journal_undo,
 };
 use afs_store::{EntityRepository, JournalRepository, MountConfig, MountRepository, StoreError};
+use afsd::file_provider;
 use serde::Serialize;
 
 use crate::diff::PlanSummaryOutput;
@@ -463,20 +464,16 @@ fn absolute_path(path: &Path) -> Result<PathBuf, HistoryError> {
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
-    mounts
-        .iter()
-        .filter(|mount| path.starts_with(&mount.root))
-        .max_by_key(|mount| mount.root.components().count())
+    file_provider::find_mount_for_path(mounts, path).map(|(mount, _)| mount)
 }
 
 fn relative_entity_path(
     mount: &MountConfig,
     absolute_path: &Path,
 ) -> Result<PathBuf, HistoryError> {
-    absolute_path
-        .strip_prefix(&mount.root)
-        .map(Path::to_path_buf)
-        .map_err(|_| HistoryError::MountNotFound(absolute_path.to_path_buf()))
+    file_provider::match_mount_path(mount, absolute_path)
+        .map(|matched| matched.relative_path)
+        .ok_or_else(|| HistoryError::MountNotFound(absolute_path.to_path_buf()))
 }
 
 fn status_parts(status: JournalStatus) -> (String, Option<String>) {

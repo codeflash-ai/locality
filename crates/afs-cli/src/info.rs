@@ -12,7 +12,7 @@ use afs_core::path_projection::{page_container_path, page_listing_parent_path};
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository, StoreError,
 };
-use afsd::source::source_display_name;
+use afsd::{file_provider, source::source_display_name};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -479,57 +479,13 @@ fn absolute_path(path: &Path) -> Result<PathBuf, InfoError> {
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {
-    mounts
-        .iter()
-        .filter(|mount| path_starts_with_mount(path, mount))
-        .max_by_key(|mount| mount.root.components().count())
-}
-
-fn path_starts_with_mount(path: &Path, mount: &MountConfig) -> bool {
-    if path.starts_with(&mount.root) {
-        return true;
-    }
-
-    let Some(canonical_path) = canonicalize_existing_prefix(path) else {
-        return false;
-    };
-    let Ok(canonical_root) = std::fs::canonicalize(&mount.root) else {
-        return false;
-    };
-
-    canonical_path.starts_with(canonical_root)
-}
-
-fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
-    let mut current = path;
-    let mut suffix = PathBuf::new();
-
-    loop {
-        if let Ok(canonical_current) = std::fs::canonicalize(current) {
-            return Some(canonical_current.join(suffix));
-        }
-
-        let file_name = current.file_name()?;
-        suffix = PathBuf::from(file_name).join(suffix);
-        current = current.parent()?;
-    }
+    file_provider::find_mount_for_path(mounts, path).map(|(mount, _)| mount)
 }
 
 fn relative_entity_path(mount: &MountConfig, absolute_path: &Path) -> Result<PathBuf, InfoError> {
-    if let Ok(relative_path) = absolute_path.strip_prefix(&mount.root) {
-        return Ok(relative_path.to_path_buf());
-    }
-
-    let Some(canonical_path) = canonicalize_existing_prefix(absolute_path) else {
-        return Err(InfoError::MountNotFound(absolute_path.to_path_buf()));
-    };
-    let canonical_root = std::fs::canonicalize(&mount.root)
-        .map_err(|_| InfoError::MountNotFound(absolute_path.to_path_buf()))?;
-
-    canonical_path
-        .strip_prefix(canonical_root)
-        .map(Path::to_path_buf)
-        .map_err(|_| InfoError::MountNotFound(absolute_path.to_path_buf()))
+    file_provider::match_mount_path(mount, absolute_path)
+        .map(|matched| matched.relative_path)
+        .ok_or_else(|| InfoError::MountNotFound(absolute_path.to_path_buf()))
 }
 
 fn entity_kind_name(kind: &EntityKind) -> &str {

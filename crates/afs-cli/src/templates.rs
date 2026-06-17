@@ -180,6 +180,15 @@ pub struct TemplateNewOptions {
     pub force: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateApplyOptions {
+    pub pack: String,
+    pub template: String,
+    pub target_dir: PathBuf,
+    pub title: Option<String>,
+    pub force: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TemplateNewReport {
     pub ok: bool,
@@ -189,9 +198,20 @@ pub struct TemplateNewReport {
     pub files_written: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TemplateApplyReport {
+    pub ok: bool,
+    pub command: &'static str,
+    pub pack: TemplatePackSummary,
+    pub template: String,
+    pub path: String,
+    pub suggested_next: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TemplatePackError {
     PackNotFound(String),
+    TemplateNotFound { pack: String, template: String },
     ManifestMissing(PathBuf),
     ManifestInvalid { path: PathBuf, message: String },
     InvalidPackId(String),
@@ -207,6 +227,7 @@ impl TemplatePackError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::PackNotFound(_) => "pack_not_found",
+            Self::TemplateNotFound { .. } => "template_not_found",
             Self::ManifestMissing(_) => "manifest_missing",
             Self::ManifestInvalid { .. } => "manifest_invalid",
             Self::InvalidPackId(_) => "invalid_pack_id",
@@ -223,6 +244,9 @@ impl TemplatePackError {
         match self {
             Self::PackNotFound(pack) => {
                 format!("template pack `{pack}` was not found")
+            }
+            Self::TemplateNotFound { pack, template } => {
+                format!("template `{template}` was not found in pack `{pack}`")
             }
             Self::ManifestMissing(path) => {
                 format!(
@@ -283,6 +307,53 @@ pub fn run_template_validate(path: PathBuf) -> Result<TemplateValidateReport, Te
         path: loaded.root.display().to_string(),
         pack: loaded.summary,
         issues: Vec::new(),
+    })
+}
+
+pub fn run_template_apply(
+    options: TemplateApplyOptions,
+) -> Result<TemplateApplyReport, TemplatePackError> {
+    if options.target_dir.exists() && !options.target_dir.is_dir() {
+        return Err(TemplatePackError::TargetNotDirectory(options.target_dir));
+    }
+    fs::create_dir_all(&options.target_dir)?;
+
+    let loaded = load_template_pack(&options.pack)?;
+    let template = read_template_file(&loaded, &options.template)?;
+    let title = options
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let body = render_template_body(&template.body, title, &loaded.summary.id);
+    let filename = title.map(markdown_filename_for_title).unwrap_or_else(|| {
+        template
+            .relative_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| "draft.md".to_string())
+    });
+    let output_relative_path = checked_relative_path(&filename)?;
+    let output_path = options.target_dir.join(&output_relative_path);
+    write_file(
+        &options.target_dir,
+        &output_relative_path,
+        body.as_bytes(),
+        options.force,
+    )?;
+
+    let path = output_path.display().to_string();
+    Ok(TemplateApplyReport {
+        ok: true,
+        command: "templates_apply",
+        pack: loaded.summary,
+        template: relative_path_to_report(&template.relative_path),
+        path: path.clone(),
+        suggested_next: vec![
+            format!("afs diff {}", shell_quote(&path)),
+            format!("afs push {} -y", shell_quote(&path)),
+        ],
     })
 }
 
@@ -473,6 +544,157 @@ fn write_local_files(
     Ok(written)
 }
 
+fn read_template_file(
+    loaded: &LoadedTemplatePack,
+    template: &str,
+) -> Result<LoadedTemplateFile, TemplatePackError> {
+    let candidates = template_path_candidates(template)?;
+    match &loaded.source {
+        TemplatePackSource::Embedded(files) => files
+            .iter()
+            .find(|file| {
+                candidates
+                    .iter()
+                    .any(|candidate| candidate == Path::new(file.path))
+            })
+            .map(|file| LoadedTemplateFile {
+                relative_path: PathBuf::from(file.path),
+                body: file.body.to_string(),
+            })
+            .ok_or_else(|| TemplatePackError::TemplateNotFound {
+                pack: loaded.summary.id.clone(),
+                template: template.to_string(),
+            }),
+        TemplatePackSource::Local(root) => {
+            for candidate in candidates {
+                let path = root.join(&candidate);
+                if path.is_file() {
+                    return Ok(LoadedTemplateFile {
+                        relative_path: candidate,
+                        body: fs::read_to_string(path)?,
+                    });
+                }
+            }
+            Err(TemplatePackError::TemplateNotFound {
+                pack: loaded.summary.id.clone(),
+                template: template.to_string(),
+            })
+        }
+    }
+}
+
+fn template_path_candidates(template: &str) -> Result<Vec<PathBuf>, TemplatePackError> {
+    let mut value = template.trim().trim_matches('/').to_string();
+    if value.is_empty() {
+        return Err(TemplatePackError::InvalidRelativePath(template.to_string()));
+    }
+    if !value.ends_with(".md") {
+        value.push_str(".md");
+    }
+
+    let direct = checked_relative_path(&value)?;
+    let prefixed = if direct.components().count() == 1 {
+        checked_relative_path(&format!("templates/{value}"))?
+    } else {
+        direct.clone()
+    };
+
+    let mut candidates = vec![prefixed, direct];
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn render_template_body(body: &str, title: Option<&str>, pack_id: &str) -> String {
+    let today = current_utc_date();
+    let rendered = body
+        .replace("{{pack_id}}", pack_id)
+        .replace("{{date}}", &today);
+    let Some(title) = title else {
+        return rendered;
+    };
+    replace_frontmatter_title(&rendered, title).replace("{{title}}", title)
+}
+
+fn replace_frontmatter_title(body: &str, title: &str) -> String {
+    if !body.starts_with("---\n") {
+        return body.to_string();
+    }
+
+    let Some(end_marker_start) = body[4..].find("\n---\n").map(|index| index + 5) else {
+        return body.to_string();
+    };
+    let frontmatter = &body[4..end_marker_start - 1];
+    let rest = &body[end_marker_start..];
+    let title_line = format!("title: \"{}\"", yaml_double_quoted(title));
+    let mut replaced = false;
+    let mut next_frontmatter = Vec::new();
+    for line in frontmatter.lines() {
+        if line.trim_start().starts_with("title:") {
+            next_frontmatter.push(title_line.clone());
+            replaced = true;
+        } else {
+            next_frontmatter.push(line.to_string());
+        }
+    }
+    if !replaced {
+        next_frontmatter.insert(0, title_line);
+    }
+
+    format!("---\n{}\n{}", next_frontmatter.join("\n"), rest)
+}
+
+fn yaml_double_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn markdown_filename_for_title(title: &str) -> String {
+    let sanitized = title
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            character if character.is_control() => '-',
+            character => character,
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+    let stem = if sanitized.is_empty() {
+        "draft".to_string()
+    } else {
+        sanitized
+    };
+    if stem.ends_with(".md") {
+        stem
+    } else {
+        format!("{stem}.md")
+    }
+}
+
+fn current_utc_date() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let days = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() / 86_400)
+        .unwrap_or(0);
+    civil_date_from_unix_days(days as i64)
+}
+
+fn civil_date_from_unix_days(days: i64) -> String {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 fn list_local_pack_files(root: &Path) -> Result<Vec<PathBuf>, TemplatePackError> {
     let mut pending = vec![root.to_path_buf()];
     let mut files = Vec::new();
@@ -540,6 +762,15 @@ fn relative_path_to_report(path: &Path) -> String {
         .join("/")
 }
 
+fn shell_quote(value: &str) -> String {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn first_party_packs() -> &'static [EmbeddedTemplatePack] {
     &[
         EmbeddedTemplatePack {
@@ -574,6 +805,12 @@ struct LoadedTemplatePack {
     root: PathBuf,
     summary: TemplatePackSummary,
     source: TemplatePackSource,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedTemplateFile {
+    relative_path: PathBuf,
+    body: String,
 }
 
 #[derive(Clone, Debug)]
