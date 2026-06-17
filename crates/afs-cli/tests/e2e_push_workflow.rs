@@ -21,6 +21,7 @@ use afs_notion::dto::{
     PaginatedListDto, RichTextBlockDto, RichTextDto, SyncedBlockDto, SyncedFromDto,
     TextRichTextDto,
 };
+use afs_notion::media::resolve_media_href;
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{ConnectionId, EntityRepository, InMemoryStateStore, ProjectionMode};
 use afsd::hydration::{HydrationExecutor, HydrationOutcome};
@@ -549,7 +550,6 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
         "database mention [AFS cyclic linked database",
         "[Cyclic bookmark](https://example.com/cyclic-bookmark)",
         "[Cyclic embed](https://example.com/cyclic-embed)",
-        "![Cyclic image](https://www.w3.org/Icons/w3c_home.png)",
         "[Cyclic video](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
         "[Cyclic file](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
         "[Cyclic PDF](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)",
@@ -559,6 +559,7 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
             "missing {expected:?}\n{markdown}"
         );
     }
+    assert_local_image_markdown(&markdown, "Cyclic image");
     assert!(
         !markdown.contains("type=link_to_page"),
         "link_to_page should render as a Markdown link, not a directive:\n{markdown}"
@@ -618,6 +619,9 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
 
     let connector = NotionConnector::new(NotionConfig::default());
     let (fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    let editable_image_line = markdown_image_line(&original, "Editable image");
+    let editable_image_href = markdown_link_href(editable_image_line);
+    let edited_image_line = format!("![Editable image changed]({editable_image_href})");
     let edited = original
         .replace(
             "Editable paragraph original.",
@@ -654,10 +658,7 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
             "[Editable embed](https://example.com/editable-embed)",
             "[Editable embed changed](https://example.com/editable-embed-changed)",
         )
-        .replace(
-            "![Editable image](https://www.w3.org/Icons/w3c_home.png)",
-            "![Editable image changed](https://www.w3.org/assets/logos/w3c-2025-transitional/w3c-72x48.png)",
-        )
+        .replace(editable_image_line, &edited_image_line)
         .replace(
             "[Editable video](https://www.youtube.com/watch?v=dQw4w9WgXcQ)",
             "[Editable video changed](https://www.youtube.com/watch?v=oHg5SJYRHA0)",
@@ -747,7 +748,6 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
         "| Editable table added | Editable table added state |",
         "[Editable bookmark changed](https://example.com/editable-bookmark-changed)",
         "[Editable embed changed](https://example.com/editable-embed-changed)",
-        "![Editable image changed](https://www.w3.org/assets/logos/w3c-2025-transitional/w3c-72x48.png)",
         "[Editable video changed](https://www.youtube.com/watch?v=oHg5SJYRHA0)",
         "[Editable file changed](https://www.orimi.com/pdf-test.pdf)",
         "[Editable PDF changed](https://www.orimi.com/pdf-test.pdf)",
@@ -760,6 +760,88 @@ fn live_cyclic_supported_block_edits_push_and_verify_notion() {
             "missing {expected:?}\n{verified}"
         );
     }
+    assert_local_image_markdown(&verified, "Editable image changed");
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_local_image_media_edit_uploads_and_reconciles_bytes() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live local image {}", unique_suffix()),
+        vec![media_child(
+            "image",
+            "https://www.w3.org/Icons/w3c_home.png",
+            "Original local image",
+        )],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    assert_local_image_markdown(&original, "Original local image");
+
+    let image_path = local_image_path(&fixture.root, &page_path, &original, "Original local image");
+    assert!(
+        image_path.is_file(),
+        "missing local image at {image_path:?}"
+    );
+    let uploaded_bytes = tiny_png_bytes();
+    fs::write(&image_path, uploaded_bytes).expect("overwrite local image bytes");
+
+    let original_image_line = markdown_image_line(&original, "Original local image");
+    let image_href = markdown_link_href(original_image_line);
+    let updated_image_line = format!("![Updated local image]({image_href})");
+    fs::write(
+        &page_path,
+        original.replace(original_image_line, &updated_image_line),
+    )
+    .expect("write local image markdown edit");
+
+    let diff = run_diff(&store, &page_path).expect("diff local image edit");
+    let plan = diff.plan.as_ref().expect("image edit plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert_eq!(plan.summary.media_updated, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push local image edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean image status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let reconciled = fs::read_to_string(&page_path).expect("read reconciled image page");
+    assert_local_image_markdown(&reconciled, "Updated local image");
+    let reconciled_image_path = local_image_path(
+        &fixture.root,
+        &page_path,
+        &reconciled,
+        "Updated local image",
+    );
+    assert_eq!(
+        fs::read(&reconciled_image_path).expect("read reconciled image"),
+        uploaded_bytes
+    );
+
+    let verified = render_live_page(&connector, &scratch.id, &page_path);
+    assert_local_image_markdown(&verified, "Updated local image");
 }
 
 #[test]
@@ -2174,6 +2256,52 @@ fn replace_line_with_prefix(markdown: String, prefix: &str, replacement: &str) -
 
     let trailing_newline = if markdown.ends_with('\n') { "\n" } else { "" };
     format!("{}{trailing_newline}", lines.join("\n"))
+}
+
+fn markdown_image_line<'a>(markdown: &'a str, caption: &str) -> &'a str {
+    let prefix = format!("![{caption}](");
+    markdown
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("missing image line for {caption:?} in:\n{markdown}"))
+}
+
+fn markdown_link_href(line: &str) -> &str {
+    let href_start = line.find("](").expect("markdown link start") + 2;
+    let href_end = line.rfind(')').expect("markdown link end");
+    &line[href_start..href_end]
+}
+
+fn assert_local_image_markdown(markdown: &str, caption: &str) {
+    let line = markdown_image_line(markdown, caption);
+    let href = markdown_link_href(line);
+    assert!(
+        !href.starts_with("http://")
+            && !href.starts_with("https://")
+            && href.contains(".afs/media/"),
+        "expected local media image href for {caption:?}, got {line:?}"
+    );
+}
+
+fn local_image_path(root: &Path, page_path: &Path, markdown: &str, caption: &str) -> PathBuf {
+    let line = markdown_image_line(markdown, caption);
+    let href = markdown_link_href(line);
+    let relative_page = page_path
+        .strip_prefix(root)
+        .unwrap_or_else(|_| panic!("page path {page_path:?} is not under root {root:?}"));
+    let local_path = resolve_media_href(relative_page, href)
+        .unwrap_or_else(|| panic!("image href {href:?} is not a local media href"));
+    root.join(local_path)
+}
+
+fn tiny_png_bytes() -> &'static [u8] {
+    &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ]
 }
 
 fn unique_suffix() -> String {

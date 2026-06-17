@@ -133,8 +133,9 @@ fn executor_writes_hydrated_assets_under_mount_root() {
     fixture.write_stub();
     let mut rendered = rendered_entity("Remote body.");
     rendered.assets.push(HydratedAsset {
-        path: PathBuf::from("media/Roadmap/image-1.png"),
+        path: PathBuf::from(".afs/media/Roadmap/image-1.png"),
         bytes: b"image-bytes".to_vec(),
+        media: None,
     });
     let source = FakeHydrationSource::with_entity("page-1", rendered);
 
@@ -144,7 +145,7 @@ fn executor_writes_hydrated_assets_under_mount_root() {
         .expect("hydrate request");
 
     assert_eq!(
-        fs::read(fixture.root.join("media/Roadmap/image-1.png")).expect("asset"),
+        fs::read(fixture.root.join(".afs/media/Roadmap/image-1.png")).expect("asset"),
         b"image-bytes"
     );
 }
@@ -156,8 +157,9 @@ fn executor_rejects_hydrated_assets_outside_mount_root() {
     fixture.write_stub();
     let mut rendered = rendered_entity("Remote body.");
     rendered.assets.push(HydratedAsset {
-        path: PathBuf::from("media/../outside.png"),
+        path: PathBuf::from(".afs/media/../outside.png"),
         bytes: b"image-bytes".to_vec(),
+        media: None,
     });
     let source = FakeHydrationSource::with_entity("page-1", rendered);
 

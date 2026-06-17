@@ -63,6 +63,11 @@ pub enum PushOperation {
         block_id: RemoteId,
         after: Option<RemoteId>,
     },
+    UpdateMedia {
+        block_id: RemoteId,
+        local_path: std::path::PathBuf,
+        caption: String,
+    },
     ArchiveBlock {
         block_id: RemoteId,
     },
@@ -94,6 +99,7 @@ pub enum PushOperationKind {
     UpdateBlock,
     AppendBlock,
     MoveBlock,
+    UpdateMedia,
     ArchiveBlock,
     ArchiveEntity,
     UpdateProperties,
@@ -106,6 +112,7 @@ impl PushOperationKind {
             Self::UpdateBlock => "update_block",
             Self::AppendBlock => "append_block",
             Self::MoveBlock => "move_block",
+            Self::UpdateMedia => "update_media",
             Self::ArchiveBlock => "archive_block",
             Self::ArchiveEntity => "archive_entity",
             Self::UpdateProperties => "update_properties",
@@ -113,11 +120,12 @@ impl PushOperationKind {
         }
     }
 
-    pub fn all() -> [Self; 7] {
+    pub fn all() -> [Self; 8] {
         [
             Self::UpdateBlock,
             Self::AppendBlock,
             Self::MoveBlock,
+            Self::UpdateMedia,
             Self::ArchiveBlock,
             Self::ArchiveEntity,
             Self::UpdateProperties,
@@ -132,6 +140,7 @@ impl PushOperation {
             Self::UpdateBlock { .. } => PushOperationKind::UpdateBlock,
             Self::AppendBlock { .. } => PushOperationKind::AppendBlock,
             Self::MoveBlock { .. } => PushOperationKind::MoveBlock,
+            Self::UpdateMedia { .. } => PushOperationKind::UpdateMedia,
             Self::ArchiveBlock { .. } => PushOperationKind::ArchiveBlock,
             Self::ArchiveEntity { .. } => PushOperationKind::ArchiveEntity,
             Self::UpdateProperties { .. } => PushOperationKind::UpdateProperties,
@@ -145,6 +154,7 @@ pub struct PlanSummary {
     pub blocks_created: usize,
     pub blocks_updated: usize,
     pub blocks_moved: usize,
+    pub media_updated: usize,
     pub blocks_archived: usize,
     pub entities_created: usize,
     pub entities_archived: usize,
@@ -160,6 +170,7 @@ impl PlanSummary {
                 PushOperation::UpdateBlock { .. } => summary.blocks_updated += 1,
                 PushOperation::AppendBlock { .. } => summary.blocks_created += 1,
                 PushOperation::MoveBlock { .. } => summary.blocks_moved += 1,
+                PushOperation::UpdateMedia { .. } => summary.media_updated += 1,
                 PushOperation::ArchiveBlock { .. } => summary.blocks_archived += 1,
                 PushOperation::ArchiveEntity { .. } => summary.entities_archived += 1,
                 PushOperation::UpdateProperties { properties, .. } => {

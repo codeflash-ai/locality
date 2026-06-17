@@ -272,6 +272,7 @@ pub struct PlanSummaryOutput {
     pub blocks_created: usize,
     pub blocks_updated: usize,
     pub blocks_moved: usize,
+    pub media_updated: usize,
     pub blocks_archived: usize,
     pub entities_created: usize,
     pub entities_archived: usize,
@@ -284,6 +285,7 @@ impl From<PlanSummary> for PlanSummaryOutput {
             blocks_created: value.blocks_created,
             blocks_updated: value.blocks_updated,
             blocks_moved: value.blocks_moved,
+            media_updated: value.media_updated,
             blocks_archived: value.blocks_archived,
             entities_created: value.entities_created,
             entities_archived: value.entities_archived,
@@ -307,6 +309,11 @@ pub enum PushOperationOutput {
     MoveBlock {
         block_id: String,
         after: Option<String>,
+    },
+    UpdateMedia {
+        block_id: String,
+        local_path: String,
+        caption: String,
     },
     ArchiveBlock {
         block_id: String,
@@ -348,6 +355,15 @@ impl From<PushOperation> for PushOperationOutput {
             PushOperation::MoveBlock { block_id, after } => Self::MoveBlock {
                 block_id: block_id.0,
                 after: after.map(|remote_id| remote_id.0),
+            },
+            PushOperation::UpdateMedia {
+                block_id,
+                local_path,
+                caption,
+            } => Self::UpdateMedia {
+                block_id: block_id.0,
+                local_path: local_path.display().to_string(),
+                caption,
             },
             PushOperation::ArchiveBlock { block_id } => Self::ArchiveBlock {
                 block_id: block_id.0,

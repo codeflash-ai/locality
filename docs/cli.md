@@ -204,7 +204,7 @@ to repair or restart the per-mount systemd user service for `afs-fuse`;
 file-provider unregister <mount>` stops and removes that Linux service. `list`
 and `reset` still target the macOS File Provider helper.
 
-`afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `media/`, and persists the root page Synced Tree shadow snapshot. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the Synced Tree shadow, returning a dirty skip instead.
+`afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `.afs/media/`, and persists the root page Synced Tree shadow snapshot. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the Synced Tree shadow, returning a dirty skip instead.
 
 The JSON report includes `via`, `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts. `via` is `daemon` when the Unix socket handled the job and `cli` when the command executed directly.
 
@@ -343,7 +343,7 @@ inspect /Users/alice/Library/CloudStorage/AFS/notion/Roadmap/page.md
 
 ## Initial `afs diff --json` Shape
 
-The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its Synced Tree shadow snapshot, and returns the core push-pipeline decision without applying anything. If the file contains unresolved inline conflict markers, validation returns `unresolved_conflict_markers` before planning. If the path is a new Markdown file directly inside a projected database directory, it plans a `create_entity` operation for a new database row instead of requiring an existing shadow. The JSON report includes:
+The first diff implementation resolves a path through the store, reads the canonical Markdown file, loads its Synced Tree shadow snapshot, and returns the core push-pipeline decision without applying anything. If the file contains unresolved inline conflict markers, validation returns `unresolved_conflict_markers` before planning. If the path is a new Markdown file directly inside a projected database directory, it plans a `create_entity` operation for a new database row instead of requiring an existing shadow. For Notion image blocks, it also compares local `.afs/media/` files against `.afs/media/manifest.json` and reports `update_media` when the image bytes or Markdown caption changed. The JSON report includes:
 
 - `validation`: machine-readable issues with file, line, message, and suggested fix;
 - `plan.summary`: block/entity/property counts;
@@ -370,7 +370,7 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 - `apply_not_implemented`;
 - `apply_failed`.
 
-Reports also include `via`, `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset, block moves, and new database-row creation through the live API. Connector capability preflight runs before journaling, so unsupported operations return `unsupported_operations` without appending a journal. Once a journaled push starts, the daemon performs connector metadata checks and verifies the current Remote Tree render still matches the Synced Tree shadow before applying Local Tree edits.
+Reports also include `via`, `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset, local image media updates, block moves, and new database-row creation through the live API. Connector capability preflight runs before journaling, so unsupported operations return `unsupported_operations` without appending a journal. Once a journaled push starts, the daemon performs connector metadata checks and verifies the current Remote Tree render still matches the Synced Tree shadow before applying Local Tree edits.
 
 Unsupported-operation JSON shape:
 

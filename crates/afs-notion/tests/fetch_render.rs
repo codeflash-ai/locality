@@ -600,7 +600,7 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "[Embed](https://example.com/embed)",
         "[Bookmark](https://example.com/bookmark)",
         "[Preview](https://example.com/preview)",
-        "![Image](https://example.com/image.png)",
+        "![Image](../.afs/media/Docs/Coverage/image-111111111111.png)",
         "[Video](https://example.com/video.mp4)",
         "[File](https://example.com/file.txt)",
         "[PDF](https://example.com/file.pdf)",
@@ -753,11 +753,11 @@ fn render_media_blocks_as_markdown_links_and_tracks_local_paths() {
     assert_eq!(rendered.media_assets.len(), 1);
     assert_eq!(
         rendered.media_assets[0].local_path,
-        Path::new("media/Docs/Coverage/image-0123456789ab.png")
+        Path::new(".afs/media/Docs/Coverage/image-0123456789ab.png")
     );
     assert_eq!(
         rendered.document.body,
-        "![Image caption](https://example.com/image.PNG?download=1)\n"
+        "![Image caption](../../.afs/media/Docs/Coverage/image-0123456789ab.png)\n"
     );
 }
 

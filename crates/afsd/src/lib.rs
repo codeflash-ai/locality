@@ -4,6 +4,7 @@ pub mod freshness;
 pub mod hydration;
 pub mod ipc;
 pub mod mcp;
+pub mod media;
 pub mod notion;
 pub mod pull;
 pub mod push;

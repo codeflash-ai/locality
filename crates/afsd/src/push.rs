@@ -32,8 +32,12 @@ use afs_core::push::{
     plan_push_pipeline,
 };
 use afs_core::shadow::ShadowDocument;
+use afs_core::shadow::segment_markdown_body;
 use afs_core::validation::{ValidationIssue, ValidationReport};
 use afs_core::{AfsError, AfsResult};
+use afs_notion::media::{
+    load_media_manifest, media_manifest_entry, resolve_media_href, sha256_hex,
+};
 use afs_store::{
     EntityRecord, EntityRepository, FreshnessStateRepository, JournalRepository, MountConfig,
     MountRepository, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
@@ -44,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::media::update_hydrated_media_manifest;
 use crate::source::{LocalSourceValidator, SourcePushValidator, SourceValidationContext};
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
@@ -187,6 +192,125 @@ where
     }
 
     prepared
+}
+
+fn augment_notion_media_plan(
+    mount: &MountConfig,
+    state_root: Option<&Path>,
+    relative_path: &Path,
+    parsed: &afs_core::canonical::ParsedCanonicalDocument,
+    shadow: &ShadowDocument,
+    approval: PushApproval,
+    pipeline: &mut PushPipelineResult,
+) {
+    if mount.connector != "notion" {
+        return;
+    }
+    let Some(plan) = pipeline.plan.as_mut() else {
+        return;
+    };
+    if !matches!(
+        pipeline.action,
+        PushPipelineAction::Noop
+            | PushPipelineAction::ProceedToApply
+            | PushPipelineAction::ConfirmPlan
+            | PushPipelineAction::ConfirmDangerousPlan
+    ) {
+        return;
+    }
+    let Ok(root) = projection_output_root(state_root, mount) else {
+        return;
+    };
+    let Ok(manifest) = load_media_manifest(&root) else {
+        return;
+    };
+    let edited_blocks = segment_markdown_body(&parsed.document.body, parsed.body_start_line);
+    let mut media_updates = BTreeMap::<RemoteId, PushOperation>::new();
+
+    for (index, shadow_block) in shadow.blocks.iter().enumerate() {
+        let Some((_, shadow_href)) = parse_image_markdown(&shadow_block.text) else {
+            continue;
+        };
+        let Some(shadow_path) = resolve_media_href(relative_path, shadow_href) else {
+            continue;
+        };
+        let Some(edited_block) = edited_blocks.get(index) else {
+            continue;
+        };
+        let Some((caption, edited_href)) = parse_image_markdown(&edited_block.text) else {
+            continue;
+        };
+        let Some(local_path) = resolve_media_href(relative_path, edited_href) else {
+            continue;
+        };
+        let Some(entry) = media_manifest_entry(&manifest, &shadow_path) else {
+            continue;
+        };
+        let markdown_changed = shadow_block.text != edited_block.text;
+        let bytes_changed = std::fs::read(root.join(&local_path))
+            .map(|bytes| sha256_hex(&bytes) != entry.sha256)
+            .unwrap_or(false);
+        if bytes_changed || markdown_changed {
+            media_updates.insert(
+                shadow_block.remote_id.clone(),
+                PushOperation::UpdateMedia {
+                    block_id: shadow_block.remote_id.clone(),
+                    local_path,
+                    caption: caption.to_string(),
+                },
+            );
+        }
+    }
+
+    if media_updates.is_empty() {
+        return;
+    }
+
+    let mut operations = Vec::with_capacity(plan.operations.len() + media_updates.len());
+    for operation in plan.operations.drain(..) {
+        match &operation {
+            PushOperation::UpdateBlock { block_id, .. } if media_updates.contains_key(block_id) => {
+            }
+            _ => operations.push(operation),
+        }
+    }
+    operations.extend(media_updates.into_values());
+    let degradations = plan.degradations.clone();
+    *plan =
+        PushPlan::new(plan.affected_entities.clone(), operations).with_degradations(degradations);
+
+    let guardrail = afs_core::push::evaluate_guardrails(plan, &GuardrailPolicy::default(), None);
+    pipeline.action = match &guardrail {
+        GuardrailDecision::Proceed if approval.assume_yes => PushPipelineAction::ProceedToApply,
+        GuardrailDecision::Proceed => PushPipelineAction::ConfirmPlan,
+        GuardrailDecision::ConfirmRequired { .. } if approval.confirm_dangerous => {
+            PushPipelineAction::ProceedToApply
+        }
+        GuardrailDecision::ConfirmRequired { .. } => PushPipelineAction::ConfirmDangerousPlan,
+    };
+    pipeline.guardrail = guardrail;
+    if !pipeline
+        .completed_stages
+        .contains(&PushStage::PlanAndConfirm)
+    {
+        pipeline.completed_stages.push(PushStage::PlanAndConfirm);
+    }
+}
+
+fn parse_image_markdown(input: &str) -> Option<(&str, &str)> {
+    let link = input.trim().strip_prefix('!')?;
+    if !link.starts_with('[') {
+        return None;
+    }
+    let label_end = link.find("](")?;
+    let href_start = label_end + 2;
+    let href_end = link[href_start..]
+        .find(')')
+        .map(|offset| href_start + offset)?;
+    if href_end + 1 != link.len() {
+        return None;
+    }
+    Some((&link[1..label_end], &link[href_start..href_end]))
 }
 
 fn remote_preconditions_for_plan<S>(
@@ -397,9 +521,9 @@ where
         parsed: &parsed,
         shadow: Some(&shadow),
     })?;
-    let pipeline = if schema_validation.is_clean() {
+    let mut pipeline = if schema_validation.is_clean() {
         plan_push_pipeline(
-            PushPipelineRequest::new(relative_path, &parsed, &shadow)
+            PushPipelineRequest::new(&relative_path, &parsed, &shadow)
                 .with_approval(PushApproval {
                     assume_yes: job.assume_yes,
                     confirm_dangerous: job.confirm_dangerous,
@@ -409,6 +533,18 @@ where
     } else {
         validation_report_pipeline(schema_validation)
     };
+    augment_notion_media_plan(
+        &mount,
+        state_root,
+        &relative_path,
+        &parsed,
+        &shadow,
+        PushApproval {
+            assume_yes: job.assume_yes,
+            confirm_dangerous: job.confirm_dangerous,
+        },
+        &mut pipeline,
+    );
 
     Ok(PreparedPush {
         absolute_path,
@@ -883,6 +1019,7 @@ where
             plan: request.plan,
             operation_ids: request.operation_ids,
             remote_preconditions: request.remote_preconditions,
+            local_root: None,
         })?;
         self.check_remote_tree_content(request)
     }
@@ -950,15 +1087,25 @@ fn remote_tree_matches_synced_tree(
 
 impl<S, Source> PushApplier for DaemonPushHost<'_, S, Source>
 where
+    S: MountRepository,
     Source: Connector + ?Sized,
 {
     fn apply(&mut self, request: PushApplyRequest<'_>) -> AfsResult<PushApplyResult> {
+        let mount = self
+            .store
+            .get_mount(request.mount_id)
+            .map_err(AfsError::from)?
+            .ok_or_else(|| {
+                AfsError::InvalidState(format!("missing mount `{}`", request.mount_id.0))
+            })?;
+        let local_root = projection_output_root(self.state_root.as_deref(), &mount)?;
         let result: ApplyPlanResult = self.source.apply(ApplyPlanRequest {
             push_id: request.push_id,
             mount_id: request.mount_id,
             plan: request.plan,
             operation_ids: request.operation_ids,
             remote_preconditions: request.remote_preconditions,
+            local_root: Some(local_root.as_path()),
         })?;
 
         Ok(PushApplyResult {
@@ -1022,7 +1169,15 @@ where
                                 HydrationState::Hydrated,
                                 afs_core::hydration::HydrationReason::ExplicitPull,
                             ))?;
-                    accept_post_apply_remote(self.store, &mount, &mut entity, &path, rendered)?;
+                    let output_root = projection_output_root(self.state_root.as_deref(), &mount)?;
+                    accept_post_apply_remote(
+                        self.store,
+                        &mount,
+                        &mut entity,
+                        &path,
+                        &output_root,
+                        rendered,
+                    )?;
                     if let Some(mutation) = self
                         .store
                         .find_virtual_mutation_by_path(request.mount_id, source_path)
@@ -1074,7 +1229,15 @@ where
                         afs_core::hydration::HydrationReason::ExplicitPull,
                     ))?;
 
-            accept_post_apply_remote(self.store, &mount, &mut entity, &path, rendered)?;
+            let output_root = projection_output_root(self.state_root.as_deref(), &mount)?;
+            accept_post_apply_remote(
+                self.store,
+                &mount,
+                &mut entity,
+                &path,
+                &output_root,
+                rendered,
+            )?;
             self.store
                 .delete_virtual_mutation(request.mount_id, &format!("rename:{}", remote_id.0))
                 .map_err(AfsError::from)?;
@@ -1092,11 +1255,17 @@ fn accept_post_apply_remote<S>(
     mount: &MountConfig,
     entity: &mut EntityRecord,
     path: &Path,
+    output_root: &Path,
     rendered: HydratedEntity,
 ) -> AfsResult<()>
 where
     S: EntityRepository + ShadowRepository + RemoteObservationRepository + FreshnessStateRepository,
 {
+    for asset in &rendered.assets {
+        let path = mount_relative_path(output_root, &asset.path)?;
+        write_binary_atomic(&path, &asset.bytes)?;
+    }
+    update_hydrated_media_manifest(output_root, &rendered.assets)?;
     write_atomic(path, render_canonical_markdown(&rendered.document))?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
@@ -1348,6 +1517,47 @@ fn write_atomic(path: &Path, contents: String) -> AfsResult<()> {
     std::fs::write(&temp_path, contents)?;
     std::fs::rename(&temp_path, path)?;
     Ok(())
+}
+
+fn write_binary_atomic(path: &Path, contents: &[u8]) -> AfsResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("afs-media");
+    let temp_path = path.with_file_name(format!(".{file_name}.afs-tmp"));
+    std::fs::write(&temp_path, contents)?;
+    std::fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
+fn mount_relative_path(root: &Path, path: &Path) -> AfsResult<PathBuf> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(AfsError::InvalidState(format!(
+            "hydrated asset path `{}` is not mount-relative",
+            path.display()
+        )));
+    }
+    Ok(root.join(path))
+}
+
+fn projection_output_root(state_root: Option<&Path>, mount: &MountConfig) -> AfsResult<PathBuf> {
+    if mount.projection.uses_virtual_filesystem()
+        && let Some(state_root) = state_root
+    {
+        return Ok(virtual_fs_content_root(state_root, &mount.mount_id));
+    }
+
+    Ok(mount.root.clone())
 }
 
 fn generate_push_id() -> PushId {

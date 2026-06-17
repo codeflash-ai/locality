@@ -13,6 +13,7 @@ use afs_core::planner::{PushOperationKind, PushPlan};
 use afs_core::push::RemotePrecondition;
 use afs_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult, UndoPlan};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectorKind(pub &'static str);
@@ -115,6 +116,8 @@ pub struct ApplyPlanRequest<'a> {
     pub operation_ids: &'a [afs_core::journal::PushOperationId],
     /// Synced Tree remote versions for compare-and-swap checks.
     pub remote_preconditions: &'a [RemotePrecondition],
+    /// Local mount/output root for operations that need local sidecar files.
+    pub local_root: Option<&'a Path>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

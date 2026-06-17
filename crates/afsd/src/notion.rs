@@ -19,7 +19,7 @@ use afs_store::{
     CredentialStore, MountConfig, MountRepository,
 };
 
-use crate::hydration::{HydratedAsset, HydratedEntity, HydrationSource};
+use crate::hydration::{HydratedAsset, HydratedAssetMedia, HydratedEntity, HydrationSource};
 
 static ENV_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -424,6 +424,11 @@ impl HydrationSource for NotionConnector {
             .map(|asset| HydratedAsset {
                 path: asset.local_path,
                 bytes: asset.bytes,
+                media: Some(HydratedAssetMedia {
+                    block_id: asset.block_id,
+                    kind: asset.kind,
+                    source_url: asset.source_url,
+                }),
             })
             .collect();
 

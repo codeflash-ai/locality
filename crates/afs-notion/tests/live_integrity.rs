@@ -63,7 +63,7 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
         rendered
             .document
             .body
-            .contains(&format!("![W3C test image]({LIVE_IMAGE_URL})"))
+            .contains("![W3C test image](../.afs/media/live-integrity/block-coverage/image-")
     );
     assert!(
         rendered
@@ -237,7 +237,7 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
         verified_render
             .document
             .body
-            .contains(&format!("![W3C test image]({LIVE_IMAGE_URL})"))
+            .contains("![W3C test image](../.afs/media/live-integrity/block-coverage/image-")
     );
 }
 
@@ -803,6 +803,7 @@ fn apply_plan(connector: &NotionConnector, plan: &PushPlan) -> afs_connector::Ap
             plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply live plan")
 }

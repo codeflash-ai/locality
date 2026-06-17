@@ -2,16 +2,22 @@
 //!
 //! Notion file URLs are useful for API round-trips, but agents work better when
 //! images are also present as normal local files. Media assets are projected
-//! under a mount-level `media/` directory that mirrors the page path without
-//! putting binary files next to Markdown documents.
+//! under a mount-level `.afs/media/` directory that mirrors the page path without
+//! putting binary files next to Markdown documents or colliding with projected
+//! Notion page/database names.
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use afs_core::path_projection::page_container_path;
 use afs_core::{AfsError, AfsResult};
 use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+const AFS_DIR: &str = ".afs";
 const MEDIA_DIR: &str = "media";
+const MEDIA_MANIFEST: &str = "manifest.json";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaAsset {
@@ -29,8 +35,28 @@ pub struct MediaDownloadReport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DownloadedMediaAsset {
+    pub block_id: String,
+    pub kind: String,
+    pub source_url: String,
     pub local_path: PathBuf,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaManifest {
+    pub version: u32,
+    #[serde(default)]
+    pub assets: BTreeMap<String, MediaManifestEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaManifestEntry {
+    pub block_id: String,
+    pub kind: String,
+    pub source_url: String,
+    pub local_path: PathBuf,
+    pub sha256: String,
+    pub size: u64,
 }
 
 pub fn media_local_path(page_path: &Path, block_id: &str, kind: &str, source_url: &str) -> PathBuf {
@@ -61,6 +87,7 @@ pub fn download_media_assets(
         write_atomic(&destination, &asset.bytes)?;
         report.downloaded += 1;
     }
+    update_media_manifest(mount_root, &downloaded)?;
 
     report.skipped = assets.len().saturating_sub(report.downloaded);
     Ok(report)
@@ -93,6 +120,9 @@ fn fetch_media_asset(client: &Client, asset: &MediaAsset) -> AfsResult<Downloade
         .to_vec();
 
     Ok(DownloadedMediaAsset {
+        block_id: asset.block_id.clone(),
+        kind: asset.kind.clone(),
+        source_url: asset.source_url.clone(),
         local_path: asset.local_path.clone(),
         bytes,
     })
@@ -103,7 +133,7 @@ fn should_download(asset: &MediaAsset) -> bool {
 }
 
 fn media_page_dir(page_path: &Path) -> PathBuf {
-    let mut path = PathBuf::from(MEDIA_DIR);
+    let mut path = media_root_path();
     let mut pushed_component = false;
     let page_path = page_container_path(page_path);
 
@@ -119,6 +149,189 @@ fn media_page_dir(page_path: &Path) -> PathBuf {
     }
 
     path
+}
+
+pub fn local_media_href(page_path: &Path, local_path: &Path) -> String {
+    let base = markdown_parent_dir(page_path);
+    let base_components = normal_components(&base);
+    let target_components = normal_components(local_path);
+    let common = base_components
+        .iter()
+        .zip(&target_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = Vec::new();
+    for _ in common..base_components.len() {
+        parts.push("..".to_string());
+    }
+    parts.extend(target_components[common..].iter().cloned());
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+pub fn resolve_media_href(page_path: &Path, href: &str) -> Option<PathBuf> {
+    if is_external_href(href) {
+        return None;
+    }
+
+    let decoded = percent_decode(href)?;
+    let mut combined = markdown_parent_dir(page_path);
+    combined.push(decoded);
+    let normalized = normalize_relative_path(&combined)?;
+    if is_media_path(&normalized) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn markdown_parent_dir(page_path: &Path) -> PathBuf {
+    page_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf()
+}
+
+pub fn load_media_manifest(mount_root: &Path) -> AfsResult<MediaManifest> {
+    let path = media_manifest_path(mount_root);
+    if !path.exists() {
+        return Ok(MediaManifest {
+            version: 1,
+            assets: BTreeMap::new(),
+        });
+    }
+    let contents = std::fs::read_to_string(&path)?;
+    serde_json::from_str(&contents)
+        .map_err(|error| AfsError::Io(format!("media manifest decode failed: {error}")))
+}
+
+pub fn update_media_manifest(mount_root: &Path, assets: &[DownloadedMediaAsset]) -> AfsResult<()> {
+    if assets.is_empty() {
+        return Ok(());
+    }
+    let mut manifest = load_media_manifest(mount_root)?;
+    manifest.version = 1;
+    for asset in assets {
+        let entry = MediaManifestEntry {
+            block_id: asset.block_id.clone(),
+            kind: asset.kind.clone(),
+            source_url: asset.source_url.clone(),
+            local_path: asset.local_path.clone(),
+            sha256: sha256_hex(&asset.bytes),
+            size: asset.bytes.len() as u64,
+        };
+        manifest
+            .assets
+            .insert(media_manifest_key(&asset.local_path), entry);
+    }
+    let path = media_manifest_path(mount_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| AfsError::Io(format!("media manifest encode failed: {error}")))?;
+    write_atomic(&path, &json)
+}
+
+pub fn media_manifest_entry<'a>(
+    manifest: &'a MediaManifest,
+    local_path: &Path,
+) -> Option<&'a MediaManifestEntry> {
+    manifest.assets.get(&media_manifest_key(local_path))
+}
+
+pub fn media_manifest_key(path: &Path) -> String {
+    normal_components(path).join("/")
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+pub fn media_manifest_path(mount_root: &Path) -> PathBuf {
+    mount_root.join(media_root_path()).join(MEDIA_MANIFEST)
+}
+
+fn media_root_path() -> PathBuf {
+    PathBuf::from(AFS_DIR).join(MEDIA_DIR)
+}
+
+fn is_media_path(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Normal(value)) if value == AFS_DIR)
+        && matches!(components.next(), Some(Component::Normal(value)) if value == MEDIA_DIR)
+}
+
+fn is_external_href(href: &str) -> bool {
+    let lower = href.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("afs://")
+        || lower.starts_with("notion://")
+}
+
+fn normal_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn normalize_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(normalized)
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let high = hex_value(bytes[index + 1])?;
+            let low = hex_value(bytes[index + 2])?;
+            out.push(high << 4 | low);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn validate_mount_relative_path(path: &Path) -> AfsResult<()> {
@@ -232,7 +445,7 @@ fn write_atomic(path: &Path, contents: &[u8]) -> AfsResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::media_local_path;
+    use super::{local_media_href, media_local_path, resolve_media_href};
     use std::path::Path;
 
     #[test]
@@ -244,7 +457,7 @@ mod tests {
                 "image",
                 "https://example.com/diagram.PNG?download=1",
             ),
-            Path::new("media/Tasks/Fix login/image-0123456789ab.png")
+            Path::new(".afs/media/Tasks/Fix login/image-0123456789ab.png")
         );
     }
 
@@ -257,7 +470,36 @@ mod tests {
                 "image",
                 "https://example.com/diagram.PNG?download=1",
             ),
-            Path::new("media/Tasks/Fix login/image-0123456789ab.png")
+            Path::new(".afs/media/Tasks/Fix login/image-0123456789ab.png")
+        );
+    }
+
+    #[test]
+    fn local_media_href_is_relative_to_markdown_file_parent() {
+        assert_eq!(
+            local_media_href(
+                Path::new("Tasks/Fix login/page.md"),
+                Path::new(".afs/media/Tasks/Fix login/image-0123456789ab.png"),
+            ),
+            "../../.afs/media/Tasks/Fix login/image-0123456789ab.png"
+        );
+        assert_eq!(
+            local_media_href(
+                Path::new("Roadmap.md"),
+                Path::new(".afs/media/Roadmap/image-0123456789ab.png"),
+            ),
+            ".afs/media/Roadmap/image-0123456789ab.png"
+        );
+    }
+
+    #[test]
+    fn resolves_local_media_href_to_mount_relative_path() {
+        assert_eq!(
+            resolve_media_href(
+                Path::new("Tasks/Fix login/page.md"),
+                "../../.afs/media/Tasks/Fix login/image-0123456789ab.png",
+            ),
+            Some(Path::new(".afs/media/Tasks/Fix login/image-0123456789ab.png").to_path_buf())
         );
     }
 }

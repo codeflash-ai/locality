@@ -27,6 +27,27 @@ fn update_block_reverses_to_preimage_content() {
 }
 
 #[test]
+fn update_media_reverses_to_preimage_markdown() {
+    let entry = journal_entry(vec![PushOperation::UpdateMedia {
+        block_id: RemoteId::new("paragraph-1"),
+        local_path: ".afs/media/Roadmap/image-paragraph1.png".into(),
+        caption: "New image".to_string(),
+    }]);
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![UndoOperation::RestoreBlockContent {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "Old paragraph.".to_string(),
+        }]
+    );
+    assert!(plan.unsupported.is_empty());
+}
+
+#[test]
 fn archive_block_reverses_to_restore_with_original_position() {
     let entry = journal_entry(vec![PushOperation::ArchiveBlock {
         block_id: RemoteId::new("paragraph-1"),

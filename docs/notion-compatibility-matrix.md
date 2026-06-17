@@ -24,7 +24,7 @@ Support terms:
 | Database / data source | Read/enumerate | Directory | Database rows appear as Markdown files under the database directory. |
 | Data source schema | Read/validation source | `_schema.yaml` | Used to validate database row property edits before writing to Notion. |
 | Database row | Read/write/create row | Markdown file with frontmatter | Editing row body and supported properties is supported. Creating a new Markdown file under a database directory creates a row when the database has one writable data source. |
-| Image asset cache | Read/download for images | `media/` directory | Images referenced by supported image blocks are copied locally so agents can inspect them. |
+| Image asset cache | Read/download for images | `.afs/media/` directory | Images referenced by supported image blocks are copied locally so agents can inspect them without colliding with projected Notion content named `media`. |
 
 ## Blocks
 

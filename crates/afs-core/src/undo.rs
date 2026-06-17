@@ -87,6 +87,15 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                     None => unsupported.push(missing_block_preimage(operation_index, block_id)),
                 }
             }
+            PushOperation::UpdateMedia { block_id, .. } => {
+                match find_preimage_block(entry, block_id) {
+                    Some((_, block)) => operations.push(UndoOperation::RestoreBlockContent {
+                        block_id: block_id.clone(),
+                        content: block.text.clone(),
+                    }),
+                    None => unsupported.push(missing_block_preimage(operation_index, block_id)),
+                }
+            }
             PushOperation::MoveBlock { block_id, .. } => {
                 match find_preimage_block_position(entry, block_id) {
                     Some((_, after)) => operations.push(UndoOperation::MoveBlock {

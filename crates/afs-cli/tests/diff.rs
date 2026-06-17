@@ -9,10 +9,12 @@ use afs_core::conflict::{
 };
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::shadow::ShadowDocument;
+use afs_notion::media::sha256_hex;
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
     ShadowRepository, SqliteStateStore, StoreError,
 };
+use serde_json::json;
 
 #[test]
 fn diff_reports_noop_plan() {
@@ -50,6 +52,58 @@ fn diff_reports_safe_plan_as_confirmation_needed() {
     assert_eq!(report.guardrail.decision, "proceed");
     assert_eq!(plan.summary.blocks_updated, 1);
     assert_eq!(plan.operations[0].operation_type(), "update_block");
+}
+
+#[test]
+fn diff_plans_local_image_media_byte_update_from_manifest() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    let media_path = PathBuf::from(".afs/media/Roadmap/image-image1.png");
+    let original_bytes = b"original image bytes";
+    fixture.write_media(&media_path, original_bytes);
+    fixture.write_media_manifest(
+        &media_path,
+        "image-1",
+        "image",
+        "https://example.com/original-image.png",
+        original_bytes,
+    );
+    let original_body = "![Original image](.afs/media/Roadmap/image-image1.png)\n";
+    let edited_body = original_body;
+    let path = fixture.write_page("Roadmap.md", edited_body);
+    fs::write(fixture.root.join(&media_path), b"updated image bytes").expect("update media");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                original_body,
+                9,
+                [RemoteId::new("image-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+
+    let report = run_diff(&store, &path).expect("diff report");
+    let plan = report.plan.expect("plan");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "confirm_plan");
+    assert_eq!(plan.summary.media_updated, 1);
+    assert_eq!(plan.summary.blocks_updated, 0);
+    match &plan.operations[0] {
+        afs_cli::diff::PushOperationOutput::UpdateMedia {
+            block_id,
+            local_path,
+            caption,
+        } => {
+            assert_eq!(block_id, "image-1");
+            assert_eq!(local_path, ".afs/media/Roadmap/image-image1.png");
+            assert_eq!(caption, "Original image");
+        }
+        operation => panic!("unexpected operation {operation:?}"),
+    }
 }
 
 #[test]
@@ -373,6 +427,47 @@ impl DiffFixture {
     fn write_tasks_schema(&self) {
         self.write_raw("Tasks/_schema.yaml", tasks_schema());
     }
+
+    fn write_media(&self, relative_path: &PathBuf, bytes: &[u8]) {
+        let path = self.root.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("media parent");
+        }
+        fs::write(path, bytes).expect("media bytes");
+    }
+
+    fn write_media_manifest(
+        &self,
+        local_path: &PathBuf,
+        block_id: &str,
+        kind: &str,
+        source_url: &str,
+        bytes: &[u8],
+    ) {
+        let manifest_path = self.root.join(".afs/media/manifest.json");
+        if let Some(parent) = manifest_path.parent() {
+            fs::create_dir_all(parent).expect("manifest parent");
+        }
+        let key = local_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "assets": {
+                    key: {
+                        "block_id": block_id,
+                        "kind": kind,
+                        "source_url": source_url,
+                        "local_path": local_path,
+                        "sha256": sha256_hex(bytes),
+                        "size": bytes.len(),
+                    }
+                }
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+    }
 }
 
 impl Drop for DiffFixture {
@@ -450,6 +545,7 @@ impl OperationOutputExt for afs_cli::diff::PushOperationOutput {
             Self::ArchiveEntity { .. } => "archive_entity",
             Self::UpdateProperties { .. } => "update_properties",
             Self::CreateEntity { .. } => "create_entity",
+            Self::UpdateMedia { .. } => "update_media",
         }
     }
 }

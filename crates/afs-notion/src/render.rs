@@ -14,7 +14,7 @@ use crate::dto::{
     RichTextDto, SyncedBlockDto, TableBlockDto, TableRowBlockDto, UrlBlockDto,
     VerificationPropertyDto,
 };
-use crate::media::{MediaAsset, media_local_path};
+use crate::media::{MediaAsset, local_media_href, media_local_path};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotionRenderedEntity {
@@ -368,8 +368,12 @@ fn file_media_block(
             attrs.push(("title", title));
         }
         if let Some(url) = file_url(payload) {
+            let mut markdown_url = url.clone();
             if let Some(page_path) = options.page_path.as_deref() {
                 let local_path = media_local_path(page_path, &block.id, media_type, &url);
+                if media_type == "image" {
+                    markdown_url = local_media_href(page_path, &local_path);
+                }
                 media_asset = Some(MediaAsset {
                     block_id: block.id.clone(),
                     kind: media_type.to_string(),
@@ -380,7 +384,7 @@ fn file_media_block(
 
             let label = title.unwrap_or_else(|| media_default_label(media_type).to_string());
             let markdown = if media_type == "image" {
-                format!("![{}]({url})", escape_markdown_link_label(&label))
+                format!("![{}]({markdown_url})", escape_markdown_link_label(&label))
             } else {
                 format!("[{}]({url})", escape_markdown_link_label(&label))
             };

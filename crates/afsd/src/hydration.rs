@@ -14,6 +14,8 @@ use afs_store::{
     ShadowRepository, StoreError,
 };
 
+use crate::media::update_hydrated_media_manifest;
+
 pub trait HydrationEngine {
     fn queue(&mut self, request: HydrationRequest) -> AfsResult<()>;
     fn drain_ready(&mut self) -> AfsResult<usize>;
@@ -35,6 +37,14 @@ pub struct HydratedEntity {
 pub struct HydratedAsset {
     pub path: PathBuf,
     pub bytes: Vec<u8>,
+    pub media: Option<HydratedAssetMedia>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HydratedAssetMedia {
+    pub block_id: String,
+    pub kind: String,
+    pub source_url: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -124,6 +134,7 @@ where
             let path = mount_relative_path(&output_root, &asset.path)?;
             write_binary_atomic(&path, &asset.bytes)?;
         }
+        update_hydrated_media_manifest(&output_root, &rendered.assets)?;
         write_atomic(&path, render_canonical_markdown(&rendered.document))?;
         self.store
             .save_shadow(&mount.mount_id, rendered.shadow.clone())
@@ -223,6 +234,7 @@ where
             let path = mount_relative_path(output_root, &asset.path)?;
             write_binary_atomic(&path, &asset.bytes)?;
         }
+        update_hydrated_media_manifest(output_root, &rendered.assets)?;
         let local_contents = read_to_string(path)?;
         let base_shadow = match self.store.load_shadow(&mount.mount_id, &entity.remote_id) {
             Ok(shadow) => Some(shadow),

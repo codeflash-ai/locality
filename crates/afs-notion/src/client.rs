@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use afs_core::{AfsError, AfsResult};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, multipart};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -82,6 +82,10 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
         body: serde_json::Value,
     ) -> AfsResult<BlockListDto>;
     fn delete_block(&self, block_id: &str) -> AfsResult<BlockDto>;
+    fn upload_file(&self, filename: &str, content_type: &str, bytes: Vec<u8>) -> AfsResult<String> {
+        let _ = (filename, content_type, bytes);
+        Err(AfsError::NotImplemented("upload Notion file"))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +161,55 @@ impl HttpNotionApi {
         T: DeserializeOwned,
     {
         self.send_json::<T, serde_json::Value>(reqwest::Method::DELETE, path, None)
+    }
+
+    fn upload_file_bytes(
+        &self,
+        filename: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> AfsResult<String> {
+        let created: Value = self.post_json(
+            "/v1/file_uploads",
+            json!({
+                "mode": "single_part",
+                "filename": filename,
+                "content_type": content_type,
+            }),
+        )?;
+        let upload_id = created
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AfsError::Io("notion file upload response missing id".to_string()))?
+            .to_string();
+        let token = self.token()?;
+        let url = format!(
+            "{}/v1/file_uploads/{}/send",
+            DEFAULT_NOTION_API_BASE_URL, upload_id
+        );
+        let part = multipart::Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str(content_type)
+            .map_err(|error| AfsError::Io(format!("notion file upload MIME failed: {error}")))?;
+        let form = multipart::Form::new().part("file", part);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .header("Notion-Version", DEFAULT_NOTION_VERSION)
+            .multipart(form)
+            .send()
+            .map_err(|error| AfsError::Io(format!("notion file upload failed: {error}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+            return Err(AfsError::Io(format!(
+                "notion file upload returned HTTP {status}: {body}"
+            )));
+        }
+        Ok(upload_id)
     }
 
     fn send_json<T, B>(&self, method: reqwest::Method, path: &str, body: Option<B>) -> AfsResult<T>
@@ -352,6 +405,10 @@ impl NotionApi for HttpNotionApi {
 
     fn delete_block(&self, block_id: &str) -> AfsResult<BlockDto> {
         self.delete_json(&format!("/v1/blocks/{block_id}"))
+    }
+
+    fn upload_file(&self, filename: &str, content_type: &str, bytes: Vec<u8>) -> AfsResult<String> {
+        self.upload_file_bytes(filename, content_type, bytes)
     }
 }
 

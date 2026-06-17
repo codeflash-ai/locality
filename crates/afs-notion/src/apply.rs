@@ -7,6 +7,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path};
 
 use afs_connector::{ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult};
 use afs_core::journal::JournalApplyEffect;
@@ -94,6 +95,50 @@ pub fn apply_plan(
                     current_block_rich_text(current)?,
                 )?;
                 ensure_update_supported(current, &patch)?;
+                api.update_block(block_id.as_str(), patch.update_body())?;
+                effects.push(JournalApplyEffect::UpdatedBlock {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    block_id: block_id.clone(),
+                });
+            }
+            PushOperation::UpdateMedia {
+                block_id,
+                local_path,
+                caption,
+            } => {
+                let current = current_block(&current_blocks, block_id)?;
+                if current.kind != "image" {
+                    return Err(AfsError::Unsupported(
+                        "local media uploads are currently supported for image blocks only",
+                    ));
+                }
+                let local_root = request.local_root.ok_or_else(|| {
+                    AfsError::InvalidState(
+                        "local media upload requires an apply local root".to_string(),
+                    )
+                })?;
+                let bytes = read_local_media(local_root, local_path)?;
+                if bytes.len() > 20 * 1024 * 1024 {
+                    return Err(AfsError::Unsupported(
+                        "local image uploads larger than 20MB need multipart upload support",
+                    ));
+                }
+                let filename = local_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("image");
+                let upload_id = api.upload_file(filename, media_content_type(local_path), bytes)?;
+                let patch = NotionBlockPatch::new(
+                    "image",
+                    json!({
+                        "type": "file_upload",
+                        "file_upload": {
+                            "id": upload_id,
+                        },
+                        "caption": rich_text_payload(caption, current_block_rich_text(current)?)?,
+                    }),
+                );
                 api.update_block(block_id.as_str(), patch.update_body())?;
                 effects.push(JournalApplyEffect::UpdatedBlock {
                     operation_id: request.operation_ids[operation_index].clone(),
@@ -1323,6 +1368,11 @@ fn parse_supported_block(
     if let Some(kind @ ("image" | "video" | "file" | "pdf" | "audio")) = current_kind
         && let Some((label, href)) = parse_media_markdown(kind, trimmed)
     {
+        if !href.starts_with("http://") && !href.starts_with("https://") {
+            return Err(AfsError::Unsupported(
+                "local media links must be planned as media uploads before applying",
+            ));
+        }
         let kind = match kind {
             "image" => "image",
             "video" => "video",
@@ -2042,6 +2092,47 @@ fn parse_media_markdown<'a>(kind: &str, input: &'a str) -> Option<(&'a str, &'a 
         Some((label, href))
     } else {
         None
+    }
+}
+
+fn read_local_media(local_root: &Path, local_path: &Path) -> AfsResult<Vec<u8>> {
+    validate_mount_relative_path(local_path)?;
+    std::fs::read(local_root.join(local_path)).map_err(|error| {
+        AfsError::Io(format!(
+            "failed to read local media `{}`: {error}",
+            local_path.display()
+        ))
+    })
+}
+
+fn validate_mount_relative_path(path: &Path) -> AfsResult<()> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err(AfsError::InvalidState(format!(
+            "media upload path `{}` is not mount-relative",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn media_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        _ => "application/octet-stream",
     }
 }
 

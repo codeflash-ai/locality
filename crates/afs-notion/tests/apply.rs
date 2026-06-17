@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -18,6 +19,7 @@ use afs_notion::dto::{
 };
 use afs_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
+use tempfile::tempdir;
 
 #[test]
 fn apply_updates_appends_and_archives_supported_blocks() {
@@ -55,6 +57,7 @@ fn apply_updates_appends_and_archives_supported_blocks() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &preconditions,
+            local_root: None,
         })
         .expect("concurrency");
     let result = connector
@@ -64,6 +67,7 @@ fn apply_updates_appends_and_archives_supported_blocks() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &preconditions,
+            local_root: None,
         })
         .expect("apply");
 
@@ -157,6 +161,7 @@ fn apply_uses_start_position_and_chains_adjacent_new_blocks() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply");
 
@@ -242,6 +247,7 @@ fn apply_normalizes_append_after_nested_block_to_direct_child_ancestor() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply");
 
@@ -319,6 +325,7 @@ fn apply_appends_tier_one_markdown_block_shapes() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply");
 
@@ -426,6 +433,7 @@ fn apply_rejects_existing_block_moves_before_api_mutation() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect_err("move should be rejected");
 
@@ -461,6 +469,7 @@ fn apply_updates_equation_blocks_from_display_math() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply");
 
@@ -503,6 +512,7 @@ fn apply_updates_toggle_summary_from_rendered_list_item() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply");
 
@@ -545,6 +555,7 @@ fn apply_updates_todo_from_empty_checkbox_shorthand() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply");
 
@@ -595,6 +606,7 @@ fn apply_updates_and_appends_callouts_from_markdown() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply");
 
@@ -651,6 +663,7 @@ fn check_concurrency_rejects_remote_timestamp_mismatch() {
             plan: &plan,
             operation_ids: &[],
             remote_preconditions: &preconditions,
+            local_root: None,
         })
         .expect_err("stale remote");
 
@@ -686,6 +699,7 @@ fn check_concurrency_uses_database_metadata_for_row_create_parent() {
             plan: &plan,
             operation_ids: &[],
             remote_preconditions: &preconditions,
+            local_root: None,
         })
         .expect("database parent concurrency check");
 }
@@ -724,6 +738,7 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply");
 
@@ -937,6 +952,7 @@ fn apply_rejects_link_to_page_retargeting_before_api_mutation() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect_err("link_to_page retargeting is intentionally unsupported");
 
@@ -972,6 +988,7 @@ fn apply_rejects_child_page_link_edits_before_api_mutation() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect_err("child_page link edits are intentionally unsupported");
 
@@ -1026,6 +1043,7 @@ fn apply_updates_bookmark_and_embed_blocks_from_markdown_links() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply URL block updates");
 
@@ -1129,6 +1147,7 @@ fn apply_updates_external_media_blocks_from_markdown_links() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply external media block updates");
 
@@ -1196,6 +1215,70 @@ fn apply_updates_external_media_blocks_from_markdown_links() {
 }
 
 #[test]
+fn apply_uploads_local_image_media_before_block_update() {
+    let temp = tempdir().expect("tempdir");
+    let media_path = temp.path().join(".afs/media/Roadmap/image-1.png");
+    fs::create_dir_all(media_path.parent().expect("parent")).expect("mkdir");
+    fs::write(&media_path, b"new image bytes").expect("write image");
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![media_block(
+            "image-1",
+            "image",
+            "https://example.com/original-image.png",
+            "Original image",
+        )],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateMedia {
+            block_id: RemoteId::new("image-1"),
+            local_path: ".afs/media/Roadmap/image-1.png".into(),
+            caption: "Updated local image".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: Some(temp.path()),
+        })
+        .expect("apply local media upload");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::UploadFile {
+                filename: "image-1.png".to_string(),
+                content_type: "image/png".to_string(),
+                bytes: b"new image bytes".to_vec(),
+            },
+            WriteCall::Update {
+                block_id: "image-1".to_string(),
+                body: json!({
+                    "image": {
+                        "type": "file_upload",
+                        "file_upload": {
+                            "id": "upload-1",
+                        },
+                        "caption": rich_text_json("Updated local image"),
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_updates_simple_table_rows_from_markdown_table() {
     let api = Arc::new(RecordingNotionApi::with_table(
         "2026-06-10T00:00:00.000Z",
@@ -1224,6 +1307,7 @@ fn apply_updates_simple_table_rows_from_markdown_table() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply table row updates");
 
@@ -1287,6 +1371,7 @@ fn apply_adds_table_rows_from_markdown_table() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply table row addition");
 
@@ -1371,6 +1456,7 @@ fn apply_deletes_table_rows_from_markdown_table() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply table row deletion");
 
@@ -1493,6 +1579,7 @@ fn apply_updates_supported_page_properties() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply");
 
@@ -1691,6 +1778,7 @@ fn apply_creates_database_row_with_properties_and_children() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect("apply");
 
@@ -1836,6 +1924,7 @@ fn apply_rejects_legacy_property_update_without_values() {
             plan: &plan,
             operation_ids: &operation_ids,
             remote_preconditions: &[],
+            local_root: None,
         })
         .expect_err("legacy property update");
 
@@ -2165,6 +2254,18 @@ impl NotionApi for RecordingNotionApi {
         });
         Ok(block(block_id, "paragraph"))
     }
+
+    fn upload_file(&self, filename: &str, content_type: &str, bytes: Vec<u8>) -> AfsResult<String> {
+        self.writes
+            .lock()
+            .expect("writes")
+            .push(WriteCall::UploadFile {
+                filename: filename.to_string(),
+                content_type: content_type.to_string(),
+                bytes,
+            });
+        Ok("upload-1".to_string())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2191,6 +2292,11 @@ enum WriteCall {
     },
     Delete {
         block_id: String,
+    },
+    UploadFile {
+        filename: String,
+        content_type: String,
+        bytes: Vec<u8>,
     },
 }
 

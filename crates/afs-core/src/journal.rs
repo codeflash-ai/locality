@@ -66,6 +66,7 @@ impl PushOperationId {
         let target = match operation {
             PushOperation::UpdateBlock { block_id, .. }
             | PushOperation::MoveBlock { block_id, .. }
+            | PushOperation::UpdateMedia { block_id, .. }
             | PushOperation::ArchiveBlock { block_id } => block_id.0.as_str(),
             PushOperation::AppendBlock { parent_id, .. }
             | PushOperation::CreateEntity { parent_id, .. } => parent_id.0.as_str(),
@@ -167,6 +168,7 @@ fn operation_kind(operation: &PushOperation) -> &'static str {
         PushOperation::UpdateBlock { .. } => "update_block",
         PushOperation::AppendBlock { .. } => "append_block",
         PushOperation::MoveBlock { .. } => "move_block",
+        PushOperation::UpdateMedia { .. } => "update_media",
         PushOperation::ArchiveBlock { .. } => "archive_block",
         PushOperation::ArchiveEntity { .. } => "archive_entity",
         PushOperation::UpdateProperties { .. } => "update_properties",

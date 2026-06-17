@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::file_provider;
 use crate::hydration::{HydratedAsset, HydratedEntity};
+use crate::media::update_hydrated_media_manifest;
 use crate::source::SourceAdapter;
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
@@ -443,6 +444,7 @@ fn write_assets(root: &Path, assets: &[HydratedAsset]) -> Result<(), PullError> 
         let path = mount_relative_path(root, &asset.path)?;
         write_binary_atomic(&path, &asset.bytes)?;
     }
+    update_hydrated_media_manifest(root, assets).map_err(PullError::Connector)?;
     Ok(())
 }
 
