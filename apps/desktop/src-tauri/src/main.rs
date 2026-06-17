@@ -790,22 +790,7 @@ fn pending_changes_from_status(status: &afs_cli::status::StatusReport) -> Vec<Pe
         .mounts
         .iter()
         .flat_map(|mount| mount.entries.iter())
-        .filter(|entry| {
-            matches!(
-                entry.state,
-                StatusState::Dirty
-                    | StatusState::Conflicted
-                    | StatusState::Missing
-                    | StatusState::Error
-            ) || matches!(
-                entry.sync_state,
-                StatusSyncState::RemoteUpdateAvailable
-                    | StatusSyncState::PendingLocalChanges
-                    | StatusSyncState::ReviewNeeded
-                    | StatusSyncState::Conflicted
-            ) || entry.pending_journal_count > 0
-                || entry.failed_journal_count > 0
-        })
+        .filter(|entry| status_entry_needs_desktop_attention(entry))
         .map(|entry| PendingChange {
             title: entry.title.clone(),
             local_path: entry.path.clone(),
@@ -819,7 +804,7 @@ fn pending_state_for_entry(entry: &afs_cli::status::StatusEntry) -> &'static str
     if matches!(entry.sync_state, StatusSyncState::Conflicted) {
         "conflict"
     } else if matches!(entry.state, StatusState::Error | StatusState::Missing)
-        || entry.failed_journal_count > 0
+        || (entry.failed_journal_count > 0 && !failed_journal_only(entry))
     {
         "blocked"
     } else if matches!(
@@ -838,7 +823,10 @@ fn pending_state_for_entry(entry: &afs_cli::status::StatusEntry) -> &'static str
 
 fn status_summary_for_entry(entry: &afs_cli::status::StatusEntry) -> String {
     if entry.failed_journal_count > 0 {
-        return "previous push needs attention".to_string();
+        if let Some(last_failure) = status_issue_message(entry, "last_failure") {
+            return failed_push_summary(last_failure);
+        }
+        return "previous push failed; review this file before trying again".to_string();
     }
     if entry.pending_journal_count > 0 {
         return "push in progress".to_string();
@@ -861,6 +849,61 @@ fn status_summary_for_entry(entry: &afs_cli::status::StatusEntry) -> String {
         return issue.message.clone();
     }
     "local edits pending review".to_string()
+}
+
+fn status_entry_needs_desktop_attention(entry: &afs_cli::status::StatusEntry) -> bool {
+    if matches!(
+        entry.state,
+        StatusState::Dirty | StatusState::Conflicted | StatusState::Missing | StatusState::Error
+    ) || matches!(
+        entry.sync_state,
+        StatusSyncState::RemoteUpdateAvailable
+            | StatusSyncState::PendingLocalChanges
+            | StatusSyncState::Conflicted
+    ) || entry.pending_journal_count > 0
+    {
+        return true;
+    }
+
+    if matches!(entry.sync_state, StatusSyncState::ReviewNeeded) {
+        return entry
+            .issues
+            .iter()
+            .any(|issue| !matches!(issue.code.as_str(), "failed_journal" | "last_failure"));
+    }
+
+    false
+}
+
+fn failed_journal_only(entry: &afs_cli::status::StatusEntry) -> bool {
+    entry.failed_journal_count > 0
+        && matches!(entry.state, StatusState::Clean)
+        && entry.pending_journal_count == 0
+        && entry
+            .issues
+            .iter()
+            .all(|issue| matches!(issue.code.as_str(), "failed_journal" | "last_failure"))
+}
+
+fn status_issue_message<'a>(
+    entry: &'a afs_cli::status::StatusEntry,
+    code: &str,
+) -> Option<&'a str> {
+    entry
+        .issues
+        .iter()
+        .find(|issue| issue.code == code)
+        .map(|issue| issue.message.as_str())
+}
+
+fn failed_push_summary(message: &str) -> String {
+    if is_remote_changed_push_message(message) || message.contains("changed since last sync") {
+        return "Notion changed since last sync. Resolve pulls the latest version and may create conflict markers.".to_string();
+    }
+    if message.contains("unsupported feature") {
+        return format!("Previous push hit an unsupported Notion feature: {message}");
+    }
+    format!("Previous push failed: {message}")
 }
 
 fn activity_from_journals(
@@ -3295,13 +3338,13 @@ mod tests {
         DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TerminalCliLinkState,
         TrayVisualState, clear_state_root_contents, connection_metadata_changed,
         current_daemon_build_id, current_desktop_build_id, diff_report_message,
-        inspect_install_state, install_terminal_cli_link_at,
+        failed_push_summary, inspect_install_state, install_terminal_cli_link_at,
         install_terminal_cli_link_in_path_dirs, is_unsupported_schema_version_message,
-        load_desktop_activity, notion_id_from_url, pull_report_message, push_action_message,
-        record_current_install_marker, record_desktop_activity, should_hide_tray_popover,
-        should_prioritize_located_result, state_event_path_requires_refresh,
-        terminal_cli_link_state, tray_icon_image, tray_popover_position, validate_mount_root,
-        virtual_projection_refresh_signal_identifiers,
+        load_desktop_activity, notion_id_from_url, pending_changes_from_status,
+        pull_report_message, push_action_message, record_current_install_marker,
+        record_desktop_activity, should_hide_tray_popover, should_prioritize_located_result,
+        state_event_path_requires_refresh, terminal_cli_link_state, tray_icon_image,
+        tray_popover_position, validate_mount_root, virtual_projection_refresh_signal_identifiers,
     };
 
     #[test]
@@ -3522,6 +3565,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_push_summary_explains_remote_changed_recovery() {
+        let message = failed_push_summary(
+            "guardrail blocked push: remote entity `abc` changed since last sync (expected remote_edited_at `2026-06-17T05:45:00.000Z`, found `2026-06-17T06:21:00.000Z`)",
+        );
+
+        assert!(message.contains("Notion changed since last sync"));
+        assert!(message.contains("Resolve pulls"));
+    }
+
+    #[test]
+    fn pending_changes_hide_clean_failed_journal_audit_entries() {
+        let status = status_report_with_entry(status_entry(
+            afs_cli::status::StatusState::Clean,
+            afs_cli::status::StatusSyncState::ReviewNeeded,
+            1,
+            vec![
+                status_issue("failed_journal", "1 push journal(s) failed"),
+                status_issue("last_failure", "previous failure"),
+            ],
+        ));
+
+        assert!(pending_changes_from_status(&status).is_empty());
+    }
+
+    #[test]
+    fn pending_changes_keep_failed_journal_with_dirty_file() {
+        let status = status_report_with_entry(status_entry(
+            afs_cli::status::StatusState::Dirty,
+            afs_cli::status::StatusSyncState::ReviewNeeded,
+            1,
+            vec![
+                status_issue("failed_journal", "1 push journal(s) failed"),
+                status_issue("last_failure", "previous failure"),
+            ],
+        ));
+
+        let changes = pending_changes_from_status(&status);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].state, "blocked");
+        assert!(changes[0].summary.contains("Previous push failed"));
+    }
+
+    #[test]
     fn pull_report_message_explains_conflict_markers() {
         let report = afs_cli::pull::PullReport {
             ok: false,
@@ -3541,6 +3627,53 @@ mod tests {
         };
 
         assert!(pull_report_message(&report).contains("conflict markers"));
+    }
+
+    fn status_report_with_entry(
+        entry: afs_cli::status::StatusEntry,
+    ) -> afs_cli::status::StatusReport {
+        afs_cli::status::StatusReport {
+            ok: true,
+            clean: false,
+            command: "status",
+            target: None,
+            summary: afs_cli::status::StatusSummary::default(),
+            mounts: vec![afs_cli::status::StatusMountReport {
+                mount_id: "notion-main".to_string(),
+                connector: "notion".to_string(),
+                root: "/tmp/notion".to_string(),
+                entries: vec![entry],
+            }],
+        }
+    }
+
+    fn status_entry(
+        state: afs_cli::status::StatusState,
+        sync_state: afs_cli::status::StatusSyncState,
+        failed_journal_count: usize,
+        issues: Vec<afs_cli::status::StatusIssue>,
+    ) -> afs_cli::status::StatusEntry {
+        afs_cli::status::StatusEntry {
+            path: "page.md".to_string(),
+            absolute_path: "/tmp/notion/page.md".to_string(),
+            entity_id: "abc".to_string(),
+            kind: "page".to_string(),
+            title: "Page".to_string(),
+            hydration: "hydrated".to_string(),
+            state,
+            sync_state,
+            remote: afs_cli::status::StatusRemoteState::default(),
+            issues,
+            pending_journal_count: 0,
+            failed_journal_count,
+        }
+    }
+
+    fn status_issue(code: &str, message: &str) -> afs_cli::status::StatusIssue {
+        afs_cli::status::StatusIssue {
+            code: code.to_string(),
+            message: message.to_string(),
+        }
     }
 
     #[test]
