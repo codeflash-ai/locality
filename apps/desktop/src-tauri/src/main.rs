@@ -48,6 +48,7 @@ use tauri::{
     image::Image,
     menu::{Menu, MenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    webview::Color,
 };
 use tauri_plugin_dialog::DialogExt;
 
@@ -3826,6 +3827,9 @@ fn build_tray_popover(app: &mut tauri::App) -> tauri::Result<()> {
         .inner_size(TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT)
         .resizable(false)
         .decorations(false)
+        .transparent(true)
+        .background_color(Color(0, 0, 0, 0))
+        .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)
