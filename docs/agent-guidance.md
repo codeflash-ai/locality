@@ -25,6 +25,8 @@ The skill tells agents:
 - Agents should edit Markdown files directly and leave changes pending for AFS review.
 - Agents should not edit AFS identity frontmatter, block IDs, `::afs{...}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
 - `afs status` is optional and only needed when the agent needs to inspect pending changes.
+- Agents should only push when the user explicitly asks. The safe sequence is `afs diff <file>`, then `afs push <file> -y` for safe plans.
+- If push reports that the remote changed since last sync, the recovery sequence is `afs pull <file>`, resolve any inline conflict markers, rerun `afs diff <file>`, then push again.
 
 ## Onboarding UX
 
