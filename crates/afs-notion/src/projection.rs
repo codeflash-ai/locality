@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use afs_connector::ChildContainer;
 use afs_core::freshness::{RemoteObservation, RemoteVersion};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
+use afs_core::path_projection::{page_container_path, page_document_path};
 use afs_core::{AfsError, AfsResult};
 
 use crate::client::NotionApi;
@@ -620,11 +621,16 @@ pub fn allocate_page_path(
 ) -> PathBuf {
     for short_len in [6, 8, 10, 12, 32] {
         let stem = projected_stem(title, remote_id, short_len);
-        let file_path = parent_dir.join(format!("{stem}.md"));
-        let child_dir = parent_dir.join(&stem);
-        if !used_paths.contains(&file_path) && !used_paths.contains(&child_dir) {
+        let page_dir = parent_dir.join(&stem);
+        let file_path = page_document_path(&page_dir);
+        let legacy_file_path = parent_dir.join(format!("{stem}.md"));
+        if !used_paths.contains(&file_path)
+            && !used_paths.contains(&page_dir)
+            && !used_paths.contains(&legacy_file_path)
+        {
             used_paths.insert(file_path.clone());
-            used_paths.insert(child_dir);
+            used_paths.insert(page_dir);
+            used_paths.insert(legacy_file_path);
             return file_path;
         }
     }
@@ -650,7 +656,7 @@ fn allocate_directory_path(
 }
 
 fn page_child_dir(page_path: &Path) -> PathBuf {
-    page_path.with_extension("")
+    page_container_path(page_path)
 }
 
 fn projected_stem(title: &str, remote_id: &str, short_len: usize) -> String {
@@ -697,6 +703,7 @@ fn short_id(remote_id: &str, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{allocate_page_path, slugify_title};
+    use afs_core::path_projection::PAGE_DOCUMENT_FILENAME;
     use std::collections::BTreeSet;
     use std::path::Path;
 
@@ -712,8 +719,15 @@ mod tests {
         let first = allocate_page_path(Path::new(""), "Roadmap", "abcdef123456", &mut used);
         let second = allocate_page_path(Path::new(""), "Roadmap", "abcdef999999", &mut used);
 
-        assert_eq!(first, Path::new("roadmap ~abcdef.md"));
-        assert_eq!(second, Path::new("roadmap ~abcdef99.md"));
+        assert_eq!(
+            first,
+            Path::new("roadmap ~abcdef").join(PAGE_DOCUMENT_FILENAME)
+        );
+        assert_eq!(
+            second,
+            Path::new("roadmap ~abcdef99").join(PAGE_DOCUMENT_FILENAME)
+        );
         assert!(used.contains(Path::new("roadmap ~abcdef")));
+        assert!(used.contains(Path::new("roadmap ~abcdef.md")));
     }
 }

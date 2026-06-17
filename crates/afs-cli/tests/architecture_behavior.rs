@@ -73,14 +73,16 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
     .expect("browse notion source root");
     assert_readonly_guidance(&source_children.children, "AGENTS.md");
     assert_readonly_guidance(&source_children.children, "CLAUDE.md");
-    assert_child(
-        &source_children.children,
-        "Teamspace Home.md",
-        EntityKind::Page,
-    );
     assert_folder(&source_children.children, "Teamspace Home");
     assert!(
-        !fixture.content_path("Teamspace Home.md").exists(),
+        !source_children
+            .children
+            .iter()
+            .any(|child| child.filename == "Teamspace Home.md"),
+        "page directories should not be paired with sibling Markdown files"
+    );
+    assert!(
+        !fixture.content_path("Teamspace Home/page.md").exists(),
         "browsing the source root must not hydrate page bodies"
     );
 
@@ -104,11 +106,11 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
         parent_container,
     )
     .expect("browse page directory");
-    assert_child(&page_children.children, "Launch Plan.md", EntityKind::Page);
+    assert_child(&page_children.children, "page.md", EntityKind::Page);
     assert_folder(&page_children.children, "Launch Plan");
     assert!(
         !fixture
-            .content_path("Teamspace Home/Launch Plan.md")
+            .content_path("Teamspace Home/Launch Plan/page.md")
             .exists(),
         "directory navigation should still be metadata-only until the file is opened"
     );
@@ -122,15 +124,15 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
     )
     .expect("open child page");
     assert_eq!(materialized.hydration, HydrationState::Hydrated);
-    let local_file = fixture.content_path("Teamspace Home/Launch Plan.md");
+    let local_file = fixture.content_path("Teamspace Home/Launch Plan/page.md");
     let original = fs::read_to_string(&local_file).expect("read materialized file");
     assert!(original.contains("Original launch plan."));
 
-    let target_path = fixture.root.join("Teamspace Home/Launch Plan.md");
+    let target_path = fixture.root.join("Teamspace Home/Launch Plan/page.md");
     let clean = status_for(&store, &fixture, &target_path);
     assert!(clean.clean);
     assert_eq!(
-        entry_state(&clean, "Teamspace Home/Launch Plan.md"),
+        entry_state(&clean, "Teamspace Home/Launch Plan/page.md"),
         StatusState::Clean
     );
 
@@ -148,11 +150,11 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
     let pending = status_for(&store, &fixture, &target_path);
     assert!(!pending.clean);
     assert_eq!(
-        entry_state(&pending, "Teamspace Home/Launch Plan.md"),
+        entry_state(&pending, "Teamspace Home/Launch Plan/page.md"),
         StatusState::Dirty
     );
     assert!(
-        entry_issue_codes(&pending, "Teamspace Home/Launch Plan.md")
+        entry_issue_codes(&pending, "Teamspace Home/Launch Plan/page.md")
             .iter()
             .any(|code| code == "local_body_changed"),
         "local edits must show up as pending review before push"
@@ -186,7 +188,7 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
     let after_push = status_for(&store, &fixture, &target_path);
     assert!(after_push.clean);
     assert_eq!(
-        entry_state(&after_push, "Teamspace Home/Launch Plan.md"),
+        entry_state(&after_push, "Teamspace Home/Launch Plan/page.md"),
         StatusState::Clean
     );
     let reconciled = fs::read_to_string(local_file).expect("read reconciled file");
@@ -249,7 +251,7 @@ impl BehaviorFixture {
                     RemoteId::new("page-1"),
                     EntityKind::Page,
                     "Teamspace Home",
-                    "Teamspace Home.md",
+                    "Teamspace Home/page.md",
                 )
                 .with_hydration(HydrationState::Stub),
             )
@@ -373,7 +375,7 @@ impl Connector for FakeSource {
                         remote_id: RemoteId::new("child-1"),
                         kind: EntityKind::Page,
                         title: "Launch Plan".to_string(),
-                        path: request.parent_path.join("Launch Plan.md"),
+                        path: request.parent_path.join("Launch Plan/page.md"),
                         hydration: HydrationState::Stub,
                         content_hash: None,
                         remote_edited_at: Some("2026-06-12T00:00:00Z".to_string()),

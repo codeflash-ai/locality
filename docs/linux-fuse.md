@@ -85,7 +85,7 @@ ls -la /path/to/mount
 Read a projected Markdown file to force hydration:
 
 ```bash
-head -n 40 "/path/to/mount/<projected-page>.md"
+head -n 40 "/path/to/mount/<projected-page>/page.md"
 ./target/debug/afs status /path/to/mount --json
 ```
 
@@ -93,7 +93,7 @@ Exercise local writes without pushing to Notion by saving the current content,
 appending a smoke-test line, then writing the original bytes back:
 
 ```bash
-file="/path/to/mount/<projected-page>.md"
+file="/path/to/mount/<projected-page>/page.md"
 backup="$(mktemp)"
 cat "$file" > "$backup"
 printf '\nFUSE smoke edit %s\n' "$(date -Is)" >> "$file"

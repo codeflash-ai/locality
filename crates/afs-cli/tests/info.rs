@@ -32,7 +32,7 @@ fn info_for_page_file_reports_source_children_and_journals() {
     let report = run_info(
         &store,
         InfoOptions {
-            path: Some(fixture.root.join("roadmap ~aaaaaa.md")),
+            path: Some(fixture.root.join("roadmap ~aaaaaa/page.md")),
         },
     )
     .expect("info report");
@@ -80,7 +80,7 @@ fn info_for_page_workspace_resolves_the_backing_page() {
             .entity
             .as_ref()
             .map(|entity| entity.path.as_str()),
-        Some("roadmap ~aaaaaa.md")
+        Some("roadmap ~aaaaaa/page.md")
     );
     assert_eq!(report.children.pages, 1);
     assert_eq!(report.children.databases, 1);
@@ -184,7 +184,7 @@ fn info_runner_works_with_sqlite_state_store() {
     let report = run_info(
         &store,
         InfoOptions {
-            path: Some(fixture.root.join("roadmap ~aaaaaa.md")),
+            path: Some(fixture.root.join("roadmap ~aaaaaa/page.md")),
         },
     )
     .expect("info report");
@@ -231,10 +231,10 @@ impl InfoFixture {
     where
         S: EntityRepository,
     {
-        self.write_raw("roadmap ~aaaaaa.md");
+        self.write_raw("roadmap ~aaaaaa/page.md");
         fs::create_dir_all(self.root.join("roadmap ~aaaaaa/tasks ~cccccc")).expect("database dir");
-        self.write_raw("roadmap ~aaaaaa/design ~bbbbbb.md");
-        self.write_raw("roadmap ~aaaaaa/tasks ~cccccc/fix-login ~dddddd.md");
+        self.write_raw("roadmap ~aaaaaa/design ~bbbbbb/page.md");
+        self.write_raw("roadmap ~aaaaaa/tasks ~cccccc/fix-login ~dddddd/page.md");
         fs::write(
             self.root.join("roadmap ~aaaaaa/tasks ~cccccc/_schema.yaml"),
             "title: Tasks\n",
@@ -248,7 +248,7 @@ impl InfoFixture {
                     "page-1",
                     EntityKind::Page,
                     "Roadmap",
-                    "roadmap ~aaaaaa.md",
+                    "roadmap ~aaaaaa/page.md",
                 )
                 .with_hydration(HydrationState::Hydrated)
                 .with_content_hash("hash-page-1")
@@ -261,7 +261,7 @@ impl InfoFixture {
                 "page-2",
                 EntityKind::Page,
                 "Design",
-                "roadmap ~aaaaaa/design ~bbbbbb.md",
+                "roadmap ~aaaaaa/design ~bbbbbb/page.md",
             ))
             .expect("save child page");
         store
@@ -279,7 +279,7 @@ impl InfoFixture {
                 "row-1",
                 EntityKind::Page,
                 "Fix login",
-                "roadmap ~aaaaaa/tasks ~cccccc/fix-login ~dddddd.md",
+                "roadmap ~aaaaaa/tasks ~cccccc/fix-login ~dddddd/page.md",
             ))
             .expect("save row");
     }

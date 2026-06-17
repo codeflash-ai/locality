@@ -57,7 +57,7 @@ Repo: `/Users/saga4/orgs/research/afs` (AgentFS). Workspace crates: `afs-core`, 
 A real Notion mount worked for pull/hydrate, but push failed on a simple edit:
 
 - Mount: `afs mount notion ~/afs/notion --root-page 37b3ac0ebb88802cbcf4d53c9cfc4972`
-- User added paragraph `"Just Testing 101"` mid-page in `initial-idea ~37b3ac.md`
+- User added paragraph `"Just Testing 101"` mid-page in `initial-idea ~37b3ac/page.md`
 - `afs diff` planned: **1 append_block, 6 move_block, 0 update**
 - `afs push -y` failed with journal status `failed`
 - `afs log` failure message: **`unsupported feature: moving Notion blocks`**
@@ -121,7 +121,7 @@ Notion page shows the new paragraph in correct position.
 
 After failed push, user was stuck:
 
-- `afs status` human output only shows: `failed_journal notion-main initial-idea ~37b3ac.md`
+- `afs status` human output only shows: `failed_journal notion-main initial-idea ~37b3ac/page.md`
 - Does **not** print `issues[]` details (dirty reason, journal failure text) — details only in `--json`
 - `afs pull` skips dirty files (correct) but there is **no `--discard-local`** or restore command
 - No way to reset without manually editing the file back to shadow content
@@ -149,7 +149,7 @@ After failed push, user was stuck:
 afs status ~/afs/notion
 # shows: dirty, failed_journal, and "unsupported feature: moving Notion blocks"
 
-afs restore ~/afs/notion/initial-idea\ ~37b3ac.md
+afs restore ~/afs/notion/initial-idea\ ~37b3ac/page.md
 afs status ~/afs/notion
 # clean (failed journals may still list in log but not block restore)
 ```
@@ -377,9 +377,9 @@ export NOTION_TOKEN="..."   # until Prompt 4 lands
 afs mount notion ~/afs/notion --root-page <notion-page-uuid>
 afsd   # foreground, separate terminal
 afs pull ~/afs/notion
-# edit initial-idea ~<shortid>.md
-afs diff ~/afs/notion/<file>.md --json
-afs push ~/afs/notion/<file>.md -y
+# edit initial-idea ~<shortid>/page.md
+afs diff ~/afs/notion/<page-dir>/page.md --json
+afs push ~/afs/notion/<page-dir>/page.md -y
 afs status ~/afs/notion --json
 afs log
 ```

@@ -10,12 +10,13 @@ Working rules:
 - Open files directly. AFS hydrates online-only files on open and refreshes clean files in the background.
 - Use `afs status <path>` to see pending local changes and `afs diff <path>` to review planned Notion operations before pushing.
 - Push intentional changes with `afs push <path>`; use `afs push <path> -y` only after review or explicit approval.
-- Use `afs pull <path>` only to force a clean local file or plain-files projection to match latest remote now. Use `afs push <path>` to make Notion match local edits.
+- Use `afs pull <path>` only to refresh clean local files now. Use `afs push <path>` to make Notion match local edits.
 - Keep edits narrow and preserve the document shape unless the user requests a broader rewrite.
 
 Notion facts:
-- Pages are `.md` files; databases are directories; database rows are `.md` files inside the database directory.
+- Pages are directories. Edit `page.md` for the page body; sibling entries in that directory are child Notion content.
+- Databases are directories. Existing database rows are page directories, while a new `.md` file created directly inside a database directory creates a new row.
 - Database `_schema.yaml` files are read-only references for property names, types, select/status options, relations, and validation.
-- Edit Markdown body content and normal editable frontmatter only. Do not edit AFS identity frontmatter, block IDs, `::afs{...}` directives, `AGENTS.md`, or `CLAUDE.md`.
+- Edit body Markdown and editable frontmatter only. Do not edit AFS identity frontmatter, block IDs, `::afs{...}` directives, `AGENTS.md`, or `CLAUDE.md`.
 - Images and downloaded media may live under `media/`; keep references intact unless the task is specifically about media.
-- If a file has conflict markers, resolve the Markdown to the intended final content, remove every marker line, then rerun `afs diff` and `afs push`.
+- If a file has conflict markers, resolve the Markdown, remove every marker line, then rerun `afs diff` and `afs push`.

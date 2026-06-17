@@ -57,7 +57,7 @@ fn search_ranks_title_path_and_remote_id_matches() {
     assert!(
         id.results[0]
             .absolute_path
-            .ends_with("Product/Initial Idea ~37b3ac.md")
+            .ends_with("Product/Initial Idea ~37b3ac/page.md")
     );
 }
 
@@ -73,7 +73,7 @@ fn search_uses_remote_observation_metadata_without_touching_remote() {
                 RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 EntityKind::Page,
                 "Launch Plan",
-                "Engineering/Launch Plan ~aaaaaa.md",
+                "Engineering/Launch Plan ~aaaaaa/page.md",
                 "2026-06-16T00:00:00Z",
             )
             .with_remote_version(RemoteVersion("remote-v2".to_string())),
@@ -107,7 +107,7 @@ fn search_does_not_treat_equal_versionless_observation_as_changed() {
             RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             EntityKind::Page,
             "Roadmap 2026",
-            "Engineering/Roadmap 2026 ~aaaaaa.md",
+            "Engineering/Roadmap 2026 ~aaaaaa/page.md",
             "2026-06-16T00:00:00Z",
         ))
         .expect("save observation");
@@ -136,7 +136,7 @@ fn search_uses_sqlite_candidate_index_without_changing_report() {
                 RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 EntityKind::Page,
                 "Launch Plan",
-                "Engineering/Launch Plan ~aaaaaa.md",
+                "Engineering/Launch Plan ~aaaaaa/page.md",
                 "2026-06-16T00:00:00Z",
             )
             .with_remote_version(RemoteVersion("remote-v2".to_string())),
@@ -218,8 +218,11 @@ fn notion_url_locate_prefers_page_file_over_workspace_fallback() {
 
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].kind, "page");
-    assert_eq!(report.results[0].path, "Product/Initial Idea ~37b3ac.md");
-    assert!(report.results[0].absolute_path.ends_with(".md"));
+    assert_eq!(
+        report.results[0].path,
+        "Product/Initial Idea ~37b3ac/page.md"
+    );
+    assert!(report.results[0].absolute_path.ends_with("/page.md"));
 }
 
 #[test]
@@ -286,7 +289,7 @@ impl SearchFixture {
                     RemoteId::new("37b3ac0ebb88802cbcf4d53c9cfc4972"),
                     EntityKind::Page,
                     "Initial Idea",
-                    "Product/Initial Idea ~37b3ac.md",
+                    "Product/Initial Idea ~37b3ac/page.md",
                 )
                 .with_hydration(HydrationState::Hydrated)
                 .with_synced_tree_remote_version("remote-v1"),
@@ -299,7 +302,7 @@ impl SearchFixture {
                     RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                     EntityKind::Page,
                     "Roadmap 2026",
-                    "Engineering/Roadmap 2026 ~aaaaaa.md",
+                    "Engineering/Roadmap 2026 ~aaaaaa/page.md",
                 )
                 .with_synced_tree_remote_version("remote-v1"),
             )

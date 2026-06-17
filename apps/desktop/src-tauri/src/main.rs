@@ -3421,12 +3421,12 @@ mod tests {
             &content_roots
         ));
         assert!(state_event_path_requires_refresh(
-            &content_root.join("notion-main/files/Roadmap.md"),
+            &content_root.join("notion-main/files/Roadmap/page.md"),
             &state_root,
             &content_roots
         ));
         assert!(!state_event_path_requires_refresh(
-            &content_root.join("notion-main/files/.Roadmap.md.afs-tmp"),
+            &content_root.join("notion-main/files/Roadmap/.page.md.afs-tmp"),
             &state_root,
             &content_roots
         ));
@@ -3516,8 +3516,8 @@ mod tests {
             title: "Roadmap".to_string(),
             kind: kind.to_string(),
             remote_id: "page-1".to_string(),
-            path: "Roadmap.md".to_string(),
-            absolute_path: "/tmp/afs/Roadmap.md".to_string(),
+            path: "Roadmap/page.md".to_string(),
+            absolute_path: "/tmp/afs/Roadmap/page.md".to_string(),
             state: state.to_string(),
             safety: SearchSafety {
                 agent_readable: state == "ready",
@@ -3589,19 +3589,19 @@ fn sample_pending_changes() -> Vec<PendingChange> {
     vec![
         PendingChange {
             title: "Roadmap 2026".to_string(),
-            local_path: "Engineering/Roadmap 2026 ~a3f2.md".to_string(),
+            local_path: "Engineering/Roadmap 2026 ~a3f2/page.md".to_string(),
             summary: "2 text edits".to_string(),
             state: "safe".to_string(),
         },
         PendingChange {
             title: "Launch Plan".to_string(),
-            local_path: "Marketing/Launch Plan ~8841.md".to_string(),
+            local_path: "Marketing/Launch Plan ~8841/page.md".to_string(),
             summary: "needs review: large deletion".to_string(),
             state: "needs_review".to_string(),
         },
         PendingChange {
             title: "Customer Notes".to_string(),
-            local_path: "Sales/Customer Notes ~6b91.md".to_string(),
+            local_path: "Sales/Customer Notes ~6b91/page.md".to_string(),
             summary: "1 property edit".to_string(),
             state: "safe".to_string(),
         },

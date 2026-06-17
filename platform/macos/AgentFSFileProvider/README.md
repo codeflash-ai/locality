@@ -17,7 +17,7 @@ macOS IPC commands are compatibility aliases over the daemon's platform-neutral
 - `fetchContents(for:)` calls `file_provider_materialize`, which blocks until
   the daemon hydrates the page, then copies the materialized Markdown into File
   Provider's transfer directory before returning it to the system.
-- `modifyItem(_:contents:)` accepts edits to existing page files and calls
+- `modifyItem(_:contents:)` accepts edits to existing `page.md` files and calls
   `virtual_fs_commit_write`. The daemon writes the replacement bytes to the
   virtual content cache and marks the page dirty so the normal review and push
   flow can decide when to update Notion.

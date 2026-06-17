@@ -441,7 +441,7 @@ impl HydrationFixture {
                     self.remote_id.clone(),
                     EntityKind::Page,
                     "Roadmap",
-                    "Roadmap.md",
+                    "Roadmap/page.md",
                 )
                 .with_hydration(hydration),
             )
@@ -460,7 +460,7 @@ impl HydrationFixture {
     }
 
     fn page_path(&self) -> PathBuf {
-        self.root.join("Roadmap.md")
+        self.root.join("Roadmap/page.md")
     }
 
     fn write_stub(&self) {
@@ -475,7 +475,7 @@ impl HydrationFixture {
     }
 
     fn write_raw(&self, contents: &str) {
-        self.write_raw_at("Roadmap.md", contents);
+        self.write_raw_at("Roadmap/page.md", contents);
     }
 
     fn write_raw_at(&self, relative_path: &str, contents: &str) {

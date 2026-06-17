@@ -112,8 +112,8 @@ print compact safety labels. JSON output is stable enough for tools:
       "title": "Roadmap 2026",
       "kind": "page",
       "remote_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "path": "Engineering/Roadmap 2026 ~aaaaaa.md",
-      "absolute_path": "/Users/alice/afs/notion/Engineering/Roadmap 2026 ~aaaaaa.md",
+      "path": "Engineering/Roadmap 2026 ~aaaaaa/page.md",
+      "absolute_path": "/Users/alice/afs/notion/Engineering/Roadmap 2026 ~aaaaaa/page.md",
       "state": "ready",
       "safety": {
         "agent_readable": true,
@@ -289,7 +289,7 @@ checked instead of listing each file.
 Non-clean human entries are multi-line so failed journals expose their recovery context:
 
 ```text
-notion-main  initial-idea ~37b3ac.md
+notion-main  initial-idea ~37b3ac/page.md
   state: dirty  sync: pending_local_changes  hydration: dirty
   issue: entity_dirty - entity is marked dirty
   issue: failed_journal - 2 push journal(s) failed
@@ -324,7 +324,7 @@ JSON output includes:
 Human output is a compact summary:
 
 ```text
-inspect /Users/alice/Library/CloudStorage/AFS/notion/Roadmap.md
+inspect /Users/alice/Library/CloudStorage/AFS/notion/Roadmap/page.md
   mount: notion-main  entity: page-1
   title: Roadmap
   Synced Tree version: 2026-06-10T00:00:00Z
@@ -388,7 +388,7 @@ Typical recovery:
 
 ```bash
 afs status ~/afs/notion
-afs restore ~/afs/notion/initial-idea\ ~37b3ac.md
+afs restore ~/afs/notion/initial-idea\ ~37b3ac/page.md
 afs status ~/afs/notion
 ```
 

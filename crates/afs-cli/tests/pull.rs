@@ -92,7 +92,7 @@ fn pull_virtual_mount_writes_content_and_schema_to_daemon_cache() {
     assert_eq!(report.hydrated, 1);
     assert!(!fixture.root_file("roadmap").exists());
     let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
-    assert!(content_root.join("roadmap ~aaaaaa.md").exists());
+    assert!(content_root.join("roadmap ~aaaaaa/page.md").exists());
     assert!(
         content_root
             .join("roadmap ~aaaaaa")
@@ -176,7 +176,7 @@ fn pull_mount_root_renames_existing_projection_when_remote_title_changes() {
         .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
         .expect("get root entity")
         .expect("root entity");
-    assert_eq!(root_entity.path, PathBuf::from("strategy ~aaaaaa.md"));
+    assert_eq!(root_entity.path, PathBuf::from("strategy ~aaaaaa/page.md"));
 }
 
 #[test]
@@ -405,13 +405,14 @@ impl PullFixture {
     }
 
     fn root_file(&self, slug: &str) -> PathBuf {
-        self.root.join(format!("{slug} ~aaaaaa.md"))
+        self.root.join(format!("{slug} ~aaaaaa")).join("page.md")
     }
 
     fn child_file(&self, root_slug: &str) -> PathBuf {
         self.root
             .join(format!("{root_slug} ~aaaaaa"))
-            .join("design-notes ~bbbbbb.md")
+            .join("design-notes ~bbbbbb")
+            .join("page.md")
     }
 
     fn database_schema_file(&self) -> PathBuf {
@@ -425,7 +426,8 @@ impl PullFixture {
         self.root
             .join("roadmap ~aaaaaa")
             .join("tasks ~cccccc")
-            .join("fix-login-bug ~eeeeee.md")
+            .join("fix-login-bug ~eeeeee")
+            .join("page.md")
     }
 }
 

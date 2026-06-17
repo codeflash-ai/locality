@@ -38,14 +38,14 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
                 &mount_id,
                 "root-page",
                 "Home",
-                "Home.md",
+                "Home/page.md",
                 "2026-06-10T00:00:00Z",
             ),
             page_entry(
                 &mount_id,
                 "child-page",
                 "Child",
-                "Home/Child.md",
+                "Home/Child/page.md",
                 "2026-06-10T00:00:00Z",
             ),
             database_entry(&mount_id, "tasks-db", "Tasks", "Home/Tasks ~tasks"),
@@ -69,14 +69,14 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
     assert_eq!(report.stubbed, 2);
     assert_eq!(report.schemas_written, 1);
     assert_eq!(report.queued_hydrations, 1);
-    assert!(root.join("Home.md").exists());
-    assert!(root.join("Home/Child.md").exists());
+    assert!(root.join("Home/page.md").exists());
+    assert!(root.join("Home/Child/page.md").exists());
     assert_eq!(
         std::fs::read_to_string(root.join("Home/Tasks ~tasks/_schema.yaml"))
             .expect("database schema"),
         "title: Tasks\nproperties: {}\n"
     );
-    let root_stub = std::fs::read_to_string(root.join("Home.md")).expect("root stub");
+    let root_stub = std::fs::read_to_string(root.join("Home/page.md")).expect("root stub");
     assert!(root_stub.contains(CanonicalDocument::STUB_MARKER));
 
     let entity = supervisor
@@ -84,7 +84,7 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
         .get_entity(&mount_id, &RemoteId::new("child-page"))
         .expect("get child entity")
         .expect("child entity");
-    assert_eq!(entity.path, PathBuf::from("Home/Child.md"));
+    assert_eq!(entity.path, PathBuf::from("Home/Child/page.md"));
     assert_eq!(entity.hydration, HydrationState::Stub);
 
     let observation = supervisor
@@ -92,7 +92,10 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
         .get_remote_observation(&mount_id, &RemoteId::new("child-page"))
         .expect("get child observation")
         .expect("child observation");
-    assert_eq!(observation.projected_path, PathBuf::from("Home/Child.md"));
+    assert_eq!(
+        observation.projected_path,
+        PathBuf::from("Home/Child/page.md")
+    );
     assert_eq!(
         observation.remote_version,
         Some(RemoteVersion::new("2026-06-10T00:00:00Z"))
@@ -405,14 +408,14 @@ fn scheduled_pull_renames_existing_projection_when_remote_title_changes() {
                 &mount_id,
                 "root-page",
                 "Vision",
-                "Vision.md",
+                "Vision/page.md",
                 "2026-06-11T00:00:00Z",
             ),
             page_entry(
                 &mount_id,
                 "child-page",
                 "Child",
-                "Vision/Child.md",
+                "Vision/Child/page.md",
                 "2026-06-11T00:00:00Z",
             ),
         ],
@@ -426,23 +429,23 @@ fn scheduled_pull_renames_existing_projection_when_remote_title_changes() {
         )
         .expect("rename scheduled pull");
 
-    assert!(root.join("Vision.md").exists());
-    assert!(root.join("Vision/Child.md").exists());
-    assert!(!root.join("Home.md").exists());
-    assert!(!root.join("Home/Child.md").exists());
+    assert!(root.join("Vision/page.md").exists());
+    assert!(root.join("Vision/Child/page.md").exists());
+    assert!(!root.join("Home/page.md").exists());
+    assert!(!root.join("Home/Child/page.md").exists());
 
     let root_entity = supervisor
         .store()
         .get_entity(&mount_id, &RemoteId::new("root-page"))
         .expect("get root entity")
         .expect("root entity");
-    assert_eq!(root_entity.path, PathBuf::from("Vision.md"));
+    assert_eq!(root_entity.path, PathBuf::from("Vision/page.md"));
     let child_entity = supervisor
         .store()
         .get_entity(&mount_id, &RemoteId::new("child-page"))
         .expect("get child entity")
         .expect("child entity");
-    assert_eq!(child_entity.path, PathBuf::from("Vision/Child.md"));
+    assert_eq!(child_entity.path, PathBuf::from("Vision/Child/page.md"));
 }
 
 fn supervisor_with_mounts(

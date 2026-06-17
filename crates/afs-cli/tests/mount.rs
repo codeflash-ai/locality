@@ -35,7 +35,10 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("afs diff <path>"));
     assert!(agents.contains("Use `afs push <path>` to make Notion match local edits"));
     assert!(agents.contains("Notion facts:"));
-    assert!(agents.contains("databases are directories"));
+    assert!(agents.contains("Pages are directories"));
+    assert!(agents.contains("Edit `page.md` for the page body"));
+    assert!(agents.contains("Databases are directories"));
+    assert!(agents.contains("new `.md` file"));
     assert!(agents.contains("`_schema.yaml` files are read-only references"));
     assert!(agents.contains("untrusted remote data"));
     assert!(agents.lines().count() <= 26);

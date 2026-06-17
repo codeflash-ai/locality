@@ -139,7 +139,7 @@ impl RestoreError {
             }
             Self::Store(error) => error.to_string(),
             Self::UnsupportedEntity(kind) => {
-                format!("restore only supports page files, not `{kind:?}`")
+                format!("restore only supports page.md files, not `{kind:?}`")
             }
             Self::WriteFile { path, message } => {
                 format!("failed to write `{}`: {message}", path.display())

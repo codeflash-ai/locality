@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::path_projection::{page_container_path, page_listing_parent_path};
 use afs_store::{
     EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository, StoreError,
 };
@@ -68,7 +69,7 @@ impl InfoRole {
     pub fn label(self) -> &'static str {
         match self {
             Self::MountRoot => "mount root",
-            Self::PageFile => "projected page file",
+            Self::PageFile => "projected page.md file",
             Self::PageWorkspace => "child workspace for a projected page",
             Self::DatabaseDirectory => "projected database directory",
             Self::ProjectedDirectory => "projected directory",
@@ -280,7 +281,7 @@ fn role_for_exact_entity(kind: &EntityKind) -> InfoRole {
 
 fn child_context_for_entity(entity: &EntityRecord) -> PathBuf {
     match entity.kind {
-        EntityKind::Page => entity.path.with_extension(""),
+        EntityKind::Page => page_container_path(&entity.path),
         EntityKind::Database | EntityKind::Directory => entity.path.clone(),
         EntityKind::Asset | EntityKind::Unknown(_) => entity
             .path
@@ -297,7 +298,7 @@ fn nearest_page_workspace<'a>(
     entities
         .iter()
         .filter(|entity| matches!(entity.kind, EntityKind::Page))
-        .filter(|entity| relative_path.starts_with(entity.path.with_extension("")))
+        .filter(|entity| relative_path.starts_with(page_container_path(&entity.path)))
         .max_by_key(|entity| entity.path.components().count())
 }
 
@@ -319,12 +320,7 @@ fn child_summary(entities: &[EntityRecord], context: &Path) -> InfoChildSummary 
     };
 
     for entity in entities {
-        if entity
-            .path
-            .parent()
-            .map(|parent| parent == context)
-            .unwrap_or(context.as_os_str().is_empty())
-        {
+        if entity_listing_parent_path(entity) == context {
             summary.immediate += 1;
             match entity.kind {
                 EntityKind::Page => summary.pages += 1,
@@ -339,6 +335,20 @@ fn child_summary(entities: &[EntityRecord], context: &Path) -> InfoChildSummary 
     summary
 }
 
+fn entity_listing_parent_path(entity: &EntityRecord) -> PathBuf {
+    match entity.kind {
+        EntityKind::Page => page_listing_parent_path(&entity.path),
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_) => entity
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default(),
+    }
+}
+
 fn subtree_count(entities: &[EntityRecord], context: &Path) -> usize {
     if context.as_os_str().is_empty() {
         return entities.len();
@@ -346,7 +356,12 @@ fn subtree_count(entities: &[EntityRecord], context: &Path) -> usize {
 
     entities
         .iter()
-        .filter(|entity| entity.path != context && entity.path.starts_with(context))
+        .filter(|entity| {
+            if entity.kind == EntityKind::Page && page_container_path(&entity.path) == context {
+                return false;
+            }
+            entity.path != context && entity.path.starts_with(context)
+        })
         .count()
 }
 

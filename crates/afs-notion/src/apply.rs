@@ -1215,7 +1215,7 @@ fn parse_supported_block(
 
     if current_kind == Some("child_page") {
         return Err(AfsError::Unsupported(
-            "editing Notion child_page link blocks; edit the child page file or title frontmatter instead",
+            "editing Notion child_page link blocks; edit the child page's page.md or title frontmatter instead",
         ));
     }
 

@@ -7,6 +7,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use afs_core::path_projection::page_container_path;
 use afs_core::{AfsError, AfsResult};
 use reqwest::blocking::Client;
 
@@ -104,7 +105,7 @@ fn should_download(asset: &MediaAsset) -> bool {
 fn media_page_dir(page_path: &Path) -> PathBuf {
     let mut path = PathBuf::from(MEDIA_DIR);
     let mut pushed_component = false;
-    let page_path = page_path.with_extension("");
+    let page_path = page_container_path(page_path);
 
     for component in page_path.components() {
         if let Component::Normal(component) = component {

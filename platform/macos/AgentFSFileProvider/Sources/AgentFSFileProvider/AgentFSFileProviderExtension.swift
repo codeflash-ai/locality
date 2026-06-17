@@ -230,7 +230,7 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
 
   private func unsupportedWriteError() -> NSError {
     unsupportedWriteError(
-      "AgentFS currently supports editing existing page files. Create, rename, and delete support will be added through the daemon write pipeline."
+      "AgentFS currently supports editing existing page.md files. Create, rename, and delete support will be added through the daemon write pipeline."
     )
   }
 

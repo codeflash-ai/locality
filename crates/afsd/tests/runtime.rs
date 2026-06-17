@@ -298,7 +298,7 @@ fn default_runner_virtual_fs_children_is_cache_only() {
             RemoteId::new("page-1"),
             EntityKind::Page,
             "Roadmap",
-            "Roadmap.md",
+            "Roadmap/page.md",
         ))
         .expect("save entity");
     drop(store);
@@ -321,7 +321,7 @@ fn default_runner_virtual_fs_children_is_cache_only() {
         report
             .children
             .iter()
-            .any(|child| child.filename == "Roadmap.md")
+            .any(|child| child.filename == "Roadmap")
     );
 }
 

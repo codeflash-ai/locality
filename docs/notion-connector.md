@@ -94,7 +94,7 @@ GitHub Actions has a manual `notion-live-e2e` workflow for these tests. The work
 
 ## Initial Block Rendering
 
-The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, bookmark/embed/link-preview URL blocks, child-page links, and media blocks with URLs as Markdown. Child pages render as normal Markdown links to their stable Notion page URLs so agents and humans can follow or locate the editable child page file. It renders child databases, toggles, synced blocks, column layouts, tabs, table of contents, breadcrumbs, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
+The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, bookmark/embed/link-preview URL blocks, child-page links, and media blocks with URLs as Markdown. Child pages render as normal Markdown links to their stable Notion page URLs so agents and humans can follow or locate the editable child page's `page.md`. It renders child databases, toggles, synced blocks, column layouts, tabs, table of contents, breadcrumbs, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
 
 Inline rich text is represented with Notion DTOs first, then rendered through one Markdown path:
 
@@ -142,18 +142,19 @@ media/
     image-0123456789ab.png
 ```
 
-The media tree mirrors the Markdown page path without the `.md` extension. This keeps binary files out of content directories while giving agents a stable local file they can open. The first downloader fetches image blocks only; other file-like blocks render their remote URL directly until size and retention policy are designed.
+The media tree mirrors the Notion page directory. This keeps binary files out of content directories while giving agents a stable local file they can open. The first downloader fetches image blocks only; other file-like blocks render their remote URL directly until size and retention policy are designed.
 
 ## Path Projection
 
-Root-page mounts use the same filename shape described in `plan.md`: `slugified-title ~shortid.md`.
+Root-page mounts use a stable directory shape: `slugified-title ~shortid/page.md`.
 
-For a page that also has child pages, AgentFS reserves a sibling directory with the same stem:
+Each Notion page is a directory. The page body lives in `page.md`; sibling entries in the same directory are child Notion content:
 
 ```text
-roadmap ~aaaaaa.md
 roadmap ~aaaaaa/
-  design-notes ~bbbbbb.md
+  page.md
+  design-notes ~bbbbbb/
+    page.md
   tasks ~cccccc/
 ```
 
@@ -163,9 +164,11 @@ Database blocks project as directories. Each data source under the database cont
 
 ```text
 roadmap ~aaaaaa/
+  page.md
   tasks ~cccccc/
     _schema.yaml
-    fix-login-bug ~eeeeee.md
+    fix-login-bug ~eeeeee/
+      page.md
 ```
 
-Row files are normal page files. Their stubs include page identity plus supported property values in frontmatter, while the body remains the standard AFS stub marker until hydration. Creating a row is creating a new `.md` file in the database directory with YAML frontmatter and no `afs.id`; `afs push -y` creates the Notion page, reads it back, saves the durable entity/shadow rows, and replaces the temporary filename with the canonical projected filename. `_view.csv` remains future work.
+Row directories are normal page directories. Their `page.md` stubs include page identity plus supported property values in frontmatter, while the body remains the standard AFS stub marker until hydration. Creating a row is still ergonomic: create a new `.md` file directly in the database directory with YAML frontmatter and no `afs.id`; `afs push -y` creates the Notion page, reads it back, saves the durable entity/shadow rows, and replaces the temporary filename with the canonical projected row directory. `_view.csv` remains future work.

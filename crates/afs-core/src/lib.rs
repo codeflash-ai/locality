@@ -18,6 +18,7 @@ pub mod freshness;
 pub mod hydration;
 pub mod journal;
 pub mod model;
+pub mod path_projection;
 pub mod planner;
 pub mod pull;
 pub mod push;

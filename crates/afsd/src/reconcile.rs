@@ -14,6 +14,7 @@ use afs_core::hydration::{
     HydrationPolicy, HydrationReason, HydrationRequest, should_eager_hydrate,
 };
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
+use afs_core::path_projection::{is_page_document_path, page_container_path};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::NotionConnector;
 use afs_store::{
@@ -392,14 +393,7 @@ fn rename_projection_if_needed(
 
     match entry.kind {
         EntityKind::Page => {
-            rename_projected_path(
-                &mount.root.join(&existing.path),
-                &mount.root.join(&entry.path),
-            )?;
-            rename_projected_path(
-                &mount.root.join(existing.path.with_extension("")),
-                &mount.root.join(entry.path.with_extension("")),
-            )?;
+            rename_page_projection_if_needed(mount, &existing.path, &entry.path)?;
         }
         EntityKind::Database
         | EntityKind::Directory
@@ -412,6 +406,47 @@ fn rename_projection_if_needed(
         }
     }
 
+    Ok(())
+}
+
+fn rename_page_projection_if_needed(
+    mount: &MountConfig,
+    existing_path: &Path,
+    entry_path: &Path,
+) -> AfsResult<()> {
+    if existing_path == entry_path {
+        return Ok(());
+    }
+
+    if is_page_document_path(existing_path) {
+        let existing_container = page_container_path(existing_path);
+        let entry_container = page_container_path(entry_path);
+        if existing_container != entry_container {
+            rename_projected_path(
+                &mount.root.join(existing_container),
+                &mount.root.join(entry_container),
+            )?;
+        } else {
+            rename_projected_path(
+                &mount.root.join(existing_path),
+                &mount.root.join(entry_path),
+            )?;
+        }
+        return Ok(());
+    }
+
+    let existing_file = mount.root.join(existing_path);
+    let legacy_child_dir = mount.root.join(page_container_path(existing_path));
+    let entry_container = mount.root.join(page_container_path(entry_path));
+    let entry_file = mount.root.join(entry_path);
+
+    if legacy_child_dir.exists() && legacy_child_dir != entry_container {
+        rename_projected_path(&legacy_child_dir, &entry_container)?;
+    } else if !entry_container.exists() {
+        create_dir_all(&entry_container)?;
+    }
+
+    rename_projected_path(&existing_file, &entry_file)?;
     Ok(())
 }
 

@@ -90,7 +90,7 @@ seed_fixture() {
 
   local db="$state_root/state.sqlite3"
   local content_root="$state_root/content/$mount_id/files"
-  mkdir -p "$content_root/Teamspace Home"
+  mkdir -p "$content_root/Teamspace Home/Launch Plan"
 
   local home_frontmatter
   local home_body
@@ -102,16 +102,16 @@ seed_fixture() {
   child_body=$'## Launch Plan\n\nOriginal launch plan from the seeded FUSE fixture.\n'
 
   printf -- '---\n%s---\n%s' "$home_frontmatter" "$home_body" \
-    > "$content_root/Teamspace Home.md"
+    > "$content_root/Teamspace Home/page.md"
   printf -- '---\n%s---\n%s' "$child_frontmatter" "$child_body" \
-    > "$content_root/Teamspace Home/Launch Plan.md"
+    > "$content_root/Teamspace Home/Launch Plan/page.md"
 
   sqlite3 "$db" <<SQL
 INSERT INTO entities (
   mount_id, remote_id, kind_json, title, path, hydration_json, content_hash, remote_edited_at
 ) VALUES
-  ('$mount_id', 'page-home', '"page"', 'Teamspace Home', 'Teamspace Home.md', '"hydrated"', NULL, '2026-06-13T00:00:00Z'),
-  ('$mount_id', 'page-launch', '"page"', 'Launch Plan', 'Teamspace Home/Launch Plan.md', '"hydrated"', NULL, '2026-06-13T00:00:00Z')
+  ('$mount_id', 'page-home', '"page"', 'Teamspace Home', 'Teamspace Home/page.md', '"hydrated"', NULL, '2026-06-13T00:00:00Z'),
+  ('$mount_id', 'page-launch', '"page"', 'Launch Plan', 'Teamspace Home/Launch Plan/page.md', '"hydrated"', NULL, '2026-06-13T00:00:00Z')
 ON CONFLICT(mount_id, remote_id) DO UPDATE SET
   kind_json = excluded.kind_json,
   title = excluded.title,
@@ -192,10 +192,12 @@ wait_for_mount
 findmnt -R "$afs_root" >/dev/null
 ls -la "$afs_root" >/dev/null
 
-home_file="$mount_root/Teamspace Home.md"
-child_dir="$mount_root/Teamspace Home"
-child_file="$child_dir/Launch Plan.md"
+home_dir="$mount_root/Teamspace Home"
+home_file="$home_dir/page.md"
+child_dir="$mount_root/Teamspace Home/Launch Plan"
+child_file="$child_dir/page.md"
 
+test -d "$home_dir"
 test -f "$home_file"
 test -d "$child_dir"
 test -f "$child_file"

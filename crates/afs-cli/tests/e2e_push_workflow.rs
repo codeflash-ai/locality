@@ -276,12 +276,14 @@ fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
         &source_root,
     )
     .expect("list source root");
-    let scratch_file = find_virtual_file(&source_children.children, &scratch.id);
+    let scratch_folder = find_virtual_folder(&source_children.children, &scratch.id);
     assert!(
-        !content_root.join(&scratch_file.path).exists(),
+        !content_root
+            .join(&scratch_folder.path)
+            .join("page.md")
+            .exists(),
         "listing the source root must not hydrate the root page body"
     );
-    let scratch_folder = find_virtual_folder(&source_children.children, &scratch.id);
 
     assert_eq!(
         refresh_virtual_fs_children(
@@ -300,9 +302,12 @@ fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
         &scratch_folder.identifier,
     )
     .expect("list nested page children");
-    let child_file = find_virtual_file(&nested_children.children, &child.id);
+    let child_folder = find_virtual_folder(&nested_children.children, &child.id);
     assert!(
-        !content_root.join(&child_file.path).exists(),
+        !content_root
+            .join(&child_folder.path)
+            .join("page.md")
+            .exists(),
         "listing a page directory must not hydrate nested page bodies"
     );
 
@@ -472,8 +477,8 @@ fn live_locate_notion_url_returns_markdown_path_and_can_prioritize_hydration() {
     assert_eq!(located.kind, "page");
     assert_eq!(located.state, "online_only");
     assert!(
-        located.path.ends_with(".md"),
-        "locate should return the Markdown file path, not only a page directory: {located:#?}"
+        located.path.ends_with("/page.md"),
+        "locate should return the page.md file path, not only a page directory: {located:#?}"
     );
     assert!(
         located.absolute_path.ends_with(&located.path),
@@ -1056,15 +1061,11 @@ impl E2eFixture {
     }
 
     fn page_file(&self) -> PathBuf {
-        fs::read_dir(&self.root)
-            .expect("read mount")
-            .map(|entry| entry.expect("dir entry").path())
-            .find(|path| {
-                path.extension().is_some_and(|extension| extension == "md")
-                    && file_name(path) != "AGENTS.md"
-                    && file_name(path) != "CLAUDE.md"
-            })
-            .expect("page file")
+        collect_files(&self.root)
+            .into_iter()
+            .filter(|path| file_name(path) == "page.md")
+            .min_by_key(|path| path.components().count())
+            .expect("page.md file")
     }
 
     fn schema_file(&self) -> PathBuf {
@@ -1148,19 +1149,6 @@ fn hydrate_virtual_root_page(
         page_id,
     )
     .expect("hydrate virtual root page");
-}
-
-fn find_virtual_file<'a>(
-    items: &'a [afsd::virtual_fs::VirtualFsItem],
-    remote_id: &str,
-) -> &'a afsd::virtual_fs::VirtualFsItem {
-    items
-        .iter()
-        .find(|item| {
-            item.remote_id.as_deref() == Some(remote_id)
-                && item.kind == afsd::virtual_fs::VirtualFsItemKind::File
-        })
-        .unwrap_or_else(|| panic!("missing virtual file for {remote_id}: {items:#?}"))
 }
 
 fn find_virtual_folder<'a>(

@@ -10,6 +10,7 @@ use afs_core::conflict::has_unresolved_conflict_markers;
 use afs_core::freshness::FreshnessTier;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::path_projection::{page_container_path, page_listing_parent_path};
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, FreshnessStateRepository, MountConfig, MountRepository,
@@ -203,16 +204,20 @@ where
         if deleted_remote_ids.contains(&entity.remote_id) {
             continue;
         }
-        if parent_path(&entity.path) == container_path {
-            children.push(entity_item(&mount, entity, &index));
+        if entity_listing_parent_path(entity) == container_path {
             if entity.kind == EntityKind::Page {
                 children.push(page_child_dir_item(
                     &mount,
-                    &entity.path.with_extension(""),
+                    &page_container_path(&entity.path),
                     &entity.remote_id,
                     &index,
                 ));
+            } else {
+                children.push(entity_item(&mount, entity, &index));
             }
+        }
+        if entity.kind == EntityKind::Page && page_container_path(&entity.path) == container_path {
+            children.push(entity_item(&mount, entity, &index));
         }
     }
     for mutation in &mutations {
@@ -350,7 +355,7 @@ where
     let entity = require_entity(store, mount_id, &remote_id)?;
     if entity.kind != EntityKind::Page {
         return Err(AfsError::Unsupported(
-            "only page files can be materialized by the virtual filesystem",
+            "only page.md files can be materialized by the virtual filesystem",
         ));
     }
 
@@ -466,7 +471,7 @@ where
             });
         }
         return Err(AfsError::Unsupported(
-            "only page files can be materialized by the virtual filesystem",
+            "only page.md files can be materialized by the virtual filesystem",
         ));
     }
 
@@ -563,7 +568,7 @@ where
     let mut entity = require_entity(store, mount_id, &remote_id)?;
     if entity.kind != EntityKind::Page {
         return Err(AfsError::Unsupported(
-            "only page files can be written by the virtual filesystem",
+            "only page.md files can be written by the virtual filesystem",
         ));
     }
     let path = content_path_for_relative(content_root, &entity.path)?;
@@ -630,7 +635,7 @@ where
     }
     if !filename.ends_with(".md") {
         return Err(AfsError::Unsupported(
-            "virtual filesystem creates currently support only Markdown page files",
+            "virtual filesystem creates currently support only Markdown page.md files",
         ));
     }
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
@@ -687,7 +692,7 @@ where
     }
     if !new_filename.ends_with(".md") {
         return Err(AfsError::Unsupported(
-            "virtual filesystem renames currently support only Markdown page files",
+            "virtual filesystem renames currently support only Markdown page.md files",
         ));
     }
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
@@ -726,7 +731,7 @@ where
     let mut entity = require_entity(store, mount_id, &remote_id)?;
     if entity.kind != EntityKind::Page {
         return Err(AfsError::Unsupported(
-            "only page files can be renamed by the virtual filesystem",
+            "only page.md files can be renamed by the virtual filesystem",
         ));
     }
     let old_parent = parent_path(&entity.path).to_path_buf();
@@ -809,7 +814,7 @@ where
     let entity = require_entity(store, mount_id, &remote_id)?;
     if entity.kind != EntityKind::Page {
         return Err(AfsError::Unsupported(
-            "only page files can be deleted by the virtual filesystem",
+            "only page.md files can be deleted by the virtual filesystem",
         ));
     }
     let now = now_string();
@@ -1109,7 +1114,7 @@ fn resolve_item(
             .ok_or_else(|| missing_identifier(identifier))?;
         return Ok(page_child_dir_item(
             mount,
-            &entity.path.with_extension(""),
+            &page_container_path(&entity.path),
             &entity.remote_id,
             index,
         ));
@@ -1254,7 +1259,7 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
         identifier: entity.remote_id.0.clone(),
         parent_identifier: Some(container_identifier_for_path(
             mount,
-            parent_path(&entity.path),
+            &entity_parent_container_path(entity),
             index,
         )),
         filename: filename(&entity.path),
@@ -1505,7 +1510,7 @@ fn container_path(
             .iter()
             .find(|entity| entity.remote_id.0 == remote_id && entity.kind == EntityKind::Page)
             .ok_or_else(|| missing_identifier(identifier))?;
-        return Ok(entity.path.with_extension(""));
+        return Ok(page_container_path(&entity.path));
     }
 
     if let Some(path) = identifier.strip_prefix(PATH_PREFIX) {
@@ -1521,7 +1526,7 @@ fn container_path(
         return Ok(entity.path.clone());
     }
     if entity.kind == EntityKind::Page {
-        return Ok(entity.path.with_extension(""));
+        return Ok(page_container_path(&entity.path));
     }
 
     Err(AfsError::InvalidState(format!(
@@ -1565,7 +1570,7 @@ fn child_container_for_identifier(
 fn has_known_entity_child(entities: &[EntityRecord], parent: &Path) -> bool {
     entities
         .iter()
-        .any(|entity| parent_path(&entity.path) == parent)
+        .any(|entity| entity_listing_parent_path(entity) == parent)
 }
 
 fn refreshed_entity_record(
@@ -1653,6 +1658,26 @@ fn parent_path(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| *parent != Path::new(""))
         .unwrap_or_else(|| Path::new(""))
+}
+
+fn entity_listing_parent_path(entity: &EntityRecord) -> PathBuf {
+    match entity.kind {
+        EntityKind::Page => page_listing_parent_path(&entity.path),
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_) => parent_path(&entity.path).to_path_buf(),
+    }
+}
+
+fn entity_parent_container_path(entity: &EntityRecord) -> PathBuf {
+    match entity.kind {
+        EntityKind::Page => page_container_path(&entity.path),
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_) => parent_path(&entity.path).to_path_buf(),
+    }
 }
 
 fn filename(path: &Path) -> String {
@@ -1764,7 +1789,7 @@ impl ProviderIndex {
         for entity in entities {
             entities_by_path.insert(entity.path.clone(), entity.clone());
             if entity.kind == EntityKind::Page {
-                page_child_dirs.insert(entity.path.with_extension(""), entity.remote_id.clone());
+                page_child_dirs.insert(page_container_path(&entity.path), entity.remote_id.clone());
             }
         }
 
@@ -1807,7 +1832,7 @@ mod tests {
     };
 
     #[test]
-    fn children_include_page_files_and_synthetic_page_child_folders() {
+    fn children_include_page_directories_with_page_body_files_inside() {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
         store
@@ -1819,7 +1844,7 @@ mod tests {
                 remote_id: RemoteId::new("page-root"),
                 kind: EntityKind::Page,
                 title: "Home".to_string(),
-                path: "Home.md".into(),
+                path: "Home/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
@@ -1831,7 +1856,7 @@ mod tests {
                 remote_id: RemoteId::new("page-child"),
                 kind: EntityKind::Page,
                 title: "Child".to_string(),
-                path: "Home/Child.md".into(),
+                path: "Home/Child/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
@@ -1848,7 +1873,7 @@ mod tests {
         let report =
             virtual_fs_children(&store, &mount_id, "source:notion").expect("source children");
 
-        assert_eq!(report.children.len(), 4);
+        assert_eq!(report.children.len(), 3);
         assert_eq!(report.children[0].filename, "AGENTS.md");
         assert_eq!(report.children[0].kind, VirtualFsItemKind::File);
         assert_eq!(report.children[0].identifier, AGENTS_GUIDANCE_IDENTIFIER);
@@ -1866,8 +1891,6 @@ mod tests {
         assert_eq!(report.children[2].filename, "Home");
         assert_eq!(report.children[2].kind, VirtualFsItemKind::Folder);
         assert_eq!(report.children[2].identifier, "children:page-root");
-        assert_eq!(report.children[3].filename, "Home.md");
-        assert_eq!(report.children[3].kind, VirtualFsItemKind::File);
     }
 
     #[test]
@@ -1962,7 +1985,7 @@ mod tests {
                 RemoteId::new("page-root"),
                 EntityKind::Page,
                 "Home",
-                "Home.md",
+                "Home/page.md",
             ))
             .expect("save root page");
         store
@@ -1971,7 +1994,7 @@ mod tests {
                 RemoteId::new("page-child"),
                 EntityKind::Page,
                 "Child",
-                "Home/Child.md",
+                "Home/Child/page.md",
             ))
             .expect("save child page");
 
@@ -1981,7 +2004,8 @@ mod tests {
         assert_eq!(report.children.len(), 2);
         assert_eq!(report.children[0].identifier, "children:page-child");
         assert_eq!(report.children[0].kind, VirtualFsItemKind::Folder);
-        assert_eq!(report.children[1].identifier, "page-child");
+        assert_eq!(report.children[1].identifier, "page-root");
+        assert_eq!(report.children[1].filename, "page.md");
         assert_eq!(
             report.children[1].parent_identifier.as_deref(),
             Some("children:page-root")
@@ -2001,7 +2025,7 @@ mod tests {
                 remote_id: RemoteId::new("page-root"),
                 kind: EntityKind::Page,
                 title: "Home".to_string(),
-                path: "home ~pagero.md".into(),
+                path: "home ~pagero/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
@@ -2016,15 +2040,13 @@ mod tests {
 
         let report =
             virtual_fs_children(&store, &mount_id, "source:notion").expect("source children");
-        assert_eq!(report.children.len(), 4);
+        assert_eq!(report.children.len(), 3);
         assert_eq!(report.children[0].identifier, AGENTS_GUIDANCE_IDENTIFIER);
         assert_eq!(report.children[0].kind, VirtualFsItemKind::File);
         assert_eq!(report.children[1].identifier, CLAUDE_GUIDANCE_IDENTIFIER);
         assert_eq!(report.children[1].kind, VirtualFsItemKind::File);
         assert_eq!(report.children[2].identifier, "children:page-root");
         assert_eq!(report.children[2].kind, VirtualFsItemKind::Folder);
-        assert_eq!(report.children[3].identifier, "page-root");
-        assert_eq!(report.children[3].kind, VirtualFsItemKind::File);
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "source:notion")
             .expect("refresh cached children");
@@ -2062,7 +2084,7 @@ mod tests {
                 remote_id: RemoteId::new("row-1"),
                 kind: EntityKind::Page,
                 title: "Fix login bug".to_string(),
-                path: "Root/Tasks/fix-login-bug.md".into(),
+                path: "Root/Tasks/fix-login-bug/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
@@ -2079,11 +2101,15 @@ mod tests {
             .get_entity(&mount_id, &RemoteId::new("row-1"))
             .expect("get row")
             .expect("row");
-        assert_eq!(row.path, PathBuf::from("Root/Tasks/fix-login-bug.md"));
+        assert_eq!(row.path, PathBuf::from("Root/Tasks/fix-login-bug/page.md"));
         let children = virtual_fs_children(&store, &mount_id, "database-1").expect("children");
-        assert!(children.children.iter().any(
-            |child| child.identifier == "row-1" && child.path == "Root/Tasks/fix-login-bug.md"
-        ));
+        assert!(
+            children
+                .children
+                .iter()
+                .any(|child| child.identifier == "children:row-1"
+                    && child.path == "Root/Tasks/fix-login-bug")
+        );
     }
 
     #[test]
@@ -2120,7 +2146,7 @@ mod tests {
                 remote_id: RemoteId::new("row-1"),
                 kind: EntityKind::Page,
                 title: "Fix login bug".to_string(),
-                path: "Root/Tasks/fix-login-bug.md".into(),
+                path: "Root/Tasks/fix-login-bug/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
@@ -2176,7 +2202,7 @@ mod tests {
                 remote_id: RemoteId::new("row-1"),
                 kind: EntityKind::Page,
                 title: "Fix login bug".to_string(),
-                path: "Root/Tasks/fix-login-bug.md".into(),
+                path: "Root/Tasks/fix-login-bug/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
@@ -2193,7 +2219,7 @@ mod tests {
             .get_entity(&mount_id, &RemoteId::new("row-1"))
             .expect("get row")
             .expect("row");
-        assert_eq!(row.path, PathBuf::from("Root/Tasks/fix-login-bug.md"));
+        assert_eq!(row.path, PathBuf::from("Root/Tasks/fix-login-bug/page.md"));
         assert_eq!(row.hydration, HydrationState::Stub);
         assert_eq!(row.content_hash, None);
     }
@@ -2282,13 +2308,13 @@ mod tests {
                 RemoteId::new("page-1"),
                 EntityKind::Page,
                 "Roadmap",
-                "Roadmap.md",
+                "Roadmap/page.md",
             ))
             .expect("save page");
 
         let report = virtual_fs_item(&store, &mount_id, "page-1").expect("item");
 
-        assert_eq!(report.item.filename, "Roadmap.md");
+        assert_eq!(report.item.filename, "page.md");
         assert_eq!(report.item.kind, VirtualFsItemKind::File);
         assert_eq!(report.item.materialized_path, None);
     }
@@ -2300,8 +2326,8 @@ mod tests {
         let state_root = temp_root("afs-virtual-fs-conflicted-materialize");
         let content_root = state_root.join("content/notion-main/files");
         let conflicted_contents = b"<<<<<<< LOCAL\nlocal\n=======\nremote\n>>>>>>> REMOTE\n";
-        std::fs::create_dir_all(&content_root).expect("content root");
-        std::fs::write(content_root.join("Roadmap.md"), conflicted_contents)
+        std::fs::create_dir_all(content_root.join("Roadmap")).expect("content root");
+        std::fs::write(content_root.join("Roadmap/page.md"), conflicted_contents)
             .expect("write conflicted cache");
         let mut store = InMemoryStateStore::new();
         store
@@ -2314,7 +2340,7 @@ mod tests {
                     remote_id,
                     EntityKind::Page,
                     "Roadmap",
-                    "Roadmap.md",
+                    "Roadmap/page.md",
                 )
                 .with_hydration(HydrationState::Conflicted),
             )
@@ -2323,7 +2349,7 @@ mod tests {
         let item = virtual_fs_item_with_content_root(&store, &content_root, &mount_id, "page-1")
             .expect("item");
         let expected_path = content_root
-            .join("Roadmap.md")
+            .join("Roadmap/page.md")
             .to_string_lossy()
             .to_string();
         assert_eq!(
@@ -2392,7 +2418,7 @@ mod tests {
                 remote_id: remote_id.clone(),
                 kind: EntityKind::Page,
                 title: "Roadmap".to_string(),
-                path: "Roadmap.md".into(),
+                path: "Roadmap/page.md".into(),
                 hydration: HydrationState::Hydrated,
                 content_hash: None,
                 remote_edited_at: None,
@@ -2405,7 +2431,7 @@ mod tests {
 
         assert_eq!(report.bytes_written, 6);
         assert_eq!(
-            std::fs::read(content_root.join("Roadmap.md")).expect("read cache"),
+            std::fs::read(content_root.join("Roadmap/page.md")).expect("read cache"),
             b"edited"
         );
         assert_eq!(
@@ -2442,7 +2468,7 @@ mod tests {
                     remote_id.clone(),
                     EntityKind::Page,
                     "Roadmap",
-                    "Roadmap.md",
+                    "Roadmap/page.md",
                 )
                 .with_hydration(HydrationState::Stub),
             )
@@ -2481,7 +2507,7 @@ mod tests {
                     remote_id.clone(),
                     EntityKind::Page,
                     "Roadmap",
-                    "Roadmap.md",
+                    "Roadmap/page.md",
                 )
                 .with_hydration(HydrationState::Stub),
             )
@@ -2523,7 +2549,7 @@ mod tests {
                 RemoteId::new("page-root"),
                 EntityKind::Page,
                 "Home",
-                "Home.md",
+                "Home/page.md",
             ))
             .expect("save parent page");
 
@@ -2575,7 +2601,7 @@ mod tests {
                 RemoteId::new("page-root"),
                 EntityKind::Page,
                 "Home",
-                "Home.md",
+                "Home/page.md",
             ))
             .expect("save parent page");
         let created = create_virtual_fs_file(
@@ -2628,7 +2654,7 @@ mod tests {
                 RemoteId::new("page-1"),
                 EntityKind::Page,
                 "Roadmap",
-                "Roadmap.md",
+                "Roadmap/page.md",
             ))
             .expect("save page");
 
@@ -2671,7 +2697,7 @@ mod tests {
                 RemoteId::new("page-1"),
                 EntityKind::Page,
                 "Roadmap",
-                "Roadmap.md",
+                "Roadmap/page.md",
             ))
             .expect("save page");
 
