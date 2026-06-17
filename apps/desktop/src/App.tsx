@@ -773,8 +773,8 @@ function Onboarding({
             </PrimaryButton>
             {mountError && <p className="field-error">{mountError}</p>}
             <p className="quiet-note">
-              This folder will include AGENTS.md and CLAUDE.md to help your agents edit files
-              natively.
+              The Notion folder will include AGENTS.md and CLAUDE.md to help your agents edit
+              files natively.
             </p>
           </SetupContent>
         )}

@@ -172,7 +172,7 @@ does not connect or mount those sources.
 
 ## Initial `afs mount` and `afs pull`
 
-`afs mount notion <path> --root-page <page-id> [--connection <id>]` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. With one active Notion connection, mount auto-assigns it. With multiple active Notion connections, pass `--connection <id>`. Existing mounts without `connection_id` continue to work through the legacy `NOTION_TOKEN` fallback.
+`afs mount notion <path> --root-page <page-id> [--connection <id>]` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. In virtual projections, the shared AFS root lists connector folders and the guidance appears inside the connector folder, for example `/AFS/notion/AGENTS.md` and `/AFS/notion/CLAUDE.md`. With one active Notion connection, mount auto-assigns it. With multiple active Notion connections, pass `--connection <id>`. Existing mounts without `connection_id` continue to work through the legacy `NOTION_TOKEN` fallback.
 
 Projection choices are platform-specific. Linux binaries accept `plain-files` and
 `linux-fuse`; macOS binaries accept `plain-files` and `macos-file-provider`;

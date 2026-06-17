@@ -194,6 +194,9 @@ where
 
     let container_path = container_path(&mount, &entities, container_identifier)?;
     let mut children = Vec::new();
+    if container_identifier == source_root_identifier(&mount.connector) {
+        children.extend(source_root_guidance_items(&mount));
+    }
     let deleted_remote_ids = pending_deleted_remote_ids(&mutations);
 
     for entity in &entities {
@@ -1169,10 +1172,13 @@ fn root_item(mount: &MountConfig) -> VirtualFsItem {
 }
 
 fn root_children(mount: &MountConfig) -> Vec<VirtualFsItem> {
+    vec![source_root_item(mount)]
+}
+
+fn source_root_guidance_items(mount: &MountConfig) -> Vec<VirtualFsItem> {
     vec![
         guidance_item(mount, AGENTS_FILE, AGENTS_GUIDANCE_IDENTIFIER),
         guidance_item(mount, CLAUDE_FILE, CLAUDE_GUIDANCE_IDENTIFIER),
-        source_root_item(mount),
     ]
 }
 
@@ -1196,7 +1202,7 @@ fn guidance_item(mount: &MountConfig, filename: &str, identifier: &str) -> Virtu
     let contents = guidance_contents_for_connector(&mount.connector);
     VirtualFsItem {
         identifier: identifier.to_string(),
-        parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
+        parent_identifier: Some(source_root_identifier(&mount.connector)),
         filename: filename.to_string(),
         kind: VirtualFsItemKind::File,
         entity_kind: None,
@@ -1795,9 +1801,9 @@ mod tests {
         AGENTS_GUIDANCE_IDENTIFIER, CLAUDE_GUIDANCE_IDENTIFIER, ROOT_CONTAINER_IDENTIFIER,
         VirtualFsItemKind, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
         create_virtual_fs_file, materialize_virtual_fs_item_with_content_root,
-        refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
-        virtual_fs_children, virtual_fs_children_with_content_root, virtual_fs_content_path,
-        virtual_fs_item, virtual_fs_item_with_content_root,
+        refresh_virtual_fs_children, rename_virtual_fs_item, source_root_identifier,
+        trash_virtual_fs_item, virtual_fs_children, virtual_fs_children_with_content_root,
+        virtual_fs_content_path, virtual_fs_item, virtual_fs_item_with_content_root,
     };
 
     #[test]
@@ -1834,30 +1840,38 @@ mod tests {
 
         let root = virtual_fs_children(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER)
             .expect("root children");
-        assert_eq!(root.children.len(), 3);
-        assert_eq!(root.children[0].filename, "AGENTS.md");
-        assert_eq!(root.children[0].kind, VirtualFsItemKind::File);
-        assert_eq!(root.children[0].identifier, AGENTS_GUIDANCE_IDENTIFIER);
-        assert_eq!(root.children[1].filename, "CLAUDE.md");
-        assert_eq!(root.children[1].kind, VirtualFsItemKind::File);
-        assert_eq!(root.children[1].identifier, CLAUDE_GUIDANCE_IDENTIFIER);
-        assert_eq!(root.children[2].filename, "notion");
-        assert_eq!(root.children[2].kind, VirtualFsItemKind::Folder);
-        assert_eq!(root.children[2].identifier, "source:notion");
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].filename, "notion");
+        assert_eq!(root.children[0].kind, VirtualFsItemKind::Folder);
+        assert_eq!(root.children[0].identifier, "source:notion");
 
         let report =
             virtual_fs_children(&store, &mount_id, "source:notion").expect("source children");
 
-        assert_eq!(report.children.len(), 2);
-        assert_eq!(report.children[0].filename, "Home");
-        assert_eq!(report.children[0].kind, VirtualFsItemKind::Folder);
-        assert_eq!(report.children[0].identifier, "children:page-root");
-        assert_eq!(report.children[1].filename, "Home.md");
+        assert_eq!(report.children.len(), 4);
+        assert_eq!(report.children[0].filename, "AGENTS.md");
+        assert_eq!(report.children[0].kind, VirtualFsItemKind::File);
+        assert_eq!(report.children[0].identifier, AGENTS_GUIDANCE_IDENTIFIER);
+        assert_eq!(
+            report.children[0].parent_identifier.as_deref(),
+            Some("source:notion")
+        );
+        assert_eq!(report.children[1].filename, "CLAUDE.md");
         assert_eq!(report.children[1].kind, VirtualFsItemKind::File);
+        assert_eq!(report.children[1].identifier, CLAUDE_GUIDANCE_IDENTIFIER);
+        assert_eq!(
+            report.children[1].parent_identifier.as_deref(),
+            Some("source:notion")
+        );
+        assert_eq!(report.children[2].filename, "Home");
+        assert_eq!(report.children[2].kind, VirtualFsItemKind::Folder);
+        assert_eq!(report.children[2].identifier, "children:page-root");
+        assert_eq!(report.children[3].filename, "Home.md");
+        assert_eq!(report.children[3].kind, VirtualFsItemKind::File);
     }
 
     #[test]
-    fn virtual_root_guidance_files_materialize_read_only_agent_instructions() {
+    fn source_root_guidance_files_materialize_read_only_agent_instructions() {
         let mount_id = MountId::new("notion-main");
         let state_root = temp_root("afs-virtual-fs-guidance");
         let content_root = state_root.join("content/notion-main/files");
@@ -1870,15 +1884,16 @@ mod tests {
             &store,
             &content_root,
             &mount_id,
-            ROOT_CONTAINER_IDENTIFIER,
+            &source_root_identifier("notion"),
         )
-        .expect("list root");
+        .expect("list source root");
         let agents = listed
             .children
             .iter()
             .find(|child| child.identifier == AGENTS_GUIDANCE_IDENTIFIER)
             .expect("agents guidance");
         assert_eq!(agents.filename, "AGENTS.md");
+        assert_eq!(agents.parent_identifier.as_deref(), Some("source:notion"));
         assert_eq!(agents.kind, VirtualFsItemKind::File);
         assert_eq!(agents.entity_kind, None);
         assert_eq!(agents.hydration, Some(HydrationState::Stub));
@@ -2001,11 +2016,15 @@ mod tests {
 
         let report =
             virtual_fs_children(&store, &mount_id, "source:notion").expect("source children");
-        assert_eq!(report.children.len(), 2);
-        assert_eq!(report.children[0].identifier, "children:page-root");
-        assert_eq!(report.children[0].kind, VirtualFsItemKind::Folder);
-        assert_eq!(report.children[1].identifier, "page-root");
+        assert_eq!(report.children.len(), 4);
+        assert_eq!(report.children[0].identifier, AGENTS_GUIDANCE_IDENTIFIER);
+        assert_eq!(report.children[0].kind, VirtualFsItemKind::File);
+        assert_eq!(report.children[1].identifier, CLAUDE_GUIDANCE_IDENTIFIER);
         assert_eq!(report.children[1].kind, VirtualFsItemKind::File);
+        assert_eq!(report.children[2].identifier, "children:page-root");
+        assert_eq!(report.children[2].kind, VirtualFsItemKind::Folder);
+        assert_eq!(report.children[3].identifier, "page-root");
+        assert_eq!(report.children[3].kind, VirtualFsItemKind::File);
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "source:notion")
             .expect("refresh cached children");

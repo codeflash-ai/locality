@@ -56,6 +56,13 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
     )
     .expect("browse mount root");
     assert_folder(&root_children.children, "notion");
+    assert!(
+        root_children
+            .children
+            .iter()
+            .all(|child| child.filename != "AGENTS.md" && child.filename != "CLAUDE.md"),
+        "agent guidance belongs under the connector root, not the shared AFS root"
+    );
 
     let source_children = virtual_fs_children_with_content_root(
         &store,
@@ -64,6 +71,8 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
         &source_root_identifier("notion"),
     )
     .expect("browse notion source root");
+    assert_readonly_guidance(&source_children.children, "AGENTS.md");
+    assert_readonly_guidance(&source_children.children, "CLAUDE.md");
     assert_child(
         &source_children.children,
         "Teamspace Home.md",
@@ -442,6 +451,16 @@ fn assert_folder(children: &[afsd::virtual_fs::VirtualFsItem], filename: &str) {
         .find(|child| child.filename == filename)
         .unwrap_or_else(|| panic!("missing folder `{filename}`"));
     assert_eq!(child.kind, afsd::virtual_fs::VirtualFsItemKind::Folder);
+}
+
+fn assert_readonly_guidance(children: &[afsd::virtual_fs::VirtualFsItem], filename: &str) {
+    let child = children
+        .iter()
+        .find(|child| child.filename == filename)
+        .unwrap_or_else(|| panic!("missing guidance `{filename}`"));
+    assert_eq!(child.kind, afsd::virtual_fs::VirtualFsItemKind::File);
+    assert_eq!(child.entity_kind, None);
+    assert_eq!(child.parent_identifier.as_deref(), Some("source:notion"));
 }
 
 fn entry_state(report: &afs_cli::status::StatusReport, path: &str) -> StatusState {
