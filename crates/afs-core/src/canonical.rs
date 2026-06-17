@@ -288,18 +288,7 @@ fn parse_directive_attributes(input: &str) -> BTreeMap<String, String> {
 
         let value = if chars.peek().is_some_and(|(_, ch)| *ch == '"') {
             chars.next();
-            let value_start = chars.peek().map(|(index, _)| *index).unwrap_or(input.len());
-            while let Some((_, ch)) = chars.peek().copied() {
-                if ch == '"' {
-                    break;
-                }
-                chars.next();
-            }
-            let value_end = chars.peek().map(|(index, _)| *index).unwrap_or(input.len());
-            if chars.peek().is_some_and(|(_, ch)| *ch == '"') {
-                chars.next();
-            }
-            input[value_start..value_end].to_string()
+            parse_quoted_directive_value(&mut chars)
         } else {
             let value_start = chars.peek().map(|(index, _)| *index).unwrap_or(input.len());
             while let Some((_, ch)) = chars.peek().copied() {
@@ -318,6 +307,38 @@ fn parse_directive_attributes(input: &str) -> BTreeMap<String, String> {
     }
 
     attributes
+}
+
+fn parse_quoted_directive_value(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+) -> String {
+    let mut value = String::new();
+
+    while let Some((_, ch)) = chars.peek().copied() {
+        match ch {
+            '"' => {
+                chars.next();
+                break;
+            }
+            '\\' => {
+                chars.next();
+                match chars.next() {
+                    Some((_, escaped @ ('"' | '\\'))) => value.push(escaped),
+                    Some((_, escaped)) => {
+                        value.push('\\');
+                        value.push(escaped);
+                    }
+                    None => value.push('\\'),
+                }
+            }
+            _ => {
+                value.push(ch);
+                chars.next();
+            }
+        }
+    }
+
+    value
 }
 
 fn skip_to_whitespace(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>) {

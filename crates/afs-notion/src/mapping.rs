@@ -40,7 +40,25 @@ pub fn strategy_for(block: &NotionBlockClass) -> RoundTripStrategy {
 
 pub fn directive(id: &str, directive_type: &str, title: Option<&str>) -> String {
     match title {
-        Some(title) => format!("::afs{{id={id} type={directive_type} title=\"{title}\"}}"),
+        Some(title) => format!(
+            "::afs{{id={id} type={directive_type} title=\"{}\"}}",
+            escape_directive_value(title)
+        ),
         None => format!("::afs{{id={id} type={directive_type}}}"),
+    }
+}
+
+fn escape_directive_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn directive_escapes_quoted_attribute_values() {
+        assert_eq!(
+            super::directive("media-1", "image", Some(r#"Quote: "hello" and slash \"#)),
+            r#"::afs{id=media-1 type=image title="Quote: \"hello\" and slash \\"}"#
+        );
     }
 }

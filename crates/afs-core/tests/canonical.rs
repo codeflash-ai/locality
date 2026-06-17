@@ -136,6 +136,26 @@ fn parses_quoted_and_unquoted_directive_attributes() {
 }
 
 #[test]
+fn parses_escaped_directive_attribute_values() {
+    let directive = parse_directive_line(
+        r#"::afs{id=media-1 type=image title="Quote: \"hello\" and slash \\"}"#,
+        7,
+    )
+    .expect("directive");
+
+    assert_eq!(directive.remote_id, Some(RemoteId::new("media-1")));
+    assert_eq!(directive.directive_type.as_deref(), Some("image"));
+    assert_eq!(
+        directive.title.as_deref(),
+        Some(r#"Quote: "hello" and slash \"#)
+    );
+    assert_eq!(
+        directive.attributes.get("title").map(String::as_str),
+        Some(r#"Quote: "hello" and slash \"#)
+    );
+}
+
+#[test]
 fn directive_syntax_validation_reports_malformed_and_missing_fields() {
     let input = "---\nafs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Bad directives\n---\n::afs{id=block-1 type=synced_block\n::afs{type=synced_block}\n::afs{id=block-2}\n";
     let parsed = parse_canonical_markdown(input).expect("parseable document");
