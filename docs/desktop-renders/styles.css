@@ -353,10 +353,10 @@ h3 {
 }
 
 .compact-final .setup-mark {
-  width: 50px;
-  height: 50px;
-  margin-bottom: 14px;
-  border-radius: 15px;
+  width: 44px;
+  height: 44px;
+  margin-bottom: 10px;
+  border-radius: 14px;
 }
 
 .sync-note {
@@ -478,11 +478,18 @@ h3 {
   align-items: center;
   gap: 12px;
   max-width: 560px;
-  margin: 14px 0 14px;
+  margin: 12px 0 12px;
   padding: 10px 11px;
   border: 1px solid rgba(8, 123, 114, 0.13);
   border-radius: 14px;
   background: rgba(246, 250, 249, 0.92);
+}
+
+.final-note {
+  margin: 10px 0 0;
+  color: var(--subtle) !important;
+  font-size: 12px !important;
+  line-height: 1.4 !important;
 }
 
 .ready-folder-card > div:nth-child(2) {
@@ -568,12 +575,23 @@ h3 {
 .agent-demo-card {
   display: grid;
   gap: 14px;
-  margin-top: 14px;
-  padding: 12px;
+  margin-top: 12px;
+  padding: 11px;
   border: 1px solid rgba(8, 123, 114, 0.13);
   border-radius: 16px;
   background: linear-gradient(180deg, rgba(239, 250, 247, 0.84), rgba(255, 255, 255, 0.86));
   box-shadow: 0 14px 36px rgba(20, 30, 43, 0.06);
+}
+
+.agent-guidance-card {
+  display: grid;
+  gap: 7px;
+  max-width: 560px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(8, 123, 114, 0.13);
+  border-radius: 14px;
+  background: rgba(246, 250, 249, 0.92);
 }
 
 .compact-agent-demo {
@@ -614,6 +632,22 @@ h3 {
   color: var(--muted);
   font-size: 13px;
   line-height: 1.5;
+}
+
+.agent-guidance-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.agent-guidance-card code {
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.agent-guidance-card strong {
+  color: var(--ink);
 }
 
 .agent-prompt-card {

@@ -20,7 +20,6 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
-  Terminal,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
@@ -571,8 +570,6 @@ function Onboarding({
   const [mountError, setMountError] = useState("");
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
-  const [cliInstallMessage, setCliInstallMessage] = useState("");
-  const [cliInstallError, setCliInstallError] = useState("");
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -702,7 +699,6 @@ function Onboarding({
 
   async function startMount() {
     setMountError("");
-    setCliInstallError("");
     const report = await callCommand<ActionReport>(
       "create_workspace_mount",
       { path: mountPath },
@@ -731,17 +727,13 @@ function Onboarding({
     const report = await callCommand<ActionReport>(
       "ensure_terminal_cli_available",
       undefined,
-      { ok: true, message: "AFS CLI is available." },
+      { ok: true, message: "AFS terminal command is ready." },
     );
     if (!report.ok) {
-      setCliInstallMessage("");
-      setCliInstallError(report.message);
       setMountError(report.message);
       return false;
     }
-    setCliInstallError("");
     setMountError("");
-    setCliInstallMessage(report.message);
     return true;
   }
 
@@ -897,14 +889,10 @@ function Onboarding({
         {step === 4 && (
           <SetupContent mark={<BrandTile variant="ready" />} variant="final">
             <div>
-              <div className="sync-note">
-                <Sparkles />
-                Setup complete
-              </div>
-              <h1>You’re ready to use AFS</h1>
+              <h1>AFS is ready</h1>
               <p>
-                Your Notion folder is ready. AFS will keep syncing the workspace quietly in the
-                background.
+                Your Notion folder is mounted. AFS will keep syncing the workspace quietly in the
+                background while agents edit local Markdown.
               </p>
             </div>
             <div className="ready-folder">
@@ -917,23 +905,14 @@ function Onboarding({
                 Copy
               </SecondaryButton>
             </div>
-            <div className="ready-folder">
-              <Terminal />
-              <div>
-                <span>Terminal command</span>
-                <code>afs</code>
-              </div>
+            <div className="final-actions">
+              <PrimaryButton icon={<FolderOpen />} onClick={openFolderAndFinish}>
+                Open Notion Folder
+              </PrimaryButton>
             </div>
-            <PrimaryButton icon={<FolderOpen />} onClick={openFolderAndFinish}>
-              Open Notion Folder
-            </PrimaryButton>
-            {cliInstallMessage && <p className="quiet-note">{cliInstallMessage}</p>}
-            {cliInstallError && <p className="field-error">{cliInstallError}</p>}
-            <p className="quiet-note">
-              If Finder asks to enable the AFS File Provider, click Enable once. macOS requires
-              this approval before showing the Notion files.
+            <p className="quiet-note final-note">
+              Finder may ask once to enable the AFS File Provider before showing the Notion files.
             </p>
-            <AgentGuidanceSummary report={agentGuidanceReport} state={agentGuidanceState} />
             <LocateBox
               label="Open a Notion page"
               value={locateUrl}
@@ -977,6 +956,7 @@ function Onboarding({
                 </SecondaryButton>
               </div>
             </div>
+            <AgentGuidanceSummary report={agentGuidanceReport} state={agentGuidanceState} />
           </SetupContent>
         )}
       </section>
@@ -991,17 +971,17 @@ function AgentGuidanceSummary({
   report: AgentGuidanceInstallReport | null;
   state: "idle" | "installing" | "ready" | "error";
 }) {
-  const visibleTargets = report?.targets.filter((target) => target.status === "installed").slice(0, 5) || [];
+  const installedAgents = compactAgentNames(report?.targets.filter((target) => target.status === "installed") || []);
   const fallbackTargets = report?.targets.filter((target) => target.status === "available").slice(0, 2) || [];
   const failed = report?.targets.some((target) => target.status === "failed") || state === "error";
   const title =
     state === "installing"
-      ? "Installing agent skills"
+      ? "Preparing agents"
       : failed
         ? "Agent skills need attention"
         : report
-          ? "Agent skills installed"
-          : "Preparing agent skills";
+          ? "Agents can use AFS"
+          : "Preparing agents";
 
   return (
     <div className={`agent-guidance-card ${failed ? "warning" : ""}`}>
@@ -1009,28 +989,41 @@ function AgentGuidanceSummary({
         {state === "installing" ? <Loader2 className="spin-icon" /> : failed ? <AlertTriangle /> : <Bot />}
         <span>{title}</span>
       </div>
-      {state === "installing" && <p>AFS is teaching installed local agents how to use the Notion folder.</p>}
-      {state !== "installing" && visibleTargets.length > 0 && (
-        <div className="agent-guidance-list">
-          {visibleTargets.map((target) => (
-            <div className="agent-guidance-row" key={`${target.agent}-${target.path || target.status}`}>
-              <Check />
-              <div>
-                <strong>{target.agent}</strong>
-                {target.path && <code>{target.path}</code>}
-              </div>
-            </div>
-          ))}
-        </div>
+      {state === "installing" && <p>Installing the AFS skill for local agents.</p>}
+      {state !== "installing" && installedAgents.length > 0 && (
+        <p>
+          Now your agents know how to use <code>afs</code> to view and edit Notion. Installed for{" "}
+          <strong>{formatList(installedAgents)}</strong>.
+        </p>
       )}
-      {state !== "installing" && visibleTargets.length === 0 && fallbackTargets.length > 0 && (
+      {state !== "installing" && installedAgents.length === 0 && fallbackTargets.length > 0 && (
         <p>{fallbackTargets[0].detail}</p>
+      )}
+      {state !== "installing" && installedAgents.length === 0 && fallbackTargets.length === 0 && !failed && (
+        <p>AFS is preparing local agent instructions for this Notion folder.</p>
       )}
       {failed && report?.targets.find((target) => target.status === "failed")?.detail && (
         <p>{report.targets.find((target) => target.status === "failed")?.detail}</p>
       )}
     </div>
   );
+}
+
+function compactAgentNames(targets: AgentGuidanceTarget[]) {
+  const names = targets.map((target) => {
+    if (target.agent.includes("Claude")) return "Claude";
+    if (target.agent.includes("Copilot")) return "Copilot";
+    if (target.agent.includes("AGENTS.md")) return "AGENTS.md";
+    return target.agent;
+  });
+  return Array.from(new Set(names));
+}
+
+function formatList(items: string[]) {
+  if (items.length <= 2) {
+    return items.join(" and ");
+  }
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
 }
 
 function MainShell({

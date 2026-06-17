@@ -228,11 +228,10 @@ Layout:
 ┌──────────────────────────────────────────────────────────────┐
 │ AFS                                            4 of 4        │
 │                                                              │
-│  ✦  Setup complete                                           │
-│                                                              │
-│ You're ready to use AFS                                      │
-│ Your Notion folder is ready. AFS will keep syncing the        │
-│ workspace quietly in the background.                         │
+│  ✓                                                           │
+│ AFS is ready                                                 │
+│ Your Notion folder is mounted. AFS syncs quietly while        │
+│ agents edit local Markdown.                                  │
 │                                                              │
 │ ┌──────────────────────────────────────────────────────────┐ │
 │ │ Notion folder                         [ Copy ]           │ │
@@ -240,6 +239,7 @@ Layout:
 │ └──────────────────────────────────────────────────────────┘ │
 │                                                              │
 │ [ Open Notion Folder ]                                      │
+│ Finder may ask once to enable the AFS File Provider.          │
 │                                                              │
 │ Open a Notion page                                           │
 │ ┌──────────────────────────────────────────────────────────┐ │
@@ -251,6 +251,11 @@ Layout:
 │ │ Find the Q4 launch plan and make it sharper for           │ │
 │ │ leadership review.                              [ Copy ]  │ │
 │ └──────────────────────────────────────────────────────────┘ │
+│                                                              │
+│ Agents can use AFS                                           │
+│ Now your agents know how to use `afs` to view and edit        │
+│ Notion. Installed for Claude, Codex, Warp, AGENTS.md,         │
+│ and Copilot.                                                 │
 └──────────────────────────────────────────────────────────────┘
 ```
 

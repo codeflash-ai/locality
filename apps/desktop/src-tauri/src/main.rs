@@ -394,7 +394,7 @@ fn ensure_terminal_cli_available() -> ActionReport {
     match install_terminal_cli_link() {
         Ok(path) => ActionReport {
             ok: true,
-            message: format!("AFS CLI is available at {}.", path.display()),
+            message: format!("AFS terminal command is ready at {}.", path.display()),
         },
         Err(message) => ActionReport { ok: false, message },
     }
@@ -2236,8 +2236,9 @@ fn install_terminal_cli_link_in_path(cli_path: &Path) -> Result<PathBuf, String>
 
 fn install_terminal_cli_link_in_path_dirs(
     cli_path: &Path,
-    dirs: Vec<PathBuf>,
+    mut dirs: Vec<PathBuf>,
 ) -> Result<PathBuf, String> {
+    sort_terminal_cli_path_dirs(&mut dirs);
     let mut errors = Vec::new();
     let mut checked = Vec::new();
 
@@ -2274,6 +2275,53 @@ fn terminal_cli_path_dirs() -> Vec<PathBuf> {
         append_path_dirs(&mut dirs, path);
     }
     dirs
+}
+
+fn sort_terminal_cli_path_dirs(dirs: &mut Vec<PathBuf>) {
+    let home = home_dir().ok();
+    let mut indexed = std::mem::take(dirs)
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>();
+    indexed.sort_by_key(|(index, directory)| {
+        (
+            terminal_cli_path_dir_rank(directory, home.as_deref()),
+            *index,
+        )
+    });
+    dirs.extend(indexed.into_iter().map(|(_, directory)| directory));
+}
+
+fn terminal_cli_path_dir_rank(directory: &Path, home: Option<&Path>) -> u8 {
+    if directory.ends_with(Path::new(".local/bin"))
+        || home.is_some_and(|home| {
+            directory == home.join("bin") || directory == home.join(".local/bin")
+        })
+    {
+        return 0;
+    }
+    if home.is_some_and(|home| directory.starts_with(home)) {
+        return 1;
+    }
+    if is_homebrew_path(directory) {
+        return 3;
+    }
+    if is_system_path(directory) {
+        return 4;
+    }
+    2
+}
+
+fn is_homebrew_path(path: &Path) -> bool {
+    let value = path.display().to_string().to_ascii_lowercase();
+    value == "/opt/homebrew/bin" || value == "/usr/local/bin" || value.contains("/homebrew/")
+}
+
+fn is_system_path(path: &Path) -> bool {
+    matches!(
+        path.to_str(),
+        Some("/usr/bin" | "/bin" | "/usr/sbin" | "/sbin")
+    )
 }
 
 fn append_path_dirs(dirs: &mut Vec<PathBuf>, path: std::ffi::OsString) {
@@ -3379,6 +3427,27 @@ mod tests {
             fs::read_to_string(occupied.join("afs")).expect("read occupied command"),
             "existing command"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_cli_installer_prefers_user_path_before_homebrew_fallback() {
+        let temp = TestTempDir::new("terminal-cli-user-path");
+        let cli = temp.path().join("app/afs");
+        let homebrew = temp.path().join("opt/homebrew/bin");
+        let user_bin = temp.path().join(".local/bin");
+        fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
+        fs::create_dir_all(&homebrew).expect("create homebrew dir");
+        fs::create_dir_all(&user_bin).expect("create user dir");
+        fs::write(&cli, b"afs cli").expect("write cli");
+
+        let installed =
+            install_terminal_cli_link_in_path_dirs(&cli, vec![homebrew.clone(), user_bin.clone()])
+                .expect("install cli link in user path");
+
+        assert_eq!(installed, user_bin.join("afs"));
+        assert_eq!(fs::read_link(&installed).expect("read cli link"), cli);
+        assert!(!homebrew.join("afs").exists());
     }
 
     #[test]
