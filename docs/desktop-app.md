@@ -25,7 +25,10 @@ files and push the reviewed changes back into Notion.
 Onboarding also installs local agent guidance for detected agents such as Claude
 Code, Codex, Warp, Cursor-compatible tools, Gemini CLI, and Cline/Roo. See
 [agent-guidance.md](agent-guidance.md) for install targets and fallback
-behavior.
+behavior. The same installer also configures the local authenticated MCP
+fallback for supported agents and refreshes periodically while AFS is running,
+so agents installed after AFS can still discover the fallback without another
+setup flow.
 
 ## Product Principles
 

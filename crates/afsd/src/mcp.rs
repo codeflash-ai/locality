@@ -5,21 +5,26 @@
 //! when they cannot execute the host `afs` binary directly.
 
 use std::env;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub const DEFAULT_MCP_ADDR: &str = "127.0.0.1:38568";
+pub const MCP_TOKEN_FILE_NAME: &str = "mcp-token";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MCP_TOKEN_BYTES: usize = 32;
+const MIN_MCP_TOKEN_LEN: usize = 32;
 
 const AGENT_GUIDE: &str = r#"AFS MCP fallback
 
@@ -44,18 +49,23 @@ push them.
 #[derive(Clone, Debug)]
 pub struct McpServerConfig {
     afs_bin: PathBuf,
+    token: String,
 }
 
 impl McpServerConfig {
-    pub fn discover() -> Self {
-        Self {
+    pub fn discover(state_root: &Path) -> Result<Self, String> {
+        Ok(Self {
             afs_bin: discover_afs_binary(),
-        }
+            token: ensure_mcp_token(state_root)?,
+        })
     }
 
     #[cfg(test)]
     fn with_afs_bin(afs_bin: PathBuf) -> Self {
-        Self { afs_bin }
+        Self {
+            afs_bin,
+            token: "test-token".to_string(),
+        }
     }
 }
 
@@ -80,6 +90,57 @@ pub fn discover_afs_binary() -> PathBuf {
         }
     }
     PathBuf::from(binary_name("afs"))
+}
+
+pub fn mcp_token_path(state_root: &Path) -> PathBuf {
+    state_root.join(MCP_TOKEN_FILE_NAME)
+}
+
+pub fn ensure_mcp_token(state_root: &Path) -> Result<String, String> {
+    let path = mcp_token_path(state_root);
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let token = existing.trim();
+        if token.len() >= MIN_MCP_TOKEN_LEN {
+            return Ok(token.to_string());
+        }
+    }
+
+    fs::create_dir_all(state_root)
+        .map_err(|error| format!("could not create MCP token directory: {error}"))?;
+    let token = generate_mcp_token()?;
+    write_private_token_file(&path, &token)?;
+    Ok(token)
+}
+
+fn generate_mcp_token() -> Result<String, String> {
+    let mut bytes = [0u8; MCP_TOKEN_BYTES];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("could not generate MCP token: {error}"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn write_private_token_file(path: &Path, token: &str) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("could not create MCP token file: {error}"))?;
+    file.write_all(token.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|error| format!("could not write MCP token file: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("could not protect MCP token file: {error}"))?;
+    }
+    Ok(())
 }
 
 fn binary_name(name: &str) -> String {
@@ -130,6 +191,13 @@ fn handle_http_request(request: HttpRequest, config: &McpServerConfig) -> String
         ("OPTIONS", _) => http_empty_response(204, "No Content"),
         ("GET", "/health") => http_json_response(200, "OK", json!({"status":"ok"})),
         ("POST", "/mcp") => {
+            if !request_token_allowed(&request, &config.token) {
+                return http_json_response(
+                    401,
+                    "Unauthorized",
+                    error_response(Value::Null, -32001, "missing or invalid MCP token"),
+                );
+            }
             if request.body.trim().is_empty() {
                 return http_json_response(
                     400,
@@ -344,7 +412,7 @@ fn execute_afs_tool(
 }
 
 fn validate_argv(argv: &[String]) -> Result<(), String> {
-    if argv.iter().any(|arg| arg.as_str() == "\0") {
+    if argv.iter().any(|arg| arg.contains('\0')) {
         return Err("argv must not contain NUL bytes".to_string());
     }
     Ok(())
@@ -466,6 +534,8 @@ struct HttpRequest {
     method: String,
     path: String,
     origin: Option<String>,
+    authorization: Option<String>,
+    afs_mcp_token: Option<String>,
     body: String,
 }
 
@@ -487,6 +557,8 @@ fn read_http_request(stream: &mut impl Read) -> Result<HttpRequest, String> {
 
     let mut content_length = 0usize;
     let mut origin = None;
+    let mut authorization = None;
+    let mut afs_mcp_token = None;
     loop {
         let mut line = String::new();
         reader
@@ -496,22 +568,23 @@ fn read_http_request(stream: &mut impl Read) -> Result<HttpRequest, String> {
         if trimmed.is_empty() {
             break;
         }
-        if let Some(value) = trimmed
-            .strip_prefix("Content-Length:")
-            .or_else(|| trimmed.strip_prefix("content-length:"))
-        {
-            content_length = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| "invalid Content-Length".to_string())?;
-            if content_length > MAX_REQUEST_BYTES {
-                return Err(format!("request body exceeds {MAX_REQUEST_BYTES} bytes"));
+        if let Some((name, value)) = trimmed.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            match name.as_str() {
+                "content-length" => {
+                    content_length = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid Content-Length".to_string())?;
+                    if content_length > MAX_REQUEST_BYTES {
+                        return Err(format!("request body exceeds {MAX_REQUEST_BYTES} bytes"));
+                    }
+                }
+                "origin" => origin = Some(value),
+                "authorization" => authorization = Some(value),
+                "x-afs-mcp-token" => afs_mcp_token = Some(value),
+                _ => {}
             }
-        } else if let Some(value) = trimmed
-            .strip_prefix("Origin:")
-            .or_else(|| trimmed.strip_prefix("origin:"))
-        {
-            origin = Some(value.trim().to_string());
         }
     }
 
@@ -523,8 +596,40 @@ fn read_http_request(stream: &mut impl Read) -> Result<HttpRequest, String> {
         method,
         path,
         origin,
+        authorization,
+        afs_mcp_token,
         body: String::from_utf8_lossy(&body).to_string(),
     })
+}
+
+fn request_token_allowed(request: &HttpRequest, expected: &str) -> bool {
+    request
+        .authorization
+        .as_deref()
+        .and_then(bearer_token)
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+        || request
+            .afs_mcp_token
+            .as_deref()
+            .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+}
+
+fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(token.trim())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let diff = left
+        .iter()
+        .zip(right.iter())
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right));
+    diff == 0
 }
 
 fn origin_allowed(origin: Option<&str>) -> bool {
@@ -541,14 +646,14 @@ fn origin_allowed(origin: Option<&str>) -> bool {
 fn http_json_response(status: u16, reason: &str, body: Value) -> String {
     let body = body.to_string();
     format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Headers: content-type,mcp-session-id,mcp-protocol-version\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Headers: authorization,content-type,mcp-session-id,mcp-protocol-version,x-afs-mcp-token\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
 
 fn http_empty_response(status: u16, reason: &str) -> String {
     format!(
-        "HTTP/1.1 {status} {reason}\r\nAccess-Control-Allow-Headers: content-type,mcp-session-id,mcp-protocol-version\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 {status} {reason}\r\nAccess-Control-Allow-Headers: authorization,content-type,mcp-session-id,mcp-protocol-version,x-afs-mcp-token\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
 }
 
@@ -621,6 +726,16 @@ mod tests {
     }
 
     #[test]
+    fn argv_validation_rejects_embedded_nul_bytes() {
+        let argv = vec!["status".to_string(), "bad\0path".to_string()];
+
+        assert_eq!(
+            validate_argv(&argv),
+            Err("argv must not contain NUL bytes".to_string())
+        );
+    }
+
+    #[test]
     fn notification_messages_do_not_emit_responses() {
         let config = McpServerConfig::with_afs_bin(PathBuf::from("afs"));
         let response = handle_json_rpc(
@@ -640,6 +755,8 @@ mod tests {
             method: "POST".to_string(),
             path: "/mcp".to_string(),
             origin: None,
+            authorization: Some("Bearer test-token".to_string()),
+            afs_mcp_token: None,
             body: body.to_string(),
         };
         let response = handle_http_request(request, &config);
@@ -655,11 +772,68 @@ mod tests {
             method: "POST".to_string(),
             path: "/mcp".to_string(),
             origin: Some("https://evil.example".to_string()),
+            authorization: Some("Bearer test-token".to_string()),
+            afs_mcp_token: None,
             body: r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.to_string(),
         };
         let response = handle_http_request(request, &config);
 
         assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    #[test]
+    fn http_rejects_missing_mcp_token() {
+        let config = McpServerConfig::with_afs_bin(PathBuf::from("afs"));
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/mcp".to_string(),
+            origin: None,
+            authorization: None,
+            afs_mcp_token: None,
+            body: r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.to_string(),
+        };
+        let response = handle_http_request(request, &config);
+
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized"));
+    }
+
+    #[test]
+    fn http_accepts_private_mcp_token_header() {
+        let config = McpServerConfig::with_afs_bin(PathBuf::from("afs"));
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/mcp".to_string(),
+            origin: None,
+            authorization: None,
+            afs_mcp_token: Some("test-token".to_string()),
+            body: r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.to_string(),
+        };
+        let response = handle_http_request(request, &config);
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn ensure_mcp_token_reuses_existing_private_token() {
+        let root = env::temp_dir().join(format!(
+            "afs-mcp-token-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            mcp_token_path(&root),
+            "existing-token-with-enough-length-123\n",
+        )
+        .expect("write token");
+
+        let token = ensure_mcp_token(&root).expect("load token");
+
+        assert_eq!(token, "existing-token-with-enough-length-123");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

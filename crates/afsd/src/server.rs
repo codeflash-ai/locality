@@ -45,16 +45,19 @@ pub fn run_foreground(config: &DaemonConfig) -> AfsResult<()> {
     }
     if let Some(addr) = config.mcp_addr {
         match TcpListener::bind(addr) {
-            Ok(listener) => {
-                println!("afsd MCP listening on http://{addr}/mcp");
-                thread::spawn(move || {
-                    crate::mcp::serve_http(listener, crate::mcp::McpServerConfig::discover())
-                });
-            }
+            Ok(listener) => match crate::mcp::McpServerConfig::discover(&config.state_root) {
+                Ok(mcp_config) => {
+                    println!("afsd MCP listening on http://{addr}/mcp");
+                    thread::spawn(move || crate::mcp::serve_http(listener, mcp_config));
+                }
+                Err(error) => {
+                    eprintln!("afsd MCP disabled: {error}");
+                    drop(listener);
+                }
+            },
             Err(error) => eprintln!("afsd MCP disabled: failed to bind {addr}: {error}"),
         }
     }
-
     let socket_path = crate::ipc::socket_path(&config.state_root);
     remove_stale_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
