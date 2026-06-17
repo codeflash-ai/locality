@@ -323,7 +323,7 @@ fn entry(remote_id: &str, content_hash: &str, remote_edited_at: &str) -> TreeEnt
         remote_id: RemoteId::new(remote_id),
         kind: EntityKind::Page,
         title: "Roadmap".to_string(),
-        path: PathBuf::from("Roadmap ~page.md"),
+        path: PathBuf::from("Roadmap/page.md"),
         hydration: HydrationState::Hydrated,
         content_hash: Some(content_hash.to_string()),
         remote_edited_at: Some(remote_edited_at.to_string()),

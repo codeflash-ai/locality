@@ -6,10 +6,10 @@ The current Notion projection represents a page as a Markdown file and also
 reserves a same-stem directory for possible child content:
 
 ```text
-roadmap ~aaaaaa.md
-roadmap ~aaaaaa/
-  design-notes ~bbbbbb.md
-  tasks ~cccccc/
+roadmap.md
+roadmap/
+  design-notes.md
+  tasks/
 ```
 
 That shape mirrors the implementation, but it is confusing in the user-facing
@@ -24,13 +24,13 @@ objects eagerly.
 Move Notion pages to a directory-backed page layout:
 
 ```text
-roadmap ~aaaaaa/
+roadmap/
   page.md
-  design-notes ~bbbbbb/
+  design-notes/
     page.md
-  tasks ~cccccc/
+  tasks/
     _schema.yaml
-    fix-login-bug ~eeeeee/
+    fix-login-bug/
       page.md
 ```
 
@@ -112,7 +112,8 @@ its parent folder.
 ### 3. Update Notion projection
 
 Change `afs-notion` path allocation so page entries use
-`<slug ~shortid>/page.md`. Reserve both the directory stem and the legacy
+`<slug>/page.md` for clean sibling names and `<slug shortid>/page.md` only
+when a sibling collision requires a remote-ID suffix. Reserve both the directory stem and the legacy
 `<stem>.md` sibling while allocating names, so the new layout cannot collide
 with files from older state or local creates.
 
@@ -148,10 +149,10 @@ same relative path under the daemon content root.
 The pull rename path must migrate a clean legacy pair like this:
 
 ```text
-old: roadmap ~aaaaaa.md
-old: roadmap ~aaaaaa/
+old: roadmap.md
+old: roadmap/
 
-new: roadmap ~aaaaaa/page.md
+new: roadmap/page.md
 ```
 
 If `page.md` already exists, stop with a structured conflict instead of
@@ -174,7 +175,7 @@ before flipping defaults. The migration should:
 
 Keep old-path lookup aliases for at least one release where practical, so
 `afs search`, `afs info`, and explicit CLI paths can explain that
-`roadmap ~aaaaaa.md` moved to `roadmap ~aaaaaa/page.md`.
+`roadmap.md` moved to `roadmap/page.md`.
 
 ### 7. Update docs and guidance
 

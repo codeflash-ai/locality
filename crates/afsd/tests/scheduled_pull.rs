@@ -48,7 +48,7 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
                 "Home/Child/page.md",
                 "2026-06-10T00:00:00Z",
             ),
-            database_entry(&mount_id, "tasks-db", "Tasks", "Home/Tasks ~tasks"),
+            database_entry(&mount_id, "tasks-db", "Tasks", "Home/Tasks"),
         ],
     );
     source.insert_schema("tasks-db", "title: Tasks\nproperties: {}\n");
@@ -72,8 +72,7 @@ fn scheduled_pull_refreshes_projection_and_queues_default_policy_hydration() {
     assert!(root.join("Home/page.md").exists());
     assert!(root.join("Home/Child/page.md").exists());
     assert_eq!(
-        std::fs::read_to_string(root.join("Home/Tasks ~tasks/_schema.yaml"))
-            .expect("database schema"),
+        std::fs::read_to_string(root.join("Home/Tasks/_schema.yaml")).expect("database schema"),
         "title: Tasks\nproperties: {}\n"
     );
     let root_stub = std::fs::read_to_string(root.join("Home/page.md")).expect("root stub");
@@ -183,17 +182,17 @@ fn assert_virtual_projection_keeps_unhydrated_pages_online_only(
                 &mount_id,
                 "root-page",
                 "Home",
-                "Home.md",
+                "Home/page.md",
                 "2026-06-10T00:00:00Z",
             ),
             page_entry(
                 &mount_id,
                 "child-page",
                 "Child",
-                "Home/Child.md",
+                "Home/Child/page.md",
                 "2026-06-10T00:00:00Z",
             ),
-            database_entry(&mount_id, "tasks-db", "Tasks", "Home/Tasks ~tasks"),
+            database_entry(&mount_id, "tasks-db", "Tasks", "Home/Tasks"),
         ],
     );
     source.insert_schema("tasks-db", "title: Tasks\nproperties: {}\n");
@@ -212,16 +211,16 @@ fn assert_virtual_projection_keeps_unhydrated_pages_online_only(
     assert_eq!(report.stubbed, 0);
     assert_eq!(report.schemas_written, 0);
     assert_eq!(report.queued_hydrations, 1);
-    assert!(!root.join("Home.md").exists());
-    assert!(!root.join("Home/Child.md").exists());
-    assert!(!root.join("Home/Tasks ~tasks/_schema.yaml").exists());
+    assert!(!root.join("Home/page.md").exists());
+    assert!(!root.join("Home/Child/page.md").exists());
+    assert!(!root.join("Home/Tasks/_schema.yaml").exists());
 
     let child = supervisor
         .store()
         .get_entity(&mount_id, &RemoteId::new("child-page"))
         .expect("get child entity")
         .expect("child entity");
-    assert_eq!(child.path, PathBuf::from("Home/Child.md"));
+    assert_eq!(child.path, PathBuf::from("Home/Child/page.md"));
     assert_eq!(child.hydration, HydrationState::Stub);
 }
 
@@ -375,14 +374,14 @@ fn scheduled_pull_renames_existing_projection_when_remote_title_changes() {
                 &mount_id,
                 "root-page",
                 "Home",
-                "Home.md",
+                "Home/page.md",
                 "2026-06-10T00:00:00Z",
             ),
             page_entry(
                 &mount_id,
                 "child-page",
                 "Child",
-                "Home/Child.md",
+                "Home/Child/page.md",
                 "2026-06-10T00:00:00Z",
             ),
         ],
@@ -398,8 +397,8 @@ fn scheduled_pull_renames_existing_projection_when_remote_title_changes() {
         )
         .expect("initial scheduled pull");
 
-    assert!(root.join("Home.md").exists());
-    assert!(root.join("Home/Child.md").exists());
+    assert!(root.join("Home/page.md").exists());
+    assert!(root.join("Home/Child/page.md").exists());
 
     source.insert_entries(
         &mount_id,

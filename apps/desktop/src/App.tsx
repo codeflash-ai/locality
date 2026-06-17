@@ -149,19 +149,19 @@ const sampleSnapshot: DesktopSnapshot = {
   pendingChanges: [
     {
       title: "Roadmap 2026",
-      localPath: "Engineering/Roadmap 2026 ~a3f2/page.md",
+      localPath: "Engineering/Roadmap 2026/page.md",
       summary: "2 text edits",
       state: "safe",
     },
     {
       title: "Launch Plan",
-      localPath: "Marketing/Launch Plan ~8841/page.md",
+      localPath: "Marketing/Launch Plan/page.md",
       summary: "needs review: large deletion",
       state: "needs_review",
     },
     {
       title: "Customer Notes",
-      localPath: "Sales/Customer Notes ~6b91/page.md",
+      localPath: "Sales/Customer Notes/page.md",
       summary: "1 property edit",
       state: "safe",
     },
@@ -213,13 +213,13 @@ const sampleSearchResults: LocatedItem[] = [
   {
     title: "Roadmap 2026",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2/page.md",
+    localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
     state: "ready",
   },
   {
     title: "Launch Plan",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/AFS/notion/Marketing/Launch Plan ~8841/page.md",
+    localPath: "~/Library/CloudStorage/AFS/notion/Marketing/Launch Plan/page.md",
     state: "online_only",
   },
 ];
@@ -782,7 +782,7 @@ function Onboarding({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2/page.md",
+          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1193,7 +1193,7 @@ function HomeView({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2/page.md",
+          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1881,7 +1881,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2/page.md",
+          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );

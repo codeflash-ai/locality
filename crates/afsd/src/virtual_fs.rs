@@ -2025,7 +2025,7 @@ mod tests {
                 remote_id: RemoteId::new("page-root"),
                 kind: EntityKind::Page,
                 title: "Home".to_string(),
-                path: "home ~pagero/page.md".into(),
+                path: "home/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,

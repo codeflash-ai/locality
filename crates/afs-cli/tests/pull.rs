@@ -92,11 +92,11 @@ fn pull_virtual_mount_writes_content_and_schema_to_daemon_cache() {
     assert_eq!(report.hydrated, 1);
     assert!(!fixture.root_file("roadmap").exists());
     let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
-    assert!(content_root.join("roadmap ~aaaaaa/page.md").exists());
+    assert!(content_root.join("roadmap/page.md").exists());
     assert!(
         content_root
-            .join("roadmap ~aaaaaa")
-            .join("tasks ~cccccc")
+            .join("roadmap")
+            .join("tasks")
             .join("_schema.yaml")
             .exists()
     );
@@ -176,7 +176,75 @@ fn pull_mount_root_renames_existing_projection_when_remote_title_changes() {
         .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
         .expect("get root entity")
         .expect("root entity");
-    assert_eq!(root_entity.path, PathBuf::from("strategy ~aaaaaa/page.md"));
+    assert_eq!(root_entity.path, PathBuf::from("strategy/page.md"));
+}
+
+#[test]
+fn pull_mount_root_renames_existing_child_when_duplicate_title_appears() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+
+    run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
+    assert!(fixture.child_file("roadmap").exists());
+
+    let report = run_pull(
+        &mut store,
+        &fixture.connector_with_duplicate_child("Roadmap"),
+        &fixture.root,
+    )
+    .expect("pull duplicate child");
+
+    assert!(report.ok);
+    assert!(fixture.colliding_child_file("roadmap", "bbbbbb").exists());
+    assert!(fixture.colliding_child_file("roadmap", "ffffff").exists());
+    assert!(!fixture.child_file("roadmap").exists());
+
+    let existing_child = store
+        .get_entity(
+            &fixture.mount_id,
+            &RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        )
+        .expect("get existing child entity")
+        .expect("existing child entity");
+    assert_eq!(
+        existing_child.path,
+        PathBuf::from("roadmap/design-notes bbbbbb/page.md")
+    );
+}
+
+#[test]
+fn pull_mount_root_renames_existing_database_row_when_duplicate_title_appears() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+
+    run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
+    assert!(fixture.row_file().exists());
+
+    let report = run_pull(
+        &mut store,
+        &fixture.connector_with_duplicate_row("Roadmap"),
+        &fixture.root,
+    )
+    .expect("pull duplicate row");
+
+    assert!(report.ok);
+    assert!(fixture.colliding_row_file("eeeeee").exists());
+    assert!(fixture.colliding_row_file("ffffff").exists());
+    assert!(!fixture.row_file().exists());
+
+    let existing_row = store
+        .get_entity(
+            &fixture.mount_id,
+            &RemoteId::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        )
+        .expect("get existing row entity")
+        .expect("existing row entity");
+    assert_eq!(
+        existing_row.path,
+        PathBuf::from("roadmap/tasks/fix-login-bug eeeeee/page.md")
+    );
 }
 
 #[test]
@@ -404,29 +472,67 @@ impl PullFixture {
         )
     }
 
+    fn connector_with_duplicate_child(&self, root_title: &str) -> NotionConnector {
+        NotionConnector::with_api(
+            NotionConfig::default(),
+            Arc::new(FixtureNotionApi::new_with_duplicate_child(
+                self.root_page_id.as_str(),
+                self.canonical_root_page_id.as_str(),
+                root_title,
+                "Root body.",
+                "2026-06-11T00:00:00.000Z",
+            )),
+        )
+    }
+
+    fn connector_with_duplicate_row(&self, root_title: &str) -> NotionConnector {
+        NotionConnector::with_api(
+            NotionConfig::default(),
+            Arc::new(FixtureNotionApi::new_with_duplicate_row(
+                self.root_page_id.as_str(),
+                self.canonical_root_page_id.as_str(),
+                root_title,
+                "Root body.",
+                "2026-06-11T00:00:00.000Z",
+            )),
+        )
+    }
+
     fn root_file(&self, slug: &str) -> PathBuf {
-        self.root.join(format!("{slug} ~aaaaaa")).join("page.md")
+        self.root.join(slug).join("page.md")
     }
 
     fn child_file(&self, root_slug: &str) -> PathBuf {
         self.root
-            .join(format!("{root_slug} ~aaaaaa"))
-            .join("design-notes ~bbbbbb")
+            .join(root_slug)
+            .join("design-notes")
             .join("page.md")
     }
 
     fn database_schema_file(&self) -> PathBuf {
-        self.root
-            .join("roadmap ~aaaaaa")
-            .join("tasks ~cccccc")
-            .join("_schema.yaml")
+        self.root.join("roadmap").join("tasks").join("_schema.yaml")
     }
 
     fn row_file(&self) -> PathBuf {
         self.root
-            .join("roadmap ~aaaaaa")
-            .join("tasks ~cccccc")
-            .join("fix-login-bug ~eeeeee")
+            .join("roadmap")
+            .join("tasks")
+            .join("fix-login-bug")
+            .join("page.md")
+    }
+
+    fn colliding_child_file(&self, root_slug: &str, short_id: &str) -> PathBuf {
+        self.root
+            .join(root_slug)
+            .join(format!("design-notes {short_id}"))
+            .join("page.md")
+    }
+
+    fn colliding_row_file(&self, short_id: &str) -> PathBuf {
+        self.root
+            .join("roadmap")
+            .join("tasks")
+            .join(format!("fix-login-bug {short_id}"))
             .join("page.md")
     }
 }
@@ -565,6 +671,78 @@ impl FixtureNotionApi {
             data_sources,
             data_source_pages,
         }
+    }
+
+    fn new_with_duplicate_child(
+        requested_root_page_id: &str,
+        returned_root_page_id: &str,
+        root_title: &str,
+        root_body: &str,
+        last_edited_time: &str,
+    ) -> Self {
+        let mut fixture = Self::new(
+            requested_root_page_id,
+            returned_root_page_id,
+            root_title,
+            root_body,
+            last_edited_time,
+        );
+        let duplicate_child_id = "ffffffffffffffffffffffffffffffff";
+        fixture.pages.insert(
+            duplicate_child_id.to_string(),
+            page(duplicate_child_id, "Design Notes", last_edited_time),
+        );
+        fixture.children.insert(
+            (duplicate_child_id.to_string(), None),
+            PaginatedListDto {
+                results: vec![paragraph_block("paragraph-duplicate", "Duplicate body.")],
+                next_cursor: None,
+                has_more: false,
+            },
+        );
+        fixture
+            .children
+            .get_mut(&(returned_root_page_id.to_string(), None))
+            .expect("root children")
+            .results
+            .push(child_page_block(duplicate_child_id, "Design Notes"));
+        fixture
+    }
+
+    fn new_with_duplicate_row(
+        requested_root_page_id: &str,
+        returned_root_page_id: &str,
+        root_title: &str,
+        root_body: &str,
+        last_edited_time: &str,
+    ) -> Self {
+        let mut fixture = Self::new(
+            requested_root_page_id,
+            returned_root_page_id,
+            root_title,
+            root_body,
+            last_edited_time,
+        );
+        let duplicate_row_id = "ffffffffffffffffffffffffffffffff";
+        fixture.pages.insert(
+            duplicate_row_id.to_string(),
+            database_row_page(duplicate_row_id, "Fix login bug", last_edited_time),
+        );
+        fixture.children.insert(
+            (duplicate_row_id.to_string(), None),
+            PaginatedListDto::default(),
+        );
+        fixture
+            .data_source_pages
+            .get_mut(&("dddddddddddddddddddddddddddddddd".to_string(), None))
+            .expect("data source page")
+            .results
+            .push(database_row_page(
+                duplicate_row_id,
+                "Fix login bug",
+                last_edited_time,
+            ));
+        fixture
     }
 }
 

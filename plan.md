@@ -76,17 +76,20 @@ Five components ship in v1, one is optional cloud.
     AGENTS.md                      # auto-generated skill file (also CLAUDE.md symlink)
     Engineering/
       _dir.md                      # directory index: titles, IDs, hydration state
-      Roadmap 2026 ~a3f2.md        # hydrated page
-      Architecture ~9c1b.md        # online-only until opened
-      Sprint Tracker ~44de/        # a Notion database
+      Roadmap 2026/
+        page.md                    # hydrated page body
+      Architecture/
+        page.md                    # online-only until opened
+      Sprint Tracker/              # a Notion database
         _schema.yaml               # property definitions, option lists, validation rules
         _view.csv                  # read-only tabular convenience view
-        Fix login bug ~b771.md     # database row as page: properties in frontmatter
+        Fix login bug/
+          page.md                  # database row as page: properties in frontmatter
     Personal/
       ...
 ```
 
-**Naming.** Filenames are `slugified-title ~shortid.md`. The short ID suffix (first 4 to 6 hex chars of the Notion UUID, lengthened on collision) makes names stable and unique: a teammate renaming a page in Notion changes the slug but the daemon recognizes the ID and performs a local rename rather than delete-plus-create. The internal data model never keys on paths, only on canonical remote IDs; paths are a projection.
+**Naming.** Notion pages are directories and the page body lives in `page.md`. Names default to a clean slugified title, for example `Roadmap 2026/page.md`. If two siblings would otherwise project to the same name, AFS appends a short remote ID suffix, for example `Roadmap 2026 a3f2/page.md`, lengthening the suffix as needed. The internal data model never keys on paths, only on canonical remote IDs; paths are a projection.
 
 **Online-only files and hydration.** Every page is addressable from the moment a mount is enumerated, so the full tree is instantly browsable by title and metadata even for a 50k-page workspace. On macOS, unhydrated pages are File Provider dataless items: metadata lives in SQLite, each mount registers a File Provider domain keyed by `mount_id`, and the first file open asks the daemon to materialize the correct Markdown before the read completes. Hydration happens four ways: explicitly (`afs pull path/`), by policy (default: auto-hydrate anything edited remotely in the last 90 days, plus anything the user starred; configurable per mount), lazily through File Provider `fetchContents`, and by prefetch (when a page is hydrated, its children and linked pages are queued at low priority, because agents that read one page very often read its neighbors next). Plain Markdown stubs remain only as a fallback/dev projection for environments without a virtualization layer. The hydration states form an explicit ladder, borrowed from VFS for Git: `virtual → online-only → hydrated → dirty → conflicted`; conflicts are main-file inline markers, and the push pipeline refuses unresolved markers.
 

@@ -114,7 +114,7 @@ The first Notion apply path is intentionally conservative:
 - supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, existing stable-width/header-mode tables including row add/delete, existing bookmark/embed URL blocks, and existing URL-backed media blocks;
 - supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, Notion page links, database links whose target ID matches a rendered database mention, explicit `@page(...)` page mentions, explicit `@database(...)` database mentions, explicit `@date(...)` date mentions, explicit `@user(...)` user mentions, legacy `afs://` page links, and unchanged preimage mentions such as dates/users;
 - supported page property writes: title, rich text with the same inline Markdown parser used by page bodies, number, select, status, multi-select, checkbox, date, URL, email, phone, external file URLs, explicit people user IDs, and explicit relation page IDs;
-- new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug ~shortid.md` path;
+- new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug/page.md` path, using `slug shortid/page.md` only when a sibling name collision requires it;
 - unsupported write forms fail before API mutation, including table width or header-mode changes, page/database creation outside database-row files, computed/read-only properties, hosted file uploads/rewrites, multi-data-source row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
 - appends use Notion's current position object, with `start` for prepends and `after_block` for inserts after a known block;
 - before apply, the connector re-reads the page and compares the current Notion edit timestamp against the Synced Tree version carried by the push executor;
@@ -138,7 +138,7 @@ When a caller renders a Notion page for a known filesystem path, media blocks wi
 
 ```text
 media/
-  roadmap ~aaaaaa/
+  roadmap/
     image-0123456789ab.png
 ```
 
@@ -146,28 +146,31 @@ The media tree mirrors the Notion page directory. This keeps binary files out of
 
 ## Path Projection
 
-Root-page mounts use a stable directory shape: `slugified-title ~shortid/page.md`.
+Root-page mounts use a stable directory shape: `slugified-title/page.md`.
+When two siblings normalize to the same slug, all colliding siblings use a short
+remote ID suffix such as `slugified-title aaaaaa/page.md`. The suffix lengthens
+only when needed to keep sibling names unique.
 
 Each Notion page is a directory. The page body lives in `page.md`; sibling entries in the same directory are child Notion content:
 
 ```text
-roadmap ~aaaaaa/
+roadmap/
   page.md
-  design-notes ~bbbbbb/
+  design-notes/
     page.md
-  tasks ~cccccc/
+  tasks/
 ```
 
-The remote ID remains the identity. The short ID starts at six hex characters and lengthens on sibling collisions, while the title slug can change without changing identity.
+The remote ID remains the identity. The title slug can change without changing identity.
 
 Database blocks project as directories. Each data source under the database contributes row pages directly inside that directory, and `_schema.yaml` mirrors the current property schema with stable property IDs, types, and select/status option names.
 
 ```text
-roadmap ~aaaaaa/
+roadmap/
   page.md
-  tasks ~cccccc/
+  tasks/
     _schema.yaml
-    fix-login-bug ~eeeeee/
+    fix-login-bug/
       page.md
 ```
 

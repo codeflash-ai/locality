@@ -32,7 +32,7 @@ fn info_for_page_file_reports_source_children_and_journals() {
     let report = run_info(
         &store,
         InfoOptions {
-            path: Some(fixture.root.join("roadmap ~aaaaaa/page.md")),
+            path: Some(fixture.root.join("roadmap/page.md")),
         },
     )
     .expect("info report");
@@ -68,7 +68,7 @@ fn info_for_page_workspace_resolves_the_backing_page() {
     let report = run_info(
         &store,
         InfoOptions {
-            path: Some(fixture.root.join("roadmap ~aaaaaa")),
+            path: Some(fixture.root.join("roadmap")),
         },
     )
     .expect("info report");
@@ -80,7 +80,7 @@ fn info_for_page_workspace_resolves_the_backing_page() {
             .entity
             .as_ref()
             .map(|entity| entity.path.as_str()),
-        Some("roadmap ~aaaaaa/page.md")
+        Some("roadmap/page.md")
     );
     assert_eq!(report.children.pages, 1);
     assert_eq!(report.children.databases, 1);
@@ -95,14 +95,14 @@ fn info_for_database_directory_reports_schema_and_rows() {
     let report = run_info(
         &store,
         InfoOptions {
-            path: Some(fixture.root.join("roadmap ~aaaaaa/tasks ~cccccc")),
+            path: Some(fixture.root.join("roadmap/tasks")),
         },
     )
     .expect("info report");
 
     let expected_schema = fixture
         .root
-        .join("roadmap ~aaaaaa/tasks ~cccccc/_schema.yaml")
+        .join("roadmap/tasks/_schema.yaml")
         .display()
         .to_string();
 
@@ -132,11 +132,11 @@ fn info_without_path_uses_cwd_inside_mount() {
     fixture.seed_tree(&mut store);
 
     let _lock = cwd_lock().lock().expect("cwd lock");
-    let _cwd = CurrentDirGuard::enter(fixture.root.join("roadmap ~aaaaaa/tasks ~cccccc"));
+    let _cwd = CurrentDirGuard::enter(fixture.root.join("roadmap/tasks"));
     let report = run_info(&store, InfoOptions::default()).expect("info report");
 
     assert_eq!(report.subject.role, InfoRole::DatabaseDirectory);
-    assert!(report.target.ends_with("roadmap ~aaaaaa/tasks ~cccccc"));
+    assert!(report.target.ends_with("roadmap/tasks"));
 }
 
 #[test]
@@ -184,7 +184,7 @@ fn info_runner_works_with_sqlite_state_store() {
     let report = run_info(
         &store,
         InfoOptions {
-            path: Some(fixture.root.join("roadmap ~aaaaaa/page.md")),
+            path: Some(fixture.root.join("roadmap/page.md")),
         },
     )
     .expect("info report");
@@ -231,12 +231,12 @@ impl InfoFixture {
     where
         S: EntityRepository,
     {
-        self.write_raw("roadmap ~aaaaaa/page.md");
-        fs::create_dir_all(self.root.join("roadmap ~aaaaaa/tasks ~cccccc")).expect("database dir");
-        self.write_raw("roadmap ~aaaaaa/design ~bbbbbb/page.md");
-        self.write_raw("roadmap ~aaaaaa/tasks ~cccccc/fix-login ~dddddd/page.md");
+        self.write_raw("roadmap/page.md");
+        fs::create_dir_all(self.root.join("roadmap/tasks")).expect("database dir");
+        self.write_raw("roadmap/design/page.md");
+        self.write_raw("roadmap/tasks/fix-login/page.md");
         fs::write(
-            self.root.join("roadmap ~aaaaaa/tasks ~cccccc/_schema.yaml"),
+            self.root.join("roadmap/tasks/_schema.yaml"),
             "title: Tasks\n",
         )
         .expect("schema");
@@ -248,7 +248,7 @@ impl InfoFixture {
                     "page-1",
                     EntityKind::Page,
                     "Roadmap",
-                    "roadmap ~aaaaaa/page.md",
+                    "roadmap/page.md",
                 )
                 .with_hydration(HydrationState::Hydrated)
                 .with_content_hash("hash-page-1")
@@ -261,7 +261,7 @@ impl InfoFixture {
                 "page-2",
                 EntityKind::Page,
                 "Design",
-                "roadmap ~aaaaaa/design ~bbbbbb/page.md",
+                "roadmap/design/page.md",
             ))
             .expect("save child page");
         store
@@ -270,7 +270,7 @@ impl InfoFixture {
                 "database-1",
                 EntityKind::Database,
                 "Tasks",
-                "roadmap ~aaaaaa/tasks ~cccccc",
+                "roadmap/tasks",
             ))
             .expect("save database");
         store
@@ -279,7 +279,7 @@ impl InfoFixture {
                 "row-1",
                 EntityKind::Page,
                 "Fix login",
-                "roadmap ~aaaaaa/tasks ~cccccc/fix-login ~dddddd/page.md",
+                "roadmap/tasks/fix-login/page.md",
             ))
             .expect("save row");
     }

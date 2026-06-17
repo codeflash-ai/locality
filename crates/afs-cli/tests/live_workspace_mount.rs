@@ -10,7 +10,7 @@ use serde_json::Value;
 const LIVE_WORKSPACE_ROOT_ENV: &str = "AFS_LIVE_WORKSPACE_ROOT";
 const LIVE_WORKSPACE_FILE_ENV: &str = "AFS_LIVE_WORKSPACE_FILE";
 const DEFAULT_WORKSPACE_ROOT: &str = "/home/mohammed/Documents/AFS/ali-workspace";
-const DEFAULT_WORKSPACE_FILE: &str = "weekly-to-do-list ~85b231.md";
+const DEFAULT_WORKSPACE_FILE: &str = "weekly-to-do-list/page.md";
 
 #[test]
 #[ignore = "destructive live regression for the ali-workspace Linux FUSE mount"]

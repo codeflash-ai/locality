@@ -239,12 +239,12 @@ mod tests {
     fn media_paths_mirror_page_paths_under_media_directory() {
         assert_eq!(
             media_local_path(
-                Path::new("Tasks/Fix login ~abcdef.md"),
+                Path::new("Tasks/Fix login/page.md"),
                 "01234567-89ab-cdef",
                 "image",
                 "https://example.com/diagram.PNG?download=1",
             ),
-            Path::new("media/Tasks/Fix login ~abcdef/image-0123456789ab.png")
+            Path::new("media/Tasks/Fix login/image-0123456789ab.png")
         );
     }
 
@@ -252,12 +252,12 @@ mod tests {
     fn media_paths_ignore_parent_and_root_components() {
         assert_eq!(
             media_local_path(
-                Path::new("/../Tasks/../Fix login ~abcdef.md"),
+                Path::new("/../Tasks/../Fix login/page.md"),
                 "01234567-89ab-cdef",
                 "image",
                 "https://example.com/diagram.PNG?download=1",
             ),
-            Path::new("media/Tasks/Fix login ~abcdef/image-0123456789ab.png")
+            Path::new("media/Tasks/Fix login/image-0123456789ab.png")
         );
     }
 }

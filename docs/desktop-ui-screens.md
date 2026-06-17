@@ -477,7 +477,7 @@ Preparing this page
 AFS is making the local file available now.
 
 Roadmap 2026
-~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2/page.md
+~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md
 
 [ Copy Path ]    Reveal in Finder
 ```
@@ -489,7 +489,7 @@ Roadmap 2026
 Page
 
 ┌──────────────────────────────────────────────────────────────┐
-│ ~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026 ~a3f2/page.md│
+│ ~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md      │
 └──────────────────────────────────────────────────────────────┘
 
 [ Copy Path ]    Reveal in Finder
@@ -519,12 +519,12 @@ Pending Changes
 
 ┌──────────────────────────────────────────────────────────────┐
 │ Roadmap 2026                                                 │
-│ Engineering/Roadmap 2026 ~a3f2/page.md                       │
+│ Engineering/Roadmap 2026/page.md                             │
 │ 2 text edits                                                 │
 │                                                [ Open ]      │
 ├──────────────────────────────────────────────────────────────┤
 │ Launch Plan                                                  │
-│ Marketing/Launch Plan ~8841/page.md                          │
+│ Marketing/Launch Plan/page.md                                │
 │ needs review: large deletion                                 │
 │                                                [ Open ]      │
 └──────────────────────────────────────────────────────────────┘
