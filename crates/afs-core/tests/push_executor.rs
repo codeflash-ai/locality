@@ -92,7 +92,7 @@ fn executor_does_not_journal_or_apply_until_pipeline_is_approved() {
 }
 
 #[test]
-fn executor_marks_failed_when_concurrency_check_fails_before_apply() {
+fn executor_reverts_journal_when_concurrency_check_fails_before_apply() {
     let events = event_log();
     let mut host = RecordingHost::new(events.clone());
     host.concurrency = host
@@ -112,13 +112,13 @@ fn executor_marks_failed_when_concurrency_check_fails_before_apply() {
             "append:prepared",
             "update:applying",
             "check",
-            "update:failed"
+            "update:reverted"
         ]
     );
-    assert!(matches!(
+    assert_eq!(
         host.journal.entry.expect("journal").status,
-        JournalStatus::Failed(_)
-    ));
+        JournalStatus::Reverted
+    );
 }
 
 #[test]
@@ -488,6 +488,7 @@ fn status_event(prefix: &'static str, status: &JournalStatus) -> &'static str {
         ("update", JournalStatus::Applying) => "update:applying",
         ("update", JournalStatus::Applied) => "update:applied",
         ("update", JournalStatus::Reconciled) => "update:reconciled",
+        ("update", JournalStatus::Reverted) => "update:reverted",
         ("update", JournalStatus::Failed(_)) => "update:failed",
         _ => "status:other",
     }

@@ -143,7 +143,8 @@ impl NotionConnector {
     ) -> AfsResult<NotionRenderedEntity> {
         render_native_entity_with_options(
             entity,
-            &RenderOptions::with_page_path(page_path.as_ref()).with_local_media_block_ids(block_ids),
+            &RenderOptions::with_page_path(page_path.as_ref())
+                .with_local_media_block_ids(block_ids),
         )
     }
 

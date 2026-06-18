@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -91,13 +92,13 @@ class NotionClient:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as error:
                 text = error.read().decode("utf-8", errors="replace")
-                if error.code == 429 and attempt < self.retries:
+                if error.code in {429, 500, 502, 503, 504} and attempt < self.retries:
                     retry_after = error.headers.get("Retry-After")
                     delay = float(retry_after) if retry_after and retry_after.isdigit() else min(2**attempt, 16)
                     time.sleep(delay)
                     continue
                 raise AuditFailure(f"notion {method} {path} failed HTTP {error.code}: {text}") from error
-            except urllib.error.URLError as error:
+            except (urllib.error.URLError, TimeoutError, socket.timeout) as error:
                 if attempt < self.retries:
                     time.sleep(min(2**attempt, 16))
                     continue
@@ -185,9 +186,10 @@ def main() -> int:
                 break
 
     final_status = run_cmd([str(afs_bin), "status", str(mount_root), "--json"], run_root / "final-status.json", check=False)
+    final_status_problems = final_status_problem_counts(run_root / "final-status.json")
     result_counts = collect_result_counts(run_root)
     summary = {
-        "ok": failures == 0 and final_status.returncode == 0,
+        "ok": failures == 0 and final_status.returncode == 0 and not any(final_status_problems.values()),
         "tested_this_invocation": tested,
         "skipped_this_invocation": skipped,
         "failures": failures,
@@ -195,6 +197,7 @@ def main() -> int:
         "results": result_counts,
         "run_root": str(run_root),
         "final_status_exit": final_status.returncode,
+        "final_status_problems": final_status_problems,
     }
     write_json(run_root / "summary.json", summary)
     log("run_complete", status="ok" if summary["ok"] else "failed", failures=failures, skipped=skipped)
@@ -298,7 +301,47 @@ def run_page(
         edited_diff = load_json_output(page_dir / "diff-edited.json")
         assert_single_append(edited_diff, marker)
 
-        run_cmd([str(afs_bin), "push", str(mounted_path), "-y", "--json"], page_dir / "push-edit.json")
+        push_edit = run_cmd(
+            [str(afs_bin), "push", str(mounted_path), "-y", "--json"],
+            page_dir / "push-edit.json",
+            check=False,
+        )
+        if push_edit.returncode != 0:
+            push_edit_json = load_json_output(page_dir / "push-edit.json")
+            if stale_remote_push_failure(push_edit_json):
+                content_path.write_bytes(original)
+                clear_empty_failed_journal(afs_bin, push_edit_json, page_dir)
+                run_cmd(
+                    [str(afs_bin), "pull", str(mounted_path), "--json"],
+                    page_dir / "pull-after-stale-push.json",
+                    retries=args.command_retries,
+                )
+                run_cmd(
+                    [str(afs_bin), "diff", str(mounted_path), "--json"],
+                    page_dir / "diff-after-stale-push.json",
+                    retries=args.command_retries,
+                )
+                stale_diff = load_json_output(page_dir / "diff-after-stale-push.json")
+                if not diff_is_noop(stale_diff):
+                    raise AuditFailure("stale push recovery left a non-clean local diff")
+
+                reason = "remote changed before push apply; refreshed and left page unchanged"
+                write_json(page_dir / "result.json", {
+                    "path": candidate.path,
+                    "remote_id": candidate.remote_id,
+                    "ok": True,
+                    "mode": "write_skipped",
+                    "restored": True,
+                    "risk_reasons": [reason],
+                })
+                log("page_write_skipped", path=candidate.path, status="stale_remote", message=reason)
+                return "skipped"
+
+            raise AuditFailure(command_failure_message(
+                [str(afs_bin), "push", str(mounted_path), "-y", "--json"],
+                page_dir / "push-edit.json",
+                push_edit,
+            ))
         remote_changed = True
         after_edit = notion_snapshot(notion, candidate.remote_id)
         write_json(page_dir / "notion-after-edit.json", after_edit)
@@ -473,7 +516,7 @@ def normalize_notion(value: Any) -> Any:
         for key, child in value.items():
             if key in VOLATILE_NOTION_KEYS:
                 continue
-            if key == "url" and value.get("type") == "file":
+            if key == "url" and (value.get("type") == "file" or "expiry_time" in value):
                 continue
             normalized[key] = normalize_notion(child)
         return normalized
@@ -490,6 +533,30 @@ def snapshot_contains_text(value: Any, needle: str) -> bool:
     if isinstance(value, list):
         return any(snapshot_contains_text(child, needle) for child in value)
     return False
+
+
+def stale_remote_push_failure(push_output: dict[str, Any]) -> bool:
+    message = str(push_output.get("message") or "")
+    return (
+        "changed since the Synced Tree shadow" in message
+        and int(push_output.get("apply_effect_count") or 0) == 0
+        and not push_output.get("changed_remote_ids")
+    )
+
+
+def clear_empty_failed_journal(afs_bin: Path, push_output: dict[str, Any], page_dir: Path) -> None:
+    if push_output.get("journal_status") != "failed":
+        return
+    if int(push_output.get("apply_effect_count") or 0) != 0:
+        return
+    push_id = push_output.get("push_id")
+    if not push_id:
+        return
+    run_cmd(
+        [str(afs_bin), "undo", str(push_id), "--json"],
+        page_dir / "undo-empty-failed-push.json",
+        check=False,
+    )
 
 
 def classify_write_risk(
@@ -595,6 +662,9 @@ def transient_command_failure(result: subprocess.CompletedProcess[str]) -> bool:
         "gateway timeout",
         "rate limit",
         "rate_limited",
+        "remote_fetch_failed",
+        "notion request failed",
+        "error sending request",
         "temporarily unavailable",
         "timed out",
         "connection reset",
@@ -722,6 +792,26 @@ def collect_result_counts(run_root: Path) -> dict[str, Any]:
         mode = str(result.get("mode", "failed" if not result.get("ok") else "unknown"))
         counts["modes"][mode] = counts["modes"].get(mode, 0) + 1
     return counts
+
+
+def final_status_problem_counts(status_path: Path) -> dict[str, int]:
+    try:
+        status = load_json_output(status_path)
+    except (OSError, json.JSONDecodeError):
+        return {"unreadable_status": 1}
+    summary = status.get("summary", {})
+    problem_keys = [
+        "dirty",
+        "conflicted",
+        "missing",
+        "error",
+        "pending_journals",
+        "failed_journals",
+        "pending_local_changes",
+        "review_needed",
+        "sync_conflicted",
+    ]
+    return {key: int(summary.get(key) or 0) for key in problem_keys}
 
 
 def safe_name(value: str) -> str:

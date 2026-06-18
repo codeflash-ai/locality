@@ -109,6 +109,34 @@ fn undo_prepared_journal_entry_marks_it_reverted() {
 }
 
 #[test]
+fn undo_failed_journal_without_apply_effects_marks_it_reverted() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    store
+        .append_journal(journal_entry(
+            "push-1",
+            "page-1",
+            JournalStatus::Failed("remote changed before apply".to_string()),
+        ))
+        .expect("append journal");
+
+    let report = run_undo(&mut store, "push-1").expect("undo report");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "reverted_empty_failed_journal");
+    assert_eq!(report.status, "reverted");
+    assert_eq!(undo_report_exit_code(&report), 0);
+    assert_eq!(
+        store
+            .get_journal(&PushId("push-1".to_string()))
+            .expect("get journal")
+            .expect("journal")
+            .status,
+        JournalStatus::Reverted
+    );
+}
+
+#[test]
 fn undo_reconciled_journal_entry_derives_reverse_plan_and_stops_before_apply() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();

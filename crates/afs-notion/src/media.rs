@@ -527,15 +527,11 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(
             first,
-            Path::new(
-                ".afs/media/Docs/Whitepaper/image-2f03ac0ebb8880ef9328c370dd88d9ba.png"
-            )
+            Path::new(".afs/media/Docs/Whitepaper/image-2f03ac0ebb8880ef9328c370dd88d9ba.png")
         );
         assert_eq!(
             second,
-            Path::new(
-                ".afs/media/Docs/Whitepaper/image-2f03ac0ebb8880c18ed8d4bc56b2e490.png"
-            )
+            Path::new(".afs/media/Docs/Whitepaper/image-2f03ac0ebb8880c18ed8d4bc56b2e490.png")
         );
     }
 

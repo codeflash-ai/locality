@@ -518,7 +518,7 @@ where
         remote_ids: &remote_ids,
         remote_preconditions: &request.remote_preconditions,
     }) {
-        mark_failed(host, &request.push_id, &error)?;
+        mark_reverted(host, &request.push_id)?;
         return Err(error);
     }
 
@@ -577,4 +577,11 @@ where
     J: JournalStore,
 {
     journal.update_status(push_id, JournalStatus::Failed(error.to_string()))
+}
+
+fn mark_reverted<J>(journal: &mut J, push_id: &PushId) -> AfsResult<()>
+where
+    J: JournalStore,
+{
+    journal.update_status(push_id, JournalStatus::Reverted)
 }

@@ -110,6 +110,26 @@ where
             entry: Some(JournalEntryOutput::from(entry)),
             undo_plan: None,
         }),
+        JournalStatus::Failed(_) if entry.apply_effects.is_empty() => {
+            store
+                .update_journal_status(&push_id, JournalStatus::Reverted)
+                .map_err(HistoryError::Store)?;
+            let mut reverted = entry;
+            reverted.status = JournalStatus::Reverted;
+
+            Ok(UndoReport {
+                ok: true,
+                command: "undo",
+                push_id: push_id.0,
+                status: "reverted".to_string(),
+                action: "reverted_empty_failed_journal".to_string(),
+                message: "failed journal had no recorded remote effects and was marked reverted"
+                    .to_string(),
+                changed_remote_ids: Vec::new(),
+                entry: Some(JournalEntryOutput::from(reverted)),
+                undo_plan: None,
+            })
+        }
         JournalStatus::Applied | JournalStatus::Reconciled => {
             let undo_plan = plan_journal_undo(&entry);
             let (action, message) = undo_boundary(&undo_plan);
