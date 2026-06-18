@@ -1275,6 +1275,20 @@ p {
   height: 13px;
 }
 
+.inline-review-button {
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.inline-review-button:hover {
+  text-decoration: underline;
+}
+
 .file-detail-panel {
   grid-column: 2 / 4;
   padding: 12px;

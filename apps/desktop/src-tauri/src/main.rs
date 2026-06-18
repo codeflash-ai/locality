@@ -28,9 +28,7 @@ use afs_cli::search::{
 };
 use afs_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
 use afs_core::canonical::parse_canonical_markdown;
-use afs_core::conflict::{
-    CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, has_unresolved_conflict_markers,
-};
+use afs_core::conflict::has_unresolved_conflict_markers;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{HydrationState, MountId, RemoteId};
@@ -1005,13 +1003,13 @@ fn conflict_preview(contents: &str) -> Option<String> {
     let lines = contents.lines().collect::<Vec<_>>();
     let first_marker = lines
         .iter()
-        .position(|line| line.trim() == CONFLICT_LOCAL_MARKER)
+        .position(|line| line.trim_start().starts_with("<<<<<<<"))
         .unwrap_or(0);
     let last_marker = lines
         .iter()
         .enumerate()
         .skip(first_marker)
-        .find_map(|(index, line)| (line.trim() == CONFLICT_REMOTE_MARKER).then_some(index))
+        .find_map(|(index, line)| line.trim_start().starts_with(">>>>>>>").then_some(index))
         .unwrap_or_else(|| (first_marker + 40).min(lines.len().saturating_sub(1)));
     let start = first_marker.saturating_sub(4);
     let end = (last_marker + 5).min(lines.len());
@@ -4265,6 +4263,19 @@ mod tests {
         assert!(preview.contains("local body"));
         assert!(preview.contains("remote body"));
         assert!(preview.contains(">>>>>>> REMOTE"));
+    }
+
+    #[test]
+    fn conflict_preview_accepts_spaced_marker_lines() {
+        let preview = conflict_preview(
+            "before\n  <<<<<<< ours\nlocal body\n  =======  \nremote body\n  >>>>>>> theirs\nafter\n",
+        )
+        .expect("preview");
+
+        assert!(preview.contains("<<<<<<< ours"));
+        assert!(preview.contains("local body"));
+        assert!(preview.contains("remote body"));
+        assert!(preview.contains(">>>>>>> theirs"));
     }
 
     #[test]

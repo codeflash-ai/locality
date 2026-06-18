@@ -198,11 +198,11 @@ pub fn unresolved_conflict_marker_line(contents: &str) -> Option<usize> {
     let mut saw_separator = false;
 
     for (index, line) in contents.lines().enumerate() {
-        let line = line.trim_end_matches('\r');
+        let line = line.trim_end_matches('\r').trim_start();
         if line.starts_with("<<<<<<<") {
             start_line = Some(index + 1);
             saw_separator = false;
-        } else if start_line.is_some() && line == CONFLICT_SEPARATOR_MARKER {
+        } else if start_line.is_some() && line.trim_end() == CONFLICT_SEPARATOR_MARKER {
             saw_separator = true;
         } else if start_line.is_some() && saw_separator && line.starts_with(">>>>>>>") {
             return start_line;
@@ -387,7 +387,8 @@ impl BlockChangeSet {
 mod tests {
     use super::{
         CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
-        render_conflict_marker_body_with_base,
+        has_unresolved_conflict_markers, render_conflict_marker_body_with_base,
+        unresolved_conflict_marker_line,
     };
 
     #[test]
@@ -442,5 +443,14 @@ mod tests {
         assert!(!merged.contains(CONFLICT_SEPARATOR_MARKER));
         assert!(!merged.contains(CONFLICT_REMOTE_MARKER));
         assert_eq!(merged, local);
+    }
+
+    #[test]
+    fn unresolved_conflict_markers_tolerate_whitespace_and_labels() {
+        let contents =
+            "intro\n  <<<<<<< ours\nlocal\n  =======  \nremote\n  >>>>>>> theirs\nafter\n";
+
+        assert!(has_unresolved_conflict_markers(contents));
+        assert_eq!(unresolved_conflict_marker_line(contents), Some(2));
     }
 }

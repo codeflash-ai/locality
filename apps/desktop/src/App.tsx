@@ -1591,7 +1591,12 @@ function PendingView({
       {hasPendingChanges ? (
         <>
           <p className="view-copy">{snapshot.pendingChanges.length} files have pending changes.</p>
-          <FileChangeList changes={snapshot.pendingChanges} mountPath={snapshot.mount.localPath} onRefresh={onRefresh} />
+          <FileChangeList
+            changes={snapshot.pendingChanges}
+            mountPath={snapshot.mount.localPath}
+            onReview={onReview}
+            onRefresh={onRefresh}
+          />
         </>
       ) : (
         <section className="panel muted-panel">
@@ -2201,11 +2206,13 @@ function FileChangeList({
   changes,
   mountPath,
   confirmDangerous = false,
+  onReview,
   onRefresh,
 }: {
   changes: PendingChange[];
   mountPath: string;
   confirmDangerous?: boolean;
+  onReview?: () => void;
   onRefresh?: () => Promise<void>;
 }) {
   const [actions, setActions] = useState<Record<string, FileActionStatus>>({});
@@ -2366,6 +2373,8 @@ function FileChangeList({
         const isWorking = action?.state === "working";
         const isSaving = editor?.state === "saving";
         const hasUnsavedEditorChanges = editor !== undefined && editor.contents !== editor.savedContents;
+        const shouldReviewBeforePush = Boolean(!confirmDangerous && change.state === "needs_review" && onReview);
+        const actionNeedsReview = Boolean(action?.state === "error" && pushNeedsReview(action.message) && onReview);
         const isSelected = selectedPath === change.localPath;
         return (
           <article className={`file-row ${change.state} ${isSelected ? "expanded" : ""}`} key={change.localPath}>
@@ -2394,7 +2403,19 @@ function FileChangeList({
               {action && (
                 <div className={`file-action-message ${action.state}`}>
                   {action.state === "working" && <Loader2 className="spin-icon" />}
-                  {action.message}
+                  <span>{action.message}</span>
+                  {actionNeedsReview && (
+                    <button
+                      className="inline-review-button"
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onReview?.();
+                      }}
+                    >
+                      Review Push
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -2405,8 +2426,18 @@ function FileChangeList({
               <SecondaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "resolve")}>
                 Resolve
               </SecondaryButton>
-              <PrimaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "push")}>
-                Push
+              <PrimaryButton
+                compact
+                disabled={isWorking}
+                onClick={() => {
+                  if (shouldReviewBeforePush) {
+                    onReview?.();
+                    return;
+                  }
+                  void runFileAction(change, "push");
+                }}
+              >
+                {shouldReviewBeforePush ? "Review" : "Push"}
               </PrimaryButton>
               <SecondaryButton
                 compact
@@ -2471,9 +2502,15 @@ function FileChangeList({
                       <PrimaryButton
                         compact
                         disabled={isSaving || hasUnsavedEditorChanges || isWorking}
-                        onClick={() => void runFileAction(change, "push")}
+                        onClick={() => {
+                          if (shouldReviewBeforePush) {
+                            onReview?.();
+                            return;
+                          }
+                          void runFileAction(change, "push");
+                        }}
                       >
-                        Push Saved
+                        {shouldReviewBeforePush ? "Review Saved" : "Push Saved"}
                       </PrimaryButton>
                     </div>
                   </>
@@ -3112,7 +3149,11 @@ function joinMountPath(mountPath: string, relativePath: string) {
 }
 
 function hasConflictMarkers(contents: string) {
-  return contents.includes("<<<<<<< LOCAL") && contents.includes("=======") && contents.includes(">>>>>>> REMOTE");
+  return /^\s*<<<<<<<.*$/m.test(contents) && /^\s*=======\s*$/m.test(contents) && /^\s*>>>>>>>.*$/m.test(contents);
+}
+
+function pushNeedsReview(message: string) {
+  return message.includes("Open Review Push") || message.includes("needs review");
 }
 
 function copyText(value: string) {
