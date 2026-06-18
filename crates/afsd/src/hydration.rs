@@ -112,7 +112,9 @@ where
             return Ok(HydrationOutcome::SkippedDirty);
         }
 
-        let rendered = self.source.fetch_render(&request)?;
+        let mut render_request = request.clone();
+        render_request.path = entity.path.clone();
+        let rendered = self.source.fetch_render(&render_request)?;
         if rendered.shadow.entity_id != request.remote_id {
             return Err(AfsError::InvalidState(format!(
                 "hydration source returned shadow for `{}` while hydrating `{}`",

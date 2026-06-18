@@ -195,6 +195,54 @@ fn inspect_reads_virtual_projection_content_cache() {
     );
 }
 
+#[test]
+fn inspect_treats_equivalent_media_paths_as_unchanged_remote() {
+    let fixture = InspectFixture::new();
+    let mut store = fixture.store(ProjectionMode::PlainFiles);
+    let long_media_href = "../../../../../../../.afs/media/home/mohammed/.afs/content/notion-main/files/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg";
+    let stable_media_href =
+        "../.afs/media/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg";
+    let synced_body = format!("# Roadmap\n\n![Image]({long_media_href})\n\nBase body.");
+    let local_body = format!("# Roadmap\n\n![Image]({long_media_href})\n\nLocal body.");
+    let remote_body = format!("# Roadmap\n\n![Image]({stable_media_href})\n\nBase body.");
+    let path = fixture.write_page("Roadmap.md", &local_body);
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow_with_blocks("page-1", &synced_body),
+        )
+        .expect("save shadow");
+    let source = FakeInspectSource::new(rendered_entity_with_image_block("page-1", &remote_body));
+
+    let report = run_inspect(
+        &store,
+        &source,
+        InspectOptions {
+            path,
+            state_root: None,
+        },
+    )
+    .expect("inspect report");
+
+    assert_eq!(
+        report.explanation.state,
+        RemoteChangeState::LocalChangedOnly
+    );
+    assert!(report.explanation.local.changed);
+    assert!(!report.explanation.remote.changed);
+    assert_eq!(
+        report
+            .explanation
+            .remote
+            .plan
+            .as_ref()
+            .expect("remote plan")
+            .operations
+            .len(),
+        0
+    );
+}
+
 struct InspectFixture {
     root: PathBuf,
     state_root: PathBuf,
@@ -299,6 +347,15 @@ fn rendered_entity(remote_id: &str, body: &str) -> HydratedEntity {
     }
 }
 
+fn rendered_entity_with_image_block(remote_id: &str, body: &str) -> HydratedEntity {
+    HydratedEntity {
+        document: CanonicalDocument::new(frontmatter(remote_id), body),
+        shadow: shadow_with_blocks(remote_id, body),
+        remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
+        assets: Vec::new(),
+    }
+}
+
 fn canonical_markdown(remote_id: &str, body: &str) -> String {
     format!("---\n{}---\n{body}", frontmatter(remote_id))
 }
@@ -309,6 +366,21 @@ fn shadow(remote_id: &str, body: &str) -> ShadowDocument {
         body,
         9,
         [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+    )
+    .expect("shadow")
+    .with_frontmatter(frontmatter(remote_id))
+}
+
+fn shadow_with_blocks(remote_id: &str, body: &str) -> ShadowDocument {
+    ShadowDocument::from_synced_body(
+        RemoteId::new(remote_id),
+        body,
+        9,
+        [
+            RemoteId::new("heading-1"),
+            RemoteId::new("image-1"),
+            RemoteId::new("paragraph-1"),
+        ],
     )
     .expect("shadow")
     .with_frontmatter(frontmatter(remote_id))

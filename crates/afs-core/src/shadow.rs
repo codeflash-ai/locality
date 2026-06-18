@@ -91,6 +91,52 @@ impl ShadowDocument {
     }
 }
 
+pub fn rendered_bodies_equivalent(left: &str, right: &str) -> bool {
+    left == right || normalize_afs_media_hrefs(left) == normalize_afs_media_hrefs(right)
+}
+
+fn normalize_afs_media_hrefs(body: &str) -> String {
+    let mut normalized = String::with_capacity(body.len());
+    let mut rest = body;
+
+    while let Some(link_start) = rest.find("](") {
+        normalized.push_str(&rest[..link_start + 2]);
+        let target_start = link_start + 2;
+        let target_and_tail = &rest[target_start..];
+        let Some(target_end) = target_and_tail.find(')') else {
+            normalized.push_str(target_and_tail);
+            return normalized;
+        };
+
+        let target = &target_and_tail[..target_end];
+        normalized.push_str(&normalize_afs_media_target(target));
+        normalized.push(')');
+        rest = &target_and_tail[target_end + 1..];
+    }
+
+    normalized.push_str(rest);
+    normalized
+}
+
+fn normalize_afs_media_target(target: &str) -> String {
+    if target.contains("://") {
+        return target.to_string();
+    }
+
+    let Some(media_start) = target.find(".afs/media/") else {
+        return target.to_string();
+    };
+    let media_path = &target[media_start..];
+    let Some(file_name) = media_path.rsplit('/').find(|part| !part.is_empty()) else {
+        return target.to_string();
+    };
+    if file_name.is_empty() {
+        return target.to_string();
+    }
+
+    format!(".afs/media/{file_name}")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShadowBlock {
     pub remote_id: RemoteId,
@@ -112,6 +158,34 @@ pub struct SegmentedBlock {
 impl SegmentedBlock {
     pub fn is_directive(&self) -> bool {
         matches!(self.kind, MarkdownBlockKind::Directive { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_afs_media_hrefs, rendered_bodies_equivalent};
+
+    #[test]
+    fn rendered_bodies_are_equivalent_when_local_media_href_shape_differs() {
+        let shadow = "# Page\n\n![Image](../../../../../../../.afs/media/home/mohammed/.afs/content/notion-main/files/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg)\n";
+        let remote = "# Page\n\n![Image](../.afs/media/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg)\n";
+
+        assert!(rendered_bodies_equivalent(shadow, remote));
+    }
+
+    #[test]
+    fn rendered_bodies_are_not_equivalent_for_different_media_files() {
+        let old = "![Image](../.afs/media/page/image-111.jpg)\n";
+        let new = "![Image](../.afs/media/page/image-222.jpg)\n";
+
+        assert!(!rendered_bodies_equivalent(old, new));
+    }
+
+    #[test]
+    fn normalize_afs_media_hrefs_leaves_external_urls_unchanged() {
+        let body = "[Link](https://example.com/.afs/media/page/image-111.jpg)\n";
+
+        assert_eq!(normalize_afs_media_hrefs(body), body);
     }
 }
 

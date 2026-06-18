@@ -229,6 +229,46 @@ fn push_safe_plan_with_daemon_journals_applies_and_reconciles() {
 }
 
 #[test]
+fn push_daemon_allows_equivalent_media_paths_in_synced_tree_guardrail() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store();
+    let long_media_href = "../../../../../../../.afs/media/home/mohammed/.afs/content/notion-main/files/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg";
+    let stable_media_href =
+        "../.afs/media/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg";
+
+    let synced_body = format!("# Roadmap\n\n![Image]({long_media_href})\n\nOld paragraph.");
+    let edited_body = format!("# Roadmap\n\n![Image]({long_media_href})\n\nChanged paragraph.");
+    let remote_before_apply =
+        format!("# Roadmap\n\n![Image]({stable_media_href})\n\nOld paragraph.");
+    let remote_after_apply =
+        format!("# Roadmap\n\n![Image]({stable_media_href})\n\nChanged paragraph.");
+    let path = fixture.write_page("Roadmap.md", &edited_body);
+    store
+        .save_shadow(&fixture.mount_id, shadow_with_blocks(&synced_body))
+        .expect("save shadow");
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity_with_image_block(&remote_before_apply),
+        rendered_entity_with_image_block(&remote_after_apply),
+    );
+
+    let report = run_push_with_daemon(
+        &mut store,
+        &source,
+        &path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push report");
+
+    assert!(report.ok, "{report:#?}");
+    assert_eq!(report.action, "reconciled");
+    assert_eq!(source.checks.get(), 1);
+    assert_eq!(source.applies.get(), 1);
+}
+
+#[test]
 fn push_virtual_projection_direct_fallback_reconciles_content_cache() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join("state");
@@ -719,12 +759,28 @@ impl Connector for FakePushSource {
 
 fn rendered_entity(body: &str) -> HydratedEntity {
     let body = format!("# Roadmap\n\n{body}");
+    rendered_entity_with_body(&body)
+}
+
+fn rendered_entity_with_body(body: &str) -> HydratedEntity {
     HydratedEntity {
         document: CanonicalDocument::new(
             "afs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
-            body.clone(),
+            body.to_string(),
         ),
-        shadow: shadow(&body),
+        shadow: shadow(body),
+        remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
+        assets: Vec::new(),
+    }
+}
+
+fn rendered_entity_with_image_block(body: &str) -> HydratedEntity {
+    HydratedEntity {
+        document: CanonicalDocument::new(
+            "afs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+            body.to_string(),
+        ),
+        shadow: shadow_with_blocks(body),
         remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
         assets: Vec::new(),
     }
@@ -770,6 +826,20 @@ fn shadow_for(remote_id: &str, body: &str) -> ShadowDocument {
         body,
         9,
         [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+    )
+    .expect("shadow")
+}
+
+fn shadow_with_blocks(body: &str) -> ShadowDocument {
+    ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        body,
+        9,
+        [
+            RemoteId::new("heading-1"),
+            RemoteId::new("image-1"),
+            RemoteId::new("paragraph-1"),
+        ],
     )
     .expect("shadow")
 }

@@ -49,6 +49,7 @@ use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
 use crate::media::update_hydrated_media_manifest;
+use crate::shadow_match::shadows_match;
 use crate::source::{LocalSourceValidator, SourcePushValidator, SourceValidationContext};
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
@@ -1079,8 +1080,7 @@ fn remote_tree_matches_synced_tree(
     synced_tree_shadow: &ShadowDocument,
     remote_tree_shadow: &ShadowDocument,
 ) -> bool {
-    synced_tree_shadow.frontmatter == remote_tree_shadow.frontmatter
-        && synced_tree_shadow.rendered_body == remote_tree_shadow.rendered_body
+    shadows_match(synced_tree_shadow, remote_tree_shadow)
 }
 
 impl<S, Source> PushApplier for DaemonPushHost<'_, S, Source>

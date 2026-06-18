@@ -3,13 +3,13 @@ use afs_core::canonical::{
     render_canonical_markdown,
 };
 use afs_core::model::CanonicalDocument;
-use afs_core::shadow::ShadowDocument;
+use afs_core::shadow::{ShadowDocument, rendered_bodies_equivalent};
 
 pub(crate) fn parsed_matches_shadow(
     parsed: &ParsedCanonicalDocument,
     shadow: &ShadowDocument,
 ) -> bool {
-    if parsed.document.body != shadow.rendered_body {
+    if !rendered_bodies_equivalent(&parsed.document.body, &shadow.rendered_body) {
         return false;
     }
 
@@ -21,7 +21,7 @@ pub(crate) fn parsed_matches_shadow(
 }
 
 pub(crate) fn shadows_match(left: &ShadowDocument, right: &ShadowDocument) -> bool {
-    if left.rendered_body != right.rendered_body {
+    if !rendered_bodies_equivalent(&left.rendered_body, &right.rendered_body) {
         return false;
     }
 

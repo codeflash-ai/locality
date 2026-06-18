@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::diff::{BlockDiffEngine, DiffEngine};
 use crate::model::CanonicalDocument;
 use crate::planner::PushPlan;
-use crate::shadow::ShadowDocument;
+use crate::shadow::{ShadowDocument, rendered_bodies_equivalent};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteChangeDocument<'a> {
@@ -162,6 +162,14 @@ fn explain_side(shadow: &ShadowDocument, input: RemoteChangeInput<'_>) -> Remote
     };
 
     let changed = document_changed_from_shadow(shadow, document.document);
+    if !changed {
+        return RemoteChangeSide {
+            changed,
+            plan: Some(PushPlan::default()),
+            issue: None,
+        };
+    }
+
     let engine = BlockDiffEngine::new().with_edited_body_start_line(document.body_start_line);
     match engine.plan_push(shadow, document.document) {
         Ok(plan) => RemoteChangeSide {
@@ -181,7 +189,8 @@ fn explain_side(shadow: &ShadowDocument, input: RemoteChangeInput<'_>) -> Remote
 }
 
 fn document_changed_from_shadow(shadow: &ShadowDocument, document: &CanonicalDocument) -> bool {
-    shadow.frontmatter != document.frontmatter || shadow.rendered_body != document.body
+    shadow.frontmatter != document.frontmatter
+        || !rendered_bodies_equivalent(&shadow.rendered_body, &document.body)
 }
 
 fn action_for_state(state: &RemoteChangeState) -> RemoteChangeAction {

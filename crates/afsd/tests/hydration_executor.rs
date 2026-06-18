@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -51,6 +52,25 @@ fn executor_hydrates_stub_file_and_persists_shadow() {
     assert_eq!(entity.hydration, HydrationState::Hydrated);
     assert_eq!(entity.content_hash, Some(rendered.shadow.body_hash.clone()));
     assert_eq!(entity.remote_edited_at, rendered.remote_edited_at);
+}
+
+#[test]
+fn executor_fetches_render_using_projected_entity_path() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    fixture.write_stub();
+    let source = FakeHydrationSource::with_entity("page-1", rendered_entity("Remote body."));
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate request");
+
+    assert_eq!(
+        source.request_paths(),
+        vec![PathBuf::from("Roadmap/page.md")]
+    );
+    assert!(fixture.page_path().exists());
 }
 
 #[test]
@@ -537,6 +557,7 @@ impl Drop for HydrationFixture {
 struct FakeHydrationSource {
     entities: BTreeMap<RemoteId, HydratedEntity>,
     failure: Option<String>,
+    request_paths: RefCell<Vec<PathBuf>>,
 }
 
 impl FakeHydrationSource {
@@ -554,11 +575,16 @@ impl FakeHydrationSource {
         Self {
             entities: BTreeMap::new(),
             failure: Some(message.to_string()),
+            request_paths: RefCell::new(Vec::new()),
         }
     }
 
     fn insert(&mut self, remote_id: &str, entity: HydratedEntity) {
         self.entities.insert(RemoteId::new(remote_id), entity);
+    }
+
+    fn request_paths(&self) -> Vec<PathBuf> {
+        self.request_paths.borrow().clone()
     }
 }
 
@@ -567,6 +593,7 @@ impl HydrationSource for FakeHydrationSource {
         if let Some(message) = &self.failure {
             return Err(AfsError::InvalidState(message.clone()));
         }
+        self.request_paths.borrow_mut().push(request.path.clone());
 
         self.entities
             .get(&request.remote_id)
