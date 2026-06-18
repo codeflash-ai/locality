@@ -14,7 +14,7 @@ use crate::dto::{
     RichTextDto, SyncedBlockDto, TableBlockDto, TableRowBlockDto, UrlBlockDto,
     VerificationPropertyDto,
 };
-use crate::media::{MediaAsset, local_media_href, media_local_path};
+use crate::media::{MediaAsset, is_downloadable_url, local_media_href, media_local_path};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotionRenderedEntity {
@@ -221,11 +221,7 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
             Some(code) => {
                 let language = code.language.as_deref().unwrap_or_default();
                 rendered_block(
-                    format!(
-                        "```{}\n{}\n```",
-                        language,
-                        rich_text_plain_text(&code.rich_text)
-                    ),
+                    code_fence_markdown(language, &rich_text_plain_text(&code.rich_text)),
                     shadow_id,
                 )
             }
@@ -369,7 +365,9 @@ fn file_media_block(
         }
         if let Some(url) = file_url(payload) {
             let mut markdown_url = url.clone();
-            if let Some(page_path) = options.page_path.as_deref() {
+            if is_downloadable_url(&url)
+                && let Some(page_path) = options.page_path.as_deref()
+            {
                 let local_path = media_local_path(page_path, &block.id, media_type, &url);
                 if media_type == "image" {
                     markdown_url = local_media_href(page_path, &local_path);
@@ -504,6 +502,25 @@ fn rendered_block(markdown: String, shadow_id: Option<RemoteId>) -> RenderedBloc
         metadata: RenderedBlockMetadata::None,
         media_asset: None,
     }
+}
+
+fn code_fence_markdown(language: &str, code: &str) -> String {
+    let fence = "`".repeat(max_consecutive_backticks(code).saturating_add(1).max(3));
+    format!("{fence}{language}\n{code}\n{fence}")
+}
+
+fn max_consecutive_backticks(value: &str) -> usize {
+    let mut max_run = 0;
+    let mut current = 0;
+    for ch in value.chars() {
+        if ch == '`' {
+            current += 1;
+            max_run = max_run.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    max_run
 }
 
 fn indent_rendered_block(mut block: RenderedBlock, indent_level: usize) -> RenderedBlock {

@@ -210,6 +210,44 @@ fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
 }
 
 #[test]
+fn render_code_block_uses_fence_longer_than_embedded_backticks() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: code_block(
+                "code-1",
+                "markdown",
+                "Before\n```python\nprint('nested')\n```\nAfter",
+            ),
+            children: Vec::new(),
+        }],
+    };
+    let raw = serde_json::to_vec(&bundle).expect("raw");
+    let native = afs_connector::NativeEntity {
+        remote_id: RemoteId::new("page-1"),
+        kind: "notion_page".to_string(),
+        raw,
+    };
+    let connector =
+        NotionConnector::with_api(NotionConfig::default(), Arc::new(FixtureNotionApi::new()));
+
+    let rendered = connector
+        .render_native_entity(&native)
+        .expect("render native entity");
+
+    assert_eq!(
+        rendered.document.body,
+        "````markdown\nBefore\n```python\nprint('nested')\n```\nAfter\n````\n"
+    );
+    assert_eq!(rendered.shadow.blocks.len(), 1);
+    assert_eq!(rendered.shadow.blocks[0].remote_id, RemoteId::new("code-1"));
+    assert!(matches!(
+        rendered.shadow.blocks[0].kind,
+        MarkdownBlockKind::CodeFence
+    ));
+}
+
+#[test]
 fn render_toggle_children_as_nested_markdown() {
     let bundle = afs_notion::dto::NotionPageBundle {
         page: page("page-1", "Roadmap"),
@@ -790,6 +828,31 @@ fn render_media_blocks_as_markdown_links_and_tracks_local_paths() {
     assert_eq!(
         rendered.document.body,
         "![Image caption](../../.afs/media/Docs/Coverage/image-0123456789ab.png)\n"
+    );
+}
+
+#[test]
+fn render_relative_media_url_without_local_download_asset() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Coverage"),
+        blocks: vec![BlockTreeDto {
+            block: file_block("image-1", "image", "img_2.png", ""),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle_with_options(
+        &bundle,
+        &afs_notion::render::RenderOptions::with_page_path("Docs/Coverage/page.md"),
+    )
+    .expect("render");
+
+    assert!(rendered.media_assets.is_empty());
+    assert_eq!(rendered.document.body, "![Image](img_2.png)\n");
+    assert_eq!(rendered.shadow.blocks.len(), 1);
+    assert_eq!(
+        rendered.shadow.blocks[0].remote_id,
+        RemoteId::new("image-1")
     );
 }
 

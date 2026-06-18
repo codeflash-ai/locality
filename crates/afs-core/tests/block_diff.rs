@@ -28,6 +28,19 @@ fn segments_common_markdown_blocks_with_source_spans() {
 }
 
 #[test]
+fn segments_code_fence_using_opening_fence_length() {
+    let body =
+        "````markdown\nBefore\n```python\nprint('nested')\n```\nAfter\n````\n\nNext paragraph.";
+    let blocks = segment_markdown_body(body, 1);
+
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].kind, MarkdownBlockKind::CodeFence);
+    assert_eq!(blocks[0].source_span.start_line, 1);
+    assert_eq!(blocks[0].source_span.end_line, 7);
+    assert_eq!(blocks[1].kind, MarkdownBlockKind::Paragraph);
+}
+
+#[test]
 fn editing_one_paragraph_produces_one_block_update() {
     let shadow = shadow("# Roadmap\n\nOld paragraph.", ["heading-1", "paragraph-1"]);
     let edited = CanonicalDocument::new("", "# Roadmap\n\nNew paragraph.");

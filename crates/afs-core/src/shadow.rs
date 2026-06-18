@@ -283,7 +283,7 @@ fn classify_block(lines: &[&str], start: usize, end: usize) -> MarkdownBlockKind
 
 fn consume_code_fence(lines: &[&str], start: usize, fence: FenceMarker) -> usize {
     for (offset, line) in lines[start + 1..].iter().enumerate() {
-        if line.trim_start().starts_with(fence.marker) {
+        if line.trim_start().starts_with(&fence.marker) {
             return start + offset + 2;
         }
     }
@@ -337,13 +337,19 @@ fn is_table_separator(line: &str) -> bool {
 
 fn fence_marker(line: &str) -> Option<FenceMarker> {
     let trimmed = line.trim_start();
-    if trimmed.starts_with("```") {
-        Some(FenceMarker { marker: "```" })
-    } else if trimmed.starts_with("~~~") {
-        Some(FenceMarker { marker: "~~~" })
-    } else {
-        None
+    let mut chars = trimmed.chars();
+    let marker_char = chars.next()?;
+    if !matches!(marker_char, '`' | '~') {
+        return None;
     }
+    let marker_len = 1 + chars.take_while(|ch| *ch == marker_char).count();
+    if marker_len < 3 {
+        return None;
+    }
+
+    Some(FenceMarker {
+        marker: std::iter::repeat(marker_char).take(marker_len).collect(),
+    })
 }
 
 fn kind_tag(kind: &MarkdownBlockKind) -> &'static str {
@@ -357,7 +363,6 @@ fn kind_tag(kind: &MarkdownBlockKind) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy)]
 struct FenceMarker {
-    marker: &'static str,
+    marker: String,
 }

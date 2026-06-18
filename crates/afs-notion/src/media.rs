@@ -129,7 +129,11 @@ fn fetch_media_asset(client: &Client, asset: &MediaAsset) -> AfsResult<Downloade
 }
 
 fn should_download(asset: &MediaAsset) -> bool {
-    asset.kind == "image"
+    asset.kind == "image" && is_downloadable_url(&asset.source_url)
+}
+
+pub(crate) fn is_downloadable_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 fn media_page_dir(page_path: &Path) -> PathBuf {

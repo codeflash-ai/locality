@@ -33,6 +33,25 @@ from typing import Any
 NOTION_VERSION = "2026-03-11"
 SKIP_CHILD_TYPES = {"child_page", "child_database"}
 VOLATILE_NOTION_KEYS = {"last_edited_time", "last_edited_by", "expiry_time", "request_id"}
+RISKY_WRITE_BLOCK_TYPES = {
+    "audio",
+    "bookmark",
+    "breadcrumb",
+    "child_database",
+    "child_page",
+    "column",
+    "column_list",
+    "embed",
+    "file",
+    "image",
+    "link_preview",
+    "pdf",
+    "synced_block",
+    "table_of_contents",
+    "template",
+    "unsupported",
+    "video",
+}
 
 
 @dataclass(frozen=True)
@@ -99,7 +118,7 @@ def main() -> int:
     args = parse_args()
     state_root = Path(args.state_root).expanduser()
     mount_root = Path(args.mount_root).expanduser()
-    run_root = Path(args.output).expanduser() / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_root = resolve_run_root(args)
     run_root.mkdir(parents=True, exist_ok=True)
     log_path = run_root / "events.jsonl"
 
@@ -123,6 +142,7 @@ def main() -> int:
     log("run_start", pages=len(candidates), mode="write" if args.write else "read_only")
 
     failures = 0
+    skipped = 0
     tested = 0
     for index, candidate in enumerate(candidates, start=1):
         page_dir = run_root / f"{index:04d}-{safe_name(candidate.path)}"
@@ -130,13 +150,14 @@ def main() -> int:
         result_path = page_dir / "result.json"
         if args.resume and result_path.exists():
             previous = json.loads(result_path.read_text(encoding="utf-8"))
-            if previous.get("restored", False) or previous.get("mode") == "read_only":
-                log("page_skip_completed", path=candidate.path)
+            if previous.get("ok") and (previous.get("restored", False) or previous.get("mode") == "read_only"):
+                skipped += 1
+                log("page_skip_completed", path=candidate.path, index=index, total=len(candidates))
                 continue
 
         try:
             tested += 1
-            run_page(
+            result = run_page(
                 args,
                 afs_bin,
                 mount_root,
@@ -148,6 +169,8 @@ def main() -> int:
                 index,
                 len(candidates),
             )
+            if result == "skipped":
+                skipped += 1
         except Exception as error:  # noqa: BLE001 - audit must capture exact unexpected failures.
             failures += 1
             write_json(result_path, {
@@ -162,16 +185,19 @@ def main() -> int:
                 break
 
     final_status = run_cmd([str(afs_bin), "status", str(mount_root), "--json"], run_root / "final-status.json", check=False)
+    result_counts = collect_result_counts(run_root)
     summary = {
         "ok": failures == 0 and final_status.returncode == 0,
-        "tested": tested,
+        "tested_this_invocation": tested,
+        "skipped_this_invocation": skipped,
         "failures": failures,
         "candidate_count": len(candidates),
+        "results": result_counts,
         "run_root": str(run_root),
         "final_status_exit": final_status.returncode,
     }
     write_json(run_root / "summary.json", summary)
-    log("run_complete", status="ok" if summary["ok"] else "failed", failures=failures)
+    log("run_complete", status="ok" if summary["ok"] else "failed", failures=failures, skipped=skipped)
     return 0 if summary["ok"] else 1
 
 
@@ -186,7 +212,7 @@ def run_page(
     log,
     index: int,
     total: int,
-) -> None:
+) -> str:
     mounted_path = mount_root / candidate.path
     content_path = virtual_content_path(state_root, args.mount_id, candidate.path)
     marker = f"AFS roundtrip audit marker {int(time.time())}-{os.getpid()}-{hashlib.sha1(candidate.remote_id.encode()).hexdigest()[:8]}"
@@ -204,6 +230,12 @@ def run_page(
     before_snapshot = notion_snapshot(notion, candidate.remote_id)
     write_json(page_dir / "notion-before.json", before_snapshot)
     write_json(page_dir / "notion-before.normalized.json", normalize_notion(before_snapshot))
+    write_classification = classify_write_risk(
+        before_snapshot,
+        original.decode("utf-8", errors="replace"),
+        args.max_write_blocks,
+    )
+    write_json(page_dir / "classification.json", write_classification)
 
     run_cmd([str(afs_bin), "inspect", str(mounted_path), "--json"], page_dir / "inspect-before.json")
     diff_before = run_cmd([str(afs_bin), "diff", str(mounted_path), "--json"], page_dir / "diff-before.json")
@@ -220,7 +252,24 @@ def run_page(
             "restored": True,
         })
         log("page_read_only_ok", path=candidate.path, status="ok")
-        return
+        return "ok"
+
+    if args.write_policy == "safe" and write_classification["risk_reasons"]:
+        write_json(page_dir / "result.json", {
+            "path": candidate.path,
+            "remote_id": candidate.remote_id,
+            "ok": True,
+            "mode": "write_skipped",
+            "restored": True,
+            "risk_reasons": write_classification["risk_reasons"],
+        })
+        log(
+            "page_write_skipped",
+            path=candidate.path,
+            status="read_only_ok",
+            message="; ".join(write_classification["risk_reasons"]),
+        )
+        return "skipped"
 
     remote_changed = False
     try:
@@ -264,6 +313,7 @@ def run_page(
             "marker": marker,
         })
         log("page_write_ok", path=candidate.path, status="restored")
+        return "ok"
     except Exception:
         content_path.write_bytes(original)
         if remote_changed:
@@ -278,17 +328,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mount-root", default="~/Library/CloudStorage/AFS-AFS/notion")
     parser.add_argument("--mount-id", default="notion-main")
     parser.add_argument("--output", default="target/notion-roundtrip-audit")
+    parser.add_argument("--run-root")
     parser.add_argument("--secret-ref")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--match", default="")
     parser.add_argument("--write", action="store_true")
+    parser.add_argument("--write-policy", choices=["safe", "all"], default="safe")
+    parser.add_argument("--max-write-blocks", type=int, default=200)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--stop-on-failure", dest="stop_on_failure", action="store_true", default=True)
     parser.add_argument("--continue-on-failure", dest="stop_on_failure", action="store_false")
     parser.add_argument("--notion-min-interval-ms", type=int, default=500)
     parser.add_argument("--notion-retries", type=int, default=6)
     return parser.parse_args()
+
+
+def resolve_run_root(args: argparse.Namespace) -> Path:
+    if args.run_root:
+        return Path(args.run_root).expanduser()
+
+    output = Path(args.output).expanduser()
+    if args.resume:
+        runs = [path for path in output.iterdir() if path.is_dir()] if output.exists() else []
+        if runs:
+            return sorted(runs)[-1]
+
+    return output / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def load_candidates(state_root: Path, mount_id: str) -> list[Candidate]:
@@ -393,6 +459,52 @@ def snapshot_contains_text(value: Any, needle: str) -> bool:
     return False
 
 
+def classify_write_risk(
+    snapshot: dict[str, Any],
+    markdown: str,
+    max_write_blocks: int,
+) -> dict[str, Any]:
+    block_types = sorted(block_type_counts(snapshot).items())
+    total_blocks = sum(count for _, count in block_types)
+    risky_types = [
+        {"type": block_type, "count": count}
+        for block_type, count in block_types
+        if block_type in RISKY_WRITE_BLOCK_TYPES
+    ]
+    risk_reasons = []
+    if risky_types:
+        risk_reasons.append(
+            "risky block types: "
+            + ", ".join(f"{item['type']}={item['count']}" for item in risky_types)
+        )
+    if total_blocks > max_write_blocks:
+        risk_reasons.append(f"large page: {total_blocks} blocks exceeds --max-write-blocks={max_write_blocks}")
+    if ".afs/media/" in markdown:
+        risk_reasons.append("page references local media assets")
+
+    return {
+        "block_count": total_blocks,
+        "block_types": [{"type": block_type, "count": count} for block_type, count in block_types],
+        "risk_reasons": risk_reasons,
+        "write_policy": "read_only_if_risky",
+    }
+
+
+def block_type_counts(snapshot: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for block in snapshot.get("blocks", []):
+        collect_block_type_counts(block, counts)
+    return counts
+
+
+def collect_block_type_counts(block: dict[str, Any], counts: dict[str, int]) -> None:
+    block_type = str(block.get("type", "unknown"))
+    counts[block_type] = counts.get(block_type, 0) + 1
+    for child in block.get("children", []):
+        if isinstance(child, dict):
+            collect_block_type_counts(child, counts)
+
+
 def run_cmd(argv: list[str], output_path: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
@@ -462,8 +574,7 @@ def assert_restore_diff(diff: dict[str, Any], marker: str) -> None:
 
 def append_marker(path: Path, marker: str) -> None:
     contents = path.read_text(encoding="utf-8")
-    separator = "\n\n" if contents.endswith("\n") else "\n\n"
-    path.write_text(contents + separator + marker + "\n", encoding="utf-8")
+    path.write_text(contents + "\n\n" + marker + "\n", encoding="utf-8")
 
 
 def copy_media_assets(markdown: str, content_path: Path, output_dir: Path) -> None:
@@ -500,6 +611,31 @@ def write_manifest(run_root: Path, args: argparse.Namespace, candidates: list[Ca
 
 def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def collect_result_counts(run_root: Path) -> dict[str, Any]:
+    counts: dict[str, Any] = {
+        "total_result_files": 0,
+        "ok": 0,
+        "failed": 0,
+        "restored": 0,
+        "modes": {},
+    }
+    for result_path in sorted(run_root.glob("*/result.json")):
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        counts["total_result_files"] += 1
+        if result.get("ok"):
+            counts["ok"] += 1
+        else:
+            counts["failed"] += 1
+        if result.get("restored"):
+            counts["restored"] += 1
+        mode = str(result.get("mode", "failed" if not result.get("ok") else "unknown"))
+        counts["modes"][mode] = counts["modes"].get(mode, 0) + 1
+    return counts
 
 
 def safe_name(value: str) -> str:
