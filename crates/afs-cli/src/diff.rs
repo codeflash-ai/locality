@@ -31,6 +31,17 @@ where
     run_preview(store, target_path, PreviewOptions::new("diff"))
 }
 
+pub fn run_diff_with_state_root<S>(
+    store: &S,
+    target_path: impl AsRef<Path>,
+    state_root: Option<&Path>,
+) -> Result<DiffReport, DiffError>
+where
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+{
+    run_preview_with_state_root(store, target_path, PreviewOptions::new("diff"), state_root)
+}
+
 pub fn run_preview<S>(
     store: &S,
     target_path: impl AsRef<Path>,
@@ -39,7 +50,20 @@ pub fn run_preview<S>(
 where
     S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
 {
-    run_preview_artifacts(store, target_path, options).map(|artifacts| artifacts.report)
+    run_preview_with_state_root(store, target_path, options, None)
+}
+
+pub fn run_preview_with_state_root<S>(
+    store: &S,
+    target_path: impl AsRef<Path>,
+    options: PreviewOptions,
+    state_root: Option<&Path>,
+) -> Result<DiffReport, DiffError>
+where
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+{
+    run_preview_artifacts_with_state_root(store, target_path, options, state_root)
+        .map(|artifacts| artifacts.report)
 }
 
 pub fn run_preview_artifacts<S>(
@@ -50,13 +74,25 @@ pub fn run_preview_artifacts<S>(
 where
     S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
 {
+    run_preview_artifacts_with_state_root(store, target_path, options, None)
+}
+
+pub fn run_preview_artifacts_with_state_root<S>(
+    store: &S,
+    target_path: impl AsRef<Path>,
+    options: PreviewOptions,
+    state_root: Option<&Path>,
+) -> Result<PreviewArtifacts, DiffError>
+where
+    S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
+{
     let job = PushJob {
         target_path: target_path.as_ref().to_path_buf(),
         assume_yes: options.approval.assume_yes,
         confirm_dangerous: options.approval.confirm_dangerous,
     };
     let validator = LocalSourceValidator;
-    let prepared = prepare_push(store, &job, None, &validator).map_err(DiffError::from)?;
+    let prepared = prepare_push(store, &job, state_root, &validator).map_err(DiffError::from)?;
     let entity_id = prepared.entity.remote_id.clone();
     let pipeline = prepared.pipeline.clone();
     let report = DiffReport::from_pipeline(

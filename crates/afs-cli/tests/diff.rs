@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use afs_cli::diff::{DiffError, run_diff};
+use afs_cli::diff::{DiffError, run_diff, run_diff_with_state_root};
 use afs_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
 };
@@ -12,7 +12,7 @@ use afs_core::shadow::ShadowDocument;
 use afs_notion::media::sha256_hex;
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ShadowRepository, SqliteStateStore, StoreError,
+    ProjectionMode, ShadowRepository, SqliteStateStore, StoreError,
 };
 use serde_json::json;
 
@@ -33,6 +33,59 @@ fn diff_reports_noop_plan() {
     assert_eq!(report.mount_id, "notion-main");
     assert_eq!(report.entity_id, "page-1");
     assert_eq!(report.plan.unwrap().operations.len(), 0);
+}
+
+#[test]
+fn diff_virtual_projection_reads_daemon_content_cache() {
+    let fixture = DiffFixture::new();
+    let state_root = fixture.root.join("state");
+    let projection_root = fixture.root.join("projection");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &projection_root)
+                .projection(ProjectionMode::MacosFileProvider),
+        )
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nSame paragraph."))
+        .expect("save shadow");
+    let content_path = afsd::virtual_fs::virtual_fs_content_path(
+        &state_root,
+        &fixture.mount_id,
+        "Roadmap.md".as_ref(),
+    )
+    .expect("content path");
+    if let Some(parent) = content_path.parent() {
+        fs::create_dir_all(parent).expect("content parent");
+    }
+    fs::write(
+        content_path,
+        canonical_markdown("page-1", "# Roadmap\n\nSame paragraph."),
+    )
+    .expect("content file");
+
+    let report = run_diff_with_state_root(
+        &store,
+        projection_root.join("Roadmap.md"),
+        Some(&state_root),
+    )
+    .expect("diff report");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "noop");
 }
 
 #[test]

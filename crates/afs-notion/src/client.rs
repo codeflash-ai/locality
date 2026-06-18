@@ -4,10 +4,14 @@
 //! can run against deterministic fixtures and live API calls stay isolated.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use afs_core::{AfsError, AfsResult};
+use reqwest::StatusCode;
 use reqwest::blocking::{Client, multipart};
+use reqwest::header::HeaderMap;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -22,6 +26,10 @@ pub const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com";
 pub const DEFAULT_NOTION_VERSION: &str = "2026-03-11";
 pub const DEFAULT_NOTION_TOKEN_ENV: &str = "NOTION_TOKEN";
 const DEFAULT_NOTION_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_NOTION_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(400);
+const DEFAULT_NOTION_RATE_LIMIT_RETRIES: usize = 4;
+
+static LAST_NOTION_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 pub trait NotionApi: std::fmt::Debug + Send + Sync {
     fn retrieve_current_user(&self) -> AfsResult<serde_json::Value> {
@@ -113,33 +121,23 @@ impl HttpNotionApi {
             DEFAULT_NOTION_API_BASE_URL,
             path.trim_start_matches('/')
         );
-        let mut request = self
-            .client
-            .get(url)
-            .bearer_auth(token)
-            .header("Notion-Version", DEFAULT_NOTION_VERSION);
+        let query = query
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect::<Vec<_>>();
 
-        for (key, value) in query {
-            request = request.query(&[(key, value)]);
-        }
+        self.send_request_with_retry(|| {
+            let mut request = self
+                .client
+                .get(&url)
+                .bearer_auth(&token)
+                .header("Notion-Version", DEFAULT_NOTION_VERSION);
 
-        let response = request
-            .send()
-            .map_err(|error| AfsError::Io(format!("notion request failed: {error}")))?;
-        let status = response.status();
-
-        if !status.is_success() {
-            let body = response
-                .text()
-                .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
-            return Err(AfsError::Io(format!(
-                "notion api returned HTTP {status}: {body}"
-            )));
-        }
-
-        response
-            .json()
-            .map_err(|error| AfsError::Io(format!("notion response decode failed: {error}")))
+            for (key, value) in &query {
+                request = request.query(&[(key.as_str(), value.as_str())]);
+            }
+            request
+        })
     }
 
     fn post_json<T>(&self, path: &str, body: impl Serialize) -> AfsResult<T>
@@ -187,29 +185,44 @@ impl HttpNotionApi {
             "{}/v1/file_uploads/{}/send",
             DEFAULT_NOTION_API_BASE_URL, upload_id
         );
-        let part = multipart::Part::bytes(bytes)
-            .file_name(filename.to_string())
-            .mime_str(content_type)
-            .map_err(|error| AfsError::Io(format!("notion file upload MIME failed: {error}")))?;
-        let form = multipart::Form::new().part("file", part);
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .header("Notion-Version", DEFAULT_NOTION_VERSION)
-            .multipart(form)
-            .send()
-            .map_err(|error| AfsError::Io(format!("notion file upload failed: {error}")))?;
-        let status = response.status();
-        if !status.is_success() {
+        for attempt in 0..=notion_rate_limit_retries() {
+            pace_notion_request();
+            let part = multipart::Part::bytes(bytes.clone())
+                .file_name(filename.to_string())
+                .mime_str(content_type)
+                .map_err(|error| {
+                    AfsError::Io(format!("notion file upload MIME failed: {error}"))
+                })?;
+            let form = multipart::Form::new().part("file", part);
+            let response = self
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .header("Notion-Version", DEFAULT_NOTION_VERSION)
+                .multipart(form)
+                .send()
+                .map_err(|error| AfsError::Io(format!("notion file upload failed: {error}")))?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(upload_id);
+            }
+
+            let retry_after = retry_after_header(response.headers());
             let body = response
                 .text()
                 .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+            if status == StatusCode::TOO_MANY_REQUESTS && attempt < notion_rate_limit_retries() {
+                sleep_for_rate_limit(attempt, retry_after);
+                continue;
+            }
             return Err(AfsError::Io(format!(
                 "notion file upload returned HTTP {status}: {body}"
             )));
         }
-        Ok(upload_id)
+
+        Err(AfsError::Io(
+            "notion file upload exhausted rate limit retries".to_string(),
+        ))
     }
 
     fn send_json<T, B>(&self, method: reqwest::Method, path: &str, body: Option<B>) -> AfsResult<T>
@@ -218,37 +231,65 @@ impl HttpNotionApi {
         B: Serialize,
     {
         let token = self.token()?;
+        let body = body
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| AfsError::Io(format!("notion request encode failed: {error}")))?;
         let url = format!(
             "{}/{}",
             DEFAULT_NOTION_API_BASE_URL,
             path.trim_start_matches('/')
         );
-        let mut request = self
-            .client
-            .request(method, url)
-            .bearer_auth(token)
-            .header("Notion-Version", DEFAULT_NOTION_VERSION);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
 
-        let response = request
-            .send()
-            .map_err(|error| AfsError::Io(format!("notion request failed: {error}")))?;
-        let status = response.status();
+        self.send_request_with_retry(|| {
+            let mut request = self
+                .client
+                .request(method.clone(), &url)
+                .bearer_auth(&token)
+                .header("Notion-Version", DEFAULT_NOTION_VERSION);
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
+            request
+        })
+    }
 
-        if !status.is_success() {
+    fn send_request_with_retry<T>(
+        &self,
+        mut build_request: impl FnMut() -> reqwest::blocking::RequestBuilder,
+    ) -> AfsResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        for attempt in 0..=notion_rate_limit_retries() {
+            pace_notion_request();
+            let response = build_request()
+                .send()
+                .map_err(|error| AfsError::Io(format!("notion request failed: {error}")))?;
+            let status = response.status();
+
+            if status.is_success() {
+                return response.json().map_err(|error| {
+                    AfsError::Io(format!("notion response decode failed: {error}"))
+                });
+            }
+
+            let retry_after = retry_after_header(response.headers());
             let body = response
                 .text()
                 .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+            if status == StatusCode::TOO_MANY_REQUESTS && attempt < notion_rate_limit_retries() {
+                sleep_for_rate_limit(attempt, retry_after);
+                continue;
+            }
             return Err(AfsError::Io(format!(
                 "notion api returned HTTP {status}: {body}"
             )));
         }
 
-        response
-            .json()
-            .map_err(|error| AfsError::Io(format!("notion response decode failed: {error}")))
+        Err(AfsError::Io(
+            "notion request exhausted rate limit retries".to_string(),
+        ))
     }
 
     fn token(&self) -> AfsResult<String> {
@@ -274,6 +315,59 @@ fn notion_http_timeout() -> Duration {
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_NOTION_HTTP_TIMEOUT)
+}
+
+fn notion_request_min_interval() -> Duration {
+    std::env::var("AFS_NOTION_REQUEST_MIN_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_NOTION_REQUEST_MIN_INTERVAL)
+}
+
+fn notion_rate_limit_retries() -> usize {
+    std::env::var("AFS_NOTION_RATE_LIMIT_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_NOTION_RATE_LIMIT_RETRIES)
+}
+
+fn pace_notion_request() {
+    let min_interval = notion_request_min_interval();
+    if min_interval.is_zero() {
+        return;
+    }
+
+    let mut last_request = LAST_NOTION_REQUEST
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("notion request pacing lock poisoned");
+    if let Some(last_request) = *last_request {
+        let elapsed = last_request.elapsed();
+        if elapsed < min_interval {
+            thread::sleep(min_interval - elapsed);
+        }
+    }
+    *last_request = Some(Instant::now());
+}
+
+fn retry_after_header(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+fn sleep_for_rate_limit(attempt: usize, retry_after: Option<Duration>) {
+    thread::sleep(retry_after.unwrap_or_else(|| rate_limit_backoff(attempt)));
+}
+
+fn rate_limit_backoff(attempt: usize) -> Duration {
+    let seconds = 1_u64 << attempt.min(4);
+    Duration::from_secs(seconds)
 }
 
 impl NotionApi for HttpNotionApi {
@@ -434,7 +528,9 @@ fn data_source_search_body(start_cursor: Option<&str>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::data_source_search_body;
+    use super::{data_source_search_body, rate_limit_backoff, retry_after_header};
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+    use std::time::Duration;
 
     #[test]
     fn search_databases_uses_current_notion_data_source_filter() {
@@ -443,6 +539,21 @@ mod tests {
         assert_eq!(body["filter"]["property"], "object");
         assert_eq!(body["filter"]["value"], "data_source");
         assert_eq!(body["start_cursor"], "cursor-1");
+    }
+
+    #[test]
+    fn retry_after_header_parses_seconds() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("3"));
+
+        assert_eq!(retry_after_header(&headers), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn rate_limit_backoff_caps_exponential_delay() {
+        assert_eq!(rate_limit_backoff(0), Duration::from_secs(1));
+        assert_eq!(rate_limit_backoff(3), Duration::from_secs(8));
+        assert_eq!(rate_limit_backoff(99), Duration::from_secs(16));
     }
 }
 

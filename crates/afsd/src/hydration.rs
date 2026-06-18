@@ -15,6 +15,7 @@ use afs_store::{
 };
 
 use crate::media::update_hydrated_media_manifest;
+use crate::shadow_match::{parsed_matches_shadow, shadows_match};
 
 pub trait HydrationEngine {
     fn queue(&mut self, request: HydrationRequest) -> AfsResult<()>;
@@ -192,8 +193,7 @@ where
             Err(error) => return Err(AfsError::from(error)),
         };
 
-        Ok(parsed.document.frontmatter == shadow.frontmatter
-            && parsed.document.body == shadow.rendered_body)
+        Ok(parsed_matches_shadow(&parsed, &shadow))
     }
 
     fn mark_dirty_if_allowed(&mut self, mut entity: EntityRecord) -> AfsResult<()> {
@@ -283,8 +283,7 @@ where
             Err(error) => return Err(AfsError::from(error)),
         };
 
-        Ok(shadow.frontmatter == rendered.frontmatter
-            && shadow.rendered_body == rendered.rendered_body)
+        Ok(shadows_match(&shadow, rendered))
     }
 
     fn clear_remote_hint(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> AfsResult<()> {

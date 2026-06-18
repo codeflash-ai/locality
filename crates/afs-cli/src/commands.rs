@@ -38,7 +38,7 @@ use crate::connector::{
     source_descriptor,
 };
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
-use crate::diff::{DiffError, run_diff};
+use crate::diff::{DiffError, run_diff_with_state_root};
 use crate::file_provider as file_provider_helper;
 use crate::history::{
     HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
@@ -2446,7 +2446,8 @@ fn diff(args: &[String], json: bool) -> i32 {
         );
     };
 
-    let store = match SqliteStateStore::open(default_state_root()) {
+    let state_root = default_state_root();
+    let store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -2457,7 +2458,7 @@ fn diff(args: &[String], json: bool) -> i32 {
         }
     };
 
-    match run_diff(&store, PathBuf::from(path)) {
+    match run_diff_with_state_root(&store, PathBuf::from(path), Some(&state_root)) {
         Ok(report) if json => {
             let exit_code = diff_report_exit_code(&report);
             print_json(&report);

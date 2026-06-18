@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::file_provider;
 use crate::hydration::{HydratedAsset, HydratedEntity};
 use crate::media::update_hydrated_media_manifest;
+use crate::shadow_match::{parsed_matches_shadow, shadows_match};
 use crate::source::SourceAdapter;
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
@@ -612,10 +613,7 @@ where
         Err(error) => return Err(PullError::Store(error)),
     };
 
-    Ok(
-        shadow.frontmatter == rendered.frontmatter
-            && shadow.rendered_body == rendered.rendered_body,
-    )
+    Ok(shadows_match(&shadow, rendered))
 }
 
 fn can_replace_file<S>(
@@ -649,8 +647,7 @@ where
         Err(error) => return Err(PullError::Store(error)),
     };
 
-    Ok(parsed.document.frontmatter == shadow.frontmatter
-        && parsed.document.body == shadow.rendered_body)
+    Ok(parsed_matches_shadow(&parsed, &shadow))
 }
 
 fn is_stub_file(path: &Path) -> Result<bool, PullError> {
@@ -897,6 +894,39 @@ mod tests {
     }
 
     #[test]
+    fn can_replace_stale_dirty_file_when_only_sync_metadata_drifted() {
+        let fixture = PullFixture::new();
+        let body = "# Roadmap\n\nOriginal body.\n";
+        let shadow_document = fixture.document_with_sync(
+            "Roadmap",
+            body,
+            "2026-06-18T07:06:00.000Z",
+            "2026-06-18T07:06:00.000Z",
+        );
+        let store = fixture.store_with_shadow(HydrationState::Dirty, shadow_document);
+        write_atomic(
+            &fixture.page_path,
+            render_canonical_markdown(&fixture.document_with_sync(
+                "Roadmap",
+                body,
+                "2026-06-10T23:03:00.000Z",
+                "2026-06-10T23:03:00.000Z",
+            )),
+        )
+        .expect("write metadata-drifted projection");
+
+        assert!(
+            can_replace_file(
+                &store,
+                &fixture.mount,
+                &fixture.entity(HydrationState::Dirty),
+                &fixture.page_path,
+            )
+            .expect("check replace")
+        );
+    }
+
+    #[test]
     fn can_replace_rejects_frontmatter_only_edits() {
         let fixture = PullFixture::new();
         let store = fixture.store_with_shadow(
@@ -964,6 +994,22 @@ mod tests {
             CanonicalDocument::new(
                 format!(
                     "afs:\n  id: {}\n  type: page\ntitle: {title}\n",
+                    self.remote_id.0
+                ),
+                body.to_string(),
+            )
+        }
+
+        fn document_with_sync(
+            &self,
+            title: &str,
+            body: &str,
+            synced_at: &str,
+            remote_edited_at: &str,
+        ) -> CanonicalDocument {
+            CanonicalDocument::new(
+                format!(
+                    "afs:\n  id: {}\n  type: page\n  synced_at: \"{synced_at}\"\n  remote_edited_at: \"{remote_edited_at}\"\ntitle: {title}\n",
                     self.remote_id.0
                 ),
                 body.to_string(),

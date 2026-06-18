@@ -20,6 +20,7 @@ use afs_store::{
 use serde::{Deserialize, Serialize};
 
 use crate::hydration::{HydrationExecutor, HydrationOutcome, HydrationSource};
+use crate::shadow_match::parsed_matches_shadow;
 
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
 pub const SOURCE_ROOT_PREFIX: &str = "source:";
@@ -619,10 +620,7 @@ where
             store
                 .load_shadow(&mount.mount_id, &entity.remote_id)
                 .ok()
-                .map(|shadow| {
-                    parsed.document.frontmatter == shadow.frontmatter
-                        && parsed.document.body == shadow.rendered_body
-                })
+                .map(|shadow| parsed_matches_shadow(&parsed, &shadow))
         })
         .unwrap_or(false);
 

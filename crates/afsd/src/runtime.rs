@@ -43,6 +43,7 @@ use crate::reconcile::{
     DefaultFetchScheduleStrategy, ScheduledPullReport, reconcile_scheduled_pull_with_state_root,
 };
 use crate::scheduler::{PullScheduler, PullSchedulerTick};
+use crate::shadow_match::parsed_matches_shadow;
 use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsItem, VirtualFsItemKind, VirtualFsMaterializeOutcome,
@@ -2463,8 +2464,7 @@ where
         Err(_) => return Ok(false),
     };
 
-    Ok(parsed.document.frontmatter == shadow.frontmatter
-        && parsed.document.body == shadow.rendered_body)
+    Ok(parsed_matches_shadow(&parsed, &shadow))
 }
 
 fn should_hydrate_on_read(entity: &EntityRecord) -> bool {

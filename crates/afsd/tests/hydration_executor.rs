@@ -127,6 +127,44 @@ fn executor_rehydrates_stale_dirty_file_when_projection_matches_shadow() {
 }
 
 #[test]
+fn executor_rehydrates_stale_dirty_file_when_only_sync_metadata_drifted() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Dirty);
+    let old = rendered_entity_with_sync(
+        "Old body.",
+        "2026-06-18T07:06:00.000Z",
+        "2026-06-18T07:06:00.000Z",
+    );
+    store
+        .save_shadow(&fixture.mount_id, old.shadow.clone())
+        .expect("save old shadow");
+    fixture.write_markdown(
+        &rendered_entity_with_sync(
+            "Old body.",
+            "2026-06-10T23:03:00.000Z",
+            "2026-06-10T23:03:00.000Z",
+        )
+        .document,
+    );
+    let new = rendered_entity("New body.");
+    let source = FakeHydrationSource::with_entity("page-1", new);
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate request");
+
+    assert_eq!(outcome, HydrationOutcome::Hydrated);
+    let contents = fs::read_to_string(fixture.page_path()).expect("hydrated file");
+    assert!(contents.contains("New body."));
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Hydrated);
+}
+
+#[test]
 fn executor_writes_hydrated_assets_under_mount_root() {
     let fixture = HydrationFixture::new();
     let mut store = fixture.store(HydrationState::Stub);
@@ -539,6 +577,20 @@ impl HydrationSource for FakeHydrationSource {
 
 fn rendered_entity(body: &str) -> HydratedEntity {
     rendered_entity_for("page-1", body)
+}
+
+fn rendered_entity_with_sync(
+    body: &str,
+    synced_at: &str,
+    remote_edited_at: &str,
+) -> HydratedEntity {
+    let mut entity = rendered_entity(body);
+    entity.document.frontmatter = format!(
+        "afs:\n  id: {}\n  type: page\n  synced_at: \"{synced_at}\"\n  remote_edited_at: \"{remote_edited_at}\"\ntitle: Roadmap\n",
+        entity.shadow.entity_id.0
+    );
+    entity.shadow.frontmatter = entity.document.frontmatter.clone();
+    entity
 }
 
 fn rendered_entity_for(remote_id: &str, body: &str) -> HydratedEntity {
