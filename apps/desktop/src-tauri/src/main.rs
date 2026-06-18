@@ -66,6 +66,9 @@ use agent_guidance::{
     AgentGuidanceInstallReport, install_agent_guidance as install_guidance_files,
 };
 
+const TERMINAL_CLI_PATH_MANAGED_START: &str = "# >>> AFS_TERMINAL_CLI_PATH >>>";
+const TERMINAL_CLI_PATH_MANAGED_END: &str = "# <<< AFS_TERMINAL_CLI_PATH <<<";
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopSnapshot {
@@ -2567,20 +2570,44 @@ fn install_terminal_cli_link_at(cli_path: &Path, link_path: &Path) -> Result<Pat
 }
 
 fn install_terminal_cli_link_in_path(cli_path: &Path) -> Result<PathBuf, String> {
-    let dirs = terminal_cli_path_dirs();
-    install_terminal_cli_link_in_path_dirs(cli_path, dirs)
+    let mut dirs = terminal_cli_path_dirs();
+    sort_terminal_cli_path_dirs(&mut dirs);
+    let user_fallback = default_user_terminal_cli_dir();
+    if let Some(directory) = user_fallback.as_deref() {
+        insert_user_terminal_cli_fallback_dir(&mut dirs, directory);
+    }
+    let installed = install_terminal_cli_link_in_sorted_path_dirs(cli_path, dirs)?;
+    if user_fallback.as_deref().is_some_and(|directory| {
+        installed
+            .parent()
+            .is_some_and(|parent| paths_equal(parent, directory))
+    }) {
+        ensure_terminal_cli_dir_registered(&installed)?;
+    }
+    Ok(installed)
 }
 
+#[cfg(test)]
 fn install_terminal_cli_link_in_path_dirs(
     cli_path: &Path,
     mut dirs: Vec<PathBuf>,
 ) -> Result<PathBuf, String> {
     sort_terminal_cli_path_dirs(&mut dirs);
+    install_terminal_cli_link_in_sorted_path_dirs(cli_path, dirs)
+}
+
+fn install_terminal_cli_link_in_sorted_path_dirs(
+    cli_path: &Path,
+    dirs: Vec<PathBuf>,
+) -> Result<PathBuf, String> {
     let mut errors = Vec::new();
     let mut checked = Vec::new();
 
     for directory in dirs {
         checked.push(directory.display().to_string());
+        if is_protected_terminal_cli_path(&directory) {
+            continue;
+        }
         let link_path = directory.join("afs");
         match install_terminal_cli_link_at(cli_path, &link_path) {
             Ok(path) => return Ok(path),
@@ -2601,6 +2628,127 @@ fn install_terminal_cli_link_in_path_dirs(
     Err(format!(
         "Could not install the AFS terminal command without administrator privileges. Add a user-writable directory such as ~/.local/bin to PATH, then try again. Checked PATH directories: {checked}.{detail}"
     ))
+}
+
+fn default_user_terminal_cli_dir() -> Option<PathBuf> {
+    home_dir().ok().map(|home| home.join(".local/bin"))
+}
+
+fn insert_user_terminal_cli_fallback_dir(dirs: &mut Vec<PathBuf>, directory: &Path) {
+    if dirs.iter().any(|existing| paths_equal(existing, directory)) {
+        return;
+    }
+    let index = dirs
+        .iter()
+        .position(|candidate| is_protected_terminal_cli_path(candidate))
+        .unwrap_or(dirs.len());
+    dirs.insert(index, directory.to_path_buf());
+}
+
+fn ensure_terminal_cli_dir_registered(installed: &Path) -> Result<(), String> {
+    let directory = installed.parent().ok_or_else(|| {
+        format!(
+            "Could not determine parent directory for {}.",
+            installed.display()
+        )
+    })?;
+    if terminal_cli_dir_is_on_path(directory) {
+        return Ok(());
+    }
+    let Some(config_path) = terminal_cli_shell_config_path() else {
+        return Err(format!(
+            "Installed the AFS terminal command at {}, but could not find your home directory to add it to PATH.",
+            installed.display()
+        ));
+    };
+    write_terminal_cli_path_section(&config_path, directory).map_err(|error| {
+        format!(
+            "Installed the AFS terminal command at {}, but could not update {} to add it to PATH: {error}",
+            installed.display(),
+            config_path.display()
+        )
+    })
+}
+
+fn terminal_cli_dir_is_on_path(directory: &Path) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| path_list_contains_dir(path, directory))
+        || login_shell_path().is_some_and(|path| path_list_contains_dir(path, directory))
+}
+
+fn path_list_contains_dir(path: std::ffi::OsString, directory: &Path) -> bool {
+    std::env::split_paths(&path).any(|candidate| paths_equal(&candidate, directory))
+}
+
+fn terminal_cli_shell_config_path() -> Option<PathBuf> {
+    let home = home_dir().ok()?;
+    let shell_name = std::env::var_os("SHELL")
+        .and_then(|shell| PathBuf::from(shell).file_name().map(|name| name.to_owned()))
+        .and_then(|name| name.to_str().map(|name| name.to_string()));
+    Some(match shell_name.as_deref() {
+        Some("bash") => home.join(".bash_profile"),
+        Some("zsh") | None => home.join(".zprofile"),
+        _ => home.join(".profile"),
+    })
+}
+
+fn write_terminal_cli_path_section(path: &Path, directory: &Path) -> Result<(), String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let block = terminal_cli_path_shell_block(directory);
+    let next = replace_terminal_cli_path_section(&existing, &block);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(path, next).map_err(|error| error.to_string())
+}
+
+fn terminal_cli_path_shell_block(directory: &Path) -> String {
+    let directory = shell_single_quote(&directory.display().to_string());
+    format!(
+        "{TERMINAL_CLI_PATH_MANAGED_START}\n\
+_afs_cli_dir={directory}\n\
+case \":$PATH:\" in\n\
+  *\":$_afs_cli_dir:\"*) ;;\n\
+  *) export PATH=\"$_afs_cli_dir:$PATH\" ;;\n\
+esac\n\
+unset _afs_cli_dir\n\
+{TERMINAL_CLI_PATH_MANAGED_END}\n"
+    )
+}
+
+fn replace_terminal_cli_path_section(existing: &str, block: &str) -> String {
+    let Some(start) = existing.find(TERMINAL_CLI_PATH_MANAGED_START) else {
+        let trimmed = existing.trim_end();
+        return if trimmed.is_empty() {
+            block.to_string()
+        } else {
+            format!("{trimmed}\n\n{block}")
+        };
+    };
+    let Some(relative_end) = existing[start..].find(TERMINAL_CLI_PATH_MANAGED_END) else {
+        let trimmed = existing.trim_end();
+        return format!("{trimmed}\n\n{block}");
+    };
+    let end = start + relative_end + TERMINAL_CLI_PATH_MANAGED_END.len();
+    let mut next = String::new();
+    next.push_str(existing[..start].trim_end());
+    if !next.is_empty() {
+        next.push_str("\n\n");
+    }
+    next.push_str(block);
+    let suffix = existing[end..].trim_start_matches(['\r', '\n']);
+    if !suffix.is_empty() {
+        next.push('\n');
+        next.push_str(suffix);
+    }
+    next
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn terminal_cli_path_dirs() -> Vec<PathBuf> {
@@ -2659,6 +2807,20 @@ fn is_system_path(path: &Path) -> bool {
         path.to_str(),
         Some("/usr/bin" | "/bin" | "/usr/sbin" | "/sbin")
     )
+}
+
+fn is_protected_terminal_cli_path(path: &Path) -> bool {
+    is_system_path(path)
+        || path.starts_with("/System")
+        || path.starts_with("/var/run/com.apple.security.cryptexd")
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+        || match (left.canonicalize(), right.canonicalize()) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
 }
 
 fn append_path_dirs(dirs: &mut Vec<PathBuf>, path: std::ffi::OsString) {
@@ -3661,14 +3823,16 @@ mod tests {
         DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TerminalCliLinkState,
         TrayVisualState, clear_state_root_contents, conflict_preview, connection_metadata_changed,
         current_daemon_build_id, current_desktop_build_id, diff_report_message,
-        failed_push_summary, hydration_after_editor_write, inspect_install_state,
-        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
+        failed_push_summary, hydration_after_editor_write, insert_user_terminal_cli_fallback_dir,
+        inspect_install_state, install_terminal_cli_link_at,
+        install_terminal_cli_link_in_path_dirs, install_terminal_cli_link_in_sorted_path_dirs,
         is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
         pending_changes_from_status, pull_report_message, push_action_message,
-        record_current_install_marker, record_desktop_activity, should_hide_tray_popover,
-        should_prioritize_located_result, state_event_path_requires_refresh,
-        terminal_cli_link_state, tray_icon_image, tray_popover_position, validate_mount_root,
-        virtual_projection_refresh_signal_identifiers,
+        record_current_install_marker, record_desktop_activity, shell_single_quote,
+        should_hide_tray_popover, should_prioritize_located_result,
+        state_event_path_requires_refresh, terminal_cli_link_state, tray_icon_image,
+        tray_popover_position, validate_mount_root, virtual_projection_refresh_signal_identifiers,
+        write_terminal_cli_path_section,
     };
 
     #[test]
@@ -4361,6 +4525,46 @@ mod tests {
         assert_eq!(installed, user_bin.join("afs"));
         assert_eq!(fs::read_link(&installed).expect("read cli link"), cli);
         assert!(!homebrew.join("afs").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_cli_installer_uses_user_fallback_before_protected_system_paths() {
+        let temp = TestTempDir::new("terminal-cli-user-fallback");
+        let cli = temp.path().join("app/afs");
+        let user_bin = temp.path().join(".local/bin");
+        fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
+        fs::write(&cli, b"afs cli").expect("write cli");
+
+        let mut dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/sbin")];
+        insert_user_terminal_cli_fallback_dir(&mut dirs, &user_bin);
+
+        let installed =
+            install_terminal_cli_link_in_sorted_path_dirs(&cli, dirs).expect("install fallback");
+
+        assert_eq!(installed, user_bin.join("afs"));
+        assert_eq!(fs::read_link(&installed).expect("read cli link"), cli);
+    }
+
+    #[test]
+    fn terminal_cli_shell_path_section_is_managed_and_idempotent() {
+        let temp = TestTempDir::new("terminal-cli-shell-path");
+        let profile = temp.path().join(".zprofile");
+        let user_bin = temp.path().join(".local/bin");
+        fs::write(&profile, "export EXISTING=1\n").expect("write profile");
+
+        write_terminal_cli_path_section(&profile, &user_bin).expect("write path section");
+        write_terminal_cli_path_section(&profile, &user_bin).expect("rewrite path section");
+
+        let contents = fs::read_to_string(&profile).expect("read profile");
+        assert!(contents.contains("export EXISTING=1"));
+        assert_eq!(contents.matches("AFS_TERMINAL_CLI_PATH").count(), 2);
+        assert!(contents.contains("export PATH=\"$_afs_cli_dir:$PATH\""));
+    }
+
+    #[test]
+    fn terminal_cli_shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_single_quote("/tmp/it's/afs"), "'/tmp/it'\"'\"'s/afs'");
     }
 
     #[test]
