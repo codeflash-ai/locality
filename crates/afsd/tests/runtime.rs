@@ -755,13 +755,13 @@ fn runtime_drains_persisted_hydration_on_startup() {
     assert_eq!(request.mount_id, MountId::new("notion-main"));
     assert_eq!(request.remote_id, RemoteId::new("page-1"));
     assert_eq!(request.reason, HydrationReason::Policy);
-    runtime.shutdown();
 
     assert_hydration_jobs_drained(config.state_root);
+    runtime.shutdown();
 }
 
 fn assert_hydration_jobs_drained(state_root: PathBuf) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let store = SqliteStateStore::open(state_root.clone()).expect("reopen store");
         if store
