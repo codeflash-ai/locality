@@ -79,7 +79,8 @@ volume.
 
 For public direct download, the release build should be signed with a Developer
 ID Application certificate and notarized. The File Provider extension must be
-signed with its own entitlements before the containing app is signed.
+signed with its own entitlements before the containing app is signed. Public
+macOS builds are Apple Silicon-only.
 
 Required Apple-side setup:
 
@@ -138,6 +139,10 @@ The publish script requires a clean git working tree by default because the
 embedded daemon build ID is derived from `HEAD`. Use `PUBLISH_ALLOW_DIRTY=1`
 only for local throwaway builds.
 
+The publish script also requires an Apple Silicon host by default. Set
+`PUBLISH_ALLOW_INTEL=1` only for an unsupported local experiment; public builds
+should come from Apple Silicon.
+
 The final artifact is copied to:
 
 ```text
@@ -151,11 +156,239 @@ PUBLISH_CHANNEL=release make publish
 PUBLISH_DMG_NAME=AFS-beta-custom-notarized-aarch64.dmg make publish
 ```
 
+## Auto-Update Artifacts
+
+AFS uses Tauri's updater plugin for signed in-app updates. The updater signing
+key is separate from Apple code signing and notarization.
+
+Generate the updater key pair once:
+
+```sh
+npm --prefix apps/desktop run tauri -- signer generate -w ~/.tauri/afs-updater.key
+```
+
+Store the private key content in CI as `TAURI_SIGNING_PRIVATE_KEY`. If the key
+has a password, store it as `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The public key
+from `~/.tauri/afs-updater.key.pub` is safe to share and must be supplied to
+release builds as `TAURI_UPDATER_PUBKEY`.
+
+Release builds enable updater artifacts when both `TAURI_UPDATER_PUBKEY` and
+`TAURI_SIGNING_PRIVATE_KEY` are set:
+
+```sh
+export TAURI_UPDATER_PUBKEY="$(cat ~/.tauri/afs-updater.key.pub)"
+export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/afs-updater.key)"
+export TAURI_UPDATER_ENDPOINT="https://github.com/codeflash-ai/afs/releases/latest/download/latest-macos.json"
+make publish
+```
+
+The publish script copies the signed updater archive and signature to:
+
+```text
+target/release/bundle/updater/AFS-beta-YYYYMMDD-<commit>-macos-<arch>.app.tar.gz
+target/release/bundle/updater/AFS-beta-YYYYMMDD-<commit>-macos-<arch>.app.tar.gz.sig
+```
+
+After uploading the updater archive to the release, render the static updater
+manifest:
+
+```sh
+GITHUB_RELEASE_TAG=v0.1.0 make render-updater-manifest
+```
+
+Upload `target/release/bundle/updater/latest-macos.json` beside the updater
+archive. The first public build that includes `TAURI_UPDATER_PUBKEY` is the
+baseline; older builds that do not include the updater plugin still need one
+manual DMG or Homebrew upgrade.
+
+## Homebrew Cask
+
+Homebrew should install the same notarized Apple Silicon DMG. Build and upload
+the DMG to a GitHub Release, then render the cask:
+
+```sh
+HOMEBREW_RELEASE_TAG=v0.1.0 make render-homebrew-cask
+```
+
+The rendered cask is written to:
+
+```text
+target/release/homebrew/Casks/afs.rb
+```
+
+Copy that file into the CodeFlash tap, for example:
+
+```text
+codeflash-ai/homebrew-tap/Casks/afs.rb
+```
+
+The generated cask declares `depends_on arch: :arm64`, so Intel Macs are not a
+supported Homebrew installation target.
+
+## GitHub Release Workflow
+
+The GitHub workflow in `.github/workflows/release-macos.yml` publishes the
+macOS channel from a `v*` tag or manual workflow dispatch. It runs on the
+GitHub-hosted `macos-15` arm64 runner, builds the notarized DMG, produces the
+signed updater archive, renders `latest-macos.json`, renders `afs.rb`, creates
+or updates the GitHub Release, uploads all release assets, and optionally pushes
+the cask to the Homebrew tap. It shares a release concurrency group with the
+Linux workflow so both workflows can target the same tag without racing while
+creating or updating the GitHub Release.
+
+Required repository secrets:
+
+- `APPLE_CERTIFICATE_P12_BASE64`: base64-encoded Developer ID Application
+  certificate exported as `.p12`.
+- `APPLE_CERTIFICATE_PASSWORD`: password for the `.p12`.
+- `APPLE_ID`: Apple ID for notarization.
+- `APPLE_PASSWORD`: app-specific password for notarization.
+- `APPLE_TEAM_ID`: Apple Developer Team ID.
+- `TAURI_UPDATER_PUBKEY`: public updater signing key.
+- `TAURI_SIGNING_PRIVATE_KEY`: private updater signing key.
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: updater key password, if one was set.
+
+Optional repository secret:
+
+- `APPLE_SIGNING_IDENTITY`: exact Developer ID identity if the imported
+  keychain has more than one Developer ID Application certificate.
+- `HOMEBREW_TAP_TOKEN`: fine-grained token with write access to the Homebrew tap
+  repo. If omitted, the workflow still uploads `afs.rb` to the GitHub Release,
+  but it does not push to the tap.
+
+Optional repository variable:
+
+- `HOMEBREW_TAP_REPOSITORY`: defaults to `codeflash-ai/homebrew-tap`.
+
+Release a new version by updating `apps/desktop/src-tauri/tauri.conf.json` and
+`apps/desktop/package.json` to the same version, committing the change, tagging
+that commit, and pushing the tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow requires the tag to match the Tauri app version exactly.
+
+## Mac App Store Track
+
+Mac App Store (MAS) distribution should be a separate build target from the
+direct DMG and Homebrew release. The App Store build needs App Sandbox enabled,
+App Store signing/provisioning instead of Developer ID signing, App Store
+Connect metadata, and review of the File Provider extension, embedded sidecars,
+and CLI install behavior. Keep the direct DMG/Homebrew build as the fast-moving
+beta channel until the sandboxed build has its own install and update story.
+
+Run the static readiness audit before attempting an App Store-signed build:
+
+```sh
+make audit-mas-readiness
+```
+
+The audit verifies that the checked-in macOS app/extension entitlements include
+App Sandbox, the shared application group, and network client access; that the
+bundle identifiers and minimum OS are consistent; and that the desktop frontend
+and backend understand the `mas` distribution channel.
+
+Build a local Mac App Store-channel `.app` bundle with:
+
+```sh
+make build-mas
+```
+
+This sets both build-time channel flags:
+
+```sh
+VITE_AFS_DISTRIBUTION_CHANNEL=mas
+AFS_DISTRIBUTION_CHANNEL=mas
+```
+
+The `mas` channel disables the in-app Tauri updater and skips automatic
+terminal-command symlink installation. The App Store build should get updates
+through the App Store, while users who need `afs` on their shell path should use
+the Homebrew or direct DMG channel.
+
+Build a signed App Store package locally with:
+
+```sh
+make publish-mas
+```
+
+`make publish-mas` builds the `mas` channel `.app`, embeds provisioning profiles
+for the containing app and File Provider extension, re-signs nested code with
+the App Store application identity, and creates a signed `.pkg` with the App
+Store installer identity. By default it only writes and validates the package
+locally:
+
+```text
+target/release/bundle/mas/AFS-app-store-YYYYMMDD-<commit>-<arch>.pkg
+target/release/bundle/mas/AFS-app-store-YYYYMMDD-<commit>-<arch>.pkg.sha256
+```
+
+Required local inputs:
+
+- `MAS_APP_SIGNING_IDENTITY`: usually `3rd Party Mac Developer Application: ...`
+  or `Apple Distribution: ...`; auto-detected when exactly one matching
+  identity exists.
+- `MAS_INSTALLER_SIGNING_IDENTITY`: `3rd Party Mac Developer Installer: ...`;
+  auto-detected when exactly one matching identity exists.
+- `MAS_APP_PROVISIONING_PROFILE` or `MAS_APP_PROVISIONING_PROFILE_BASE64`.
+- `MAS_FILE_PROVIDER_PROVISIONING_PROFILE` or
+  `MAS_FILE_PROVIDER_PROVISIONING_PROFILE_BASE64`.
+
+Optional App Store Connect upload inputs:
+
+- `APP_STORE_CONNECT_API_KEY_ID`.
+- `APP_STORE_CONNECT_API_ISSUER_ID`.
+- `APP_STORE_CONNECT_API_PRIVATE_KEY` or
+  `APP_STORE_CONNECT_API_PRIVATE_KEY_PATH`.
+- `MAS_VALIDATE_WITH_APPLE=1` to validate the `.pkg` with App Store Connect.
+- `MAS_UPLOAD=1` to validate and upload the `.pkg` to App Store Connect.
+
+The GitHub workflow in `.github/workflows/release-mas.yml` is manual-only. It
+checks out an existing release tag, imports App Store application and installer
+certificates, builds the signed package, and optionally validates/uploads it to
+App Store Connect.
+
+Required repository secrets:
+
+- `MAS_APP_CERTIFICATE_P12_BASE64`.
+- `MAS_APP_CERTIFICATE_PASSWORD`.
+- `MAS_INSTALLER_CERTIFICATE_P12_BASE64`.
+- `MAS_INSTALLER_CERTIFICATE_PASSWORD`.
+- `MAS_APP_PROVISIONING_PROFILE_BASE64`.
+- `MAS_FILE_PROVIDER_PROVISIONING_PROFILE_BASE64`.
+
+Required for App Store Connect validation or upload:
+
+- `APP_STORE_CONNECT_API_KEY_ID`.
+- `APP_STORE_CONNECT_API_ISSUER_ID`.
+- `APP_STORE_CONNECT_API_PRIVATE_KEY`.
+
+Optional repository secrets:
+
+- `MAS_APP_SIGNING_IDENTITY`.
+- `MAS_INSTALLER_SIGNING_IDENTITY`.
+
+Remaining App Store work:
+
+- Create or confirm App Store App IDs for `ai.codeflash.afs` and
+  `ai.codeflash.afs.AgentFS.FileProvider`.
+- Create provisioning profiles for the containing app and File Provider
+  extension with `group.ai.codeflash.afs`.
+- Run the manual workflow with validation enabled.
+- Run the manual workflow with upload enabled when validation passes.
+- Complete TestFlight/App Review metadata in App Store Connect.
+
 ## Distribution Channels
 
 Initial channel: notarized DMG direct download.
 
 Power-user channel: Homebrew cask that installs the same notarized DMG.
 
-Later channel: Tauri updater for in-app update checks after the signing and
-release hosting flow is stable.
+Fast-moving channel: Tauri updater using the signed updater archive and
+`latest-macos.json` manifest from the GitHub Release.
+
+App Store channel: manual `release-mas` workflow after App Store provisioning
+and metadata are ready.

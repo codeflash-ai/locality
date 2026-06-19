@@ -343,6 +343,15 @@ AFS projects connected company sources, including Notion, into the local filesys
 6. Only push when the user explicitly asks. Run `afs diff <file>` first, then `afs push <file> -y` for safe plans.
 7. If push says the remote changed since last sync, run `afs pull <file>`, resolve any inline conflict markers in the Markdown, rerun `afs diff <file>`, then push again.
 
+## Creating Notion Content
+
+- Read `{mount_path}/AGENTS.md` for connector-specific creation rules.
+- Pages are directories; edit or create the `page.md` inside the page directory.
+- To create a child page, create `parent-page/new-page/page.md`.
+- New `page.md` files need YAML frontmatter with `title: "..."` and no `afs:` identity block.
+- Existing files already have an `afs:` block; preserve it and edit only the body, `title`, and supported property frontmatter.
+- Database rows can be created as `database/new-row/page.md` or, where supported, direct `database/new-row.md` files.
+
 ## MCP fallback
 
 If your sandbox cannot run the host `afs` CLI, use the MCP tool named `afs`.
@@ -765,6 +774,9 @@ mod tests {
         assert!(skill.contains("~/Library/CloudStorage/AFS/notion"));
         assert!(skill.contains("pending for AFS review"));
         assert!(skill.contains("afs diff <file>"));
+        assert!(skill.contains("Creating Notion Content"));
+        assert!(skill.contains("parent-page/new-page/page.md"));
+        assert!(skill.contains("no `afs:` identity block"));
         assert!(skill.contains("remote changed since last sync"));
         assert!(skill.contains("AFS configures this fallback automatically"));
     }

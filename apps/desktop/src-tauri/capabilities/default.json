@@ -7,6 +7,8 @@
     "core:window:allow-hide",
     "core:window:allow-minimize",
     "core:window:allow-start-dragging",
-    "core:window:allow-toggle-maximize"
+    "core:window:allow-toggle-maximize",
+    "process:default",
+    "updater:default"
   ]
 }

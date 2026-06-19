@@ -1,0 +1,211 @@
+name: release macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, for example v0.1.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  macos-arm64:
+    name: Build and publish macOS arm64
+    runs-on: macos-15
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      PUBLISH_CHANNEL: release
+      TAURI_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest-macos.json
+      TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      HOMEBREW_TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY || 'codeflash-ai/homebrew-tap' }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Verify release tag is current main
+        run: |
+          git fetch --force --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          main_commit="$(git rev-parse "origin/main^{commit}")"
+          if [[ "${tag_commit}" != "${main_commit}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} must point at current origin/main (${main_commit}); got ${tag_commit}."
+            exit 1
+          fi
+          echo "Release tag ${RELEASE_TAG} points at current origin/main (${main_commit})."
+
+      - name: Verify Apple Silicon runner
+        run: |
+          if [[ "$(uname -m)" != "arm64" ]]; then
+            echo "::error::macOS release workflow must run on an Apple Silicon runner."
+            exit 1
+          fi
+
+      - name: Verify tag matches app version
+        run: |
+          version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' apps/desktop/src-tauri/tauri.conf.json | head -n 1)"
+          if [[ -z "${version}" ]]; then
+            echo "::error::Could not read Tauri app version."
+            exit 1
+          fi
+          expected="v${version}"
+          if [[ "${RELEASE_TAG}" != "${expected}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} does not match app version ${version}; expected ${expected}."
+            exit 1
+          fi
+          echo "APP_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          if [[ -z "${APPLE_CERTIFICATE_P12_BASE64}" || -z "${APPLE_CERTIFICATE_PASSWORD}" ]]; then
+            echo "::error::Set APPLE_CERTIFICATE_P12_BASE64 and APPLE_CERTIFICATE_PASSWORD repository secrets."
+            exit 1
+          fi
+
+          keychain_path="${RUNNER_TEMP}/afs-signing.keychain-db"
+          certificate_path="${RUNNER_TEMP}/developer-id.p12"
+          printf '%s' "${APPLE_CERTIFICATE_P12_BASE64}" | base64 --decode > "${certificate_path}" 2>/dev/null \
+            || printf '%s' "${APPLE_CERTIFICATE_P12_BASE64}" | base64 -D > "${certificate_path}"
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+          security import "${certificate_path}" \
+            -P "${APPLE_CERTIFICATE_PASSWORD}" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+
+      - name: Verify release secrets
+        run: |
+          missing=0
+          for name in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_UPDATER_PUBKEY TAURI_SIGNING_PRIVATE_KEY; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required secret or environment value: ${name}"
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Build, sign, notarize, and staple DMG
+        run: make publish
+
+      - name: Render updater manifest and Homebrew cask
+        env:
+          GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          HOMEBREW_RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          UPDATER_NOTES: "AFS ${{ env.APP_VERSION }} macOS update."
+        run: |
+          make render-updater-manifest
+          make render-homebrew-cask
+
+      - name: Collect release assets
+        run: |
+          mkdir -p target/release/github-assets
+          cp target/release/bundle/dmg/AFS-release-*-notarized-*.dmg target/release/github-assets/
+          cp target/release/bundle/updater/*.app.tar.gz target/release/github-assets/
+          cp target/release/bundle/updater/*.app.tar.gz.sig target/release/github-assets/
+          cp target/release/bundle/updater/latest-macos.json target/release/github-assets/
+          cp target/release/homebrew/Casks/afs.rb target/release/github-assets/afs.rb
+          shasum -a 256 target/release/github-assets/* > target/release/github-assets/SHA256SUMS
+          ls -la target/release/github-assets
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+        run: |
+          create_args=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "AFS ${APP_VERSION}" --generate-notes)
+          edit_args=(--repo "${GITHUB_REPOSITORY}" --title "AFS ${APP_VERSION}")
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            create_args+=(--prerelease --latest=false)
+            edit_args+=(--prerelease=true --latest=false)
+          else
+            create_args+=(--latest=true)
+            edit_args+=(--prerelease=false --latest=true)
+          fi
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" "${edit_args[@]}"
+          else
+            gh release create "${RELEASE_TAG}" "${create_args[@]}"
+          fi
+
+      - name: Upload GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${RELEASE_TAG}" target/release/github-assets/* --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Update Homebrew tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          GIT_AUTHOR_NAME: codeflash-release-bot
+          GIT_AUTHOR_EMAIL: release-bot@codeflash.ai
+          GIT_COMMITTER_NAME: codeflash-release-bot
+          GIT_COMMITTER_EMAIL: release-bot@codeflash.ai
+        run: |
+          tap_dir="${RUNNER_TEMP}/homebrew-tap"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${HOMEBREW_TAP_REPOSITORY}.git" "${tap_dir}"
+          mkdir -p "${tap_dir}/Casks"
+          cp target/release/homebrew/Casks/afs.rb "${tap_dir}/Casks/afs.rb"
+          cd "${tap_dir}"
+          git add Casks/afs.rb
+          if git diff --cached --quiet; then
+            echo "Homebrew cask already up to date."
+            exit 0
+          fi
+          git commit -m "Update AFS cask to ${RELEASE_TAG}"
+          git push
+
+      - name: Homebrew tap update instructions
+        if: env.HOMEBREW_TAP_TOKEN == ''
+        run: |
+          echo "::notice::Set HOMEBREW_TAP_TOKEN to let this workflow push Casks/afs.rb to ${HOMEBREW_TAP_REPOSITORY}."
+          echo "::notice::The generated cask was uploaded as a release asset named afs.rb."

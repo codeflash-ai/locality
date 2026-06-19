@@ -22,9 +22,9 @@ final class AgentFSFileProviderItem: NSObject, NSFileProviderItem {
     self.filename = metadata.filename
     self.contentType = UTType(metadata.contentType) ?? .data
     if metadata.kind == "folder" {
-      self.capabilities = [.allowsReading, .allowsContentEnumerating]
+      self.capabilities = [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems]
     } else if metadata.entityKind == "page" {
-      self.capabilities = [.allowsReading, .allowsWriting]
+      self.capabilities = [.allowsReading, .allowsWriting, .allowsRenaming]
     } else {
       self.capabilities = [.allowsReading]
     }

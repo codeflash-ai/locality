@@ -757,6 +757,58 @@ p {
   overflow: auto;
 }
 
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  max-width: 860px;
+  margin-bottom: 18px;
+  padding: 12px 14px;
+  border: 1px solid rgba(47, 116, 208, 0.18);
+  border-radius: 12px;
+  background: rgba(232, 240, 247, 0.86);
+  color: #294967;
+  box-shadow: 0 8px 22px rgba(20, 30, 43, 0.06);
+}
+
+.update-banner strong {
+  color: #152a3c;
+  font-size: 13px;
+}
+
+.update-banner p {
+  margin-top: 3px;
+  color: #51667b;
+  font-size: 12px;
+}
+
+.update-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.update-banner .primary-button,
+.update-banner .secondary-button {
+  margin-top: 0;
+}
+
+.update-dismiss {
+  min-height: 32px;
+  padding: 0 8px;
+  border: 0;
+  background: transparent;
+  color: #51667b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.update-dismiss:hover {
+  color: #152a3c;
+}
+
 .view-stack {
   display: grid;
   gap: 18px;

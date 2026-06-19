@@ -379,6 +379,69 @@ fn live_drift_preflight_blocks_push_before_overwriting_remote() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_page_directory_create_pushes_child_page_and_refreshes_parent() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live page-dir parent {}", unique_suffix()),
+        vec![paragraph_child("Parent body before child page creation.")],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, parent_page_path, _markdown) =
+        pull_live_page(&connector, &scratch.id);
+    let child_title = format!("AFS live page-dir child {}", unique_suffix());
+    let child_dir = parent_page_path
+        .parent()
+        .expect("parent page directory")
+        .join(slug_for_test(&child_title));
+    fs::create_dir_all(&child_dir).expect("create child page directory");
+    let child_page_path = child_dir.join("page.md");
+    fs::write(
+        &child_page_path,
+        format!("---\ntitle: \"{child_title}\"\n---\n# Created child\n\nCreated from page.md.\n"),
+    )
+    .expect("write child page.md");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &child_page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push child page create");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    let created_page_id = push
+        .changed_remote_ids
+        .iter()
+        .find(|id| *id != &scratch.id)
+        .expect("created page id")
+        .clone();
+    cleanup.block_ids.push(created_page_id.clone());
+
+    let child_markdown = render_live_markdown(&connector, &created_page_id, &child_page_path);
+    assert!(child_markdown.contains(&format!("title: \"{child_title}\"")));
+    assert!(child_markdown.contains("Created from page.md."));
+
+    let parent_markdown = fs::read_to_string(&parent_page_path).expect("read reconciled parent");
+    assert!(
+        parent_markdown.contains(&child_title),
+        "parent page should reconcile the Notion child_page link:\n{parent_markdown}"
+    );
+    let remote_parent = render_live_markdown(&connector, &scratch.id, &parent_page_path);
+    assert!(
+        remote_parent.contains(&child_title),
+        "remote parent should render the new child page link:\n{remote_parent}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_remote_fast_forward_updates_clean_file_and_preserves_pending_file() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
@@ -2233,6 +2296,22 @@ fn compact_notion_id(input: &str) -> String {
 
 fn notion_object_url(id: &str) -> String {
     format!("https://www.notion.so/{}", normalize_notion_id(id))
+}
+
+fn slug_for_test(title: &str) -> String {
+    let slug = title
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() {
+                Some(character.to_ascii_lowercase())
+            } else if character.is_whitespace() || matches!(character, '-' | '_') {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect::<String>();
+    slug.trim_matches('-').to_string()
 }
 
 fn replace_line_with_prefix(markdown: String, prefix: &str, replacement: &str) -> String {

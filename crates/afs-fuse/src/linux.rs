@@ -208,6 +208,12 @@ trait VirtualFsClient {
         filename: &str,
     ) -> Result<VirtualFsMutationReport, FuseError>;
 
+    fn create_directory(
+        &self,
+        parent_identifier: &str,
+        dirname: &str,
+    ) -> Result<VirtualFsMutationReport, FuseError>;
+
     fn rename(
         &self,
         identifier: &str,
@@ -282,6 +288,21 @@ impl VirtualFsClient for DaemonClient {
                 mount_id: self.mount_id.clone(),
                 parent_identifier: parent_identifier.to_string(),
                 filename: filename.to_string(),
+            },
+            MUTATION_REQUEST_TIMEOUT,
+        )
+    }
+
+    fn create_directory(
+        &self,
+        parent_identifier: &str,
+        dirname: &str,
+    ) -> Result<VirtualFsMutationReport, FuseError> {
+        self.request_with_timeout(
+            &DaemonRequest::VirtualFsCreateDirectory {
+                mount_id: self.mount_id.clone(),
+                parent_identifier: parent_identifier.to_string(),
+                dirname: dirname.to_string(),
             },
             MUTATION_REQUEST_TIMEOUT,
         )
@@ -846,6 +867,30 @@ where
         })
     }
 
+    async fn mkdir(
+        &self,
+        _req: Request,
+        parent: &OsStr,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+    ) -> FuseResult<ReplyEntry> {
+        let parent_item = self.resolve_path(Path::new(parent))?;
+        if parent_item.kind != VirtualFsItemKind::Folder {
+            return Err(FuseError::NotDirectory.into());
+        }
+        let dirname = name.to_str().ok_or(FuseError::Invalid)?;
+        let report = self
+            .client
+            .create_directory(&parent_item.identifier, dirname)?;
+        self.cache_item_at(child_path(Path::new(parent), dirname), report.item.clone());
+
+        Ok(ReplyEntry {
+            ttl: ATTR_TTL,
+            attr: attr_for_item(&report.item),
+        })
+    }
+
     async fn rename(
         &self,
         _req: Request,
@@ -1327,6 +1372,16 @@ mod tests {
             _filename: &str,
         ) -> Result<VirtualFsMutationReport, FuseError> {
             Err(FuseError::Daemon("unexpected create request".to_string()))
+        }
+
+        fn create_directory(
+            &self,
+            _parent_identifier: &str,
+            _dirname: &str,
+        ) -> Result<VirtualFsMutationReport, FuseError> {
+            Err(FuseError::Daemon(
+                "unexpected create directory request".to_string(),
+            ))
         }
 
         fn rename(

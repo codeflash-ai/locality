@@ -240,6 +240,11 @@ pub fn apply_plan(
                 if !changed_remote_ids.contains(&created_id) {
                     changed_remote_ids.push(created_id.clone());
                 }
+                if matches!(parent_kind, Some(afs_core::model::EntityKind::Page))
+                    && !changed_remote_ids.contains(parent_id)
+                {
+                    changed_remote_ids.push(parent_id.clone());
+                }
                 effects.push(JournalApplyEffect::CreatedEntity {
                     operation_id: request.operation_ids[operation_index].clone(),
                     operation_index,

@@ -1,0 +1,191 @@
+name: release Linux
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, for example v0.1.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x64:
+    name: Build and publish Linux x64
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      PUBLISH_CHANNEL: release
+      PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+      TAURI_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest-linux.json
+      TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      LINUX_REPO_BASE_URL: ${{ vars.LINUX_REPO_BASE_URL || 'https://codeflash-ai.github.io/afs' }}
+      LINUX_REPO_GPG_PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
+      LINUX_REPO_GPG_PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Verify release tag is current main
+        run: |
+          git fetch --force --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          main_commit="$(git rev-parse "origin/main^{commit}")"
+          if [[ "${tag_commit}" != "${main_commit}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} must point at current origin/main (${main_commit}); got ${tag_commit}."
+            exit 1
+          fi
+          echo "Release tag ${RELEASE_TAG} points at current origin/main (${main_commit})."
+
+      - name: Verify tag matches app version
+        run: |
+          version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' apps/desktop/src-tauri/tauri.conf.json | head -n 1)"
+          if [[ -z "${version}" ]]; then
+            echo "::error::Could not read Tauri app version."
+            exit 1
+          fi
+          expected="v${version}"
+          if [[ "${RELEASE_TAG}" != "${expected}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} does not match app version ${version}; expected ${expected}."
+            exit 1
+          fi
+          echo "APP_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Select stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            fuse3 \
+            libayatana-appindicator3-dev \
+            libfuse3-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            apt-utils \
+            createrepo-c \
+            dpkg-dev \
+            gnupg \
+            patchelf \
+            pkg-config \
+            rpm \
+            sqlite3 \
+            zstd
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Verify updater and repository secrets
+        run: |
+          missing=0
+          for name in TAURI_UPDATER_PUBKEY TAURI_SIGNING_PRIVATE_KEY LINUX_REPO_GPG_PRIVATE_KEY; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required secret or environment value: ${name}"
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Build and validate Linux packages
+        run: make publish-linux
+
+      - name: Render updater manifest and package repositories
+        env:
+          GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-linux.json
+          UPDATER_NOTES: AFS ${{ env.APP_VERSION }} Linux update.
+        run: |
+          export UPDATER_LINUX_X86_64_ARTIFACT="$(find target/release/bundle/updater -maxdepth 1 -type f -name 'AFS-release-[0-9]*-linux-x86_64.AppImage' | sort | tail -n 1)"
+          make render-updater-manifest
+          make render-linux-repositories
+
+      - name: Collect release assets
+        run: |
+          mkdir -p target/release/github-assets
+          cp target/release/bundle/linux/AFS-release-*.deb target/release/github-assets/
+          cp target/release/bundle/linux/AFS-release-*.deb.sha256 target/release/github-assets/
+          cp target/release/bundle/linux/AFS-release-*.rpm target/release/github-assets/
+          cp target/release/bundle/linux/AFS-release-*.rpm.sha256 target/release/github-assets/
+          cp target/release/bundle/updater/*.AppImage target/release/github-assets/
+          cp target/release/bundle/updater/*.AppImage.sig target/release/github-assets/
+          cp target/release/bundle/updater/latest-linux.json target/release/github-assets/
+          sha256sum target/release/github-assets/* > target/release/github-assets/SHA256SUMS-linux
+          ls -la target/release/github-assets
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+        run: |
+          create_args=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "AFS ${APP_VERSION}" --generate-notes)
+          edit_args=(--repo "${GITHUB_REPOSITORY}" --title "AFS ${APP_VERSION}")
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            create_args+=(--prerelease --latest=false)
+            edit_args+=(--prerelease=true --latest=false)
+          else
+            create_args+=(--latest=true)
+            edit_args+=(--prerelease=false --latest=true)
+          fi
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" "${edit_args[@]}"
+          else
+            gh release create "${RELEASE_TAG}" "${create_args[@]}"
+          fi
+
+      - name: Upload GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${RELEASE_TAG}" target/release/github-assets/* --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Configure GitHub Pages
+        if: env.PRERELEASE != 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Linux repository Pages artifact
+        if: env.PRERELEASE != 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/release/linux-repo
+
+      - name: Deploy Linux package repositories
+        if: env.PRERELEASE != 'true'
+        uses: actions/deploy-pages@v4

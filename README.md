@@ -4,6 +4,46 @@ AgentFS mounts systems of record as real Markdown files that agents and editors 
 
 This repository contains the Rust workspace for the `plan.md` design and the first functional slices of the core sync engine, CLI, store, daemon hydration loop, and Notion connector.
 
+## Install on macOS
+
+AFS publishes an Apple Silicon macOS build through Homebrew:
+
+```sh
+brew tap codeflash-ai/tap
+brew install --cask afs
+```
+
+To update an existing Homebrew install:
+
+```sh
+brew update
+brew upgrade --cask afs
+```
+
+The public Homebrew build currently requires an Apple Silicon Mac running macOS 14 Sonoma or newer.
+
+## Install on Linux
+
+Linux packages are published through distro package repositories. On Debian or Ubuntu:
+
+```sh
+curl -fsSL https://codeflash-ai.github.io/afs/apt/codeflash-afs.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-afs.gpg && echo "deb [signed-by=/usr/share/keyrings/codeflash-afs.gpg] https://codeflash-ai.github.io/afs/apt stable main" | sudo tee /etc/apt/sources.list.d/afs.list >/dev/null && sudo apt update && sudo apt install afs
+```
+
+On Fedora, RHEL, or compatible distributions:
+
+```sh
+sudo curl -fsSL -o /etc/yum.repos.d/afs.repo https://codeflash-ai.github.io/afs/rpm/afs.repo && sudo dnf install afs
+```
+
+Linux packages require `fuse3` and `systemd`; the package metadata declares both dependencies.
+APT/DNF installs update through the system package manager. For Tauri-managed
+self-update, use the AppImage channel:
+
+```sh
+mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/AFS.AppImage https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.AppImage && chmod +x ~/.local/bin/AFS.AppImage
+```
+
 ## Development
 
 The root `Makefile` is the easiest way to run common project tasks:

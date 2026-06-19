@@ -139,6 +139,45 @@ fn prepare_push_uses_shared_validator_for_direct_and_virtual_creates() {
 }
 
 #[test]
+fn prepare_push_uses_page_directory_parent_for_new_page_document() {
+    let fixture = PrepareFixture::new();
+    let validator = RecordingValidator::default();
+    let mut store = fixture.store("fake");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("page-parent"),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap/page.md",
+        ))
+        .expect("save page directory parent");
+    let path = fixture.write_raw("Roadmap/Draft/page.md", "---\ntitle: Draft\n---\n# Draft\n");
+
+    let prepared = prepare_push(&store, &job(path), None, &validator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    assert_eq!(
+        validator.parents.borrow().as_slice(),
+        &[RemoteId::new("page-parent")]
+    );
+    let plan = prepared.pipeline.plan.expect("plan");
+    match &plan.operations[0] {
+        PushOperation::CreateEntity {
+            parent_id,
+            parent_kind,
+            source_path,
+            ..
+        } => {
+            assert_eq!(parent_id, &RemoteId::new("page-parent"));
+            assert_eq!(parent_kind, &Some(EntityKind::Page));
+            assert_eq!(source_path, &PathBuf::from("Roadmap/Draft/page.md"));
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[test]
 fn prepare_push_preserves_structured_missing_shadow_error() {
     let fixture = PrepareFixture::new();
     let store = fixture.store("fake");

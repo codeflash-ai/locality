@@ -362,23 +362,25 @@ fn runtime_prime_virtual_mounts_queues_root_and_source_refreshes() {
         .prime_virtual_mounts()
         .expect("prime virtual mounts");
 
-    let first = refresh_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("root refresh");
-    let second = refresh_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("source refresh");
+    let mut refreshes = vec![
+        refresh_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first refresh"),
+        refresh_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second refresh"),
+    ];
+    refreshes.sort();
 
     assert_eq!(
-        first,
-        (
-            "notion-main".to_string(),
-            ROOT_CONTAINER_IDENTIFIER.to_string()
-        )
-    );
-    assert_eq!(
-        second,
-        ("notion-main".to_string(), "source:notion".to_string())
+        refreshes,
+        vec![
+            (
+                "notion-main".to_string(),
+                ROOT_CONTAINER_IDENTIFIER.to_string()
+            ),
+            ("notion-main".to_string(), "source:notion".to_string()),
+        ]
     );
     runtime.shutdown();
 }

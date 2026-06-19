@@ -52,6 +52,11 @@ pub enum DaemonRequest {
         parent_identifier: String,
         filename: String,
     },
+    VirtualFsCreateDirectory {
+        mount_id: String,
+        parent_identifier: String,
+        dirname: String,
+    },
     VirtualFsRename {
         mount_id: String,
         identifier: String,
@@ -520,6 +525,10 @@ mod tests {
             r#"{"command":"virtual_fs_create_file","mount_id":"notion-main","parent_identifier":"children:page-1","filename":"Draft.md"}"#,
         )
         .expect("decode virtual fs create request");
+        let mkdir: DaemonRequest = serde_json::from_str(
+            r#"{"command":"virtual_fs_create_directory","mount_id":"notion-main","parent_identifier":"children:page-1","dirname":"Draft"}"#,
+        )
+        .expect("decode virtual fs create directory request");
         let rename: DaemonRequest = serde_json::from_str(
             r#"{"command":"virtual_fs_rename","mount_id":"notion-main","identifier":"local:1","new_parent_identifier":"children:page-1","new_filename":"Updated.md"}"#,
         )
@@ -535,6 +544,14 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 parent_identifier: "children:page-1".to_string(),
                 filename: "Draft.md".to_string(),
+            }
+        );
+        assert_eq!(
+            mkdir,
+            DaemonRequest::VirtualFsCreateDirectory {
+                mount_id: "notion-main".to_string(),
+                parent_identifier: "children:page-1".to_string(),
+                dirname: "Draft".to_string(),
             }
         );
         assert_eq!(

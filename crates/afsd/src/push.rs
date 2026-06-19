@@ -22,6 +22,7 @@ use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::path_projection::{is_page_document_path, page_document_path};
 use afs_core::planner::GuardrailDecision;
 use afs_core::planner::{GuardrailPolicy, PushOperation, PushPlan};
 use afs_core::push::{
@@ -1422,7 +1423,30 @@ where
     let parent = store
         .find_entity_by_path(&mount.mount_id, parent_path)
         .map_err(PushPrepareError::Store)?;
-    Ok(parent)
+    if parent.is_some() {
+        return Ok(parent);
+    }
+
+    if is_page_document_path(relative_path)
+        && let Some(container_path) = parent_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+    {
+        if let Some(parent) = store
+            .find_entity_by_path(&mount.mount_id, container_path)
+            .map_err(PushPrepareError::Store)?
+        {
+            return Ok(Some(parent));
+        }
+        let parent_page_path = page_document_path(container_path);
+        if parent_page_path != relative_path {
+            return store
+                .find_entity_by_path(&mount.mount_id, &parent_page_path)
+                .map_err(PushPrepareError::Store);
+        }
+    }
+
+    Ok(None)
 }
 
 fn required_parent_entity<S>(

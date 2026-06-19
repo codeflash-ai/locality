@@ -47,11 +47,11 @@ use crate::shadow_match::parsed_matches_shadow;
 use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsItem, VirtualFsItemKind, VirtualFsMaterializeOutcome,
-    commit_virtual_fs_write, create_virtual_fs_file, materialize_virtual_fs_item_with_content_root,
-    refresh_virtual_fs_children, rename_virtual_fs_item, source_root_identifier,
-    trash_virtual_fs_item, virtual_fs_children_refresh_needed,
-    virtual_fs_children_with_content_root, virtual_fs_content_root,
-    virtual_fs_item_with_content_root,
+    commit_virtual_fs_write, create_virtual_fs_directory, create_virtual_fs_file,
+    materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
+    rename_virtual_fs_item, source_root_identifier, trash_virtual_fs_item,
+    virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
+    virtual_fs_content_root, virtual_fs_item_with_content_root,
 };
 use crate::watcher::{FileEvent, FileEventKind};
 
@@ -277,6 +277,19 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
         DaemonResponse::error(
             "unsupported",
             "runtime runner does not handle virtual filesystem creates",
+        )
+    }
+
+    fn run_virtual_fs_create_directory(
+        &self,
+        _state_root: PathBuf,
+        _mount_id: String,
+        _parent_identifier: String,
+        _dirname: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle virtual filesystem directory creates",
         )
     }
 
@@ -744,6 +757,34 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             &mount_id,
             &parent_identifier,
             &filename,
+        ) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+
+    fn run_virtual_fs_create_directory(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        parent_identifier: String,
+        dirname: String,
+    ) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        match create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &parent_identifier,
+            &dirname,
         ) {
             Ok(report) => DaemonResponse::ok(report),
             Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
@@ -1246,6 +1287,20 @@ impl RuntimeState {
                         mount_id,
                         parent_identifier,
                         filename,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
+            }
+            DaemonRequest::VirtualFsCreateDirectory {
+                mount_id,
+                parent_identifier,
+                dirname,
+            } => {
+                self.pending_requests
+                    .push_front(MutatingRequest::VirtualFsCreateDirectory {
+                        mount_id,
+                        parent_identifier,
+                        dirname,
                         respond_to,
                     });
                 self.maybe_start_next_job();
@@ -2035,6 +2090,25 @@ fn run_job(
                 freshness_jobs,
             }
         }
+        MutatingJob::Request(MutatingRequest::VirtualFsCreateDirectory {
+            mount_id,
+            parent_identifier,
+            dirname,
+            respond_to,
+        }) => {
+            let response = runner.run_virtual_fs_create_directory(
+                state_root,
+                mount_id,
+                parent_identifier,
+                dirname,
+            );
+            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::LocalEdited);
+            JobCompletion::Response {
+                response,
+                respond_to,
+                freshness_jobs,
+            }
+        }
         MutatingJob::Request(MutatingRequest::VirtualFsRename {
             mount_id,
             identifier,
@@ -2190,6 +2264,12 @@ enum MutatingRequest {
         filename: String,
         respond_to: Sender<DaemonResponse>,
     },
+    VirtualFsCreateDirectory {
+        mount_id: String,
+        parent_identifier: String,
+        dirname: String,
+        respond_to: Sender<DaemonResponse>,
+    },
     VirtualFsRename {
         mount_id: String,
         identifier: String,
@@ -2283,6 +2363,15 @@ impl MutatingRequest {
             } => (
                 "virtual_fs_create_file".to_string(),
                 Some(format!("{mount_id}:{parent_identifier}/{filename}")),
+            ),
+            Self::VirtualFsCreateDirectory {
+                mount_id,
+                parent_identifier,
+                dirname,
+                ..
+            } => (
+                "virtual_fs_create_directory".to_string(),
+                Some(format!("{mount_id}:{parent_identifier}/{dirname}")),
             ),
             Self::VirtualFsRename {
                 mount_id,

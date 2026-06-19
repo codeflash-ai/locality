@@ -1748,6 +1748,84 @@ fn apply_updates_supported_page_properties() {
 }
 
 #[test]
+fn apply_creates_child_page_and_marks_parent_changed() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-parent")],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new("page-parent"),
+            parent_kind: Some(EntityKind::Page),
+            title: "New child".to_string(),
+            properties: BTreeMap::new(),
+            body: "# Child body\n\nCreated from AFS.".to_string(),
+            source_path: "Roadmap/New child/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    assert_eq!(
+        result.changed_remote_ids,
+        vec![
+            RemoteId::new("created-page-1"),
+            RemoteId::new("page-parent")
+        ]
+    );
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::CreatedEntity {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            parent_id: RemoteId::new("page-parent"),
+            entity_id: RemoteId::new("created-page-1"),
+        }]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::CreatePage {
+            body: json!({
+                "parent": {
+                    "type": "page_id",
+                    "page_id": "page-parent",
+                },
+                "properties": {
+                    "title": {
+                        "title": rich_text_json("New child"),
+                    },
+                },
+                "children": [{
+                    "object": "block",
+                    "type": "heading_1",
+                    "heading_1": {
+                        "rich_text": rich_text_json("Child body"),
+                    },
+                }, {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": rich_text_json("Created from AFS."),
+                    },
+                }],
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_creates_database_row_with_properties_and_children() {
     let api = Arc::new(RecordingNotionApi::with_data_source_properties(
         "2026-06-10T00:00:00.000Z",

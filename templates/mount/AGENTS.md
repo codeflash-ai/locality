@@ -15,8 +15,19 @@ Working rules:
 
 Notion facts:
 - Pages are directories. Edit `page.md` for the page body; sibling entries in that directory are child Notion content.
-- Databases are directories. Existing database rows are page directories, while a new `.md` file created directly inside a database directory creates a new row.
+- To create a child page, make a new directory under the parent page directory and write that directory's `page.md`. Example: `parent-page/new-page/page.md`.
+- New page files must start with YAML frontmatter containing `title: "..."` and must not include an `afs:` identity block. AFS adds `afs.id` after the first push.
+- Existing `page.md` files already have an `afs:` block. Preserve it; edit only the body, `title`, and supported property frontmatter.
+- Databases are directories. Existing database rows are page directories. Create a row by writing either `database/new-row/page.md` or a direct `database/new-row.md`.
 - Database `_schema.yaml` files are read-only references for property names, types, select/status options, relations, and validation.
 - Edit body Markdown and editable frontmatter only. Do not edit AFS identity frontmatter, block IDs, `::afs{...}` directives, `AGENTS.md`, or `CLAUDE.md`.
 - Images and downloaded media may live under `media/`; keep references intact unless the task is specifically about media.
 - If a file has conflict markers, resolve the Markdown, remove every marker line, then rerun `afs diff` and `afs push`.
+
+New child page example:
+```markdown
+---
+title: "Target Companies & CTOs"
+---
+# Target Companies & CTOs
+```

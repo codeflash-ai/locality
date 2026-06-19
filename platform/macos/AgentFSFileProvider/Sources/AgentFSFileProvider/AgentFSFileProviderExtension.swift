@@ -1,6 +1,7 @@
 @preconcurrency import Dispatch
 @preconcurrency import FileProvider
 @preconcurrency import Foundation
+@preconcurrency import UniformTypeIdentifiers
 
 @objc(AgentFSFileProviderExtension)
 final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
@@ -122,9 +123,58 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     completionHandler:
       @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
   ) -> Progress {
-    let progress = Progress(totalUnitCount: 1)
-    completionHandler(nil, [], false, unsupportedWriteError())
-    progress.completedUnitCount = 1
+    let progress = Progress(totalUnitCount: 2)
+    let completion = UncheckedSendable(completionHandler)
+    let progressHandle = UncheckedSendable(progress)
+    let mountId = self.mountId
+    let parentIdentifier = AgentFSFileProviderItem.daemonIdentifier(itemTemplate.parentItemIdentifier)
+    let filename = itemTemplate.filename
+    let isDirectory = itemTemplate.contentType?.conforms(to: .folder) ?? false
+    let client: AgentFSDaemonClient
+    do {
+      client = try daemonClient()
+    } catch {
+      completionHandler(nil, [], false, error)
+      progress.completedUnitCount = 2
+      return progress
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let created: AgentFSMutationPayload
+        if isDirectory {
+          created = try client.createDirectory(
+            mountId: mountId,
+            parentIdentifier: parentIdentifier,
+            dirname: filename
+          )
+        } else {
+          created = try client.createFile(
+            mountId: mountId,
+            parentIdentifier: parentIdentifier,
+            filename: filename
+          )
+          if let url {
+            let data = try Data(contentsOf: url)
+            _ = try client.write(
+              mountId: mountId,
+              identifier: created.identifier,
+              contentsBase64: data.base64EncodedString()
+            )
+          }
+        }
+        progressHandle.value.completedUnitCount = 1
+        completion.value(
+          AgentFSFileProviderItem(metadata: created.item),
+          [],
+          false,
+          nil
+        )
+        progressHandle.value.completedUnitCount = 2
+      } catch {
+        completion.value(nil, fields, false, agentFSFileProviderError(error))
+        progressHandle.value.completedUnitCount = 2
+      }
+    }
     return progress
   }
 
@@ -153,6 +203,23 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     }
     DispatchQueue.global(qos: .userInitiated).async {
       do {
+        if changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier) {
+          let renamed = try client.rename(
+            mountId: mountId,
+            identifier: daemonIdentifier,
+            newParentIdentifier: AgentFSFileProviderItem.daemonIdentifier(item.parentItemIdentifier),
+            newFilename: item.filename
+          )
+          completion.value(
+            AgentFSFileProviderItem(metadata: renamed.item),
+            [],
+            false,
+            nil
+          )
+          progressHandle.value.completedUnitCount = 2
+          return
+        }
+
         guard let newContents else {
           let refreshed = try client.item(
             mountId: mountId,

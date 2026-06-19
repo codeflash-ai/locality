@@ -2516,7 +2516,22 @@ fn bundled_afs_cli_binary() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+fn app_store_distribution() -> bool {
+    option_env!("AFS_DISTRIBUTION_CHANNEL")
+        .is_some_and(|channel| channel.eq_ignore_ascii_case("mas"))
+}
+
 fn install_terminal_cli_link() -> Result<PathBuf, String> {
+    if app_store_distribution() {
+        if let Some(path) = find_command_in_path("afs") {
+            return Ok(path);
+        }
+        return Err(
+            "The Mac App Store build does not install a terminal command. Install AFS from Homebrew or the direct download to use the bundled CLI."
+                .to_string(),
+        );
+    }
+
     if running_from_read_only_volume()? {
         if let Some(path) = find_command_in_path("afs") {
             return Ok(path);
@@ -4832,8 +4847,16 @@ fn sample_pending_changes() -> Vec<PendingChange> {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init());
+    let builder = if app_store_distribution() {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_updater::Builder::new().build())
+    };
+
+    builder
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event
                 && window.label() == "main"

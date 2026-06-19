@@ -21,6 +21,9 @@ macOS IPC commands are compatibility aliases over the daemon's platform-neutral
   `virtual_fs_commit_write`. The daemon writes the replacement bytes to the
   virtual content cache and marks the page dirty so the normal review and push
   flow can decide when to update Notion.
+- `createItem(basedOn:contents:)` accepts new Markdown files and new page
+  directories. A new directory is recorded as a pending page create whose
+  writable body is the synthesized `page.md` file inside that directory.
 
 The File Provider domain identifier must be the AgentFS `mount_id`; the daemon
 uses that to resolve the mounted Notion tree. The extension talks to `afsd` over
@@ -51,6 +54,6 @@ in Finder. Opening the raw mount root is not enough to test lazy enumeration:
 Finder must enter the File Provider domain so directory listings call
 `file_provider_children` on `afsd`.
 
-The current create, rename, and delete callbacks still return unsupported.
-Those operations require separate virtual mutations and should stay aligned with
-the same daemon review and push model before they are exposed to Finder.
+Delete support still returns unsupported. Creates and renames are represented as
+daemon virtual mutations and stay pending until the normal review and push flow
+applies them to the remote source.

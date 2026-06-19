@@ -124,6 +124,20 @@ struct AgentFSWritePayload: Decodable {
   }
 }
 
+struct AgentFSMutationPayload: Decodable {
+  let mountId: String
+  let identifier: String
+  let path: String
+  let item: AgentFSItemMetadata
+
+  enum CodingKeys: String, CodingKey {
+    case mountId = "mount_id"
+    case identifier
+    case path
+    case item
+  }
+}
+
 struct AgentFSItemMetadata: Decodable {
   let identifier: String
   let parentIdentifier: String?
@@ -222,6 +236,47 @@ final class AgentFSDaemonClient: @unchecked Sendable {
       "mount_id": mountId,
       "identifier": identifier,
       "contents_base64": contentsBase64,
+    ])
+  }
+
+  func createFile(
+    mountId: String,
+    parentIdentifier: String,
+    filename: String
+  ) throws -> AgentFSMutationPayload {
+    try request([
+      "command": "virtual_fs_create_file",
+      "mount_id": mountId,
+      "parent_identifier": parentIdentifier,
+      "filename": filename,
+    ])
+  }
+
+  func createDirectory(
+    mountId: String,
+    parentIdentifier: String,
+    dirname: String
+  ) throws -> AgentFSMutationPayload {
+    try request([
+      "command": "virtual_fs_create_directory",
+      "mount_id": mountId,
+      "parent_identifier": parentIdentifier,
+      "dirname": dirname,
+    ])
+  }
+
+  func rename(
+    mountId: String,
+    identifier: String,
+    newParentIdentifier: String,
+    newFilename: String
+  ) throws -> AgentFSMutationPayload {
+    try request([
+      "command": "virtual_fs_rename",
+      "mount_id": mountId,
+      "identifier": identifier,
+      "new_parent_identifier": newParentIdentifier,
+      "new_filename": newFilename,
     ])
   }
 
