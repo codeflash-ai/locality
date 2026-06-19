@@ -209,16 +209,82 @@ pub fn default_tcp_addr() -> SocketAddr {
         .expect("default daemon TCP address is valid")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DaemonEndpoint {
+    UnixSocket(PathBuf),
+    LocalTcp(SocketAddr),
+    WindowsNamedPipe(String),
+}
+
+impl DaemonEndpoint {
+    pub fn for_state_root(state_root: &Path) -> Result<Self, DaemonClientError> {
+        #[cfg(unix)]
+        {
+            Ok(Self::UnixSocket(socket_path(state_root)))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = state_root;
+            configured_tcp_addr().map(Self::LocalTcp)
+        }
+    }
+}
+
+pub trait DaemonTransport {
+    fn send(
+        &self,
+        request: &DaemonRequest,
+        timeout: Duration,
+    ) -> Result<DaemonResponse, DaemonClientError>;
+}
+
+impl DaemonTransport for DaemonEndpoint {
+    fn send(
+        &self,
+        request: &DaemonRequest,
+        timeout: Duration,
+    ) -> Result<DaemonResponse, DaemonClientError> {
+        send_endpoint_request_with_timeout(self, request, timeout)
+    }
+}
+
+pub fn send_endpoint_request(
+    endpoint: &DaemonEndpoint,
+    request: &DaemonRequest,
+) -> Result<DaemonResponse, DaemonClientError> {
+    match endpoint {
+        DaemonEndpoint::UnixSocket(path) => send_unix_socket_request(path, request),
+        DaemonEndpoint::LocalTcp(addr) => send_tcp_request(*addr, request),
+        DaemonEndpoint::WindowsNamedPipe(name) => Err(DaemonClientError::NotAvailable(format!(
+            "daemon named pipe IPC `{name}` is not implemented yet"
+        ))),
+    }
+}
+
+pub fn send_endpoint_request_with_timeout(
+    endpoint: &DaemonEndpoint,
+    request: &DaemonRequest,
+    timeout: Duration,
+) -> Result<DaemonResponse, DaemonClientError> {
+    match endpoint {
+        DaemonEndpoint::UnixSocket(path) => {
+            send_unix_socket_request_with_timeout(path, request, timeout)
+        }
+        DaemonEndpoint::LocalTcp(addr) => send_tcp_request_with_timeout(*addr, request, timeout),
+        DaemonEndpoint::WindowsNamedPipe(name) => Err(DaemonClientError::NotAvailable(format!(
+            "daemon named pipe IPC `{name}` is not implemented yet"
+        ))),
+    }
+}
+
 #[cfg(unix)]
 pub fn send_request(
     state_root: &Path,
     request: &DaemonRequest,
 ) -> Result<DaemonResponse, DaemonClientError> {
-    let path = socket_path(state_root);
-    let mut stream = UnixStream::connect(&path)
-        .map_err(|error| DaemonClientError::NotAvailable(error.to_string()))?;
-    write_json_line(&mut stream, request).map_err(daemon_io_error)?;
-    read_response(stream)
+    let endpoint = DaemonEndpoint::for_state_root(state_root)?;
+    send_endpoint_request(&endpoint, request)
 }
 
 #[cfg(unix)]
@@ -227,8 +293,28 @@ pub fn send_request_with_timeout(
     request: &DaemonRequest,
     timeout: Duration,
 ) -> Result<DaemonResponse, DaemonClientError> {
-    let path = socket_path(state_root);
-    let mut stream = UnixStream::connect(&path)
+    let endpoint = DaemonEndpoint::for_state_root(state_root)?;
+    send_endpoint_request_with_timeout(&endpoint, request, timeout)
+}
+
+#[cfg(unix)]
+fn send_unix_socket_request(
+    path: &Path,
+    request: &DaemonRequest,
+) -> Result<DaemonResponse, DaemonClientError> {
+    let mut stream = UnixStream::connect(path)
+        .map_err(|error| DaemonClientError::NotAvailable(error.to_string()))?;
+    write_json_line(&mut stream, request).map_err(daemon_io_error)?;
+    read_response(stream)
+}
+
+#[cfg(unix)]
+fn send_unix_socket_request_with_timeout(
+    path: &Path,
+    request: &DaemonRequest,
+    timeout: Duration,
+) -> Result<DaemonResponse, DaemonClientError> {
+    let mut stream = UnixStream::connect(path)
         .map_err(|error| DaemonClientError::NotAvailable(error.to_string()))?;
     stream
         .set_read_timeout(Some(timeout))
@@ -238,6 +324,29 @@ pub fn send_request_with_timeout(
         .map_err(daemon_io_error)?;
     write_json_line(&mut stream, request).map_err(daemon_io_error)?;
     read_response(stream)
+}
+
+#[cfg(not(unix))]
+fn send_unix_socket_request(
+    path: &Path,
+    _request: &DaemonRequest,
+) -> Result<DaemonResponse, DaemonClientError> {
+    Err(DaemonClientError::NotAvailable(format!(
+        "Unix socket IPC is not available on this platform: {}",
+        path.display()
+    )))
+}
+
+#[cfg(not(unix))]
+fn send_unix_socket_request_with_timeout(
+    path: &Path,
+    _request: &DaemonRequest,
+    _timeout: Duration,
+) -> Result<DaemonResponse, DaemonClientError> {
+    Err(DaemonClientError::NotAvailable(format!(
+        "Unix socket IPC is not available on this platform: {}",
+        path.display()
+    )))
 }
 
 pub fn send_tcp_request(
@@ -272,8 +381,8 @@ pub fn send_request(
     _state_root: &Path,
     request: &DaemonRequest,
 ) -> Result<DaemonResponse, DaemonClientError> {
-    let addr = configured_tcp_addr()?;
-    send_tcp_request(addr, request)
+    let endpoint = DaemonEndpoint::for_state_root(_state_root)?;
+    send_endpoint_request(&endpoint, request)
 }
 
 #[cfg(not(unix))]
@@ -282,8 +391,8 @@ pub fn send_request_with_timeout(
     request: &DaemonRequest,
     timeout: Duration,
 ) -> Result<DaemonResponse, DaemonClientError> {
-    let addr = configured_tcp_addr()?;
-    send_tcp_request_with_timeout(addr, request, timeout)
+    let endpoint = DaemonEndpoint::for_state_root(_state_root)?;
+    send_endpoint_request_with_timeout(&endpoint, request, timeout)
 }
 
 #[cfg(not(unix))]
@@ -353,7 +462,8 @@ where
 mod tests {
     #[cfg(unix)]
     use super::DaemonClientError;
-    use super::DaemonRequest;
+    use super::{DaemonEndpoint, DaemonRequest, DaemonTransport};
+    use std::time::Duration;
 
     #[test]
     fn virtual_fs_item_command_decodes_as_platform_neutral_request() {
@@ -459,6 +569,28 @@ mod tests {
                 identifier: "page-1".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn named_pipe_endpoint_reports_not_implemented() {
+        let endpoint = DaemonEndpoint::WindowsNamedPipe(r"\\.\pipe\afs-test".to_string());
+
+        let error = endpoint
+            .send(&DaemonRequest::Ping, Duration::from_millis(1))
+            .expect_err("named pipe transport is not implemented yet");
+
+        assert!(matches!(error, super::DaemonClientError::NotAvailable(_)));
+        assert!(error.message().contains("named pipe IPC"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_root_endpoint_uses_unix_socket_on_unix() {
+        let root = std::path::PathBuf::from("/tmp/afs-state");
+
+        let endpoint = DaemonEndpoint::for_state_root(&root).expect("endpoint");
+
+        assert_eq!(endpoint, DaemonEndpoint::UnixSocket(root.join("afsd.sock")));
     }
 
     #[cfg(unix)]

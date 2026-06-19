@@ -1,12 +1,21 @@
-use std::process::Command;
+use std::io;
+use std::process::{Child, Command};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 
 pub trait SessionProcessManager {
-    fn configure_detached(&self, command: &mut Command);
+    fn spawn_detached(&self, command: &mut Command) -> io::Result<Child>;
     fn stop_command(&self, pid: &str) -> ProcessStopCommand;
 }
 
@@ -14,8 +23,9 @@ pub trait SessionProcessManager {
 pub struct DefaultSessionProcessManager;
 
 impl SessionProcessManager for DefaultSessionProcessManager {
-    fn configure_detached(&self, command: &mut Command) {
+    fn spawn_detached(&self, command: &mut Command) -> io::Result<Child> {
         configure_detached_session(command);
+        spawn_detached_session(command)
     }
 
     fn stop_command(&self, pid: &str) -> ProcessStopCommand {
@@ -70,6 +80,18 @@ fn configure_detached_session(command: &mut Command) {
 #[cfg(not(any(unix, windows)))]
 fn configure_detached_session(_command: &mut Command) {}
 
+#[cfg(windows)]
+fn spawn_detached_session(command: &mut Command) -> io::Result<Child> {
+    // Prevent shells that capture stdout/stderr from waiting on a daemon-held pipe handle.
+    let _guard = StandardHandleInheritanceGuard::disable_inheritance();
+    command.spawn()
+}
+
+#[cfg(not(windows))]
+fn spawn_detached_session(command: &mut Command) -> io::Result<Child> {
+    command.spawn()
+}
+
 fn stop_command_for_target(target_os: &str, pid: &str) -> ProcessStopCommand {
     if target_os == "windows" {
         return ProcessStopCommand::new(
@@ -84,6 +106,46 @@ fn stop_command_for_target(target_os: &str, pid: &str) -> ProcessStopCommand {
     }
 
     ProcessStopCommand::new("kill", vec![pid.to_string()])
+}
+
+#[cfg(windows)]
+struct StandardHandleInheritanceGuard {
+    saved: Vec<(HANDLE, u32)>,
+}
+
+#[cfg(windows)]
+impl StandardHandleInheritanceGuard {
+    fn disable_inheritance() -> Self {
+        let mut saved = Vec::new();
+        for handle_id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = unsafe { GetStdHandle(handle_id) };
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+
+            let mut flags = 0;
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+                continue;
+            }
+            if flags & HANDLE_FLAG_INHERIT == 0 {
+                continue;
+            }
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+                saved.push((handle, flags));
+            }
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StandardHandleInheritanceGuard {
+    fn drop(&mut self) {
+        for (handle, flags) in self.saved.drain(..) {
+            let inherit_flag = flags & HANDLE_FLAG_INHERIT;
+            let _ = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, inherit_flag) };
+        }
+    }
 }
 
 #[cfg(test)]

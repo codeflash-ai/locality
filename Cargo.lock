@@ -95,6 +95,7 @@ version = "0.1.0"
 dependencies = [
  "afs-store",
  "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

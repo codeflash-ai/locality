@@ -6,12 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use afs_platform::{DefaultSessionProcessManager, SessionProcessManager};
-#[cfg(not(windows))]
-use afsd::ipc::send_request_with_timeout;
-#[cfg(windows)]
-use afsd::ipc::send_tcp_request_with_timeout;
 use afsd::ipc::{
-    DaemonClientError, DaemonReloadReport, DaemonRequest, DaemonResponse, DaemonStatusReport,
+    DaemonClientError, DaemonEndpoint, DaemonReloadReport, DaemonRequest, DaemonResponse,
+    DaemonStatusReport, send_endpoint_request_with_timeout,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -537,16 +534,23 @@ fn send_daemon_request(
     request: &DaemonRequest,
     timeout: Duration,
 ) -> Result<DaemonResponse, DaemonClientError> {
+    let endpoint = control_endpoint(options, paths)?;
+    send_endpoint_request_with_timeout(&endpoint, request, timeout)
+}
+
+fn control_endpoint(
+    options: &DaemonOptions,
+    paths: &DaemonPaths,
+) -> Result<DaemonEndpoint, DaemonClientError> {
     #[cfg(windows)]
     {
-        let addr = control_tcp_addr(options, paths)?;
-        send_tcp_request_with_timeout(addr, request, timeout)
+        control_tcp_addr(options, paths).map(DaemonEndpoint::LocalTcp)
     }
 
     #[cfg(not(windows))]
     {
         let _ = options;
-        send_request_with_timeout(&paths.state_root, request, timeout)
+        Ok(DaemonEndpoint::UnixSocket(paths.socket.clone()))
     }
 }
 
@@ -635,10 +639,8 @@ fn start_session(
     if let Some(tcp_addr) = &options.tcp_addr {
         command.env("AFS_DAEMON_TCP_ADDR", tcp_addr);
     }
-    DefaultSessionProcessManager.configure_detached(&mut command);
-
-    let child = command
-        .spawn()
+    let child = DefaultSessionProcessManager
+        .spawn_detached(&mut command)
         .map_err(|error| DaemonControlError::new("start_failed", error.to_string()))?;
     fs::write(&paths.pid_file, child.id().to_string())
         .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
