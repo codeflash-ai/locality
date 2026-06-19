@@ -4,6 +4,24 @@ AgentFS mounts systems of record as real Markdown files that agents and editors 
 
 This repository contains the Rust workspace for the `plan.md` design and the first functional slices of the core sync engine, CLI, store, daemon hydration loop, and Notion connector.
 
+## Install on macOS
+
+AFS publishes an Apple Silicon macOS build through Homebrew:
+
+```sh
+brew tap codeflash-ai/tap
+brew install --cask afs
+```
+
+To update an existing Homebrew install:
+
+```sh
+brew update
+brew upgrade --cask afs
+```
+
+The public Homebrew build currently requires an Apple Silicon Mac running macOS 14 Sonoma or newer.
+
 ## Development
 
 The root `Makefile` is the easiest way to run common project tasks:

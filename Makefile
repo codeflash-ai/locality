@@ -49,6 +49,14 @@ publish: setup ## Build, sign, notarize, staple, and validate a macOS DMG.
 publish-linux: setup ## Build and validate Linux .deb and .rpm packages.
 	scripts/publish-linux.sh
 
+.PHONY: render-homebrew-cask
+render-homebrew-cask: ## Render a Homebrew cask from published macOS DMG artifacts.
+	scripts/render-homebrew-cask.sh
+
+.PHONY: render-updater-manifest
+render-updater-manifest: ## Render the Tauri updater latest-macos.json manifest.
+	scripts/render-tauri-updater-manifest.sh
+
 .PHONY: prepare-macos-file-provider
 prepare-macos-file-provider: ## Stage the macOS File Provider extension for Tauri packaging.
 	$(DESKTOP_DIR)/scripts/prepare-macos-file-provider.sh

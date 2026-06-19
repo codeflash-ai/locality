@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   AlertTriangle,
   Bot,
@@ -9,6 +11,7 @@ import {
   Clipboard,
   Clock3,
   Copy,
+  Download,
   EyeOff,
   FolderOpen,
   History,
@@ -16,6 +19,7 @@ import {
   ListChecks,
   Loader2,
   Power,
+  RefreshCw,
   RotateCcw,
   Search,
   Settings,
@@ -99,6 +103,13 @@ type PushPlan = {
 type ActionReport = {
   ok: boolean;
   message: string;
+};
+
+type UpdateStatus = {
+  state: "idle" | "checking" | "available" | "installing" | "current" | "error";
+  message: string;
+  update: Update | null;
+  version?: string;
 };
 
 type FileDetailReport = {
@@ -294,6 +305,19 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function emptyUpdateStatus(): UpdateStatus {
+  return { state: "idle", message: "", update: null };
+}
+
+function updaterErrorMessage(error: unknown) {
+  const message = errorMessage(error);
+  const lower = message.toLowerCase();
+  if (lower.includes("updater") && (lower.includes("config") || lower.includes("endpoint"))) {
+    return "Updates are not configured for this build.";
+  }
+  return message;
+}
+
 function useNotionSearchResults(query: string, enabled = true) {
   const [results, setResults] = useState<LocatedItem[]>([]);
   const [searching, setSearching] = useState(false);
@@ -353,12 +377,86 @@ export default function App() {
   const [onboardingInitialStep, setOnboardingInitialStep] = useState<1 | 4>(() =>
     route === "#onboarding-ready" ? 4 : 1,
   );
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
   const setupIsComplete = setupComplete(snapshot);
 
   async function refreshSnapshot() {
     const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
     setSnapshot(nextSnapshot);
     setSnapshotLoaded(true);
+  }
+
+  async function checkForAppUpdate(options: { silent?: boolean } = {}) {
+    if (!isTauriRuntime()) {
+      if (!options.silent) {
+        setUpdateStatus({
+          state: "error",
+          message: "Updates are available in the packaged app.",
+          update: null,
+        });
+      }
+      return;
+    }
+
+    if (!options.silent) {
+      setUpdateStatus({ state: "checking", message: "Checking for updates.", update: null });
+    }
+
+    try {
+      const update = await check();
+      if (!update) {
+        if (!options.silent) {
+          setUpdateStatus({ state: "current", message: "AFS is up to date.", update: null });
+        }
+        return;
+      }
+
+      setUpdateStatus({
+        state: "available",
+        message: `AFS ${update.version} is ready to install.`,
+        update,
+        version: update.version,
+      });
+    } catch (error) {
+      if (!options.silent) {
+        setUpdateStatus({ state: "error", message: updaterErrorMessage(error), update: null });
+      }
+    }
+  }
+
+  async function installAppUpdate() {
+    if (!isTauriRuntime()) {
+      setUpdateStatus({
+        state: "error",
+        message: "Updates are available in the packaged app.",
+        update: null,
+      });
+      return;
+    }
+
+    setUpdateStatus((current) => ({
+      ...current,
+      state: "installing",
+      message: current.version ? `Installing AFS ${current.version}.` : "Installing update.",
+    }));
+
+    try {
+      const update = updateStatus.update ?? (await check());
+      if (!update) {
+        setUpdateStatus({ state: "current", message: "AFS is up to date.", update: null });
+        return;
+      }
+      await update.downloadAndInstall();
+      setUpdateStatus({
+        state: "installing",
+        message: "Restarting AFS to finish the update.",
+        update: null,
+        version: update.version,
+      });
+      await relaunch();
+    } catch (error) {
+      setUpdateStatus({ state: "error", message: updaterErrorMessage(error), update: null });
+    }
   }
 
   useEffect(() => {
@@ -379,6 +477,18 @@ export default function App() {
       setSnapshot(sampleSnapshot);
       setSnapshotLoaded(true);
     });
+  }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => {
+      void checkForAppUpdate({ silent: true });
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
   }, []);
 
   useEffect(() => {
@@ -482,6 +592,10 @@ export default function App() {
       view={view}
       onViewChange={setView}
       onRefresh={refreshSnapshot}
+      updateStatus={updateStatus}
+      onCheckForUpdate={checkForAppUpdate}
+      onInstallUpdate={installAppUpdate}
+      onDismissUpdate={() => setUpdateStatus(emptyUpdateStatus())}
       onResetComplete={() => {
         setOnboardingInitialStep(1);
         setOnboardingKey((key) => key + 1);
@@ -1047,12 +1161,20 @@ function MainShell({
   view,
   onViewChange,
   onRefresh,
+  updateStatus,
+  onCheckForUpdate,
+  onInstallUpdate,
+  onDismissUpdate,
   onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
   view: AppView;
   onViewChange: (view: AppView) => void;
   onRefresh: () => Promise<void>;
+  updateStatus: UpdateStatus;
+  onCheckForUpdate: (options?: { silent?: boolean }) => Promise<void>;
+  onInstallUpdate: () => Promise<void>;
+  onDismissUpdate: () => void;
   onResetComplete: () => void;
 }) {
   const meta = snapshot.health.attentionCount > 0 ? "Pending Changes" : "Ready";
@@ -1115,6 +1237,12 @@ function MainShell({
         </aside>
 
         <section className="content">
+          <UpdateBanner
+            status={updateStatus}
+            onInstall={onInstallUpdate}
+            onDismiss={onDismissUpdate}
+            onSettings={() => onViewChange("settings")}
+          />
           {view === "home" && (
             <HomeView
               snapshot={snapshot}
@@ -1154,12 +1282,57 @@ function MainShell({
               snapshot={snapshot}
               onHome={() => onViewChange("home")}
               onRefresh={onRefresh}
+              updateStatus={updateStatus}
+              onCheckForUpdate={onCheckForUpdate}
+              onInstallUpdate={onInstallUpdate}
               onResetComplete={onResetComplete}
             />
           )}
         </section>
       </div>
     </main>
+  );
+}
+
+function UpdateBanner({
+  status,
+  onInstall,
+  onDismiss,
+  onSettings,
+}: {
+  status: UpdateStatus;
+  onInstall: () => Promise<void>;
+  onDismiss: () => void;
+  onSettings: () => void;
+}) {
+  if (status.state !== "available" && status.state !== "installing") {
+    return null;
+  }
+
+  const installing = status.state === "installing";
+  return (
+    <div className="update-banner">
+      <div>
+        <strong>{status.version ? `AFS ${status.version} available` : "AFS update available"}</strong>
+        <p>{status.message}</p>
+      </div>
+      <div className="update-banner-actions">
+        <SecondaryButton compact onClick={onSettings}>
+          Settings
+        </SecondaryButton>
+        <PrimaryButton
+          compact
+          icon={installing ? <Loader2 className="spin-icon" /> : <Download />}
+          disabled={installing}
+          onClick={() => void onInstall()}
+        >
+          {installing ? "Installing" : "Install"}
+        </PrimaryButton>
+        <button className="update-dismiss" aria-label="Dismiss update notice" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1780,11 +1953,17 @@ function SettingsView({
   snapshot,
   onHome,
   onRefresh,
+  updateStatus,
+  onCheckForUpdate,
+  onInstallUpdate,
   onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
   onHome: () => void;
   onRefresh: () => Promise<void>;
+  updateStatus: UpdateStatus;
+  onCheckForUpdate: (options?: { silent?: boolean }) => Promise<void>;
+  onInstallUpdate: () => Promise<void>;
   onResetComplete: () => void;
 }) {
   const [diagnosticMessage, setDiagnosticMessage] = useState("");
@@ -1796,6 +1975,9 @@ function SettingsView({
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const daemonStopped = snapshot.health.state === "stopped";
+  const checkingForUpdate = updateStatus.state === "checking";
+  const installingUpdate = updateStatus.state === "installing";
+  const updateAvailable = updateStatus.state === "available" || updateStatus.state === "installing";
 
   useEffect(() => {
     setLocalSettings(snapshot.settings);
@@ -1936,6 +2118,34 @@ function SettingsView({
           <SettingRow title="Local edits" value="Pending until reviewed" />
           <SettingRow title="Push confirmation" value="Require for large changes" />
           <SettingRow title="Default new mount mode" value="Edit enabled" />
+        </div>
+
+        <div className="panel">
+          <PanelTitle title="Updates" />
+          <SettingRow title="Channel" value="GitHub Releases" />
+          <SettingRow
+            title="Status"
+            value={updateStatus.message || "Ready"}
+          />
+          {updateStatus.version && <SettingRow title="Available version" value={updateStatus.version} />}
+          <div className="button-row">
+            <SecondaryButton
+              compact
+              icon={checkingForUpdate ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+              disabled={checkingForUpdate || installingUpdate}
+              onClick={() => void onCheckForUpdate()}
+            >
+              {checkingForUpdate ? "Checking" : "Check"}
+            </SecondaryButton>
+            <PrimaryButton
+              compact
+              icon={installingUpdate ? <Loader2 className="spin-icon" /> : <Download />}
+              disabled={!updateAvailable || checkingForUpdate || installingUpdate}
+              onClick={() => void onInstallUpdate()}
+            >
+              {installingUpdate ? "Installing" : "Install"}
+            </PrimaryButton>
+          </div>
         </div>
 
         <div className="panel">
