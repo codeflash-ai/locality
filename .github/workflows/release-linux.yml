@@ -47,6 +47,19 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           persist-credentials: false
 
+      - name: Verify release tag is current main
+        run: |
+          git fetch --force --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          main_commit="$(git rev-parse "origin/main^{commit}")"
+          if [[ "${tag_commit}" != "${main_commit}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} must point at current origin/main (${main_commit}); got ${tag_commit}."
+            exit 1
+          fi
+          echo "Release tag ${RELEASE_TAG} points at current origin/main (${main_commit})."
+
       - name: Verify tag matches app version
         run: |
           version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' apps/desktop/src-tauri/tauri.conf.json | head -n 1)"
