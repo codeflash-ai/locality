@@ -52,6 +52,28 @@ jobs:
         run: npm run build
         working-directory: apps/desktop
 
+  windows:
+    name: Windows tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Windows Rust tests
+        run: >
+          cargo test
+          -p afs-core
+          -p afs-connector
+          -p afs-store
+          -p afs-platform
+          -p afs-notion
+          -p afsd
+          -p afs-cli
+          --all-targets
+          --no-fail-fast
+      - name: Check Linux-only FUSE stub
+        run: cargo check -p afs-fuse
+
   macos:
     name: macOS tests
     runs-on: macos-15

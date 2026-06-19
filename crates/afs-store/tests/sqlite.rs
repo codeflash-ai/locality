@@ -89,6 +89,10 @@ fn persisted_json_uses_stable_snake_case_names() {
         "\"linux_fuse\""
     );
     assert_eq!(
+        serde_json::to_string(&ProjectionMode::WindowsCloudFiles).expect("projection json"),
+        "\"windows_cloud_files\""
+    );
+    assert_eq!(
         serde_json::to_string(&FreshnessTier::Hot).expect("freshness tier json"),
         "\"hot\""
     );

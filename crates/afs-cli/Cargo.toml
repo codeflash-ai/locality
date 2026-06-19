@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 afs-core.workspace = true
 afs-connector.workspace = true
+afs-platform.workspace = true
 afs-store.workspace = true
 afs-notion.workspace = true
 afsd = { path = "../afsd" }

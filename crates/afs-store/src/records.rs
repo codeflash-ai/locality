@@ -43,6 +43,7 @@ pub enum ProjectionMode {
     PlainFiles,
     MacosFileProvider,
     LinuxFuse,
+    WindowsCloudFiles,
 }
 
 impl ProjectionMode {
@@ -51,11 +52,15 @@ impl ProjectionMode {
             Self::PlainFiles => "plain_files",
             Self::MacosFileProvider => "macos_file_provider",
             Self::LinuxFuse => "linux_fuse",
+            Self::WindowsCloudFiles => "windows_cloud_files",
         }
     }
 
     pub fn uses_virtual_filesystem(&self) -> bool {
-        matches!(self, Self::MacosFileProvider | Self::LinuxFuse)
+        matches!(
+            self,
+            Self::MacosFileProvider | Self::LinuxFuse | Self::WindowsCloudFiles
+        )
     }
 }
 

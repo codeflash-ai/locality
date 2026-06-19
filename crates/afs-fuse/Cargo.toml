@@ -10,7 +10,7 @@ rust-version.workspace = true
 name = "afs-fuse"
 path = "src/main.rs"
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 afs-core.workspace = true
 afsd = { path = "../afsd" }
 base64 = "0.22"

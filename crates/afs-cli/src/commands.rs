@@ -4119,23 +4119,9 @@ fn projection_mode(args: &[String]) -> Result<ProjectionMode, String> {
 }
 
 fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<ProjectionMode, String> {
-    match flag_value(args, "--projection") {
-        None | Some("plain-files") => Ok(ProjectionMode::PlainFiles),
-        Some("macos-file-provider") if target_os == "macos" => {
-            Ok(ProjectionMode::MacosFileProvider)
-        }
-        Some("linux-fuse") if target_os == "linux" => Ok(ProjectionMode::LinuxFuse),
-        Some("macos-file-provider") => Err(format!(
-            "--projection macos-file-provider is only supported on macOS; this binary is running on {target_os}"
-        )),
-        Some("linux-fuse") => Err(format!(
-            "--projection linux-fuse is only supported on Linux; this binary is running on {target_os}"
-        )),
-        Some(_) => Err(format!(
-            "--projection must be {}",
-            projection_usage_options_for_target(target_os)
-        )),
-    }
+    afs_platform::mount_cli_capabilities_for_target(target_os)
+        .projection_from_cli_value(flag_value(args, "--projection"))
+        .map_err(|error| error.message())
 }
 
 fn mount_usage() -> String {
@@ -4147,12 +4133,8 @@ fn mount_usage() -> String {
     )
 }
 
-fn projection_usage_options_for_target(target_os: &str) -> &'static str {
-    match target_os {
-        "macos" => "plain-files|macos-file-provider",
-        "linux" => "plain-files|linux-fuse",
-        _ => "plain-files",
-    }
+fn projection_usage_options_for_target(target_os: &str) -> String {
+    afs_platform::mount_cli_capabilities_for_target(target_os).projection_usage_options()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4170,10 +4152,7 @@ impl VirtualProjectionRegistration {
     }
 
     fn projection_cli_value(self) -> &'static str {
-        match self {
-            Self::MacosFileProvider => "macos-file-provider",
-            Self::LinuxFuse => "linux-fuse",
-        }
+        afs_platform::capabilities::projection_cli_value(&self.projection())
     }
 }
 
@@ -4209,9 +4188,11 @@ fn validate_virtual_projection_registration(
 fn virtual_projection_registration_for_target(
     target_os: &str,
 ) -> Option<VirtualProjectionRegistration> {
-    match target_os {
-        "macos" => Some(VirtualProjectionRegistration::MacosFileProvider),
-        "linux" => Some(VirtualProjectionRegistration::LinuxFuse),
+    match afs_platform::mount_cli_capabilities_for_target(target_os).virtual_registration {
+        Some(ProjectionMode::MacosFileProvider) => {
+            Some(VirtualProjectionRegistration::MacosFileProvider)
+        }
+        Some(ProjectionMode::LinuxFuse) => Some(VirtualProjectionRegistration::LinuxFuse),
         _ => None,
     }
 }
@@ -4299,15 +4280,7 @@ fn takes_value(arg: &str) -> bool {
 }
 
 fn default_state_root() -> PathBuf {
-    if let Ok(value) = std::env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
+    afs_platform::default_state_root()
 }
 
 fn escape_json_string(value: &str) -> String {

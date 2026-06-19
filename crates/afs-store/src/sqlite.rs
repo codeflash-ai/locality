@@ -332,7 +332,7 @@ impl ConnectorProfileRepository for SqliteStateStore {
 impl EntityRepository for SqliteStateStore {
     fn save_entity(&mut self, entity: EntityRecord) -> StoreResult<()> {
         let connection = self.connection()?;
-        let path = path_to_text(&entity.path);
+        let path = logical_path_to_text(&entity.path);
         let kind_json = to_json(&entity.kind)?;
         let hydration_json = to_json(&entity.hydration)?;
         let existing_remote_id: Option<String> = connection
@@ -411,7 +411,11 @@ impl EntityRepository for SqliteStateStore {
         let connection = self.connection()?;
         let sql = format!("{ENTITY_SELECT_WITH_WHERE}WHERE mount_id = ?1 AND path = ?2");
         connection
-            .query_row(&sql, params![mount_id.0, path_to_text(path)], entity_row)
+            .query_row(
+                &sql,
+                params![mount_id.0, logical_path_to_text(path)],
+                entity_row,
+            )
             .optional()?
             .map(entity_from_row)
             .transpose()
@@ -665,8 +669,8 @@ impl VirtualMutationRepository for SqliteStateStore {
                 mutation
                     .original_path
                     .as_ref()
-                    .map(|path| path_to_text(path)),
-                path_to_text(&mutation.projected_path),
+                    .map(|path| logical_path_to_text(path)),
+                logical_path_to_text(&mutation.projected_path),
                 mutation.title,
                 mutation
                     .content_path
@@ -705,7 +709,7 @@ impl VirtualMutationRepository for SqliteStateStore {
         connection
             .query_row(
                 &sql,
-                params![mount_id.0, path_to_text(path)],
+                params![mount_id.0, logical_path_to_text(path)],
                 virtual_mutation_row,
             )
             .optional()?
@@ -746,7 +750,7 @@ impl RemoteObservationRepository for SqliteStateStore {
             .parent_remote_id
             .as_ref()
             .map(|remote_id| remote_id.0.as_str());
-        let projected_path = path_to_text(&observation.projected_path);
+        let projected_path = logical_path_to_text(&observation.projected_path);
         connection.execute(
             "INSERT INTO remote_observations (
                 mount_id,
@@ -2029,6 +2033,10 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreRes
 
 fn path_to_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn logical_path_to_text(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn bool_to_int(value: bool) -> i64 {

@@ -616,15 +616,9 @@ fn render_template_body(body: &str, title: Option<&str>, pack_id: &str) -> Strin
 }
 
 fn replace_frontmatter_title(body: &str, title: &str) -> String {
-    if !body.starts_with("---\n") {
-        return body.to_string();
-    }
-
-    let Some(end_marker_start) = body[4..].find("\n---\n").map(|index| index + 5) else {
+    let Some((frontmatter, rest)) = split_frontmatter_body(body) else {
         return body.to_string();
     };
-    let frontmatter = &body[4..end_marker_start - 1];
-    let rest = &body[end_marker_start..];
     let title_line = format!("title: \"{}\"", yaml_double_quoted(title));
     let mut replaced = false;
     let mut next_frontmatter = Vec::new();
@@ -641,6 +635,18 @@ fn replace_frontmatter_title(body: &str, title: &str) -> String {
     }
 
     format!("---\n{}\n{}", next_frontmatter.join("\n"), rest)
+}
+
+fn split_frontmatter_body(body: &str) -> Option<(&str, &str)> {
+    let content = body
+        .strip_prefix("---\n")
+        .or_else(|| body.strip_prefix("---\r\n"))?;
+    for marker in ["\n---\n", "\r\n---\r\n", "\n---\r\n", "\r\n---\n"] {
+        if let Some(index) = content.find(marker) {
+            return Some((&content[..index], &content[index + marker.len()..]));
+        }
+    }
+    None
 }
 
 fn yaml_double_quoted(value: &str) -> String {

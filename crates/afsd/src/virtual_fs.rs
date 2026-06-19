@@ -1731,7 +1731,7 @@ fn title_from_filename(filename: &str) -> String {
 }
 
 fn path_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+    afs_platform::logical_path_display(path)
 }
 
 fn content_path_for_relative(content_root: &Path, relative_path: &Path) -> AfsResult<PathBuf> {

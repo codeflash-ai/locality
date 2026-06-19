@@ -995,21 +995,12 @@ fn takes_value(arg: &str) -> bool {
 }
 
 fn default_state_root() -> PathBuf {
-    if let Ok(value) = env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
-
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
+    afs_platform::default_state_root()
 }
 
 fn home_dir() -> Result<PathBuf, DaemonControlError> {
-    env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| DaemonControlError::new("env_missing", "HOME is not set"))
+    afs_platform::user_home()
+        .ok_or_else(|| DaemonControlError::new("env_missing", "home directory is not set"))
 }
 
 #[allow(dead_code)]

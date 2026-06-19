@@ -2226,6 +2226,7 @@ fn projection_label(projection: &ProjectionMode) -> &'static str {
         ProjectionMode::PlainFiles => "Plain files",
         ProjectionMode::MacosFileProvider => "macOS File Provider",
         ProjectionMode::LinuxFuse => "Linux FUSE",
+        ProjectionMode::WindowsCloudFiles => "Windows Cloud Files",
     }
 }
 
@@ -2417,6 +2418,8 @@ fn desktop_projection_mode() -> ProjectionMode {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
+        // Windows Cloud Files is the target product projection, but plain files
+        // stay as the desktop fallback until the provider helper exists.
         ProjectionMode::PlainFiles
     }
 }
@@ -3103,7 +3106,9 @@ fn signal_virtual_projection_container(
         ProjectionMode::MacosFileProvider => {
             signal_macos_virtual_projection(&mount.mount_id.0, container_identifier)
         }
-        ProjectionMode::LinuxFuse | ProjectionMode::PlainFiles => Ok(()),
+        ProjectionMode::LinuxFuse
+        | ProjectionMode::PlainFiles
+        | ProjectionMode::WindowsCloudFiles => Ok(()),
     }
 }
 
@@ -3140,6 +3145,9 @@ fn register_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result
         }
         ProjectionMode::LinuxFuse => register_linux_virtual_projection(state_root, mount),
         ProjectionMode::PlainFiles => Ok(()),
+        ProjectionMode::WindowsCloudFiles => {
+            Err("Windows Cloud Files projection registration is not implemented yet".to_string())
+        }
     }
 }
 
@@ -3203,6 +3211,9 @@ fn open_virtual_projection(mount: &MountConfig) -> Result<(), String> {
         ProjectionMode::MacosFileProvider => open_macos_virtual_projection(mount),
         ProjectionMode::LinuxFuse => open_in_file_manager(&mount_access_root(mount)),
         ProjectionMode::PlainFiles => open_in_file_manager(&mount.root),
+        ProjectionMode::WindowsCloudFiles => {
+            Err("Windows Cloud Files projection opening is not implemented yet".to_string())
+        }
     }
 }
 

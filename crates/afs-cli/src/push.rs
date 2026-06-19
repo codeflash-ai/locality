@@ -424,13 +424,27 @@ fn push_error_suggested_fix(error: &PushJobError, path: &str) -> Option<String> 
 }
 
 fn shell_quote(value: &str) -> String {
-    if value.chars().all(|character| {
-        character.is_ascii_alphanumeric()
-            || matches!(character, '/' | '.' | '_' | '-' | '~' | ':' | '=')
-    }) {
-        return value.to_string();
+    #[cfg(windows)]
+    {
+        if value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '/' | '\\' | '.' | '_' | '-' | '~' | ':' | '=')
+        }) {
+            return value.to_string();
+        }
+        return format!("'{}'", value.replace('\'', "''"));
     }
-    format!("'{}'", value.replace('\'', "'\\''"))
+
+    #[cfg(not(windows))]
+    {
+        if value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '/' | '.' | '_' | '-' | '~' | ':' | '=')
+        }) {
+            return value.to_string();
+        }
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 fn remote_ids_to_strings(remote_ids: Vec<RemoteId>) -> Vec<String> {

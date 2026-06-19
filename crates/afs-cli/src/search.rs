@@ -461,7 +461,8 @@ fn remote_state(
 
     SearchRemoteState {
         observed_title: title_changed.then(|| observation.title.clone()),
-        observed_path: path_changed.then(|| observation.projected_path.display().to_string()),
+        observed_path: path_changed
+            .then(|| afs_platform::logical_path_display(&observation.projected_path)),
         observed_at: Some(observation.observed_at.clone()),
         changed,
         deleted: observation.deleted,
