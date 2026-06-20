@@ -234,6 +234,9 @@ try {
     }
 
     $tcpAddr = Get-FreeTcpAddr
+    $env:AFS_STATE_DIR = $stateRoot
+    $env:NOTION_TOKEN = $notionToken
+    $env:AFS_CLOUD_FILES_BIN = $cloudFilesBin
     $parentPageId = Normalize-NotionId $parentPageId
     $scratchTitle = "AFS Cloud Files live $unique"
     $initialBody = "Initial paragraph created by the Windows Cloud Files live e2e."
@@ -281,7 +284,7 @@ try {
             "--mount-id", $mountId,
             "--projection", "windows-cloud-files",
             "--json"
-        ) -Step "afs mount"
+        ) -Step "afs mount" | Out-Null
     } finally {
         if ($null -eq $previousDisable) {
             Remove-Item Env:\AFS_DAEMON_DISABLE -ErrorAction SilentlyContinue
@@ -290,10 +293,7 @@ try {
         }
     }
 
-    $env:AFS_STATE_DIR = $stateRoot
     $env:AFS_DAEMON_TCP_ADDR = $tcpAddr
-    $env:NOTION_TOKEN = $notionToken
-    $env:AFS_CLOUD_FILES_BIN = $cloudFilesBin
     if (-not $env:AFS_CLOUD_FILES_TRACE) {
         $env:AFS_CLOUD_FILES_TRACE = "1"
     }
