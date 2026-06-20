@@ -37,7 +37,7 @@ struct FuseOptions {
     mountpoint: PathBuf,
 }
 
-pub fn main() {
+pub(super) fn main() {
     if let Err(error) = run() {
         eprintln!("afs-fuse: {error}");
         std::process::exit(1);

@@ -26,8 +26,88 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-preflight:
+    name: Release preflight
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Verify release tag is current main
+        run: |
+          git fetch --force --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          main_commit="$(git rev-parse "origin/main^{commit}")"
+          if [[ "${tag_commit}" != "${main_commit}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} must point at current origin/main (${main_commit}); got ${tag_commit}."
+            exit 1
+          fi
+
+      - name: Verify tag matches app version
+        run: |
+          version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' apps/desktop/src-tauri/tauri.conf.json | head -n 1)"
+          if [[ -z "${version}" ]]; then
+            echo "::error::Could not read Tauri app version."
+            exit 1
+          fi
+          expected="v${version}"
+          if [[ "${RELEASE_TAG}" != "${expected}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} does not match app version ${version}; expected ${expected}."
+            exit 1
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Select stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fuse3 \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            sqlite3
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Rust tests
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run real Linux FUSE smoke test
+        run: AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
+
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Build desktop web UI
+        run: npm run build
+        working-directory: apps/desktop
+
   linux-x64:
     name: Build and publish Linux x64
+    needs: release-preflight
     runs-on: ubuntu-24.04
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}

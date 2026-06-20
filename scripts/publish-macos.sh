@@ -168,6 +168,44 @@ verify_signed_app_in_dmg() (
   [[ "${appex_signature}" == *"Developer ID Application"* ]] \
     || fail "AgentFSFileProvider.appex is not signed with a Developer ID Application identity"
   grep -a -F -q "${expected_build}" "${app}/Contents/MacOS/afsd"
+  smoke_test_desktop_app "${app}"
+)
+
+smoke_test_desktop_app() (
+  local app="$1"
+  local tmpdir stdout stderr pid status
+  tmpdir="$(mktemp -d)"
+  stdout="${tmpdir}/stdout.log"
+  stderr="${tmpdir}/stderr.log"
+
+  cleanup() {
+    if [[ -n "${pid:-}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+      kill "${pid}" >/dev/null 2>&1 || true
+      wait "${pid}" >/dev/null 2>&1 || true
+    fi
+    rm -rf "${tmpdir}"
+  }
+  trap cleanup EXIT
+
+  AFS_DESKTOP_SMOKE_TEST=1 "${app}/Contents/MacOS/afs-desktop" >"${stdout}" 2>"${stderr}" &
+  pid="$!"
+
+  for _ in {1..20}; do
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      if wait "${pid}"; then
+        return 0
+      fi
+      status="$?"
+      cat "${stdout}" >&2 || true
+      cat "${stderr}" >&2 || true
+      fail "${PRODUCT_NAME}.app launch smoke test failed with exit code ${status}"
+    fi
+    sleep 0.5
+  done
+
+  cat "${stdout}" >&2 || true
+  cat "${stderr}" >&2 || true
+  fail "${PRODUCT_NAME}.app launch smoke test did not exit"
 )
 
 validate_notarized_dmg() {

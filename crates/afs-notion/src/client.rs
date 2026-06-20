@@ -31,6 +31,23 @@ const DEFAULT_NOTION_REQUEST_BURST: f64 = 3.0;
 const DEFAULT_NOTION_RATE_LIMIT_RETRIES: usize = 4;
 
 static NOTION_RATE_LIMITER: OnceLock<Mutex<NotionRateLimiter>> = OnceLock::new();
+static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
+
+pub fn notion_http_client() -> Client {
+    ensure_reqwest_crypto_provider();
+    Client::new()
+}
+
+fn notion_http_client_builder() -> reqwest::blocking::ClientBuilder {
+    ensure_reqwest_crypto_provider();
+    Client::builder()
+}
+
+fn ensure_reqwest_crypto_provider() {
+    REQWEST_CRYPTO_PROVIDER.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 pub trait NotionApi: std::fmt::Debug + Send + Sync {
     fn retrieve_current_user(&self) -> AfsResult<serde_json::Value> {
@@ -105,10 +122,10 @@ pub struct HttpNotionApi {
 
 impl HttpNotionApi {
     pub fn new(config: NotionConfig) -> Self {
-        let client = Client::builder()
+        let client = notion_http_client_builder()
             .timeout(notion_http_timeout())
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .unwrap_or_else(|_| notion_http_client());
         Self { config, client }
     }
 

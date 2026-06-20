@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::client::{DEFAULT_NOTION_API_BASE_URL, DEFAULT_NOTION_VERSION};
+use crate::client::{DEFAULT_NOTION_API_BASE_URL, DEFAULT_NOTION_VERSION, notion_http_client};
 
 pub const DEFAULT_NOTION_OAUTH_AUTHORIZE_URL: &str = "https://api.notion.com/v1/oauth/authorize";
 pub const DEFAULT_AFS_NOTION_OAUTH_BROKER_URL: &str =
@@ -186,7 +186,7 @@ impl HttpNotionOAuthBrokerClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client: notion_http_client(),
         }
     }
 
@@ -352,7 +352,7 @@ pub struct HttpNotionOAuthClient {
 impl HttpNotionOAuthClient {
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: notion_http_client(),
         }
     }
 

@@ -8,7 +8,7 @@ use afs_core::canonical::parse_canonical_markdown;
 use afs_core::journal::{PushId, PushOperationId};
 use afs_core::model::{MountId, RemoteId};
 use afs_core::planner::{PropertyValue, PushOperation, PushPlan};
-use afs_notion::client::{DEFAULT_NOTION_API_BASE_URL, DEFAULT_NOTION_VERSION};
+use afs_notion::client::{DEFAULT_NOTION_API_BASE_URL, DEFAULT_NOTION_VERSION, notion_http_client};
 use afs_notion::dto::{DatabaseDto, NotionPageBundle, PageDto};
 use afs_notion::schema::validate_create_row_frontmatter;
 use afs_notion::{NotionConfig, NotionConnector};
@@ -724,7 +724,7 @@ impl LiveNotion {
     fn new(token: String) -> Self {
         Self {
             token,
-            client: Client::new(),
+            client: notion_http_client(),
         }
     }
 
