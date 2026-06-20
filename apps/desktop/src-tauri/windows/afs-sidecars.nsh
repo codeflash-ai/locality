@@ -20,8 +20,8 @@
 
 !macro NSIS_HOOK_POSTINSTALL
   SetOutPath "$INSTDIR"
-  File /oname=afs.exe "${__FILEDIR__}\afs.exe"
-  File /oname=afsd.exe "${__FILEDIR__}\afsd.exe"
+  File /oname=afs.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afs.exe"
+  File /oname=afsd.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\afsd.exe"
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
