@@ -54,6 +54,7 @@ type DesktopSnapshot = {
     projection: string;
     readOnly: boolean;
     status: string;
+    provider?: ProviderRuntimeSummary | null;
   };
   settings: {
     launchAtLogin: boolean;
@@ -83,6 +84,15 @@ type ConnectorSuggestion = {
   connector: string;
   description: string;
   state: string;
+};
+
+type ProviderRuntimeSummary = {
+  state: string;
+  message: string;
+  daemonRunning: boolean;
+  registered?: boolean | null;
+  pid?: number | null;
+  stalePidFile: boolean;
 };
 
 type LocatedItem = {
@@ -166,6 +176,7 @@ const sampleSnapshot: DesktopSnapshot = {
     projection: "macOS File Provider",
     readOnly: false,
     status: "ready",
+    provider: null,
   },
   settings: {
     launchAtLogin: true,
@@ -1888,6 +1899,8 @@ function SettingsView({
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const daemonStopped = snapshot.health.state === "stopped";
+  const runtimeStopped = snapshot.health.state === "runtime_stopped";
+  const runtimeNeedsRepair = daemonStopped || runtimeStopped;
   const checkingForUpdate = updateStatus.state === "checking";
   const installingUpdate = updateStatus.state === "installing";
   const updateAvailable = updateStatus.state === "available" || updateStatus.state === "installing";
@@ -1901,14 +1914,14 @@ function SettingsView({
   }, [snapshot.settings.launchAtLogin, snapshot.settings.showMenuBar]);
 
   async function repairRuntime() {
-    if (!daemonStopped) {
+    if (!runtimeNeedsRepair) {
       return;
     }
     setDiagnosticMessage("");
     const report = await callCommand<ActionReport>(
       "ensure_runtime_ready",
       undefined,
-      { ok: true, message: "AFS daemon is running." },
+      { ok: true, message: "AFS runtime is running." },
     );
     setDiagnosticMessage(report.message);
     await onRefresh().catch(() => undefined);
@@ -1917,12 +1930,13 @@ function SettingsView({
   function copyDiagnostics() {
     const summary = [
       `AFS process: ${daemonStopped ? "Stopped" : "Running"}`,
+      snapshot.mount.provider ? `Provider: ${providerStatusLabel(snapshot.mount.provider)}` : null,
       "State folder: ~/.afs",
       `Projection: ${snapshot.mount.projection}`,
       `Connection: ${snapshot.connection.status}`,
       `Mount: ${snapshot.mount.status}`,
       `Pending changes: ${snapshot.pendingChanges.length}`,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
     copyText(summary);
     setDiagnosticMessage("Copied diagnostics summary.");
   }
@@ -2085,14 +2099,17 @@ function SettingsView({
         <div className="panel">
           <PanelTitle title="Diagnostics" />
           <SettingRow title="AFS process" value={daemonStopped ? "Stopped" : "Running"} />
+          {snapshot.mount.provider && (
+            <SettingRow title="Provider" value={providerStatusLabel(snapshot.mount.provider)} />
+          )}
           <SettingRow title="State folder" value="~/.afs" />
           <SettingRow title="Projection" value={snapshot.mount.projection} />
           <div className="button-row">
             <SecondaryButton compact onClick={copyDiagnostics}>
               Copy Summary
             </SecondaryButton>
-            <SecondaryButton compact disabled={!daemonStopped} onClick={() => void repairRuntime()}>
-              {daemonStopped ? "Start AFS" : "Repair AFS"}
+            <SecondaryButton compact disabled={!runtimeNeedsRepair} onClick={() => void repairRuntime()}>
+              {runtimeNeedsRepair ? "Start AFS" : "Repair AFS"}
             </SecondaryButton>
           </div>
           {diagnosticMessage && <p className="quiet-note inline-note">{diagnosticMessage}</p>}
@@ -3205,6 +3222,9 @@ function healthLabel(state: string) {
   if (state === "stopped") {
     return "Stopped";
   }
+  if (state === "runtime_stopped") {
+    return "Runtime Needs Repair";
+  }
   if (state === "checking_freshness") {
     return "Checking";
   }
@@ -3221,6 +3241,9 @@ function healthDescription(state: string, attentionCount: number) {
   if (state === "stopped") {
     return "The AFS daemon is stopped; the app can still run direct actions when needed.";
   }
+  if (state === "runtime_stopped") {
+    return "The filesystem provider is stopped or unregistered; start AFS to restore online-only file access.";
+  }
   if (state === "checking_freshness") {
     return "AFS is checking the local mount and Notion freshness state.";
   }
@@ -3228,7 +3251,7 @@ function healthDescription(state: string, attentionCount: number) {
 }
 
 function healthTone(state: string): "ready" | "warn" | "danger" {
-  if (state === "reconnect_needed" || state === "stopped") {
+  if (state === "reconnect_needed" || state === "stopped" || state === "runtime_stopped") {
     return "danger";
   }
   if (state === "needs_review") {
@@ -3238,7 +3261,7 @@ function healthTone(state: string): "ready" | "warn" | "danger" {
 }
 
 function healthIconState(state: string): "default" | "review" | "reconnect" {
-  if (state === "reconnect_needed" || state === "stopped") {
+  if (state === "reconnect_needed" || state === "stopped" || state === "runtime_stopped") {
     return "reconnect";
   }
   if (state === "needs_review") {
@@ -3267,6 +3290,21 @@ function locatedStateLabel(state: LocatedItem["state"]) {
     return "Not Found";
   }
   return "Ready";
+}
+
+function providerStatusLabel(provider: ProviderRuntimeSummary) {
+  const state = provider.state === "running" ? "Running" : provider.state === "stopped" ? "Stopped" : "Error";
+  const parts = [state];
+  if (provider.pid) {
+    parts.push(`pid ${provider.pid}`);
+  }
+  if (provider.registered === false) {
+    parts.push("not registered");
+  }
+  if (provider.stalePidFile) {
+    parts.push("stale pid");
+  }
+  return parts.join(" - ");
 }
 
 function joinMountPath(mountPath: string, relativePath: string) {

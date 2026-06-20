@@ -43,14 +43,9 @@ $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) "afs-windows-cloud-files-
 $stateRoot = if ($env:AFS_WINDOWS_CLOUD_FILES_LIVE_STATE) { $env:AFS_WINDOWS_CLOUD_FILES_LIVE_STATE } else { Join-Path $tmpRoot "state" }
 $syncRoot = if ($env:AFS_WINDOWS_CLOUD_FILES_LIVE_ROOT) { $env:AFS_WINDOWS_CLOUD_FILES_LIVE_ROOT } else { Join-Path $tmpRoot "AFS" }
 $mountId = if ($env:AFS_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID) { $env:AFS_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID } else { "notion-windows-cloud-live-$unique" }
-$daemonOut = Join-Path $tmpRoot "afsd.out.log"
-$daemonErr = Join-Path $tmpRoot "afsd.err.log"
-$providerOut = Join-Path $tmpRoot "afs-cloud-files.out.log"
-$providerErr = Join-Path $tmpRoot "afs-cloud-files.err.log"
 $scratchPageId = $null
 $createdChildPageId = $null
-$daemonProcess = $null
-$providerProcess = $null
+$tcpAddr = $null
 $failed = $false
 
 function Normalize-NotionId {
@@ -205,22 +200,6 @@ function Wait-ForStatusContains {
     }
 }
 
-function Test-ProcessRunning {
-    param([System.Diagnostics.Process] $Process)
-    return $Process -and -not $Process.HasExited
-}
-
-function Stop-ChildProcess {
-    param([System.Diagnostics.Process] $Process)
-    if (Test-ProcessRunning $Process) {
-        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
-        try {
-            $Process.WaitForExit(5000)
-        } catch {
-        }
-    }
-}
-
 try {
     New-Item -ItemType Directory -Force -Path $stateRoot, $syncRoot | Out-Null
 
@@ -298,40 +277,30 @@ try {
         $env:AFS_CLOUD_FILES_TRACE = "1"
     }
 
-    Invoke-Native -FilePath $cloudFilesBin -Arguments @(
-        "register",
-        "--mount-id", $mountId,
-        "--display-name", "AFS Live Cloud Files",
-        "--sync-root", $syncRoot,
+    Invoke-Native -FilePath $afsBin -Arguments @(
+        "daemon", "start",
+        "--session",
         "--state-dir", $stateRoot,
+        "--tcp-addr", $tcpAddr,
+        "--afsd-bin", $afsdBin,
+        "--include-env", "NOTION_TOKEN",
         "--json"
-    ) -Step "afs-cloud-files register" | Out-Null
-
-    $daemonProcess = Start-Process -FilePath $afsdBin -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput $daemonOut -RedirectStandardError $daemonErr
+    ) -Step "afs daemon start" | Out-Null
     Wait-ForCondition -Name "afsd TCP endpoint" -Condition {
-        if (-not (Test-ProcessRunning $daemonProcess)) {
-            throw "afsd exited with code $($daemonProcess.ExitCode)"
-        }
         $output = Invoke-Native -FilePath $afsBin -Arguments @("daemon", "status", "--state-dir", $stateRoot, "--tcp-addr", $tcpAddr, "--json") -Step "afs daemon status"
         return $output.Contains('"state": "running"')
     }
 
-    $providerProcess = Start-Process -FilePath $cloudFilesBin -ArgumentList @(
-        "run",
-        "--mount-id", $mountId,
-        "--sync-root", $syncRoot,
-        "--state-dir", $stateRoot,
-        "--json"
-    ) -PassThru -WindowStyle Hidden -RedirectStandardOutput $providerOut -RedirectStandardError $providerErr
+    Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "start", $mountId, "--json") -Step "afs file-provider start" | Out-Null
+    Wait-ForCondition -Name "Cloud Files provider lifecycle" -Condition {
+        $output = Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "status", $mountId, "--json") -Step "afs file-provider status"
+        return $output.Contains('"state": "running"')
+    }
 
     $sourceRoot = Join-Path $syncRoot "notion"
     $pageDir = Join-Path $sourceRoot (ConvertTo-AfsSlug $scratchTitle)
     $pageFile = Join-Path $pageDir "page.md"
     Wait-ForCondition -Name "Cloud Files source root" -Condition {
-        if (-not (Test-ProcessRunning $providerProcess)) {
-            throw "afs-cloud-files exited with code $($providerProcess.ExitCode)"
-        }
         Test-Path -LiteralPath $sourceRoot
     }
     Wait-ForCondition -Name "scratch page placeholder" -Condition {
@@ -395,20 +364,35 @@ try {
     $failed = $true
     Write-Error $_ -ErrorAction Continue
 } finally {
-    Stop-ChildProcess $providerProcess
-    Stop-ChildProcess $daemonProcess
-    if (Test-Path -LiteralPath $cloudFilesBin) {
+    if (Test-Path -LiteralPath $afsBin) {
         try {
-            Invoke-Native -FilePath $cloudFilesBin -Arguments @("unregister", "--mount-id", $mountId, "--state-dir", $stateRoot, "--json") -Step "afs-cloud-files unregister" | Out-Null
+            Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "stop", $mountId, "--json") -Step "afs file-provider stop" | Out-Null
+        } catch {
+            Write-Warning "Cloud Files provider stop failed: $($_.Exception.Message)"
+        }
+        try {
+            Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "unregister", $mountId, "--json") -Step "afs file-provider unregister" | Out-Null
         } catch {
             Write-Warning "Cloud Files unregister failed: $($_.Exception.Message)"
+        }
+        if ($tcpAddr) {
+            try {
+                Invoke-Native -FilePath $afsBin -Arguments @("daemon", "stop", "--state-dir", $stateRoot, "--tcp-addr", $tcpAddr, "--json") -Step "afs daemon stop" | Out-Null
+            } catch {
+                Write-Warning "afsd stop failed: $($_.Exception.Message)"
+            }
         }
     }
     Archive-NotionPage -PageId $createdChildPageId
     Archive-NotionPage -PageId $scratchPageId
 
     if ($failed) {
-        foreach ($log in @($daemonOut, $daemonErr, $providerOut, $providerErr)) {
+        $logs = @()
+        $logRoot = Join-Path $stateRoot "logs"
+        if (Test-Path -LiteralPath $logRoot) {
+            $logs += Get-ChildItem -LiteralPath $logRoot -Filter "*.log" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+        }
+        foreach ($log in $logs) {
             if (Test-Path -LiteralPath $log) {
                 Write-Host "----- $log -----"
                 Get-Content -LiteralPath $log -ErrorAction SilentlyContinue

@@ -2,8 +2,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(target_os = "windows")]
-use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::sync::{
     Mutex, OnceLock,
@@ -13,16 +11,16 @@ use std::sync::{
 use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
 use afs_cli::daemon::{DaemonRunState, run_daemon_control};
 use afs_cli::diff::{DiffReport, run_diff};
+#[cfg(target_os = "windows")]
+use afs_cli::file_provider::{
+    WindowsCloudFilesLifecycleAction, open_windows_cloud_files_sync_root,
+    register_windows_cloud_files_sync_root, run_windows_cloud_files_lifecycle,
+};
 #[cfg(target_os = "macos")]
 use afs_cli::file_provider::{
     macos_file_provider_display_name, macos_file_provider_domain_url,
     open_macos_file_provider_domain, register_macos_file_provider_domain,
     run_macos_file_provider_helper,
-};
-#[cfg(target_os = "windows")]
-use afs_cli::file_provider::{
-    open_windows_cloud_files_sync_root, register_windows_cloud_files_sync_root,
-    windows_cloud_files_helper_path, windows_cloud_files_run_command_args,
 };
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
@@ -43,8 +41,6 @@ use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
 use afs_platform::bundled_binary_next_to_current_exe;
-#[cfg(target_os = "windows")]
-use afs_platform::{DefaultSessionProcessManager, SessionProcessManager};
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
@@ -123,6 +119,18 @@ struct MountSummary {
     projection: String,
     read_only: bool,
     status: String,
+    provider: Option<ProviderRuntimeSummary>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderRuntimeSummary {
+    state: String,
+    message: String,
+    daemon_running: bool,
+    registered: Option<bool>,
+    pid: Option<u32>,
+    stale_pid_file: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -438,7 +446,7 @@ fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
             refresh_tray_icon(&app);
             ActionReport {
                 ok: true,
-                message: "AFS daemon is running.".to_string(),
+                message: "AFS runtime is running.".to_string(),
             }
         }
         Err(message) => ActionReport { ok: false, message },
@@ -787,6 +795,9 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
 
     let mount = choose_mount(&mounts);
     let connection = choose_connection(&connections, mount.as_ref());
+    let provider = mount
+        .as_ref()
+        .and_then(|mount| provider_runtime_summary(&state_root, mount));
     let pending_changes = status
         .as_ref()
         .map(pending_changes_from_status)
@@ -798,6 +809,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
         &pending_changes,
         connection.as_ref(),
         daemon_ready,
+        provider.as_ref(),
         status.as_ref(),
     );
 
@@ -807,7 +819,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
             attention_count: pending_changes.len(),
         },
         connection: connection_summary(connection.as_ref()),
-        mount: mount_summary(mount.as_ref(), connection.as_ref()),
+        mount: mount_summary(mount.as_ref(), connection.as_ref(), provider),
         settings: desktop_settings(),
         pending_changes,
         activity: activity_from_journals(&journals, &store, &state_root),
@@ -870,6 +882,7 @@ fn connection_summary(connection: Option<&ConnectionRecord>) -> ConnectionSummar
 fn mount_summary(
     mount: Option<&MountConfig>,
     connection: Option<&ConnectionRecord>,
+    provider: Option<ProviderRuntimeSummary>,
 ) -> MountSummary {
     let Some(mount) = mount else {
         return MountSummary {
@@ -882,8 +895,14 @@ fn mount_summary(
             projection: projection_label(&desktop_projection_mode()).to_string(),
             read_only: false,
             status: "not_mounted".to_string(),
+            provider: None,
         };
     };
+
+    let mount_status = provider
+        .as_ref()
+        .and_then(mount_status_from_provider)
+        .unwrap_or("ready");
 
     MountSummary {
         connector: mount.connector.clone(),
@@ -897,7 +916,104 @@ fn mount_summary(
             .map(|remote_id| notion_object_url(&remote_id.0)),
         projection: projection_label(&mount.projection).to_string(),
         read_only: mount.read_only,
-        status: "ready".to_string(),
+        status: mount_status.to_string(),
+        provider,
+    }
+}
+
+fn mount_status_from_provider(provider: &ProviderRuntimeSummary) -> Option<&'static str> {
+    match provider.state.as_str() {
+        "running" if provider.registered == Some(false) => Some("provider_unregistered"),
+        "running" => Some("ready"),
+        "stopped" => Some("provider_stopped"),
+        "error" => Some("provider_error"),
+        _ => None,
+    }
+}
+
+fn provider_runtime_summary(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Option<ProviderRuntimeSummary> {
+    if !mount.projection.uses_virtual_filesystem() {
+        return None;
+    }
+    match mount.projection {
+        ProjectionMode::WindowsCloudFiles => {
+            Some(windows_cloud_files_provider_status(state_root, mount))
+        }
+        ProjectionMode::MacosFileProvider
+        | ProjectionMode::LinuxFuse
+        | ProjectionMode::PlainFiles => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_provider_status(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> ProviderRuntimeSummary {
+    match run_windows_cloud_files_lifecycle(
+        state_root,
+        mount,
+        &connector_label(&mount.connector),
+        WindowsCloudFilesLifecycleAction::Status,
+    ) {
+        Ok(report) => provider_runtime_summary_from_value(&report.helper_report),
+        Err(error) => ProviderRuntimeSummary {
+            state: "error".to_string(),
+            message: error.message(),
+            daemon_running: daemon_is_ready(state_root),
+            registered: None,
+            pid: None,
+            stale_pid_file: false,
+        },
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_cloud_files_provider_status(
+    _state_root: &Path,
+    mount: &MountConfig,
+) -> ProviderRuntimeSummary {
+    ProviderRuntimeSummary {
+        state: "error".to_string(),
+        message: format!(
+            "Windows Cloud Files mounts can only be inspected on Windows; mount `{}` cannot be inspected here.",
+            mount.mount_id.0
+        ),
+        daemon_running: false,
+        registered: None,
+        pid: None,
+        stale_pid_file: false,
+    }
+}
+
+fn provider_runtime_summary_from_value(value: &serde_json::Value) -> ProviderRuntimeSummary {
+    ProviderRuntimeSummary {
+        state: value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        message: value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Provider status is unavailable.")
+            .to_string(),
+        daemon_running: value
+            .get("daemon_running")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        registered: value.get("registered").and_then(serde_json::Value::as_bool),
+        pid: value
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok()),
+        stale_pid_file: value
+            .get("stale_pid_file")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -1162,12 +1278,15 @@ fn health_state(
     pending_changes: &[PendingChange],
     connection: Option<&ConnectionRecord>,
     daemon_ready: bool,
+    provider: Option<&ProviderRuntimeSummary>,
     status: Option<&afs_cli::status::StatusReport>,
 ) -> &'static str {
     if connection.is_some_and(|connection| connection.status != "active") {
         "reconnect_needed"
     } else if !daemon_ready {
         "stopped"
+    } else if provider.is_some_and(provider_needs_repair) {
+        "runtime_stopped"
     } else if !pending_changes.is_empty() {
         "needs_review"
     } else if status.is_some_and(|status| status.summary.checking_freshness > 0) {
@@ -1223,6 +1342,10 @@ fn set_tray_icon_and_tooltip(app: &AppHandle, state: TrayVisualState, tooltip: &
     }
 }
 
+fn provider_needs_repair(provider: &ProviderRuntimeSummary) -> bool {
+    provider.state != "running" || provider.registered == Some(false)
+}
+
 fn sync_tray_visibility(app: &AppHandle, settings: &DesktopSettings) {
     if let Some(tray) = app.tray_by_id("main") {
         let _ = tray.set_visible(settings.show_menu_bar);
@@ -1230,7 +1353,7 @@ fn sync_tray_visibility(app: &AppHandle, settings: &DesktopSettings) {
 }
 
 fn tray_state_for_health(state: &str) -> TrayVisualState {
-    if state == "reconnect_needed" || state == "stopped" {
+    if state == "reconnect_needed" || state == "stopped" || state == "runtime_stopped" {
         TrayVisualState::Reconnect
     } else if state == "needs_review" {
         TrayVisualState::Review
@@ -1245,6 +1368,7 @@ fn tray_tooltip(snapshot: &DesktopSnapshot) -> String {
         "checking_freshness" => "AFS: checking freshness".to_string(),
         "reconnect_needed" => "AFS: reconnect Notion".to_string(),
         "stopped" => "AFS: daemon stopped".to_string(),
+        "runtime_stopped" => "AFS: provider needs repair".to_string(),
         _ => "AFS: ready".to_string(),
     }
 }
@@ -3428,9 +3552,7 @@ fn ensure_virtual_projection_runtimes_for_state(state_root: &Path) -> Result<(),
 
 #[cfg(target_os = "windows")]
 #[derive(Default)]
-struct WindowsCloudFilesProviderSupervisor {
-    children: std::collections::HashMap<String, Child>,
-}
+struct WindowsCloudFilesProviderSupervisor;
 
 #[cfg(target_os = "windows")]
 impl WindowsCloudFilesProviderSupervisor {
@@ -3439,86 +3561,49 @@ impl WindowsCloudFilesProviderSupervisor {
             return Ok(());
         }
 
-        let mount_id = mount.mount_id.0.clone();
-        let mut exited_status = None;
-        if let Some(child) = self.children.get_mut(&mount_id) {
-            match child.try_wait() {
-                Ok(None) => return Ok(()),
-                Ok(Some(status)) => exited_status = Some(status.to_string()),
-                Err(error) => {
-                    return Err(format!(
-                        "Could not inspect Windows Cloud Files provider for `{mount_id}`: {error}"
-                    ));
-                }
-            }
-        }
-        if let Some(status) = exited_status {
-            self.children.remove(&mount_id);
-            eprintln!(
-                "afs desktop restarting Windows Cloud Files provider `{mount_id}` after exit with {status}"
-            );
-        }
-
-        let helper = windows_cloud_files_helper_path().ok_or_else(|| {
-            "afs-cloud-files was not found; build or install the Windows Cloud Files helper"
-                .to_string()
+        let report = run_windows_cloud_files_lifecycle(
+            state_root,
+            mount,
+            &connector_label(&mount.connector),
+            WindowsCloudFilesLifecycleAction::Start,
+        )
+        .map_err(|error| {
+            format!(
+                "Could not start Windows Cloud Files provider `{}`: {}",
+                mount.mount_id.0,
+                error.message()
+            )
         })?;
-        let mut command = Command::new(&helper);
-        command
-            .args(windows_cloud_files_run_command_args(state_root, mount))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        let child = DefaultSessionProcessManager
-            .spawn_detached(&mut command)
-            .map_err(|error| {
-                format!(
-                    "Could not start Windows Cloud Files provider `{}` with `{}`: {error}",
-                    mount.mount_id.0,
-                    helper.display()
-                )
-            })?;
-        eprintln!(
-            "afs desktop started Windows Cloud Files provider `{}` as pid {}",
-            mount.mount_id.0,
-            child.id()
-        );
-        self.children.insert(mount_id, child);
+        if let Some(message) = report
+            .helper_report
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+        {
+            eprintln!("{message}");
+        }
         Ok(())
     }
 
-    fn retain_mount_ids(&mut self, active_mount_ids: &std::collections::HashSet<String>) {
-        let stale_mount_ids = self
-            .children
-            .keys()
-            .filter(|mount_id| !active_mount_ids.contains(*mount_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        for mount_id in stale_mount_ids {
-            self.stop_mount(&mount_id);
-        }
-    }
-
-    fn stop_all(&mut self) {
-        let mount_ids = self.children.keys().cloned().collect::<Vec<_>>();
-        for mount_id in mount_ids {
-            self.stop_mount(&mount_id);
-        }
-    }
-
-    fn stop_mount(&mut self, mount_id: &str) {
-        let Some(mut child) = self.children.remove(mount_id) else {
-            return;
-        };
-        if child.try_wait().ok().flatten().is_none() {
-            if let Err(error) = child.kill() {
+    fn stop_all(&mut self, state_root: &Path) {
+        for mount in windows_cloud_files_mounts(state_root) {
+            if let Err(error) = self.stop_mount(state_root, &mount) {
                 eprintln!(
-                    "afs desktop could not stop Windows Cloud Files provider `{mount_id}`: {error}"
+                    "afs desktop could not stop Windows Cloud Files provider `{}`: {error}",
+                    mount.mount_id.0
                 );
             }
-            let _ = child.wait();
         }
+    }
+
+    fn stop_mount(&mut self, state_root: &Path, mount: &MountConfig) -> Result<(), String> {
+        run_windows_cloud_files_lifecycle(
+            state_root,
+            mount,
+            &connector_label(&mount.connector),
+            WindowsCloudFilesLifecycleAction::Stop,
+        )
+        .map(|_| ())
+        .map_err(|error| error.message())
     }
 }
 
@@ -3550,38 +3635,38 @@ fn ensure_windows_cloud_files_provider_running(
 
 #[cfg(target_os = "windows")]
 fn ensure_windows_cloud_files_providers_for_state(state_root: &Path) -> Result<(), String> {
-    let store = SqliteStateStore::open(state_root.to_path_buf())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
-    let cloud_mounts = store
-        .load_mounts()
-        .map_err(|error| format!("Could not load mounts: {error}"))?
-        .into_iter()
-        .filter(|mount| mount.projection == ProjectionMode::WindowsCloudFiles)
-        .collect::<Vec<_>>();
-    let active_mount_ids = cloud_mounts
-        .iter()
-        .map(|mount| mount.mount_id.0.clone())
-        .collect::<std::collections::HashSet<_>>();
+    let cloud_mounts = load_windows_cloud_files_mounts(state_root)?;
 
     if cloud_mounts.is_empty() {
-        windows_cloud_files_provider_supervisor()
-            .lock()
-            .map_err(|_| "Windows Cloud Files provider supervisor lock was poisoned".to_string())?
-            .retain_mount_ids(&active_mount_ids);
         return Ok(());
     }
 
     ensure_daemon_running(state_root)?;
     reload_daemon_mounts(state_root)?;
     for mount in &cloud_mounts {
-        register_windows_virtual_projection(state_root, mount)?;
         ensure_windows_cloud_files_provider_running(state_root, mount)?;
     }
-    windows_cloud_files_provider_supervisor()
-        .lock()
-        .map_err(|_| "Windows Cloud Files provider supervisor lock was poisoned".to_string())?
-        .retain_mount_ids(&active_mount_ids);
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn load_windows_cloud_files_mounts(state_root: &Path) -> Result<Vec<MountConfig>, String> {
+    let store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    Ok(store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts: {error}"))?
+        .into_iter()
+        .filter(|mount| mount.projection == ProjectionMode::WindowsCloudFiles)
+        .collect::<Vec<_>>())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_mounts(state_root: &Path) -> Vec<MountConfig> {
+    load_windows_cloud_files_mounts(state_root).unwrap_or_else(|error| {
+        eprintln!("afs desktop could not load Windows Cloud Files mounts: {error}");
+        Vec::new()
+    })
 }
 
 fn start_windows_cloud_files_provider_supervisor() {
@@ -3608,7 +3693,7 @@ fn stop_windows_cloud_files_provider_supervisor() {
             return;
         };
         match supervisor.lock() {
-            Ok(mut supervisor) => supervisor.stop_all(),
+            Ok(mut supervisor) => supervisor.stop_all(&default_state_root()),
             Err(_) => {
                 eprintln!("afs desktop could not stop Windows Cloud Files providers: lock poisoned")
             }
@@ -4532,7 +4617,7 @@ mod tests {
     #[test]
     fn windows_mount_summary_without_mount_reports_cloud_files_projection() {
         assert_eq!(
-            super::mount_summary(None, None).projection,
+            super::mount_summary(None, None, None).projection,
             "Windows Cloud Files"
         );
         assert_eq!(
@@ -4566,7 +4651,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_mount_summary_without_mount_reports_linux_fuse_projection() {
-        assert_eq!(super::mount_summary(None, None).projection, "Linux FUSE");
+        assert_eq!(
+            super::mount_summary(None, None, None).projection,
+            "Linux FUSE"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -5473,6 +5561,7 @@ fn sample_snapshot() -> DesktopSnapshot {
             projection: "macOS File Provider".to_string(),
             read_only: false,
             status: "ready".to_string(),
+            provider: None,
         },
         settings: DesktopSettings {
             launch_at_login: true,
