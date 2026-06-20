@@ -852,6 +852,14 @@ impl ProviderIdentityIndex {
             .and_then(|paths| paths.get(&normalized_cloud_path_string(path)).cloned())
     }
 
+    fn path_for_identity(&self, identifier: &str) -> Option<PathBuf> {
+        self.paths.lock().ok().and_then(|paths| {
+            paths.iter().find_map(|(path, candidate)| {
+                (candidate == identifier).then(|| PathBuf::from(path))
+            })
+        })
+    }
+
     fn forget_subtree(&self, path: &Path) {
         let path = normalized_cloud_path_string(path);
         let prefix = format!("{path}\\");
@@ -1008,6 +1016,10 @@ impl ProviderContext {
 
     fn cached_path_identity(&self, path: &Path) -> Option<String> {
         self.identity_index.get(&absolute_cloud_path(self, path))
+    }
+
+    fn cached_path_for_identity(&self, identifier: &str) -> Option<PathBuf> {
+        self.identity_index.path_for_identity(identifier)
     }
 
     fn forget_path_identities(&self, path: &Path) {
@@ -1761,8 +1773,12 @@ unsafe fn handle_fetch_data(
     ));
 
     if info.FileSize != content_len {
-        let path = callback_path(context, info)
-            .ok_or_else(|| HelperError::new("invalid_callback", "fetch data missing path"))?;
+        let path = fetch_data_path(context, info, &read.item, &identifier).ok_or_else(|| {
+            HelperError::new(
+                "invalid_callback",
+                format!("fetch data missing path for identity `{identifier}`"),
+            )
+        })?;
         trace_cloud_files(format!(
             "fetch data update placeholder identity=`{identifier}` path=`{}` advertised_size={} materialized_size={content_len}",
             path.display(),
@@ -1786,6 +1802,23 @@ unsafe fn handle_fetch_data(
             range.len() as i64,
         )
     }
+}
+
+#[cfg(target_os = "windows")]
+fn fetch_data_path(
+    context: &ProviderContext,
+    info: &windows::Win32::Storage::CloudFilters::CF_CALLBACK_INFO,
+    item: &afsd::file_provider::FileProviderItem,
+    identifier: &str,
+) -> Option<PathBuf> {
+    callback_path(context, info)
+        .or_else(|| context.cached_path_for_identity(identifier))
+        .or_else(|| {
+            item.parent_identifier
+                .as_deref()
+                .and_then(|parent| context.cached_path_for_identity(parent))
+                .map(|parent| parent.join(&item.filename))
+        })
 }
 
 #[cfg(target_os = "windows")]
@@ -3078,5 +3111,20 @@ mod tests {
         );
         assert_eq!(index.get(source), None);
         assert_eq!(index.get(&child), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn provider_identity_index_can_find_path_by_identity() {
+        let index = ProviderIdentityIndex::default();
+        let path = Path::new(r"C:\Users\Ada\AFS\Notion\Draft\page.md");
+
+        index.remember(path, "page-123");
+
+        assert_eq!(
+            index.path_for_identity("page-123"),
+            Some(PathBuf::from(r"c:\users\ada\afs\notion\draft\page.md"))
+        );
+        assert_eq!(index.path_for_identity("missing"), None);
     }
 }
