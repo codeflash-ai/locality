@@ -2194,6 +2194,7 @@ fn observable_remote_identifier(identifier: &str) -> bool {
         && !identifier.starts_with("local:")
         && !identifier.starts_with("schema:")
         && !identifier.starts_with("children:")
+        && !identifier.starts_with("guidance:")
         && !identifier.starts_with("path:")
         && !identifier.starts_with("source:")
         && identifier != ROOT_CONTAINER_IDENTIFIER
@@ -2772,7 +2773,10 @@ fn afs_error_code(error: &AfsError) -> &'static str {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{ActiveChildRefresh, ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest};
+    use super::{
+        ActiveChildRefresh, ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest,
+        observable_remote_identifier,
+    };
 
     #[test]
     fn child_refresh_queue_promotes_existing_requests() {
@@ -2848,6 +2852,16 @@ mod tests {
         active.clear();
         let deeper = queue.pop_ready(&active).expect("deeper refresh");
         assert_eq!(deeper.container_identifier, "children:page-a1");
+    }
+
+    #[test]
+    fn observable_remote_identifiers_exclude_virtual_only_items() {
+        assert!(observable_remote_identifier(
+            "3833ac0e-bb88-814b-b0e3-ea6963b6708a"
+        ));
+        assert!(!observable_remote_identifier("guidance:AGENTS.md"));
+        assert!(!observable_remote_identifier("children:page-1"));
+        assert!(!observable_remote_identifier("source:notion"));
     }
 
     fn request(

@@ -808,11 +808,15 @@ const DAEMON_READY_POLL: std::time::Duration = std::time::Duration::from_millis(
 #[cfg(target_os = "windows")]
 const DAEMON_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(target_os = "windows")]
-const METADATA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const METADATA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 #[cfg(target_os = "windows")]
 const MATERIALIZE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 #[cfg(target_os = "windows")]
 const MUTATION_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(target_os = "windows")]
+const LOCAL_CREATE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(target_os = "windows")]
+const LOCAL_CREATE_IO_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(target_os = "windows")]
 const STATUS_SUCCESS_VALUE: i32 = 0;
 #[cfg(target_os = "windows")]
@@ -824,6 +828,7 @@ struct ProviderContext {
     mount_id: String,
     sync_root: PathBuf,
     state_dir: PathBuf,
+    path_identities: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<PathBuf, String>>>,
 }
 
 #[cfg(target_os = "windows")]
@@ -932,6 +937,25 @@ impl ProviderContext {
         )
     }
 
+    fn remember_path_identity(&self, path: &Path, identifier: &str) {
+        if let Ok(mut identities) = self.path_identities.lock() {
+            identities.insert(absolute_cloud_path(self, path), identifier.to_string());
+        }
+    }
+
+    fn cached_path_identity(&self, path: &Path) -> Option<String> {
+        self.path_identities
+            .lock()
+            .ok()
+            .and_then(|identities| identities.get(&absolute_cloud_path(self, path)).cloned())
+    }
+
+    fn forget_path_identity(&self, path: &Path) {
+        if let Ok(mut identities) = self.path_identities.lock() {
+            identities.remove(&absolute_cloud_path(self, path));
+        }
+    }
+
     fn request<T>(
         &self,
         request: &afsd::ipc::DaemonRequest,
@@ -995,11 +1019,44 @@ fn local_change_worker(
     for result in receiver {
         match result {
             Ok(event) if is_create_like_event(&event.kind) => {
+                trace_cloud_files(format!(
+                    "local create-like event kind={:?} paths={:?}",
+                    event.kind, event.paths
+                ));
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 for path in event.paths {
                     if let Err(error) = handle_local_create_like_path(&context, &path) {
                         eprintln!(
                             "{COMMAND_NAME}: local create mapping failed for `{}`: {error}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            Ok(event) if is_modify_like_event(&event.kind) => {
+                trace_cloud_files(format!(
+                    "local modify-like event kind={:?} paths={:?}",
+                    event.kind, event.paths
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                for path in event.paths {
+                    if let Err(error) = handle_local_modify_like_path(&context, &path) {
+                        eprintln!(
+                            "{COMMAND_NAME}: local modify mapping failed for `{}`: {error}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            Ok(event) if is_remove_like_event(&event.kind) => {
+                trace_cloud_files(format!(
+                    "local remove-like event kind={:?} paths={:?}",
+                    event.kind, event.paths
+                ));
+                for path in event.paths {
+                    if let Err(error) = handle_local_remove_like_path(&context, &path) {
+                        eprintln!(
+                            "{COMMAND_NAME}: local remove mapping failed for `{}`: {error}",
                             path.display()
                         );
                     }
@@ -1020,6 +1077,32 @@ fn is_create_like_event(kind: &notify::event::EventKind) -> bool {
         EventKind::Create(CreateKind::Any | CreateKind::File | CreateKind::Folder)
             | EventKind::Modify(ModifyKind::Name(
                 RenameMode::Any | RenameMode::To | RenameMode::Both
+            ))
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn is_remove_like_event(kind: &notify::event::EventKind) -> bool {
+    use notify::event::{EventKind, RemoveKind};
+
+    matches!(
+        kind,
+        EventKind::Remove(RemoveKind::Any | RemoveKind::File | RemoveKind::Folder)
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn is_modify_like_event(kind: &notify::event::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind};
+
+    matches!(
+        kind,
+        EventKind::Any
+            | EventKind::Modify(
+                ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other
+            )
+            | EventKind::Access(AccessKind::Close(
+                AccessMode::Any | AccessMode::Write | AccessMode::Other
             ))
     )
 }
@@ -1049,26 +1132,162 @@ fn handle_local_create_like_path(
     let parent = path
         .parent()
         .ok_or_else(|| HelperError::new("invalid_path", "created path has no parent"))?;
-    let parent_identifier = parent_identifier_for_path(context, parent)?;
+    let parent_identifier = parent_identifier_for_path_when_ready(context, parent)?;
 
     if metadata.is_dir() {
         let created = context.create_directory(&parent_identifier, filename)?;
-        convert_to_placeholder(&path, &created.identifier, false)?;
+        context.remember_path_identity(&path, &created.identifier);
+        convert_to_placeholder_when_ready(&path, &created.identifier, false)?;
         let _ = set_placeholder_in_sync_state(&path, false);
         return Ok(());
     }
 
     if metadata.is_file() {
         let created = context.create_file(&parent_identifier, filename)?;
-        convert_to_placeholder(&path, &created.identifier, false)?;
-        let _ = set_placeholder_in_sync_state(&path, false);
-        let contents =
-            std::fs::read(&path).map_err(|error| HelperError::io("read created file", error))?;
+        context.remember_path_identity(&path, &created.identifier);
+        let contents = read_created_file_when_ready(&path)?;
         if !contents.is_empty() {
             commit_local_bytes(context, &created.identifier, &path, &contents)?;
         }
+        convert_to_placeholder_when_ready(&path, &created.identifier, false)?;
+        let _ = set_placeholder_in_sync_state(&path, false);
+        if let Some(parent_identifier) = context.cached_path_identity(parent)
+            && placeholder_identity_for_path(parent)?.is_none()
+            && convert_to_placeholder_when_ready(parent, &parent_identifier, false).is_ok()
+        {
+            let _ = set_placeholder_in_sync_state(parent, false);
+        }
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn handle_local_modify_like_path(
+    context: &ProviderContext,
+    path: &Path,
+) -> Result<(), HelperError> {
+    let path = absolute_cloud_path(context, path);
+    if !path_is_under_sync_root(context, &path) || same_cloud_path(&path, &context.sync_root) {
+        return Ok(());
+    }
+    let Some(identifier) = identity_for_path(context, &path)? else {
+        trace_cloud_files(format!(
+            "local modify skipped path=`{}` reason=no_placeholder_identity",
+            path.display()
+        ));
+        return Ok(());
+    };
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(HelperError::io("inspect local modify", error)),
+    };
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let contents = read_created_file_when_ready(&path)?;
+    trace_cloud_files(format!(
+        "local modify commit path=`{}` identity=`{identifier}` bytes={}",
+        path.display(),
+        contents.len()
+    ));
+    commit_local_bytes(context, &identifier, &path, &contents)
+}
+
+#[cfg(target_os = "windows")]
+fn handle_local_remove_like_path(
+    context: &ProviderContext,
+    path: &Path,
+) -> Result<(), HelperError> {
+    let path = absolute_cloud_path(context, path);
+    if !path_is_under_sync_root(context, &path) || same_cloud_path(&path, &context.sync_root) {
+        return Ok(());
+    }
+    let Some(identifier) = context.cached_path_identity(&path) else {
+        trace_cloud_files(format!(
+            "local remove skipped path=`{}` reason=no_cached_identity",
+            path.display()
+        ));
+        return Ok(());
+    };
+    trace_cloud_files(format!(
+        "local remove trash path=`{}` identity=`{identifier}`",
+        path.display()
+    ));
+    match context.trash(&identifier) {
+        Ok(_) => {
+            context.forget_path_identity(&path);
+            Ok(())
+        }
+        Err(error) if stale_pending_page_directory_delete(&identifier, &error) => {
+            context.forget_path_identity(&path);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parent_identifier_for_path_when_ready(
+    context: &ProviderContext,
+    parent: &Path,
+) -> Result<String, HelperError> {
+    retry_local_create_operation(|| parent_identifier_for_path(context, parent))
+}
+
+#[cfg(target_os = "windows")]
+fn identity_for_path(
+    context: &ProviderContext,
+    path: &Path,
+) -> Result<Option<String>, HelperError> {
+    if let Some(identifier) = placeholder_identity_for_path(path)? {
+        context.remember_path_identity(path, &identifier);
+        return Ok(Some(identifier));
+    }
+    Ok(context.cached_path_identity(path))
+}
+
+#[cfg(target_os = "windows")]
+fn read_created_file_when_ready(path: &Path) -> Result<Vec<u8>, HelperError> {
+    retry_local_create_operation(|| {
+        std::fs::read(path).map_err(|error| HelperError::io("read created file", error))
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn convert_to_placeholder_when_ready(
+    path: &Path,
+    identifier: &str,
+    in_sync: bool,
+) -> Result<(), HelperError> {
+    retry_local_create_operation(|| convert_to_placeholder(path, identifier, in_sync))
+}
+
+#[cfg(target_os = "windows")]
+fn retry_local_create_operation<T>(
+    operation: impl FnMut() -> Result<T, HelperError>,
+) -> Result<T, HelperError> {
+    retry_operation_until(
+        LOCAL_CREATE_IO_TIMEOUT,
+        LOCAL_CREATE_IO_RETRY_DELAY,
+        operation,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn retry_operation_until<T>(
+    timeout: std::time::Duration,
+    delay: std::time::Duration,
+    mut operation: impl FnMut() -> Result<T, HelperError>,
+) -> Result<T, HelperError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(delay),
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1166,6 +1385,7 @@ fn connect_cloud_filter_sync_root(
         mount_id: mount_id.to_string(),
         sync_root: sync_root.to_path_buf(),
         state_dir: state_dir.to_path_buf(),
+        path_identities: Default::default(),
     });
     let callbacks = [
         CF_CALLBACK_REGISTRATION {
@@ -1216,6 +1436,7 @@ fn connect_cloud_filter_sync_root(
 fn seed_root_placeholders(context: &ProviderContext) -> Result<usize, HelperError> {
     let children = context.children(afsd::file_provider::ROOT_CONTAINER_IDENTIFIER)?;
     create_placeholders_in_directory(&context.sync_root, &children.children)?;
+    remember_placeholder_children(context, &context.sync_root, &children.children);
     Ok(children.children.len())
 }
 
@@ -1353,6 +1574,7 @@ unsafe fn handle_fetch_placeholders(
         "fetch placeholders start container=`{container_identifier}`"
     ));
     let children = context.children(&container_identifier)?;
+    let directory = callback_path(context, info).unwrap_or_else(|| context.sync_root.clone());
     trace_cloud_files(format!(
         "fetch placeholders transfer container=`{container_identifier}` count={}",
         children.children.len()
@@ -1366,7 +1588,9 @@ unsafe fn handle_fetch_placeholders(
             batch.infos.len() as u32,
             batch.infos.len() as i64,
         )
-    }
+    }?;
+    remember_placeholder_children(context, &directory, &children.children);
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1441,6 +1665,7 @@ unsafe fn handle_file_close_completion(
         .ok_or_else(|| HelperError::new("invalid_callback", "file close missing file identity"))?;
     let path = callback_path(context, info)
         .ok_or_else(|| HelperError::new("invalid_callback", "file close missing path"))?;
+    context.remember_path_identity(&path, &identifier);
     commit_local_file_contents(context, &identifier, &path)
 }
 
@@ -1515,8 +1740,17 @@ unsafe fn handle_delete(
     let context = unsafe { provider_context(info) }?;
     let identifier = callback_identifier(info)
         .ok_or_else(|| HelperError::new("invalid_callback", "delete missing file identity"))?;
-    context.trash(&identifier)?;
-    Ok(())
+    match context.trash(&identifier) {
+        Ok(_) => Ok(()),
+        Err(error) if stale_pending_page_directory_delete(&identifier, &error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stale_pending_page_directory_delete(identifier: &str, error: &HelperError) -> bool {
+    identifier.starts_with("children:local:")
+        && error.message.contains("not present in daemon state")
 }
 
 #[cfg(target_os = "windows")]
@@ -1603,15 +1837,20 @@ fn parent_identifier_for_path(
     if same_cloud_path(&parent, &context.sync_root) {
         return Ok(afsd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string());
     }
-    placeholder_identity_for_path(&parent)?.ok_or_else(|| {
-        HelperError::new(
-            "missing_parent_identity",
-            format!(
-                "could not resolve Cloud Files identity for parent `{}`",
-                parent.display()
-            ),
-        )
-    })
+    if let Some(identifier) = placeholder_identity_for_path(&parent)? {
+        context.remember_path_identity(&parent, &identifier);
+        return Ok(identifier);
+    }
+    if let Some(identifier) = context.cached_path_identity(&parent) {
+        return Ok(identifier);
+    }
+    Err(HelperError::new(
+        "missing_parent_identity",
+        format!(
+            "could not resolve Cloud Files identity for parent `{}`",
+            parent.display()
+        ),
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -1686,11 +1925,14 @@ fn placeholder_info_for_path(path: &Path) -> Result<Option<PlaceholderInfo>, Hel
 #[cfg(target_os = "windows")]
 fn convert_to_placeholder(path: &Path, identifier: &str, in_sync: bool) -> Result<(), HelperError> {
     use windows::Win32::Storage::CloudFilters::{
-        CF_CONVERT_FLAG_MARK_IN_SYNC, CF_CONVERT_FLAG_NONE, CF_OPEN_FILE_FLAG_WRITE_ACCESS,
-        CfConvertToPlaceholder,
+        CF_CONVERT_FLAG_MARK_IN_SYNC, CF_CONVERT_FLAG_NONE, CF_OPEN_FILE_FLAG_EXCLUSIVE,
+        CF_OPEN_FILE_FLAG_WRITE_ACCESS, CfConvertToPlaceholder,
     };
 
-    let handle = open_cloud_file(path, CF_OPEN_FILE_FLAG_WRITE_ACCESS)?;
+    let handle = open_cloud_file(
+        path,
+        CF_OPEN_FILE_FLAG_WRITE_ACCESS | CF_OPEN_FILE_FLAG_EXCLUSIVE,
+    )?;
     let identity = identifier.as_bytes();
     let flags = if in_sync {
         CF_CONVERT_FLAG_MARK_IN_SYNC
@@ -1741,7 +1983,7 @@ impl CloudFileHandle {
 impl Drop for CloudFileHandle {
     fn drop(&mut self) {
         unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            windows::Win32::Storage::CloudFilters::CfCloseHandle(self.0);
         }
     }
 }
@@ -1758,6 +2000,17 @@ fn open_cloud_file(
     unsafe { CfOpenFileWithOplock(PCWSTR::from_raw(path_wide.as_ptr()), flags) }
         .map(CloudFileHandle)
         .map_err(win32_error("open cloud file"))
+}
+
+#[cfg(target_os = "windows")]
+fn remember_placeholder_children(
+    context: &ProviderContext,
+    directory: &Path,
+    items: &[afsd::file_provider::FileProviderItem],
+) {
+    for item in items {
+        context.remember_path_identity(&directory.join(&item.filename), &item.identifier);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2506,6 +2759,7 @@ mod tests {
             mount_id: "notion-main".to_string(),
             sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
+            path_identities: Default::default(),
         };
 
         assert_eq!(
@@ -2521,6 +2775,7 @@ mod tests {
             mount_id: "notion-main".to_string(),
             sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
+            path_identities: Default::default(),
         };
 
         assert!(path_is_under_sync_root(
@@ -2548,6 +2803,102 @@ mod tests {
         assert_eq!(
             transfer_placeholders_flags_for_status(status_unsuccessful()).0,
             CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE.0
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn local_create_retry_retries_until_success() {
+        let attempts = std::cell::Cell::new(0);
+
+        let value = retry_operation_until(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::ZERO,
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    return Err(HelperError::new("transient", "not ready"));
+                }
+                Ok("ready")
+            },
+        )
+        .expect("retry should eventually succeed");
+
+        assert_eq!(value, "ready");
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn local_create_retry_returns_last_error_after_timeout() {
+        let attempts = std::cell::Cell::new(0);
+
+        let error = retry_operation_until(
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            || -> Result<(), HelperError> {
+                attempts.set(attempts.get() + 1);
+                Err(HelperError::new("transient", "still locked"))
+            },
+        )
+        .expect_err("retry should return the operation error");
+
+        assert_eq!(error.code, "transient");
+        assert_eq!(error.message, "still locked");
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stale_pending_page_directory_delete_is_idempotent() {
+        let error = HelperError::new(
+            "daemon_error",
+            "invalid_state: invalid state: virtual filesystem item `children:local:123` is not present in daemon state",
+        );
+
+        assert!(stale_pending_page_directory_delete(
+            "children:local:123",
+            &error
+        ));
+        assert!(!stale_pending_page_directory_delete(
+            "children:page-1",
+            &error
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parent_identifier_can_use_pending_local_directory_cache() {
+        let context = ProviderContext {
+            mount_id: "notion-main".to_string(),
+            sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
+            state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
+            path_identities: Default::default(),
+        };
+        let directory = Path::new(r"C:\Users\Ada\AFS\Notion\Draft");
+        context.remember_path_identity(directory, "children:local:123");
+
+        assert_eq!(
+            parent_identifier_for_path(&context, directory).expect("parent identifier"),
+            "children:local:123"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn identity_for_path_can_use_provider_cache() {
+        let context = ProviderContext {
+            mount_id: "notion-main".to_string(),
+            sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
+            state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
+            path_identities: Default::default(),
+        };
+        let page = Path::new(r"C:\Users\Ada\AFS\Notion\Draft\page.md");
+        context.remember_path_identity(page, "local:123");
+
+        assert_eq!(
+            identity_for_path(&context, page).expect("identity"),
+            Some("local:123".to_string())
         );
     }
 }

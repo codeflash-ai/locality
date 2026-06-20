@@ -928,6 +928,39 @@ where
         ));
     }
     let entities = store.list_entities(mount_id).map_err(AfsError::from)?;
+    let mutations = store
+        .list_virtual_mutations(mount_id)
+        .map_err(AfsError::from)?;
+    if let Some(child_identifier) = identifier.strip_prefix(CHILDREN_PREFIX) {
+        if child_identifier.starts_with(LOCAL_PREFIX) {
+            let mutation = pending_page_directory_mutation(&mutations, identifier)?
+                .ok_or_else(|| missing_identifier(identifier))?
+                .clone();
+            let path = content_path_for_relative(content_root, &mutation.projected_path)?;
+            let _ = std::fs::remove_file(path);
+            store
+                .delete_virtual_mutation(mount_id, &mutation.local_id)
+                .map_err(AfsError::from)?;
+            let index = ProviderIndex::new(&entities);
+            let item = pending_page_child_dir_item(&mount, &mutation, &index);
+            return Ok(VirtualFsMutationReport {
+                mount_id: mount_id.0.clone(),
+                identifier: identifier.to_string(),
+                path: item.path.clone(),
+                item,
+            });
+        }
+
+        let remote_id = RemoteId::new(child_identifier);
+        let entity = require_entity(store, mount_id, &remote_id)?;
+        if entity.kind != EntityKind::Page {
+            return Err(AfsError::Unsupported(
+                "only page directories can be deleted by the virtual filesystem",
+            ));
+        }
+        return record_virtual_fs_page_delete(store, content_root, &mount, &entities, entity, true);
+    }
+
     if let Some(mutation) = local_mutation(store, mount_id, identifier)? {
         let path = content_path_for_relative(content_root, &mutation.projected_path)?;
         let _ = std::fs::remove_file(path);
@@ -950,6 +983,22 @@ where
             "only page.md files can be deleted by the virtual filesystem",
         ));
     }
+    record_virtual_fs_page_delete(store, content_root, &mount, &entities, entity, false)
+}
+
+fn record_virtual_fs_page_delete<S>(
+    store: &mut S,
+    content_root: &Path,
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+    entity: EntityRecord,
+    directory_item: bool,
+) -> AfsResult<VirtualFsMutationReport>
+where
+    S: EntityRepository + VirtualMutationRepository + FreshnessStateRepository,
+{
+    let mount_id = &mount.mount_id;
+    let remote_id = entity.remote_id.clone();
     let now = now_string();
     let mutation = VirtualMutationRecord {
         mount_id: mount_id.clone(),
@@ -969,10 +1018,19 @@ where
         .map_err(AfsError::from)?;
     record_virtual_local_change(store, &entity)?;
     let index = ProviderIndex::new(&entities);
-    let item = entity_item(&mount, &entity, &index);
+    let item = if directory_item {
+        page_child_dir_item(
+            mount,
+            &page_container_path(&entity.path),
+            &entity.remote_id,
+            &index,
+        )
+    } else {
+        entity_item(mount, &entity, &index)
+    };
     Ok(VirtualFsMutationReport {
         mount_id: mount_id.0.clone(),
-        identifier: remote_id.0,
+        identifier: item.identifier.clone(),
         path: item.path.clone(),
         item,
     })
@@ -3134,6 +3192,94 @@ mod tests {
             .expect("get mutation")
             .expect("mutation");
         assert_eq!(mutation.mutation_kind, VirtualMutationKind::Delete);
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn trash_remote_page_directory_records_tombstone_and_hides_child() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("afs-virtual-fs-trash-page-dir");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            ))
+            .expect("save page");
+
+        let trashed =
+            trash_virtual_fs_item(&mut store, &content_root, &mount_id, "children:page-1")
+                .expect("trash virtual page directory");
+
+        assert_eq!(trashed.identifier, "children:page-1");
+        assert_eq!(trashed.item.kind, VirtualFsItemKind::Folder);
+        let children =
+            virtual_fs_children(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER).expect("children");
+        assert!(
+            !children
+                .children
+                .iter()
+                .any(|child| child.identifier == "children:page-1")
+        );
+        let mutation = store
+            .get_virtual_mutation(&mount_id, "delete:page-1")
+            .expect("get mutation")
+            .expect("mutation");
+        assert_eq!(mutation.mutation_kind, VirtualMutationKind::Delete);
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn trash_pending_page_directory_discards_overlay_and_cache() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("afs-virtual-fs-trash-pending-dir");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-root"),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            ))
+            .expect("save parent page");
+        let created = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:page-root",
+            "Draft",
+        )
+        .expect("create virtual directory");
+        let cache_path = content_root.join("Home/Draft/page.md");
+        std::fs::write(&cache_path, b"pending body").expect("write pending cache");
+
+        let trashed =
+            trash_virtual_fs_item(&mut store, &content_root, &mount_id, &created.identifier)
+                .expect("trash pending virtual page directory");
+
+        assert_eq!(trashed.identifier, created.identifier);
+        assert_eq!(trashed.item.kind, VirtualFsItemKind::Folder);
+        assert!(!cache_path.exists());
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
 
         let _ = std::fs::remove_dir_all(state_root);
     }
