@@ -1570,7 +1570,8 @@ fn connect_cloud_filter_sync_root(
 
 #[cfg(target_os = "windows")]
 fn seed_root_placeholders(context: &ProviderContext) -> Result<usize, HelperError> {
-    let children = context.children(afsd::file_provider::ROOT_CONTAINER_IDENTIFIER)?;
+    let mut children = context.children(afsd::file_provider::ROOT_CONTAINER_IDENTIFIER)?;
+    ensure_placeholder_file_sizes(context, &mut children.children)?;
     create_placeholders_in_directory(&context.sync_root, &children.children)?;
     remember_placeholder_children(context, &context.sync_root, &children.children);
     Ok(children.children.len())
@@ -1709,12 +1710,13 @@ unsafe fn handle_fetch_placeholders(
     trace_cloud_files(format!(
         "fetch placeholders start container=`{container_identifier}`"
     ));
-    let children = context.children(&container_identifier)?;
+    let mut children = context.children(&container_identifier)?;
     let directory = callback_path(context, info).unwrap_or_else(|| context.sync_root.clone());
     trace_cloud_files(format!(
         "fetch placeholders transfer container=`{container_identifier}` count={}",
         children.children.len()
     ));
+    ensure_placeholder_file_sizes(context, &mut children.children)?;
     let mut batch = PlaceholderBatch::from_items(&children.children);
     unsafe {
         complete_fetch_placeholders_with_status(
@@ -2174,6 +2176,30 @@ fn remember_placeholder_children(
     for item in items {
         context.remember_path_identity(&directory.join(&item.filename), &item.identifier);
     }
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_placeholder_file_sizes(
+    context: &ProviderContext,
+    items: &mut [afsd::file_provider::FileProviderItem],
+) -> Result<(), HelperError> {
+    for item in items {
+        if item.kind == afsd::file_provider::FileProviderItemKind::Folder
+            || item.byte_size.is_some()
+        {
+            continue;
+        }
+        trace_cloud_files(format!(
+            "materialize placeholder size identity=`{}` filename=`{}`",
+            item.identifier, item.filename
+        ));
+        let read = context.read(&item.identifier)?;
+        let contents = decode_base64(&read.contents_base64)?;
+        item.byte_size = Some(contents.len() as u64);
+        item.hydration = read.item.hydration;
+        item.materialized_path = read.item.materialized_path;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
