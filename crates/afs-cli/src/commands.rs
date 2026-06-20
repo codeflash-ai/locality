@@ -424,8 +424,16 @@ struct TemplateApplyArgs {
 enum FileProviderCommand {
     #[command(about = "Register a virtual filesystem provider for a mount")]
     Register(FileProviderTargetArg),
+    #[command(about = "Start the background provider runtime for a mount")]
+    Start(FileProviderTargetArg),
     #[command(about = "Run the foreground Windows Cloud Files provider for a mount")]
     Run(FileProviderTargetArg),
+    #[command(about = "Stop the background provider runtime for a mount")]
+    Stop(FileProviderTargetArg),
+    #[command(about = "Show provider runtime status for a mount")]
+    Status(FileProviderTargetArg),
+    #[command(about = "Restart the background provider runtime for a mount")]
+    Restart(FileProviderTargetArg),
     #[command(about = "Open a registered virtual filesystem mount")]
     Open(FileProviderTargetArg),
     #[command(about = "Unregister a virtual filesystem provider for a mount")]
@@ -749,8 +757,24 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
                     args.push("register".to_string());
                     args.push(options.target.clone());
                 }
+                FileProviderCommand::Start(options) => {
+                    args.push("start".to_string());
+                    args.push(options.target.clone());
+                }
                 FileProviderCommand::Run(options) => {
                     args.push("run".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Stop(options) => {
+                    args.push("stop".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Status(options) => {
+                    args.push("status".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Restart(options) => {
+                    args.push("restart".to_string());
                     args.push(options.target.clone());
                 }
                 FileProviderCommand::Open(options) => {
@@ -1145,7 +1169,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "file-provider",
                 "usage",
-                "usage: afs file-provider register|run|open|unregister <mount-id-or-path> [--json]",
+                "usage: afs file-provider register|start|run|stop|status|restart|open|unregister <mount-id-or-path> [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1153,7 +1177,27 @@ fn file_provider(args: &[String], json: bool) -> i32 {
 
     match action {
         "register" => file_provider_register(args, json),
+        "start" => file_provider_lifecycle(
+            args,
+            json,
+            file_provider_helper::WindowsCloudFilesLifecycleAction::Start,
+        ),
         "run" => file_provider_run(args, json),
+        "stop" => file_provider_lifecycle(
+            args,
+            json,
+            file_provider_helper::WindowsCloudFilesLifecycleAction::Stop,
+        ),
+        "status" => file_provider_lifecycle(
+            args,
+            json,
+            file_provider_helper::WindowsCloudFilesLifecycleAction::Status,
+        ),
+        "restart" => file_provider_lifecycle(
+            args,
+            json,
+            file_provider_helper::WindowsCloudFilesLifecycleAction::Restart,
+        ),
         "open" => file_provider_open(args, json),
         "unregister" => file_provider_unregister(args, json),
         "list" => run_platform_file_provider_helper(
@@ -1173,7 +1217,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "file-provider",
                 "usage",
-                "usage: afs file-provider register|run|open|unregister|list|reset",
+                "usage: afs file-provider register|start|run|stop|status|restart|open|unregister|list|reset",
             ),
             EXIT_USAGE,
         ),
@@ -1239,6 +1283,72 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
         VirtualProjectionRegistration::WindowsCloudFiles => {
             run_windows_cloud_files_register(json, &mount)
         }
+    }
+}
+
+fn file_provider_lifecycle(
+    args: &[String],
+    json: bool,
+    action: file_provider_helper::WindowsCloudFilesLifecycleAction,
+) -> i32 {
+    let Some(target) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "usage",
+                format!(
+                    "usage: afs file-provider {} <mount-id-or-path> [--json]",
+                    action.as_str()
+                ),
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let mount = match resolve_mount_target(&store, target) {
+        Ok(mount) => mount,
+        Err(message) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "mount_not_found", message),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let registration = match validate_virtual_projection_registration(&mount, std::env::consts::OS)
+    {
+        Ok(registration) => registration,
+        Err(error) => return command_error(json, error, EXIT_USAGE),
+    };
+
+    match registration {
+        VirtualProjectionRegistration::WindowsCloudFiles => {
+            run_windows_cloud_files_lifecycle(json, &mount, action)
+        }
+        VirtualProjectionRegistration::MacosFileProvider
+        | VirtualProjectionRegistration::LinuxFuse => command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "unsupported_platform",
+                format!(
+                    "file-provider {} is currently implemented for Windows Cloud Files mounts",
+                    action.as_str()
+                ),
+            ),
+            EXIT_USAGE,
+        ),
     }
 }
 
@@ -3216,6 +3326,37 @@ fn run_windows_cloud_files_run(json: bool, mount: &MountConfig) -> i32 {
     file_provider_helper_success_report(json, "run", Some(mount.mount_id.0.clone()), helper_report)
 }
 
+fn run_windows_cloud_files_lifecycle(
+    json: bool,
+    mount: &MountConfig,
+    action: file_provider_helper::WindowsCloudFilesLifecycleAction,
+) -> i32 {
+    let state_root = default_state_root();
+    let display_name = file_provider_display_name(mount);
+    let helper_report = match file_provider_helper::run_windows_cloud_files_lifecycle(
+        &state_root,
+        mount,
+        &display_name,
+        action,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(
+                json,
+                windows_cloud_files_command_error(error),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    file_provider_helper_success_report(
+        json,
+        action.as_str(),
+        Some(mount.mount_id.0.clone()),
+        helper_report,
+    )
+}
+
 fn run_windows_cloud_files_open(json: bool, mount: &MountConfig) -> i32 {
     let helper_report = match file_provider_helper::open_windows_cloud_files_sync_root(mount) {
         Ok(report) => report,
@@ -3470,8 +3611,42 @@ fn linux_fuse_command_error(
     CommandError::new("file-provider", error.code(), error.message())
 }
 
+fn windows_cloud_files_command_error(
+    error: file_provider_helper::WindowsCloudFilesHelperError,
+) -> CommandError {
+    let command_error = CommandError::new("file-provider", error.code(), error.message());
+    match error {
+        file_provider_helper::WindowsCloudFilesHelperError::DaemonNotRunning => {
+            command_error.with_suggested_command("afs daemon start")
+        }
+        _ => command_error,
+    }
+}
+
 fn print_file_provider_report(report: &FileProviderCommandReport) {
     if report.action == "list" {
+        if let Some(roots) = report.helper_report.get("roots").and_then(Value::as_array) {
+            if roots.is_empty() {
+                println!("no file provider domains");
+                return;
+            }
+            for root in roots {
+                let mount_id = root
+                    .get("mount_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                let display_name = root
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                let path = root
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                println!("{mount_id}\t{display_name}\t{path}");
+            }
+            return;
+        }
         let Some(domains) = report
             .helper_report
             .get("domains")
@@ -4809,7 +4984,14 @@ mod tests {
             ),
             (
                 vec!["file-provider", "--help"],
-                vec!["Usage: afs file-provider", "Commands:", "register", "reset"],
+                vec![
+                    "Usage: afs file-provider",
+                    "Commands:",
+                    "register",
+                    "start",
+                    "status",
+                    "reset",
+                ],
             ),
             (
                 vec!["file-provider", "register", "--help"],
@@ -4818,6 +5000,38 @@ mod tests {
                     "Register a virtual filesystem",
                     "mount-id-or-path",
                     "--json",
+                ],
+            ),
+            (
+                vec!["file-provider", "start", "--help"],
+                vec![
+                    "Usage: afs file-provider start",
+                    "Start the background provider",
+                    "mount-id-or-path",
+                ],
+            ),
+            (
+                vec!["file-provider", "stop", "--help"],
+                vec![
+                    "Usage: afs file-provider stop",
+                    "Stop the background provider",
+                    "mount-id-or-path",
+                ],
+            ),
+            (
+                vec!["file-provider", "status", "--help"],
+                vec![
+                    "Usage: afs file-provider status",
+                    "Show provider runtime status",
+                    "mount-id-or-path",
+                ],
+            ),
+            (
+                vec!["file-provider", "restart", "--help"],
+                vec![
+                    "Usage: afs file-provider restart",
+                    "Restart the background provider",
+                    "mount-id-or-path",
                 ],
             ),
             (
@@ -4938,6 +5152,12 @@ mod tests {
                 "/tmp/founder",
                 "--force"
             ]
+        );
+
+        let cli = parse_cli(["file-provider", "restart", "notion-main"]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["file-provider", "restart", "notion-main"]
         );
     }
 

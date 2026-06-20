@@ -9,7 +9,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs profiles [--json]`
 - `afs connection show <id> [--json]`
 - `afs disconnect <id> [--json]`
-- `afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse] [--read-only] [--json]`
+- `afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `afs daemon status [--json]`
 - `afs info [path] [--json]`
 - `afs status [path] [--json]`
@@ -24,7 +24,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs undo [push-id] [--json]`
 - `afs log [path] [--json]`
 - `afs config set <key=value>`
-- `afs file-provider register|run|open|unregister|list|reset [target] [--json]`
+- `afs file-provider register|start|run|stop|status|restart|open|unregister|list|reset [target] [--json]`
 
 ## Exit-code contract
 
@@ -185,9 +185,9 @@ Workspace Notion mounts use the access granted to the connected integration. If 
 
 Projection choices are platform-specific. Linux binaries accept `plain-files` and
 `linux-fuse`; macOS binaries accept `plain-files` and `macos-file-provider`;
-Windows currently accepts `plain-files` only.
+Windows binaries accept `plain-files` and `windows-cloud-files`.
 
-`afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. On Linux, `--projection linux-fuse` records the equivalent virtual projection and registers the per-mount FUSE service. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension lists dataless files from the daemon and materializes a file on open.
+`afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. On Linux, `--projection linux-fuse` records the equivalent virtual projection and registers the per-mount FUSE service. On Windows, `--projection windows-cloud-files` records a Cloud Files sync root. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension, FUSE helper, or Cloud Files provider lists dataless files from the daemon and materializes a file on open.
 
 Linux should expose the same online-only behavior through a FUSE projection
 helper rather than through inotify-triggered placeholder files. The daemon API for
@@ -195,14 +195,27 @@ that path is platform-neutral `virtual_fs`; macOS File Provider commands are
 compatibility aliases over it.
 
 `afs file-provider register <mount-id-or-path>` validates the mount against the
-current platform's virtual projection: `macos_file_provider` on macOS and
-`linux_fuse` on Linux. The macOS path shells out to the signed app-bundle helper
-at `AgentFS.app/Contents/MacOS/agentfs-file-providerctl`; `AFS_FILE_PROVIDERCTL`
+current platform's virtual projection: `macos_file_provider` on macOS,
+`linux_fuse` on Linux, and `windows_cloud_files` on Windows. The macOS path
+shells out to the signed app-bundle helper at
+`AgentFS.app/Contents/MacOS/agentfs-file-providerctl`; `AFS_FILE_PROVIDERCTL`
 can override the helper path for development. On Linux this command can be rerun
 to repair or restart the per-mount systemd user service for `afs-fuse`;
-`AFS_FUSE_BIN` can override the helper binary path for development. `afs
-file-provider unregister <mount>` stops and removes that Linux service. `list`
-and `reset` still target the macOS File Provider helper.
+`AFS_FUSE_BIN` can override the helper binary path for development.
+
+On Windows, `afs file-provider start <mount>` registers or repairs the sync
+root, starts `afs-cloud-files.exe` as a detached per-mount provider process, and
+writes per-mount PID and log metadata under the AFS state directory. `status`
+reports provider state, daemon reachability, sync-root registration, PID
+metadata, and log paths. `stop` stops the provider runtime without unregistering
+the sync root; `restart` performs stop then start. `AFS_CLOUD_FILES_BIN` can
+override the helper binary path for development.
+
+`afs file-provider unregister <mount>` unregisters the current platform's
+virtual projection. On Linux it stops and removes the systemd user service. On
+Windows it removes the Cloud Files sync-root registration; use `stop` first when
+you only want to stop the runtime. `list` and `reset` target the platform helper
+for the current host.
 
 `afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `.afs/media/`, and persists the root page Synced Tree shadow snapshot. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the Synced Tree shadow, returning a dirty skip instead.
 

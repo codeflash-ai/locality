@@ -303,10 +303,11 @@ the virtual mutation, and then tracked through the same placeholder identity pat
 as existing cloud items.
 
 Current implementation direction: Windows uses the Rust `afs-cloud-files.exe`
-helper. The desktop app registers the sync root, starts the per-mount provider
-runtime when a mount is activated/opened or when the app launches with existing
-Cloud Files mounts, and restarts provider children that exit while the desktop
-app is supervising them.
+helper. The CLI exposes `afs file-provider start|stop|status|restart` as the
+shared lifecycle surface for the provider runtime; the desktop app should call
+the same platform layer when a mount is activated/opened or when the app
+launches with existing Cloud Files mounts, and can build restart supervision on
+top of the same per-mount PID/log metadata.
 
 Open design questions:
 
@@ -478,7 +479,9 @@ Work:
 - Implement placeholder enumeration from daemon metadata.
 - Implement hydration callback through daemon `materialize`.
 - Implement write/create/rename/delete callback mapping to virtual mutations.
-- Wire desktop lifecycle supervision for the Windows provider runtime.
+- Wire CLI lifecycle management and diagnostics for the Windows provider
+  runtime.
+- Wire desktop lifecycle supervision through the same provider lifecycle layer.
 - Add Windows Cloud Files smoke tests on a suitable runner.
 
 ### Phase 4: Cross-Platform Product Hardening
@@ -488,7 +491,8 @@ install and recovery paths.
 
 Work:
 
-- Unified diagnostics: `afs doctor`.
+- Unified diagnostics: extend the provider lifecycle `status` output into
+  top-level `afs doctor`.
 - Unified reset: unregister projection, stop daemon, preserve user documents,
   clear state/credentials only with confirmation.
 - Shared projection contract test suite.
