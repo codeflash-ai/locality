@@ -5,6 +5,7 @@
 //! and journal pushes. The crate provides a deterministic in-memory
 //! implementation for tests and a SQLite implementation for local durable state.
 
+pub mod compatibility;
 pub mod credentials;
 pub mod error;
 pub mod memory;
@@ -12,6 +13,10 @@ pub mod records;
 pub mod repository;
 pub mod sqlite;
 
+pub use compatibility::{
+    StateCompatibilityIssue, StateCompatibilityReport, StateCompatibilityStatus,
+    StateComponentDefinition, StateComponentRecord,
+};
 pub use credentials::{
     CredentialError, CredentialResult, CredentialStore, FileCredentialStore,
     InMemoryCredentialStore, open_credential_store,

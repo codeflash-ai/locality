@@ -48,19 +48,19 @@ target/release/bundle/macos/AFS.app
 target/release/bundle/dmg/*.dmg
 ```
 
-## Beta Upgrade State
+## Upgrade State
 
-During early beta builds, the desktop app treats an existing `~/.afs/state.sqlite3`
-from a different build as potentially incompatible local state. On first launch
-of a new build, AFS prompts the user to reset local AFS state before onboarding
-continues. The reset stops `afsd`, unregisters File Provider domains, removes
-AFS metadata/cache/support state, and clears connector credentials. It does not
-delete user-visible local folders or documents.
+The desktop app records the currently installed app and daemon build metadata,
+but an existing `~/.afs/state.sqlite3` from a different build no longer blocks
+onboarding or asks the user to reset local state. Durable state compatibility is
+owned by SQLite schema and state-component migrations in `afs-store`; ordinary
+upgrades should continue without a user-visible state step.
 
-The same reset is available in the app under **Settings > Developer > Reset
-Local State**. This is intentionally a beta-era escape hatch; longer-term
-releases should use stable SQLite migrations and explicit state migrations
-instead of asking users to reset.
+A destructive reset remains available in the app under **Settings > Developer >
+Reset Local State** for explicit repair/debugging. The reset stops `afsd`,
+unregisters File Provider domains, removes AFS metadata/cache/support state, and
+clears connector credentials. It does not delete user-visible local folders or
+documents.
 
 The desktop app also checks the running `afsd` build metadata before reusing a
 daemon. If the daemon does not report the same build ID as the app bundle, or if

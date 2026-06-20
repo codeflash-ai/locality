@@ -1576,10 +1576,9 @@ fn inspect_install_state(state_root: &Path) -> InstallStateReview {
     let state_exists = state_root.exists();
     let current_build_id = current_desktop_build_id();
     let previous_build_id = marker.as_ref().map(install_marker_display_build_id);
-    let marker_matches = marker.as_ref().is_some_and(install_marker_matches_current);
 
     InstallStateReview {
-        should_prompt: sqlite_exists && !marker_matches,
+        should_prompt: false,
         state_exists,
         sqlite_exists,
         previous_build_id,
@@ -1616,13 +1615,6 @@ fn current_install_marker() -> DesktopInstallMarker {
         app_build_id: current_desktop_build_id(),
         daemon_build_id: current_daemon_build_id(),
     }
-}
-
-fn install_marker_matches_current(marker: &DesktopInstallMarker) -> bool {
-    marker.state_format_version == DESKTOP_INSTALL_MARKER_VERSION
-        && marker.app_version == env!("CARGO_PKG_VERSION")
-        && marker.app_build_id == current_desktop_build_id()
-        && marker.daemon_build_id == current_daemon_build_id()
 }
 
 fn install_marker_display_build_id(marker: &DesktopInstallMarker) -> String {
@@ -4368,21 +4360,21 @@ mod tests {
     }
 
     #[test]
-    fn install_state_prompts_for_existing_sqlite_without_current_marker() {
+    fn install_state_does_not_prompt_for_existing_sqlite_without_current_marker() {
         let temp = TestTempDir::new("install-state-existing-sqlite");
         fs::write(temp.path().join("state.sqlite3"), b"not a real sqlite db")
             .expect("write sqlite marker");
 
         let review = inspect_install_state(temp.path());
 
-        assert!(review.should_prompt);
+        assert!(!review.should_prompt);
         assert!(review.state_exists);
         assert!(review.sqlite_exists);
         assert_eq!(review.previous_build_id, None);
     }
 
     #[test]
-    fn install_state_marker_suppresses_upgrade_prompt() {
+    fn install_state_marker_records_previous_build_without_prompting() {
         let temp = TestTempDir::new("install-state-current-marker");
         fs::write(temp.path().join("state.sqlite3"), b"not a real sqlite db")
             .expect("write sqlite marker");
@@ -4399,7 +4391,7 @@ mod tests {
     }
 
     #[test]
-    fn install_state_prompts_for_legacy_marker_without_desktop_build_id() {
+    fn install_state_does_not_prompt_for_legacy_marker_without_desktop_build_id() {
         let temp = TestTempDir::new("install-state-legacy-marker");
         fs::write(temp.path().join("state.sqlite3"), b"not a real sqlite db")
             .expect("write sqlite marker");
@@ -4415,7 +4407,7 @@ mod tests {
 
         let review = inspect_install_state(temp.path());
 
-        assert!(review.should_prompt);
+        assert!(!review.should_prompt);
         assert_eq!(
             review.previous_build_id.as_deref(),
             Some(current_daemon_build_id().as_str())
@@ -4423,7 +4415,7 @@ mod tests {
     }
 
     #[test]
-    fn install_state_prompts_when_desktop_build_changes() {
+    fn install_state_does_not_prompt_when_desktop_build_changes() {
         let temp = TestTempDir::new("install-state-new-desktop-build");
         fs::write(temp.path().join("state.sqlite3"), b"not a real sqlite db")
             .expect("write sqlite marker");
@@ -4441,7 +4433,7 @@ mod tests {
 
         let review = inspect_install_state(temp.path());
 
-        assert!(review.should_prompt);
+        assert!(!review.should_prompt);
         assert_eq!(
             review.previous_build_id.as_deref(),
             Some("old-desktop-build")

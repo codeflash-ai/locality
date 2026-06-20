@@ -147,14 +147,6 @@ type AgentGuidanceInstallReport = {
   prompt: string;
 };
 
-type InstallStateReview = {
-  shouldPrompt: boolean;
-  stateExists: boolean;
-  sqliteExists: boolean;
-  previousBuildId?: string | null;
-  currentBuildId: string;
-};
-
 const sampleSnapshot: DesktopSnapshot = {
   health: {
     state: "ready",
@@ -375,7 +367,6 @@ export default function App() {
   const [view, setView] = useState<AppView>("home");
   const route = window.location.hash;
   const [showOnboarding, setShowOnboarding] = useState(() => route !== "#app" && route !== "#tray");
-  const [installReview, setInstallReview] = useState<InstallStateReview | null>(null);
   const [onboardingKey, setOnboardingKey] = useState(0);
   const [onboardingInitialStep, setOnboardingInitialStep] = useState<1 | 4>(() =>
     route === "#onboarding-ready" ? 4 : 1,
@@ -485,12 +476,6 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       if (isTauriRuntime()) {
-        const review = await callCommand<InstallStateReview>("install_state_review");
-        if (review.shouldPrompt) {
-          setInstallReview(review);
-          setSnapshotLoaded(true);
-          return;
-        }
         await callCommand<ActionReport>("acknowledge_install_state").catch(() => undefined);
         if (!appStoreDistribution) {
           await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
@@ -558,45 +543,6 @@ export default function App() {
     return <TrayPopover snapshot={snapshot} />;
   }
 
-  if (installReview?.shouldPrompt) {
-    return (
-      <StateResetPrompt
-        review={installReview}
-        onReset={async () => {
-          const report = await callCommand<ActionReport>("reset_local_afs_state", undefined, {
-            ok: true,
-            message: "AFS local state was reset.",
-          });
-          if (!report.ok) {
-            throw new Error(report.message);
-          }
-          setSnapshotLoaded(false);
-          setOnboardingInitialStep(1);
-          setOnboardingKey((key) => key + 1);
-          await refreshSnapshot();
-          setInstallReview(null);
-          setView("home");
-          setShowOnboarding(true);
-        }}
-        onKeep={async () => {
-          const report = await callCommand<ActionReport>("acknowledge_install_state", undefined, {
-            ok: true,
-            message: "AFS install state recorded.",
-          });
-          if (!report.ok) {
-            throw new Error(report.message);
-          }
-          setInstallReview(null);
-          if (!appStoreDistribution) {
-            await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
-          }
-          await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
-          await refreshSnapshot();
-        }}
-      />
-    );
-  }
-
   if (showOnboarding) {
     return (
       <Onboarding
@@ -631,76 +577,6 @@ export default function App() {
         setShowOnboarding(true);
       }}
     />
-  );
-}
-
-function StateResetPrompt({
-  review,
-  onReset,
-  onKeep,
-}: {
-  review: InstallStateReview;
-  onReset: () => Promise<void>;
-  onKeep: () => Promise<void>;
-}) {
-  const [state, setState] = useState<"idle" | "resetting" | "keeping" | "error">("idle");
-  const [message, setMessage] = useState("");
-
-  async function run(action: "reset" | "keep") {
-    setState(action === "reset" ? "resetting" : "keeping");
-    setMessage("");
-    try {
-      await (action === "reset" ? onReset() : onKeep());
-    } catch (error) {
-      setState("error");
-      setMessage(errorMessage(error));
-    }
-  }
-
-  return (
-    <main className="setup-shell">
-      <section className="setup-window">
-        <WindowChrome title="AFS Setup" meta="State Check" />
-        <SetupContent mark={<BrandTile variant="folder" />}>
-          <div>
-            <div className="sync-note warning">
-              <AlertTriangle />
-              Previous install found
-            </div>
-            <h1>Start this beta with clean AFS state?</h1>
-            <p>
-              AFS found an existing local database from an earlier build. During the beta, resetting
-              avoids mount and schema drift. Your local files and folders are left in place.
-            </p>
-          </div>
-          <div className="state-reset-card">
-            <SettingRow title="Local database" value={review.sqliteExists ? "~/.afs/state.sqlite3" : "Not found"} />
-            <SettingRow title="Previous build" value={review.previousBuildId ?? "Unknown"} />
-            <SettingRow title="Current build" value={review.currentBuildId} />
-          </div>
-          <div className="button-row">
-            <PrimaryButton
-              icon={state === "resetting" ? <Loader2 className="spin-icon" /> : <RotateCcw />}
-              disabled={state === "resetting" || state === "keeping"}
-              onClick={() => void run("reset")}
-            >
-              {state === "resetting" ? "Resetting" : "Reset AFS State"}
-            </PrimaryButton>
-            <SecondaryButton
-              disabled={state === "resetting" || state === "keeping"}
-              onClick={() => void run("keep")}
-            >
-              Keep Existing State
-            </SecondaryButton>
-          </div>
-          <p className="quiet-note">
-            Reset clears AFS metadata, cache, mount registration, and connector credentials. It does
-            not delete documents outside AFS state.
-          </p>
-          {state === "error" && <p className="field-error">{message}</p>}
-        </SetupContent>
-      </section>
-    </main>
   );
 }
 

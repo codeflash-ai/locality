@@ -40,6 +40,10 @@
 - SQLite migrates v8 connection rows to v9 by adding `profile_id` and seeding the built-in `notion-token-default` profile with connector capability flags.
 - SQLite migrates v11 rows to v12 by creating and rebuilding
   `entity_search_fts` from entity and remote-observation metadata.
+- SQLite migrates v12 rows to v13 by adding state compatibility metadata,
+  migration history, connector state, and projection state tables.
+- SQLite records component versions for durable subsystems so compatibility is
+  decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
 
 ## SQLite Schema
@@ -53,6 +57,32 @@ The first schema keeps high-value lookup fields relational and stores complex co
 - `entity_search_fts`: derived full-text index over entity titles/paths and
   observed remote titles/paths. It is rebuildable and stores no secrets;
 - `shadows`: mount id, entity id, body hash, rendered body, JSON shadow blocks;
-- `journals`: push id, mount id, JSON remote ids, JSON push plan, JSON preimage snapshots, JSON apply effects, JSON status.
+- `journals`: push id, mount id, JSON remote ids, JSON push plan, JSON preimage snapshots, JSON apply effects, JSON status;
+- `state_components`: current durable/rebuildable component versions, minimum
+  reader versions, and whether unknown components must block older binaries;
+- `state_migrations`: append-only migration history for state/schema upgrades;
+- `connector_state`: connector-owned durable state versioned by connector and
+  scope, for future connectors and connector-specific migrations;
+- `projection_state`: projection-owned state such as File Provider/FUSE layout
+  versions and repair generations.
 
 Shadow blocks, journal plans, journal preimages, and journal apply effects are JSON by design for now. They round-trip through typed Rust records with stable snake-case serde names, and the schema can normalize them later if query patterns justify it.
+
+## Compatibility Rules
+
+- Bump `PRAGMA user_version` when SQLite DDL changes, and add a forward migration.
+- Bump a `state_components` version when the stored meaning of JSON, paths,
+  shadows, journals, virtual mutations, auth bindings, connector state, or
+  projection state changes without a table-shape change.
+- Mark rebuildable components as `required = 0` and `rebuildable = 1`; stale
+  rebuildable state should be repaired or regenerated instead of forcing a
+  reset.
+- If a new writer produces state that older readers must not open, raise that
+  component's `min_reader_version` so old binaries return `NeedsUpdate`.
+- Unknown required components block older binaries. Unknown non-required
+  rebuildable components are ignored by older binaries.
+
+The SQLite test suite includes a v13 schema snapshot, old-DB migration fixtures,
+newer-schema detection, newer-component detection, and unknown-component
+compatibility checks. A PR that changes durable state should update these tests
+as part of the same change.

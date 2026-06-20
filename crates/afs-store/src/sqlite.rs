@@ -6,6 +6,7 @@
 //! until query needs justify normalization.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_core::AfsResult;
 use afs_core::hydration::HydrationReason;
@@ -15,11 +16,15 @@ use afs_core::journal::{
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PlanSummary, PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::compatibility::{
+    StateCompatibilityIssue, StateCompatibilityReport, StateCompatibilityStatus,
+    StateComponentDefinition, StateComponentRecord,
+};
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
@@ -33,9 +38,92 @@ use crate::repository::{
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
 const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
+const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
+    StateComponentDefinition {
+        component_id: "core:schema",
+        component_kind: "schema",
+        current_version: SCHEMA_VERSION,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "connector:notion",
+        component_kind: "connector_state",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{\"connector_version\":\"notion.v1\"}",
+    },
+    StateComponentDefinition {
+        component_id: "projection:plain_files",
+        component_kind: "projection_layout",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "projection:macos_file_provider",
+        component_kind: "projection_layout",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "projection:linux_fuse",
+        component_kind: "projection_layout",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "durable:journals",
+        component_kind: "durable_json",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "durable:virtual_mutations",
+        component_kind: "durable_json",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "auth:connections",
+        component_kind: "secret_binding",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "cache:entity_search",
+        component_kind: "rebuildable_cache",
+        current_version: 1,
+        min_reader_version: 1,
+        required: false,
+        rebuildable: true,
+        data_json: "{}",
+    },
+];
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -44,12 +132,25 @@ pub struct SqliteStateStore {
 }
 
 impl SqliteStateStore {
+    pub fn current_schema_version() -> i64 {
+        SCHEMA_VERSION
+    }
+
+    pub fn current_component_definitions() -> &'static [StateComponentDefinition] {
+        CURRENT_COMPONENT_DEFINITIONS
+    }
+
+    pub fn inspect_compatibility(root: PathBuf) -> StoreResult<StateCompatibilityReport> {
+        inspect_state_compatibility(root)
+    }
+
     pub fn open(root: PathBuf) -> StoreResult<Self> {
         std::fs::create_dir_all(&root)?;
         let db_path = root.join(DB_FILE);
         let store = Self { root, db_path };
         let connection = store.connection()?;
         initialize_schema(&connection)?;
+        ensure_current_state_is_readable(&connection)?;
         Ok(store)
     }
 
@@ -1490,8 +1591,15 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         rebuild_entity_search_index(connection)?;
     }
 
+    if user_version < 13 {
+        create_state_management_tables(connection)?;
+        seed_current_state_components(connection)?;
+        record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
+        seed_current_state_components(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
 
@@ -1851,6 +1959,293 @@ fn json_type(value: &Value) -> Option<&str> {
     value.get("type").and_then(Value::as_str)
 }
 
+fn inspect_state_compatibility(root: PathBuf) -> StoreResult<StateCompatibilityReport> {
+    let db_path = root.join(DB_FILE);
+    if !db_path.exists() {
+        return Ok(StateCompatibilityReport::ready(
+            db_path,
+            false,
+            SCHEMA_VERSION,
+        ));
+    }
+
+    let connection = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let schema_version = read_user_version(&connection)?;
+    let mut issues = Vec::new();
+
+    if schema_version > SCHEMA_VERSION {
+        issues.push(StateCompatibilityIssue::NewerSchema {
+            found: schema_version,
+            supported: SCHEMA_VERSION,
+        });
+    } else if schema_version < SCHEMA_VERSION {
+        issues.push(StateCompatibilityIssue::OlderSchema {
+            found: schema_version,
+            current: SCHEMA_VERSION,
+        });
+    } else {
+        issues.extend(inspect_state_component_issues(&connection)?);
+    }
+
+    Ok(StateCompatibilityReport::from_issues(
+        db_path,
+        true,
+        Some(schema_version),
+        SCHEMA_VERSION,
+        issues,
+    ))
+}
+
+fn ensure_current_state_is_readable(connection: &Connection) -> StoreResult<()> {
+    let report = inspect_open_connection_compatibility(connection)?;
+    match report.status {
+        StateCompatibilityStatus::Ready => Ok(()),
+        StateCompatibilityStatus::Migratable
+        | StateCompatibilityStatus::NeedsUpdate
+        | StateCompatibilityStatus::Incompatible => Err(StoreError::StateCompatibility(format!(
+            "state is not readable by this binary: {:?}",
+            report.issues
+        ))),
+    }
+}
+
+fn inspect_open_connection_compatibility(
+    connection: &Connection,
+) -> StoreResult<StateCompatibilityReport> {
+    let schema_version = read_user_version(connection)?;
+    let mut issues = Vec::new();
+
+    if schema_version > SCHEMA_VERSION {
+        issues.push(StateCompatibilityIssue::NewerSchema {
+            found: schema_version,
+            supported: SCHEMA_VERSION,
+        });
+    } else if schema_version < SCHEMA_VERSION {
+        issues.push(StateCompatibilityIssue::OlderSchema {
+            found: schema_version,
+            current: SCHEMA_VERSION,
+        });
+    } else {
+        issues.extend(inspect_state_component_issues(connection)?);
+    }
+
+    Ok(StateCompatibilityReport::from_issues(
+        PathBuf::from(DB_FILE),
+        true,
+        Some(schema_version),
+        SCHEMA_VERSION,
+        issues,
+    ))
+}
+
+fn inspect_state_component_issues(
+    connection: &Connection,
+) -> StoreResult<Vec<StateCompatibilityIssue>> {
+    if !table_exists(connection, "state_components")? {
+        return Ok(CURRENT_COMPONENT_DEFINITIONS
+            .iter()
+            .map(|definition| StateCompatibilityIssue::MissingComponent {
+                component_id: definition.component_id.to_string(),
+            })
+            .collect());
+    }
+
+    let mut components = list_state_components(connection)?;
+    let mut issues = Vec::new();
+
+    for definition in CURRENT_COMPONENT_DEFINITIONS {
+        match components
+            .iter()
+            .position(|component| component.component_id == definition.component_id)
+        {
+            Some(index) => {
+                let component = components.remove(index);
+                if component.version > definition.current_version {
+                    issues.push(StateCompatibilityIssue::NewerComponent {
+                        component_id: component.component_id,
+                        found: component.version,
+                        supported: definition.current_version,
+                    });
+                } else if component.min_reader_version > definition.current_version {
+                    issues.push(StateCompatibilityIssue::ComponentRequiresNewerReader {
+                        component_id: component.component_id,
+                        min_reader_version: component.min_reader_version,
+                        supported: definition.current_version,
+                    });
+                } else if component.version < definition.current_version {
+                    issues.push(StateCompatibilityIssue::OlderComponent {
+                        component_id: component.component_id,
+                        found: component.version,
+                        current: definition.current_version,
+                    });
+                }
+            }
+            None => issues.push(StateCompatibilityIssue::MissingComponent {
+                component_id: definition.component_id.to_string(),
+            }),
+        }
+    }
+
+    for component in components {
+        if component.required {
+            issues.push(StateCompatibilityIssue::UnknownRequiredComponent {
+                component_id: component.component_id,
+                version: component.version,
+            });
+        }
+    }
+
+    Ok(issues)
+}
+
+fn list_state_components(connection: &Connection) -> StoreResult<Vec<StateComponentRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT component_id, component_kind, version, min_reader_version, required, rebuildable, data_json, updated_at
+         FROM state_components
+         ORDER BY component_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(StateComponentRecord {
+            component_id: row.get(0)?,
+            component_kind: row.get(1)?,
+            version: row.get(2)?,
+            min_reader_version: row.get(3)?,
+            required: row.get::<_, i64>(4)? != 0,
+            rebuildable: row.get::<_, i64>(5)? != 0,
+            data_json: row.get(6)?,
+            updated_at: row.get(7)?,
+        })
+    })?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn create_state_management_tables(connection: &Connection) -> StoreResult<()> {
+    connection.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS state_components (
+            component_id TEXT PRIMARY KEY,
+            component_kind TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            min_reader_version INTEGER NOT NULL DEFAULT 1,
+            required INTEGER NOT NULL DEFAULT 1 CHECK (required IN (0, 1)),
+            rebuildable INTEGER NOT NULL DEFAULT 0 CHECK (rebuildable IN (0, 1)),
+            data_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS state_migrations (
+            migration_id TEXT PRIMARY KEY,
+            from_schema_version INTEGER NOT NULL,
+            to_schema_version INTEGER NOT NULL,
+            app_version TEXT NOT NULL,
+            app_build_id TEXT,
+            daemon_build_id TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL,
+            error_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS connector_state (
+            connector TEXT NOT NULL,
+            scope_kind TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            state_version INTEGER NOT NULL,
+            min_reader_version INTEGER NOT NULL DEFAULT 1,
+            state_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (connector, scope_kind, scope_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS projection_state (
+            mount_id TEXT NOT NULL,
+            projection TEXT NOT NULL,
+            layout_version INTEGER NOT NULL,
+            min_reader_version INTEGER NOT NULL DEFAULT 1,
+            os_domain_id TEXT,
+            root_item_id TEXT,
+            repair_generation INTEGER NOT NULL DEFAULT 0,
+            state_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, projection),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+fn seed_current_state_components(connection: &Connection) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let updated_at = unix_timestamp_string();
+    for definition in CURRENT_COMPONENT_DEFINITIONS {
+        connection.execute(
+            "INSERT INTO state_components (
+                component_id,
+                component_kind,
+                version,
+                min_reader_version,
+                required,
+                rebuildable,
+                data_json,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(component_id) DO UPDATE SET
+                component_kind = excluded.component_kind,
+                version = excluded.version,
+                min_reader_version = excluded.min_reader_version,
+                required = excluded.required,
+                rebuildable = excluded.rebuildable,
+                data_json = excluded.data_json,
+                updated_at = excluded.updated_at",
+            params![
+                definition.component_id,
+                definition.component_kind,
+                definition.current_version,
+                definition.min_reader_version,
+                bool_to_int(definition.required),
+                bool_to_int(definition.rebuildable),
+                definition.data_json,
+                &updated_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn record_schema_migration(connection: &Connection, from: i64, to: i64) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let now = unix_timestamp_string();
+    let migration_id = format!("schema-{from}-to-{to}");
+    connection.execute(
+        "INSERT INTO state_migrations (
+            migration_id,
+            from_schema_version,
+            to_schema_version,
+            app_version,
+            app_build_id,
+            daemon_build_id,
+            started_at,
+            finished_at,
+            status,
+            error_json
+         )
+         VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?5, 'finished', NULL)
+         ON CONFLICT(migration_id) DO NOTHING",
+        params![migration_id, from, to, env!("CARGO_PKG_VERSION"), now],
+    )?;
+    Ok(())
+}
+
+fn read_user_version(connection: &Connection) -> StoreResult<i64> {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
 fn seed_default_notion_profile(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS connector_profiles (
@@ -2027,6 +2422,18 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> StoreRes
     Ok(false)
 }
 
+fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1",
+            params![table],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|result| result.is_some())
+        .map_err(Into::into)
+}
+
 fn path_to_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -2041,4 +2448,11 @@ fn to_json<T: Serialize>(value: &T) -> StoreResult<String> {
 
 fn from_json<T: DeserializeOwned>(value: &str) -> StoreResult<T> {
     serde_json::from_str(value).map_err(Into::into)
+}
+
+fn unix_timestamp_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
