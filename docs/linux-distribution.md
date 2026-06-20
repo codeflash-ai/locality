@@ -104,14 +104,19 @@ The GitHub workflow in `.github/workflows/release-linux.yml` publishes Linux
 packages from a `v*` tag or manual workflow dispatch. It runs on
 `ubuntu-24.04`, installs the GTK/WebKit/FUSE/AppIndicator packaging
 dependencies, runs `make publish-linux`, and uploads the resulting `.deb`,
-`.rpm`, signed AppImage updater artifact, updater manifest, per-artifact
-checksums, and `SHA256SUMS-linux` to the matching GitHub Release.
+`.rpm`, signed AppImage updater artifact, updater manifest, and
+`SHA256SUMS-linux` to the matching GitHub Release.
 
-The stable alias assets support latest-release install URLs, for example:
+GitHub Release uploads use stable asset names so latest-release install URLs do
+not need to know the version or commit:
 
 ```sh
 curl -L -o /tmp/afs.deb https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.deb && sudo apt install /tmp/afs.deb
 ```
+
+The workflow still renders versioned package files inside the APT/RPM
+repositories deployed to GitHub Pages, but it does not upload those duplicate
+versioned files to the GitHub Release page.
 
 The same workflow renders static APT and RPM repository metadata under
 `target/release/linux-repo` and deploys it to GitHub Pages for non-prerelease

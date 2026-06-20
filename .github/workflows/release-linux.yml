@@ -133,19 +133,17 @@ jobs:
           UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-linux.json
           UPDATER_NOTES: AFS ${{ env.APP_VERSION }} Linux update.
         run: |
-          export UPDATER_LINUX_X86_64_ARTIFACT="$(find target/release/bundle/updater -maxdepth 1 -type f -name 'AFS-release-[0-9]*-linux-x86_64.AppImage' | sort | tail -n 1)"
+          export UPDATER_LINUX_X86_64_ARTIFACT="target/release/bundle/updater/AFS-release-linux-x86_64.AppImage"
           make render-updater-manifest
           make render-linux-repositories
 
       - name: Collect release assets
         run: |
           mkdir -p target/release/github-assets
-          cp target/release/bundle/linux/AFS-release-*.deb target/release/github-assets/
-          cp target/release/bundle/linux/AFS-release-*.deb.sha256 target/release/github-assets/
-          cp target/release/bundle/linux/AFS-release-*.rpm target/release/github-assets/
-          cp target/release/bundle/linux/AFS-release-*.rpm.sha256 target/release/github-assets/
-          cp target/release/bundle/updater/*.AppImage target/release/github-assets/
-          cp target/release/bundle/updater/*.AppImage.sig target/release/github-assets/
+          cp target/release/bundle/linux/AFS-release-linux-x86_64.deb target/release/github-assets/
+          cp target/release/bundle/linux/AFS-release-linux-x86_64.rpm target/release/github-assets/
+          cp target/release/bundle/updater/AFS-release-linux-x86_64.AppImage target/release/github-assets/
+          cp target/release/bundle/updater/AFS-release-linux-x86_64.AppImage.sig target/release/github-assets/
           cp target/release/bundle/updater/latest-linux.json target/release/github-assets/
           sha256sum target/release/github-assets/* > target/release/github-assets/SHA256SUMS-linux
           ls -la target/release/github-assets
