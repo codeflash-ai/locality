@@ -239,9 +239,15 @@ main() {
   rm -rf "${UPDATER_DIR}"
   rm -rf "${ROOT}/target/release/bundle/macos/${PRODUCT_NAME}.app"
 
-  log "building signed Tauri DMG"
+  local bundle_targets
+  bundle_targets="dmg"
+  if updater_enabled; then
+    bundle_targets="app,dmg"
+  fi
+
+  log "building signed Tauri bundle targets: ${bundle_targets}"
   APPLE_SIGNING_IDENTITY="${signing_identity}" \
-    npm --prefix "${DESKTOP_DIR}" run tauri -- build --bundles dmg --config "${config_json}"
+    npm --prefix "${DESKTOP_DIR}" run tauri -- build --bundles "${bundle_targets}" --config "${config_json}"
 
   dmg="$(latest_tauri_dmg)"
   [[ -n "${dmg}" && -f "${dmg}" ]] || fail "Tauri did not produce a ${PRODUCT_NAME}_*.dmg artifact"
