@@ -2510,6 +2510,10 @@ fn app_store_distribution() -> bool {
         .is_some_and(|channel| channel.eq_ignore_ascii_case("mas"))
 }
 
+fn desktop_smoke_test_requested() -> bool {
+    std::env::var_os("AFS_DESKTOP_SMOKE_TEST").is_some()
+}
+
 fn install_terminal_cli_link() -> Result<PathBuf, String> {
     if app_store_distribution() {
         if let Some(path) = find_command_in_path("afs") {
@@ -4851,6 +4855,10 @@ fn main() {
             }
         })
         .setup(|app| {
+            if desktop_smoke_test_requested() {
+                app.app_handle().exit(0);
+                return Ok(());
+            }
             if let Err(error) = apply_launch_at_login_preference() {
                 eprintln!("afs desktop could not apply launch-at-login preference: {error}");
             }
