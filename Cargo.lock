@@ -49,6 +49,7 @@ dependencies = [
  "afs-cli",
  "afs-core",
  "afs-notion",
+ "afs-platform",
  "afs-store",
  "afsd",
  "notify",

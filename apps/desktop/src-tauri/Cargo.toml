@@ -13,6 +13,7 @@ tauri-build = { version = "2", features = [] }
 afs-cli = { path = "../../../crates/afs-cli" }
 afs-core.workspace = true
 afs-notion.workspace = true
+afs-platform.workspace = true
 afs-store.workspace = true
 afsd = { path = "../../../crates/afsd" }
 notify = "8"

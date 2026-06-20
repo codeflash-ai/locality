@@ -35,6 +35,7 @@ use afs_core::model::{HydrationState, MountId, RemoteId};
 use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
+use afs_platform::bundled_binary_next_to_current_exe;
 use afs_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
@@ -2505,15 +2506,11 @@ fn daemon_control_args_any_manager(action: &str, state_root: &Path) -> Vec<Strin
 }
 
 fn bundled_afsd_binary() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let candidate = executable.parent()?.join("afsd");
-    candidate.is_file().then_some(candidate)
+    bundled_binary_next_to_current_exe("afsd")
 }
 
 fn bundled_afs_cli_binary() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let candidate = executable.parent()?.join("afs");
-    candidate.is_file().then_some(candidate)
+    bundled_binary_next_to_current_exe("afs")
 }
 
 fn app_store_distribution() -> bool {

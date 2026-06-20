@@ -73,6 +73,8 @@ jobs:
           --no-fail-fast
       - name: Check Linux-only FUSE stub
         run: cargo check -p afs-fuse
+      - name: Check Windows desktop shell
+        run: cargo check -p afs-desktop
 
   macos:
     name: macOS tests

@@ -9,6 +9,7 @@
     "build:mac": "tauri build --bundles dmg && bash ./scripts/postprocess-dmg-volume-icon.sh",
     "build:mas": "VITE_AFS_DISTRIBUTION_CHANNEL=mas AFS_DISTRIBUTION_CHANNEL=mas tauri build --bundles app",
     "build:linux": "tauri build --bundles deb,rpm",
+    "build:windows": "tauri build --bundles nsis",
     "preview": "vite preview --host 127.0.0.1 --port 1421",
     "tauri": "tauri"
   },

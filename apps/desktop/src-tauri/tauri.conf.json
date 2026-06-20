@@ -7,7 +7,7 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
     "beforeBuildCommand": "npm run build",
-    "beforeBundleCommand": "./scripts/prepare-bundle.sh",
+    "beforeBundleCommand": "node ./scripts/prepare-bundle.mjs",
     "frontendDist": "../dist"
   },
   "app": {
@@ -40,7 +40,7 @@
     "category": "Productivity",
     "shortDescription": "Mount workspaces as local files for agents.",
     "longDescription": "AFS lets agents edit connected workspaces through local files while keeping remote writes reviewable.",
-    "icon": ["icons/icon.png"],
+    "icon": ["icons/icon.png", "icons/icon.ico"],
     "macOS": {
       "minimumSystemVersion": "14.0",
       "signingIdentity": "-",

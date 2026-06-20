@@ -3,11 +3,17 @@
 //! This crate owns operating-system decisions that should not leak into the
 //! sync engine or connector implementations.
 
+pub mod bundle;
 pub mod capabilities;
 pub mod daemon;
 pub mod paths;
 pub mod process;
 
+pub use bundle::{
+    bundled_binary_candidates, bundled_binary_candidates_for_target,
+    bundled_binary_next_to_current_exe, executable_filename, executable_filename_for_target,
+    find_bundled_binary,
+};
 pub use capabilities::{
     PlatformCapabilities, ProjectionModeError, mount_cli_capabilities,
     mount_cli_capabilities_for_target,

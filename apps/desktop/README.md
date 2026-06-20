@@ -56,6 +56,18 @@ app, packages the `afs` CLI and `afsd` sidecar, and post-processes the DMG with
 a dedicated installer disk icon. See `docs/macos-distribution.md` for signing,
 notarization, terminal command setup, and Homebrew cask notes.
 
+## Windows Packaging
+
+Build a local NSIS installer from the repo root on Windows:
+
+```sh
+make build-tauri-windows
+```
+
+The build stages `afs.exe` and `afsd.exe` under `src-tauri/windows` before
+Tauri bundles the app. The installer copies those sidecars next to the desktop
+executable so the app can start the packaged daemon and locate the packaged CLI.
+
 ## Current Scope
 
 This app implements the first desktop UI pass from `docs/desktop-app.md` and
