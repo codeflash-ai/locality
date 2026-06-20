@@ -67,6 +67,12 @@ use agent_guidance::{
 
 const TERMINAL_CLI_PATH_MANAGED_START: &str = "# >>> AFS_TERMINAL_CLI_PATH >>>";
 const TERMINAL_CLI_PATH_MANAGED_END: &str = "# <<< AFS_TERMINAL_CLI_PATH <<<";
+#[cfg(windows)]
+const WINDOWS_TERMINAL_CLI_SHIM_MARKER: &str = "AFS_TERMINAL_CLI_SHIM";
+#[cfg(windows)]
+const WINDOWS_RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
+const WINDOWS_RUN_VALUE_NAME: &str = "AFS";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1482,7 +1488,7 @@ fn search_kind_label(kind: &str) -> &str {
 fn desktop_settings() -> DesktopSettings {
     let persisted = load_desktop_settings().unwrap_or_default();
     DesktopSettings {
-        launch_at_login: launch_agent_path().is_some_and(|path| path.exists()),
+        launch_at_login: launch_at_login_enabled(),
         show_menu_bar: persisted.show_menu_bar,
     }
 }
@@ -1537,16 +1543,9 @@ fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
         if running_from_read_only_volume()? {
             return Err("Move AFS to Applications before enabling launch at login.".to_string());
         }
-        install_launch_agent()?;
-    } else if let Some(path) = launch_agent_path()
-        && path.exists()
-    {
-        fs::remove_file(&path).map_err(|error| {
-            format!(
-                "Could not remove launch agent `{}`: {error}",
-                path.display()
-            )
-        })?;
+        install_launch_at_login()?;
+    } else {
+        uninstall_launch_at_login()?;
     }
 
     let mut settings = load_desktop_settings().unwrap_or_default();
@@ -1566,7 +1565,7 @@ fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
 fn apply_launch_at_login_preference() -> Result<(), String> {
     let settings = load_desktop_settings().unwrap_or_default();
     if settings.launch_at_login && !running_from_read_only_volume()? {
-        install_launch_agent()?;
+        install_launch_at_login()?;
     }
     Ok(())
 }
@@ -1917,6 +1916,50 @@ fn running_from_read_only_volume() -> Result<bool, String> {
     Ok(executable.starts_with("/Volumes"))
 }
 
+fn launch_at_login_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        windows_run_key_is_registered().unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        launch_agent_path().is_some_and(|path| path.exists())
+    }
+}
+
+fn install_launch_at_login() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        install_windows_login_item()
+    }
+    #[cfg(not(windows))]
+    {
+        install_launch_agent()
+    }
+}
+
+fn uninstall_launch_at_login() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        uninstall_windows_login_item()
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(path) = launch_agent_path()
+            && path.exists()
+        {
+            fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "Could not remove launch agent `{}`: {error}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
 fn install_launch_agent() -> Result<(), String> {
     let Some(path) = launch_agent_path() else {
         return Err("HOME is not set, so AFS cannot install a login item.".to_string());
@@ -1932,6 +1975,7 @@ fn install_launch_agent() -> Result<(), String> {
         .map_err(|error| format!("Could not write launch agent `{}`: {error}", path.display()))
 }
 
+#[cfg(not(windows))]
 fn launch_agent_plist(executable: &Path) -> String {
     let executable = escape_xml(&executable.display().to_string());
     format!(
@@ -1953,6 +1997,90 @@ fn launch_agent_plist(executable: &Path) -> String {
     )
 }
 
+#[cfg(windows)]
+fn install_windows_login_item() -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve the AFS app executable: {error}"))?;
+    let value = windows_run_value_for_executable(&executable);
+    let output = Command::new("reg")
+        .args([
+            "add",
+            WINDOWS_RUN_KEY_PATH,
+            "/v",
+            WINDOWS_RUN_VALUE_NAME,
+            "/t",
+            "REG_SZ",
+            "/d",
+        ])
+        .arg(value)
+        .arg("/f")
+        .output()
+        .map_err(|error| format!("Could not update the Windows login item: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not update the Windows login item: {}",
+            process_output_message(&output)
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn uninstall_windows_login_item() -> Result<(), String> {
+    let output = Command::new("reg")
+        .args([
+            "delete",
+            WINDOWS_RUN_KEY_PATH,
+            "/v",
+            WINDOWS_RUN_VALUE_NAME,
+            "/f",
+        ])
+        .output()
+        .map_err(|error| format!("Could not remove the Windows login item: {error}"))?;
+    if output.status.success()
+        || process_output_message(&output)
+            .to_ascii_lowercase()
+            .contains("unable to find")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not remove the Windows login item: {}",
+            process_output_message(&output)
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn windows_run_key_is_registered() -> Result<bool, String> {
+    let output = Command::new("reg")
+        .args(["query", WINDOWS_RUN_KEY_PATH, "/v", WINDOWS_RUN_VALUE_NAME])
+        .output()
+        .map_err(|error| format!("Could not inspect the Windows login item: {error}"))?;
+    Ok(output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains(WINDOWS_RUN_VALUE_NAME))
+}
+
+#[cfg(windows)]
+fn windows_run_value_for_executable(executable: &Path) -> String {
+    format!("\"{}\"", executable.display())
+}
+
+#[cfg(windows)]
+fn process_output_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("process exited with {}", output.status)
+}
+
+#[cfg(not(windows))]
 fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1970,6 +2098,7 @@ fn desktop_activity_path(state_root: &Path) -> PathBuf {
     state_root.join("desktop-activity.json")
 }
 
+#[cfg(not(windows))]
 fn launch_agent_path() -> Option<PathBuf> {
     home_dir().ok().map(|home| {
         home.join("Library")
@@ -2552,6 +2681,17 @@ enum TerminalCliLinkState {
     NeedsInstall,
 }
 
+fn terminal_cli_command_filename() -> &'static str {
+    #[cfg(windows)]
+    {
+        "afs.cmd"
+    }
+    #[cfg(not(windows))]
+    {
+        "afs"
+    }
+}
+
 fn install_terminal_cli_link_at(cli_path: &Path, link_path: &Path) -> Result<PathBuf, String> {
     let cli_path = absolute_path(cli_path)?;
     if !cli_path.is_file() {
@@ -2621,7 +2761,7 @@ fn install_terminal_cli_link_in_sorted_path_dirs(
         if is_protected_terminal_cli_path(&directory) {
             continue;
         }
-        let link_path = directory.join("afs");
+        let link_path = directory.join(terminal_cli_command_filename());
         match install_terminal_cli_link_at(cli_path, &link_path) {
             Ok(path) => return Ok(path),
             Err(error) => errors.push(error),
@@ -2643,8 +2783,31 @@ fn install_terminal_cli_link_in_sorted_path_dirs(
     ))
 }
 
+#[cfg(not(windows))]
 fn default_user_terminal_cli_dir() -> Option<PathBuf> {
     home_dir().ok().map(|home| home.join(".local/bin"))
+}
+
+#[cfg(windows)]
+fn default_user_terminal_cli_dir() -> Option<PathBuf> {
+    env_first(&["LOCALAPPDATA"])
+        .map(PathBuf::from)
+        .map(|local_app_data| {
+            let windows_apps = local_app_data.join("Microsoft").join("WindowsApps");
+            if terminal_cli_dir_is_on_path(&windows_apps) {
+                windows_apps
+            } else {
+                local_app_data.join("AgentFS").join("bin")
+            }
+        })
+        .or_else(|| {
+            home_dir().ok().map(|home| {
+                home.join("AppData")
+                    .join("Local")
+                    .join("AgentFS")
+                    .join("bin")
+            })
+        })
 }
 
 fn insert_user_terminal_cli_fallback_dir(dirs: &mut Vec<PathBuf>, directory: &Path) {
@@ -2668,19 +2831,32 @@ fn ensure_terminal_cli_dir_registered(installed: &Path) -> Result<(), String> {
     if terminal_cli_dir_is_on_path(directory) {
         return Ok(());
     }
-    let Some(config_path) = terminal_cli_shell_config_path() else {
+
+    #[cfg(windows)]
+    {
         return Err(format!(
-            "Installed the AFS terminal command at {}, but could not find your home directory to add it to PATH.",
-            installed.display()
+            "Installed the AFS terminal command at {}, but {} is not on PATH. Add that directory to your user PATH, then open a new terminal.",
+            installed.display(),
+            directory.display()
         ));
-    };
-    write_terminal_cli_path_section(&config_path, directory).map_err(|error| {
+    }
+
+    #[cfg(not(windows))]
+    {
+        let Some(config_path) = terminal_cli_shell_config_path() else {
+            return Err(format!(
+                "Installed the AFS terminal command at {}, but could not find your home directory to add it to PATH.",
+                installed.display()
+            ));
+        };
+        write_terminal_cli_path_section(&config_path, directory).map_err(|error| {
         format!(
             "Installed the AFS terminal command at {}, but could not update {} to add it to PATH: {error}",
             installed.display(),
             config_path.display()
         )
     })
+    }
 }
 
 fn terminal_cli_dir_is_on_path(directory: &Path) -> bool {
@@ -2692,6 +2868,7 @@ fn path_list_contains_dir(path: std::ffi::OsString, directory: &Path) -> bool {
     std::env::split_paths(&path).any(|candidate| paths_equal(&candidate, directory))
 }
 
+#[cfg(not(windows))]
 fn terminal_cli_shell_config_path() -> Option<PathBuf> {
     let home = home_dir().ok()?;
     let shell_name = std::env::var_os("SHELL")
@@ -2791,6 +2968,13 @@ fn sort_terminal_cli_path_dirs(dirs: &mut Vec<PathBuf>) {
 }
 
 fn terminal_cli_path_dir_rank(directory: &Path, home: Option<&Path>) -> u8 {
+    #[cfg(windows)]
+    {
+        if is_windows_user_terminal_cli_path(directory) {
+            return 0;
+        }
+    }
+
     if directory.ends_with(Path::new(".local/bin"))
         || home.is_some_and(|home| {
             directory == home.join("bin") || directory == home.join(".local/bin")
@@ -2823,9 +3007,38 @@ fn is_system_path(path: &Path) -> bool {
 }
 
 fn is_protected_terminal_cli_path(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        if is_windows_system_path(path) {
+            return true;
+        }
+    }
+
     is_system_path(path)
         || path.starts_with("/System")
         || path.starts_with("/var/run/com.apple.security.cryptexd")
+}
+
+#[cfg(windows)]
+fn is_windows_user_terminal_cli_path(path: &Path) -> bool {
+    let value = path
+        .display()
+        .to_string()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    value.ends_with(r"\microsoft\windowsapps") || value.ends_with(r"\agentfs\bin")
+}
+
+#[cfg(windows)]
+fn is_windows_system_path(path: &Path) -> bool {
+    let value = path
+        .display()
+        .to_string()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    value.starts_with(r"c:\windows")
+        || value.starts_with(r"c:\program files")
+        || value.starts_with(r"c:\program files (x86)")
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
@@ -2861,6 +3074,11 @@ fn terminal_cli_link_state(
             ));
         }
     };
+
+    #[cfg(windows)]
+    if let Some(state) = windows_terminal_cli_shim_state(link_path, &cli_path, &metadata)? {
+        return Ok(state);
+    }
 
     if metadata.file_type().is_symlink() {
         let target = fs::read_link(link_path).map_err(|error| {
@@ -2904,6 +3122,58 @@ fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     left == right
 }
 
+#[cfg(windows)]
+fn windows_terminal_cli_shim_state(
+    link_path: &Path,
+    cli_path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<Option<TerminalCliLinkState>, String> {
+    if !metadata.is_file() || !path_extension_eq(link_path, "cmd") {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(link_path).map_err(|error| {
+        format!(
+            "Could not read terminal command shim {}: {error}",
+            link_path.display()
+        )
+    })?;
+    if !contents.contains(WINDOWS_TERMINAL_CLI_SHIM_MARKER) {
+        return Err(format!(
+            "A file already exists at {}. Move it aside so AFS can install the bundled CLI there.",
+            link_path.display()
+        ));
+    }
+
+    Ok(Some(
+        if contents == windows_terminal_cli_shim_contents(cli_path) {
+            TerminalCliLinkState::Current
+        } else {
+            TerminalCliLinkState::NeedsInstall
+        },
+    ))
+}
+
+#[cfg(windows)]
+fn windows_terminal_cli_shim_contents(cli_path: &Path) -> String {
+    let cli_path = batch_file_literal(&cli_path.display().to_string());
+    format!(
+        "@echo off\r\nrem {WINDOWS_TERMINAL_CLI_SHIM_MARKER}\r\nset \"_afs_cli={cli_path}\"\r\n\"%_afs_cli%\" %*\r\n"
+    )
+}
+
+#[cfg(windows)]
+fn batch_file_literal(value: &str) -> String {
+    value.replace('%', "%%")
+}
+
+#[cfg(windows)]
+fn path_extension_eq(path: &Path, extension: &str) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+}
+
 #[cfg(unix)]
 fn install_terminal_cli_link_direct(cli_path: &Path, link_path: &Path) -> io::Result<()> {
     if let Some(parent) = link_path.parent() {
@@ -2918,11 +3188,24 @@ fn install_terminal_cli_link_direct(cli_path: &Path, link_path: &Path) -> io::Re
     std::os::unix::fs::symlink(cli_path, link_path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn install_terminal_cli_link_direct(cli_path: &Path, link_path: &Path) -> io::Result<()> {
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::symlink_metadata(link_path) {
+        Ok(_) => fs::remove_file(link_path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::write(link_path, windows_terminal_cli_shim_contents(cli_path))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn install_terminal_cli_link_direct(_cli_path: &Path, _link_path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "terminal command links are only supported on Unix",
+        "terminal command links are only supported on Unix and Windows",
     ))
 }
 
@@ -2950,17 +3233,40 @@ fn login_shell_path() -> Option<std::ffi::OsString> {
 }
 
 fn find_command_in_path(command: &str) -> Option<PathBuf> {
-    if command.contains('/') {
+    if command.contains('/') || command.contains('\\') {
         return None;
     }
     let path = std::env::var_os("PATH")?;
+    let candidates = command_path_candidates(command);
     for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(command);
-        if candidate.is_file() {
-            return Some(candidate);
+        for candidate in &candidates {
+            let path = directory.join(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
         }
     }
     None
+}
+
+fn command_path_candidates(command: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        if Path::new(command).extension().is_some() {
+            return vec![command.to_string()];
+        }
+        return vec![
+            format!("{command}.exe"),
+            format!("{command}.cmd"),
+            format!("{command}.bat"),
+            command.to_string(),
+        ];
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![command.to_string()]
+    }
 }
 
 fn reload_daemon_mounts(state_root: &Path) -> Result<(), String> {
@@ -3844,9 +4150,8 @@ mod tests {
         DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TerminalCliLinkState,
         TrayVisualState, clear_state_root_contents, conflict_preview, connection_metadata_changed,
         current_daemon_build_id, current_desktop_build_id, diff_report_message,
-        failed_push_summary, hydration_after_editor_write, insert_user_terminal_cli_fallback_dir,
-        inspect_install_state, install_terminal_cli_link_at,
-        install_terminal_cli_link_in_path_dirs, install_terminal_cli_link_in_sorted_path_dirs,
+        failed_push_summary, hydration_after_editor_write, inspect_install_state,
+        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
         is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
         pending_changes_from_status, pull_report_message, push_action_message,
         record_current_install_marker, record_desktop_activity, shell_single_quote,
@@ -4476,6 +4781,86 @@ mod tests {
         assert_eq!(fs::read_link(&link).expect("read cli link"), cli);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn terminal_cli_installer_creates_windows_cmd_shim() {
+        let temp = TestTempDir::new("terminal-cli-windows-shim");
+        let cli = temp.path().join("app/afs.exe");
+        let link = temp.path().join("bin/afs.cmd");
+        fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
+        fs::write(&cli, b"afs cli").expect("write cli");
+
+        let installed = install_terminal_cli_link_at(&cli, &link).expect("install cli shim");
+
+        assert_eq!(installed, link);
+        assert_eq!(
+            terminal_cli_link_state(&link, &cli).expect("shim state"),
+            TerminalCliLinkState::Current
+        );
+        let contents = fs::read_to_string(&link).expect("read shim");
+        assert!(contents.contains(super::WINDOWS_TERMINAL_CLI_SHIM_MARKER));
+        assert!(contents.contains(&cli.display().to_string()));
+        assert!(contents.contains("%*"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_cli_installer_updates_stale_windows_cmd_shim() {
+        let temp = TestTempDir::new("terminal-cli-windows-shim-refresh");
+        let old_cli = temp.path().join("old/afs.exe");
+        let new_cli = temp.path().join("new/afs.exe");
+        let link = temp.path().join("bin/afs.cmd");
+        fs::create_dir_all(old_cli.parent().expect("old cli parent")).expect("create old parent");
+        fs::create_dir_all(new_cli.parent().expect("new cli parent")).expect("create new parent");
+        fs::create_dir_all(link.parent().expect("link parent")).expect("create link parent");
+        fs::write(&old_cli, b"old afs cli").expect("write old cli");
+        fs::write(&new_cli, b"new afs cli").expect("write new cli");
+        fs::write(&link, super::windows_terminal_cli_shim_contents(&old_cli))
+            .expect("write stale shim");
+
+        install_terminal_cli_link_at(&new_cli, &link).expect("refresh cli shim");
+
+        let contents = fs::read_to_string(&link).expect("read shim");
+        assert!(contents.contains(&new_cli.display().to_string()));
+        assert!(!contents.contains(&old_cli.display().to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_cli_installer_uses_cmd_file_on_windows() {
+        let temp = TestTempDir::new("terminal-cli-windows-path-dir");
+        let cli = temp.path().join("app/afs.exe");
+        let writable = temp.path().join("writable-bin");
+        fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
+        fs::create_dir_all(&writable).expect("create writable dir");
+        fs::write(&cli, b"afs cli").expect("write cli");
+
+        let installed = install_terminal_cli_link_in_path_dirs(&cli, vec![writable.clone()])
+            .expect("install cli shim in path");
+
+        assert_eq!(installed, writable.join("afs.cmd"));
+        assert!(installed.is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_terminal_lookup_checks_exe_and_cmd_extensions() {
+        assert_eq!(
+            super::command_path_candidates("afs"),
+            vec!["afs.exe", "afs.cmd", "afs.bat", "afs"]
+        );
+        assert_eq!(super::terminal_cli_command_filename(), "afs.cmd");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_login_run_value_quotes_executable() {
+        assert_eq!(
+            super::windows_run_value_for_executable(Path::new(r"C:\Program Files\AFS\AFS.exe")),
+            r#""C:\Program Files\AFS\AFS.exe""#
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn terminal_cli_installer_updates_stale_symlink() {
@@ -4571,10 +4956,10 @@ mod tests {
         fs::write(&cli, b"afs cli").expect("write cli");
 
         let mut dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/sbin")];
-        insert_user_terminal_cli_fallback_dir(&mut dirs, &user_bin);
+        super::insert_user_terminal_cli_fallback_dir(&mut dirs, &user_bin);
 
-        let installed =
-            install_terminal_cli_link_in_sorted_path_dirs(&cli, dirs).expect("install fallback");
+        let installed = super::install_terminal_cli_link_in_sorted_path_dirs(&cli, dirs)
+            .expect("install fallback");
 
         assert_eq!(installed, user_bin.join("afs"));
         assert_eq!(fs::read_link(&installed).expect("read cli link"), cli);
