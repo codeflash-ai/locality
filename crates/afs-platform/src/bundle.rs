@@ -83,16 +83,18 @@ mod tests {
 
     #[test]
     fn sidecar_candidates_include_plain_and_tauri_triple_names() {
+        let bundle_dir = PathBuf::from("bundle");
+
         assert_eq!(
             bundled_binary_candidates_for_target(
-                &PathBuf::from(r"C:\Program Files\AFS"),
+                &bundle_dir,
                 "afsd",
                 "windows",
                 Some("x86_64-pc-windows-msvc")
             ),
             vec![
-                PathBuf::from(r"C:\Program Files\AFS\afsd.exe"),
-                PathBuf::from(r"C:\Program Files\AFS\afsd-x86_64-pc-windows-msvc.exe"),
+                bundle_dir.join("afsd.exe"),
+                bundle_dir.join("afsd-x86_64-pc-windows-msvc.exe"),
             ]
         );
     }
