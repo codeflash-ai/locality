@@ -1123,13 +1123,8 @@ fn is_modify_like_event(kind: &notify::event::EventKind) -> bool {
 
     matches!(
         kind,
-        EventKind::Any
-            | EventKind::Modify(
-                ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other
-            )
-            | EventKind::Access(AccessKind::Close(
-                AccessMode::Any | AccessMode::Write | AccessMode::Other
-            ))
+        EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Access(AccessKind::Close(AccessMode::Write))
     )
 }
 
@@ -1196,7 +1191,21 @@ fn handle_local_modify_like_path(
     if !path_is_under_sync_root(context, &path) || same_cloud_path(&path, &context.sync_root) {
         return Ok(());
     }
-    let Some(identifier) = identity_for_path(context, &path)? else {
+    let placeholder = placeholder_info_for_path(&path)?;
+    let identifier = if let Some(info) = placeholder {
+        context.remember_path_identity(&path, &info.identity);
+        if info.in_sync {
+            trace_cloud_files(format!(
+                "local modify skipped path=`{}` reason=placeholder_in_sync",
+                path.display()
+            ));
+            return Ok(());
+        }
+        Some(info.identity)
+    } else {
+        identity_for_path(context, &path)?
+    };
+    let Some(identifier) = identifier else {
         trace_cloud_files(format!(
             "local modify skipped path=`{}` reason=no_placeholder_identity",
             path.display()
@@ -2883,6 +2892,28 @@ mod tests {
         };
 
         assert_eq!(placeholder_size_for_item(&item), 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn watcher_modify_events_ignore_metadata_and_non_write_closes() {
+        use notify::event::{
+            AccessKind, AccessMode, DataChange, EventKind, MetadataKind, ModifyKind,
+        };
+
+        assert!(is_modify_like_event(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Content
+        ))));
+        assert!(is_modify_like_event(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(!is_modify_like_event(&EventKind::Any));
+        assert!(!is_modify_like_event(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any)
+        )));
+        assert!(!is_modify_like_event(&EventKind::Access(
+            AccessKind::Close(AccessMode::Any)
+        )));
     }
 
     #[cfg(target_os = "windows")]
