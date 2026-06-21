@@ -11,6 +11,10 @@
         "uninstallerIcon": "icons/icon.ico",
         "installMode": "currentUser",
         "startMenuFolder": "AFS",
+        "languages": ["English"],
+        "customLanguageFiles": {
+          "English": "windows/English.nsh"
+        },
         "installerHooks": "windows/afs-sidecars.nsh"
       }
     }
