@@ -377,7 +377,7 @@ export default function App() {
   const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
   const route = window.location.hash;
-  const [showOnboarding, setShowOnboarding] = useState(() => route !== "#app" && route !== "#tray");
+  const [showOnboarding, setShowOnboarding] = useState(() => route === "#onboarding-ready");
   const [onboardingKey, setOnboardingKey] = useState(0);
   const [onboardingInitialStep, setOnboardingInitialStep] = useState<1 | 4>(() =>
     route === "#onboarding-ready" ? 4 : 1,
@@ -385,7 +385,6 @@ export default function App() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
   const refreshSnapshotPromise = useRef<Promise<void> | null>(null);
   const refreshSnapshotQueued = useRef(false);
-  const setupIsComplete = setupComplete(snapshot);
 
   async function refreshSnapshot() {
     if (refreshSnapshotPromise.current) {
@@ -531,13 +530,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!snapshotLoaded || route === "#app" || route === "#tray" || route === "#onboarding-ready") {
+    if (!snapshotLoaded || route === "#tray") {
       return;
     }
-    if (setupIsComplete) {
-      setShowOnboarding(false);
+
+    if (route === "#onboarding-ready") {
+      setShowOnboarding(true);
+      return;
     }
-  }, [route, setupIsComplete, snapshotLoaded]);
+
+    setShowOnboarding(false);
+  }, [route, snapshotLoaded]);
 
   useEffect(() => {
     const handleOpenView = (event: Event) => {
@@ -3220,10 +3223,6 @@ function connectionMissing(snapshot: DesktopSnapshot) {
 
 function mountMissing(snapshot: DesktopSnapshot) {
   return snapshot.mount.status === "not_mounted";
-}
-
-function setupComplete(snapshot: DesktopSnapshot) {
-  return !connectionMissing(snapshot) && !mountMissing(snapshot);
 }
 
 function isAppView(value: string): value is AppView {
