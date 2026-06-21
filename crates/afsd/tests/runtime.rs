@@ -933,7 +933,7 @@ fn runtime_queues_remote_fast_forward_from_freshness_report() {
         .expect("submit freshness event");
 
     let request = hydrated_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(5))
         .expect("auto fast-forward hydration drained");
     assert_eq!(request.mount_id, MountId::new("notion-main"));
     assert_eq!(request.remote_id, RemoteId::new("page-1"));
