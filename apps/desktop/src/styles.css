@@ -122,7 +122,18 @@ p {
   user-select: none;
 }
 
-.window-chrome > div:last-child {
+.window-chrome.windows-chrome {
+  grid-template-columns: 150px 1fr 190px;
+  min-height: 40px;
+  padding: 0 0 0 14px;
+}
+
+.window-chrome-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 100%;
+  gap: 10px;
   text-align: right;
 }
 
@@ -139,6 +150,40 @@ p {
 
 .window-meta-button:hover {
   background: rgba(148, 163, 184, 0.16);
+}
+
+.window-controls {
+  display: inline-grid;
+  grid-template-columns: repeat(3, 46px);
+  align-self: stretch;
+  min-height: 100%;
+}
+
+.window-control-button {
+  display: grid;
+  width: 46px;
+  height: 100%;
+  min-height: 40px;
+  place-items: center;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #334155;
+}
+
+.window-control-button svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 2.2;
+}
+
+.window-control-button:hover {
+  background: rgba(148, 163, 184, 0.18);
+}
+
+.window-control-button.close:hover {
+  background: #d92d20;
+  color: #ffffff;
 }
 
 .native-traffic-space {

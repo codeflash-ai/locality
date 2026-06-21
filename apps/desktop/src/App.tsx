@@ -18,6 +18,7 @@ import {
   Home,
   ListChecks,
   Loader2,
+  Minus,
   Power,
   RefreshCw,
   RotateCcw,
@@ -25,6 +26,8 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Square,
+  X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -2968,11 +2971,19 @@ function WindowChrome({
   metaTitle?: string;
   onMetaClick?: () => void;
 }) {
+  const showWindowControls = isWindowsRuntime();
+
   return (
-    <div className="window-chrome" onMouseDown={handleChromeMouseDown}>
+    <div
+      className={`window-chrome ${showWindowControls ? "windows-chrome" : ""}`}
+      onMouseDown={handleChromeMouseDown}
+    >
       <div className="native-traffic-space" aria-hidden="true" />
       <div data-tauri-drag-region>{title}</div>
-      <div data-tauri-drag-region={!onMetaClick || undefined}>
+      <div
+        className="window-chrome-actions"
+        data-tauri-drag-region={(!onMetaClick && !showWindowControls) || undefined}
+      >
         {onMetaClick ? (
           <button className="window-meta-button" title={metaTitle} onClick={onMetaClick}>
             {meta}
@@ -2980,7 +2991,42 @@ function WindowChrome({
         ) : (
           <span title={metaTitle}>{meta}</span>
         )}
+        {showWindowControls && <WindowsWindowControls />}
       </div>
+    </div>
+  );
+}
+
+function WindowsWindowControls() {
+  return (
+    <div className="window-controls" aria-label="Window controls">
+      <button
+        className="window-control-button"
+        type="button"
+        aria-label="Minimize"
+        title="Minimize"
+        onClick={() => void getCurrentWindow().minimize()}
+      >
+        <Minus />
+      </button>
+      <button
+        className="window-control-button"
+        type="button"
+        aria-label="Maximize or restore"
+        title="Maximize or restore"
+        onClick={() => void getCurrentWindow().toggleMaximize()}
+      >
+        <Square />
+      </button>
+      <button
+        className="window-control-button close"
+        type="button"
+        aria-label="Close"
+        title="Close"
+        onClick={() => void getCurrentWindow().close()}
+      >
+        <X />
+      </button>
     </div>
   );
 }
@@ -2997,6 +3043,10 @@ function handleChromeMouseDown(event: React.MouseEvent<HTMLDivElement>) {
 
   event.preventDefault();
   void getCurrentWindow().startDragging();
+}
+
+function isWindowsRuntime() {
+  return typeof navigator !== "undefined" && /^Win/i.test(navigator.platform);
 }
 
 function SetupContent({

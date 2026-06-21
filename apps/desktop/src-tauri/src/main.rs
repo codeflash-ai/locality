@@ -6032,6 +6032,7 @@ fn main() {
                 eprintln!("afs desktop could not apply launch-at-login preference: {error}");
             }
             refresh_launch_at_login_cache_async();
+            configure_main_window_chrome(app);
             build_tray(app)?;
             start_desktop_activation_listener(app.app_handle().clone(), activation_event_handle);
             sync_tray_visibility(app.app_handle(), &desktop_settings());
@@ -6086,6 +6087,22 @@ fn start_agent_guidance_refresher() {
             std::thread::sleep(std::time::Duration::from_secs(10 * 60));
         }
     });
+}
+
+fn configure_main_window_chrome(app: &mut tauri::App) {
+    #[cfg(windows)]
+    {
+        if let Some(window) = app.get_webview_window("main") {
+            if let Err(error) = window.set_decorations(false) {
+                eprintln!("afs desktop could not configure Windows window chrome: {error}");
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+    }
 }
 
 fn refresh_agent_guidance_best_effort() {
