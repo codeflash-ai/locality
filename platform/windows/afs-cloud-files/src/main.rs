@@ -1,6 +1,10 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use afs_platform::{
+    cloud_files_mount_id_component, decode_cloud_files_mount_id_component,
+    windows_cloud_files_registration_marker_dir,
+};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
@@ -531,60 +535,18 @@ fn path_for_report(path: &Path) -> String {
 fn sync_root_id_for_mount(mount_id: &str) -> String {
     format!(
         "{SYNC_ROOT_ID_PREFIX}{}",
-        encode_sync_root_component(mount_id)
+        cloud_files_mount_id_component(mount_id)
     )
 }
 
 fn mount_id_from_sync_root_id(sync_root_id: &str) -> Option<String> {
     sync_root_id
         .strip_prefix(SYNC_ROOT_ID_PREFIX)
-        .and_then(decode_sync_root_component)
-}
-
-fn encode_sync_root_component(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push('%');
-            encoded.push_str(&format!("{byte:02X}"));
-        }
-    }
-    encoded
-}
-
-fn decode_sync_root_component(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let high = *bytes.get(index + 1)?;
-            let low = *bytes.get(index + 2)?;
-            decoded.push((hex_value(high)? << 4) | hex_value(low)?);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).ok()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+        .and_then(decode_cloud_files_mount_id_component)
 }
 
 fn registration_marker_dir(state_dir: &Path, mount_id: &str) -> PathBuf {
-    state_dir
-        .join("cloud-files")
-        .join(encode_sync_root_component(mount_id))
+    windows_cloud_files_registration_marker_dir(state_dir, mount_id)
 }
 
 fn write_registration_marker(
@@ -1570,8 +1532,7 @@ fn connect_cloud_filter_sync_root(
 
 #[cfg(target_os = "windows")]
 fn seed_root_placeholders(context: &ProviderContext) -> Result<usize, HelperError> {
-    let mut children = context.children(afsd::file_provider::ROOT_CONTAINER_IDENTIFIER)?;
-    ensure_placeholder_file_sizes(context, &mut children.children)?;
+    let children = context.children(afsd::file_provider::ROOT_CONTAINER_IDENTIFIER)?;
     create_placeholders_in_directory(&context.sync_root, &children.children)?;
     remember_placeholder_children(context, &context.sync_root, &children.children);
     Ok(children.children.len())
@@ -1710,13 +1671,12 @@ unsafe fn handle_fetch_placeholders(
     trace_cloud_files(format!(
         "fetch placeholders start container=`{container_identifier}`"
     ));
-    let mut children = context.children(&container_identifier)?;
+    let children = context.children(&container_identifier)?;
     let directory = callback_path(context, info).unwrap_or_else(|| context.sync_root.clone());
     trace_cloud_files(format!(
         "fetch placeholders transfer container=`{container_identifier}` count={}",
         children.children.len()
     ));
-    ensure_placeholder_file_sizes(context, &mut children.children)?;
     let mut batch = PlaceholderBatch::from_items(&children.children);
     unsafe {
         complete_fetch_placeholders_with_status(
@@ -2176,30 +2136,6 @@ fn remember_placeholder_children(
     for item in items {
         context.remember_path_identity(&directory.join(&item.filename), &item.identifier);
     }
-}
-
-#[cfg(target_os = "windows")]
-fn ensure_placeholder_file_sizes(
-    context: &ProviderContext,
-    items: &mut [afsd::file_provider::FileProviderItem],
-) -> Result<(), HelperError> {
-    for item in items {
-        if item.kind == afsd::file_provider::FileProviderItemKind::Folder
-            || item.byte_size.is_some()
-        {
-            continue;
-        }
-        trace_cloud_files(format!(
-            "materialize placeholder size identity=`{}` filename=`{}`",
-            item.identifier, item.filename
-        ));
-        let read = context.read(&item.identifier)?;
-        let contents = decode_base64(&read.contents_base64)?;
-        item.byte_size = Some(contents.len() as u64);
-        item.hydration = read.item.hydration;
-        item.materialized_path = read.item.materialized_path;
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -2926,6 +2862,27 @@ mod tests {
                 .join("cloud-files")
                 .join("notion%2Fmain")
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn placeholders_without_known_sizes_stay_online_only() {
+        let item = afsd::file_provider::FileProviderItem {
+            identifier: "notion-main:page-1".to_string(),
+            parent_identifier: Some(afsd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string()),
+            filename: "Roadmap.md".to_string(),
+            kind: afsd::file_provider::FileProviderItemKind::File,
+            entity_kind: None,
+            remote_id: Some("page-1".to_string()),
+            path: "Notion/Roadmap.md".to_string(),
+            hydration: None,
+            content_type: "text/markdown".to_string(),
+            remote_edited_at: None,
+            materialized_path: None,
+            byte_size: None,
+        };
+
+        assert_eq!(placeholder_size_for_item(&item), 1);
     }
 
     #[cfg(target_os = "windows")]

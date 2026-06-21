@@ -5,6 +5,7 @@
 
 pub mod bundle;
 pub mod capabilities;
+pub mod cloud_files;
 pub mod daemon;
 pub mod paths;
 pub mod process;
@@ -17,6 +18,10 @@ pub use bundle::{
 pub use capabilities::{
     PlatformCapabilities, ProjectionModeError, mount_cli_capabilities,
     mount_cli_capabilities_for_target,
+};
+pub use cloud_files::{
+    cloud_files_mount_id_component, decode_cloud_files_mount_id_component,
+    windows_cloud_files_registration_marker_dir,
 };
 pub use daemon::{
     DAEMON_METADATA_FILENAME, DAEMON_PID_FILENAME, DAEMON_SOCKET_FILENAME,

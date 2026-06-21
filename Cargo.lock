@@ -29,6 +29,7 @@ name = "afs-cloud-files"
 version = "0.1.3"
 dependencies = [
  "afs-core",
+ "afs-platform",
  "afsd",
  "base64 0.22.1",
  "clap",

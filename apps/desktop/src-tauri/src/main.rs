@@ -143,13 +143,6 @@ struct ProviderRuntimeSummary {
     stale_pid_file: bool,
 }
 
-#[cfg(target_os = "windows")]
-#[derive(Deserialize)]
-struct DesktopWindowsCloudFilesProcessMetadata {
-    mount_id: String,
-    pid: u32,
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopSettings {
@@ -1051,60 +1044,49 @@ fn windows_cloud_files_provider_status(
     state_root: &Path,
     mount: &MountConfig,
 ) -> ProviderRuntimeSummary {
-    let metadata = desktop_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0);
-    let registered = desktop_windows_cloud_files_registration_marker_exists(state_root, mount);
-    if let Some(metadata) = metadata {
-        return ProviderRuntimeSummary {
-            state: "running".to_string(),
-            message: format!(
-                "Windows Cloud Files provider is running for `{}` (pid {})",
-                mount.mount_id.0, metadata.pid
-            ),
+    match run_windows_cloud_files_lifecycle(
+        state_root,
+        mount,
+        &connector_label(&mount.connector),
+        WindowsCloudFilesLifecycleAction::Status,
+    ) {
+        Ok(report) => {
+            let value = report.helper_report;
+            ProviderRuntimeSummary {
+                state: value
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("error")
+                    .to_string(),
+                message: value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Windows Cloud Files provider status is unavailable")
+                    .to_string(),
+                daemon_running: value
+                    .get("daemon_running")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_else(|| daemon_is_ready(state_root)),
+                registered: value.get("registered").and_then(serde_json::Value::as_bool),
+                pid: value
+                    .get("pid")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok()),
+                stale_pid_file: value
+                    .get("stale_pid_file")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            }
+        }
+        Err(error) => ProviderRuntimeSummary {
+            state: "error".to_string(),
+            message: error.message(),
             daemon_running: daemon_is_ready(state_root),
-            registered: Some(registered),
-            pid: Some(metadata.pid),
+            registered: None,
+            pid: None,
             stale_pid_file: false,
-        };
+        },
     }
-
-    ProviderRuntimeSummary {
-        state: "stopped".to_string(),
-        message: format!(
-            "Windows Cloud Files provider is stopped for `{}`",
-            mount.mount_id.0
-        ),
-        daemon_running: daemon_is_ready(state_root),
-        registered: Some(registered),
-        pid: None,
-        stale_pid_file: false,
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn desktop_windows_cloud_files_lifecycle_metadata(
-    state_root: &Path,
-    mount_id: &str,
-) -> Option<DesktopWindowsCloudFilesProcessMetadata> {
-    let dir = state_root.join("cloud-files-lifecycle");
-    let entries = fs::read_dir(dir).ok()?;
-    entries.flatten().find_map(|entry| {
-        let json = fs::read_to_string(entry.path()).ok()?;
-        let metadata =
-            serde_json::from_str::<DesktopWindowsCloudFilesProcessMetadata>(&json).ok()?;
-        (metadata.mount_id == mount_id).then_some(metadata)
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn desktop_windows_cloud_files_registration_marker_exists(
-    state_root: &Path,
-    mount: &MountConfig,
-) -> bool {
-    let marker = state_root
-        .join("cloud-files")
-        .join(&mount.mount_id.0)
-        .join("registration.json");
-    marker.exists()
 }
 
 #[cfg(not(target_os = "windows"))]

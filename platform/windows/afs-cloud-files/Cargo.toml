@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 afs-core = { path = "../../../crates/afs-core" }
+afs-platform.workspace = true
 afsd = { path = "../../../crates/afsd" }
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }

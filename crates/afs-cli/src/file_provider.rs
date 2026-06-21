@@ -685,9 +685,7 @@ fn windows_cloud_files_registration_status(state_root: &Path, mount_id: &str) ->
 
 #[cfg(target_os = "windows")]
 fn windows_cloud_files_registration_marker_exists(state_root: &Path, mount_id: &str) -> bool {
-    state_root
-        .join("cloud-files")
-        .join(mount_id)
+    afs_platform::windows_cloud_files_registration_marker_dir(state_root, mount_id)
         .join("registration.json")
         .exists()
 }
@@ -1509,6 +1507,22 @@ mod tests {
             state_root
                 .join("logs")
                 .join(format!("afs-cloud-files.{fragment}.err.log"))
+        );
+    }
+
+    #[test]
+    fn windows_cloud_files_registration_marker_paths_escape_mount_ids() {
+        let state_root = std::path::Path::new(r"C:\Users\Ada\AppData\Local\AgentFS");
+        let marker_path =
+            afs_platform::windows_cloud_files_registration_marker_dir(state_root, "notion/main")
+                .join("registration.json");
+
+        assert_eq!(
+            marker_path,
+            state_root
+                .join("cloud-files")
+                .join("notion%2Fmain")
+                .join("registration.json")
         );
     }
 
