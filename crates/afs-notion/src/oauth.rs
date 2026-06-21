@@ -5,7 +5,7 @@
 //! values.
 
 use afs_core::{AfsError, AfsResult};
-use reqwest::blocking::Client;
+use reqwest::{Url, blocking::Client};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -45,6 +45,17 @@ pub struct NotionOAuthBrokerStartResponse {
     pub session: String,
     pub state: String,
     pub expires_in: u64,
+}
+
+impl NotionOAuthBrokerStartResponse {
+    pub fn normalized_authorization_url(&self) -> String {
+        normalize_notion_authorization_url(
+            &self.authorization_url,
+            &self.client_id,
+            &self.redirect_uri,
+            &self.state,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,6 +193,60 @@ pub struct HttpNotionOAuthBrokerClient {
     client: Client,
 }
 
+pub fn normalize_notion_authorization_url(
+    authorization_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+) -> String {
+    let mut url = Url::parse(authorization_url)
+        .ok()
+        .filter(is_notion_authorization_url)
+        .unwrap_or_else(default_notion_authorization_url);
+
+    set_notion_authorization_query(&mut url, client_id, redirect_uri, state);
+    url.to_string()
+}
+
+fn default_notion_authorization_url() -> Url {
+    Url::parse(DEFAULT_NOTION_OAUTH_AUTHORIZE_URL)
+        .expect("default Notion OAuth authorize URL must be valid")
+}
+
+fn is_notion_authorization_url(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("api.notion.com")
+        && url.path() == "/v1/oauth/authorize"
+}
+
+fn set_notion_authorization_query(url: &mut Url, client_id: &str, redirect_uri: &str, state: &str) {
+    let preserved_pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| !is_managed_notion_authorization_query_key(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in preserved_pairs {
+            query.append_pair(&key, &value);
+        }
+        query.append_pair("client_id", client_id);
+        query.append_pair("response_type", "code");
+        query.append_pair("owner", "user");
+        query.append_pair("redirect_uri", redirect_uri);
+        query.append_pair("state", state);
+    }
+}
+
+fn is_managed_notion_authorization_query_key(key: &str) -> bool {
+    matches!(
+        key,
+        "client_id" | "response_type" | "owner" | "redirect_uri" | "state"
+    )
+}
+
 impl HttpNotionOAuthBrokerClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
@@ -258,7 +323,82 @@ impl HttpNotionOAuthBrokerClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{NotionOAuthToken, StoredNotionCredential};
+    use reqwest::Url;
+
+    use super::{
+        DEFAULT_NOTION_OAUTH_AUTHORIZE_URL, NotionOAuthBrokerStartResponse, NotionOAuthToken,
+        StoredNotionCredential, normalize_notion_authorization_url,
+    };
+
+    #[test]
+    fn broker_start_response_normalizes_missing_response_type() {
+        let start = NotionOAuthBrokerStartResponse {
+            connector: "notion".to_string(),
+            client_id: "client-id".to_string(),
+            authorization_url:
+                "https://api.notion.com/v1/oauth/authorize?client_id=client-id&prompt=select"
+                    .to_string(),
+            redirect_uri: "http://localhost:8757/oauth/notion/callback".to_string(),
+            session: "session-1".to_string(),
+            state: "state-1".to_string(),
+            expires_in: 300,
+        };
+
+        let url = Url::parse(&start.normalized_authorization_url()).expect("normalized URL");
+
+        assert_eq!(
+            url.as_str().split('?').next(),
+            Some(DEFAULT_NOTION_OAUTH_AUTHORIZE_URL)
+        );
+        assert_eq!(query_value(&url, "prompt").as_deref(), Some("select"));
+        assert_eq!(query_value(&url, "client_id").as_deref(), Some("client-id"));
+        assert_eq!(query_value(&url, "response_type").as_deref(), Some("code"));
+        assert_eq!(query_value(&url, "owner").as_deref(), Some("user"));
+        assert_eq!(
+            query_value(&url, "redirect_uri").as_deref(),
+            Some("http://localhost:8757/oauth/notion/callback")
+        );
+        assert_eq!(query_value(&url, "state").as_deref(), Some("state-1"));
+    }
+
+    #[test]
+    fn normalize_notion_authorization_url_replaces_managed_parameters() {
+        let normalized = normalize_notion_authorization_url(
+            "https://api.notion.com/v1/oauth/authorize?client_id=wrong&response_type=token&response_type=none&owner=workspace&redirect_uri=http%3A%2F%2Fwrong&state=wrong",
+            "client-id",
+            "http://localhost:8757/oauth/notion/callback",
+            "state-1",
+        );
+        let url = Url::parse(&normalized).expect("normalized URL");
+
+        assert_eq!(query_value(&url, "client_id").as_deref(), Some("client-id"));
+        assert_eq!(query_value(&url, "response_type").as_deref(), Some("code"));
+        assert_eq!(query_count(&url, "response_type"), 1);
+        assert_eq!(query_value(&url, "owner").as_deref(), Some("user"));
+        assert_eq!(
+            query_value(&url, "redirect_uri").as_deref(),
+            Some("http://localhost:8757/oauth/notion/callback")
+        );
+        assert_eq!(query_value(&url, "state").as_deref(), Some("state-1"));
+    }
+
+    #[test]
+    fn normalize_notion_authorization_url_discards_non_notion_authorize_url() {
+        let normalized = normalize_notion_authorization_url(
+            "https://example.test/oauth?prompt=select",
+            "client-id",
+            "http://localhost:8757/oauth/notion/callback",
+            "state-1",
+        );
+        let url = Url::parse(&normalized).expect("normalized URL");
+
+        assert_eq!(
+            url.as_str().split('?').next(),
+            Some(DEFAULT_NOTION_OAUTH_AUTHORIZE_URL)
+        );
+        assert_eq!(query_value(&url, "prompt"), None);
+        assert_eq!(query_value(&url, "response_type").as_deref(), Some("code"));
+    }
 
     #[test]
     fn broker_oauth_credential_stores_refresh_handle_without_client_secret() {
@@ -341,6 +481,15 @@ mod tests {
         );
         assert_eq!(refreshed.workspace_name.as_deref(), Some("AgentFS"));
         assert_eq!(refreshed.expires_at, Some(7400));
+    }
+
+    fn query_value(url: &Url, name: &str) -> Option<String> {
+        url.query_pairs()
+            .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+    }
+
+    fn query_count(url: &Url, name: &str) -> usize {
+        url.query_pairs().filter(|(key, _)| key == name).count()
     }
 }
 

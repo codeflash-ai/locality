@@ -955,9 +955,10 @@ fn connect(args: &[String], json: bool) -> i32 {
                 );
             }
         };
+        let authorization_url = start.normalized_authorization_url();
         let authorization = match run_local_oauth_authorization(
             "Notion",
-            &start.authorization_url,
+            &authorization_url,
             &start.redirect_uri,
             &start.state,
             has_flag(args, "--no-browser"),

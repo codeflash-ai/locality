@@ -3950,10 +3950,11 @@ fn connect_notion_with_broker(state_root: PathBuf) -> Result<String, String> {
             redirect_uri: redirect_uri.clone(),
         })
         .map_err(|error| format!("Could not start Notion OAuth broker flow: {error}"))?;
-    set_notion_login_link(start.authorization_url.clone());
+    let authorization_url = start.normalized_authorization_url();
+    set_notion_login_link(authorization_url.clone());
     let authorization = run_local_oauth_authorization(
         "Notion",
-        &start.authorization_url,
+        &authorization_url,
         &start.redirect_uri,
         &start.state,
         false,

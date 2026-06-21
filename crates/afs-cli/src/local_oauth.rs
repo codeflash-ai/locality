@@ -275,24 +275,7 @@ pub fn random_state() -> String {
 }
 
 fn open_browser(url: &str) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = ProcessCommand::new("open");
-        command.arg(url);
-        command
-    };
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = ProcessCommand::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    };
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let mut command = {
-        let mut command = ProcessCommand::new("xdg-open");
-        command.arg(url);
-        command
-    };
+    let mut command = browser_command(url).into_command();
 
     let status = command.status()?;
     if status.success() {
@@ -301,6 +284,44 @@ fn open_browser(url: &str) -> io::Result<()> {
         Err(io::Error::other(format!(
             "browser command exited with {status}"
         )))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BrowserCommandSpec {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+impl BrowserCommandSpec {
+    fn into_command(self) -> ProcessCommand {
+        let mut command = ProcessCommand::new(self.program);
+        command.args(self.args);
+        command
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn browser_command(url: &str) -> BrowserCommandSpec {
+    BrowserCommandSpec {
+        program: "open",
+        args: vec![url.to_string()],
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn browser_command(url: &str) -> BrowserCommandSpec {
+    BrowserCommandSpec {
+        program: "rundll32.exe",
+        args: vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()],
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn browser_command(url: &str) -> BrowserCommandSpec {
+    BrowserCommandSpec {
+        program: "xdg-open",
+        args: vec![url.to_string()],
     }
 }
 
@@ -356,7 +377,22 @@ mod tests {
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
 
-    use super::{LocalOAuthAuthorization, retryable_callback_error, wait_for_oauth_callback};
+    use super::{
+        LocalOAuthAuthorization, browser_command, retryable_callback_error, wait_for_oauth_callback,
+    };
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_browser_command_does_not_route_oauth_url_through_cmd() {
+        let url = "https://api.notion.com/v1/oauth/authorize?client_id=client&response_type=code&owner=user";
+        let command = browser_command(url);
+
+        assert_eq!(command.program, "rundll32.exe");
+        assert_eq!(
+            command.args,
+            vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()]
+        );
+    }
 
     #[test]
     fn retryable_errors_keep_callback_listener_alive() {
