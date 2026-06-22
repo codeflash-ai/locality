@@ -778,6 +778,10 @@ const LOCAL_CREATE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 #[cfg(target_os = "windows")]
 const LOCAL_CREATE_IO_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(target_os = "windows")]
+const LOCAL_DIRTY_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(target_os = "windows")]
+const LOCAL_DIRTY_SCAN_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+#[cfg(target_os = "windows")]
 const STATUS_SUCCESS_VALUE: i32 = 0;
 #[cfg(target_os = "windows")]
 const STATUS_UNSUCCESSFUL_VALUE: i32 = 0xC0000001_u32 as i32;
@@ -789,6 +793,7 @@ struct ProviderContext {
     sync_root: PathBuf,
     state_dir: PathBuf,
     identity_index: ProviderIdentityIndex,
+    local_file_index: ProviderLocalFileIndex,
 }
 
 #[cfg(target_os = "windows")]
@@ -850,6 +855,63 @@ impl ProviderIdentityIndex {
             }
             for (path, identifier) in moved {
                 paths.insert(path, identifier);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalFileFingerprint {
+    len: u64,
+    modified_millis: Option<u128>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+struct TrackedLocalFile {
+    path: PathBuf,
+    identifier: String,
+    fingerprint: Option<LocalFileFingerprint>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug, Default)]
+struct ProviderLocalFileIndex {
+    files: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, TrackedLocalFile>>>,
+}
+
+#[cfg(target_os = "windows")]
+impl ProviderLocalFileIndex {
+    fn remember(&self, path: &Path, identifier: &str) {
+        let tracked = TrackedLocalFile {
+            path: path.to_path_buf(),
+            identifier: identifier.to_string(),
+            fingerprint: local_file_fingerprint(path).ok().flatten(),
+        };
+        if let Ok(mut files) = self.files.lock() {
+            files.insert(normalized_cloud_path_string(path), tracked);
+        }
+    }
+
+    fn entries(&self) -> Vec<TrackedLocalFile> {
+        self.files
+            .lock()
+            .map(|files| files.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn forget_subtree(&self, path: &Path) {
+        let path = normalized_cloud_path_string(path);
+        let prefix = format!("{path}\\");
+        if let Ok(mut files) = self.files.lock() {
+            let keys = files
+                .keys()
+                .filter(|key| *key == &path || key.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in keys {
+                files.remove(&key);
             }
         }
     }
@@ -966,20 +1028,30 @@ impl ProviderContext {
             .remember(&absolute_cloud_path(self, path), identifier);
     }
 
+    fn remember_local_file(&self, path: &Path, identifier: &str) {
+        self.local_file_index
+            .remember(&absolute_cloud_path(self, path), identifier);
+    }
+
+    fn tracked_local_files(&self) -> Vec<TrackedLocalFile> {
+        self.local_file_index.entries()
+    }
+
     fn cached_path_identity(&self, path: &Path) -> Option<String> {
         self.identity_index.get(&absolute_cloud_path(self, path))
     }
 
     fn forget_path_identities(&self, path: &Path) {
-        self.identity_index
-            .forget_subtree(&absolute_cloud_path(self, path));
+        let path = absolute_cloud_path(self, path);
+        self.identity_index.forget_subtree(&path);
+        self.local_file_index.forget_subtree(&path);
     }
 
     fn move_path_identities(&self, source: &Path, target: &Path) {
-        self.identity_index.move_subtree(
-            &absolute_cloud_path(self, source),
-            &absolute_cloud_path(self, target),
-        );
+        let source = absolute_cloud_path(self, source);
+        let target = absolute_cloud_path(self, target);
+        self.identity_index.move_subtree(&source, &target);
+        self.local_file_index.forget_subtree(&source);
     }
 
     fn request<T>(
@@ -1032,7 +1104,14 @@ fn start_local_change_watcher(context: ProviderContext) -> Result<LocalChangeWat
         .map_err(|error| HelperError::new("watcher_failed", error.to_string()))?;
     std::thread::Builder::new()
         .name("afs-cloud-files-local-changes".to_string())
-        .spawn(move || local_change_worker(context, receiver))
+        .spawn({
+            let context = context.clone();
+            move || local_change_worker(context, receiver)
+        })
+        .map_err(|error| HelperError::new("watcher_failed", error.to_string()))?;
+    std::thread::Builder::new()
+        .name("afs-cloud-files-local-dirty-scan".to_string())
+        .spawn(move || local_dirty_scan_worker(context))
         .map_err(|error| HelperError::new("watcher_failed", error.to_string()))?;
     Ok(LocalChangeWatcher { _watcher: watcher })
 }
@@ -1095,6 +1174,46 @@ fn local_change_worker(
             Err(error) => eprintln!("{COMMAND_NAME}: local change watcher failed: {error}"),
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn local_dirty_scan_worker(context: ProviderContext) {
+    loop {
+        std::thread::sleep(LOCAL_DIRTY_SCAN_INTERVAL);
+        for tracked in context.tracked_local_files() {
+            if let Err(error) = scan_tracked_local_file(&context, &tracked) {
+                eprintln!(
+                    "{COMMAND_NAME}: local dirty scan failed for `{}`: {error}",
+                    tracked.path.display()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn scan_tracked_local_file(
+    context: &ProviderContext,
+    tracked: &TrackedLocalFile,
+) -> Result<(), HelperError> {
+    let Some(current) = local_file_fingerprint(&tracked.path)? else {
+        return Ok(());
+    };
+    if Some(current) == tracked.fingerprint {
+        return Ok(());
+    }
+
+    std::thread::sleep(LOCAL_DIRTY_SCAN_SETTLE);
+    if local_file_fingerprint(&tracked.path)? != Some(current) {
+        return Ok(());
+    }
+
+    trace_cloud_files(format!(
+        "local dirty scan commit path=`{}` identity=`{}`",
+        tracked.path.display(),
+        tracked.identifier
+    ));
+    commit_local_file_by_identifier(context, &tracked.identifier, &tracked.path)
 }
 
 #[cfg(target_os = "windows")]
@@ -1190,6 +1309,7 @@ fn handle_local_create_like_path(
         }
         convert_to_placeholder_when_ready(&path, &created.identifier, false)?;
         let _ = set_placeholder_in_sync_state(&path, false);
+        context.remember_local_file(&path, &created.identifier);
         if let Some(parent_identifier) = context.cached_path_identity(parent)
             && placeholder_identity_for_path(parent)?.is_none()
             && convert_to_placeholder_when_ready(parent, &parent_identifier, false).is_ok()
@@ -1239,13 +1359,22 @@ fn handle_local_modify_like_path(
     if !metadata.is_file() {
         return Ok(());
     }
-    let contents = read_created_file_when_ready(&path)?;
+    commit_local_file_by_identifier(context, &identifier, &path)
+}
+
+#[cfg(target_os = "windows")]
+fn commit_local_file_by_identifier(
+    context: &ProviderContext,
+    identifier: &str,
+    path: &Path,
+) -> Result<(), HelperError> {
+    let contents = read_created_file_when_ready(path)?;
     trace_cloud_files(format!(
         "local modify commit path=`{}` identity=`{identifier}` bytes={}",
         path.display(),
         contents.len()
     ));
-    commit_local_bytes(context, &identifier, &path, &contents)
+    commit_local_bytes(context, identifier, path, &contents)
 }
 
 #[cfg(target_os = "windows")]
@@ -1381,6 +1510,28 @@ fn read_created_file_when_ready(path: &Path) -> Result<Vec<u8>, HelperError> {
 }
 
 #[cfg(target_os = "windows")]
+fn local_file_fingerprint(path: &Path) -> Result<Option<LocalFileFingerprint>, HelperError> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(HelperError::io("inspect local file", error)),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let modified_millis = metadata.modified().ok().and_then(|modified| {
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis())
+    });
+    Ok(Some(LocalFileFingerprint {
+        len: metadata.len(),
+        modified_millis,
+    }))
+}
+
+#[cfg(target_os = "windows")]
 fn convert_to_placeholder_when_ready(
     path: &Path,
     identifier: &str,
@@ -1512,6 +1663,7 @@ fn connect_cloud_filter_sync_root(
         sync_root: sync_root.to_path_buf(),
         state_dir: state_dir.to_path_buf(),
         identity_index: Default::default(),
+        local_file_index: Default::default(),
     });
     let callbacks = [
         CF_CALLBACK_REGISTRATION {
@@ -1753,6 +1905,7 @@ unsafe fn handle_fetch_data(
     let context = unsafe { provider_context(info) }?;
     let identifier = callback_identifier(info)
         .ok_or_else(|| HelperError::new("invalid_callback", "fetch data missing file identity"))?;
+    let path = callback_path(context, info);
     let fetch = unsafe { params.Anonymous.FetchData };
     trace_cloud_files(format!(
         "fetch data start identity=`{identifier}` advertised_size={} required_offset={} required_length={}",
@@ -1783,7 +1936,7 @@ unsafe fn handle_fetch_data(
         fetch.RequiredFileOffset,
         range.len()
     ));
-    unsafe {
+    let result = unsafe {
         complete_fetch_data_with_status(
             callback_info,
             status_success(),
@@ -1791,7 +1944,13 @@ unsafe fn handle_fetch_data(
             fetch.RequiredFileOffset,
             range.len() as i64,
         )
+    };
+    if result.is_ok()
+        && let Some(path) = path.as_deref()
+    {
+        context.remember_local_file(path, &identifier);
     }
+    result
 }
 
 #[cfg(target_os = "windows")]
@@ -1872,6 +2031,9 @@ unsafe fn handle_rename(
         context.move_path_identities(source_path, &target_path);
     }
     context.remember_path_identity(&target_path, &identifier);
+    if std::fs::metadata(&target_path).is_ok_and(|metadata| metadata.is_file()) {
+        context.remember_local_file(&target_path, &identifier);
+    }
     Ok(())
 }
 
@@ -2000,6 +2162,7 @@ fn commit_local_bytes(
     let report = context.commit_write(identifier, contents)?;
     let in_sync = report.hydration == afs_core::model::HydrationState::Hydrated;
     let _ = set_placeholder_in_sync_state(path, in_sync);
+    context.remember_local_file(path, identifier);
     Ok(())
 }
 
@@ -2976,6 +3139,7 @@ mod tests {
             sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
             identity_index: Default::default(),
+            local_file_index: Default::default(),
         };
 
         assert_eq!(
@@ -2992,6 +3156,7 @@ mod tests {
             sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
             identity_index: Default::default(),
+            local_file_index: Default::default(),
         };
 
         assert!(path_is_under_sync_root(
@@ -3090,6 +3255,7 @@ mod tests {
             sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
             identity_index: Default::default(),
+            local_file_index: Default::default(),
         };
         let directory = Path::new(r"C:\Users\Ada\AFS\Notion\Draft");
         context.remember_path_identity(directory, "children:local:123");
@@ -3108,6 +3274,7 @@ mod tests {
             sync_root: PathBuf::from(r"C:\Users\Ada\AFS\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\AFS"),
             identity_index: Default::default(),
+            local_file_index: Default::default(),
         };
         let page = Path::new(r"C:\Users\Ada\AFS\Notion\Draft\page.md");
         context.remember_path_identity(page, "local:123");
