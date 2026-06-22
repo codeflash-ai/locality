@@ -671,10 +671,10 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
         "[Bookmark](https://example.com/bookmark)",
         "[Preview](https://example.com/preview)",
         "![Image](../.afs/media/Docs/Coverage/image-111111111111aaaa.png)",
-        "[Video](https://example.com/video.mp4)",
-        "[File](https://example.com/file.txt)",
-        "[PDF](https://example.com/file.pdf)",
-        "[Audio](https://example.com/audio.mp3)",
+        "[Video](../.afs/media/Docs/Coverage/video-222222222222bbbb.mp4)",
+        "[File](../.afs/media/Docs/Coverage/file-333333333333cccc.txt)",
+        "[PDF](../.afs/media/Docs/Coverage/pdf-444444444444dddd.pdf)",
+        "[Audio](../.afs/media/Docs/Coverage/audio-555555555555eeee.mp3)",
         "::afs{id=synced-original-1 type=synced_block}",
         "::afs{id=synced-copy-1 type=synced_block source_block_id=\"source-block-1\"}",
         "[Linked page](https://www.notion.so/target-page-1)",
@@ -879,6 +879,87 @@ fn render_media_blocks_as_markdown_links_and_tracks_local_paths() {
     assert_eq!(
         rendered.document.body,
         "![Image caption](../../.afs/media/Docs/Coverage/image-0123456789abcdef.png)\n"
+    );
+}
+
+#[test]
+fn render_file_like_media_blocks_as_local_links_when_downloaded() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Coverage"),
+        blocks: vec![
+            BlockTreeDto {
+                block: file_block(
+                    "1111111111111111",
+                    "video",
+                    "https://example.com/cars.MP4?download=1",
+                    "Cars",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: file_block(
+                    "2222222222222222",
+                    "pdf",
+                    "https://example.com/brief.PDF?download=1",
+                    "Brief",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: file_block(
+                    "3333333333333333",
+                    "audio",
+                    "https://example.com/theme.MP3?download=1",
+                    "Theme",
+                ),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: file_block(
+                    "4444444444444444",
+                    "file",
+                    "https://example.com/index.HTML?download=1",
+                    "Index",
+                ),
+                children: Vec::new(),
+            },
+        ],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle_with_options(
+        &bundle,
+        &afs_notion::render::RenderOptions::with_page_path("Docs/Coverage/page.md"),
+    )
+    .expect("render");
+
+    assert_eq!(
+        rendered
+            .media_assets
+            .iter()
+            .map(|asset| (&asset.kind, asset.local_path.as_path()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                &"video".to_string(),
+                Path::new(".afs/media/Docs/Coverage/video-1111111111111111.mp4")
+            ),
+            (
+                &"pdf".to_string(),
+                Path::new(".afs/media/Docs/Coverage/pdf-2222222222222222.pdf")
+            ),
+            (
+                &"audio".to_string(),
+                Path::new(".afs/media/Docs/Coverage/audio-3333333333333333.mp3")
+            ),
+            (
+                &"file".to_string(),
+                Path::new(".afs/media/Docs/Coverage/file-4444444444444444.html")
+            ),
+        ]
+    );
+    assert_eq!(
+        rendered.document.body,
+        "[Cars](../../.afs/media/Docs/Coverage/video-1111111111111111.mp4)\n\n[Brief](../../.afs/media/Docs/Coverage/pdf-2222222222222222.pdf)\n\n[Theme](../../.afs/media/Docs/Coverage/audio-3333333333333333.mp3)\n\n[Index](../../.afs/media/Docs/Coverage/file-4444444444444444.html)\n"
     );
 }
 

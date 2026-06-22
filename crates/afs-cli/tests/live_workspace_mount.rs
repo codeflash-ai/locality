@@ -9,7 +9,6 @@ use serde_json::Value;
 
 const LIVE_WORKSPACE_ROOT_ENV: &str = "AFS_LIVE_WORKSPACE_ROOT";
 const LIVE_WORKSPACE_FILE_ENV: &str = "AFS_LIVE_WORKSPACE_FILE";
-const DEFAULT_WORKSPACE_ROOT: &str = "/home/mohammed/Documents/AFS/notion";
 const DEFAULT_WORKSPACE_FILE: &str = "weekly-to-do-list/page.md";
 
 #[test]
@@ -17,7 +16,8 @@ const DEFAULT_WORKSPACE_FILE: &str = "weekly-to-do-list/page.md";
 fn live_workspace_pull_edit_pull_push_regression() {
     let afs = env!("CARGO_BIN_EXE_afs");
     let root = PathBuf::from(
-        env::var(LIVE_WORKSPACE_ROOT_ENV).unwrap_or_else(|_| DEFAULT_WORKSPACE_ROOT.to_string()),
+        env::var(LIVE_WORKSPACE_ROOT_ENV)
+            .unwrap_or_else(|_| panic!("set {LIVE_WORKSPACE_ROOT_ENV} to run this live test")),
     );
     let file = root.join(
         env::var(LIVE_WORKSPACE_FILE_ENV).unwrap_or_else(|_| DEFAULT_WORKSPACE_FILE.to_string()),

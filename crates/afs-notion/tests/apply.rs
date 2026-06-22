@@ -1318,6 +1318,160 @@ fn apply_uploads_local_image_media_before_block_update() {
 }
 
 #[test]
+fn apply_uploads_local_file_like_media_before_block_update() {
+    let temp = tempdir().expect("tempdir");
+    let video_path = temp.path().join(".afs/media/Roadmap/cars.mp4");
+    let pdf_path = temp.path().join(".afs/media/Roadmap/brief.pdf");
+    let audio_path = temp.path().join(".afs/media/Roadmap/theme.mp3");
+    let html_path = temp.path().join(".afs/media/Roadmap/index.html");
+    fs::create_dir_all(video_path.parent().expect("parent")).expect("mkdir");
+    fs::write(&video_path, b"video bytes").expect("write video");
+    fs::write(&pdf_path, b"pdf bytes").expect("write pdf");
+    fs::write(&audio_path, b"audio bytes").expect("write audio");
+    fs::write(&html_path, b"html bytes").expect("write html");
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            media_block(
+                "video-1",
+                "video",
+                "https://example.com/original-video.mp4",
+                "Original video",
+            ),
+            media_block(
+                "pdf-1",
+                "pdf",
+                "https://example.com/original.pdf",
+                "Original PDF",
+            ),
+            media_block(
+                "audio-1",
+                "audio",
+                "https://example.com/original-audio.mp3",
+                "Original audio",
+            ),
+            media_block(
+                "file-1",
+                "file",
+                "https://example.com/original.html",
+                "Original file",
+            ),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::UpdateMedia {
+                block_id: RemoteId::new("video-1"),
+                local_path: ".afs/media/Roadmap/cars.mp4".into(),
+                caption: "Updated video".to_string(),
+            },
+            PushOperation::UpdateMedia {
+                block_id: RemoteId::new("pdf-1"),
+                local_path: ".afs/media/Roadmap/brief.pdf".into(),
+                caption: "Updated PDF".to_string(),
+            },
+            PushOperation::UpdateMedia {
+                block_id: RemoteId::new("audio-1"),
+                local_path: ".afs/media/Roadmap/theme.mp3".into(),
+                caption: "Updated audio".to_string(),
+            },
+            PushOperation::UpdateMedia {
+                block_id: RemoteId::new("file-1"),
+                local_path: ".afs/media/Roadmap/index.html".into(),
+                caption: "Updated file".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: Some(temp.path()),
+        })
+        .expect("apply local file-like media upload");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::UploadFile {
+                filename: "cars.mp4".to_string(),
+                content_type: "video/mp4".to_string(),
+                bytes: b"video bytes".to_vec(),
+            },
+            WriteCall::Update {
+                block_id: "video-1".to_string(),
+                body: json!({
+                    "video": {
+                        "file_upload": {
+                            "id": "upload-1",
+                        },
+                        "caption": rich_text_json("Updated video"),
+                    },
+                }),
+            },
+            WriteCall::UploadFile {
+                filename: "brief.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                bytes: b"pdf bytes".to_vec(),
+            },
+            WriteCall::Update {
+                block_id: "pdf-1".to_string(),
+                body: json!({
+                    "pdf": {
+                        "file_upload": {
+                            "id": "upload-1",
+                        },
+                        "caption": rich_text_json("Updated PDF"),
+                    },
+                }),
+            },
+            WriteCall::UploadFile {
+                filename: "theme.mp3".to_string(),
+                content_type: "audio/mpeg".to_string(),
+                bytes: b"audio bytes".to_vec(),
+            },
+            WriteCall::Update {
+                block_id: "audio-1".to_string(),
+                body: json!({
+                    "audio": {
+                        "file_upload": {
+                            "id": "upload-1",
+                        },
+                        "caption": rich_text_json("Updated audio"),
+                    },
+                }),
+            },
+            WriteCall::UploadFile {
+                filename: "index.html".to_string(),
+                content_type: "text/html".to_string(),
+                bytes: b"html bytes".to_vec(),
+            },
+            WriteCall::Update {
+                block_id: "file-1".to_string(),
+                body: json!({
+                    "file": {
+                        "file_upload": {
+                            "id": "upload-1",
+                        },
+                        "caption": rich_text_json("Updated file"),
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_uploads_local_image_media_before_block_append() {
     let temp = tempdir().expect("tempdir");
     let media_path = temp.path().join(".afs/media/Roadmap/night-sky.jpg");
@@ -1383,6 +1537,277 @@ fn apply_uploads_local_image_media_before_block_append() {
                         "type": "after_block",
                         "after_block": {
                             "id": "paragraph-1",
+                        },
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
+fn apply_uploads_local_video_media_before_block_append() {
+    let temp = tempdir().expect("tempdir");
+    let media_path = temp.path().join(".afs/media/Roadmap/cars.mp4");
+    fs::create_dir_all(media_path.parent().expect("parent")).expect("mkdir");
+    fs::write(&media_path, b"new video bytes").expect("write video");
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("paragraph-1")),
+            content: format!("[cars]({})", media_path.display()),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: Some(temp.path()),
+        })
+        .expect("apply local video append");
+
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::CreatedBlock {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            parent_id: RemoteId::new("page-1"),
+            block_id: RemoteId::new("created-1"),
+        }]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::UploadFile {
+                filename: "cars.mp4".to_string(),
+                content_type: "video/mp4".to_string(),
+                bytes: b"new video bytes".to_vec(),
+            },
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "video",
+                        "video": {
+                            "file_upload": {
+                                "id": "upload-1",
+                            },
+                            "caption": rich_text_json("cars"),
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "paragraph-1",
+                        },
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
+fn apply_uploads_common_local_file_media_before_block_append() {
+    let temp = tempdir().expect("tempdir");
+    let pdf_path = temp.path().join(".afs/media/Roadmap/brief.pdf");
+    let audio_path = temp.path().join(".afs/media/Roadmap/theme.mp3");
+    let html_path = temp.path().join(".afs/media/Roadmap/index.html");
+    let slides_path = temp.path().join(".afs/media/Roadmap/slides.pptx");
+    fs::create_dir_all(pdf_path.parent().expect("parent")).expect("mkdir");
+    fs::write(&pdf_path, b"pdf bytes").expect("write pdf");
+    fs::write(&audio_path, b"audio bytes").expect("write audio");
+    fs::write(&html_path, b"html bytes").expect("write html");
+    fs::write(&slides_path, b"slides bytes").expect("write slides");
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: format!("[Brief]({})", pdf_path.display()),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: format!("[Theme]({})", audio_path.display()),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: format!("[Index]({})", html_path.display()),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: format!("[Slides]({})", slides_path.display()),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: Some(temp.path()),
+        })
+        .expect("apply local file media append");
+
+    assert_eq!(
+        result.effects,
+        vec![
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[0].clone(),
+                operation_index: 0,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-1"),
+            },
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[1].clone(),
+                operation_index: 1,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-2"),
+            },
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[2].clone(),
+                operation_index: 2,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-3"),
+            },
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[3].clone(),
+                operation_index: 3,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-4"),
+            },
+        ]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::UploadFile {
+                filename: "brief.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                bytes: b"pdf bytes".to_vec(),
+            },
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "pdf",
+                        "pdf": {
+                            "file_upload": {
+                                "id": "upload-1",
+                            },
+                            "caption": rich_text_json("Brief"),
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "paragraph-1",
+                        },
+                    },
+                }),
+            },
+            WriteCall::UploadFile {
+                filename: "theme.mp3".to_string(),
+                content_type: "audio/mpeg".to_string(),
+                bytes: b"audio bytes".to_vec(),
+            },
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "audio",
+                        "audio": {
+                            "file_upload": {
+                                "id": "upload-1",
+                            },
+                            "caption": rich_text_json("Theme"),
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "created-1",
+                        },
+                    },
+                }),
+            },
+            WriteCall::UploadFile {
+                filename: "index.html".to_string(),
+                content_type: "text/html".to_string(),
+                bytes: b"html bytes".to_vec(),
+            },
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "file",
+                        "file": {
+                            "file_upload": {
+                                "id": "upload-1",
+                            },
+                            "caption": rich_text_json("Index"),
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "created-2",
+                        },
+                    },
+                }),
+            },
+            WriteCall::UploadFile {
+                filename: "slides.pptx".to_string(),
+                content_type:
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                        .to_string(),
+                bytes: b"slides bytes".to_vec(),
+            },
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "file",
+                        "file": {
+                            "file_upload": {
+                                "id": "upload-1",
+                            },
+                            "caption": rich_text_json("Slides"),
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "created-3",
                         },
                     },
                 }),

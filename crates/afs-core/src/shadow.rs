@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn rendered_bodies_are_equivalent_when_local_media_href_shape_differs() {
-        let shadow = "# Page\n\n![Image](/home/mohammed/.afs/content/notion-main/files/.afs/media/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg)\n";
+        let shadow = "# Page\n\n![Image](/tmp/afs-content/notion-main/files/.afs/media/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg)\n";
         let remote = "# Page\n\n![Image](../.afs/media/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg)\n";
 
         assert!(rendered_bodies_equivalent(shadow, remote));

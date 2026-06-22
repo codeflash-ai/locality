@@ -101,6 +101,7 @@ version = "0.1.3"
 dependencies = [
  "afs-connector",
  "afs-core",
+ "mime_guess",
  "reqwest",
  "rustls",
  "serde",

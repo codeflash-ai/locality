@@ -232,7 +232,7 @@ fn push_safe_plan_with_daemon_journals_applies_and_reconciles() {
 fn push_daemon_allows_equivalent_media_paths_in_synced_tree_guardrail() {
     let fixture = PushFixture::new();
     let mut store = fixture.store();
-    let long_media_href = "../../../../../../../.afs/media/home/mohammed/.afs/content/notion-main/files/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg";
+    let long_media_href = "/tmp/afs-content/notion-main/files/.afs/media/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg";
     let stable_media_href =
         "../.afs/media/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg";
 

@@ -385,7 +385,7 @@ fn file_media_block(
                 && let Some(page_path) = options.page_path.as_deref()
             {
                 let local_path = media_local_path(page_path, &block.id, media_type, &url);
-                if media_type == "image" && options.use_local_media_for(&block.id) {
+                if options.use_local_media_for(&block.id) {
                     markdown_url = local_media_href(page_path, &local_path);
                 }
                 media_asset = Some(MediaAsset {
@@ -400,7 +400,7 @@ fn file_media_block(
             let markdown = if media_type == "image" {
                 format!("![{}]({markdown_url})", escape_markdown_link_label(&label))
             } else {
-                format!("[{}]({url})", escape_markdown_link_label(&label))
+                format!("[{}]({markdown_url})", escape_markdown_link_label(&label))
             };
             let mut rendered = rendered_block(markdown, Some(RemoteId::new(block.id.clone())));
             rendered.media_asset = media_asset;

@@ -1,7 +1,7 @@
 //! Local media materialization for Notion file-like blocks.
 //!
 //! Notion file URLs are useful for API round-trips, but agents work better when
-//! images are also present as normal local files. Media assets are projected
+//! file-like media are also present as normal local files. Media assets are projected
 //! under a mount-level `.afs/media/` directory that mirrors the page path without
 //! putting binary files next to Markdown documents or colliding with projected
 //! Notion page/database names.
@@ -163,7 +163,11 @@ fn fetch_media_asset(client: &Client, asset: &MediaAsset) -> AfsResult<Downloade
 }
 
 fn should_download(asset: &MediaAsset) -> bool {
-    asset.kind == "image" && is_downloadable_url(&asset.source_url)
+    is_file_like_media_kind(&asset.kind) && is_downloadable_url(&asset.source_url)
+}
+
+fn is_file_like_media_kind(kind: &str) -> bool {
+    matches!(kind, "image" | "video" | "file" | "pdf" | "audio")
 }
 
 pub(crate) fn is_downloadable_url(url: &str) -> bool {
@@ -506,7 +510,7 @@ fn write_atomic(path: &Path, contents: &[u8]) -> AfsResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{local_media_href, media_local_path, resolve_media_href};
+    use super::{MediaAsset, local_media_href, media_local_path, resolve_media_href};
     use std::path::Path;
 
     #[test]
@@ -588,5 +592,28 @@ mod tests {
             ),
             Some(Path::new(".afs/media/Tasks/Fix login/image-0123456789ab.png").to_path_buf())
         );
+    }
+
+    #[test]
+    fn downloads_file_like_media_kinds_from_http_urls() {
+        for kind in ["image", "video", "file", "pdf", "audio"] {
+            let asset = MediaAsset {
+                block_id: format!("{kind}-1"),
+                kind: kind.to_string(),
+                source_url: format!("https://example.com/{kind}.bin"),
+                local_path: Path::new(".afs/media/Page/media.bin").to_path_buf(),
+            };
+
+            assert!(super::should_download(&asset), "{kind} should download");
+        }
+
+        let relative = MediaAsset {
+            block_id: "video-1".to_string(),
+            kind: "video".to_string(),
+            source_url: "cars.mp4".to_string(),
+            local_path: Path::new(".afs/media/Page/video-1.mp4").to_path_buf(),
+        };
+
+        assert!(!super::should_download(&relative));
     }
 }

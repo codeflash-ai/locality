@@ -29,9 +29,8 @@ fn clean_noop_push_finishes_without_apply() {
 
 #[test]
 fn local_media_href_shape_only_change_is_noop() {
-    let parsed = parsed_doc(
-        "![Image](/home/mohammed/.afs/content/notion-main/files/.afs/media/Roadmap/image-1.png)",
-    );
+    let parsed =
+        parsed_doc("![Image](/tmp/afs-content/notion-main/files/.afs/media/Roadmap/image-1.png)");
     let shadow = shadow("![Image](.afs/media/Roadmap/image-1.png)", ["image-1"]);
 
     let output = plan_push_pipeline(request(&parsed, &shadow));

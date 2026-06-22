@@ -109,9 +109,9 @@ pub fn apply_plan(
                 caption,
             } => {
                 let current = current_block(&current_blocks, block_id)?;
-                if current.kind != "image" {
+                if !is_file_like_media_kind(&current.kind) {
                     return Err(AfsError::Unsupported(
-                        "local media uploads are currently supported for image blocks only",
+                        "local media uploads are supported for file-like media blocks only",
                     ));
                 }
                 let local_root = request.local_root.ok_or_else(|| {
@@ -119,9 +119,9 @@ pub fn apply_plan(
                         "local media upload requires an apply local root".to_string(),
                     )
                 })?;
-                let upload_id = upload_local_image(api, local_root, local_path)?;
+                let upload_id = upload_local_media(api, local_root, local_path)?;
                 let patch = NotionBlockPatch::new(
-                    "image",
+                    media_kind(current.kind.as_str())?,
                     json!({
                         "file_upload": {
                             "id": upload_id,
@@ -1403,22 +1403,34 @@ fn parse_append_block(
     local_root: Option<&Path>,
 ) -> AfsResult<NotionBlockPatch> {
     let trimmed = markdown.trim_end_matches('\n');
-    if let Some((caption, href)) = parse_media_markdown("image", trimmed)
-        && !href.starts_with("http://")
-        && !href.starts_with("https://")
-    {
-        let local_root = local_root.ok_or_else(|| {
-            AfsError::InvalidState("local media upload requires an apply local root".to_string())
-        })?;
-        let local_path = resolve_media_href_with_content_root(Path::new("page.md"), href, local_root)
-            .ok_or_else(|| {
-                AfsError::Unsupported(
-                    "appended local image blocks must reference .afs/media under the projection output root",
-                )
-            })?;
-        let upload_id = upload_local_image(api, local_root, &local_path)?;
+    if let Some((caption, href, image_syntax)) = parse_local_media_markdown(trimmed) {
+        let Some(local_root) = local_root else {
+            if image_syntax || looks_like_media_href(href) {
+                return Err(AfsError::InvalidState(
+                    "local media upload requires an apply local root".to_string(),
+                ));
+            }
+            return parse_supported_block(markdown, None, None);
+        };
+        let Some(local_path) =
+            resolve_media_href_with_content_root(Path::new("page.md"), href, local_root)
+        else {
+            if image_syntax || looks_like_media_href(href) {
+                return Err(AfsError::Unsupported(
+                    "appended local media blocks must reference .afs/media under the projection output root",
+                ));
+            }
+            return parse_supported_block(markdown, None, None);
+        };
+        let kind = notion_media_kind_for_path(&local_path);
+        if image_syntax && kind != "image" {
+            return Err(AfsError::Unsupported(
+                "appended image Markdown must reference an image file",
+            ));
+        }
+        let upload_id = upload_local_media(api, local_root, &local_path)?;
         return Ok(NotionBlockPatch::new(
-            "image",
+            kind,
             json!({
                 "file_upload": {
                     "id": upload_id,
@@ -2124,6 +2136,33 @@ fn parse_media_markdown<'a>(kind: &str, input: &'a str) -> Option<(&'a str, &'a 
     }
 }
 
+fn parse_local_media_markdown(input: &str) -> Option<(&str, &str, bool)> {
+    if let Some((caption, href)) = parse_media_markdown("image", input)
+        && !is_external_url(href)
+    {
+        return Some((caption, href, true));
+    }
+
+    if let Some((caption, href)) = parse_media_markdown("file", input)
+        && !is_external_url(href)
+    {
+        return Some((caption, href, false));
+    }
+
+    None
+}
+
+fn is_external_url(href: &str) -> bool {
+    href.starts_with("http://") || href.starts_with("https://")
+}
+
+fn looks_like_media_href(href: &str) -> bool {
+    let normalized = href.replace('\\', "/");
+    normalized == ".afs/media"
+        || normalized.starts_with(".afs/media/")
+        || normalized.contains("/.afs/media/")
+}
+
 fn read_local_media(local_root: &Path, local_path: &Path) -> AfsResult<Vec<u8>> {
     validate_mount_relative_path(local_path)?;
     std::fs::read(local_root.join(local_path)).map_err(|error| {
@@ -2149,7 +2188,7 @@ fn validate_mount_relative_path(path: &Path) -> AfsResult<()> {
     Ok(())
 }
 
-fn upload_local_image(
+fn upload_local_media(
     api: &dyn NotionApi,
     local_root: &Path,
     local_path: &Path,
@@ -2157,29 +2196,120 @@ fn upload_local_image(
     let bytes = read_local_media(local_root, local_path)?;
     if bytes.len() > 20 * 1024 * 1024 {
         return Err(AfsError::Unsupported(
-            "local image uploads larger than 20MB need multipart upload support",
+            "local media uploads larger than 20MB need multipart upload support",
         ));
     }
     let filename = local_path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("image");
-    api.upload_file(filename, media_content_type(local_path), bytes)
+        .unwrap_or("media");
+    let content_type = media_content_type(local_path);
+    api.upload_file(filename, &content_type, bytes)
 }
 
-fn media_content_type(path: &Path) -> &'static str {
-    match path
+fn is_file_like_media_kind(kind: &str) -> bool {
+    matches!(kind, "image" | "video" | "file" | "pdf" | "audio")
+}
+
+fn media_kind(kind: &str) -> AfsResult<&'static str> {
+    match kind {
+        "image" => Ok("image"),
+        "video" => Ok("video"),
+        "file" => Ok("file"),
+        "pdf" => Ok("pdf"),
+        "audio" => Ok("audio"),
+        _ => Err(AfsError::Unsupported(
+            "local media uploads are supported for file-like media blocks only",
+        )),
+    }
+}
+
+fn notion_media_kind_for_path(path: &Path) -> &'static str {
+    let content_type = media_content_type(path);
+    if content_type.starts_with("image/") {
+        "image"
+    } else if content_type.starts_with("video/") {
+        "video"
+    } else if content_type.starts_with("audio/") {
+        "audio"
+    } else if content_type == "application/pdf" {
+        "pdf"
+    } else {
+        "file"
+    }
+}
+
+fn media_content_type(path: &Path) -> String {
+    let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        _ => "application/octet-stream",
+        .map(|extension| extension.to_ascii_lowercase());
+
+    if let Some(content_type) = extension.as_deref().and_then(popular_media_content_type) {
+        return content_type.to_string();
+    }
+
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string()
+}
+
+fn popular_media_content_type(extension: &str) -> Option<&'static str> {
+    match extension {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        "avif" => Some("image/avif"),
+        "bmp" => Some("image/bmp"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "heic" => Some("image/heic"),
+        "heif" => Some("image/heif"),
+        "mp4" | "m4v" => Some("video/mp4"),
+        "mov" => Some("video/quicktime"),
+        "webm" => Some("video/webm"),
+        "avi" => Some("video/x-msvideo"),
+        "mkv" => Some("video/x-matroska"),
+        "mpeg" | "mpg" => Some("video/mpeg"),
+        "mp3" => Some("audio/mpeg"),
+        "m4a" => Some("audio/mp4"),
+        "aac" => Some("audio/aac"),
+        "wav" => Some("audio/wav"),
+        "flac" => Some("audio/flac"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "opus" => Some("audio/opus"),
+        "pdf" => Some("application/pdf"),
+        "txt" => Some("text/plain"),
+        "md" | "markdown" => Some("text/markdown"),
+        "csv" => Some("text/csv"),
+        "tsv" => Some("text/tab-separated-values"),
+        "html" | "htm" => Some("text/html"),
+        "css" => Some("text/css"),
+        "js" | "mjs" => Some("text/javascript"),
+        "json" => Some("application/json"),
+        "jsonl" | "ndjson" => Some("application/x-ndjson"),
+        "xml" => Some("application/xml"),
+        "yaml" | "yml" => Some("application/yaml"),
+        "zip" => Some("application/zip"),
+        "gz" => Some("application/gzip"),
+        "tgz" => Some("application/gzip"),
+        "tar" => Some("application/x-tar"),
+        "bz2" => Some("application/x-bzip2"),
+        "xz" => Some("application/x-xz"),
+        "rar" => Some("application/vnd.rar"),
+        "7z" => Some("application/x-7z-compressed"),
+        "doc" => Some("application/msword"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "xls" => Some("application/vnd.ms-excel"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "ppt" => Some("application/vnd.ms-powerpoint"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        "odt" => Some("application/vnd.oasis.opendocument.text"),
+        "ods" => Some("application/vnd.oasis.opendocument.spreadsheet"),
+        "odp" => Some("application/vnd.oasis.opendocument.presentation"),
+        _ => None,
     }
 }
 

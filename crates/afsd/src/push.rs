@@ -407,7 +407,9 @@ fn augment_notion_media_plan(
     let mut media_updates = BTreeMap::<RemoteId, PushOperation>::new();
 
     for (index, shadow_block) in shadow.blocks.iter().enumerate() {
-        let Some((shadow_caption, shadow_href)) = parse_image_markdown(&shadow_block.text) else {
+        let Some((shadow_shape, shadow_caption, shadow_href)) =
+            parse_file_like_media_markdown(&shadow_block.text)
+        else {
             continue;
         };
         let Some(shadow_path) =
@@ -415,18 +417,29 @@ fn augment_notion_media_plan(
         else {
             continue;
         };
+        let Some(entry) = media_manifest_entry(&manifest, &shadow_path) else {
+            continue;
+        };
+        if entry.block_id != shadow_block.remote_id.as_str()
+            || !is_file_like_media_kind(&entry.kind)
+            || !media_markdown_shape_matches_kind(shadow_shape, &entry.kind)
+        {
+            continue;
+        }
         let Some(edited_block) = edited_blocks.get(index) else {
             continue;
         };
-        let Some((caption, edited_href)) = parse_image_markdown(&edited_block.text) else {
-            continue;
-        };
-        let Some(local_path) =
-            resolve_media_href_with_content_root(relative_path, edited_href, &root)
+        let Some((edited_shape, caption, edited_href)) =
+            parse_file_like_media_markdown(&edited_block.text)
         else {
             continue;
         };
-        let Some(entry) = media_manifest_entry(&manifest, &shadow_path) else {
+        if !media_markdown_shape_matches_kind(edited_shape, &entry.kind) {
+            continue;
+        }
+        let Some(local_path) =
+            resolve_media_href_with_content_root(relative_path, edited_href, &root)
+        else {
             continue;
         };
         let markdown_changed = shadow_caption != caption || shadow_path != local_path;
@@ -480,20 +493,48 @@ fn augment_notion_media_plan(
     }
 }
 
-fn parse_image_markdown(input: &str) -> Option<(&str, &str)> {
-    let link = input.trim().strip_prefix('!')?;
-    if !link.starts_with('[') {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaMarkdownShape {
+    Image,
+    Link,
+}
+
+fn parse_file_like_media_markdown(input: &str) -> Option<(MediaMarkdownShape, &str, &str)> {
+    let trimmed = input.trim();
+    if let Some(link) = trimmed.strip_prefix('!') {
+        let (label, href) = parse_markdown_link_exact(link)?;
+        return Some((MediaMarkdownShape::Image, label, href));
+    }
+
+    let (label, href) = parse_markdown_link_exact(trimmed)?;
+    Some((MediaMarkdownShape::Link, label, href))
+}
+
+fn parse_markdown_link_exact(input: &str) -> Option<(&str, &str)> {
+    if !input.starts_with('[') {
         return None;
     }
-    let label_end = link.find("](")?;
+    let label_end = input.find("](")?;
     let href_start = label_end + 2;
-    let href_end = link[href_start..]
+    let href_end = input[href_start..]
         .find(')')
         .map(|offset| href_start + offset)?;
-    if href_end + 1 != link.len() {
+    if href_end + 1 != input.len() {
         return None;
     }
-    Some((&link[1..label_end], &link[href_start..href_end]))
+    Some((&input[1..label_end], &input[href_start..href_end]))
+}
+
+fn media_markdown_shape_matches_kind(shape: MediaMarkdownShape, kind: &str) -> bool {
+    matches!(
+        (shape, kind),
+        (MediaMarkdownShape::Image, "image")
+            | (MediaMarkdownShape::Link, "video" | "file" | "pdf" | "audio")
+    )
+}
+
+fn is_file_like_media_kind(kind: &str) -> bool {
+    matches!(kind, "image" | "video" | "file" | "pdf" | "audio")
 }
 
 fn remote_preconditions_for_plan<S>(
