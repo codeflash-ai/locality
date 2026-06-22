@@ -173,6 +173,41 @@ where
         + VirtualMutationRepository
         + FreshnessStateRepository,
 {
+    reconcile_macos_file_provider_projection_with_mode(store, state_root, target, true)
+}
+
+/// Imports only visible macOS File Provider replicas newer than daemon content.
+///
+/// This is used before explicit pull so a missed local edit is preserved, while
+/// an older stale CloudStorage replica does not get mistaken for a local edit.
+pub fn reconcile_newer_macos_file_provider_projection<S>(
+    store: &mut S,
+    state_root: &Path,
+    target: Option<&Path>,
+) -> AfsResult<ProjectionReconcileReport>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + VirtualMutationRepository
+        + FreshnessStateRepository,
+{
+    reconcile_macos_file_provider_projection_with_mode(store, state_root, target, false)
+}
+
+fn reconcile_macos_file_provider_projection_with_mode<S>(
+    store: &mut S,
+    state_root: &Path,
+    target: Option<&Path>,
+    force_explicit_target_read: bool,
+) -> AfsResult<ProjectionReconcileReport>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + VirtualMutationRepository
+        + FreshnessStateRepository,
+{
     let Some(target) = target.map(absolute_reconcile_path).transpose()? else {
         return Ok(ProjectionReconcileReport::default());
     };
@@ -191,9 +226,13 @@ where
         let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
         let entities = scoped_page_entities(store, &mount, Some(&target_match))?;
         for entity in entities {
-            let Some(candidate) =
-                reconcile_candidate_path(&mount, &entity, Some(&target), Some(&target_match))
-            else {
+            let Some(candidate) = reconcile_candidate_path(
+                &mount,
+                &entity,
+                Some(&target),
+                Some(&target_match),
+                force_explicit_target_read,
+            ) else {
                 continue;
             };
 
@@ -448,6 +487,7 @@ fn reconcile_candidate_path(
     entity: &EntityRecord,
     target: Option<&Path>,
     target_match: Option<&MountPathMatch>,
+    force_explicit_target_read: bool,
 ) -> Option<ProjectionCandidate> {
     if let (Some(target), Some(target_match)) = (target, target_match)
         && target_match.relative_path == entity.path
@@ -455,7 +495,7 @@ fn reconcile_candidate_path(
     {
         return Some(ProjectionCandidate {
             path: target.to_path_buf(),
-            force_read: true,
+            force_read: force_explicit_target_read,
         });
     }
 
@@ -587,6 +627,11 @@ fn refresh_projection_candidate_if_clean(
         return Ok(ProjectionRefreshOutcome::Unchanged);
     }
 
+    if projection_is_not_newer_than_cache(&projection_path, &content_path) == Some(true) {
+        write_binary_atomic(&projection_path, &cache_contents).map_err(AfsError::from)?;
+        return Ok(ProjectionRefreshOutcome::Refreshed);
+    }
+
     if !projection_contents_are_replaceable(&projection_contents, previous_shadow) {
         return Ok(ProjectionRefreshOutcome::SkippedLocalChanges);
     }
@@ -616,6 +661,12 @@ fn projection_contents_are_replaceable(
 
     std::str::from_utf8(contents)
         .is_ok_and(|contents| contents.contains(CanonicalDocument::STUB_MARKER))
+}
+
+fn projection_is_not_newer_than_cache(projection_path: &Path, content_path: &Path) -> Option<bool> {
+    let projection_metadata = std::fs::metadata(projection_path).ok()?;
+    let content_metadata = std::fs::metadata(content_path).ok()?;
+    Some(metadata_modified(&projection_metadata) <= metadata_modified(&content_metadata))
 }
 
 fn projection_contents_match_shadow(contents: &[u8], shadow: &ShadowDocument) -> bool {
@@ -1170,8 +1221,9 @@ mod tests {
     fn refresh_macos_projection_skips_visible_local_changes() {
         let fixture = ProjectionFixture::new("refresh-visible-local-change");
         let refresh_bases = fixture.refresh_bases();
-        fixture.write_projection_without_identity("Local visible edit.\n");
         fixture.write_cache("Pulled remote body.\n");
+        std::thread::sleep(Duration::from_millis(5));
+        fixture.write_projection_without_identity("Local visible edit.\n");
 
         let store = fixture.store();
         let report = refresh_macos_file_provider_projection(
@@ -1221,8 +1273,9 @@ mod tests {
     fn refresh_macos_entity_projection_if_clean_skips_visible_local_changes() {
         let fixture = ProjectionFixture::new("refresh-entity-local-change");
         let previous_shadow = fixture.previous_shadow();
-        fixture.write_projection_without_identity("Local visible edit.\n");
         fixture.write_cache("Pulled remote body.\n");
+        std::thread::sleep(Duration::from_millis(5));
+        fixture.write_projection_without_identity("Local visible edit.\n");
 
         let store = fixture.store();
         let report = refresh_macos_file_provider_entity_projection_if_clean(

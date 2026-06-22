@@ -146,7 +146,7 @@ where
         file_provider::macos_file_provider_projection_refresh_bases(store, Some(target_path))
             .map_err(PullError::Projection)?;
     if !refresh_bases.is_empty() {
-        file_provider::reconcile_macos_file_provider_projection(
+        file_provider::reconcile_newer_macos_file_provider_projection(
             store,
             state_root,
             Some(target_path),
