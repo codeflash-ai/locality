@@ -24,13 +24,15 @@ pub use credentials::{
 pub use error::{StoreError, StoreResult};
 pub use memory::InMemoryStateStore;
 pub use records::{
-    ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
-    FreshnessStateRecord, HydrationJobRecord, MountConfig, ProjectionMode, RemoteObservationRecord,
-    ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
+    AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveState, ConnectionId, ConnectionRecord,
+    ConnectorProfileId, ConnectorProfileRecord, EntityRecord, FreshnessStateRecord,
+    HydrationJobRecord, MountConfig, ProjectionMode, RemoteObservationRecord, ShadowBlockRecord,
+    ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
 };
 pub use repository::{
-    ConnectionRepository, ConnectorProfileRepository, EntityRepository, EntitySearchCandidate,
-    EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository, JournalRepository,
-    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
+    AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
+    EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
+    HydrationJobRepository, JournalRepository, MountRepository, RemoteObservationRepository,
+    ShadowRepository, VirtualMutationRepository,
 };
 pub use sqlite::SqliteStateStore;

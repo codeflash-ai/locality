@@ -27,18 +27,20 @@ use crate::compatibility::{
 };
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
-    ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
-    FreshnessStateRecord, HydrationJobRecord, MountConfig, ProjectionMode, RemoteObservationRecord,
-    ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
+    AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
+    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord, MountConfig,
+    ProjectionMode, RemoteObservationRecord, ShadowBlockRecord, ShadowSnapshotRecord,
+    VirtualMutationKind, VirtualMutationRecord,
 };
 use crate::repository::{
-    ConnectionRepository, ConnectorProfileRepository, EntityRepository, EntitySearchCandidate,
-    EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository, JournalRepository,
-    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
+    AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
+    EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
+    HydrationJobRepository, JournalRepository, MountRepository, RemoteObservationRepository,
+    ShadowRepository, VirtualMutationRepository,
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
 const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
 const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
@@ -98,6 +100,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     },
     StateComponentDefinition {
         component_id: "durable:virtual_mutations",
+        component_kind: "durable_json",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "durable:auto_save",
         component_kind: "durable_json",
         current_version: 1,
         min_reader_version: 1,
@@ -838,6 +849,110 @@ impl VirtualMutationRepository for SqliteStateStore {
     }
 }
 
+impl AutoSaveRepository for SqliteStateStore {
+    fn save_auto_save_enrollment(
+        &mut self,
+        enrollment: AutoSaveEnrollmentRecord,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO auto_save_enrollments (
+                mount_id,
+                path,
+                remote_id,
+                enabled,
+                origin_json,
+                state_json,
+                last_reason,
+                last_push_id,
+                created_at,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(mount_id, path) DO UPDATE SET
+                remote_id = excluded.remote_id,
+                enabled = excluded.enabled,
+                origin_json = excluded.origin_json,
+                state_json = excluded.state_json,
+                last_reason = excluded.last_reason,
+                last_push_id = excluded.last_push_id,
+                updated_at = excluded.updated_at",
+            params![
+                enrollment.mount_id.0,
+                path_to_text(&enrollment.path),
+                enrollment.remote_id.map(|remote_id| remote_id.0),
+                bool_to_int(enrollment.enabled),
+                to_json(&enrollment.origin)?,
+                to_json(&enrollment.state)?,
+                enrollment.last_reason,
+                enrollment.last_push_id,
+                enrollment.created_at,
+                enrollment.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_auto_save_enrollment(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> StoreResult<Option<AutoSaveEnrollmentRecord>> {
+        let connection = self.connection()?;
+        let sql = AUTO_SAVE_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 AND path = ?2";
+        connection
+            .query_row(
+                &sql,
+                params![mount_id.0, path_to_text(path)],
+                auto_save_enrollment_row,
+            )
+            .optional()?
+            .map(auto_save_enrollment_from_row)
+            .transpose()
+    }
+
+    fn find_auto_save_enrollment_by_remote_id(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<Option<AutoSaveEnrollmentRecord>> {
+        let connection = self.connection()?;
+        let sql = AUTO_SAVE_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 AND remote_id = ?2";
+        connection
+            .query_row(
+                &sql,
+                params![mount_id.0, remote_id.0],
+                auto_save_enrollment_row,
+            )
+            .optional()?
+            .map(auto_save_enrollment_from_row)
+            .transpose()
+    }
+
+    fn list_auto_save_enrollments(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<AutoSaveEnrollmentRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            &(AUTO_SAVE_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1 ORDER BY path"),
+        )?;
+        let rows = statement.query_map(params![mount_id.0], auto_save_enrollment_row)?;
+
+        rows.map(|row| auto_save_enrollment_from_row(row?))
+            .collect()
+    }
+
+    fn delete_auto_save_enrollment(&mut self, mount_id: &MountId, path: &Path) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM auto_save_enrollments WHERE mount_id = ?1 AND path = ?2",
+            params![mount_id.0, path_to_text(path)],
+        )?;
+        Ok(())
+    }
+}
+
 impl RemoteObservationRepository for SqliteStateStore {
     fn save_remote_observation(&mut self, observation: RemoteObservationRecord) -> StoreResult<()> {
         let connection = self.connection()?;
@@ -1143,6 +1258,7 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
         "shadows",
         "hydration_jobs",
         "virtual_mutations",
+        "auto_save_enrollments",
         "remote_observations",
         "freshness_states",
         "journals",
@@ -1175,6 +1291,11 @@ const VIRTUAL_MUTATION_SELECT_WITH_WHERE: &str = "
     SELECT mount_id, local_id, mutation_kind_json, target_remote_id, parent_remote_id,
            original_path, projected_path, title, content_path, created_at, updated_at
     FROM virtual_mutations
+    ";
+const AUTO_SAVE_SELECT_WITH_WHERE: &str = "
+    SELECT mount_id, path, remote_id, enabled, origin_json, state_json, last_reason,
+           last_push_id, created_at, updated_at
+    FROM auto_save_enrollments
     ";
 const REMOTE_OBSERVATION_SELECT_WITH_WHERE: &str = "
     SELECT mount_id, remote_id, kind_json, title, parent_remote_id, projected_path,
@@ -1248,6 +1369,18 @@ type VirtualMutationRow = (
     Option<String>,
     String,
     String,
+    Option<String>,
+    String,
+    String,
+);
+type AutoSaveEnrollmentRow = (
+    String,
+    String,
+    Option<String>,
+    i64,
+    String,
+    String,
+    Option<String>,
     Option<String>,
     String,
     String,
@@ -1386,6 +1519,21 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             updated_at TEXT NOT NULL,
             PRIMARY KEY (mount_id, local_id),
             UNIQUE (mount_id, projected_path),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS auto_save_enrollments (
+            mount_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            remote_id TEXT,
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            origin_json TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            last_reason TEXT,
+            last_push_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, path),
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
 
@@ -1597,6 +1745,28 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
     }
 
+    if user_version < 14 {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS auto_save_enrollments (
+                mount_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                remote_id TEXT,
+                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                origin_json TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                last_reason TEXT,
+                last_push_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (mount_id, path),
+                FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+            );",
+        )?;
+        if user_version >= 13 {
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         seed_current_state_components(connection)?;
@@ -1772,6 +1942,38 @@ fn virtual_mutation_from_row(row: VirtualMutationRow) -> StoreResult<VirtualMuta
         content_path: row.8.map(PathBuf::from),
         created_at: row.9,
         updated_at: row.10,
+    })
+}
+
+fn auto_save_enrollment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutoSaveEnrollmentRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn auto_save_enrollment_from_row(
+    row: AutoSaveEnrollmentRow,
+) -> StoreResult<AutoSaveEnrollmentRecord> {
+    Ok(AutoSaveEnrollmentRecord {
+        mount_id: MountId(row.0),
+        path: PathBuf::from(row.1),
+        remote_id: row.2.map(RemoteId),
+        enabled: row.3 != 0,
+        origin: from_json(&row.4)?,
+        state: from_json(&row.5)?,
+        last_reason: row.6,
+        last_push_id: row.7,
+        created_at: row.8,
+        updated_at: row.9,
     })
 }
 

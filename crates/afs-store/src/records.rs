@@ -179,6 +179,107 @@ pub struct VirtualMutationRecord {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoSaveOrigin {
+    AfsCreated,
+    UserEnabled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoSaveState {
+    Active,
+    Blocked,
+    PausedRemoteChanged,
+    PausedFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoSaveEnrollmentRecord {
+    pub mount_id: MountId,
+    pub path: PathBuf,
+    pub remote_id: Option<RemoteId>,
+    pub enabled: bool,
+    pub origin: AutoSaveOrigin,
+    pub state: AutoSaveState,
+    pub last_reason: Option<String>,
+    pub last_push_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl AutoSaveEnrollmentRecord {
+    pub fn new(
+        mount_id: MountId,
+        path: impl Into<PathBuf>,
+        origin: AutoSaveOrigin,
+        created_at: impl Into<String>,
+    ) -> Self {
+        let created_at = created_at.into();
+        Self {
+            mount_id,
+            path: path.into(),
+            remote_id: None,
+            enabled: true,
+            origin,
+            state: AutoSaveState::Active,
+            last_reason: None,
+            last_push_id: None,
+            created_at: created_at.clone(),
+            updated_at: created_at,
+        }
+    }
+
+    pub fn disabled(mut self, updated_at: impl Into<String>) -> Self {
+        self.enabled = false;
+        self.state = AutoSaveState::Active;
+        self.last_reason = None;
+        self.updated_at = updated_at.into();
+        self
+    }
+
+    pub fn active(mut self, updated_at: impl Into<String>) -> Self {
+        self.enabled = true;
+        self.state = AutoSaveState::Active;
+        self.last_reason = None;
+        self.updated_at = updated_at.into();
+        self
+    }
+
+    pub fn blocked(mut self, reason: impl Into<String>, updated_at: impl Into<String>) -> Self {
+        self.enabled = true;
+        self.state = AutoSaveState::Blocked;
+        self.last_reason = Some(reason.into());
+        self.updated_at = updated_at.into();
+        self
+    }
+
+    pub fn paused_remote_changed(
+        mut self,
+        reason: impl Into<String>,
+        updated_at: impl Into<String>,
+    ) -> Self {
+        self.enabled = true;
+        self.state = AutoSaveState::PausedRemoteChanged;
+        self.last_reason = Some(reason.into());
+        self.updated_at = updated_at.into();
+        self
+    }
+
+    pub fn paused_failure(
+        mut self,
+        reason: impl Into<String>,
+        updated_at: impl Into<String>,
+    ) -> Self {
+        self.enabled = true;
+        self.state = AutoSaveState::PausedFailure;
+        self.last_reason = Some(reason.into());
+        self.updated_at = updated_at.into();
+        self
+    }
+}
+
 /// Latest known metadata for the Nucleus Remote Tree.
 ///
 /// This is intentionally separate from `EntityRecord::remote_edited_at`, which

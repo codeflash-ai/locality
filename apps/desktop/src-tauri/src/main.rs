@@ -36,12 +36,16 @@ use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
 use afs_store::{
-    ConnectionId, ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
+    AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
+    ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
-    ShadowRepository, SqliteStateStore, VirtualMutationRepository, open_credential_store,
+    ShadowRepository, SqliteStateStore, VirtualMutationKind, VirtualMutationRepository,
+    open_credential_store,
 };
+use afsd::autosave::auto_save_timestamp;
 use afsd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
+use afsd::push::execute_auto_save_push_job_with_content_root;
 use afsd::source::{resolve_source_for_path, source_display_name};
 use afsd::virtual_fs::{
     commit_virtual_fs_write, source_root_directory_name, source_root_identifier,
@@ -130,6 +134,16 @@ struct PendingChange {
     local_path: String,
     summary: String,
     state: String,
+    auto_save: AutoSaveFileStatus,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoSaveFileStatus {
+    enabled: bool,
+    state: String,
+    label: String,
+    reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +238,13 @@ struct DesktopInstallMarker {
 #[serde(rename_all = "camelCase")]
 struct DesktopSettingChange {
     key: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoSaveFileChange {
+    path: String,
     enabled: bool,
 }
 
@@ -734,6 +755,11 @@ fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> ActionRe
 }
 
 #[tauri::command]
+fn set_auto_save_for_file(change: AutoSaveFileChange) -> ActionReport {
+    set_auto_save_for_file_blocking(change).unwrap_or_else(action_error)
+}
+
+#[tauri::command]
 fn quit_completely(app: AppHandle) -> ActionReport {
     app.exit(0);
     ActionReport {
@@ -763,7 +789,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let connection = choose_connection(&connections, mount.as_ref());
     let pending_changes = status
         .as_ref()
-        .map(pending_changes_from_status)
+        .map(|status| pending_changes_from_status(&store, status))
         .unwrap_or_default();
     let daemon_ready = send_request(&state_root, &DaemonRequest::Ping)
         .map(|response| response.ok)
@@ -875,19 +901,75 @@ fn mount_summary(
     }
 }
 
-fn pending_changes_from_status(status: &afs_cli::status::StatusReport) -> Vec<PendingChange> {
+fn pending_changes_from_status<S>(
+    store: &S,
+    status: &afs_cli::status::StatusReport,
+) -> Vec<PendingChange>
+where
+    S: AutoSaveRepository,
+{
     status
         .mounts
         .iter()
-        .flat_map(|mount| mount.entries.iter())
-        .filter(|entry| status_entry_needs_desktop_attention(entry))
-        .map(|entry| PendingChange {
+        .flat_map(|mount| {
+            mount.entries.iter().map(move |entry| {
+                (
+                    MountId::new(mount.mount_id.clone()),
+                    entry,
+                    auto_save_status_for_entry(store, &MountId::new(mount.mount_id.clone()), entry),
+                )
+            })
+        })
+        .filter(|(_, entry, _)| status_entry_needs_desktop_attention(entry))
+        .map(|(_, entry, auto_save)| PendingChange {
             title: entry.title.clone(),
             local_path: entry.path.clone(),
             summary: status_summary_for_entry(entry),
             state: pending_state_for_entry(entry).to_string(),
+            auto_save,
         })
         .collect()
+}
+
+fn auto_save_status_for_entry(
+    store: &impl AutoSaveRepository,
+    mount_id: &MountId,
+    entry: &afs_cli::status::StatusEntry,
+) -> AutoSaveFileStatus {
+    let enrollment = store
+        .get_auto_save_enrollment(mount_id, Path::new(&entry.path))
+        .ok()
+        .flatten();
+    match enrollment {
+        Some(enrollment) if enrollment.enabled => {
+            let (state, label) = match enrollment.state {
+                AutoSaveState::Active => ("active", "Auto-save on"),
+                AutoSaveState::Blocked => ("blocked", "Auto-save blocked"),
+                AutoSaveState::PausedRemoteChanged => {
+                    ("paused_remote_changed", "Paused: remote changed")
+                }
+                AutoSaveState::PausedFailure => ("paused_failure", "Paused: failed"),
+            };
+            AutoSaveFileStatus {
+                enabled: true,
+                state: state.to_string(),
+                label: label.to_string(),
+                reason: enrollment.last_reason,
+            }
+        }
+        Some(enrollment) => AutoSaveFileStatus {
+            enabled: false,
+            state: "off".to_string(),
+            label: "Auto-save off".to_string(),
+            reason: enrollment.last_reason,
+        },
+        None => AutoSaveFileStatus {
+            enabled: false,
+            state: "off".to_string(),
+            label: "Auto-save off".to_string(),
+            reason: None,
+        },
+    }
 }
 
 fn pending_state_for_entry(entry: &afs_cli::status::StatusEntry) -> &'static str {
@@ -3451,6 +3533,15 @@ fn clear_mount_cached_projection(
             .map_err(|error| format!("Could not clear virtual mutation: {error}"))?;
     }
 
+    for enrollment in store
+        .list_auto_save_enrollments(mount_id)
+        .map_err(|error| format!("Could not list auto-save enrollments: {error}"))?
+    {
+        store
+            .delete_auto_save_enrollment(mount_id, &enrollment.path)
+            .map_err(|error| format!("Could not clear auto-save enrollment: {error}"))?;
+    }
+
     for job in store
         .list_hydration_jobs()
         .map_err(|error| format!("Could not list hydration jobs: {error}"))?
@@ -3519,6 +3610,108 @@ fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushRepo
         Some(&state_root),
     )
     .map_err(|error| error.to_string())
+}
+
+fn set_auto_save_for_file_blocking(change: AutoSaveFileChange) -> Result<ActionReport, String> {
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    let target = expand_tilde(&change.path).unwrap_or_else(|_| PathBuf::from(&change.path));
+    let target = absolute_path(&target)?;
+    let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
+    let existing = store
+        .get_auto_save_enrollment(&mount.mount_id, &relative_path)
+        .map_err(|error| error.to_string())?;
+    let remote_id = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(|error| error.to_string())?
+        .map(|entity| entity.remote_id);
+    let now = auto_save_timestamp();
+
+    let mut enrollment = existing.unwrap_or_else(|| {
+        AutoSaveEnrollmentRecord::new(
+            mount.mount_id.clone(),
+            relative_path.clone(),
+            auto_save_origin_for_path(&store, &mount.mount_id, &relative_path),
+            now.clone(),
+        )
+    });
+    enrollment.remote_id = remote_id;
+    enrollment.enabled = change.enabled;
+    enrollment.state = AutoSaveState::Active;
+    enrollment.last_reason = None;
+    enrollment.updated_at = now;
+    store
+        .save_auto_save_enrollment(enrollment)
+        .map_err(|error| error.to_string())?;
+
+    if change.enabled {
+        let _ = auto_save_target_direct(&target);
+    }
+
+    Ok(ActionReport {
+        ok: true,
+        message: if change.enabled {
+            "Auto-save is on for this file.".to_string()
+        } else {
+            "Auto-save is off for this file.".to_string()
+        },
+    })
+}
+
+fn auto_save_origin_for_path(
+    store: &SqliteStateStore,
+    mount_id: &MountId,
+    relative_path: &Path,
+) -> AutoSaveOrigin {
+    if store
+        .find_virtual_mutation_by_path(mount_id, relative_path)
+        .ok()
+        .flatten()
+        .is_some_and(|mutation| mutation.mutation_kind == VirtualMutationKind::Create)
+    {
+        AutoSaveOrigin::AfsCreated
+    } else if store
+        .find_entity_by_path(mount_id, relative_path)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        AutoSaveOrigin::AfsCreated
+    } else {
+        AutoSaveOrigin::UserEnabled
+    }
+}
+
+fn resolve_desktop_mount_path(
+    store: &SqliteStateStore,
+    target: &Path,
+) -> Result<(MountConfig, PathBuf), String> {
+    let mounts = store.load_mounts().map_err(|error| error.to_string())?;
+    daemon_file_provider::find_mount_for_path(&mounts, target)
+        .map(|(mount, matched)| (mount.clone(), matched.relative_path))
+        .ok_or_else(|| format!("Path is not inside an AFS mount: {}", target.display()))
+}
+
+fn auto_save_target_direct(target: &Path) -> Result<PushReport, String> {
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
+        .map_err(|error| error.message())?;
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        afsd::execution::PushJob {
+            target_path: target.to_path_buf(),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &connector,
+        Some(&state_root),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(PushReport::from_daemon(report))
 }
 
 fn pull_target_direct(target: &Path) -> Result<PullReport, String> {
@@ -3823,7 +4016,8 @@ mod tests {
     use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
     use afs_core::shadow::ShadowDocument;
     use afs_store::{
-        ConnectionId, ConnectionRecord, EntityRecord, EntityRepository, MountConfig,
+        AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
+        ConnectionRecord, EntityRecord, EntityRepository, InMemoryStateStore, MountConfig,
         MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
     };
     use tauri::{PhysicalPosition, PhysicalSize};
@@ -4146,7 +4340,8 @@ mod tests {
             ],
         ));
 
-        assert!(pending_changes_from_status(&status).is_empty());
+        let store = InMemoryStateStore::new();
+        assert!(pending_changes_from_status(&store, &status).is_empty());
     }
 
     #[test]
@@ -4161,10 +4356,44 @@ mod tests {
             ],
         ));
 
-        let changes = pending_changes_from_status(&status);
+        let store = InMemoryStateStore::new();
+        let changes = pending_changes_from_status(&store, &status);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].state, "blocked");
         assert!(changes[0].summary.contains("Previous push failed"));
+    }
+
+    #[test]
+    fn pending_changes_include_auto_save_state_for_enrolled_file() {
+        let status = status_report_with_entry(status_entry(
+            afs_cli::status::StatusState::Dirty,
+            afs_cli::status::StatusSyncState::ReviewNeeded,
+            0,
+            vec![],
+        ));
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_auto_save_enrollment(
+                AutoSaveEnrollmentRecord::new(
+                    MountId::new("notion-main"),
+                    "page.md",
+                    AutoSaveOrigin::AfsCreated,
+                    "now",
+                )
+                .blocked("deletions require review", "now"),
+            )
+            .expect("save enrollment");
+
+        let changes = pending_changes_from_status(&store, &status);
+
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].auto_save.enabled);
+        assert_eq!(changes[0].auto_save.state, "blocked");
+        assert_eq!(changes[0].auto_save.label, "Auto-save blocked");
+        assert_eq!(
+            changes[0].auto_save.reason.as_deref(),
+            Some("deletions require review")
+        );
     }
 
     #[test]
@@ -4815,20 +5044,37 @@ fn sample_pending_changes() -> Vec<PendingChange> {
             local_path: "Engineering/Roadmap 2026/page.md".to_string(),
             summary: "2 text edits".to_string(),
             state: "safe".to_string(),
+            auto_save: sample_auto_save_status(false),
         },
         PendingChange {
             title: "Launch Plan".to_string(),
             local_path: "Marketing/Launch Plan/page.md".to_string(),
             summary: "needs review: large deletion".to_string(),
             state: "needs_review".to_string(),
+            auto_save: sample_auto_save_status(false),
         },
         PendingChange {
             title: "Customer Notes".to_string(),
             local_path: "Sales/Customer Notes/page.md".to_string(),
             summary: "1 property edit".to_string(),
             state: "safe".to_string(),
+            auto_save: sample_auto_save_status(true),
         },
     ]
+}
+
+fn sample_auto_save_status(enabled: bool) -> AutoSaveFileStatus {
+    AutoSaveFileStatus {
+        enabled,
+        state: if enabled { "active" } else { "off" }.to_string(),
+        label: if enabled {
+            "Auto-save on"
+        } else {
+            "Auto-save off"
+        }
+        .to_string(),
+        reason: None,
+    }
 }
 
 fn main() {
@@ -4891,6 +5137,7 @@ fn main() {
             inspect_notion_file,
             read_notion_file,
             save_notion_file,
+            set_auto_save_for_file,
             open_path,
             reveal_path,
             show_main_window,

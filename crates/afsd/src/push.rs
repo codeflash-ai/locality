@@ -40,12 +40,17 @@ use afs_notion::media::{
     load_media_manifest, media_manifest_entry, resolve_media_href, sha256_hex,
 };
 use afs_store::{
-    EntityRecord, EntityRepository, FreshnessStateRepository, JournalRepository, MountConfig,
-    MountRepository, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
-    StoreError, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    AutoSaveRepository, EntityRecord, EntityRepository, FreshnessStateRepository,
+    JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
+    RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::autosave::{
+    auto_save_block_reason, mark_auto_save_active, mark_auto_save_blocked,
+    mark_auto_save_paused_failure, mark_auto_save_paused_remote_changed,
+};
 use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
@@ -92,6 +97,139 @@ where
 {
     let validator = LocalSourceValidator;
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
+    execute_prepared_push(store, source, prepared, state_root)
+}
+
+pub fn execute_auto_save_push_job_with_content_root<S, Source>(
+    store: &mut S,
+    mut job: PushJob,
+    source: &Source,
+    state_root: Option<&Path>,
+) -> AfsResult<PushJobReport>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + VirtualMutationRepository
+        + AutoSaveRepository,
+    Source: Connector + HydrationSource + ?Sized,
+{
+    job.assume_yes = true;
+    job.confirm_dangerous = false;
+
+    let validator = LocalSourceValidator;
+    let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
+    let relative_path = auto_save_relative_path(&prepared);
+
+    if let Some(reason) = auto_save_block_reason(&prepared.pipeline) {
+        mark_auto_save_blocked(
+            store,
+            &prepared.mount.mount_id,
+            &relative_path,
+            reason.clone(),
+        )?;
+        return Ok(PushJobReport {
+            target_path: prepared.absolute_path,
+            mount_id: prepared.mount.mount_id,
+            entity_id: prepared.entity.remote_id,
+            pipeline: prepared.pipeline,
+            action: PushJobAction::NotReady,
+            execution: None,
+            push_id: None,
+            journal_status: None,
+            error: Some(PushJobError {
+                code: "auto_save_blocked".to_string(),
+                message: reason,
+            }),
+        });
+    }
+
+    let report = execute_prepared_push(store, source, prepared, state_root)?;
+    match report.action {
+        PushJobAction::Reconciled => {
+            let created_remote_id = created_entity_id(&report).or_else(|| {
+                report
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| execution.changed_remote_ids.first().cloned())
+            });
+            let remote_id = created_remote_id.or_else(|| Some(report.entity_id.clone()));
+            mark_auto_save_active(
+                store,
+                &report.mount_id,
+                &relative_path,
+                remote_id,
+                report.push_id.as_ref(),
+            )?;
+        }
+        PushJobAction::NotReady if report.pipeline.action == PushPipelineAction::Noop => {
+            mark_auto_save_active(
+                store,
+                &report.mount_id,
+                &relative_path,
+                Some(report.entity_id.clone()),
+                report.push_id.as_ref(),
+            )?;
+        }
+        PushJobAction::NotReady => {
+            mark_auto_save_blocked(
+                store,
+                &report.mount_id,
+                &relative_path,
+                "push plan needs review before auto-save",
+            )?;
+        }
+        PushJobAction::Failed => {
+            let reason = report
+                .error
+                .as_ref()
+                .map(|error| error.message.clone())
+                .unwrap_or_else(|| "auto-save push failed".to_string());
+            if auto_save_failed_due_remote_change(&report) {
+                mark_auto_save_paused_remote_changed(
+                    store,
+                    &report.mount_id,
+                    &relative_path,
+                    reason,
+                )?;
+            } else {
+                mark_auto_save_paused_failure(store, &report.mount_id, &relative_path, reason)?;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn auto_save_failed_due_remote_change(report: &PushJobReport) -> bool {
+    report.error.as_ref().is_some_and(|error| {
+        error.code == "guardrail"
+            && (error.message.contains("changed since")
+                || error.message.contains("pull before pushing"))
+    })
+}
+
+fn execute_prepared_push<S, Source>(
+    store: &mut S,
+    source: &Source,
+    prepared: PreparedPush,
+    state_root: Option<&Path>,
+) -> AfsResult<PushJobReport>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + VirtualMutationRepository,
+    Source: Connector + HydrationSource + ?Sized,
+{
     let push_id = generate_push_id();
     let remote_preconditions = remote_preconditions_for_plan(
         store,
@@ -160,6 +298,34 @@ where
             error: Some(PushJobError::from(error)),
         }),
     }
+}
+
+fn auto_save_relative_path(prepared: &PreparedPush) -> PathBuf {
+    prepared
+        .pipeline
+        .plan
+        .as_ref()
+        .and_then(|plan| {
+            plan.operations
+                .iter()
+                .find_map(|operation| match operation {
+                    PushOperation::CreateEntity { source_path, .. } => Some(source_path.clone()),
+                    _ => None,
+                })
+        })
+        .unwrap_or_else(|| prepared.entity.path.clone())
+}
+
+fn created_entity_id(report: &PushJobReport) -> Option<RemoteId> {
+    report
+        .execution
+        .as_ref()?
+        .apply_effects
+        .iter()
+        .find_map(|effect| match effect {
+            JournalApplyEffect::CreatedEntity { entity_id, .. } => Some(entity_id.clone()),
+            _ => None,
+        })
 }
 
 fn preflight_push<Source>(source: &Source, mut prepared: PreparedPush) -> PreparedPush

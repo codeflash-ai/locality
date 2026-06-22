@@ -69,6 +69,12 @@ type PendingChange = {
   localPath: string;
   summary: string;
   state: "safe" | "needs_review" | "conflict" | "blocked";
+  autoSave: {
+    enabled: boolean;
+    state: "off" | "active" | "blocked" | "paused_remote_changed" | "paused_failure";
+    label: string;
+    reason?: string | null;
+  };
 };
 
 type ActivityItem = {
@@ -177,18 +183,21 @@ const sampleSnapshot: DesktopSnapshot = {
       localPath: "Engineering/Roadmap 2026/page.md",
       summary: "2 text edits",
       state: "safe",
+      autoSave: { enabled: false, state: "off", label: "Auto-save off" },
     },
     {
       title: "Launch Plan",
       localPath: "Marketing/Launch Plan/page.md",
       summary: "needs review: large deletion",
       state: "needs_review",
+      autoSave: { enabled: false, state: "off", label: "Auto-save off" },
     },
     {
       title: "Customer Notes",
       localPath: "Sales/Customer Notes/page.md",
       summary: "1 property edit",
       state: "safe",
+      autoSave: { enabled: true, state: "active", label: "Auto-save on" },
     },
   ],
   activity: [
@@ -2493,6 +2502,33 @@ function FileChangeList({
     }
   }
 
+  async function toggleAutoSave(change: PendingChange, enabled: boolean) {
+    const path = joinMountPath(mountPath, change.localPath);
+    setActions((current) => ({
+      ...current,
+      [change.localPath]: { state: "working", message: enabled ? "Turning on auto-save..." : "Turning off auto-save..." },
+    }));
+
+    try {
+      const report = await callCommand<ActionReport>("set_auto_save_for_file", {
+        change: { path, enabled },
+      });
+      setActions((current) => ({
+        ...current,
+        [change.localPath]: {
+          state: report.ok ? "success" : "error",
+          message: report.message,
+        },
+      }));
+      await onRefresh?.().catch(() => undefined);
+    } catch (error) {
+      setActions((current) => ({
+        ...current,
+        [change.localPath]: { state: "error", message: errorMessage(error) },
+      }));
+    }
+  }
+
   return (
     <section className="file-list">
       {changes.map((change) => {
@@ -2549,6 +2585,18 @@ function FileChangeList({
               )}
             </div>
             <div className="file-row-actions">
+              <div className={`auto-save-control ${change.autoSave.state}`}>
+                <span title={change.autoSave.reason || change.autoSave.label}>{change.autoSave.label}</span>
+                <button
+                  className={`toggle ${change.autoSave.enabled ? "enabled" : ""}`}
+                  type="button"
+                  disabled={isWorking}
+                  aria-label={`${change.autoSave.enabled ? "Turn off" : "Turn on"} auto-save for ${change.title}`}
+                  onClick={() => void toggleAutoSave(change, !change.autoSave.enabled)}
+                >
+                  <i />
+                </button>
+              </div>
               <SecondaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "diff")}>
                 Diff
               </SecondaryButton>

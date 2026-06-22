@@ -20,10 +20,10 @@ use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::pull::PullMode;
 use afs_store::{
-    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    HydrationJobRecord, HydrationJobRepository, MountConfig, MountRepository,
-    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-    open_credential_store,
+    AutoSaveRepository, AutoSaveState, EntityRecord, EntityRepository, FreshnessStateRecord,
+    FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
+    MountRepository, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
+    SqliteStateStore, open_credential_store,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -31,6 +31,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::DaemonConfig;
+use crate::autosave::{auto_save_target_for_write, pause_auto_save_for_remote_change};
 use crate::execution::{DaemonEventReport, PushJob};
 use crate::freshness::{
     FreshnessQueue, freshness_timestamp, record_file_opened, record_local_change,
@@ -38,7 +39,9 @@ use crate::freshness::{
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationQueue};
 use crate::ipc::{DaemonActiveJobStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use crate::pull::run_pull_with_state_root;
-use crate::push::execute_push_job_with_content_root;
+use crate::push::{
+    execute_auto_save_push_job_with_content_root, execute_push_job_with_content_root,
+};
 use crate::reconcile::{
     DefaultFetchScheduleStrategy, ScheduledPullReport, reconcile_scheduled_pull_with_state_root,
 };
@@ -173,6 +176,10 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
     fn run_pull(&self, state_root: PathBuf, path: PathBuf) -> DaemonResponse;
 
     fn run_push(&self, state_root: PathBuf, job: PushJob) -> DaemonResponse;
+
+    fn run_auto_push(&self, state_root: PathBuf, job: PushJob) -> DaemonResponse {
+        self.run_push(state_root, job)
+    }
 
     fn run_scheduled_pull(
         &self,
@@ -364,6 +371,7 @@ pub struct FileEventRuntimeReport {
     pub report: DaemonEventReport,
     pub queued_hydrations: Vec<HydrationRequest>,
     pub freshness_jobs: Vec<SyncJob>,
+    pub auto_push_targets: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,6 +441,31 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             };
 
         match execute_push_job_with_content_root(&mut store, job, &connector, Some(&state_root)) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+
+    fn run_auto_push(&self, state_root: PathBuf, job: PushJob) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                return DaemonResponse::error("store_open_failed", error.to_string());
+            }
+        };
+        let credentials = open_credential_store(&state_root);
+        let connector =
+            match resolve_source_for_path(&store, credentials.as_ref(), &job.target_path) {
+                Ok(connector) => connector,
+                Err(error) => return DaemonResponse::error(error.code(), error.message()),
+            };
+
+        match execute_auto_save_push_job_with_content_root(
+            &mut store,
+            job,
+            &connector,
+            Some(&state_root),
+        ) {
             Ok(report) => DaemonResponse::ok(report),
             Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
         }
@@ -1369,14 +1402,28 @@ impl RuntimeState {
             } => {
                 let _ = respond_to.send(response);
             }
+            JobCompletion::AutoPush { response } => {
+                if !response.ok {
+                    let message = response
+                        .error
+                        .as_ref()
+                        .map(|error| error.message.as_str())
+                        .unwrap_or("unknown error");
+                    eprintln!("afsd auto-save push failed: {message}");
+                }
+            }
             JobCompletion::Response {
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets,
             } => {
                 let _ = respond_to.send(response);
                 for job in freshness_jobs {
                     self.queue_freshness(job);
+                }
+                for target in auto_push_targets {
+                    self.queue_auto_push(target);
                 }
             }
             JobCompletion::VirtualFsRefreshChildren {
@@ -1449,6 +1496,9 @@ impl RuntimeState {
                     }
                     for job in result.freshness_jobs {
                         self.queue_freshness(job);
+                    }
+                    for target in result.auto_push_targets {
+                        self.queue_auto_push(target);
                     }
                 }
                 Err(error) => eprintln!("afsd file event failed: {error}"),
@@ -1634,6 +1684,13 @@ impl RuntimeState {
 
     fn queue_freshness(&mut self, job: SyncJob) {
         self.freshness.upsert(job);
+    }
+
+    fn queue_auto_push(&mut self, target_path: PathBuf) {
+        self.pending_requests.push_back(MutatingRequest::AutoPush {
+            job: auto_push_job(target_path),
+        });
+        self.maybe_start_next_job();
     }
 
     fn auto_fast_forward_queue_decision(
@@ -1916,7 +1973,11 @@ fn auto_fast_forward_queue_decision<S>(
     request: &HydrationRequest,
 ) -> afs_core::AfsResult<AutoFastForwardQueueDecision>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository,
 {
     let Some(entity) = store
         .get_entity(&request.mount_id, &request.remote_id)
@@ -2009,6 +2070,9 @@ fn run_job(
             response: runner.run_push(state_root, job),
             respond_to,
         },
+        MutatingJob::Request(MutatingRequest::AutoPush { job }) => JobCompletion::AutoPush {
+            response: runner.run_auto_push(state_root, job),
+        },
         MutatingJob::Request(MutatingRequest::FileEvent { event }) => {
             JobCompletion::FileEvent(runner.run_file_event(state_root, event))
         }
@@ -2023,6 +2087,7 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::Request(MutatingRequest::FileProviderRead {
@@ -2036,6 +2101,7 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::Request(MutatingRequest::FileProviderChildren {
@@ -2059,16 +2125,18 @@ fn run_job(
             respond_to,
         }) => {
             let response = runner.run_virtual_fs_commit_write(
-                state_root,
+                state_root.clone(),
                 mount_id,
                 identifier,
                 contents_base64,
             );
             let freshness_jobs = response_local_edit_observe_jobs(&response);
+            let auto_push_targets = response_auto_push_targets(&state_root, &response);
             JobCompletion::Response {
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets,
             }
         }
         MutatingJob::Request(MutatingRequest::VirtualFsCreateFile {
@@ -2088,6 +2156,7 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::Request(MutatingRequest::VirtualFsCreateDirectory {
@@ -2107,6 +2176,7 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::Request(MutatingRequest::VirtualFsRename {
@@ -2128,6 +2198,7 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::Request(MutatingRequest::VirtualFsTrash {
@@ -2141,6 +2212,7 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::ScheduledPull { tick } => {
@@ -2168,6 +2240,64 @@ fn response_local_edit_observe_jobs(response: &DaemonResponse) -> Vec<SyncJob> {
     }
 
     response_observe_jobs(response, ChangeHintKind::LocalEdited)
+}
+
+fn response_auto_push_targets(state_root: &Path, response: &DaemonResponse) -> Vec<PathBuf> {
+    if !response.ok {
+        return Vec::new();
+    }
+
+    let Some(payload) = response.payload.as_ref() else {
+        return Vec::new();
+    };
+    if payload
+        .get("hydration")
+        .and_then(Value::as_str)
+        .is_some_and(|hydration| hydration != "dirty")
+    {
+        return Vec::new();
+    }
+
+    let Some(mount_id) = payload.get("mount_id").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(remote_id) = payload.get("remote_id").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    if !observable_remote_identifier(remote_id) {
+        return Vec::new();
+    }
+
+    let Ok(store) = SqliteStateStore::open(state_root.to_path_buf()) else {
+        return Vec::new();
+    };
+    let mount_id = MountId::new(mount_id);
+    let remote_id = RemoteId::new(remote_id);
+    let Ok(Some(enrollment)) = store.find_auto_save_enrollment_by_remote_id(&mount_id, &remote_id)
+    else {
+        return Vec::new();
+    };
+    if !enrollment.enabled
+        || matches!(
+            enrollment.state,
+            AutoSaveState::PausedRemoteChanged | AutoSaveState::PausedFailure
+        )
+    {
+        return Vec::new();
+    }
+    let Ok(Some(mount)) = store.get_mount(&mount_id) else {
+        return Vec::new();
+    };
+
+    vec![mount.root.join(enrollment.path)]
+}
+
+fn auto_push_job(target_path: PathBuf) -> PushJob {
+    PushJob {
+        target_path,
+        assume_yes: true,
+        confirm_dangerous: false,
+    }
 }
 
 fn response_observe_jobs(response: &DaemonResponse, reason: ChangeHintKind) -> Vec<SyncJob> {
@@ -2233,6 +2363,9 @@ enum MutatingRequest {
     Push {
         job: PushJob,
         respond_to: Sender<DaemonResponse>,
+    },
+    AutoPush {
+        job: PushJob,
     },
     FileEvent {
         event: FileEvent,
@@ -2319,6 +2452,10 @@ impl MutatingRequest {
                 "push".to_string(),
                 Some(job.target_path.display().to_string()),
             ),
+            Self::AutoPush { job } => (
+                "auto_push".to_string(),
+                Some(job.target_path.display().to_string()),
+            ),
             Self::FileEvent { event } => (
                 "file_event".to_string(),
                 Some(event.path.display().to_string()),
@@ -2403,10 +2540,14 @@ enum JobCompletion {
         response: DaemonResponse,
         respond_to: Sender<DaemonResponse>,
     },
+    AutoPush {
+        response: DaemonResponse,
+    },
     Response {
         response: DaemonResponse,
         respond_to: Sender<DaemonResponse>,
         freshness_jobs: Vec<SyncJob>,
+        auto_push_targets: Vec<PathBuf>,
     },
     VirtualFsRefreshChildren {
         mount_id: String,
@@ -2435,7 +2576,11 @@ fn execute_file_event<S>(
     event: FileEvent,
 ) -> afs_core::AfsResult<FileEventRuntimeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository,
 {
     let mut runtime_report = FileEventRuntimeReport::default();
     let Some((mount, entity)) = resolve_event_entity(store, &event.path)? else {
@@ -2498,7 +2643,7 @@ fn handle_write_event<S>(
     runtime_report: &mut FileEventRuntimeReport,
 ) -> afs_core::AfsResult<()>
 where
-    S: EntityRepository + ShadowRepository + FreshnessStateRepository,
+    S: EntityRepository + ShadowRepository + FreshnessStateRepository + AutoSaveRepository,
 {
     if entity.hydration != HydrationState::Hydrated {
         if matches!(
@@ -2509,6 +2654,12 @@ where
             runtime_report
                 .freshness_jobs
                 .push(observe_entity_job(&entity, ChangeHintKind::LocalEdited));
+            if entity.hydration == HydrationState::Dirty
+                && let Some(target) =
+                    auto_save_target_for_write(store, &mount, &entity, &event_path)?
+            {
+                runtime_report.auto_push_targets.push(target);
+            }
         } else {
             runtime_report.report.ignored_events = 1;
         }
@@ -2526,6 +2677,9 @@ where
     runtime_report
         .freshness_jobs
         .push(observe_entity_job(&entity, ChangeHintKind::LocalEdited));
+    if let Some(target) = auto_save_target_for_write(store, &mount, &entity, &event_path)? {
+        runtime_report.auto_push_targets.push(target);
+    }
     runtime_report.report.marked_dirty = 1;
     Ok(())
 }
@@ -2545,7 +2699,10 @@ fn execute_freshness_job<S, C>(
     job: SyncJob,
 ) -> afs_core::AfsResult<FreshnessRuntimeReport>
 where
-    S: EntityRepository + RemoteObservationRepository + FreshnessStateRepository,
+    S: EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository,
     C: Connector,
 {
     if job.kind != SyncJobKind::ObserveEntity {
@@ -2562,7 +2719,10 @@ fn execute_observe_entity_job<S, C>(
     job: SyncJob,
 ) -> afs_core::AfsResult<FreshnessRuntimeReport>
 where
-    S: EntityRepository + RemoteObservationRepository + FreshnessStateRepository,
+    S: EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository,
     C: Connector,
 {
     let Some(remote_id) = job.remote_id.clone() else {
@@ -2580,6 +2740,9 @@ where
         .map_err(AfsError::from)?;
     let remote_hint_pending = observed_remote_version_changed(existing.as_ref(), &observation);
     let observed_at = freshness_timestamp();
+    if remote_hint_pending {
+        pause_auto_save_for_remote_change(store, &job.mount_id, &remote_id)?;
+    }
 
     store
         .save_remote_observation(remote_observation_record(&observation, &observed_at))
@@ -2784,7 +2947,21 @@ fn afs_error_code(error: &AfsError) -> &'static str {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{ActiveChildRefresh, ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest};
+    use afs_core::canonical::render_canonical_markdown;
+    use afs_core::freshness::{RemoteObservation, RemoteVersion};
+    use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+    use afs_core::shadow::ShadowDocument;
+    use afs_store::{
+        AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, EntityRecord,
+        EntityRepository, InMemoryStateStore, MountConfig, MountRepository, ShadowRepository,
+    };
+
+    use crate::watcher::{FileEvent, FileEventKind};
+
+    use super::{
+        ActiveChildRefresh, ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest,
+        execute_file_event, execute_observe_entity_job,
+    };
 
     #[test]
     fn child_refresh_queue_promotes_existing_requests() {
@@ -2862,6 +3039,62 @@ mod tests {
         assert_eq!(deeper.container_identifier, "children:page-a1");
     }
 
+    #[test]
+    fn write_event_queues_auto_push_for_enrolled_dirty_file() {
+        let fixture = RuntimeAutoSaveFixture::new();
+        let mut store = fixture.store();
+        fixture.write_page("Updated body.");
+
+        let report = execute_file_event(
+            &mut store,
+            FileEvent {
+                path: fixture.page_path.clone(),
+                kind: FileEventKind::Write,
+            },
+        )
+        .expect("file event");
+
+        assert_eq!(report.report.marked_dirty, 1);
+        assert_eq!(report.auto_push_targets, vec![fixture.page_path.clone()]);
+    }
+
+    #[test]
+    fn remote_observation_pauses_auto_save_for_external_drift() {
+        let fixture = RuntimeAutoSaveFixture::new();
+        let mut store = fixture.store();
+        let connector = ObservingConnector {
+            observation: RemoteObservation {
+                mount_id: fixture.mount_id.clone(),
+                remote_id: fixture.remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Roadmap".to_string(),
+                parent_remote_id: None,
+                projected_path: "Roadmap.md".into(),
+                remote_version: Some(RemoteVersion::new("remote-v2")),
+                deleted: false,
+                raw_metadata_json: "{}".to_string(),
+            },
+        };
+
+        execute_observe_entity_job(
+            &mut store,
+            &connector,
+            afs_core::freshness::SyncJob::new(
+                fixture.mount_id.clone(),
+                Some(fixture.remote_id.clone()),
+                afs_core::freshness::SyncJobKind::ObserveEntity,
+                afs_core::freshness::ChangeHintKind::RemoteMaybeChanged,
+            ),
+        )
+        .expect("observe");
+
+        let enrollment = store
+            .get_auto_save_enrollment(&fixture.mount_id, "Roadmap.md".as_ref())
+            .expect("get enrollment")
+            .expect("enrollment");
+        assert_eq!(enrollment.state, AutoSaveState::PausedRemoteChanged);
+    }
+
     fn request(
         mount_id: &str,
         container_identifier: &str,
@@ -2873,6 +3106,168 @@ mod tests {
             container_identifier: container_identifier.to_string(),
             priority,
             depth,
+        }
+    }
+
+    struct RuntimeAutoSaveFixture {
+        root: std::path::PathBuf,
+        page_path: std::path::PathBuf,
+        mount_id: MountId,
+        remote_id: RemoteId,
+    }
+
+    impl RuntimeAutoSaveFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "afs-runtime-autosave-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).expect("root");
+            let page_path = root.join("Roadmap.md");
+            let fixture = Self {
+                root,
+                page_path,
+                mount_id: MountId::new("notion-main"),
+                remote_id: RemoteId::new("page-1"),
+            };
+            fixture.write_page("Original body.");
+            fixture
+        }
+
+        fn store(&self) -> InMemoryStateStore {
+            let mut store = InMemoryStateStore::new();
+            store
+                .save_mount(MountConfig::new(
+                    self.mount_id.clone(),
+                    "notion",
+                    self.root.clone(),
+                ))
+                .expect("mount");
+            store
+                .save_entity(
+                    EntityRecord::new(
+                        self.mount_id.clone(),
+                        self.remote_id.clone(),
+                        EntityKind::Page,
+                        "Roadmap",
+                        "Roadmap.md",
+                    )
+                    .with_hydration(HydrationState::Hydrated)
+                    .with_remote_edited_at("remote-v1"),
+                )
+                .expect("entity");
+            store
+                .save_shadow(&self.mount_id, shadow("Original body."))
+                .expect("shadow");
+            let mut enrollment = AutoSaveEnrollmentRecord::new(
+                self.mount_id.clone(),
+                "Roadmap.md",
+                AutoSaveOrigin::AfsCreated,
+                "1",
+            );
+            enrollment.remote_id = Some(self.remote_id.clone());
+            store
+                .save_auto_save_enrollment(enrollment)
+                .expect("enrollment");
+            store
+        }
+
+        fn write_page(&self, body: &str) {
+            let document = CanonicalDocument::new(
+                "afs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: remote-v1\ntitle: Roadmap\n",
+                format!("# Roadmap\n\n{body}\n"),
+            );
+            std::fs::write(&self.page_path, render_canonical_markdown(&document))
+                .expect("write page");
+        }
+    }
+
+    impl Drop for RuntimeAutoSaveFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn shadow(body: &str) -> ShadowDocument {
+        ShadowDocument::from_synced_body(
+            RemoteId::new("page-1"),
+            format!("# Roadmap\n\n{body}\n"),
+            7,
+            [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+        )
+        .expect("shadow")
+    }
+
+    struct ObservingConnector {
+        observation: RemoteObservation,
+    }
+
+    impl afs_connector::Connector for ObservingConnector {
+        fn kind(&self) -> afs_connector::ConnectorKind {
+            afs_connector::ConnectorKind("observing")
+        }
+
+        fn capabilities(&self) -> afs_connector::ConnectorCapabilities {
+            afs_connector::ConnectorCapabilities::default()
+        }
+
+        fn observe(
+            &self,
+            _request: afs_connector::ObserveRequest,
+        ) -> afs_core::AfsResult<RemoteObservation> {
+            Ok(self.observation.clone())
+        }
+
+        fn enumerate(
+            &self,
+            _request: afs_connector::EnumerateRequest,
+        ) -> afs_core::AfsResult<Vec<afs_core::model::TreeEntry>> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn fetch(
+            &self,
+            _request: afs_connector::FetchRequest,
+        ) -> afs_core::AfsResult<afs_connector::NativeEntity> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn render(
+            &self,
+            _entity: &afs_connector::NativeEntity,
+        ) -> afs_core::AfsResult<CanonicalDocument> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn parse(
+            &self,
+            _document: &CanonicalDocument,
+        ) -> afs_core::AfsResult<afs_connector::ParsedEntity> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn check_concurrency(
+            &self,
+            _request: afs_connector::ApplyPlanRequest<'_>,
+        ) -> afs_core::AfsResult<()> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn apply(
+            &self,
+            _request: afs_connector::ApplyPlanRequest<'_>,
+        ) -> afs_core::AfsResult<afs_connector::ApplyPlanResult> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn apply_undo(
+            &self,
+            _request: afs_connector::ApplyUndoRequest<'_>,
+        ) -> afs_core::AfsResult<afs_connector::ApplyUndoResult> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
         }
     }
 }

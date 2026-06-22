@@ -13,14 +13,14 @@ use afs_core::shadow::ShadowDocument;
 
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
-    ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
-    FreshnessStateRecord, HydrationJobRecord, MountConfig, RemoteObservationRecord,
-    ShadowSnapshotRecord, VirtualMutationRecord,
+    AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
+    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord, MountConfig,
+    RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
 use crate::repository::{
-    ConnectionRepository, ConnectorProfileRepository, EntityRepository, EntitySearchRepository,
-    FreshnessStateRepository, HydrationJobRepository, JournalRepository, MountRepository,
-    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
+    AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
+    EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository, JournalRepository,
+    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -28,6 +28,7 @@ type PathKey = (MountId, PathBuf);
 type ShadowKey = (MountId, RemoteId);
 type HydrationJobKey = (MountId, RemoteId);
 type VirtualMutationKey = (MountId, String);
+type AutoSaveKey = (MountId, PathBuf);
 type RemoteObservationKey = (MountId, RemoteId);
 type FreshnessStateKey = (MountId, RemoteId);
 
@@ -41,6 +42,7 @@ pub struct InMemoryStateStore {
     shadows: BTreeMap<ShadowKey, ShadowSnapshotRecord>,
     hydration_jobs: BTreeMap<HydrationJobKey, HydrationJobRecord>,
     virtual_mutations: BTreeMap<VirtualMutationKey, VirtualMutationRecord>,
+    auto_save_enrollments: BTreeMap<AutoSaveKey, AutoSaveEnrollmentRecord>,
     remote_observations: BTreeMap<RemoteObservationKey, RemoteObservationRecord>,
     freshness_states: BTreeMap<FreshnessStateKey, FreshnessStateRecord>,
     journals: BTreeMap<String, JournalEntry>,
@@ -71,6 +73,10 @@ impl InMemoryStateStore {
         (mount_id.clone(), local_id.to_string())
     }
 
+    fn auto_save_key(mount_id: &MountId, path: &Path) -> AutoSaveKey {
+        (mount_id.clone(), path.to_path_buf())
+    }
+
     fn remote_observation_key(mount_id: &MountId, remote_id: &RemoteId) -> RemoteObservationKey {
         (mount_id.clone(), remote_id.clone())
     }
@@ -89,6 +95,8 @@ impl InMemoryStateStore {
         self.hydration_jobs
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
         self.virtual_mutations
+            .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.auto_save_enrollments
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
         self.remote_observations
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
@@ -341,6 +349,64 @@ impl VirtualMutationRepository for InMemoryStateStore {
     fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()> {
         self.virtual_mutations
             .remove(&Self::virtual_mutation_key(mount_id, local_id));
+        Ok(())
+    }
+}
+
+impl AutoSaveRepository for InMemoryStateStore {
+    fn save_auto_save_enrollment(
+        &mut self,
+        enrollment: AutoSaveEnrollmentRecord,
+    ) -> StoreResult<()> {
+        self.auto_save_enrollments.insert(
+            Self::auto_save_key(&enrollment.mount_id, &enrollment.path),
+            enrollment,
+        );
+        Ok(())
+    }
+
+    fn get_auto_save_enrollment(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> StoreResult<Option<AutoSaveEnrollmentRecord>> {
+        Ok(self
+            .auto_save_enrollments
+            .get(&Self::auto_save_key(mount_id, path))
+            .cloned())
+    }
+
+    fn find_auto_save_enrollment_by_remote_id(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<Option<AutoSaveEnrollmentRecord>> {
+        Ok(self
+            .auto_save_enrollments
+            .values()
+            .find(|enrollment| {
+                enrollment.mount_id == *mount_id && enrollment.remote_id.as_ref() == Some(remote_id)
+            })
+            .cloned())
+    }
+
+    fn list_auto_save_enrollments(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<AutoSaveEnrollmentRecord>> {
+        let mut enrollments = self
+            .auto_save_enrollments
+            .values()
+            .filter(|enrollment| enrollment.mount_id == *mount_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        enrollments.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(enrollments)
+    }
+
+    fn delete_auto_save_enrollment(&mut self, mount_id: &MountId, path: &Path) -> StoreResult<()> {
+        self.auto_save_enrollments
+            .remove(&Self::auto_save_key(mount_id, path));
         Ok(())
     }
 }

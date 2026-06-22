@@ -1223,7 +1223,7 @@ p {
 
 .file-row {
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) 184px;
+  grid-template-columns: 32px minmax(0, 1fr) 224px;
   align-items: center;
   gap: 16px;
   padding: 16px;
@@ -1296,7 +1296,25 @@ p {
   display: grid;
   grid-template-columns: repeat(2, minmax(76px, 1fr));
   gap: 8px;
-  min-width: 184px;
+  min-width: 224px;
+}
+
+.auto-save-control {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 28px;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.auto-save-control.blocked,
+.auto-save-control.paused_remote_changed,
+.auto-save-control.paused_failure {
+  color: var(--amber);
 }
 
 .file-row-actions .primary-button,

@@ -13,9 +13,9 @@ use afs_core::pull::PullMode;
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    HydrationJobRecord, HydrationJobRepository, MountConfig, MountRepository, ProjectionMode,
-    ShadowRepository, SqliteStateStore,
+    AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, EntityRecord, EntityRepository,
+    FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
+    MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
 };
 use afsd::DaemonConfig;
 use afsd::execution::{DaemonEventReport, PushJob};
@@ -907,6 +907,51 @@ fn runtime_drains_freshness_queued_by_virtual_write() {
     assert_eq!(job.remote_id, Some(RemoteId::new("page-1")));
     assert_eq!(job.kind, SyncJobKind::ObserveEntity);
     assert_eq!(job.reason, ChangeHintKind::LocalEdited);
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_queues_auto_push_for_enrolled_virtual_write() {
+    let config = relay_config("virtual-write-auto-push");
+    let mount_root = temp_root("virtual-write-auto-push-root");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(MountId::new("notion-main"), "notion", mount_root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    let mut enrollment = AutoSaveEnrollmentRecord::new(
+        MountId::new("notion-main"),
+        "Roadmap.md",
+        AutoSaveOrigin::AfsCreated,
+        "now",
+    );
+    enrollment.remote_id = Some(RemoteId::new("page-1"));
+    store
+        .save_auto_save_enrollment(enrollment)
+        .expect("save enrollment");
+    drop(store);
+
+    let (push_tx, push_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(config, VirtualWriteAutoPushRunner { push_tx })
+        .expect("spawn runtime");
+
+    let response = runtime
+        .handle()
+        .request(DaemonRequest::VirtualFsCommitWrite {
+            mount_id: "notion-main".to_string(),
+            identifier: "page-1".to_string(),
+            contents_base64: "ZWRpdGVk".to_string(),
+        });
+
+    assert!(response.ok);
+    let job = push_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("auto-push job");
+    assert_eq!(job.target_path, mount_root.join("Roadmap.md"));
+    assert!(job.assume_yes);
+    assert!(!job.confirm_dangerous);
     runtime.shutdown();
 }
 
@@ -1823,6 +1868,10 @@ struct FreshnessFromEventRunner {
     freshness_tx: mpsc::Sender<SyncJob>,
 }
 
+struct VirtualWriteAutoPushRunner {
+    push_tx: mpsc::Sender<PushJob>,
+}
+
 struct AutoFastForwardRunner {
     hydrated: mpsc::Sender<HydrationRequest>,
 }
@@ -2165,6 +2214,72 @@ impl RuntimeJobRunner for FreshnessFromEventRunner {
         self.freshness_tx
             .send(job.clone())
             .expect("notify freshness");
+        Ok(FreshnessRuntimeReport {
+            job,
+            remote_hint_pending: false,
+            queued_hydrations: Vec::new(),
+            follow_up_jobs: Vec::new(),
+        })
+    }
+}
+
+impl RuntimeJobRunner for VirtualWriteAutoPushRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_auto_push(&self, _state_root: PathBuf, job: PushJob) -> DaemonResponse {
+        self.push_tx.send(job).expect("send auto-push job");
+        DaemonResponse::ok(json!({ "command": "auto_push" }))
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        Err(AfsError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_virtual_fs_commit_write(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        identifier: String,
+        _contents_base64: String,
+    ) -> DaemonResponse {
+        DaemonResponse::ok(json!({
+            "mount_id": mount_id,
+            "identifier": identifier,
+            "remote_id": "page-1",
+            "path": "Roadmap.md",
+            "bytes_written": 6,
+            "hydration": "dirty"
+        }))
+    }
+
+    fn run_freshness_job(
+        &self,
+        _state_root: PathBuf,
+        job: SyncJob,
+    ) -> afs_core::AfsResult<FreshnessRuntimeReport> {
         Ok(FreshnessRuntimeReport {
             job,
             remote_hint_pending: false,

@@ -1,3 +1,4 @@
+pub mod autosave;
 pub mod execution;
 pub mod file_provider;
 pub mod freshness;

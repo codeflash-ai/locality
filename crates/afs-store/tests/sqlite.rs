@@ -13,13 +13,14 @@ use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use afs_core::undo::{UndoOperation, UndoPlanStatus, plan_journal_undo};
 use afs_store::{
-    ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
-    ConnectorProfileRecord, ConnectorProfileRepository, EntityRecord, EntityRepository,
-    EntitySearchRepository, FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord,
-    HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
-    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-    StateCompatibilityIssue, StateCompatibilityStatus, StoreError, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository,
+    AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
+    ConnectionRecord, ConnectionRepository, ConnectorProfileId, ConnectorProfileRecord,
+    ConnectorProfileRepository, EntityRecord, EntityRepository, EntitySearchRepository,
+    FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
+    JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
+    RemoteObservationRepository, ShadowRepository, SqliteStateStore, StateCompatibilityIssue,
+    StateCompatibilityStatus, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository,
 };
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -42,7 +43,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 13);
+    assert_eq!(user_version, 14);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -81,7 +82,15 @@ fn sqlite_store_seeds_state_compatibility_components() {
                 1,
                 0
             ),
-            ("core:schema".to_string(), "schema".to_string(), 13, 1, 1, 0),
+            ("core:schema".to_string(), "schema".to_string(), 14, 1, 1, 0),
+            (
+                "durable:auto_save".to_string(),
+                "durable_json".to_string(),
+                1,
+                1,
+                1,
+                0
+            ),
             (
                 "durable:journals".to_string(),
                 "durable_json".to_string(),
@@ -132,15 +141,16 @@ fn sqlite_store_seeds_state_compatibility_components() {
 }
 
 #[test]
-fn sqlite_schema_snapshot_matches_v13_contract() {
+fn sqlite_schema_snapshot_matches_v14_contract() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
     let connection = Connection::open(&store.db_path).expect("raw connection");
 
-    assert_eq!(SqliteStateStore::current_schema_version(), 13);
+    assert_eq!(SqliteStateStore::current_schema_version(), 14);
     assert_eq!(
         schema_column_snapshot(&connection),
         "\
+auto_save_enrollments: mount_id, path, remote_id, enabled, origin_json, state_json, last_reason, last_push_id, created_at, updated_at
 connections: connection_id, profile_id, connector, display_name, account_label, workspace_id, workspace_name, auth_kind, secret_ref, scopes_json, capabilities_json, status, created_at, updated_at, expires_at
 connector_profiles: profile_id, connector, display_name, auth_kind, scopes_json, capabilities_json, enabled_actions_json, connector_version, status, created_at, updated_at
 connector_state: connector, scope_kind, scope_id, state_version, min_reader_version, state_json, updated_at
@@ -171,7 +181,7 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
         before.issues,
         vec![StateCompatibilityIssue::OlderSchema {
             found: 12,
-            current: 13,
+            current: 14,
         }]
     );
 
@@ -182,13 +192,13 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
         .expect("user version");
     let migration_count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM state_migrations WHERE migration_id = 'schema-12-to-13'",
+            "SELECT COUNT(*) FROM state_migrations WHERE migration_id = 'schema-12-to-14'",
             [],
             |row| row.get(0),
         )
         .expect("migration row count");
 
-    assert_eq!(user_version, 13);
+    assert_eq!(user_version, 14);
     assert_eq!(migration_count, 1);
     assert_eq!(
         store.get_mount(&fixture.mount_id).expect("get mount"),
@@ -203,7 +213,7 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
     );
 
     let after =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v13");
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v14");
     assert_eq!(after.status, StateCompatibilityStatus::Ready);
 }
 
@@ -223,7 +233,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 13,
+            supported: 14,
         }
     );
 }
@@ -246,7 +256,7 @@ fn sqlite_store_reports_newer_schema_as_needing_update() {
         report.issues,
         vec![StateCompatibilityIssue::NewerSchema {
             found: 999,
-            supported: 13,
+            supported: 14,
         }]
     );
 }
@@ -561,6 +571,12 @@ fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state()
     );
     assert!(
         reopened
+            .list_auto_save_enrollments(&fixture.mount_id)
+            .expect("list auto-save")
+            .is_empty()
+    );
+    assert!(
+        reopened
             .list_freshness_states(&fixture.mount_id)
             .expect("list freshness")
             .is_empty()
@@ -665,6 +681,59 @@ fn virtual_mutations_round_trip_and_delete_after_reopen() {
     assert!(
         reopened
             .list_virtual_mutations(&fixture.mount_id)
+            .expect("list after delete")
+            .is_empty()
+    );
+}
+
+#[test]
+fn auto_save_enrollments_round_trip_and_delete_after_reopen() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    let mut enrollment = AutoSaveEnrollmentRecord::new(
+        fixture.mount_id.clone(),
+        "Roadmap/Draft.md",
+        AutoSaveOrigin::AfsCreated,
+        "1",
+    );
+    enrollment.remote_id = Some(RemoteId::new("page-2"));
+    enrollment.state = AutoSaveState::PausedRemoteChanged;
+    enrollment.last_reason = Some("Notion changed externally".to_string());
+
+    store
+        .save_mount(fixture.mount_config())
+        .expect("save mount");
+    store
+        .save_auto_save_enrollment(enrollment.clone())
+        .expect("save enrollment");
+    drop(store);
+
+    let mut reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_auto_save_enrollment(&fixture.mount_id, "Roadmap/Draft.md".as_ref())
+            .expect("get enrollment"),
+        Some(enrollment.clone())
+    );
+    assert_eq!(
+        reopened
+            .find_auto_save_enrollment_by_remote_id(&fixture.mount_id, &RemoteId::new("page-2"))
+            .expect("find enrollment"),
+        Some(enrollment.clone())
+    );
+    assert_eq!(
+        reopened
+            .list_auto_save_enrollments(&fixture.mount_id)
+            .expect("list enrollments"),
+        vec![enrollment]
+    );
+
+    reopened
+        .delete_auto_save_enrollment(&fixture.mount_id, "Roadmap/Draft.md".as_ref())
+        .expect("delete enrollment");
+    assert!(
+        reopened
+            .list_auto_save_enrollments(&fixture.mount_id)
             .expect("list after delete")
             .is_empty()
     );
@@ -895,7 +964,7 @@ fn sqlite_store_migrates_v5_projection_and_connections_schema() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 13);
+    assert_eq!(user_version, 14);
     assert_eq!(connection_column_count, 1);
     assert_eq!(projection_column_count, 1);
     assert_eq!(connection_table_count, 1);
@@ -970,7 +1039,7 @@ fn sqlite_store_migrates_v6_projection_schema_to_connections() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 13);
+    assert_eq!(user_version, 14);
     assert_eq!(connection_column_count, 1);
     assert_eq!(connection_table_count, 1);
     assert_eq!(
@@ -1055,7 +1124,7 @@ fn sqlite_store_migrates_v7_hydration_jobs_schema() {
         )
         .expect("hydration_jobs table");
 
-    assert_eq!(user_version, 13);
+    assert_eq!(user_version, 14);
     assert_eq!(hydration_jobs_table_count, 1);
     assert!(
         store
@@ -1142,7 +1211,7 @@ fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
         )
         .expect("profile_id column");
 
-    assert_eq!(user_version, 13);
+    assert_eq!(user_version, 14);
     assert_eq!(profile_column_count, 1);
     let migrated_connection = store
         .get_connection(&ConnectionId::new("notion-work"))
@@ -1261,7 +1330,7 @@ fn sqlite_store_migrates_v11_entity_search_index() {
         )
         .expect("entity search table");
 
-    assert_eq!(user_version, 13);
+    assert_eq!(user_version, 14);
     assert_eq!(search_table_count, 1);
     let matches = store
         .list_entity_search_candidates(&fixture.mount_id, "launch", None)
@@ -1613,7 +1682,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 13);
+    assert_eq!(user_version, 14);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -1684,7 +1753,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 13);
+    assert_eq!(user_version, 14);
     assert!(entry.apply_effects.is_empty());
 }
 
@@ -1994,6 +2063,14 @@ fn seed_source_scoped_state(store: &mut SqliteStateStore, mount_id: &MountId) {
     store
         .save_virtual_mutation(virtual_mutation_record())
         .expect("save virtual mutation");
+    store
+        .save_auto_save_enrollment(AutoSaveEnrollmentRecord::new(
+            mount_id.clone(),
+            "Roadmap/Draft.md",
+            AutoSaveOrigin::AfsCreated,
+            "1",
+        ))
+        .expect("save auto-save enrollment");
     store
         .save_freshness_state(freshness_state_record())
         .expect("save freshness");
