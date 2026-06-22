@@ -12,6 +12,7 @@ use afs_core::conflict::unresolved_conflict_marker_line;
 use afs_core::freshness::FreshnessTier;
 use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::shadow::rendered_bodies_equivalent;
 use afs_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
     JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
@@ -1054,7 +1055,7 @@ where
         }
     };
 
-    if parsed.document.body == shadow.rendered_body {
+    if rendered_bodies_equivalent(&parsed.document.body, &shadow.rendered_body) {
         (StatusState::Clean, Vec::new())
     } else {
         (

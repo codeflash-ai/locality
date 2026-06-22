@@ -209,6 +209,39 @@ fn executor_writes_hydrated_assets_under_mount_root() {
 }
 
 #[test]
+fn executor_writes_absolute_media_hrefs_under_output_root() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    fixture.write_stub();
+    let mut rendered = rendered_entity("![Image](../.afs/media/Roadmap/image-1.png)");
+    rendered.assets.push(HydratedAsset {
+        path: PathBuf::from(".afs/media/Roadmap/image-1.png"),
+        bytes: b"image-bytes".to_vec(),
+        media: None,
+    });
+    let source = FakeHydrationSource::with_entity("page-1", rendered.clone());
+    let output_root = fixture.root.join(".content/notion-main/files");
+
+    let mut executor =
+        HydrationExecutor::new_with_output_root(&mut store, &source, output_root.clone());
+    executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate request");
+
+    let contents = fs::read_to_string(fixture.page_path()).expect("hydrated file");
+    assert!(contents.contains(&format!(
+        "![Image]({})",
+        output_root.join(".afs/media/Roadmap/image-1.png").display()
+    )));
+    assert_eq!(
+        store
+            .load_shadow(&fixture.mount_id, &fixture.remote_id)
+            .expect("load shadow"),
+        rendered.shadow
+    );
+}
+
+#[test]
 fn executor_rejects_hydrated_assets_outside_mount_root() {
     let fixture = HydrationFixture::new();
     let mut store = fixture.store(HydrationState::Stub);

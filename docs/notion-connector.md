@@ -24,8 +24,8 @@ The current implementation is a live-capable read, pull, and narrow write projec
   when the API exposes it.
 - bookmark/embed/link-preview URL blocks render as ordinary Markdown links.
 - media blocks with a Notion URL render as ordinary Markdown image or link syntax; filesystem-aware
-  image renders use local `.afs/media/` hrefs and keep download metadata for pull, hydration, and
-  post-push reconcile.
+  image writes use absolute local hrefs under the projection output root and keep mount-relative
+  download metadata for pull, hydration, and post-push reconcile.
 - `afs push -y` can update, append, and archive simple Notion blocks, upload changed local image
   media for existing image blocks, update supported page
   properties, create new rows in single-data-source databases, and reconcile by reading the changed
@@ -101,7 +101,7 @@ provider file operations.
 
 ## Initial Block Rendering
 
-The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, bookmark/embed/link-preview URL blocks, child-page links, and media blocks with URLs as Markdown. Filesystem-aware image renders point at the downloaded local `.afs/media/` file instead of a transient Notion-hosted URL. Child pages render as normal Markdown links to their stable Notion page URLs so agents and humans can follow or locate the editable child page's `page.md`. It renders child databases, toggles, synced blocks, column layouts, tabs, table of contents, breadcrumbs, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
+The renderer currently supports paragraphs, headings 1-4, bulleted/numbered list items, to-dos, quotes, callouts, code blocks, simple tables, dividers, display equations, bookmark/embed/link-preview URL blocks, child-page links, and media blocks with URLs as Markdown. Filesystem-aware page writes point at the downloaded local media file under the projection output root instead of a transient Notion-hosted URL; for virtual projections this is the daemon content-cache path. Durable shadows keep the connector-rendered mount-relative href so state remains portable. Child pages render as normal Markdown links to their stable Notion page URLs so agents and humans can follow or locate the editable child page's `page.md`. It renders child databases, toggles, synced blocks, column layouts, tabs, table of contents, breadcrumbs, meeting notes, AI/custom blocks, URL-less media payloads, and unknown future blocks as anchored directives.
 
 Inline rich text is represented with Notion DTOs first, then rendered through one Markdown path:
 
@@ -141,7 +141,7 @@ Multi-data-source databases still stop before row writes because AFS does not ye
 
 ## Local Media
 
-When a caller renders a Notion page for a known filesystem path, media blocks with `external.url` or Notion-hosted `file.url` render as Markdown image/link syntax. Image links point at a mount-local media file, and image blocks are downloaded to a mount-level media tree:
+When AFS writes a Notion page into a local projection, media blocks with `external.url` or Notion-hosted `file.url` render as Markdown image/link syntax. Image links point at an absolute local media file under the projection output root, and image blocks are downloaded to that root's media tree:
 
 ```text
 .afs/
@@ -150,7 +150,7 @@ When a caller renders a Notion page for a known filesystem path, media blocks wi
       image-0123456789ab.png
 ```
 
-The media tree mirrors the Notion page directory under the reserved mount-level `.afs/` namespace. This keeps binary files out of content directories while giving agents a stable local file they can open, and avoids collision with a projected Notion page or database named `media`. AFS records downloaded image metadata and checksums in `.afs/media/manifest.json`; if the local image bytes or caption change, `afs diff` plans an `update_media` operation and `afs push` uploads the local image to the existing Notion image block. The first downloader fetches image blocks only; other file-like blocks render their remote URL directly until size and retention policy are designed.
+The media tree mirrors the Notion page directory under the reserved `.afs/` namespace in the projection output root. This keeps binary files out of content directories while giving agents a stable local file they can open, and avoids collision with a projected Notion page or database named `media`. AFS records downloaded image metadata and checksums in `.afs/media/manifest.json` using mount-relative paths. `afs status`, `afs inspect`, `afs diff`, and `afs push` treat equivalent relative and projection-output-root absolute media hrefs as the same asset. If the resolved local media path, image bytes, or caption changes, `afs diff` plans an `update_media` operation and `afs push` uploads the local image to the existing Notion image block. The first downloader fetches image blocks only; other file-like blocks render their remote URL directly until size and retention policy is designed.
 
 ## Path Projection
 

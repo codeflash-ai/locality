@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
-use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
+use afs_core::canonical::parse_canonical_markdown;
 use afs_core::conflict::{
     has_unresolved_conflict_markers, render_inline_conflict_markdown_with_base,
 };
@@ -14,7 +14,10 @@ use afs_store::{
     ShadowRepository, StoreError,
 };
 
-use crate::media::update_hydrated_media_manifest;
+use crate::media::{
+    document_with_absolute_media_hrefs, render_document_with_absolute_media_hrefs,
+    update_hydrated_media_manifest,
+};
 use crate::shadow_match::{parsed_matches_shadow, shadows_match};
 
 pub trait HydrationEngine {
@@ -138,7 +141,14 @@ where
             write_binary_atomic(&path, &asset.bytes)?;
         }
         update_hydrated_media_manifest(&output_root, &rendered.assets)?;
-        write_atomic(&path, render_canonical_markdown(&rendered.document))?;
+        write_atomic(
+            &path,
+            render_document_with_absolute_media_hrefs(
+                &rendered.document,
+                &entity.path,
+                &output_root,
+            ),
+        )?;
         self.store
             .save_shadow(&mount.mount_id, rendered.shadow.clone())
             .map_err(AfsError::from)?;
@@ -243,12 +253,14 @@ where
             Err(StoreError::ShadowMissing { .. }) => None,
             Err(error) => return Err(AfsError::from(error)),
         };
+        let remote_document =
+            document_with_absolute_media_hrefs(&rendered.document, &entity.path, output_root);
         let conflict_markdown = render_inline_conflict_markdown_with_base(
             &local_contents,
             base_shadow
                 .as_ref()
                 .map(|shadow| shadow.rendered_body.as_str()),
-            &rendered.document,
+            &remote_document,
         );
         write_atomic(path, conflict_markdown)?;
         self.store

@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::file_provider;
 use crate::hydration::{HydratedAsset, HydratedEntity};
-use crate::media::update_hydrated_media_manifest;
+use crate::media::{
+    document_with_absolute_media_hrefs, render_document_with_absolute_media_hrefs,
+    update_hydrated_media_manifest,
+};
 use crate::shadow_match::{parsed_matches_shadow, shadows_match};
 use crate::source::SourceAdapter;
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
@@ -532,7 +535,7 @@ where
     write_assets(&media_root, &rendered.assets)?;
 
     if can_replace {
-        accept_remote_projection(store, mount, entity, &path, rendered)?;
+        accept_remote_projection(store, mount, entity, &path, &media_root, rendered)?;
         return Ok(HydrationOutcome::Hydrated);
     }
 
@@ -544,7 +547,7 @@ where
         return Ok(HydrationOutcome::Conflicted(conflict));
     } else if !remote_matches_shadow(store, mount, &entity, &rendered.shadow)? {
         let conflict = pull_conflict(mount, &entity);
-        materialize_conflict(store, mount, entity, &path, rendered)?;
+        materialize_conflict(store, mount, entity, &path, &media_root, rendered)?;
         return Ok(HydrationOutcome::Conflicted(conflict));
     } else {
         store
@@ -612,12 +615,14 @@ fn accept_remote_projection<S>(
     mount: &MountConfig,
     entity: EntityRecord,
     path: &Path,
+    output_root: &Path,
     rendered: HydratedEntity,
 ) -> Result<(), PullError>
 where
     S: EntityRepository + ShadowRepository,
 {
-    let markdown = render_canonical_markdown(&rendered.document);
+    let markdown =
+        render_document_with_absolute_media_hrefs(&rendered.document, &entity.path, output_root);
     write_atomic(path, markdown)?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
@@ -638,6 +643,7 @@ fn materialize_conflict<S>(
     mount: &MountConfig,
     entity: EntityRecord,
     path: &Path,
+    output_root: &Path,
     rendered: HydratedEntity,
 ) -> Result<(), PullError>
 where
@@ -652,12 +658,14 @@ where
         Err(StoreError::ShadowMissing { .. }) => None,
         Err(error) => return Err(PullError::Store(error)),
     };
+    let remote_document =
+        document_with_absolute_media_hrefs(&rendered.document, &entity.path, output_root);
     let conflict_markdown = render_inline_conflict_markdown_with_base(
         &local_contents,
         base_shadow
             .as_ref()
             .map(|shadow| shadow.rendered_body.as_str()),
-        &rendered.document,
+        &remote_document,
     );
     write_atomic(path, conflict_markdown)?;
     store

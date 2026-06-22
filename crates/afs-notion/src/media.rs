@@ -211,11 +211,35 @@ pub fn local_media_href(page_path: &Path, local_path: &Path) -> String {
 }
 
 pub fn resolve_media_href(page_path: &Path, href: &str) -> Option<PathBuf> {
+    resolve_media_href_inner(page_path, href, None)
+}
+
+pub fn resolve_media_href_with_content_root(
+    page_path: &Path,
+    href: &str,
+    content_root: &Path,
+) -> Option<PathBuf> {
+    resolve_media_href_inner(page_path, href, Some(content_root))
+}
+
+fn resolve_media_href_inner(
+    page_path: &Path,
+    href: &str,
+    content_root: Option<&Path>,
+) -> Option<PathBuf> {
     if is_external_href(href) {
         return None;
     }
 
     let decoded = percent_decode(href)?;
+    let decoded_path = Path::new(&decoded);
+    if decoded_path.is_absolute() {
+        let content_root = content_root?;
+        let relative = decoded_path.strip_prefix(content_root).ok()?;
+        let normalized = normalize_relative_path(relative)?;
+        return is_media_path(&normalized).then_some(normalized);
+    }
+
     let mut combined = markdown_parent_dir(page_path);
     combined.push(decoded);
     let normalized = normalize_relative_path(&combined)?;

@@ -28,6 +28,19 @@ fn clean_noop_push_finishes_without_apply() {
 }
 
 #[test]
+fn local_media_href_shape_only_change_is_noop() {
+    let parsed = parsed_doc(
+        "![Image](/home/mohammed/.afs/content/notion-main/files/.afs/media/Roadmap/image-1.png)",
+    );
+    let shadow = shadow("![Image](.afs/media/Roadmap/image-1.png)", ["image-1"]);
+
+    let output = plan_push_pipeline(request(&parsed, &shadow));
+
+    assert_eq!(output.action, PushPipelineAction::Noop);
+    assert_eq!(output.plan.unwrap().operations, Vec::new());
+}
+
+#[test]
 fn validation_failure_blocks_diff_and_apply() {
     let parsed =
         parse_canonical_markdown("---\ntitle: Missing AFS\n---\n# Body").expect("parseable");

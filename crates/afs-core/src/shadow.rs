@@ -123,18 +123,15 @@ fn normalize_afs_media_target(target: &str) -> String {
         return target.to_string();
     }
 
+    if let Some(media_start) = target.find("/files/.afs/media/") {
+        let media_path = &target[media_start + "/files/".len()..];
+        return media_path.to_string();
+    }
+
     let Some(media_start) = target.find(".afs/media/") else {
         return target.to_string();
     };
-    let media_path = &target[media_start..];
-    let Some(file_name) = media_path.rsplit('/').find(|part| !part.is_empty()) else {
-        return target.to_string();
-    };
-    if file_name.is_empty() {
-        return target.to_string();
-    }
-
-    format!(".afs/media/{file_name}")
+    target[media_start..].to_string()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,7 +164,7 @@ mod tests {
 
     #[test]
     fn rendered_bodies_are_equivalent_when_local_media_href_shape_differs() {
-        let shadow = "# Page\n\n![Image](../../../../../../../.afs/media/home/mohammed/.afs/content/notion-main/files/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg)\n";
+        let shadow = "# Page\n\n![Image](/home/mohammed/.afs/content/notion-main/files/.afs/media/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg)\n";
         let remote = "# Page\n\n![Image](../.afs/media/getting-started-3-new/image-fb3123d34d04464487428b0f2557e4a0.jpg)\n";
 
         assert!(rendered_bodies_equivalent(shadow, remote));

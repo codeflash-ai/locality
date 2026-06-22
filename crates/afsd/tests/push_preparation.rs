@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +9,7 @@ use afs_core::planner::PushOperation;
 use afs_core::push::PushPipelineAction;
 use afs_core::shadow::ShadowDocument;
 use afs_core::validation::ValidationReport;
+use afs_notion::media::sha256_hex;
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
     ProjectionMode, ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
@@ -17,6 +18,8 @@ use afs_store::{
 use afsd::execution::PushJob;
 use afsd::push::{PushPrepareError, prepare_push};
 use afsd::source::{LocalSourceValidator, SourcePushValidator, SourceValidationContext};
+use afsd::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
+use serde_json::json;
 
 #[test]
 fn prepare_push_blocks_notion_schema_violation_for_existing_database_row() {
@@ -86,6 +89,65 @@ fn prepare_push_leaves_non_notion_database_schema_validation_clean() {
         plan.operations[0],
         PushOperation::CreateEntity { .. }
     ));
+}
+
+#[test]
+fn prepare_push_plans_content_cache_absolute_media_byte_update() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("notion");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                "![Image](../.afs/media/Roadmap/image-1.png)",
+                8,
+                [RemoteId::new("image-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+    let content_root = virtual_fs_content_root(&fixture.state_root, &fixture.mount_id);
+    let media_path = PathBuf::from(".afs/media/Roadmap/image-1.png");
+    fixture.write_virtual_media_manifest(&media_path, "image-1", b"original image bytes");
+    fixture.write_virtual_media(&media_path, b"updated image bytes");
+    let absolute_media = content_root.join(&media_path);
+    fixture.write_virtual_page(
+        "Roadmap/page.md",
+        &canonical_markdown("page-1", &format!("![Image]({})", absolute_media.display())),
+    );
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Roadmap/page.md")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+    let plan = prepared.pipeline.plan.expect("plan");
+
+    assert_eq!(plan.summary.media_updated, 1);
+    assert_eq!(plan.summary.blocks_updated, 0);
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::UpdateMedia {
+            block_id: RemoteId::new("image-1"),
+            local_path: media_path,
+            caption: "Image".to_string(),
+        }]
+    );
 }
 
 #[test]
@@ -220,6 +282,7 @@ impl SourcePushValidator for RecordingValidator {
 
 struct PrepareFixture {
     root: PathBuf,
+    state_root: PathBuf,
     mount_id: MountId,
 }
 
@@ -235,9 +298,15 @@ impl PrepareFixture {
             "afsd-push-preparation-{}-{unique}-{suffix}",
             std::process::id()
         ));
+        let state_root = std::env::temp_dir().join(format!(
+            "afsd-push-preparation-state-{}-{unique}-{suffix}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).expect("fixture root");
+        fs::create_dir_all(&state_root).expect("fixture state root");
         Self {
             root,
+            state_root,
             mount_id: MountId::new("notion-main"),
         }
     }
@@ -318,6 +387,53 @@ impl PrepareFixture {
         self.write_raw(&format!(".content/{relative_path}"), contents)
     }
 
+    fn write_virtual_page(&self, relative_path: &str, contents: &str) -> PathBuf {
+        let path =
+            virtual_fs_content_path(&self.state_root, &self.mount_id, Path::new(relative_path))
+                .expect("content path");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("content parent");
+        }
+        fs::write(&path, contents).expect("write virtual page");
+        path
+    }
+
+    fn write_virtual_media(&self, relative_path: &Path, contents: &[u8]) -> PathBuf {
+        let path = virtual_fs_content_root(&self.state_root, &self.mount_id).join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("media parent");
+        }
+        fs::write(&path, contents).expect("write virtual media");
+        path
+    }
+
+    fn write_virtual_media_manifest(&self, local_path: &Path, block_id: &str, bytes: &[u8]) {
+        let manifest_path = virtual_fs_content_root(&self.state_root, &self.mount_id)
+            .join(".afs/media/manifest.json");
+        if let Some(parent) = manifest_path.parent() {
+            fs::create_dir_all(parent).expect("manifest parent");
+        }
+        let key = local_path.to_string_lossy().replace('\\', "/");
+        fs::write(
+            manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "assets": {
+                    key: {
+                        "block_id": block_id,
+                        "kind": "image",
+                        "source_url": "https://example.com/image.png",
+                        "local_path": local_path,
+                        "sha256": sha256_hex(bytes),
+                        "size": bytes.len(),
+                    }
+                }
+            }))
+            .expect("manifest json"),
+        )
+        .expect("write manifest");
+    }
+
     fn write_tasks_schema(&self) {
         self.write_raw("Tasks/_schema.yaml", tasks_schema());
     }
@@ -326,6 +442,7 @@ impl PrepareFixture {
 impl Drop for PrepareFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.state_root);
     }
 }
 

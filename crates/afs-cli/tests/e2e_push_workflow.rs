@@ -21,7 +21,7 @@ use afs_notion::dto::{
     PaginatedListDto, RichTextBlockDto, RichTextDto, SyncedBlockDto, SyncedFromDto,
     TextRichTextDto,
 };
-use afs_notion::media::resolve_media_href;
+use afs_notion::media::resolve_media_href_with_content_root;
 use afs_notion::{NotionConfig, NotionConnector};
 use afs_store::{ConnectionId, EntityRepository, InMemoryStateStore, ProjectionMode};
 use afsd::hydration::{HydrationExecutor, HydrationOutcome};
@@ -2368,7 +2368,7 @@ fn local_image_path(root: &Path, page_path: &Path, markdown: &str, caption: &str
     let relative_page = page_path
         .strip_prefix(root)
         .unwrap_or_else(|_| panic!("page path {page_path:?} is not under root {root:?}"));
-    let local_path = resolve_media_href(relative_page, href)
+    let local_path = resolve_media_href_with_content_root(relative_page, href, root)
         .unwrap_or_else(|| panic!("image href {href:?} is not a local media href"));
     root.join(local_path)
 }

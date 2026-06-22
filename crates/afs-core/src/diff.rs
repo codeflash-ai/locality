@@ -15,7 +15,8 @@ use crate::planner::{
     PlanDegradation, PlanDegradationKind, PropertyValue, PushOperation, PushPlan,
 };
 use crate::shadow::{
-    MarkdownBlockKind, SegmentedBlock, ShadowBlock, ShadowDocument, segment_markdown_body,
+    MarkdownBlockKind, SegmentedBlock, ShadowBlock, ShadowDocument, rendered_bodies_equivalent,
+    segment_markdown_body,
 };
 use crate::validation::{ValidationIssue, ValidationReport};
 use crate::{AfsError, AfsResult};
@@ -111,7 +112,7 @@ pub fn plan_block_diff(
                     });
                 }
 
-                if shadow_block.content_hash != edited_block.content_hash {
+                if !rendered_bodies_equivalent(&shadow_block.text, &edited_block.text) {
                     operations.push(PushOperation::UpdateBlock {
                         block_id: shadow_block.remote_id.clone(),
                         content: edited_block.text.clone(),
