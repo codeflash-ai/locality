@@ -36,6 +36,56 @@ fn diff_reports_noop_plan() {
 }
 
 #[test]
+fn diff_reports_tight_rendered_lists_as_noop_against_shadow() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    let body = concat!(
+        "Intro.\n\n",
+        "- First bullet\n",
+        "- Second bullet\n",
+        "- [ ] First task\n",
+        "- [x] Done task\n",
+        "1. First number\n",
+        "1. Second number\n\n",
+        "After.",
+    );
+    let path = fixture.write_page("Roadmap.md", body);
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                body,
+                9,
+                [
+                    RemoteId::new("intro"),
+                    RemoteId::new("bullet-1"),
+                    RemoteId::new("bullet-2"),
+                    RemoteId::new("todo-1"),
+                    RemoteId::new("todo-2"),
+                    RemoteId::new("number-1"),
+                    RemoteId::new("number-2"),
+                    RemoteId::new("after"),
+                ],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+
+    let report = run_diff(&store, &path).expect("diff report");
+    let plan = report.plan.expect("plan");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "noop");
+    assert!(report.validation.is_empty());
+    assert!(plan.operations.is_empty());
+    assert_eq!(plan.summary.blocks_created, 0);
+    assert_eq!(plan.summary.blocks_updated, 0);
+    assert_eq!(plan.summary.blocks_replaced, 0);
+    assert_eq!(plan.summary.blocks_archived, 0);
+}
+
+#[test]
 fn diff_virtual_projection_reads_daemon_content_cache() {
     let fixture = DiffFixture::new();
     let state_root = fixture.root.join("state");
