@@ -55,8 +55,8 @@ use afs_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
-    ShadowRepository, SqliteStateStore, VirtualMutationKind, VirtualMutationRepository,
-    open_credential_store,
+    RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
+    VirtualMutationRepository, open_credential_store,
 };
 use afsd::autosave::auto_save_timestamp;
 use afsd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
@@ -136,6 +136,7 @@ struct MountSummary {
     workspace_name: String,
     local_path: String,
     notion_url: Option<String>,
+    access_scope: String,
     projection: String,
     read_only: bool,
     status: String,
@@ -972,7 +973,7 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
             attention_count: pending_changes.len(),
         },
         connection: connection_summary(connection.as_ref()),
-        mount: mount_summary(mount.as_ref(), connection.as_ref(), provider),
+        mount: mount_summary(Some(&store), mount.as_ref(), connection.as_ref(), provider),
         settings: desktop_settings(),
         pending_changes,
         activity: activity_from_journals(&journals, &store, &state_root),
@@ -1033,6 +1034,7 @@ fn connection_summary(connection: Option<&ConnectionRecord>) -> ConnectionSummar
 }
 
 fn mount_summary(
+    store: Option<&SqliteStateStore>,
     mount: Option<&MountConfig>,
     connection: Option<&ConnectionRecord>,
     provider: Option<ProviderRuntimeSummary>,
@@ -1045,6 +1047,7 @@ fn mount_summary(
                 .unwrap_or_else(|| "No Notion folder".to_string()),
             local_path: absolute_display_path(&default_notion_access_root()),
             notion_url: None,
+            access_scope: "No mounted Notion access yet".to_string(),
             projection: projection_label(&desktop_projection_mode()).to_string(),
             read_only: false,
             status: "not_mounted".to_string(),
@@ -1067,6 +1070,7 @@ fn mount_summary(
             .remote_root_id
             .as_ref()
             .map(|remote_id| notion_object_url(&remote_id.0)),
+        access_scope: notion_access_scope_label(store, mount),
         projection: projection_label(&mount.projection).to_string(),
         read_only: mount.read_only,
         status: mount_status.to_string(),
@@ -1829,7 +1833,7 @@ fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
 
 fn notion_access_miss_message() -> String {
     let Ok(store) = SqliteStateStore::open(default_state_root()) else {
-        return "That Notion page is not in the mounted Notion workspace yet. Make sure it was selected during Notion authorization, then sync the workspace.".to_string();
+        return "That Notion page is outside the selected Notion access for this mount. Use Change Notion Access to select the page or teamspace, then sync the workspace.".to_string();
     };
     let mounts = store.load_mounts().unwrap_or_default();
     let connections = store.list_connections().unwrap_or_default();
@@ -1844,19 +1848,15 @@ fn notion_access_miss_message() -> String {
                 .map(|mount| connector_label(&mount.connector))
         })
         .unwrap_or_else(|| "the connected Notion workspace".to_string());
+    let scope = mount
+        .as_ref()
+        .map(|mount| notion_access_scope_label(Some(&store), mount))
+        .unwrap_or_else(|| "No mounted Notion access yet".to_string());
     let root_url = mount
         .as_ref()
-        .and_then(|mount| mount.remote_root_id.as_ref())
-        .map(|remote_id| notion_object_url(&remote_id.0));
+        .and_then(|mount| notion_access_scope_url(mount));
 
-    match root_url {
-        Some(url) => format!(
-            "That Notion page is not available in workspace `{workspace}` yet. Open the mounted root ({url}), make sure the page was selected for this Notion connection, then sync the workspace."
-        ),
-        None => format!(
-            "That Notion page is not available in workspace `{workspace}` yet. Make sure it was selected for this Notion connection, then sync the workspace."
-        ),
-    }
+    notion_access_miss_message_from_parts(&workspace, &scope, root_url.as_deref())
 }
 
 fn notion_object_url(id: &str) -> String {
@@ -1867,6 +1867,54 @@ fn notion_url_id(id: &str) -> String {
     id.chars()
         .filter(|character| character.is_ascii_hexdigit())
         .collect::<String>()
+}
+
+fn notion_access_miss_message_from_parts(
+    workspace: &str,
+    access_scope: &str,
+    root_url: Option<&str>,
+) -> String {
+    let root_hint = root_url
+        .map(|url| format!(" Open the mounted root ({url}) to confirm the current access scope."))
+        .unwrap_or_default();
+    format!(
+        "That Notion page is outside the selected Notion access for workspace `{workspace}`. Current mount access: `{access_scope}`.{root_hint} Use Change Notion Access to select this page or the correct teamspace, then sync the workspace."
+    )
+}
+
+fn notion_access_scope_label(store: Option<&SqliteStateStore>, mount: &MountConfig) -> String {
+    let Some(remote_root_id) = mount.remote_root_id.as_ref() else {
+        return "Selected pages and databases".to_string();
+    };
+
+    let title = store
+        .and_then(|store| {
+            store
+                .get_entity(&mount.mount_id, remote_root_id)
+                .ok()
+                .flatten()
+                .map(|entity| entity.title)
+                .or_else(|| {
+                    store
+                        .get_remote_observation(&mount.mount_id, remote_root_id)
+                        .ok()
+                        .flatten()
+                        .map(|observation| observation.title)
+                })
+        })
+        .filter(|title| !title.trim().is_empty());
+
+    match title {
+        Some(title) => title,
+        None => format!("Mounted root {}", notion_url_id(&remote_root_id.0)),
+    }
+}
+
+fn notion_access_scope_url(mount: &MountConfig) -> Option<String> {
+    mount
+        .remote_root_id
+        .as_ref()
+        .map(|remote_id| notion_object_url(&remote_id.0))
 }
 
 fn search_notion_index(query: &str, limit: usize) -> Result<Vec<LocatedItem>, String> {
@@ -5116,8 +5164,22 @@ mod tests {
     }
 
     #[test]
+    fn notion_access_miss_message_names_selected_scope() {
+        let message = super::notion_access_miss_message_from_parts(
+            "Synergy Labs",
+            "Product Teamspace",
+            Some("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972"),
+        );
+
+        assert!(message.contains("workspace `Synergy Labs`"));
+        assert!(message.contains("Current mount access: `Product Teamspace`"));
+        assert!(message.contains("select this page or the correct teamspace"));
+        assert!(message.contains("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972"));
+    }
+
+    #[test]
     fn mount_summary_default_path_is_absolute() {
-        let summary = super::mount_summary(None, None, None);
+        let summary = super::mount_summary(None, None, None, None);
 
         assert!(Path::new(&summary.local_path).is_absolute());
     }
@@ -5212,7 +5274,7 @@ mod tests {
     #[test]
     fn windows_mount_summary_without_mount_reports_cloud_files_projection() {
         assert_eq!(
-            super::mount_summary(None, None, None).projection,
+            super::mount_summary(None, None, None, None).projection,
             "Windows Cloud Files"
         );
         assert_eq!(
@@ -5247,7 +5309,7 @@ mod tests {
     #[test]
     fn linux_mount_summary_without_mount_reports_linux_fuse_projection() {
         assert_eq!(
-            super::mount_summary(None, None, None).projection,
+            super::mount_summary(None, None, None, None).projection,
             "Linux FUSE"
         );
     }
@@ -6216,6 +6278,7 @@ fn sample_snapshot() -> DesktopSnapshot {
             workspace_name: "CodeFlash".to_string(),
             local_path: absolute_display_path(&default_notion_mount_root()),
             notion_url: Some("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972".to_string()),
+            access_scope: "Initial Idea".to_string(),
             projection: "macOS File Provider".to_string(),
             read_only: false,
             status: "ready".to_string(),
