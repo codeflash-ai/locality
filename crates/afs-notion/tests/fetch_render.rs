@@ -102,6 +102,68 @@ fn render_empty_paragraph_as_blank_line_without_shadow_marker() {
 }
 
 #[test]
+fn render_consecutive_list_blocks_as_tight_markdown_list() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![
+            BlockTreeDto {
+                block: paragraph_block("intro", vec![rich_text("Intro.")]),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("bullet-1", "bulleted_list_item", "First bullet"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("bullet-2", "bulleted_list_item", "Second bullet"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: to_do_block("todo-1", "First task", false),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: to_do_block("todo-2", "Done task", true),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("number-1", "numbered_list_item", "First number"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: rich_text_block("number-2", "numbered_list_item", "Second number"),
+                children: Vec::new(),
+            },
+            BlockTreeDto {
+                block: paragraph_block("after", vec![rich_text("After.")]),
+                children: Vec::new(),
+            },
+        ],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "Intro.\n\n- First bullet\n- Second bullet\n- [ ] First task\n- [x] Done task\n1. First number\n1. Second number\n\nAfter.\n"
+    );
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| block.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "intro", "bullet-1", "bullet-2", "todo-1", "todo-2", "number-1", "number-2", "after",
+        ]
+    );
+    for block in &rendered.shadow.blocks[1..7] {
+        assert_eq!(block.kind, MarkdownBlockKind::List);
+    }
+}
+
+#[test]
 fn render_rich_text_line_breaks_inside_one_shadow_block() {
     let bundle = afs_notion::dto::NotionPageBundle {
         page: page("page-1", "Roadmap"),
