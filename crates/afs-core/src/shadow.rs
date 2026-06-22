@@ -315,10 +315,22 @@ fn block_end(lines: &[&str], start: usize) -> usize {
     }
 
     if is_list_item(lines[start]) {
-        return consume_while(lines, start, |line| {
-            !line.trim().is_empty()
-                && (is_list_item(line) || line.starts_with(' ') || line.starts_with('\t'))
-        });
+        let start_indent = indent_width(lines[start]);
+        let mut end = start + 1;
+        while end < lines.len() {
+            let line = lines[end];
+            if line.trim().is_empty() {
+                break;
+            }
+            if is_list_item(line) && indent_width(line) <= start_indent {
+                break;
+            }
+            if !line.starts_with(' ') && !line.starts_with('\t') {
+                break;
+            }
+            end += 1;
+        }
+        return end;
     }
 
     consume_while(lines, start, |line| {
@@ -394,6 +406,13 @@ fn is_list_item(line: &str) -> bool {
 fn ordered_list_marker(line: &str) -> bool {
     let digit_count = line.chars().take_while(|ch| ch.is_ascii_digit()).count();
     digit_count > 0 && line[digit_count..].starts_with(". ")
+}
+
+fn indent_width(line: &str) -> usize {
+    line.chars()
+        .take_while(|ch| matches!(ch, ' ' | '\t'))
+        .map(|ch| if ch == '\t' { 4 } else { 1 })
+        .sum()
 }
 
 fn is_table_start(lines: &[&str], start: usize) -> bool {
