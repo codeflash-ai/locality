@@ -884,10 +884,15 @@ struct ProviderLocalFileIndex {
 #[cfg(target_os = "windows")]
 impl ProviderLocalFileIndex {
     fn remember(&self, path: &Path, identifier: &str) {
+        let fingerprint = local_file_fingerprint(path).ok().flatten();
+        trace_cloud_files(format!(
+            "track local file path=`{}` identity=`{identifier}` fingerprint={fingerprint:?}",
+            path.display()
+        ));
         let tracked = TrackedLocalFile {
             path: path.to_path_buf(),
             identifier: identifier.to_string(),
-            fingerprint: local_file_fingerprint(path).ok().flatten(),
+            fingerprint,
         };
         if let Ok(mut files) = self.files.lock() {
             files.insert(normalized_cloud_path_string(path), tracked);
@@ -1654,7 +1659,7 @@ fn connect_cloud_filter_sync_root(
         CF_CALLBACK_REGISTRATION, CF_CALLBACK_TYPE_FETCH_DATA, CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS,
         CF_CALLBACK_TYPE_NONE, CF_CALLBACK_TYPE_NOTIFY_DELETE,
         CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION, CF_CALLBACK_TYPE_NOTIFY_RENAME,
-        CF_CONNECT_FLAG_NONE, CfConnectSyncRoot,
+        CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH, CfConnectSyncRoot,
     };
     use windows::core::PCWSTR;
 
@@ -1698,7 +1703,7 @@ fn connect_cloud_filter_sync_root(
             PCWSTR::from_raw(sync_root_wide.as_ptr()),
             callbacks.as_ptr(),
             Some(context_ptr),
-            CF_CONNECT_FLAG_NONE,
+            CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
         )
     }
     .map_err(win32_error("connect cloud filter sync root"))?;
