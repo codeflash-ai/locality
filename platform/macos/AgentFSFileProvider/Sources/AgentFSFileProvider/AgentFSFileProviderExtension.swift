@@ -1,12 +1,18 @@
 @preconcurrency import Dispatch
 @preconcurrency import FileProvider
 @preconcurrency import Foundation
+import OSLog
 @preconcurrency import UniformTypeIdentifiers
 
 @objc(AgentFSFileProviderExtension)
 final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
   NSFileProviderEnumerating
 {
+  private static let writeLog = Logger(
+    subsystem: "ai.codeflash.afs.AgentFS.FileProvider",
+    category: "writes"
+  )
+
   private let domain: NSFileProviderDomain
   private let client: Result<AgentFSDaemonClient, Error>
 
@@ -194,9 +200,15 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     let mountId = self.mountId
     let daemonIdentifier = AgentFSFileProviderItem.daemonIdentifier(item.itemIdentifier)
     let client: AgentFSDaemonClient
+    Self.writeLog.info(
+      "modifyItem started mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) filename=\(item.filename, privacy: .public) changedFields=\(changedFields.rawValue, privacy: .public) hasContents=\((newContents != nil), privacy: .public)"
+    )
     do {
       client = try daemonClient()
     } catch {
+      Self.writeLog.error(
+        "modifyItem daemon client failed mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) error=\(String(describing: error), privacy: .public)"
+      )
       completionHandler(nil, [], false, error)
       progress.completedUnitCount = 2
       return progress
@@ -204,6 +216,9 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     DispatchQueue.global(qos: .userInitiated).async {
       do {
         if changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier) {
+          Self.writeLog.info(
+            "modifyItem rename started mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) filename=\(item.filename, privacy: .public)"
+          )
           let renamed = try client.rename(
             mountId: mountId,
             identifier: daemonIdentifier,
@@ -216,11 +231,17 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
             false,
             nil
           )
+          Self.writeLog.info(
+            "modifyItem rename succeeded mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public)"
+          )
           progressHandle.value.completedUnitCount = 2
           return
         }
 
         guard let newContents else {
+          Self.writeLog.info(
+            "modifyItem content missing mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) changedFields=\(changedFields.rawValue, privacy: .public)"
+          )
           let refreshed = try client.item(
             mountId: mountId,
             identifier: daemonIdentifier
@@ -236,10 +257,16 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
         }
 
         let data = try Data(contentsOf: newContents)
+        Self.writeLog.info(
+          "modifyItem content read mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) bytes=\(data.count, privacy: .public)"
+        )
         _ = try client.write(
           mountId: mountId,
           identifier: daemonIdentifier,
           contentsBase64: data.base64EncodedString()
+        )
+        Self.writeLog.info(
+          "modifyItem daemon write succeeded mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) bytes=\(data.count, privacy: .public)"
         )
         progressHandle.value.completedUnitCount = 1
         let refreshed = try client.item(
@@ -252,8 +279,14 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
           false,
           nil
         )
+        Self.writeLog.info(
+          "modifyItem completed mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public)"
+        )
         progressHandle.value.completedUnitCount = 2
       } catch {
+        Self.writeLog.error(
+          "modifyItem failed mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) error=\(String(describing: error), privacy: .public)"
+        )
         completion.value(nil, changedFields, false, agentFSFileProviderError(error))
         progressHandle.value.completedUnitCount = 2
       }

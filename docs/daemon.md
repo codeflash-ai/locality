@@ -93,6 +93,14 @@ therefore does not block the daemon from accepting other requests or responding
 to pings, and two pull/push/hydration mutations cannot advance durable state at
 the same time.
 
+For macOS File Provider mounts, the Swift extension normally sends writes to the
+daemon through `modifyItem`. AFS also has a narrow reconciliation fallback at
+review and push boundaries: status, diff, push, auto-save, and the desktop
+pending-changes snapshot can import a newer visible CloudStorage file into the
+daemon content cache before planning. This fallback is intentionally scoped to
+explicit targets or materialized files with newer mtimes; it is not a broad
+background scanner.
+
 ## Operator Guide
 
 Reset a local macOS test machine to a clean AFS install state:

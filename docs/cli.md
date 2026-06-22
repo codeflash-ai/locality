@@ -232,6 +232,12 @@ helper rather than through inotify-triggered placeholder files. The daemon API f
 that path is platform-neutral `virtual_fs`; macOS File Provider commands are
 compatibility aliases over it.
 
+For macOS File Provider mounts, `afs status`, `afs diff`, and `afs push` also
+reconcile visible CloudStorage edits into the daemon content cache before
+planning. This is a command-boundary fallback for rare File Provider callback
+misses: normal writes should still arrive through `modifyItem`, but review and
+push commands should not ignore a newer visible `page.md` replica.
+
 `afs file-provider register <mount-id-or-path>` validates the mount against the
 current platform's virtual projection: `macos_file_provider` on macOS,
 `linux_fuse` on Linux, and `windows_cloud_files` on Windows. The macOS path
@@ -323,6 +329,10 @@ mount/entity mapping, compares hydrated page bodies against their Synced Tree
 shadow snapshots, reports stubs, conflicted files with unresolved inline markers,
 dirty files, missing projections, and pending or failed push journals touching
 each entity. It does not call remote connectors itself.
+
+For macOS File Provider mounts, status first makes a best-effort reconciliation
+from the visible CloudStorage projection into daemon state. If that repair fails,
+status continues and reports the daemon's current view.
 
 The production state directory defaults to `~/.afs`; `AFS_STATE_DIR` is a developer/test override for isolated runs. When no path is supplied, `afs status` first checks the current working directory: inside a mount it scopes to that subtree, and outside all mounts it reports every registered mount in the active state directory.
 

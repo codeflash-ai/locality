@@ -940,7 +940,9 @@ fn quit_completely(app: AppHandle) -> ActionReport {
 
 fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let state_root = default_state_root();
-    let store = SqliteStateStore::open(state_root.clone()).map_err(|error| error.to_string())?;
+    let mut store =
+        SqliteStateStore::open(state_root.clone()).map_err(|error| error.to_string())?;
+    reconcile_desktop_projection_changes_best_effort(&mut store, &state_root, None);
     let mounts = store.load_mounts().map_err(|error| error.to_string())?;
     let connections = store
         .list_connections()
@@ -4538,6 +4540,7 @@ fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushRepo
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    reconcile_desktop_projection_changes(&mut store, &state_root, Some(target))?;
     let credentials = open_credential_store(&state_root);
     let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
         .map_err(|error| error.message())?;
@@ -4636,10 +4639,33 @@ fn resolve_desktop_mount_path(
         .ok_or_else(|| format!("Path is not inside an AFS mount: {}", target.display()))
 }
 
+fn reconcile_desktop_projection_changes(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    target: Option<&Path>,
+) -> Result<(), String> {
+    daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+        .map(|_| ())
+        .map_err(|error| format!("Could not reconcile macOS File Provider changes: {error}"))
+}
+
+fn reconcile_desktop_projection_changes_best_effort(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    target: Option<&Path>,
+) {
+    if let Err(error) =
+        daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+    {
+        eprintln!("afs desktop could not reconcile macOS File Provider changes: {error}");
+    }
+}
+
 fn auto_save_target_direct(target: &Path) -> Result<PushReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    reconcile_desktop_projection_changes(&mut store, &state_root, Some(target))?;
     let credentials = open_credential_store(&state_root);
     let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
         .map_err(|error| error.message())?;
@@ -4670,8 +4696,10 @@ fn pull_target_direct(target: &Path) -> Result<PullReport, String> {
 }
 
 fn diff_target_direct(target: &Path) -> Result<DiffReport, String> {
-    let store = SqliteStateStore::open(default_state_root())
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open AFS state: {error}"))?;
+    reconcile_desktop_projection_changes(&mut store, &state_root, Some(target))?;
 
     run_diff(&store, target).map_err(|error| error.message())
 }

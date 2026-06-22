@@ -20,6 +20,7 @@ use afs_store::{
     open_credential_store,
 };
 use afsd::execution::PushJobReport;
+use afsd::file_provider as daemon_file_provider;
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
 use afsd::virtual_fs::{VirtualFsChildrenReport, virtual_fs_ancestor_container_identifiers};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -1756,7 +1757,7 @@ fn pull(args: &[String], json: bool) -> i32 {
 
 fn status(args: &[String], json: bool) -> i32 {
     let state_root = default_state_root();
-    let store = match SqliteStateStore::open(state_root.clone()) {
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -1770,6 +1771,12 @@ fn status(args: &[String], json: bool) -> i32 {
         path: first_positional(args).map(PathBuf::from),
         state_root: Some(state_root.clone()),
     };
+    reconcile_projection_changes_best_effort(
+        "status",
+        &mut store,
+        &state_root,
+        options.path.as_deref(),
+    );
 
     match run_status(&store, options) {
         Ok(report) if json => {
@@ -2390,8 +2397,13 @@ fn push(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let selection = match select_push_targets(&store, PathBuf::from(path), Some(state_root.clone()))
+    let target_path = PathBuf::from(path);
+    if let Err(error) =
+        reconcile_projection_changes("push", &mut store, &state_root, Some(&target_path))
     {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+    let selection = match select_push_targets(&store, target_path, Some(state_root.clone())) {
         Ok(selection) => selection,
         Err(error) => return push_target_error(json, error),
     };
@@ -2659,7 +2671,7 @@ fn diff(args: &[String], json: bool) -> i32 {
     };
 
     let state_root = default_state_root();
-    let store = match SqliteStateStore::open(state_root.clone()) {
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -2669,8 +2681,14 @@ fn diff(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let target_path = PathBuf::from(path);
+    if let Err(error) =
+        reconcile_projection_changes("diff", &mut store, &state_root, Some(&target_path))
+    {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
 
-    match run_diff_with_state_root(&store, PathBuf::from(path), Some(&state_root)) {
+    match run_diff_with_state_root(&store, target_path, Some(&state_root)) {
         Ok(report) if json => {
             let exit_code = diff_report_exit_code(&report);
             print_json(&report);
@@ -4750,6 +4768,36 @@ fn takes_value(arg: &str) -> bool {
 
 fn default_state_root() -> PathBuf {
     afs_platform::default_state_root()
+}
+
+fn reconcile_projection_changes(
+    command: &'static str,
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    target: Option<&Path>,
+) -> Result<(), CommandError> {
+    daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+        .map(|_| ())
+        .map_err(|error| {
+            CommandError::new(
+                command,
+                "projection_reconcile_failed",
+                format!("failed to reconcile macOS File Provider changes: {error}"),
+            )
+        })
+}
+
+fn reconcile_projection_changes_best_effort(
+    command: &'static str,
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    target: Option<&Path>,
+) {
+    if let Err(error) =
+        daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+    {
+        eprintln!("afs {command}: skipped macOS File Provider reconciliation: {error}");
+    }
 }
 
 fn escape_json_string(value: &str) -> String {
