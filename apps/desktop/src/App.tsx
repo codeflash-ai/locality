@@ -1548,7 +1548,7 @@ function MountDetailView({
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Mount" }]} />
-      <ViewHeader eyebrow="Mount" title={snapshot.mount.workspaceName}>
+      <ViewHeader title={snapshot.mount.workspaceName}>
         <StatusPill
           tone={healthTone(snapshot.health.state)}
           title={healthDescription(snapshot.health.state, snapshot.health.attentionCount)}
@@ -1701,7 +1701,7 @@ function PendingView({
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Pending" }]} />
-      <ViewHeader eyebrow="Pending" title="Pending Changes">
+      <ViewHeader title="Pending Changes">
         <div className="button-row">
           <SecondaryButton
             disabled={!hasPendingChanges || isPushing}
@@ -1825,7 +1825,7 @@ function ReviewView({
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Pending", onClick: onPending }, { label: "Review" }]} />
-      <ViewHeader eyebrow="Review Push" title={plan.title}>
+      <ViewHeader title={plan.title}>
         <StatusPill
           tone={pushState === "error" ? "danger" : isPushing ? "warn" : "ready"}
           title={isPushing ? "AFS is writing the approved local changes to Notion." : "This push is ready for review."}
@@ -1885,7 +1885,7 @@ function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome:
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Activity" }]} />
-      <ViewHeader eyebrow="Activity" title="Recent activity" />
+      <ViewHeader title="Recent activity" />
       {Object.entries(grouped).map(([when, items]) => (
         <section className="activity-group" key={when}>
           <p className="label">{when}</p>
@@ -2125,7 +2125,7 @@ function SettingsView({
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Settings" }]} />
-      <ViewHeader eyebrow="Settings" title="AFS controls" />
+      <ViewHeader title="AFS controls" />
 
       <section className="settings-grid">
         <div className="panel">
@@ -3112,14 +3112,14 @@ function ViewHeader({
   title,
   children,
 }: {
-  eyebrow: string;
+  eyebrow?: string;
   title: string;
   children?: React.ReactNode;
 }) {
   return (
     <header className="view-header">
       <div>
-        <p className="eyebrow">{eyebrow}</p>
+        {eyebrow && <p className="eyebrow">{eyebrow}</p>}
         <h1>{title}</h1>
       </div>
       {children}
