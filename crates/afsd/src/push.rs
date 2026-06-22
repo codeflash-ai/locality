@@ -22,6 +22,7 @@ use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::path_projection::{is_page_document_path, page_document_path};
 use afs_core::planner::GuardrailDecision;
 use afs_core::planner::{GuardrailPolicy, PushOperation, PushPlan};
 use afs_core::push::{
@@ -39,12 +40,17 @@ use afs_notion::media::{
     load_media_manifest, media_manifest_entry, resolve_media_href, sha256_hex,
 };
 use afs_store::{
-    EntityRecord, EntityRepository, FreshnessStateRepository, JournalRepository, MountConfig,
-    MountRepository, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
-    StoreError, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    AutoSaveRepository, EntityRecord, EntityRepository, FreshnessStateRepository,
+    JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
+    RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::autosave::{
+    auto_save_block_reason, mark_auto_save_active, mark_auto_save_blocked,
+    mark_auto_save_paused_failure, mark_auto_save_paused_remote_changed,
+};
 use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::file_provider;
 use crate::hydration::{HydratedEntity, HydrationSource};
@@ -90,7 +96,154 @@ where
     Source: Connector + HydrationSource + ?Sized,
 {
     let validator = LocalSourceValidator;
+    if let Some(state_root) = state_root {
+        file_provider::reconcile_macos_file_provider_projection(
+            store,
+            state_root,
+            Some(&job.target_path),
+        )?;
+    }
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
+    execute_prepared_push(store, source, prepared, state_root)
+}
+
+pub fn execute_auto_save_push_job_with_content_root<S, Source>(
+    store: &mut S,
+    mut job: PushJob,
+    source: &Source,
+    state_root: Option<&Path>,
+) -> AfsResult<PushJobReport>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + VirtualMutationRepository
+        + AutoSaveRepository,
+    Source: Connector + HydrationSource + ?Sized,
+{
+    job.assume_yes = true;
+    job.confirm_dangerous = false;
+
+    let validator = LocalSourceValidator;
+    if let Some(state_root) = state_root {
+        file_provider::reconcile_macos_file_provider_projection(
+            store,
+            state_root,
+            Some(&job.target_path),
+        )?;
+    }
+    let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
+    let relative_path = auto_save_relative_path(&prepared);
+
+    if let Some(reason) = auto_save_block_reason(&prepared.pipeline) {
+        mark_auto_save_blocked(
+            store,
+            &prepared.mount.mount_id,
+            &relative_path,
+            reason.clone(),
+        )?;
+        return Ok(PushJobReport {
+            target_path: prepared.absolute_path,
+            mount_id: prepared.mount.mount_id,
+            entity_id: prepared.entity.remote_id,
+            pipeline: prepared.pipeline,
+            action: PushJobAction::NotReady,
+            execution: None,
+            push_id: None,
+            journal_status: None,
+            error: Some(PushJobError {
+                code: "auto_save_blocked".to_string(),
+                message: reason,
+            }),
+        });
+    }
+
+    let report = execute_prepared_push(store, source, prepared, state_root)?;
+    match report.action {
+        PushJobAction::Reconciled => {
+            let created_remote_id = created_entity_id(&report).or_else(|| {
+                report
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| execution.changed_remote_ids.first().cloned())
+            });
+            let remote_id = created_remote_id.or_else(|| Some(report.entity_id.clone()));
+            mark_auto_save_active(
+                store,
+                &report.mount_id,
+                &relative_path,
+                remote_id,
+                report.push_id.as_ref(),
+            )?;
+        }
+        PushJobAction::NotReady if report.pipeline.action == PushPipelineAction::Noop => {
+            mark_auto_save_active(
+                store,
+                &report.mount_id,
+                &relative_path,
+                Some(report.entity_id.clone()),
+                report.push_id.as_ref(),
+            )?;
+        }
+        PushJobAction::NotReady => {
+            mark_auto_save_blocked(
+                store,
+                &report.mount_id,
+                &relative_path,
+                "push plan needs review before auto-save",
+            )?;
+        }
+        PushJobAction::Failed => {
+            let reason = report
+                .error
+                .as_ref()
+                .map(|error| error.message.clone())
+                .unwrap_or_else(|| "auto-save push failed".to_string());
+            if auto_save_failed_due_remote_change(&report) {
+                mark_auto_save_paused_remote_changed(
+                    store,
+                    &report.mount_id,
+                    &relative_path,
+                    reason,
+                )?;
+            } else {
+                mark_auto_save_paused_failure(store, &report.mount_id, &relative_path, reason)?;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn auto_save_failed_due_remote_change(report: &PushJobReport) -> bool {
+    report.error.as_ref().is_some_and(|error| {
+        error.code == "guardrail"
+            && (error.message.contains("changed since")
+                || error.message.contains("pull before pushing"))
+    })
+}
+
+fn execute_prepared_push<S, Source>(
+    store: &mut S,
+    source: &Source,
+    prepared: PreparedPush,
+    state_root: Option<&Path>,
+) -> AfsResult<PushJobReport>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + VirtualMutationRepository,
+    Source: Connector + HydrationSource + ?Sized,
+{
     let push_id = generate_push_id();
     let remote_preconditions = remote_preconditions_for_plan(
         store,
@@ -159,6 +312,34 @@ where
             error: Some(PushJobError::from(error)),
         }),
     }
+}
+
+fn auto_save_relative_path(prepared: &PreparedPush) -> PathBuf {
+    prepared
+        .pipeline
+        .plan
+        .as_ref()
+        .and_then(|plan| {
+            plan.operations
+                .iter()
+                .find_map(|operation| match operation {
+                    PushOperation::CreateEntity { source_path, .. } => Some(source_path.clone()),
+                    _ => None,
+                })
+        })
+        .unwrap_or_else(|| prepared.entity.path.clone())
+}
+
+fn created_entity_id(report: &PushJobReport) -> Option<RemoteId> {
+    report
+        .execution
+        .as_ref()?
+        .apply_effects
+        .iter()
+        .find_map(|effect| match effect {
+            JournalApplyEffect::CreatedEntity { entity_id, .. } => Some(entity_id.clone()),
+            _ => None,
+        })
 }
 
 fn preflight_push<Source>(source: &Source, mut prepared: PreparedPush) -> PreparedPush
@@ -658,20 +839,7 @@ where
             remote_id: parent_id.clone(),
         })
         .map_err(PushPrepareError::Store)?;
-    let read_path = pending
-        .content_path
-        .clone()
-        .or_else(|| {
-            state_root.map(|root| {
-                virtual_fs_content_root(root, &mount.mount_id).join(&pending.projected_path)
-            })
-        })
-        .ok_or_else(|| {
-            PushPrepareError::Core(AfsError::InvalidState(format!(
-                "pending create `{}` has no cached content path",
-                pending.local_id
-            )))
-        })?;
+    let read_path = pending_create_read_path(&mount, &pending, state_root, &absolute_path)?;
     let contents = read_to_string(&read_path)?;
     if let Some(line) = unresolved_conflict_marker_line(&contents) {
         return Ok(PreparedPush {
@@ -723,6 +891,32 @@ where
         shadows: Vec::new(),
         pipeline,
     })
+}
+
+fn pending_create_read_path(
+    mount: &MountConfig,
+    pending: &VirtualMutationRecord,
+    state_root: Option<&Path>,
+    absolute_path: &Path,
+) -> Result<PathBuf, PushPrepareError> {
+    if mount.projection.uses_virtual_filesystem() && absolute_path.is_file() {
+        return Ok(absolute_path.to_path_buf());
+    }
+
+    pending
+        .content_path
+        .clone()
+        .or_else(|| {
+            state_root.map(|root| {
+                virtual_fs_content_root(root, &mount.mount_id).join(&pending.projected_path)
+            })
+        })
+        .ok_or_else(|| {
+            PushPrepareError::Core(AfsError::InvalidState(format!(
+                "pending create `{}` has no cached content path",
+                pending.local_id
+            )))
+        })
 }
 
 fn prepare_pending_scope<S, Validator>(
@@ -1422,7 +1616,30 @@ where
     let parent = store
         .find_entity_by_path(&mount.mount_id, parent_path)
         .map_err(PushPrepareError::Store)?;
-    Ok(parent)
+    if parent.is_some() {
+        return Ok(parent);
+    }
+
+    if is_page_document_path(relative_path)
+        && let Some(container_path) = parent_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+    {
+        if let Some(parent) = store
+            .find_entity_by_path(&mount.mount_id, container_path)
+            .map_err(PushPrepareError::Store)?
+        {
+            return Ok(Some(parent));
+        }
+        let parent_page_path = page_document_path(container_path);
+        if parent_page_path != relative_path {
+            return store
+                .find_entity_by_path(&mount.mount_id, &parent_page_path)
+                .map_err(PushPrepareError::Store);
+        }
+    }
+
+    Ok(None)
 }
 
 fn required_parent_entity<S>(

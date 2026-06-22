@@ -21,10 +21,13 @@ json_value() {
 }
 
 require_executable "${ROOT}/scripts/publish-linux.sh"
+require_executable "${ROOT}/scripts/render-linux-repositories.sh"
 require_executable "${ROOT}/apps/desktop/scripts/prepare-bundle.sh"
 require_executable "${ROOT}/apps/desktop/scripts/prepare-linux-bundle.sh"
 
 grep -q '^publish-linux:' "${MAKEFILE}" || fail "Makefile is missing publish-linux target"
+grep -q '^render-linux-repositories:' "${MAKEFILE}" \
+  || fail "Makefile is missing render-linux-repositories target"
 ! grep -q '^build-tauri-linux:' "${MAKEFILE}" \
   || fail "Makefile should expose one Linux publish target, publish-linux"
 [[ "$(json_value '.scripts["build:linux"]' "${PACKAGE_JSON}")" == "tauri build --bundles deb,rpm" ]] \
@@ -51,3 +54,15 @@ grep -q 'appindicator3-0.1' "${ROOT}/scripts/publish-linux.sh" \
   || fail "publish-linux must prepare appindicator pkg-config metadata for Tauri"
 grep -q 'PKG_CONFIG_PATH' "${ROOT}/scripts/publish-linux.sh" \
   || fail "publish-linux must export PKG_CONFIG_PATH when using temporary metadata"
+grep -q 'copy_latest_alias' "${ROOT}/scripts/publish-linux.sh" \
+  || fail "publish-linux must create stable latest-release artifact aliases"
+grep -q 'appimage' "${ROOT}/scripts/publish-linux.sh" \
+  || fail "publish-linux must build AppImage artifacts for Tauri self-update"
+grep -q 'latest-linux.json' "${ROOT}/scripts/publish-linux.sh" \
+  || fail "publish-linux must configure a Linux updater endpoint"
+grep -q 'createrepo_c' "${ROOT}/scripts/render-linux-repositories.sh" \
+  || fail "Linux repository renderer must create RPM metadata"
+grep -q 'apt-ftparchive' "${ROOT}/scripts/render-linux-repositories.sh" \
+  || fail "Linux repository renderer must create APT metadata"
+grep -q 'LINUX_REPO_GPG_PRIVATE_KEY' "${ROOT}/scripts/render-linux-repositories.sh" \
+  || fail "Linux repository renderer must support signed metadata"

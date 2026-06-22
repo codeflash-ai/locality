@@ -26,10 +26,28 @@ pub const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com";
 pub const DEFAULT_NOTION_VERSION: &str = "2026-03-11";
 pub const DEFAULT_NOTION_TOKEN_ENV: &str = "NOTION_TOKEN";
 const DEFAULT_NOTION_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_NOTION_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(400);
+const DEFAULT_NOTION_REQUESTS_PER_SECOND: f64 = 3.0;
+const DEFAULT_NOTION_REQUEST_BURST: f64 = 3.0;
 const DEFAULT_NOTION_RATE_LIMIT_RETRIES: usize = 4;
 
-static LAST_NOTION_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+static NOTION_RATE_LIMITER: OnceLock<Mutex<NotionRateLimiter>> = OnceLock::new();
+static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
+
+pub fn notion_http_client() -> Client {
+    ensure_reqwest_crypto_provider();
+    Client::new()
+}
+
+fn notion_http_client_builder() -> reqwest::blocking::ClientBuilder {
+    ensure_reqwest_crypto_provider();
+    Client::builder()
+}
+
+fn ensure_reqwest_crypto_provider() {
+    REQWEST_CRYPTO_PROVIDER.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 pub trait NotionApi: std::fmt::Debug + Send + Sync {
     fn retrieve_current_user(&self) -> AfsResult<serde_json::Value> {
@@ -104,10 +122,10 @@ pub struct HttpNotionApi {
 
 impl HttpNotionApi {
     pub fn new(config: NotionConfig) -> Self {
-        let client = Client::builder()
+        let client = notion_http_client_builder()
             .timeout(notion_http_timeout())
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .unwrap_or_else(|_| notion_http_client());
         Self { config, client }
     }
 
@@ -186,7 +204,7 @@ impl HttpNotionApi {
             DEFAULT_NOTION_API_BASE_URL, upload_id
         );
         for attempt in 0..=notion_rate_limit_retries() {
-            pace_notion_request();
+            acquire_notion_request_token();
             let part = multipart::Part::bytes(bytes.clone())
                 .file_name(filename.to_string())
                 .mime_str(content_type)
@@ -211,8 +229,8 @@ impl HttpNotionApi {
             let body = response
                 .text()
                 .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
-            if status == StatusCode::TOO_MANY_REQUESTS && attempt < notion_rate_limit_retries() {
-                sleep_for_rate_limit(attempt, retry_after);
+            if is_notion_rate_limited(status) && attempt < notion_rate_limit_retries() {
+                record_notion_rate_limit(attempt, retry_after);
                 continue;
             }
             return Err(AfsError::Io(format!(
@@ -262,7 +280,7 @@ impl HttpNotionApi {
         T: DeserializeOwned,
     {
         for attempt in 0..=notion_rate_limit_retries() {
-            pace_notion_request();
+            acquire_notion_request_token();
             let response = build_request()
                 .send()
                 .map_err(|error| AfsError::Io(format!("notion request failed: {error}")))?;
@@ -278,8 +296,8 @@ impl HttpNotionApi {
             let body = response
                 .text()
                 .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
-            if status == StatusCode::TOO_MANY_REQUESTS && attempt < notion_rate_limit_retries() {
-                sleep_for_rate_limit(attempt, retry_after);
+            if is_notion_rate_limited(status) && attempt < notion_rate_limit_retries() {
+                record_notion_rate_limit(attempt, retry_after);
                 continue;
             }
             return Err(AfsError::Io(format!(
@@ -317,14 +335,6 @@ fn notion_http_timeout() -> Duration {
         .unwrap_or(DEFAULT_NOTION_HTTP_TIMEOUT)
 }
 
-fn notion_request_min_interval() -> Duration {
-    std::env::var("AFS_NOTION_REQUEST_MIN_INTERVAL_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_NOTION_REQUEST_MIN_INTERVAL)
-}
-
 fn notion_rate_limit_retries() -> usize {
     std::env::var("AFS_NOTION_RATE_LIMIT_RETRIES")
         .ok()
@@ -332,23 +342,96 @@ fn notion_rate_limit_retries() -> usize {
         .unwrap_or(DEFAULT_NOTION_RATE_LIMIT_RETRIES)
 }
 
-fn pace_notion_request() {
-    let min_interval = notion_request_min_interval();
-    if min_interval.is_zero() {
-        return;
-    }
+fn notion_requests_per_second() -> f64 {
+    std::env::var("AFS_NOTION_REQUESTS_PER_SECOND")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_NOTION_REQUESTS_PER_SECOND)
+}
 
-    let mut last_request = LAST_NOTION_REQUEST
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("notion request pacing lock poisoned");
-    if let Some(last_request) = *last_request {
-        let elapsed = last_request.elapsed();
-        if elapsed < min_interval {
-            thread::sleep(min_interval - elapsed);
+fn notion_request_burst() -> f64 {
+    std::env::var("AFS_NOTION_REQUEST_BURST")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .unwrap_or(DEFAULT_NOTION_REQUEST_BURST)
+}
+
+#[derive(Debug)]
+struct NotionRateLimiter {
+    tokens: f64,
+    last_refill: Instant,
+    cooldown_until: Option<Instant>,
+}
+
+impl NotionRateLimiter {
+    fn new() -> Self {
+        Self {
+            tokens: notion_request_burst(),
+            last_refill: Instant::now(),
+            cooldown_until: None,
         }
     }
-    *last_request = Some(Instant::now());
+
+    fn acquire(&mut self) -> Option<Duration> {
+        let now = Instant::now();
+        if let Some(cooldown_until) = self.cooldown_until {
+            if cooldown_until > now {
+                return Some(cooldown_until.saturating_duration_since(now));
+            }
+            self.cooldown_until = None;
+        }
+
+        let rate = notion_requests_per_second();
+        let burst = notion_request_burst();
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.tokens = (self.tokens + elapsed.as_secs_f64() * rate).min(burst);
+        self.last_refill = now;
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            return None;
+        }
+
+        let needed = 1.0 - self.tokens;
+        Some(Duration::from_secs_f64(needed / rate))
+    }
+
+    fn record_rate_limit(&mut self, delay: Duration) {
+        let until = Instant::now() + delay;
+        self.cooldown_until = Some(
+            self.cooldown_until
+                .map_or(until, |current| current.max(until)),
+        );
+        self.tokens = 0.0;
+        self.last_refill = Instant::now();
+    }
+}
+
+fn notion_rate_limiter() -> &'static Mutex<NotionRateLimiter> {
+    NOTION_RATE_LIMITER.get_or_init(|| Mutex::new(NotionRateLimiter::new()))
+}
+
+fn acquire_notion_request_token() {
+    loop {
+        let wait = notion_rate_limiter()
+            .lock()
+            .expect("notion request rate limiter lock poisoned")
+            .acquire();
+        match wait {
+            Some(delay) if !delay.is_zero() => thread::sleep(delay),
+            _ => return,
+        }
+    }
+}
+
+fn record_notion_rate_limit(attempt: usize, retry_after: Option<Duration>) {
+    let delay = retry_after.unwrap_or_else(|| rate_limit_backoff(attempt));
+    notion_rate_limiter()
+        .lock()
+        .expect("notion request rate limiter lock poisoned")
+        .record_rate_limit(delay);
 }
 
 fn retry_after_header(headers: &HeaderMap) -> Option<Duration> {
@@ -361,8 +444,8 @@ fn retry_after_header(headers: &HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-fn sleep_for_rate_limit(attempt: usize, retry_after: Option<Duration>) {
-    thread::sleep(retry_after.unwrap_or_else(|| rate_limit_backoff(attempt)));
+fn is_notion_rate_limited(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529
 }
 
 fn rate_limit_backoff(attempt: usize) -> Duration {

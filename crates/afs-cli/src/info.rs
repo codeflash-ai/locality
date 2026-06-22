@@ -151,7 +151,7 @@ where
         subject: InfoSubject {
             role: subject_context.role,
             source: source_name(&mount.connector, subject_context.entity.as_ref()),
-            path: relative_path.display().to_string(),
+            path: afs_platform::logical_path_display(&relative_path),
             absolute_path: target.display().to_string(),
             exists: target.exists(),
             entity: subject_context
@@ -426,7 +426,7 @@ fn info_entity(mount: &MountConfig, entity: &EntityRecord) -> InfoEntity {
         entity_id: entity.remote_id.0.clone(),
         kind: entity_kind_name(&entity.kind).to_string(),
         title: entity.title.clone(),
-        path: entity.path.display().to_string(),
+        path: afs_platform::logical_path_display(&entity.path),
         absolute_path: mount.root.join(&entity.path).display().to_string(),
         hydration: hydration_name(&entity.hydration).to_string(),
         content_hash: entity.content_hash.clone(),

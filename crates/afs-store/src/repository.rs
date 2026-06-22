@@ -12,9 +12,9 @@ use afs_core::shadow::ShadowDocument;
 
 use crate::error::StoreResult;
 use crate::records::{
-    ConnectionId, ConnectionRecord, ConnectorProfileId, ConnectorProfileRecord, EntityRecord,
-    FreshnessStateRecord, HydrationJobRecord, MountConfig, RemoteObservationRecord,
-    ShadowSnapshotRecord, VirtualMutationRecord,
+    AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
+    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord, MountConfig,
+    RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
 
 pub trait MountRepository {
@@ -86,6 +86,28 @@ pub trait VirtualMutationRepository {
     fn list_virtual_mutations(&self, mount_id: &MountId)
     -> StoreResult<Vec<VirtualMutationRecord>>;
     fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()>;
+}
+
+pub trait AutoSaveRepository {
+    fn save_auto_save_enrollment(
+        &mut self,
+        enrollment: AutoSaveEnrollmentRecord,
+    ) -> StoreResult<()>;
+    fn get_auto_save_enrollment(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> StoreResult<Option<AutoSaveEnrollmentRecord>>;
+    fn find_auto_save_enrollment_by_remote_id(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<Option<AutoSaveEnrollmentRecord>>;
+    fn list_auto_save_enrollments(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<AutoSaveEnrollmentRecord>>;
+    fn delete_auto_save_enrollment(&mut self, mount_id: &MountId, path: &Path) -> StoreResult<()>;
 }
 
 pub trait RemoteObservationRepository {

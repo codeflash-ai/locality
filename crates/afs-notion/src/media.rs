@@ -15,6 +15,8 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::client::notion_http_client;
+
 const AFS_DIR: &str = ".afs";
 const MEDIA_DIR: &str = "media";
 const MEDIA_MANIFEST: &str = "manifest.json";
@@ -115,7 +117,7 @@ pub fn fetch_media_assets(assets: &[MediaAsset]) -> AfsResult<Vec<DownloadedMedi
 }
 
 pub fn fetch_media_asset_report(assets: &[MediaAsset]) -> MediaFetchReport {
-    let client = Client::new();
+    let client = notion_http_client();
     let mut report = MediaFetchReport::default();
 
     for asset in assets.iter().filter(|asset| should_download(asset)) {

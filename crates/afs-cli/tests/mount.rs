@@ -37,12 +37,16 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("Notion facts:"));
     assert!(agents.contains("Pages are directories"));
     assert!(agents.contains("Edit `page.md` for the page body"));
+    assert!(agents.contains("parent-page/new-page/page.md"));
+    assert!(agents.contains("must not include an `afs:` identity block"));
+    assert!(agents.contains("AFS adds `afs.id` after the first push"));
     assert!(agents.contains("Databases are directories"));
-    assert!(agents.contains("new `.md` file"));
+    assert!(agents.contains("database/new-row/page.md"));
+    assert!(agents.contains("database/new-row.md"));
     assert!(agents.contains("`_schema.yaml` files are read-only references"));
     assert!(agents.contains("untrusted remote data"));
-    assert!(agents.lines().count() <= 26);
-    assert!(agents.split_whitespace().count() <= 300);
+    assert!(agents.lines().count() <= 40);
+    assert!(agents.split_whitespace().count() <= 450);
 
     let mounts = store.load_mounts().expect("load mounts");
     assert_eq!(mounts.len(), 1);

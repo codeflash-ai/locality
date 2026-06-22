@@ -5,9 +5,11 @@ members = [
   "crates/afsd",
   "crates/afs-core",
   "crates/afs-connector",
+  "crates/afs-platform",
   "crates/afs-store",
   "crates/afs-notion",
   "crates/afs-fuse",
+  "platform/windows/afs-cloud-files",
 ]
 resolver = "2"
 
@@ -20,5 +22,6 @@ rust-version = "1.96"
 [workspace.dependencies]
 afs-core = { path = "crates/afs-core" }
 afs-connector = { path = "crates/afs-connector" }
+afs-platform = { path = "crates/afs-platform" }
 afs-store = { path = "crates/afs-store" }
 afs-notion = { path = "crates/afs-notion" }

@@ -24,6 +24,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run architecture behavior e2e
         run: cargo test -p afs-cli --test architecture_behavior -- --test-threads=1
+      - name: Run shared projection contract e2e
+        run: cargo test -p afs-cli --test projection_contract -- --test-threads=1
+      - name: Run doctor diagnostics e2e
+        run: cargo test -p afs-cli --test doctor -- --test-threads=1
       - name: Run local push workflow e2e
         run: cargo test -p afs-cli --test e2e_push_workflow -- --test-threads=1
 

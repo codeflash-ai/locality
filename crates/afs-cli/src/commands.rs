@@ -20,6 +20,7 @@ use afs_store::{
     open_credential_store,
 };
 use afsd::execution::PushJobReport;
+use afsd::file_provider as daemon_file_provider;
 use afsd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
 use afsd::virtual_fs::{VirtualFsChildrenReport, virtual_fs_ancestor_container_identifiers};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -39,6 +40,7 @@ use crate::connector::{
 };
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff_with_state_root};
+use crate::doctor::{DoctorOptions, doctor_exit_code, print_doctor_report, run_doctor};
 use crate::file_provider as file_provider_helper;
 use crate::history::{
     HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
@@ -123,6 +125,8 @@ enum AfsCommand {
     Info(PathArg),
     #[command(about = "Show local sync state for mounts or paths")]
     Status(PathArg),
+    #[command(about = "Run read-only diagnostics for daemon, mounts, providers, and auth")]
+    Doctor,
     #[command(about = "Search local mount metadata without contacting remote sources")]
     Search(SearchArgs),
     #[command(about = "List, validate, and create local template pack workspaces")]
@@ -288,7 +292,7 @@ struct MountNotionArgs {
     #[arg(
         long,
         value_name = "mode",
-        help = "Projection mode: plain-files, macos-file-provider, or linux-fuse."
+        help = "Projection mode. Supported values depend on the host platform."
     )]
     projection: Option<String>,
     #[arg(
@@ -424,6 +428,16 @@ struct TemplateApplyArgs {
 enum FileProviderCommand {
     #[command(about = "Register a virtual filesystem provider for a mount")]
     Register(FileProviderTargetArg),
+    #[command(about = "Start the background provider runtime for a mount")]
+    Start(FileProviderTargetArg),
+    #[command(about = "Run the foreground Windows Cloud Files provider for a mount")]
+    Run(FileProviderTargetArg),
+    #[command(about = "Stop the background provider runtime for a mount")]
+    Stop(FileProviderTargetArg),
+    #[command(about = "Show provider runtime status for a mount")]
+    Status(FileProviderTargetArg),
+    #[command(about = "Restart the background provider runtime for a mount")]
+    Restart(FileProviderTargetArg),
     #[command(about = "Open a registered virtual filesystem mount")]
     Open(FileProviderTargetArg),
     #[command(about = "Unregister a virtual filesystem provider for a mount")]
@@ -552,6 +566,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         AfsCommand::Mount { .. } => mount(&legacy_args[1..], json),
         AfsCommand::Info(_) => info(&legacy_args[1..], json),
         AfsCommand::Status(_) => status(&legacy_args[1..], json),
+        AfsCommand::Doctor => doctor(json),
         AfsCommand::Search(_) => search(&legacy_args[1..], json),
         AfsCommand::Templates { .. } => templates(&legacy_args[1..], json),
         AfsCommand::Inspect(_) => inspect(&legacy_args[1..], json),
@@ -675,6 +690,7 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
             args.push("status".to_string());
             push_optional_positional(&mut args, options.path.as_deref());
         }
+        AfsCommand::Doctor => args.push("doctor".to_string()),
         AfsCommand::Search(options) => {
             args.push("search".to_string());
             for query_part in &options.query {
@@ -745,6 +761,26 @@ fn legacy_args_for_command(command: &AfsCommand) -> Vec<String> {
             match command {
                 FileProviderCommand::Register(options) => {
                     args.push("register".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Start(options) => {
+                    args.push("start".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Run(options) => {
+                    args.push("run".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Stop(options) => {
+                    args.push("stop".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Status(options) => {
+                    args.push("status".to_string());
+                    args.push(options.target.clone());
+                }
+                FileProviderCommand::Restart(options) => {
+                    args.push("restart".to_string());
                     args.push(options.target.clone());
                 }
                 FileProviderCommand::Open(options) => {
@@ -828,6 +864,17 @@ fn daemon(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn doctor(json: bool) -> i32 {
+    let report = run_doctor(DoctorOptions::default());
+    let exit_code = doctor_exit_code(&report);
+    if json {
+        print_json(&report);
+    } else {
+        print_doctor_report(&report);
+    }
+    exit_code
+}
+
 fn connect(args: &[String], json: bool) -> i32 {
     if first_positional(args) != Some("notion") {
         return command_error(
@@ -909,9 +956,10 @@ fn connect(args: &[String], json: bool) -> i32 {
                 );
             }
         };
+        let authorization_url = start.normalized_authorization_url();
         let authorization = match run_local_oauth_authorization(
             "Notion",
-            &start.authorization_url,
+            &authorization_url,
             &start.redirect_uri,
             &start.state,
             has_flag(args, "--no-browser"),
@@ -1139,7 +1187,7 @@ fn file_provider(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "file-provider",
                 "usage",
-                "usage: afs file-provider register|open|unregister <mount-id-or-path> [--json]",
+                "usage: afs file-provider register|start|run|stop|status|restart|open|unregister <mount-id-or-path> [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1147,16 +1195,47 @@ fn file_provider(args: &[String], json: bool) -> i32 {
 
     match action {
         "register" => file_provider_register(args, json),
+        "start" => file_provider_lifecycle(
+            args,
+            json,
+            file_provider_helper::WindowsCloudFilesLifecycleAction::Start,
+        ),
+        "run" => file_provider_run(args, json),
+        "stop" => file_provider_lifecycle(
+            args,
+            json,
+            file_provider_helper::WindowsCloudFilesLifecycleAction::Stop,
+        ),
+        "status" => file_provider_lifecycle(
+            args,
+            json,
+            file_provider_helper::WindowsCloudFilesLifecycleAction::Status,
+        ),
+        "restart" => file_provider_lifecycle(
+            args,
+            json,
+            file_provider_helper::WindowsCloudFilesLifecycleAction::Restart,
+        ),
         "open" => file_provider_open(args, json),
         "unregister" => file_provider_unregister(args, json),
-        "list" => run_file_provider_helper(json, "list", Vec::new(), None),
-        "reset" => run_file_provider_helper(json, "reset", Vec::new(), None),
+        "list" => run_platform_file_provider_helper(
+            json,
+            "list",
+            windows_cloud_files_state_args_for_platform(),
+            None,
+        ),
+        "reset" => run_platform_file_provider_helper(
+            json,
+            "reset",
+            windows_cloud_files_state_args_for_platform(),
+            None,
+        ),
         _ => command_error(
             json,
             CommandError::new(
                 "file-provider",
                 "usage",
-                "usage: afs file-provider register|open|unregister|list|reset",
+                "usage: afs file-provider register|start|run|stop|status|restart|open|unregister|list|reset",
             ),
             EXIT_USAGE,
         ),
@@ -1219,6 +1298,131 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
             )
         }
         VirtualProjectionRegistration::LinuxFuse => run_linux_fuse_register(json, &mount),
+        VirtualProjectionRegistration::WindowsCloudFiles => {
+            run_windows_cloud_files_register(json, &mount)
+        }
+    }
+}
+
+fn file_provider_lifecycle(
+    args: &[String],
+    json: bool,
+    action: file_provider_helper::WindowsCloudFilesLifecycleAction,
+) -> i32 {
+    let Some(target) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "usage",
+                format!(
+                    "usage: afs file-provider {} <mount-id-or-path> [--json]",
+                    action.as_str()
+                ),
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let mount = match resolve_mount_target(&store, target) {
+        Ok(mount) => mount,
+        Err(message) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "mount_not_found", message),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let registration = match validate_virtual_projection_registration(&mount, std::env::consts::OS)
+    {
+        Ok(registration) => registration,
+        Err(error) => return command_error(json, error, EXIT_USAGE),
+    };
+
+    match registration {
+        VirtualProjectionRegistration::WindowsCloudFiles => {
+            run_windows_cloud_files_lifecycle(json, &mount, action)
+        }
+        VirtualProjectionRegistration::MacosFileProvider
+        | VirtualProjectionRegistration::LinuxFuse => command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "unsupported_platform",
+                format!(
+                    "file-provider {} is currently implemented for Windows Cloud Files mounts",
+                    action.as_str()
+                ),
+            ),
+            EXIT_USAGE,
+        ),
+    }
+}
+
+fn file_provider_run(args: &[String], json: bool) -> i32 {
+    let Some(target) = nth_positional(args, 1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "usage",
+                "usage: afs file-provider run <mount-id-or-path> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let store = match SqliteStateStore::open(default_state_root()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let mount = match resolve_mount_target(&store, target) {
+        Ok(mount) => mount,
+        Err(message) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", "mount_not_found", message),
+                EXIT_USAGE,
+            );
+        }
+    };
+    let target_os = std::env::consts::OS;
+    let registration = match validate_virtual_projection_registration(&mount, target_os) {
+        Ok(registration) => registration,
+        Err(error) => return command_error(json, error, EXIT_USAGE),
+    };
+
+    match registration {
+        VirtualProjectionRegistration::WindowsCloudFiles => {
+            run_windows_cloud_files_run(json, &mount)
+        }
+        VirtualProjectionRegistration::MacosFileProvider
+        | VirtualProjectionRegistration::LinuxFuse => command_error(
+            json,
+            CommandError::new(
+                "file-provider",
+                "unsupported_platform",
+                "foreground provider run is only supported for Windows Cloud Files",
+            ),
+            EXIT_USAGE,
+        ),
     }
 }
 
@@ -1269,6 +1473,9 @@ fn file_provider_open(args: &[String], json: bool) -> i32 {
             Some(mount.mount_id.0),
         ),
         VirtualProjectionRegistration::LinuxFuse => open_path_for_linux_fuse(json, &mount),
+        VirtualProjectionRegistration::WindowsCloudFiles => {
+            run_windows_cloud_files_open(json, &mount)
+        }
     }
 }
 
@@ -1291,6 +1498,12 @@ fn file_provider_unregister(args: &[String], json: bool) -> i32 {
         .and_then(|store| resolve_mount_target(&store, target).ok());
     if target_os == "linux" {
         return run_linux_fuse_unregister(json, resolved_mount.as_ref(), target);
+    }
+    if target_os == "windows" {
+        let mount_id = resolved_mount
+            .map(|mount| mount.mount_id.0)
+            .unwrap_or_else(|| target.to_string());
+        return run_windows_cloud_files_unregister(json, &mount_id);
     }
 
     let mount_id = match resolved_mount {
@@ -1544,7 +1757,7 @@ fn pull(args: &[String], json: bool) -> i32 {
 
 fn status(args: &[String], json: bool) -> i32 {
     let state_root = default_state_root();
-    let store = match SqliteStateStore::open(state_root.clone()) {
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -1558,6 +1771,9 @@ fn status(args: &[String], json: bool) -> i32 {
         path: first_positional(args).map(PathBuf::from),
         state_root: Some(state_root.clone()),
     };
+    if let Some(target) = options.path.as_deref() {
+        reconcile_projection_changes_best_effort("status", &mut store, &state_root, Some(target));
+    }
 
     match run_status(&store, options) {
         Ok(report) if json => {
@@ -2178,8 +2394,13 @@ fn push(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let selection = match select_push_targets(&store, PathBuf::from(path), Some(state_root.clone()))
+    let target_path = PathBuf::from(path);
+    if let Err(error) =
+        reconcile_projection_changes("push", &mut store, &state_root, Some(&target_path))
     {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
+    let selection = match select_push_targets(&store, target_path, Some(state_root.clone())) {
         Ok(selection) => selection,
         Err(error) => return push_target_error(json, error),
     };
@@ -2447,7 +2668,7 @@ fn diff(args: &[String], json: bool) -> i32 {
     };
 
     let state_root = default_state_root();
-    let store = match SqliteStateStore::open(state_root.clone()) {
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -2457,8 +2678,14 @@ fn diff(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let target_path = PathBuf::from(path);
+    if let Err(error) =
+        reconcile_projection_changes("diff", &mut store, &state_root, Some(&target_path))
+    {
+        return command_error(json, error, EXIT_INTERNAL);
+    }
 
-    match run_diff_with_state_root(&store, PathBuf::from(path), Some(&state_root)) {
+    match run_diff_with_state_root(&store, target_path, Some(&state_root)) {
         Ok(report) if json => {
             let exit_code = diff_report_exit_code(&report);
             print_json(&report);
@@ -3041,6 +3268,19 @@ fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
+fn run_platform_file_provider_helper(
+    json: bool,
+    action: &str,
+    args: Vec<String>,
+    mount_id: Option<String>,
+) -> i32 {
+    if std::env::consts::OS == "windows" {
+        return run_windows_cloud_files_helper(json, action, args, mount_id);
+    }
+
+    run_file_provider_helper(json, action, args, mount_id)
+}
+
 fn run_file_provider_helper(
     json: bool,
     action: &str,
@@ -3058,6 +3298,184 @@ fn run_file_provider_helper(
         }
     };
 
+    let report = FileProviderCommandReport {
+        ok: true,
+        command: "file-provider",
+        action: action.to_string(),
+        mount_id,
+        helper: helper_report.helper.display().to_string(),
+        helper_report: helper_report.helper_report,
+    };
+
+    if json {
+        print_json(&report);
+    } else {
+        print_file_provider_report(&report);
+    }
+    EXIT_SUCCESS
+}
+
+fn run_windows_cloud_files_register(json: bool, mount: &MountConfig) -> i32 {
+    let state_root = default_state_root();
+    let display_name = file_provider_display_name(mount);
+    let helper_report = match file_provider_helper::register_windows_cloud_files_sync_root(
+        &state_root,
+        mount,
+        &display_name,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", error.code(), error.message()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    file_provider_helper_success_report(
+        json,
+        "register",
+        Some(mount.mount_id.0.clone()),
+        helper_report,
+    )
+}
+
+fn run_windows_cloud_files_run(json: bool, mount: &MountConfig) -> i32 {
+    let state_root = default_state_root();
+    let helper_report =
+        match file_provider_helper::run_windows_cloud_files_provider(&state_root, mount) {
+            Ok(report) => report,
+            Err(error) => {
+                return command_error(
+                    json,
+                    CommandError::new("file-provider", error.code(), error.message()),
+                    EXIT_INTERNAL,
+                );
+            }
+        };
+
+    file_provider_helper_success_report(json, "run", Some(mount.mount_id.0.clone()), helper_report)
+}
+
+fn run_windows_cloud_files_lifecycle(
+    json: bool,
+    mount: &MountConfig,
+    action: file_provider_helper::WindowsCloudFilesLifecycleAction,
+) -> i32 {
+    let state_root = default_state_root();
+    let display_name = file_provider_display_name(mount);
+    let helper_report = match file_provider_helper::run_windows_cloud_files_lifecycle(
+        &state_root,
+        mount,
+        &display_name,
+        action,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(
+                json,
+                windows_cloud_files_command_error(error),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    file_provider_helper_success_report(
+        json,
+        action.as_str(),
+        Some(mount.mount_id.0.clone()),
+        helper_report,
+    )
+}
+
+fn run_windows_cloud_files_open(json: bool, mount: &MountConfig) -> i32 {
+    let helper_report = match file_provider_helper::open_windows_cloud_files_sync_root(mount) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", error.code(), error.message()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    file_provider_helper_success_report(json, "open", Some(mount.mount_id.0.clone()), helper_report)
+}
+
+fn run_windows_cloud_files_unregister(json: bool, mount_id: &str) -> i32 {
+    let state_root = default_state_root();
+    let helper_report =
+        match file_provider_helper::unregister_windows_cloud_files_sync_root(&state_root, mount_id)
+        {
+            Ok(report) => report,
+            Err(error) => {
+                return command_error(
+                    json,
+                    CommandError::new("file-provider", error.code(), error.message()),
+                    EXIT_INTERNAL,
+                );
+            }
+        };
+
+    file_provider_helper_success_report(
+        json,
+        "unregister",
+        Some(mount_id.to_string()),
+        helper_report,
+    )
+}
+
+fn windows_cloud_files_state_args_for_platform() -> Vec<String> {
+    if std::env::consts::OS == "windows" {
+        vec![
+            "--state-dir".to_string(),
+            absolute_command_path(&default_state_root())
+                .display()
+                .to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+fn absolute_command_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn run_windows_cloud_files_helper(
+    json: bool,
+    action: &str,
+    args: Vec<String>,
+    mount_id: Option<String>,
+) -> i32 {
+    let helper_report = match file_provider_helper::run_windows_cloud_files_helper(action, args) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("file-provider", error.code(), error.message()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    file_provider_helper_success_report(json, action, mount_id, helper_report)
+}
+
+fn file_provider_helper_success_report(
+    json: bool,
+    action: &str,
+    mount_id: Option<String>,
+    helper_report: file_provider_helper::FileProviderHelperReport,
+) -> i32 {
     let report = FileProviderCommandReport {
         ok: true,
         command: "file-provider",
@@ -3237,8 +3655,42 @@ fn linux_fuse_command_error(
     CommandError::new("file-provider", error.code(), error.message())
 }
 
+fn windows_cloud_files_command_error(
+    error: file_provider_helper::WindowsCloudFilesHelperError,
+) -> CommandError {
+    let command_error = CommandError::new("file-provider", error.code(), error.message());
+    match error {
+        file_provider_helper::WindowsCloudFilesHelperError::DaemonNotRunning => {
+            command_error.with_suggested_command("afs daemon start")
+        }
+        _ => command_error,
+    }
+}
+
 fn print_file_provider_report(report: &FileProviderCommandReport) {
     if report.action == "list" {
+        if let Some(roots) = report.helper_report.get("roots").and_then(Value::as_array) {
+            if roots.is_empty() {
+                println!("no file provider domains");
+                return;
+            }
+            for root in roots {
+                let mount_id = root
+                    .get("mount_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                let display_name = root
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                let path = root
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                println!("{mount_id}\t{display_name}\t{path}");
+            }
+            return;
+        }
         let Some(domains) = report
             .helper_report
             .get("domains")
@@ -4119,23 +4571,9 @@ fn projection_mode(args: &[String]) -> Result<ProjectionMode, String> {
 }
 
 fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<ProjectionMode, String> {
-    match flag_value(args, "--projection") {
-        None | Some("plain-files") => Ok(ProjectionMode::PlainFiles),
-        Some("macos-file-provider") if target_os == "macos" => {
-            Ok(ProjectionMode::MacosFileProvider)
-        }
-        Some("linux-fuse") if target_os == "linux" => Ok(ProjectionMode::LinuxFuse),
-        Some("macos-file-provider") => Err(format!(
-            "--projection macos-file-provider is only supported on macOS; this binary is running on {target_os}"
-        )),
-        Some("linux-fuse") => Err(format!(
-            "--projection linux-fuse is only supported on Linux; this binary is running on {target_os}"
-        )),
-        Some(_) => Err(format!(
-            "--projection must be {}",
-            projection_usage_options_for_target(target_os)
-        )),
-    }
+    afs_platform::mount_cli_capabilities_for_target(target_os)
+        .projection_from_cli_value(flag_value(args, "--projection"))
+        .map_err(|error| error.message())
 }
 
 fn mount_usage() -> String {
@@ -4147,18 +4585,15 @@ fn mount_usage() -> String {
     )
 }
 
-fn projection_usage_options_for_target(target_os: &str) -> &'static str {
-    match target_os {
-        "macos" => "plain-files|macos-file-provider",
-        "linux" => "plain-files|linux-fuse",
-        _ => "plain-files",
-    }
+fn projection_usage_options_for_target(target_os: &str) -> String {
+    afs_platform::mount_cli_capabilities_for_target(target_os).projection_usage_options()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VirtualProjectionRegistration {
     MacosFileProvider,
     LinuxFuse,
+    WindowsCloudFiles,
 }
 
 impl VirtualProjectionRegistration {
@@ -4166,14 +4601,12 @@ impl VirtualProjectionRegistration {
         match self {
             Self::MacosFileProvider => ProjectionMode::MacosFileProvider,
             Self::LinuxFuse => ProjectionMode::LinuxFuse,
+            Self::WindowsCloudFiles => ProjectionMode::WindowsCloudFiles,
         }
     }
 
     fn projection_cli_value(self) -> &'static str {
-        match self {
-            Self::MacosFileProvider => "macos-file-provider",
-            Self::LinuxFuse => "linux-fuse",
-        }
+        afs_platform::capabilities::projection_cli_value(&self.projection())
     }
 }
 
@@ -4209,9 +4642,14 @@ fn validate_virtual_projection_registration(
 fn virtual_projection_registration_for_target(
     target_os: &str,
 ) -> Option<VirtualProjectionRegistration> {
-    match target_os {
-        "macos" => Some(VirtualProjectionRegistration::MacosFileProvider),
-        "linux" => Some(VirtualProjectionRegistration::LinuxFuse),
+    match afs_platform::mount_cli_capabilities_for_target(target_os).virtual_registration {
+        Some(ProjectionMode::MacosFileProvider) => {
+            Some(VirtualProjectionRegistration::MacosFileProvider)
+        }
+        Some(ProjectionMode::LinuxFuse) => Some(VirtualProjectionRegistration::LinuxFuse),
+        Some(ProjectionMode::WindowsCloudFiles) => {
+            Some(VirtualProjectionRegistration::WindowsCloudFiles)
+        }
         _ => None,
     }
 }
@@ -4227,6 +4665,9 @@ fn auto_registration_for_mounted_projection(
 
     match (projection, target_os) {
         (ProjectionMode::LinuxFuse, "linux") => Some(VirtualProjectionRegistration::LinuxFuse),
+        (ProjectionMode::WindowsCloudFiles, "windows") => {
+            Some(VirtualProjectionRegistration::WindowsCloudFiles)
+        }
         _ => None,
     }
 }
@@ -4278,6 +4719,30 @@ fn auto_register_mounted_projection(
                 })
         }
         VirtualProjectionRegistration::MacosFileProvider => Ok(()),
+        VirtualProjectionRegistration::WindowsCloudFiles => {
+            let display_name = file_provider_display_name(&mount);
+            file_provider_helper::register_windows_cloud_files_sync_root(
+                state_root,
+                &mount,
+                &display_name,
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                CommandError::new(
+                    "mount",
+                    error.code(),
+                    format!(
+                        "mounted `{}` but Windows Cloud Files registration failed: {}",
+                        mount.mount_id.0,
+                        error.message()
+                    ),
+                )
+                .with_suggested_command(format!(
+                    "afs file-provider register {}",
+                    mount.root.display()
+                ))
+            })
+        }
     }
 }
 
@@ -4299,15 +4764,37 @@ fn takes_value(arg: &str) -> bool {
 }
 
 fn default_state_root() -> PathBuf {
-    if let Ok(value) = std::env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
+    afs_platform::default_state_root()
+}
 
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
+fn reconcile_projection_changes(
+    command: &'static str,
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    target: Option<&Path>,
+) -> Result<(), CommandError> {
+    daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+        .map(|_| ())
+        .map_err(|error| {
+            CommandError::new(
+                command,
+                "projection_reconcile_failed",
+                format!("failed to reconcile macOS File Provider changes: {error}"),
+            )
+        })
+}
 
-    PathBuf::from(".afs")
+fn reconcile_projection_changes_best_effort(
+    command: &'static str,
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    target: Option<&Path>,
+) {
+    if let Err(error) =
+        daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+    {
+        eprintln!("afs {command}: skipped macOS File Provider reconciliation: {error}");
+    }
 }
 
 fn escape_json_string(value: &str) -> String {
@@ -4364,6 +4851,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::path::Path;
 
     use clap::Parser;
     use clap::error::ErrorKind;
@@ -4378,8 +4866,8 @@ mod tests {
 
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
-        auto_registration_for_mounted_projection, diff_report_exit_code, legacy_args_for_command,
-        notion_oauth_broker_config, projection_mode_for_target,
+        absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
+        legacy_args_for_command, notion_oauth_broker_config, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, should_prompt_for_push_confirmation,
         should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
@@ -4495,6 +4983,10 @@ mod tests {
                 ],
             ),
             (
+                vec!["doctor", "--help"],
+                vec!["Usage: afs doctor", "Run read-only diagnostics", "--json"],
+            ),
+            (
                 vec!["search", "--help"],
                 vec![
                     "Usage: afs search",
@@ -4571,7 +5063,14 @@ mod tests {
             ),
             (
                 vec!["file-provider", "--help"],
-                vec!["Usage: afs file-provider", "Commands:", "register", "reset"],
+                vec![
+                    "Usage: afs file-provider",
+                    "Commands:",
+                    "register",
+                    "start",
+                    "status",
+                    "reset",
+                ],
             ),
             (
                 vec!["file-provider", "register", "--help"],
@@ -4580,6 +5079,38 @@ mod tests {
                     "Register a virtual filesystem",
                     "mount-id-or-path",
                     "--json",
+                ],
+            ),
+            (
+                vec!["file-provider", "start", "--help"],
+                vec![
+                    "Usage: afs file-provider start",
+                    "Start the background provider",
+                    "mount-id-or-path",
+                ],
+            ),
+            (
+                vec!["file-provider", "stop", "--help"],
+                vec![
+                    "Usage: afs file-provider stop",
+                    "Stop the background provider",
+                    "mount-id-or-path",
+                ],
+            ),
+            (
+                vec!["file-provider", "status", "--help"],
+                vec![
+                    "Usage: afs file-provider status",
+                    "Show provider runtime status",
+                    "mount-id-or-path",
+                ],
+            ),
+            (
+                vec!["file-provider", "restart", "--help"],
+                vec![
+                    "Usage: afs file-provider restart",
+                    "Restart the background provider",
+                    "mount-id-or-path",
                 ],
             ),
             (
@@ -4700,6 +5231,18 @@ mod tests {
                 "/tmp/founder",
                 "--force"
             ]
+        );
+
+        let cli = parse_cli(["file-provider", "restart", "notion-main"]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["file-provider", "restart", "notion-main"]
+        );
+
+        let cli = parse_cli(["doctor"]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["doctor"]
         );
     }
 
@@ -4886,8 +5429,19 @@ mod tests {
             ProjectionMode::PlainFiles
         );
         assert_eq!(
+            projection_mode_for_target(
+                &[
+                    "--projection".to_string(),
+                    "windows-cloud-files".to_string()
+                ],
+                "windows"
+            )
+            .expect("windows cloud files projection"),
+            ProjectionMode::WindowsCloudFiles
+        );
+        assert_eq!(
             projection_usage_options_for_target("windows"),
-            "plain-files"
+            "plain-files|windows-cloud-files"
         );
     }
 
@@ -4899,6 +5453,12 @@ mod tests {
         let linux_mount =
             MountConfig::new(MountId::new("notion-linux"), "notion", "/tmp/afs/linux")
                 .projection(ProjectionMode::LinuxFuse);
+        let windows_mount = MountConfig::new(
+            MountId::new("notion-windows"),
+            "notion",
+            r"C:\Users\Ada\AFS",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
 
         assert_eq!(
             validate_virtual_projection_registration(&macos_mount, "macos")
@@ -4909,6 +5469,11 @@ mod tests {
             validate_virtual_projection_registration(&linux_mount, "linux")
                 .expect("linux fuse mount is valid"),
             VirtualProjectionRegistration::LinuxFuse
+        );
+        assert_eq!(
+            validate_virtual_projection_registration(&windows_mount, "windows")
+                .expect("windows cloud files mount is valid"),
+            VirtualProjectionRegistration::WindowsCloudFiles
         );
 
         let wrong_projection = validate_virtual_projection_registration(&linux_mount, "macos")
@@ -4925,14 +5490,13 @@ mod tests {
         assert_eq!(wrong_projection.code, "wrong_projection");
         assert!(wrong_projection.message.contains("--projection linux-fuse"));
 
-        let unsupported_platform =
-            validate_virtual_projection_registration(&macos_mount, "windows")
-                .expect_err("windows has no virtual projection registration yet");
-        assert_eq!(unsupported_platform.code, "unsupported_platform");
+        let wrong_projection = validate_virtual_projection_registration(&macos_mount, "windows")
+            .expect_err("macos file provider mount is not a windows cloud files sync root");
+        assert_eq!(wrong_projection.code, "wrong_projection");
         assert!(
-            unsupported_platform
+            wrong_projection
                 .message
-                .contains("no virtual filesystem registration is implemented")
+                .contains("--projection windows-cloud-files")
         );
     }
 
@@ -4941,6 +5505,14 @@ mod tests {
         assert_eq!(
             auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux", false),
             Some(VirtualProjectionRegistration::LinuxFuse)
+        );
+        assert_eq!(
+            auto_registration_for_mounted_projection(
+                ProjectionMode::WindowsCloudFiles,
+                "windows",
+                false
+            ),
+            Some(VirtualProjectionRegistration::WindowsCloudFiles)
         );
         assert_eq!(
             auto_registration_for_mounted_projection(ProjectionMode::PlainFiles, "linux", false),
@@ -4958,6 +5530,14 @@ mod tests {
             auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux", true),
             None
         );
+    }
+
+    #[test]
+    fn command_paths_absolutize_relative_state_roots() {
+        let path = absolute_command_path(Path::new(".afs"));
+
+        assert!(path.is_absolute());
+        assert!(path.ends_with(".afs"));
     }
 
     #[test]

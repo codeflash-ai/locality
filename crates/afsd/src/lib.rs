@@ -1,3 +1,4 @@
+pub mod autosave;
 pub mod execution;
 pub mod file_provider;
 pub mod freshness;
@@ -68,15 +69,7 @@ impl Daemon {
 }
 
 fn default_state_root() -> PathBuf {
-    if let Ok(value) = std::env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
+    afs_platform::default_state_root()
 }
 
 fn default_tcp_addr() -> Option<SocketAddr> {

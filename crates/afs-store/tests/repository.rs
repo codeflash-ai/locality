@@ -8,7 +8,8 @@ use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::planner::{PushOperation, PushPlan};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
-    ConnectionId, EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+    AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
+    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
     InMemoryStateStore, JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
@@ -72,6 +73,12 @@ fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state()
         store
             .list_virtual_mutations(&mount_id())
             .expect("list mutations")
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_auto_save_enrollments(&mount_id())
+            .expect("list auto-save")
             .is_empty()
     );
     assert!(
@@ -239,6 +246,33 @@ fn entity_lists_are_ordered_by_projected_path() {
     assert_eq!(
         paths,
         vec![PathBuf::from("Alpha.md"), PathBuf::from("Zebra.md")]
+    );
+}
+
+#[test]
+fn auto_save_enrollments_round_trip_by_path_and_remote_id() {
+    let mut store = InMemoryStateStore::new();
+    let mut enrollment =
+        AutoSaveEnrollmentRecord::new(mount_id(), "Draft/page.md", AutoSaveOrigin::AfsCreated, "1");
+    enrollment.remote_id = Some(RemoteId::new("page-2"));
+    enrollment.state = AutoSaveState::Blocked;
+    enrollment.last_reason = Some("deletions require review".to_string());
+
+    store
+        .save_auto_save_enrollment(enrollment.clone())
+        .expect("save enrollment");
+
+    assert_eq!(
+        store
+            .get_auto_save_enrollment(&mount_id(), Path::new("Draft/page.md"))
+            .expect("get enrollment"),
+        Some(enrollment.clone())
+    );
+    assert_eq!(
+        store
+            .find_auto_save_enrollment_by_remote_id(&mount_id(), &RemoteId::new("page-2"))
+            .expect("find enrollment"),
+        Some(enrollment)
     );
 }
 
@@ -517,6 +551,14 @@ fn seed_source_scoped_state(store: &mut InMemoryStateStore) {
     store
         .save_virtual_mutation(virtual_mutation("local:1", "Draft.md"))
         .expect("save mutation");
+    store
+        .save_auto_save_enrollment(AutoSaveEnrollmentRecord::new(
+            mount_id(),
+            "Draft.md",
+            AutoSaveOrigin::AfsCreated,
+            "2026-06-15T00:00:00Z",
+        ))
+        .expect("save auto-save");
     store
         .save_freshness_state(FreshnessStateRecord::new(
             mount_id(),

@@ -41,13 +41,50 @@ build-desktop: $(DESKTOP_NODE_MODULES_STAMP) ## Build the desktop frontend asset
 build-tauri: ## Build the packaged Tauri desktop app.
 	$(DESKTOP_NPM) run build:mac
 
+.PHONY: build-mas
+build-mas: setup ## Build a local Mac App Store-channel .app bundle.
+	$(DESKTOP_NPM) run build:mas
+
 .PHONY: publish
 publish: setup ## Build, sign, notarize, staple, and validate a macOS DMG.
 	scripts/publish-macos.sh
 
+.PHONY: publish-mas
+publish-mas: setup ## Build, sign, package, and optionally upload a Mac App Store build.
+	scripts/publish-mas.sh
+
 .PHONY: publish-linux
 publish-linux: setup ## Build and validate Linux .deb and .rpm packages.
 	scripts/publish-linux.sh
+
+.PHONY: publish-windows
+publish-windows: setup ## Build, sign, and validate a Windows NSIS package.
+	pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/publish-windows.ps1
+
+.PHONY: build-tauri-windows
+build-tauri-windows: setup ## Build the Windows Tauri installer.
+	$(DESKTOP_NPM) run build:windows
+
+.PHONY: render-homebrew-cask
+render-homebrew-cask: ## Render a Homebrew cask from published macOS DMG artifacts.
+	scripts/render-homebrew-cask.sh
+
+.PHONY: render-updater-manifest
+render-updater-manifest: ## Render a Tauri updater manifest from updater artifacts.
+	scripts/render-tauri-updater-manifest.sh
+
+.PHONY: render-linux-repositories
+render-linux-repositories: ## Render APT and RPM repository metadata from Linux package artifacts.
+	scripts/render-linux-repositories.sh
+
+.PHONY: bump-version
+bump-version: ## Bump release version; pass VERSION=0.1.1.
+	@test -n "$(VERSION)" || (echo "Usage: make bump-version VERSION=0.1.1" >&2; exit 2)
+	node scripts/bump-version.mjs "$(VERSION)"
+
+.PHONY: audit-mas-readiness
+audit-mas-readiness: ## Run static checks for Mac App Store release readiness.
+	scripts/audit-mas-readiness.sh
 
 .PHONY: prepare-macos-file-provider
 prepare-macos-file-provider: ## Stage the macOS File Provider extension for Tauri packaging.

@@ -117,8 +117,12 @@ fn info_for_database_directory_reports_schema_and_rows() {
         Some("Tasks")
     );
     assert_eq!(
-        report.subject.schema_path.as_deref(),
-        Some(expected_schema.as_str())
+        report
+            .subject
+            .schema_path
+            .as_deref()
+            .map(|path| path.replace('\\', "/")),
+        Some(expected_schema.replace('\\', "/"))
     );
     assert_eq!(report.children.pages, 1);
     assert_eq!(report.children.immediate, 1);
@@ -136,7 +140,7 @@ fn info_without_path_uses_cwd_inside_mount() {
     let report = run_info(&store, InfoOptions::default()).expect("info report");
 
     assert_eq!(report.subject.role, InfoRole::DatabaseDirectory);
-    assert!(report.target.ends_with("roadmap/tasks"));
+    assert!(report.target.replace('\\', "/").ends_with("roadmap/tasks"));
 }
 
 #[test]

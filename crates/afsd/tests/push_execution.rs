@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,7 +9,7 @@ use afs_connector::{
     ParsedEntity,
 };
 use afs_core::canonical::render_canonical_markdown;
-use afs_core::journal::JournalStatus;
+use afs_core::journal::{JournalApplyEffect, JournalStatus, PushOperationId};
 use afs_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
@@ -18,13 +18,16 @@ use afs_core::push::PushExecutionAction;
 use afs_core::shadow::ShadowDocument;
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, ProjectionMode, ShadowRepository, VirtualMutationKind, VirtualMutationRecord,
+    AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, EntityRecord,
+    EntityRepository, InMemoryStateStore, JournalRepository, MountConfig, MountRepository,
+    ProjectionMode, ShadowRepository, VirtualMutationKind, VirtualMutationRecord,
     VirtualMutationRepository,
 };
 use afsd::execution::{DaemonExecutor, PushJob};
 use afsd::hydration::{HydratedEntity, HydrationQueue, HydrationSource};
-use afsd::push::{PushJobAction, execute_push_job_with_content_root};
+use afsd::push::{
+    PushJobAction, execute_auto_save_push_job_with_content_root, execute_push_job_with_content_root,
+};
 use afsd::scheduler::PullScheduler;
 use afsd::supervisor::DaemonSupervisor;
 use afsd::virtual_fs::virtual_fs_content_path;
@@ -99,6 +102,89 @@ fn daemon_push_job_applies_and_reconciles_through_single_store_owner() {
     let journal = supervisor.store().list_journal().expect("journal");
     assert_eq!(journal.len(), 1);
     assert_eq!(journal[0].status, JournalStatus::Reconciled);
+}
+
+#[test]
+fn auto_save_push_applies_safe_update_and_keeps_enrollment_active() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store("Old body.");
+    store
+        .save_auto_save_enrollment(
+            AutoSaveEnrollmentRecord::new(
+                fixture.mount_id.clone(),
+                "Roadmap.md",
+                AutoSaveOrigin::AfsCreated,
+                "now",
+            )
+            .active("now"),
+        )
+        .expect("save enrollment");
+    fixture.write_page("New body.");
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "New body."),
+    );
+
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        fixture.push_job(false),
+        &source,
+        None,
+    )
+    .expect("auto-save push");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert_eq!(source.applied_count(), 1);
+    let enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, Path::new("Roadmap.md"))
+        .expect("get enrollment")
+        .expect("enrollment");
+    assert!(enrollment.enabled);
+    assert_eq!(enrollment.state, AutoSaveState::Active);
+    assert_eq!(enrollment.remote_id, Some(fixture.remote_id.clone()));
+    assert!(enrollment.last_push_id.is_some());
+}
+
+#[test]
+fn auto_save_push_pauses_when_remote_changed_before_apply() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store("Old body.");
+    store
+        .save_auto_save_enrollment(
+            AutoSaveEnrollmentRecord::new(
+                fixture.mount_id.clone(),
+                "Roadmap.md",
+                AutoSaveOrigin::AfsCreated,
+                "now",
+            )
+            .active("now"),
+        )
+        .expect("save enrollment");
+    fixture.write_page("New body.");
+    let source = FakePushSource::with_remote(rendered_entity("page-1", "Remote body."));
+
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        fixture.push_job(false),
+        &source,
+        None,
+    )
+    .expect("auto-save push");
+
+    assert_eq!(report.action, PushJobAction::Failed);
+    assert_eq!(source.applied_count(), 0);
+    let enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, Path::new("Roadmap.md"))
+        .expect("get enrollment")
+        .expect("enrollment");
+    assert_eq!(enrollment.state, AutoSaveState::PausedRemoteChanged);
+    assert!(
+        enrollment
+            .last_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("changed since")
+    );
 }
 
 #[test]
@@ -328,6 +414,165 @@ fn daemon_push_job_plans_pending_virtual_create() {
 }
 
 #[test]
+fn daemon_push_job_reads_explicit_pending_virtual_create_from_projected_path() {
+    let fixture = PushFixture::new();
+    let cache_path = fixture.root.join(".content/Roadmap/Draft/page.md");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(&cache_path, "").expect("stale cache file");
+    let projected_path = fixture.root.join("Roadmap/Draft/page.md");
+    fs::create_dir_all(projected_path.parent().expect("projected parent"))
+        .expect("projected parent");
+    fs::write(
+        &projected_path,
+        "---\ntitle: Fresh Draft\n---\n# Fresh Draft\n\nProjected body.\n",
+    )
+    .expect("projected file");
+
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::WindowsCloudFiles),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            fixture.remote_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap.md",
+        ))
+        .expect("save parent page");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(fixture.remote_id.clone()),
+            "Roadmap/Draft/page.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: projected_path,
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &FakePushSource::default(),
+        None,
+    )
+    .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    assert!(report.pipeline.validation.issues.is_empty());
+    let plan = report.pipeline.plan.expect("plan");
+    match &plan.operations[0] {
+        PushOperation::CreateEntity {
+            title,
+            body,
+            source_path,
+            ..
+        } => {
+            assert_eq!(title, "Fresh Draft");
+            assert_eq!(body, "# Fresh Draft\n\nProjected body.\n");
+            assert_eq!(source_path, &PathBuf::from("Roadmap/Draft/page.md"));
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[test]
+fn auto_save_push_applies_pending_virtual_create_and_tracks_created_remote() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("Roadmap/Draft.md");
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(&cache_path, "---\ntitle: Draft\n---\n# Draft\n\nBody.\n").expect("cache file");
+
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            fixture.remote_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap.md",
+        ))
+        .expect("save parent page");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(fixture.remote_id.clone()),
+            "Roadmap/Draft.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    store
+        .save_auto_save_enrollment(AutoSaveEnrollmentRecord::new(
+            fixture.mount_id.clone(),
+            source_path,
+            AutoSaveOrigin::AfsCreated,
+            "now",
+        ))
+        .expect("save enrollment");
+    let created_remote_id = RemoteId::new("page-2");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            created_remote_id.clone(),
+            rendered_entity("page-2", "Body."),
+        )
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-draft".to_string()),
+            operation_index: 0,
+            parent_id: fixture.remote_id.clone(),
+            entity_id: created_remote_id.clone(),
+        }]);
+
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("auto-save create");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert_eq!(source.applied_count(), 1);
+    let enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, source_path)
+        .expect("get enrollment")
+        .expect("enrollment");
+    assert_eq!(enrollment.state, AutoSaveState::Active);
+    assert_eq!(enrollment.remote_id, Some(created_remote_id.clone()));
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
+            .expect("find mutation")
+            .is_none()
+    );
+}
+
+#[test]
 fn daemon_push_job_plans_pending_virtual_delete_from_scope() {
     let fixture = PushFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -458,6 +703,88 @@ fn daemon_push_job_plans_pending_virtual_delete_from_file_path() {
 }
 
 #[test]
+fn auto_save_push_blocks_pending_virtual_delete_without_applying() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save page");
+    store
+        .save_shadow(&fixture.mount_id, shadow("page-1", "Old body."))
+        .expect("save shadow");
+    let cached_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, Path::new("Roadmap.md"))
+            .expect("cache path");
+    fs::create_dir_all(cached_path.parent().expect("cache parent")).expect("cache parent");
+    fixture.write_page_to(&cached_path, "Old body.");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "delete:page-1",
+            VirtualMutationKind::Delete,
+            Some(fixture.remote_id.clone()),
+            None,
+            "Roadmap.md",
+            None,
+        ))
+        .expect("save mutation");
+    store
+        .save_auto_save_enrollment(AutoSaveEnrollmentRecord::new(
+            fixture.mount_id.clone(),
+            "Roadmap.md",
+            AutoSaveOrigin::AfsCreated,
+            "now",
+        ))
+        .expect("save enrollment");
+    let source = FakePushSource::default();
+
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join("Roadmap.md"),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("auto-save delete");
+
+    assert_eq!(report.action, PushJobAction::NotReady);
+    assert_eq!(source.applied_count(), 0);
+    assert_eq!(
+        report.error.as_ref().expect("error").code,
+        "auto_save_blocked"
+    );
+    let enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, Path::new("Roadmap.md"))
+        .expect("get enrollment")
+        .expect("enrollment");
+    assert_eq!(enrollment.state, AutoSaveState::Blocked);
+    assert_eq!(
+        enrollment.last_reason.as_deref(),
+        Some("deletions require review")
+    );
+    assert!(store.list_journal().expect("journal").is_empty());
+}
+
+#[test]
 fn daemon_push_job_plans_normal_update_for_pending_virtual_rename_path() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
@@ -547,6 +874,17 @@ impl PushFixture {
         &self,
         synced_body: &str,
     ) -> DaemonSupervisor<InMemoryStateStore, RecordingWatcher, HydrationQueue> {
+        let store = self.store(synced_body);
+
+        DaemonSupervisor::new(
+            store,
+            RecordingWatcher::default(),
+            HydrationQueue::new(),
+            PullScheduler::new(Default::default()),
+        )
+    }
+
+    fn store(&self, synced_body: &str) -> InMemoryStateStore {
         let mut store = InMemoryStateStore::new();
         let mount = MountConfig::new(self.mount_id.clone(), "notion", self.root.clone());
         store.save_mount(mount).expect("save mount");
@@ -566,13 +904,7 @@ impl PushFixture {
         store
             .save_shadow(&self.mount_id, shadow("page-1", synced_body))
             .expect("save shadow");
-
-        DaemonSupervisor::new(
-            store,
-            RecordingWatcher::default(),
-            HydrationQueue::new(),
-            PullScheduler::new(Default::default()),
-        )
+        store
     }
 
     fn push_job(&self, assume_yes: bool) -> PushJob {
@@ -621,6 +953,8 @@ struct FakePushSource {
     applied: std::cell::Cell<usize>,
     requested_paths: std::cell::RefCell<Vec<PathBuf>>,
     supported_operations: Option<BTreeSet<PushOperationKind>>,
+    created_entities: BTreeMap<RemoteId, HydratedEntity>,
+    apply_effects: Vec<JournalApplyEffect>,
 }
 
 impl FakePushSource {
@@ -628,9 +962,7 @@ impl FakePushSource {
         Self {
             remote_before_apply: Some(remote.clone()),
             remote_after_apply: Some(remote),
-            applied: std::cell::Cell::new(0),
-            requested_paths: std::cell::RefCell::new(Vec::new()),
-            supported_operations: None,
+            ..Self::default()
         }
     }
 
@@ -641,9 +973,7 @@ impl FakePushSource {
         Self {
             remote_before_apply: Some(remote_before_apply),
             remote_after_apply: Some(remote_after_apply),
-            applied: std::cell::Cell::new(0),
-            requested_paths: std::cell::RefCell::new(Vec::new()),
-            supported_operations: None,
+            ..Self::default()
         }
     }
 
@@ -662,6 +992,16 @@ impl FakePushSource {
         self.supported_operations = Some(supported_operations);
         self
     }
+
+    fn with_created_entity(mut self, remote_id: RemoteId, rendered: HydratedEntity) -> Self {
+        self.created_entities.insert(remote_id, rendered);
+        self
+    }
+
+    fn with_apply_effects(mut self, effects: Vec<JournalApplyEffect>) -> Self {
+        self.apply_effects = effects;
+        self
+    }
 }
 
 impl HydrationSource for FakePushSource {
@@ -669,10 +1009,13 @@ impl HydrationSource for FakePushSource {
         &self,
         request: &afs_core::hydration::HydrationRequest,
     ) -> AfsResult<HydratedEntity> {
+        self.requested_paths.borrow_mut().push(request.path.clone());
+        if let Some(rendered) = self.created_entities.get(&request.remote_id) {
+            return Ok(rendered.clone());
+        }
         if request.remote_id != RemoteId::new("page-1") {
             return Err(AfsError::InvalidState("unexpected remote id".to_string()));
         }
-        self.requested_paths.borrow_mut().push(request.path.clone());
 
         let remote = if self.applied.get() == 0 {
             self.remote_before_apply.clone()
@@ -725,9 +1068,14 @@ impl Connector for FakePushSource {
 
     fn apply(&self, request: ApplyPlanRequest<'_>) -> AfsResult<ApplyPlanResult> {
         self.applied.set(self.applied.get() + 1);
+        let changed_remote_ids = if self.apply_effects.is_empty() {
+            request.plan.affected_entities.clone()
+        } else {
+            Vec::new()
+        };
         Ok(ApplyPlanResult {
-            changed_remote_ids: request.plan.affected_entities.clone(),
-            effects: Vec::new(),
+            changed_remote_ids,
+            effects: self.apply_effects.clone(),
         })
     }
 
@@ -739,7 +1087,9 @@ impl Connector for FakePushSource {
 fn rendered_entity(remote_id: &str, plain_body: &str) -> HydratedEntity {
     let body = markdown_body(plain_body);
     let document = CanonicalDocument::new(
-        "afs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+        format!(
+            "afs:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n"
+        ),
         body.clone(),
     );
     HydratedEntity {

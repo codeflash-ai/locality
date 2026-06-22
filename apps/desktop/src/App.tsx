@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   AlertTriangle,
   Bot,
@@ -9,20 +11,28 @@ import {
   Clipboard,
   Clock3,
   Copy,
+  Download,
   EyeOff,
   FolderOpen,
   History,
   Home,
   ListChecks,
   Loader2,
+  Minus,
   Power,
+  RefreshCw,
   RotateCcw,
   Search,
   Settings,
   ShieldCheck,
   Sparkles,
+  Square,
+  X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+
+const distributionChannel = (import.meta.env.VITE_AFS_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
+const appStoreDistribution = distributionChannel === "mas";
 
 type AppView = "home" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
@@ -47,6 +57,7 @@ type DesktopSnapshot = {
     projection: string;
     readOnly: boolean;
     status: string;
+    provider?: ProviderRuntimeSummary | null;
   };
   settings: {
     launchAtLogin: boolean;
@@ -62,12 +73,19 @@ type PendingChange = {
   localPath: string;
   summary: string;
   state: "safe" | "needs_review" | "conflict" | "blocked";
+  autoSave: {
+    enabled: boolean;
+    state: "off" | "active" | "blocked" | "paused_remote_changed" | "paused_failure";
+    label: string;
+    reason?: string | null;
+  };
 };
 
 type ActivityItem = {
   title: string;
   detail: string;
   when: string;
+  occurredAt?: string | null;
   kind: string;
   undoAvailable: boolean;
 };
@@ -76,6 +94,15 @@ type ConnectorSuggestion = {
   connector: string;
   description: string;
   state: string;
+};
+
+type ProviderRuntimeSummary = {
+  state: string;
+  message: string;
+  daemonRunning: boolean;
+  registered?: boolean | null;
+  pid?: number | null;
+  stalePidFile: boolean;
 };
 
 type LocatedItem = {
@@ -99,6 +126,13 @@ type PushPlan = {
 type ActionReport = {
   ok: boolean;
   message: string;
+};
+
+type UpdateStatus = {
+  state: "idle" | "checking" | "available" | "installing" | "current" | "error";
+  message: string;
+  update: Update | null;
+  version?: string;
 };
 
 type FileDetailReport = {
@@ -133,14 +167,6 @@ type AgentGuidanceInstallReport = {
   prompt: string;
 };
 
-type InstallStateReview = {
-  shouldPrompt: boolean;
-  stateExists: boolean;
-  sqliteExists: boolean;
-  previousBuildId?: string | null;
-  currentBuildId: string;
-};
-
 const sampleSnapshot: DesktopSnapshot = {
   health: {
     state: "ready",
@@ -160,6 +186,7 @@ const sampleSnapshot: DesktopSnapshot = {
     projection: "macOS File Provider",
     readOnly: false,
     status: "ready",
+    provider: null,
   },
   settings: {
     launchAtLogin: true,
@@ -171,18 +198,21 @@ const sampleSnapshot: DesktopSnapshot = {
       localPath: "Engineering/Roadmap 2026/page.md",
       summary: "2 text edits",
       state: "safe",
+      autoSave: { enabled: false, state: "off", label: "Auto-save off" },
     },
     {
       title: "Launch Plan",
       localPath: "Marketing/Launch Plan/page.md",
       summary: "needs review: large deletion",
       state: "needs_review",
+      autoSave: { enabled: false, state: "off", label: "Auto-save off" },
     },
     {
       title: "Customer Notes",
       localPath: "Sales/Customer Notes/page.md",
       summary: "1 property edit",
       state: "safe",
+      autoSave: { enabled: true, state: "active", label: "Auto-save on" },
     },
   ],
   activity: [
@@ -190,6 +220,7 @@ const sampleSnapshot: DesktopSnapshot = {
       title: "Pushed Roadmap 2026 to Notion",
       detail: "2 block edits",
       when: "Today",
+      occurredAt: "unix_ms:1782033300000",
       kind: "push",
       undoAvailable: true,
     },
@@ -197,6 +228,7 @@ const sampleSnapshot: DesktopSnapshot = {
       title: "Located Launch Plan",
       detail: "Prepared local path for an agent",
       when: "Today",
+      occurredAt: "unix_ms:1782028800000",
       kind: "locate",
       undoAvailable: false,
     },
@@ -204,6 +236,7 @@ const sampleSnapshot: DesktopSnapshot = {
       title: "Connected Notion workspace CodeFlash",
       detail: "Credentials stored in the OS credential store",
       when: "Earlier",
+      occurredAt: "unix_ms:1781942400000",
       kind: "connect",
       undoAvailable: false,
     },
@@ -294,6 +327,19 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function emptyUpdateStatus(): UpdateStatus {
+  return { state: "idle", message: "", update: null };
+}
+
+function updaterErrorMessage(error: unknown) {
+  const message = errorMessage(error);
+  const lower = message.toLowerCase();
+  if (lower.includes("updater") && (lower.includes("config") || lower.includes("endpoint"))) {
+    return "Updates are not configured for this build.";
+  }
+  return message;
+}
+
 function useNotionSearchResults(query: string, enabled = true) {
   const [results, setResults] = useState<LocatedItem[]>([]);
   const [searching, setSearching] = useState(false);
@@ -347,31 +393,137 @@ export default function App() {
   const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
   const route = window.location.hash;
-  const [showOnboarding, setShowOnboarding] = useState(() => route !== "#app" && route !== "#tray");
-  const [installReview, setInstallReview] = useState<InstallStateReview | null>(null);
+  const [showOnboarding, setShowOnboarding] = useState(() => route === "#onboarding-ready");
   const [onboardingKey, setOnboardingKey] = useState(0);
   const [onboardingInitialStep, setOnboardingInitialStep] = useState<1 | 4>(() =>
     route === "#onboarding-ready" ? 4 : 1,
   );
-  const setupIsComplete = setupComplete(snapshot);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
+  const refreshSnapshotPromise = useRef<Promise<void> | null>(null);
+  const refreshSnapshotQueued = useRef(false);
 
   async function refreshSnapshot() {
-    const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
-    setSnapshot(nextSnapshot);
-    setSnapshotLoaded(true);
+    if (refreshSnapshotPromise.current) {
+      refreshSnapshotQueued.current = true;
+      return refreshSnapshotPromise.current;
+    }
+
+    const run = async () => {
+      do {
+        refreshSnapshotQueued.current = false;
+        const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
+        setSnapshot(nextSnapshot);
+        setSnapshotLoaded(true);
+      } while (refreshSnapshotQueued.current);
+    };
+
+    const promise = run().finally(() => {
+      refreshSnapshotPromise.current = null;
+    });
+    refreshSnapshotPromise.current = promise;
+    return promise;
+  }
+
+  async function checkForAppUpdate(options: { silent?: boolean } = {}) {
+    if (appStoreDistribution) {
+      if (!options.silent) {
+        setUpdateStatus({
+          state: "current",
+          message: "Updates are managed by the Mac App Store.",
+          update: null,
+        });
+      }
+      return;
+    }
+
+    if (!isTauriRuntime()) {
+      if (!options.silent) {
+        setUpdateStatus({
+          state: "error",
+          message: "Updates are available in the packaged app.",
+          update: null,
+        });
+      }
+      return;
+    }
+
+    if (!options.silent) {
+      setUpdateStatus({ state: "checking", message: "Checking for updates.", update: null });
+    }
+
+    try {
+      const update = await check();
+      if (!update) {
+        if (!options.silent) {
+          setUpdateStatus({ state: "current", message: "AFS is up to date.", update: null });
+        }
+        return;
+      }
+
+      setUpdateStatus({
+        state: "available",
+        message: `AFS ${update.version} is ready to install.`,
+        update,
+        version: update.version,
+      });
+    } catch (error) {
+      if (!options.silent) {
+        setUpdateStatus({ state: "error", message: updaterErrorMessage(error), update: null });
+      }
+    }
+  }
+
+  async function installAppUpdate() {
+    if (appStoreDistribution) {
+      setUpdateStatus({
+        state: "current",
+        message: "Updates are managed by the Mac App Store.",
+        update: null,
+      });
+      return;
+    }
+
+    if (!isTauriRuntime()) {
+      setUpdateStatus({
+        state: "error",
+        message: "Updates are available in the packaged app.",
+        update: null,
+      });
+      return;
+    }
+
+    setUpdateStatus((current) => ({
+      ...current,
+      state: "installing",
+      message: current.version ? `Installing AFS ${current.version}.` : "Installing update.",
+    }));
+
+    try {
+      const update = updateStatus.update ?? (await check());
+      if (!update) {
+        setUpdateStatus({ state: "current", message: "AFS is up to date.", update: null });
+        return;
+      }
+      await update.downloadAndInstall();
+      setUpdateStatus({
+        state: "installing",
+        message: "Restarting AFS to finish the update.",
+        update: null,
+        version: update.version,
+      });
+      await relaunch();
+    } catch (error) {
+      setUpdateStatus({ state: "error", message: updaterErrorMessage(error), update: null });
+    }
   }
 
   useEffect(() => {
     void (async () => {
       if (isTauriRuntime()) {
-        const review = await callCommand<InstallStateReview>("install_state_review");
-        if (review.shouldPrompt) {
-          setInstallReview(review);
-          setSnapshotLoaded(true);
-          return;
-        }
         await callCommand<ActionReport>("acknowledge_install_state").catch(() => undefined);
-        await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
+        if (!appStoreDistribution) {
+          await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
+        }
         await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
       }
       await refreshSnapshot();
@@ -382,13 +534,29 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!snapshotLoaded || route === "#app" || route === "#tray" || route === "#onboarding-ready") {
+    if (!isTauriRuntime() || appStoreDistribution) {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => {
+      void checkForAppUpdate({ silent: true });
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!snapshotLoaded || route === "#tray") {
       return;
     }
-    if (setupIsComplete) {
-      setShowOnboarding(false);
+
+    if (route === "#onboarding-ready") {
+      setShowOnboarding(true);
+      return;
     }
-  }, [route, setupIsComplete, snapshotLoaded]);
+
+    setShowOnboarding(false);
+  }, [route, snapshotLoaded]);
 
   useEffect(() => {
     const handleOpenView = (event: Event) => {
@@ -423,43 +591,6 @@ export default function App() {
     return <TrayPopover snapshot={snapshot} />;
   }
 
-  if (installReview?.shouldPrompt) {
-    return (
-      <StateResetPrompt
-        review={installReview}
-        onReset={async () => {
-          const report = await callCommand<ActionReport>("reset_local_afs_state", undefined, {
-            ok: true,
-            message: "AFS local state was reset.",
-          });
-          if (!report.ok) {
-            throw new Error(report.message);
-          }
-          setSnapshotLoaded(false);
-          setOnboardingInitialStep(1);
-          setOnboardingKey((key) => key + 1);
-          await refreshSnapshot();
-          setInstallReview(null);
-          setView("home");
-          setShowOnboarding(true);
-        }}
-        onKeep={async () => {
-          const report = await callCommand<ActionReport>("acknowledge_install_state", undefined, {
-            ok: true,
-            message: "AFS install state recorded.",
-          });
-          if (!report.ok) {
-            throw new Error(report.message);
-          }
-          setInstallReview(null);
-          await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
-          await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
-          await refreshSnapshot();
-        }}
-      />
-    );
-  }
-
   if (showOnboarding) {
     return (
       <Onboarding
@@ -482,6 +613,11 @@ export default function App() {
       view={view}
       onViewChange={setView}
       onRefresh={refreshSnapshot}
+      updateStatus={updateStatus}
+      onCheckForUpdate={checkForAppUpdate}
+      onInstallUpdate={installAppUpdate}
+      onDismissUpdate={() => setUpdateStatus(emptyUpdateStatus())}
+      appStoreDistribution={appStoreDistribution}
       onResetComplete={() => {
         setOnboardingInitialStep(1);
         setOnboardingKey((key) => key + 1);
@@ -489,76 +625,6 @@ export default function App() {
         setShowOnboarding(true);
       }}
     />
-  );
-}
-
-function StateResetPrompt({
-  review,
-  onReset,
-  onKeep,
-}: {
-  review: InstallStateReview;
-  onReset: () => Promise<void>;
-  onKeep: () => Promise<void>;
-}) {
-  const [state, setState] = useState<"idle" | "resetting" | "keeping" | "error">("idle");
-  const [message, setMessage] = useState("");
-
-  async function run(action: "reset" | "keep") {
-    setState(action === "reset" ? "resetting" : "keeping");
-    setMessage("");
-    try {
-      await (action === "reset" ? onReset() : onKeep());
-    } catch (error) {
-      setState("error");
-      setMessage(errorMessage(error));
-    }
-  }
-
-  return (
-    <main className="setup-shell">
-      <section className="setup-window">
-        <WindowChrome title="AFS Setup" meta="State Check" />
-        <SetupContent mark={<BrandTile variant="folder" />}>
-          <div>
-            <div className="sync-note warning">
-              <AlertTriangle />
-              Previous install found
-            </div>
-            <h1>Start this beta with clean AFS state?</h1>
-            <p>
-              AFS found an existing local database from an earlier build. During the beta, resetting
-              avoids mount and schema drift. Your local files and folders are left in place.
-            </p>
-          </div>
-          <div className="state-reset-card">
-            <SettingRow title="Local database" value={review.sqliteExists ? "~/.afs/state.sqlite3" : "Not found"} />
-            <SettingRow title="Previous build" value={review.previousBuildId ?? "Unknown"} />
-            <SettingRow title="Current build" value={review.currentBuildId} />
-          </div>
-          <div className="button-row">
-            <PrimaryButton
-              icon={state === "resetting" ? <Loader2 className="spin-icon" /> : <RotateCcw />}
-              disabled={state === "resetting" || state === "keeping"}
-              onClick={() => void run("reset")}
-            >
-              {state === "resetting" ? "Resetting" : "Reset AFS State"}
-            </PrimaryButton>
-            <SecondaryButton
-              disabled={state === "resetting" || state === "keeping"}
-              onClick={() => void run("keep")}
-            >
-              Keep Existing State
-            </SecondaryButton>
-          </div>
-          <p className="quiet-note">
-            Reset clears AFS metadata, cache, mount registration, and connector credentials. It does
-            not delete documents outside AFS state.
-          </p>
-          {state === "error" && <p className="field-error">{message}</p>}
-        </SetupContent>
-      </section>
-    </main>
   );
 }
 
@@ -743,6 +809,10 @@ function Onboarding({
   }
 
   async function ensureCliAvailable() {
+    if (appStoreDistribution) {
+      return true;
+    }
+
     const report = await callCommand<ActionReport>(
       "ensure_terminal_cli_available",
       undefined,
@@ -1047,12 +1117,22 @@ function MainShell({
   view,
   onViewChange,
   onRefresh,
+  updateStatus,
+  onCheckForUpdate,
+  onInstallUpdate,
+  onDismissUpdate,
+  appStoreDistribution,
   onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
   view: AppView;
   onViewChange: (view: AppView) => void;
   onRefresh: () => Promise<void>;
+  updateStatus: UpdateStatus;
+  onCheckForUpdate: (options?: { silent?: boolean }) => Promise<void>;
+  onInstallUpdate: () => Promise<void>;
+  onDismissUpdate: () => void;
+  appStoreDistribution: boolean;
   onResetComplete: () => void;
 }) {
   const meta = snapshot.health.attentionCount > 0 ? "Pending Changes" : "Ready";
@@ -1115,6 +1195,12 @@ function MainShell({
         </aside>
 
         <section className="content">
+          <UpdateBanner
+            status={updateStatus}
+            onInstall={onInstallUpdate}
+            onDismiss={onDismissUpdate}
+            onSettings={() => onViewChange("settings")}
+          />
           {view === "home" && (
             <HomeView
               snapshot={snapshot}
@@ -1154,12 +1240,58 @@ function MainShell({
               snapshot={snapshot}
               onHome={() => onViewChange("home")}
               onRefresh={onRefresh}
+              updateStatus={updateStatus}
+              onCheckForUpdate={onCheckForUpdate}
+              onInstallUpdate={onInstallUpdate}
+              appStoreDistribution={appStoreDistribution}
               onResetComplete={onResetComplete}
             />
           )}
         </section>
       </div>
     </main>
+  );
+}
+
+function UpdateBanner({
+  status,
+  onInstall,
+  onDismiss,
+  onSettings,
+}: {
+  status: UpdateStatus;
+  onInstall: () => Promise<void>;
+  onDismiss: () => void;
+  onSettings: () => void;
+}) {
+  if (status.state !== "available" && status.state !== "installing") {
+    return null;
+  }
+
+  const installing = status.state === "installing";
+  return (
+    <div className="update-banner">
+      <div>
+        <strong>{status.version ? `AFS ${status.version} available` : "AFS update available"}</strong>
+        <p>{status.message}</p>
+      </div>
+      <div className="update-banner-actions">
+        <SecondaryButton compact onClick={onSettings}>
+          Settings
+        </SecondaryButton>
+        <PrimaryButton
+          compact
+          icon={installing ? <Loader2 className="spin-icon" /> : <Download />}
+          disabled={installing}
+          onClick={() => void onInstall()}
+        >
+          {installing ? "Installing" : "Install"}
+        </PrimaryButton>
+        <button className="update-dismiss" aria-label="Dismiss update notice" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1744,7 +1876,8 @@ function ReviewView({
 function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome: () => void }) {
   const grouped = useMemo(() => {
     return snapshot.activity.reduce<Record<string, ActivityItem[]>>((acc, item) => {
-      acc[item.when] = [...(acc[item.when] ?? []), item];
+      const label = activityGroupLabel(item);
+      acc[label] = [...(acc[label] ?? []), item];
       return acc;
     }, {});
   }, [snapshot.activity]);
@@ -1757,8 +1890,11 @@ function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome:
         <section className="activity-group" key={when}>
           <p className="label">{when}</p>
           {items.map((item) => (
-            <article className="activity-item" key={`${when}-${item.title}`}>
-              <Clock3 />
+            <article className="activity-item" key={`${when}-${item.kind}-${item.title}-${item.occurredAt ?? item.when}`}>
+              <span className="activity-time" title={activityFullTimeLabel(item)}>
+                <Clock3 />
+                <span>{activityTimeLabel(item)}</span>
+              </span>
               <div>
                 <h3>{item.title}</h3>
                 <p>{item.detail}</p>
@@ -1776,15 +1912,84 @@ function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome:
   );
 }
 
+function activityGroupLabel(item: ActivityItem) {
+  const date = parseActivityDate(item.occurredAt);
+  if (!date) {
+    return item.when;
+  }
+  if (sameCalendarDay(date, new Date())) {
+    return "Today";
+  }
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (sameCalendarDay(date, yesterday)) {
+    return "Yesterday";
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
+  }).format(date);
+}
+
+function activityTimeLabel(item: ActivityItem) {
+  const date = parseActivityDate(item.occurredAt);
+  if (!date) {
+    return item.when;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function activityFullTimeLabel(item: ActivityItem) {
+  const date = parseActivityDate(item.occurredAt);
+  if (!date) {
+    return item.when;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
+
+function parseActivityDate(value?: string | null) {
+  if (!value) {
+    return null;
+  }
+  const millis = value.startsWith("unix_ms:") ? Number(value.slice("unix_ms:".length)) : Number(value);
+  const date = Number.isFinite(millis)
+    ? new Date(value.length <= 10 ? millis * 1000 : millis)
+    : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function sameCalendarDay(left: Date, right: Date) {
+  return (
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate()
+  );
+}
+
 function SettingsView({
   snapshot,
   onHome,
   onRefresh,
+  updateStatus,
+  onCheckForUpdate,
+  onInstallUpdate,
+  appStoreDistribution,
   onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
   onHome: () => void;
   onRefresh: () => Promise<void>;
+  updateStatus: UpdateStatus;
+  onCheckForUpdate: (options?: { silent?: boolean }) => Promise<void>;
+  onInstallUpdate: () => Promise<void>;
+  appStoreDistribution: boolean;
   onResetComplete: () => void;
 }) {
   const [diagnosticMessage, setDiagnosticMessage] = useState("");
@@ -1796,20 +2001,29 @@ function SettingsView({
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const daemonStopped = snapshot.health.state === "stopped";
+  const runtimeStopped = snapshot.health.state === "runtime_stopped";
+  const runtimeNeedsRepair = daemonStopped || runtimeStopped;
+  const checkingForUpdate = updateStatus.state === "checking";
+  const installingUpdate = updateStatus.state === "installing";
+  const updateAvailable = updateStatus.state === "available" || updateStatus.state === "installing";
+  const updateChannelLabel = appStoreDistribution ? "Mac App Store" : "GitHub Releases";
+  const updateStatusLabel = appStoreDistribution
+    ? "Managed by the App Store"
+    : updateStatus.message || "Ready";
 
   useEffect(() => {
     setLocalSettings(snapshot.settings);
   }, [snapshot.settings.launchAtLogin, snapshot.settings.showMenuBar]);
 
   async function repairRuntime() {
-    if (!daemonStopped) {
+    if (!runtimeNeedsRepair) {
       return;
     }
     setDiagnosticMessage("");
     const report = await callCommand<ActionReport>(
       "ensure_runtime_ready",
       undefined,
-      { ok: true, message: "AFS daemon is running." },
+      { ok: true, message: "AFS runtime is running." },
     );
     setDiagnosticMessage(report.message);
     await onRefresh().catch(() => undefined);
@@ -1818,12 +2032,13 @@ function SettingsView({
   function copyDiagnostics() {
     const summary = [
       `AFS process: ${daemonStopped ? "Stopped" : "Running"}`,
+      snapshot.mount.provider ? `Provider: ${providerStatusLabel(snapshot.mount.provider)}` : null,
       "State folder: ~/.afs",
       `Projection: ${snapshot.mount.projection}`,
       `Connection: ${snapshot.connection.status}`,
       `Mount: ${snapshot.mount.status}`,
       `Pending changes: ${snapshot.pendingChanges.length}`,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
     copyText(summary);
     setDiagnosticMessage("Copied diagnostics summary.");
   }
@@ -1939,6 +2154,36 @@ function SettingsView({
         </div>
 
         <div className="panel">
+          <PanelTitle title="Updates" />
+          <SettingRow title="Channel" value={updateChannelLabel} />
+          <SettingRow
+            title="Status"
+            value={updateStatusLabel}
+          />
+          {updateStatus.version && <SettingRow title="Available version" value={updateStatus.version} />}
+          {!appStoreDistribution && (
+            <div className="button-row">
+              <SecondaryButton
+                compact
+                icon={checkingForUpdate ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+                disabled={checkingForUpdate || installingUpdate}
+                onClick={() => void onCheckForUpdate()}
+              >
+                {checkingForUpdate ? "Checking" : "Check"}
+              </SecondaryButton>
+              <PrimaryButton
+                compact
+                icon={installingUpdate ? <Loader2 className="spin-icon" /> : <Download />}
+                disabled={!updateAvailable || checkingForUpdate || installingUpdate}
+                onClick={() => void onInstallUpdate()}
+              >
+                {installingUpdate ? "Installing" : "Install"}
+              </PrimaryButton>
+            </div>
+          )}
+        </div>
+
+        <div className="panel">
           <PanelTitle title="Agent Instructions" />
           <SettingRow title="Local agents" value="Claude, Codex, Warp, Cursor, Gemini, Cline/Roo" />
           <SettingRow title="Notion guidance" value="Installed under /AFS/notion" />
@@ -1956,14 +2201,17 @@ function SettingsView({
         <div className="panel">
           <PanelTitle title="Diagnostics" />
           <SettingRow title="AFS process" value={daemonStopped ? "Stopped" : "Running"} />
+          {snapshot.mount.provider && (
+            <SettingRow title="Provider" value={providerStatusLabel(snapshot.mount.provider)} />
+          )}
           <SettingRow title="State folder" value="~/.afs" />
           <SettingRow title="Projection" value={snapshot.mount.projection} />
           <div className="button-row">
             <SecondaryButton compact onClick={copyDiagnostics}>
               Copy Summary
             </SecondaryButton>
-            <SecondaryButton compact disabled={!daemonStopped} onClick={() => void repairRuntime()}>
-              {daemonStopped ? "Start AFS" : "Repair AFS"}
+            <SecondaryButton compact disabled={!runtimeNeedsRepair} onClick={() => void repairRuntime()}>
+              {runtimeNeedsRepair ? "Start AFS" : "Repair AFS"}
             </SecondaryButton>
           </div>
           {diagnosticMessage && <p className="quiet-note inline-note">{diagnosticMessage}</p>}
@@ -2219,6 +2467,34 @@ function FileChangeList({
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [details, setDetails] = useState<Record<string, FileDetailStatus>>({});
   const [editors, setEditors] = useState<Record<string, FileEditorStatus>>({});
+  const [autoSaveOverrides, setAutoSaveOverrides] = useState<Record<string, PendingChange["autoSave"]>>({});
+
+  useEffect(() => {
+    setAutoSaveOverrides((current) => {
+      let changed = false;
+      const next = { ...current };
+      const activePaths = new Set(changes.map((change) => change.localPath));
+      for (const path of Object.keys(next)) {
+        if (!activePaths.has(path)) {
+          delete next[path];
+          changed = true;
+        }
+      }
+      for (const change of changes) {
+        const override = next[change.localPath];
+        if (
+          override &&
+          override.enabled === change.autoSave.enabled &&
+          override.state === change.autoSave.state &&
+          override.label === change.autoSave.label
+        ) {
+          delete next[change.localPath];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [changes]);
 
   async function loadFileDetails(change: PendingChange) {
     setDetails((current) => ({
@@ -2364,6 +2640,54 @@ function FileChangeList({
     }
   }
 
+  async function toggleAutoSave(change: PendingChange, enabled: boolean) {
+    const path = joinMountPath(mountPath, change.localPath);
+    const optimisticState: PendingChange["autoSave"] = {
+      ...change.autoSave,
+      enabled,
+      state: enabled ? "active" : "off",
+      label: enabled ? "Auto-save on" : "Auto-save off",
+      reason: null,
+    };
+    setAutoSaveOverrides((current) => ({
+      ...current,
+      [change.localPath]: optimisticState,
+    }));
+    setActions((current) => ({
+      ...current,
+      [change.localPath]: { state: "working", message: enabled ? "Turning on auto-save..." : "Turning off auto-save..." },
+    }));
+
+    try {
+      const report = await callCommand<ActionReport>("set_auto_save_for_file", {
+        change: { path, enabled },
+      });
+      setActions((current) => ({
+        ...current,
+        [change.localPath]: {
+          state: report.ok ? "success" : "error",
+          message: report.message,
+        },
+      }));
+      if (!report.ok) {
+        setAutoSaveOverrides((current) => ({
+          ...current,
+          [change.localPath]: change.autoSave,
+        }));
+      }
+      await onRefresh?.().catch(() => undefined);
+    } catch (error) {
+      setAutoSaveOverrides((current) => ({
+        ...current,
+        [change.localPath]: change.autoSave,
+      }));
+      setActions((current) => ({
+        ...current,
+        [change.localPath]: { state: "error", message: errorMessage(error) },
+      }));
+    }
+  }
+
   return (
     <section className="file-list">
       {changes.map((change) => {
@@ -2376,6 +2700,7 @@ function FileChangeList({
         const shouldReviewBeforePush = Boolean(!confirmDangerous && change.state === "needs_review" && onReview);
         const actionNeedsReview = Boolean(action?.state === "error" && pushNeedsReview(action.message) && onReview);
         const isSelected = selectedPath === change.localPath;
+        const autoSave = autoSaveOverrides[change.localPath] ?? change.autoSave;
         return (
           <article className={`file-row ${change.state} ${isSelected ? "expanded" : ""}`} key={change.localPath}>
             <div className="file-state">
@@ -2420,6 +2745,18 @@ function FileChangeList({
               )}
             </div>
             <div className="file-row-actions">
+              <div className={`auto-save-control ${autoSave.state}`}>
+                <span title={autoSave.reason || autoSave.label}>{autoSave.label}</span>
+                <button
+                  className={`toggle ${autoSave.enabled ? "enabled" : ""}`}
+                  type="button"
+                  disabled={isWorking}
+                  aria-label={`${autoSave.enabled ? "Turn off" : "Turn on"} auto-save for ${change.title}`}
+                  onClick={() => void toggleAutoSave(change, !autoSave.enabled)}
+                >
+                  <i />
+                </button>
+              </div>
               <SecondaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "diff")}>
                 Diff
               </SecondaryButton>
@@ -2801,11 +3138,19 @@ function WindowChrome({
   metaTitle?: string;
   onMetaClick?: () => void;
 }) {
+  const showWindowControls = isWindowsRuntime();
+
   return (
-    <div className="window-chrome" onMouseDown={handleChromeMouseDown}>
+    <div
+      className={`window-chrome ${showWindowControls ? "windows-chrome" : ""}`}
+      onMouseDown={handleChromeMouseDown}
+    >
       <div className="native-traffic-space" aria-hidden="true" />
       <div data-tauri-drag-region>{title}</div>
-      <div data-tauri-drag-region={!onMetaClick || undefined}>
+      <div
+        className="window-chrome-actions"
+        data-tauri-drag-region={(!onMetaClick && !showWindowControls) || undefined}
+      >
         {onMetaClick ? (
           <button className="window-meta-button" title={metaTitle} onClick={onMetaClick}>
             {meta}
@@ -2813,7 +3158,42 @@ function WindowChrome({
         ) : (
           <span title={metaTitle}>{meta}</span>
         )}
+        {showWindowControls && <WindowsWindowControls />}
       </div>
+    </div>
+  );
+}
+
+function WindowsWindowControls() {
+  return (
+    <div className="window-controls" aria-label="Window controls">
+      <button
+        className="window-control-button"
+        type="button"
+        aria-label="Minimize"
+        title="Minimize"
+        onClick={() => void getCurrentWindow().minimize()}
+      >
+        <Minus />
+      </button>
+      <button
+        className="window-control-button"
+        type="button"
+        aria-label="Maximize or restore"
+        title="Maximize or restore"
+        onClick={() => void getCurrentWindow().toggleMaximize()}
+      >
+        <Square />
+      </button>
+      <button
+        className="window-control-button close"
+        type="button"
+        aria-label="Close"
+        title="Close"
+        onClick={() => void getCurrentWindow().close()}
+      >
+        <X />
+      </button>
     </div>
   );
 }
@@ -2830,6 +3210,10 @@ function handleChromeMouseDown(event: React.MouseEvent<HTMLDivElement>) {
 
   event.preventDefault();
   void getCurrentWindow().startDragging();
+}
+
+function isWindowsRuntime() {
+  return typeof navigator !== "undefined" && /^Win/i.test(navigator.platform);
 }
 
 function SetupContent({
@@ -2966,7 +3350,16 @@ function StatusPill({
   tone: "ready" | "warn" | "danger";
   title?: string;
 }) {
-  return <span className={`status-pill ${tone}`} title={title}>{children}</span>;
+  return (
+    <span
+      className={`status-pill ${tone} ${title ? "has-tooltip" : ""}`}
+      aria-label={title}
+      data-tooltip={title}
+      tabIndex={title ? 0 : undefined}
+    >
+      {children}
+    </span>
+  );
 }
 
 function ApertureIcon({ state = "default" }: { state?: "default" | "review" | "reconnect" }) {
@@ -3058,10 +3451,6 @@ function mountMissing(snapshot: DesktopSnapshot) {
   return snapshot.mount.status === "not_mounted";
 }
 
-function setupComplete(snapshot: DesktopSnapshot) {
-  return !connectionMissing(snapshot) && !mountMissing(snapshot);
-}
-
 function isAppView(value: string): value is AppView {
   return value === "home" || value === "mount" || value === "pending" || value === "review" || value === "activity" || value === "settings";
 }
@@ -3075,6 +3464,9 @@ function healthLabel(state: string) {
   }
   if (state === "stopped") {
     return "Stopped";
+  }
+  if (state === "runtime_stopped") {
+    return "Runtime Needs Repair";
   }
   if (state === "checking_freshness") {
     return "Checking";
@@ -3090,7 +3482,10 @@ function healthDescription(state: string, attentionCount: number) {
     return "Notion needs to be reconnected before AFS can sync this workspace.";
   }
   if (state === "stopped") {
-    return "The AFS daemon is stopped; the app can still run direct actions when needed.";
+    return "The AFS daemon is stopped. Background sync, hydration, and auto-save are paused; direct actions can still run from the app.";
+  }
+  if (state === "runtime_stopped") {
+    return "The filesystem provider is stopped or unregistered. Use Repair AFS in Settings to restore online-only file access.";
   }
   if (state === "checking_freshness") {
     return "AFS is checking the local mount and Notion freshness state.";
@@ -3099,7 +3494,7 @@ function healthDescription(state: string, attentionCount: number) {
 }
 
 function healthTone(state: string): "ready" | "warn" | "danger" {
-  if (state === "reconnect_needed" || state === "stopped") {
+  if (state === "reconnect_needed" || state === "stopped" || state === "runtime_stopped") {
     return "danger";
   }
   if (state === "needs_review") {
@@ -3109,7 +3504,7 @@ function healthTone(state: string): "ready" | "warn" | "danger" {
 }
 
 function healthIconState(state: string): "default" | "review" | "reconnect" {
-  if (state === "reconnect_needed" || state === "stopped") {
+  if (state === "reconnect_needed" || state === "stopped" || state === "runtime_stopped") {
     return "reconnect";
   }
   if (state === "needs_review") {
@@ -3138,6 +3533,21 @@ function locatedStateLabel(state: LocatedItem["state"]) {
     return "Not Found";
   }
   return "Ready";
+}
+
+function providerStatusLabel(provider: ProviderRuntimeSummary) {
+  const state = provider.state === "running" ? "Running" : provider.state === "stopped" ? "Stopped" : "Error";
+  const parts = [state];
+  if (provider.pid) {
+    parts.push(`pid ${provider.pid}`);
+  }
+  if (provider.registered === false) {
+    parts.push("not registered");
+  }
+  if (provider.stalePidFile) {
+    parts.push("stale pid");
+  }
+  return parts.join(" - ");
 }
 
 function joinMountPath(mountPath: string, relativePath: string) {

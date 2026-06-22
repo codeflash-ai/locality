@@ -20,25 +20,28 @@ use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::pull::PullMode;
 use afs_store::{
-    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    HydrationJobRecord, HydrationJobRepository, MountConfig, MountRepository,
-    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-    open_credential_store,
+    AutoSaveRepository, AutoSaveState, EntityRecord, EntityRepository, FreshnessStateRecord,
+    FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
+    MountRepository, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
+    SqliteStateStore, open_credential_store,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::DaemonConfig;
+use crate::autosave::{auto_save_target_for_write, pause_auto_save_for_remote_change};
 use crate::execution::{DaemonEventReport, PushJob};
+use crate::file_provider::FileProviderReadReport;
 use crate::freshness::{
     FreshnessQueue, freshness_timestamp, record_file_opened, record_local_change,
 };
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationQueue};
 use crate::ipc::{DaemonActiveJobStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use crate::pull::run_pull_with_state_root;
-use crate::push::execute_push_job_with_content_root;
+use crate::push::{
+    execute_auto_save_push_job_with_content_root, execute_push_job_with_content_root,
+};
 use crate::reconcile::{
     DefaultFetchScheduleStrategy, ScheduledPullReport, reconcile_scheduled_pull_with_state_root,
 };
@@ -46,12 +49,12 @@ use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::shadow_match::parsed_matches_shadow;
 use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
-    ROOT_CONTAINER_IDENTIFIER, VirtualFsItem, VirtualFsItemKind, VirtualFsMaterializeOutcome,
-    commit_virtual_fs_write, create_virtual_fs_file, materialize_virtual_fs_item_with_content_root,
-    refresh_virtual_fs_children, rename_virtual_fs_item, source_root_identifier,
-    trash_virtual_fs_item, virtual_fs_children_refresh_needed,
-    virtual_fs_children_with_content_root, virtual_fs_content_root,
-    virtual_fs_item_with_content_root,
+    ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, commit_virtual_fs_write,
+    create_virtual_fs_directory, create_virtual_fs_file,
+    materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
+    rename_virtual_fs_item, source_root_identifier, trash_virtual_fs_item,
+    virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
+    virtual_fs_content_root, virtual_fs_item_with_content_root,
 };
 use crate::watcher::{FileEvent, FileEventKind};
 
@@ -63,6 +66,8 @@ pub struct DaemonRuntimeHandle {
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const FRESHNESS_JOB_BUDGET_UNITS: u16 = 5;
 const AUTO_FAST_FORWARD_ACTIVE_LEASE_MS: u64 = 30_000;
+const MAX_CHILD_REFRESH_WORKERS: usize = 3;
+const MAX_BACKGROUND_CHILD_REFRESH_WORKERS: usize = 2;
 
 impl DaemonRuntimeHandle {
     pub fn request(&self, request: DaemonRequest) -> DaemonResponse {
@@ -172,6 +177,10 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
 
     fn run_push(&self, state_root: PathBuf, job: PushJob) -> DaemonResponse;
 
+    fn run_auto_push(&self, state_root: PathBuf, job: PushJob) -> DaemonResponse {
+        self.run_push(state_root, job)
+    }
+
     fn run_scheduled_pull(
         &self,
         state_root: PathBuf,
@@ -278,6 +287,19 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
         )
     }
 
+    fn run_virtual_fs_create_directory(
+        &self,
+        _state_root: PathBuf,
+        _mount_id: String,
+        _parent_identifier: String,
+        _dirname: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle virtual filesystem directory creates",
+        )
+    }
+
     fn run_virtual_fs_rename(
         &self,
         _state_root: PathBuf,
@@ -349,6 +371,7 @@ pub struct FileEventRuntimeReport {
     pub report: DaemonEventReport,
     pub queued_hydrations: Vec<HydrationRequest>,
     pub freshness_jobs: Vec<SyncJob>,
+    pub auto_push_targets: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -363,18 +386,6 @@ pub struct FreshnessRuntimeReport {
     pub remote_hint_pending: bool,
     pub queued_hydrations: Vec<HydrationRequest>,
     pub follow_up_jobs: Vec<SyncJob>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-struct FileProviderReadPayload {
-    mount_id: String,
-    identifier: String,
-    remote_id: String,
-    path: String,
-    outcome: VirtualFsMaterializeOutcome,
-    hydration: HydrationState,
-    item: VirtualFsItem,
-    contents_base64: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -418,6 +429,31 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             };
 
         match execute_push_job_with_content_root(&mut store, job, &connector, Some(&state_root)) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+
+    fn run_auto_push(&self, state_root: PathBuf, job: PushJob) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => {
+                return DaemonResponse::error("store_open_failed", error.to_string());
+            }
+        };
+        let credentials = open_credential_store(&state_root);
+        let connector =
+            match resolve_source_for_path(&store, credentials.as_ref(), &job.target_path) {
+                Ok(connector) => connector,
+                Err(error) => return DaemonResponse::error(error.code(), error.message()),
+            };
+
+        match execute_auto_save_push_job_with_content_root(
+            &mut store,
+            job,
+            &connector,
+            Some(&state_root),
+        ) {
             Ok(report) => DaemonResponse::ok(report),
             Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
         }
@@ -681,7 +717,7 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             Err(error) => return DaemonResponse::error(afs_error_code(&error), error.to_string()),
         };
 
-        DaemonResponse::ok(FileProviderReadPayload {
+        DaemonResponse::ok(FileProviderReadReport {
             mount_id: materialized.mount_id,
             identifier: materialized.identifier,
             remote_id: materialized.remote_id,
@@ -742,6 +778,34 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             &mount_id,
             &parent_identifier,
             &filename,
+        ) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
+    }
+
+    fn run_virtual_fs_create_directory(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        parent_identifier: String,
+        dirname: String,
+    ) -> DaemonResponse {
+        let mut store = match SqliteStateStore::open(state_root.clone()) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        let mount_id = MountId::new(mount_id);
+        if let Some(response) = reject_plain_files_virtual_fs_mount(&store, &mount_id) {
+            return response;
+        }
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        match create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &parent_identifier,
+            &dirname,
         ) {
             Ok(report) => DaemonResponse::ok(report),
             Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
@@ -866,6 +930,7 @@ struct ChildRefreshRequest {
     mount_id: String,
     container_identifier: String,
     priority: ChildRefreshPriority,
+    depth: u32,
 }
 
 impl ChildRefreshRequest {
@@ -903,10 +968,11 @@ impl ChildRefreshQueue {
             return true;
         }
 
-        if let Some(existing) = self.pending.get_mut(&key)
-            && request.priority > existing.priority
-        {
-            existing.priority = request.priority;
+        if let Some(existing) = self.pending.get_mut(&key) {
+            if request.priority > existing.priority {
+                existing.priority = request.priority;
+            }
+            existing.depth = existing.depth.min(request.depth);
         }
         false
     }
@@ -921,36 +987,37 @@ impl ChildRefreshQueue {
         }
     }
 
-    fn peek_priority(&self) -> Option<ChildRefreshPriority> {
-        let key = self.next_ready_key()?;
-        self.pending.get(key).map(|request| request.priority)
-    }
-
-    fn pop_ready(&mut self) -> Option<ChildRefreshRequest> {
-        let index = self.next_ready_index()?;
+    fn pop_ready(
+        &mut self,
+        active: &BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
+    ) -> Option<ChildRefreshRequest> {
+        let index = self.next_ready_index(active)?;
         let key = self.order.remove(index)?;
         self.pending.remove(&key)
     }
 
-    fn next_ready_key(&self) -> Option<&ChildRefreshKey> {
-        self.next_ready_index()
-            .and_then(|index| self.order.get(index))
-    }
-
-    fn next_ready_index(&self) -> Option<usize> {
-        let mut best: Option<(usize, ChildRefreshPriority)> = None;
+    fn next_ready_index(
+        &self,
+        active: &BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
+    ) -> Option<usize> {
+        let mut best: Option<(usize, ChildRefreshPriority, u32)> = None;
         for (index, key) in self.order.iter().enumerate() {
             let Some(request) = self.pending.get(key) else {
                 continue;
             };
-            if best
-                .as_ref()
-                .is_none_or(|(_, best_priority)| request.priority > *best_priority)
-            {
-                best = Some((index, request.priority));
+            if active.values().any(|active| {
+                active.request.priority == request.priority && active.request.depth < request.depth
+            }) {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, best_priority, best_depth)| {
+                request.priority > *best_priority
+                    || (request.priority == *best_priority && request.depth < *best_depth)
+            }) {
+                best = Some((index, request.priority, request.depth));
             }
         }
-        best.map(|(index, _)| index)
+        best.map(|(index, _, _)| index)
     }
 }
 
@@ -960,6 +1027,8 @@ struct RuntimeState {
     sender: Sender<RuntimeMessage>,
     pending_requests: VecDeque<MutatingRequest>,
     child_refreshes: ChildRefreshQueue,
+    active_child_refreshes: BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
+    completed_child_refreshes: BTreeMap<ChildRefreshKey, ChildRefreshPriority>,
     hydration: HydrationQueue,
     freshness: FreshnessQueue,
     deferred_hydration: Vec<HydrationRequest>,
@@ -978,12 +1047,37 @@ struct ActiveRuntimeJob {
     started_at_unix_ms: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveChildRefresh {
+    request: ChildRefreshRequest,
+    status: ActiveRuntimeJob,
+}
+
+impl ActiveChildRefresh {
+    fn new(request: ChildRefreshRequest) -> Self {
+        let status = ActiveRuntimeJob::from_child_refresh(&request);
+        Self { request, status }
+    }
+}
+
 impl ActiveRuntimeJob {
     fn from_job(job: &MutatingJob) -> Self {
         let (kind, target) = job.active_status_parts();
         Self {
             kind,
             target,
+            started_at: Instant::now(),
+            started_at_unix_ms: unix_time_ms(),
+        }
+    }
+
+    fn from_child_refresh(request: &ChildRefreshRequest) -> Self {
+        Self {
+            kind: "virtual_fs_refresh_children".to_string(),
+            target: Some(format!(
+                "{}:{}",
+                request.mount_id, request.container_identifier
+            )),
             started_at: Instant::now(),
             started_at_unix_ms: unix_time_ms(),
         }
@@ -1029,6 +1123,8 @@ impl RuntimeState {
             sender,
             pending_requests: VecDeque::new(),
             child_refreshes: ChildRefreshQueue::default(),
+            active_child_refreshes: BTreeMap::new(),
+            completed_child_refreshes: BTreeMap::new(),
             hydration,
             freshness: FreshnessQueue::new(),
             deferred_hydration: Vec::new(),
@@ -1142,6 +1238,7 @@ impl RuntimeState {
                         mount_id,
                         container_identifier,
                         ChildRefreshPriority::Interactive,
+                        0,
                     );
                 }
             }
@@ -1215,6 +1312,20 @@ impl RuntimeState {
                     });
                 self.maybe_start_next_job();
             }
+            DaemonRequest::VirtualFsCreateDirectory {
+                mount_id,
+                parent_identifier,
+                dirname,
+            } => {
+                self.pending_requests
+                    .push_front(MutatingRequest::VirtualFsCreateDirectory {
+                        mount_id,
+                        parent_identifier,
+                        dirname,
+                        respond_to,
+                    });
+                self.maybe_start_next_job();
+            }
             DaemonRequest::VirtualFsRename {
                 mount_id,
                 identifier,
@@ -1253,7 +1364,20 @@ impl RuntimeState {
     }
 
     fn handle_completion(&mut self, completion: JobCompletion) {
-        self.active_job = None;
+        match &completion {
+            JobCompletion::VirtualFsRefreshChildren {
+                mount_id,
+                container_identifier,
+                ..
+            } => {
+                let key = ChildRefreshKey {
+                    mount_id: mount_id.clone(),
+                    container_identifier: container_identifier.clone(),
+                };
+                self.active_child_refreshes.remove(&key);
+            }
+            _ => self.active_job = None,
+        }
 
         match completion {
             JobCompletion::Pull {
@@ -1266,22 +1390,46 @@ impl RuntimeState {
             } => {
                 let _ = respond_to.send(response);
             }
+            JobCompletion::AutoPush { response } => {
+                if !response.ok {
+                    let message = response
+                        .error
+                        .as_ref()
+                        .map(|error| error.message.as_str())
+                        .unwrap_or("unknown error");
+                    eprintln!("afsd auto-save push failed: {message}");
+                }
+            }
             JobCompletion::Response {
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets,
             } => {
                 let _ = respond_to.send(response);
                 for job in freshness_jobs {
                     self.queue_freshness(job);
                 }
+                for target in auto_push_targets {
+                    self.queue_auto_push(target);
+                }
             }
             JobCompletion::VirtualFsRefreshChildren {
                 mount_id,
                 container_identifier,
+                depth,
+                priority,
                 result,
             } => match result {
-                Ok(_) => self.queue_child_refresh_descendants(&mount_id, &container_identifier),
+                Ok(_) => {
+                    self.mark_child_refresh_completed(&mount_id, &container_identifier, priority);
+                    self.queue_child_refresh_descendants(
+                        &mount_id,
+                        &container_identifier,
+                        depth,
+                        priority,
+                    );
+                }
                 Err(error) => {
                     eprintln!(
                         "afsd virtual filesystem child refresh failed for `{mount_id}:{container_identifier}`: {error}"
@@ -1297,7 +1445,17 @@ impl RuntimeState {
                 let ok = response.ok;
                 let _ = respond_to.send(response);
                 if ok {
-                    self.queue_child_refresh_descendants(&mount_id, &container_identifier);
+                    self.mark_child_refresh_completed(
+                        &mount_id,
+                        &container_identifier,
+                        ChildRefreshPriority::Interactive,
+                    );
+                    self.queue_child_refresh_descendants(
+                        &mount_id,
+                        &container_identifier,
+                        0,
+                        ChildRefreshPriority::Interactive,
+                    );
                 }
             }
             JobCompletion::ScheduledPull(result) => match result {
@@ -1326,6 +1484,9 @@ impl RuntimeState {
                     }
                     for job in result.freshness_jobs {
                         self.queue_freshness(job);
+                    }
+                    for target in result.auto_push_targets {
+                        self.queue_auto_push(target);
                     }
                 }
                 Err(error) => eprintln!("afsd file event failed: {error}"),
@@ -1372,35 +1533,31 @@ impl RuntimeState {
     }
 
     fn maybe_start_next_job(&mut self) {
-        if self.active_job.is_some() {
-            return;
+        if self.active_job.is_none() {
+            let job = if let Some(request) = self.pending_requests.pop_front() {
+                Some(MutatingJob::Request(request))
+            } else if let Some(request) = self.hydration.pop_ready() {
+                Some(MutatingJob::Hydration { request })
+            } else if let Some(job) = self
+                .freshness
+                .pop_ready_at(Some(&freshness_timestamp()), FRESHNESS_JOB_BUDGET_UNITS)
+            {
+                Some(MutatingJob::Freshness { job })
+            } else {
+                self.pending_scheduled_tick
+                    .take()
+                    .map(|tick| MutatingJob::ScheduledPull { tick })
+            };
+
+            if let Some(job) = job {
+                self.start_exclusive_job(job);
+            }
         }
 
-        let job = if let Some(request) = self.pending_requests.pop_front() {
-            Some(MutatingJob::Request(request))
-        } else if self.child_refreshes.peek_priority() == Some(ChildRefreshPriority::Interactive) {
-            self.child_refreshes
-                .pop_ready()
-                .map(|request| MutatingJob::ChildRefresh { request })
-        } else if let Some(request) = self.hydration.pop_ready() {
-            Some(MutatingJob::Hydration { request })
-        } else if let Some(job) = self
-            .freshness
-            .pop_ready_at(Some(&freshness_timestamp()), FRESHNESS_JOB_BUDGET_UNITS)
-        {
-            Some(MutatingJob::Freshness { job })
-        } else if let Some(request) = self.child_refreshes.pop_ready() {
-            Some(MutatingJob::ChildRefresh { request })
-        } else {
-            self.pending_scheduled_tick
-                .take()
-                .map(|tick| MutatingJob::ScheduledPull { tick })
-        };
+        self.maybe_start_child_refresh_jobs();
+    }
 
-        let Some(job) = job else {
-            return;
-        };
-
+    fn start_exclusive_job(&mut self, job: MutatingJob) {
         self.active_job = Some(ActiveRuntimeJob::from_job(&job));
         let sender = self.sender.clone();
         let runner = Arc::clone(&self.runner);
@@ -1410,6 +1567,58 @@ impl RuntimeState {
         thread::spawn(move || {
             let completion = run_job(runner, state_root, policy, job);
             let _ = sender.send(RuntimeMessage::JobFinished(completion));
+        });
+    }
+
+    fn maybe_start_child_refresh_jobs(&mut self) {
+        while self.active_job.is_none()
+            && self.active_child_refreshes.len() < MAX_CHILD_REFRESH_WORKERS
+        {
+            let Some(request) = self.child_refreshes.pop_ready(&self.active_child_refreshes) else {
+                break;
+            };
+
+            if request.priority == ChildRefreshPriority::Background
+                && self.active_background_child_refreshes() >= MAX_BACKGROUND_CHILD_REFRESH_WORKERS
+            {
+                self.child_refreshes.queue(request);
+                break;
+            }
+
+            self.start_child_refresh_job(request);
+        }
+    }
+
+    fn active_background_child_refreshes(&self) -> usize {
+        self.active_child_refreshes
+            .values()
+            .filter(|active| active.request.priority == ChildRefreshPriority::Background)
+            .count()
+    }
+
+    fn start_child_refresh_job(&mut self, request: ChildRefreshRequest) {
+        let key = request.key();
+        let sender = self.sender.clone();
+        let runner = Arc::clone(&self.runner);
+        let state_root = self.config.state_root.clone();
+        self.active_child_refreshes
+            .insert(key, ActiveChildRefresh::new(request.clone()));
+
+        thread::spawn(move || {
+            let result = runner.run_virtual_fs_refresh_children(
+                state_root,
+                request.mount_id.clone(),
+                request.container_identifier.clone(),
+            );
+            let _ = sender.send(RuntimeMessage::JobFinished(
+                JobCompletion::VirtualFsRefreshChildren {
+                    mount_id: request.mount_id,
+                    container_identifier: request.container_identifier,
+                    depth: request.depth,
+                    priority: request.priority,
+                    result,
+                },
+            ));
         });
     }
 
@@ -1465,6 +1674,13 @@ impl RuntimeState {
         self.freshness.upsert(job);
     }
 
+    fn queue_auto_push(&mut self, target_path: PathBuf) {
+        self.pending_requests.push_back(MutatingRequest::AutoPush {
+            job: auto_push_job(target_path),
+        });
+        self.maybe_start_next_job();
+    }
+
     fn auto_fast_forward_queue_decision(
         &self,
         request: &HydrationRequest,
@@ -1484,6 +1700,7 @@ impl RuntimeState {
                 return;
             }
         };
+        self.completed_child_refreshes.clear();
 
         for mount in mounts
             .into_iter()
@@ -1493,11 +1710,13 @@ impl RuntimeState {
                 mount.mount_id.0.clone(),
                 ROOT_CONTAINER_IDENTIFIER.to_string(),
                 ChildRefreshPriority::Background,
+                0,
             );
             self.queue_child_refresh(
                 mount.mount_id.0,
                 source_root_identifier(&mount.connector),
                 ChildRefreshPriority::Background,
+                0,
             );
         }
     }
@@ -1507,16 +1726,56 @@ impl RuntimeState {
         mount_id: String,
         container_identifier: String,
         priority: ChildRefreshPriority,
+        depth: u32,
     ) {
+        let key = ChildRefreshKey {
+            mount_id: mount_id.clone(),
+            container_identifier: container_identifier.clone(),
+        };
+        if self
+            .completed_child_refreshes
+            .get(&key)
+            .is_some_and(|completed_priority| *completed_priority >= priority)
+        {
+            return;
+        }
+        if self.active_child_refreshes.contains_key(&key) {
+            return;
+        }
         self.child_refreshes.queue(ChildRefreshRequest {
             mount_id,
             container_identifier,
             priority,
+            depth,
         });
         self.maybe_start_next_job();
     }
 
-    fn queue_child_refresh_descendants(&mut self, mount_id: &str, container_identifier: &str) {
+    fn mark_child_refresh_completed(
+        &mut self,
+        mount_id: &str,
+        container_identifier: &str,
+        priority: ChildRefreshPriority,
+    ) {
+        let key = ChildRefreshKey {
+            mount_id: mount_id.to_string(),
+            container_identifier: container_identifier.to_string(),
+        };
+        self.completed_child_refreshes
+            .entry(key)
+            .and_modify(|completed_priority| {
+                *completed_priority = (*completed_priority).max(priority);
+            })
+            .or_insert(priority);
+    }
+
+    fn queue_child_refresh_descendants(
+        &mut self,
+        mount_id: &str,
+        container_identifier: &str,
+        parent_depth: u32,
+        parent_priority: ChildRefreshPriority,
+    ) {
         let child_containers = match self
             .child_container_identifiers(mount_id, container_identifier)
         {
@@ -1532,7 +1791,8 @@ impl RuntimeState {
             self.queue_child_refresh(
                 mount_id.to_string(),
                 child_container,
-                ChildRefreshPriority::Background,
+                parent_priority,
+                parent_depth.saturating_add(1),
             );
         }
     }
@@ -1582,9 +1842,18 @@ impl RuntimeState {
 
     fn status(&self) -> DaemonRuntimeStatus {
         let freshness_metrics = self.freshness.metrics(Some(&freshness_timestamp()));
+        let active_child_refresh = self
+            .active_child_refreshes
+            .values()
+            .next()
+            .map(|active| active.status.status());
         DaemonRuntimeStatus {
-            active_job: self.active_job.is_some(),
-            active_job_detail: self.active_job.as_ref().map(ActiveRuntimeJob::status),
+            active_job: self.active_job.is_some() || active_child_refresh.is_some(),
+            active_job_detail: self
+                .active_job
+                .as_ref()
+                .map(ActiveRuntimeJob::status)
+                .or(active_child_refresh),
             pending_requests: self.pending_requests.len() + self.child_refreshes.len(),
             pending_hydrations: self.hydration.len(),
             deferred_hydrations: self.deferred_hydration.len(),
@@ -1692,7 +1961,11 @@ fn auto_fast_forward_queue_decision<S>(
     request: &HydrationRequest,
 ) -> afs_core::AfsResult<AutoFastForwardQueueDecision>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository,
 {
     let Some(entity) = store
         .get_entity(&request.mount_id, &request.remote_id)
@@ -1785,20 +2058,11 @@ fn run_job(
             response: runner.run_push(state_root, job),
             respond_to,
         },
+        MutatingJob::Request(MutatingRequest::AutoPush { job }) => JobCompletion::AutoPush {
+            response: runner.run_auto_push(state_root, job),
+        },
         MutatingJob::Request(MutatingRequest::FileEvent { event }) => {
             JobCompletion::FileEvent(runner.run_file_event(state_root, event))
-        }
-        MutatingJob::ChildRefresh { request } => {
-            let result = runner.run_virtual_fs_refresh_children(
-                state_root,
-                request.mount_id.clone(),
-                request.container_identifier.clone(),
-            );
-            JobCompletion::VirtualFsRefreshChildren {
-                mount_id: request.mount_id,
-                container_identifier: request.container_identifier,
-                result,
-            }
         }
         MutatingJob::Request(MutatingRequest::VirtualFsMaterialize {
             mount_id,
@@ -1811,6 +2075,7 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::Request(MutatingRequest::FileProviderRead {
@@ -1824,6 +2089,7 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::Request(MutatingRequest::FileProviderChildren {
@@ -1847,16 +2113,18 @@ fn run_job(
             respond_to,
         }) => {
             let response = runner.run_virtual_fs_commit_write(
-                state_root,
+                state_root.clone(),
                 mount_id,
                 identifier,
                 contents_base64,
             );
             let freshness_jobs = response_local_edit_observe_jobs(&response);
+            let auto_push_targets = response_auto_push_targets(&state_root, &response);
             JobCompletion::Response {
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets,
             }
         }
         MutatingJob::Request(MutatingRequest::VirtualFsCreateFile {
@@ -1876,6 +2144,27 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
+            }
+        }
+        MutatingJob::Request(MutatingRequest::VirtualFsCreateDirectory {
+            mount_id,
+            parent_identifier,
+            dirname,
+            respond_to,
+        }) => {
+            let response = runner.run_virtual_fs_create_directory(
+                state_root,
+                mount_id,
+                parent_identifier,
+                dirname,
+            );
+            let freshness_jobs = response_observe_jobs(&response, ChangeHintKind::LocalEdited);
+            JobCompletion::Response {
+                response,
+                respond_to,
+                freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::Request(MutatingRequest::VirtualFsRename {
@@ -1897,6 +2186,7 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::Request(MutatingRequest::VirtualFsTrash {
@@ -1910,6 +2200,7 @@ fn run_job(
                 response,
                 respond_to,
                 freshness_jobs,
+                auto_push_targets: Vec::new(),
             }
         }
         MutatingJob::ScheduledPull { tick } => {
@@ -1937,6 +2228,64 @@ fn response_local_edit_observe_jobs(response: &DaemonResponse) -> Vec<SyncJob> {
     }
 
     response_observe_jobs(response, ChangeHintKind::LocalEdited)
+}
+
+fn response_auto_push_targets(state_root: &Path, response: &DaemonResponse) -> Vec<PathBuf> {
+    if !response.ok {
+        return Vec::new();
+    }
+
+    let Some(payload) = response.payload.as_ref() else {
+        return Vec::new();
+    };
+    if payload
+        .get("hydration")
+        .and_then(Value::as_str)
+        .is_some_and(|hydration| hydration != "dirty")
+    {
+        return Vec::new();
+    }
+
+    let Some(mount_id) = payload.get("mount_id").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(remote_id) = payload.get("remote_id").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    if !observable_remote_identifier(remote_id) {
+        return Vec::new();
+    }
+
+    let Ok(store) = SqliteStateStore::open(state_root.to_path_buf()) else {
+        return Vec::new();
+    };
+    let mount_id = MountId::new(mount_id);
+    let remote_id = RemoteId::new(remote_id);
+    let Ok(Some(enrollment)) = store.find_auto_save_enrollment_by_remote_id(&mount_id, &remote_id)
+    else {
+        return Vec::new();
+    };
+    if !enrollment.enabled
+        || matches!(
+            enrollment.state,
+            AutoSaveState::PausedRemoteChanged | AutoSaveState::PausedFailure
+        )
+    {
+        return Vec::new();
+    }
+    let Ok(Some(mount)) = store.get_mount(&mount_id) else {
+        return Vec::new();
+    };
+
+    vec![mount.root.join(enrollment.path)]
+}
+
+fn auto_push_job(target_path: PathBuf) -> PushJob {
+    PushJob {
+        target_path,
+        assume_yes: true,
+        confirm_dangerous: false,
+    }
 }
 
 fn response_observe_jobs(response: &DaemonResponse, reason: ChangeHintKind) -> Vec<SyncJob> {
@@ -1975,6 +2324,7 @@ fn observable_remote_identifier(identifier: &str) -> bool {
         && !identifier.starts_with("local:")
         && !identifier.starts_with("schema:")
         && !identifier.starts_with("children:")
+        && !identifier.starts_with("guidance:")
         && !identifier.starts_with("path:")
         && !identifier.starts_with("source:")
         && identifier != ROOT_CONTAINER_IDENTIFIER
@@ -2002,6 +2352,9 @@ enum MutatingRequest {
     Push {
         job: PushJob,
         respond_to: Sender<DaemonResponse>,
+    },
+    AutoPush {
+        job: PushJob,
     },
     FileEvent {
         event: FileEvent,
@@ -2033,6 +2386,12 @@ enum MutatingRequest {
         filename: String,
         respond_to: Sender<DaemonResponse>,
     },
+    VirtualFsCreateDirectory {
+        mount_id: String,
+        parent_identifier: String,
+        dirname: String,
+        respond_to: Sender<DaemonResponse>,
+    },
     VirtualFsRename {
         mount_id: String,
         identifier: String,
@@ -2049,7 +2408,6 @@ enum MutatingRequest {
 
 enum MutatingJob {
     Request(MutatingRequest),
-    ChildRefresh { request: ChildRefreshRequest },
     ScheduledPull { tick: PullSchedulerTick },
     Hydration { request: HydrationRequest },
     Freshness { job: SyncJob },
@@ -2059,13 +2417,6 @@ impl MutatingJob {
     fn active_status_parts(&self) -> (String, Option<String>) {
         match self {
             Self::Request(request) => request.active_status_parts(),
-            Self::ChildRefresh { request } => (
-                "virtual_fs_refresh_children".to_string(),
-                Some(format!(
-                    "{}:{}",
-                    request.mount_id, request.container_identifier
-                )),
-            ),
             Self::ScheduledPull { .. } => ("scheduled_pull".to_string(), None),
             Self::Hydration { request } => (
                 "hydration".to_string(),
@@ -2088,6 +2439,10 @@ impl MutatingRequest {
             Self::Pull { path, .. } => ("pull".to_string(), Some(path.display().to_string())),
             Self::Push { job, .. } => (
                 "push".to_string(),
+                Some(job.target_path.display().to_string()),
+            ),
+            Self::AutoPush { job } => (
+                "auto_push".to_string(),
                 Some(job.target_path.display().to_string()),
             ),
             Self::FileEvent { event } => (
@@ -2135,6 +2490,15 @@ impl MutatingRequest {
                 "virtual_fs_create_file".to_string(),
                 Some(format!("{mount_id}:{parent_identifier}/{filename}")),
             ),
+            Self::VirtualFsCreateDirectory {
+                mount_id,
+                parent_identifier,
+                dirname,
+                ..
+            } => (
+                "virtual_fs_create_directory".to_string(),
+                Some(format!("{mount_id}:{parent_identifier}/{dirname}")),
+            ),
             Self::VirtualFsRename {
                 mount_id,
                 identifier,
@@ -2165,14 +2529,20 @@ enum JobCompletion {
         response: DaemonResponse,
         respond_to: Sender<DaemonResponse>,
     },
+    AutoPush {
+        response: DaemonResponse,
+    },
     Response {
         response: DaemonResponse,
         respond_to: Sender<DaemonResponse>,
         freshness_jobs: Vec<SyncJob>,
+        auto_push_targets: Vec<PathBuf>,
     },
     VirtualFsRefreshChildren {
         mount_id: String,
         container_identifier: String,
+        depth: u32,
+        priority: ChildRefreshPriority,
         result: afs_core::AfsResult<usize>,
     },
     FileProviderChildren {
@@ -2195,7 +2565,11 @@ fn execute_file_event<S>(
     event: FileEvent,
 ) -> afs_core::AfsResult<FileEventRuntimeReport>
 where
-    S: MountRepository + EntityRepository + ShadowRepository + FreshnessStateRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository,
 {
     let mut runtime_report = FileEventRuntimeReport::default();
     let Some((mount, entity)) = resolve_event_entity(store, &event.path)? else {
@@ -2258,7 +2632,7 @@ fn handle_write_event<S>(
     runtime_report: &mut FileEventRuntimeReport,
 ) -> afs_core::AfsResult<()>
 where
-    S: EntityRepository + ShadowRepository + FreshnessStateRepository,
+    S: EntityRepository + ShadowRepository + FreshnessStateRepository + AutoSaveRepository,
 {
     if entity.hydration != HydrationState::Hydrated {
         if matches!(
@@ -2269,6 +2643,12 @@ where
             runtime_report
                 .freshness_jobs
                 .push(observe_entity_job(&entity, ChangeHintKind::LocalEdited));
+            if entity.hydration == HydrationState::Dirty
+                && let Some(target) =
+                    auto_save_target_for_write(store, &mount, &entity, &event_path)?
+            {
+                runtime_report.auto_push_targets.push(target);
+            }
         } else {
             runtime_report.report.ignored_events = 1;
         }
@@ -2286,6 +2666,9 @@ where
     runtime_report
         .freshness_jobs
         .push(observe_entity_job(&entity, ChangeHintKind::LocalEdited));
+    if let Some(target) = auto_save_target_for_write(store, &mount, &entity, &event_path)? {
+        runtime_report.auto_push_targets.push(target);
+    }
     runtime_report.report.marked_dirty = 1;
     Ok(())
 }
@@ -2305,7 +2688,10 @@ fn execute_freshness_job<S, C>(
     job: SyncJob,
 ) -> afs_core::AfsResult<FreshnessRuntimeReport>
 where
-    S: EntityRepository + RemoteObservationRepository + FreshnessStateRepository,
+    S: EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository,
     C: Connector,
 {
     if job.kind != SyncJobKind::ObserveEntity {
@@ -2322,7 +2708,10 @@ fn execute_observe_entity_job<S, C>(
     job: SyncJob,
 ) -> afs_core::AfsResult<FreshnessRuntimeReport>
 where
-    S: EntityRepository + RemoteObservationRepository + FreshnessStateRepository,
+    S: EntityRepository
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + AutoSaveRepository,
     C: Connector,
 {
     let Some(remote_id) = job.remote_id.clone() else {
@@ -2340,6 +2729,9 @@ where
         .map_err(AfsError::from)?;
     let remote_hint_pending = observed_remote_version_changed(existing.as_ref(), &observation);
     let observed_at = freshness_timestamp();
+    if remote_hint_pending {
+        pause_auto_save_for_remote_change(store, &job.mount_id, &remote_id)?;
+    }
 
     store
         .save_remote_observation(remote_observation_record(&observation, &observed_at))
@@ -2542,7 +2934,23 @@ fn afs_error_code(error: &AfsError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest};
+    use std::collections::BTreeMap;
+
+    use afs_core::canonical::render_canonical_markdown;
+    use afs_core::freshness::{RemoteObservation, RemoteVersion};
+    use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+    use afs_core::shadow::ShadowDocument;
+    use afs_store::{
+        AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, EntityRecord,
+        EntityRepository, InMemoryStateStore, MountConfig, MountRepository, ShadowRepository,
+    };
+
+    use crate::watcher::{FileEvent, FileEventKind};
+
+    use super::{
+        ActiveChildRefresh, ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest,
+        execute_file_event, execute_observe_entity_job, observable_remote_identifier,
+    };
 
     #[test]
     fn child_refresh_queue_promotes_existing_requests() {
@@ -2552,36 +2960,313 @@ mod tests {
             "notion-main",
             "children:page-1",
             ChildRefreshPriority::Background,
+            0,
         )));
         assert!(queue.queue(request(
             "notion-main",
             "children:page-2",
             ChildRefreshPriority::Background,
+            0,
         )));
         assert!(!queue.queue(request(
             "notion-main",
             "children:page-1",
             ChildRefreshPriority::Interactive,
+            0,
         )));
 
-        let first = queue.pop_ready().expect("first refresh");
+        let active = BTreeMap::new();
+        let first = queue.pop_ready(&active).expect("first refresh");
         assert_eq!(first.container_identifier, "children:page-1");
         assert_eq!(first.priority, ChildRefreshPriority::Interactive);
 
-        let second = queue.pop_ready().expect("second refresh");
+        let second = queue.pop_ready(&active).expect("second refresh");
         assert_eq!(second.container_identifier, "children:page-2");
         assert_eq!(second.priority, ChildRefreshPriority::Background);
+    }
+
+    #[test]
+    fn child_refresh_queue_blocks_deeper_background_while_shallower_is_active() {
+        let mut queue = ChildRefreshQueue::default();
+        let active_request = request(
+            "notion-main",
+            "children:page-a",
+            ChildRefreshPriority::Background,
+            1,
+        );
+        let mut active = BTreeMap::new();
+        active.insert(
+            active_request.key(),
+            ActiveChildRefresh::new(active_request),
+        );
+
+        queue.queue(request(
+            "notion-main",
+            "children:page-a1",
+            ChildRefreshPriority::Background,
+            2,
+        ));
+        queue.queue(request(
+            "notion-main",
+            "children:page-b",
+            ChildRefreshPriority::Background,
+            1,
+        ));
+
+        let next = queue
+            .pop_ready(&active)
+            .expect("same-depth sibling refresh");
+        assert_eq!(next.container_identifier, "children:page-b");
+        assert_eq!(next.depth, 1);
+
+        assert!(
+            queue.pop_ready(&active).is_none(),
+            "deeper refresh should wait for active shallower work"
+        );
+        active.clear();
+        let deeper = queue.pop_ready(&active).expect("deeper refresh");
+        assert_eq!(deeper.container_identifier, "children:page-a1");
+    }
+
+    #[test]
+    fn observable_remote_identifiers_exclude_virtual_only_items() {
+        assert!(observable_remote_identifier(
+            "3833ac0e-bb88-814b-b0e3-ea6963b6708a"
+        ));
+        assert!(!observable_remote_identifier("guidance:AGENTS.md"));
+        assert!(!observable_remote_identifier("children:page-1"));
+        assert!(!observable_remote_identifier("source:notion"));
+    }
+
+    #[test]
+    fn write_event_queues_auto_push_for_enrolled_dirty_file() {
+        let fixture = RuntimeAutoSaveFixture::new();
+        let mut store = fixture.store();
+        fixture.write_page("Updated body.");
+
+        let report = execute_file_event(
+            &mut store,
+            FileEvent {
+                path: fixture.page_path.clone(),
+                kind: FileEventKind::Write,
+            },
+        )
+        .expect("file event");
+
+        assert_eq!(report.report.marked_dirty, 1);
+        assert_eq!(report.auto_push_targets, vec![fixture.page_path.clone()]);
+    }
+
+    #[test]
+    fn remote_observation_pauses_auto_save_for_external_drift() {
+        let fixture = RuntimeAutoSaveFixture::new();
+        let mut store = fixture.store();
+        let connector = ObservingConnector {
+            observation: RemoteObservation {
+                mount_id: fixture.mount_id.clone(),
+                remote_id: fixture.remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Roadmap".to_string(),
+                parent_remote_id: None,
+                projected_path: "Roadmap.md".into(),
+                remote_version: Some(RemoteVersion::new("remote-v2")),
+                deleted: false,
+                raw_metadata_json: "{}".to_string(),
+            },
+        };
+
+        execute_observe_entity_job(
+            &mut store,
+            &connector,
+            afs_core::freshness::SyncJob::new(
+                fixture.mount_id.clone(),
+                Some(fixture.remote_id.clone()),
+                afs_core::freshness::SyncJobKind::ObserveEntity,
+                afs_core::freshness::ChangeHintKind::RemoteMaybeChanged,
+            ),
+        )
+        .expect("observe");
+
+        let enrollment = store
+            .get_auto_save_enrollment(&fixture.mount_id, "Roadmap.md".as_ref())
+            .expect("get enrollment")
+            .expect("enrollment");
+        assert_eq!(enrollment.state, AutoSaveState::PausedRemoteChanged);
     }
 
     fn request(
         mount_id: &str,
         container_identifier: &str,
         priority: ChildRefreshPriority,
+        depth: u32,
     ) -> ChildRefreshRequest {
         ChildRefreshRequest {
             mount_id: mount_id.to_string(),
             container_identifier: container_identifier.to_string(),
             priority,
+            depth,
+        }
+    }
+
+    struct RuntimeAutoSaveFixture {
+        root: std::path::PathBuf,
+        page_path: std::path::PathBuf,
+        mount_id: MountId,
+        remote_id: RemoteId,
+    }
+
+    impl RuntimeAutoSaveFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "afs-runtime-autosave-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).expect("root");
+            let page_path = root.join("Roadmap.md");
+            let fixture = Self {
+                root,
+                page_path,
+                mount_id: MountId::new("notion-main"),
+                remote_id: RemoteId::new("page-1"),
+            };
+            fixture.write_page("Original body.");
+            fixture
+        }
+
+        fn store(&self) -> InMemoryStateStore {
+            let mut store = InMemoryStateStore::new();
+            store
+                .save_mount(MountConfig::new(
+                    self.mount_id.clone(),
+                    "notion",
+                    self.root.clone(),
+                ))
+                .expect("mount");
+            store
+                .save_entity(
+                    EntityRecord::new(
+                        self.mount_id.clone(),
+                        self.remote_id.clone(),
+                        EntityKind::Page,
+                        "Roadmap",
+                        "Roadmap.md",
+                    )
+                    .with_hydration(HydrationState::Hydrated)
+                    .with_remote_edited_at("remote-v1"),
+                )
+                .expect("entity");
+            store
+                .save_shadow(&self.mount_id, shadow("Original body."))
+                .expect("shadow");
+            let mut enrollment = AutoSaveEnrollmentRecord::new(
+                self.mount_id.clone(),
+                "Roadmap.md",
+                AutoSaveOrigin::AfsCreated,
+                "1",
+            );
+            enrollment.remote_id = Some(self.remote_id.clone());
+            store
+                .save_auto_save_enrollment(enrollment)
+                .expect("enrollment");
+            store
+        }
+
+        fn write_page(&self, body: &str) {
+            let document = CanonicalDocument::new(
+                "afs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: remote-v1\ntitle: Roadmap\n",
+                format!("# Roadmap\n\n{body}\n"),
+            );
+            std::fs::write(&self.page_path, render_canonical_markdown(&document))
+                .expect("write page");
+        }
+    }
+
+    impl Drop for RuntimeAutoSaveFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn shadow(body: &str) -> ShadowDocument {
+        ShadowDocument::from_synced_body(
+            RemoteId::new("page-1"),
+            format!("# Roadmap\n\n{body}\n"),
+            7,
+            [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+        )
+        .expect("shadow")
+    }
+
+    struct ObservingConnector {
+        observation: RemoteObservation,
+    }
+
+    impl afs_connector::Connector for ObservingConnector {
+        fn kind(&self) -> afs_connector::ConnectorKind {
+            afs_connector::ConnectorKind("observing")
+        }
+
+        fn capabilities(&self) -> afs_connector::ConnectorCapabilities {
+            afs_connector::ConnectorCapabilities::default()
+        }
+
+        fn observe(
+            &self,
+            _request: afs_connector::ObserveRequest,
+        ) -> afs_core::AfsResult<RemoteObservation> {
+            Ok(self.observation.clone())
+        }
+
+        fn enumerate(
+            &self,
+            _request: afs_connector::EnumerateRequest,
+        ) -> afs_core::AfsResult<Vec<afs_core::model::TreeEntry>> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn fetch(
+            &self,
+            _request: afs_connector::FetchRequest,
+        ) -> afs_core::AfsResult<afs_connector::NativeEntity> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn render(
+            &self,
+            _entity: &afs_connector::NativeEntity,
+        ) -> afs_core::AfsResult<CanonicalDocument> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn parse(
+            &self,
+            _document: &CanonicalDocument,
+        ) -> afs_core::AfsResult<afs_connector::ParsedEntity> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn check_concurrency(
+            &self,
+            _request: afs_connector::ApplyPlanRequest<'_>,
+        ) -> afs_core::AfsResult<()> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn apply(
+            &self,
+            _request: afs_connector::ApplyPlanRequest<'_>,
+        ) -> afs_core::AfsResult<afs_connector::ApplyPlanResult> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
+        }
+
+        fn apply_undo(
+            &self,
+            _request: afs_connector::ApplyUndoRequest<'_>,
+        ) -> afs_core::AfsResult<afs_connector::ApplyUndoResult> {
+            Err(afs_core::AfsError::NotImplemented("test connector"))
         }
     }
 }

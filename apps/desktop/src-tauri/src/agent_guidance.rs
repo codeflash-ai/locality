@@ -343,6 +343,15 @@ AFS projects connected company sources, including Notion, into the local filesys
 6. Only push when the user explicitly asks. Run `afs diff <file>` first, then `afs push <file> -y` for safe plans.
 7. If push says the remote changed since last sync, run `afs pull <file>`, resolve any inline conflict markers in the Markdown, rerun `afs diff <file>`, then push again.
 
+## Creating Notion Content
+
+- Read `{mount_path}/AGENTS.md` for connector-specific creation rules.
+- Pages are directories; edit or create the `page.md` inside the page directory.
+- To create a child page, create `parent-page/new-page/page.md`.
+- New `page.md` files need YAML frontmatter with `title: "..."` and no `afs:` identity block.
+- Existing files already have an `afs:` block; preserve it and edit only the body, `title`, and supported property frontmatter.
+- Database rows can be created as `database/new-row/page.md` or, where supported, direct `database/new-row.md` files.
+
 ## MCP fallback
 
 If your sandbox cannot run the host `afs` CLI, use the MCP tool named `afs`.
@@ -608,6 +617,10 @@ fn protect_private_file(path: &Path) -> Result<(), String> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("Could not protect `{}`: {error}", path.display()))?;
     }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 
@@ -653,19 +666,21 @@ fn normalized_mount_path(mount_path: Option<&str>) -> String {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
+    afs_platform::user_home()
 }
 
 fn default_state_root() -> PathBuf {
     if let Ok(value) = env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            return path;
+        }
+        if let Ok(current_dir) = env::current_dir() {
+            return current_dir.join(path);
+        }
     }
 
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
+    afs_platform::default_state_root()
 }
 
 fn mcp_endpoint() -> String {
@@ -765,6 +780,9 @@ mod tests {
         assert!(skill.contains("~/Library/CloudStorage/AFS/notion"));
         assert!(skill.contains("pending for AFS review"));
         assert!(skill.contains("afs diff <file>"));
+        assert!(skill.contains("Creating Notion Content"));
+        assert!(skill.contains("parent-page/new-page/page.md"));
+        assert!(skill.contains("no `afs:` identity block"));
         assert!(skill.contains("remote changed since last sync"));
         assert!(skill.contains("AFS configures this fallback automatically"));
     }

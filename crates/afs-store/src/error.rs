@@ -39,6 +39,7 @@ pub enum StoreError {
         found: i64,
         supported: i64,
     },
+    StateCompatibility(String),
     Database(String),
     Json(String),
     Io(String),
@@ -87,6 +88,7 @@ impl Display for StoreError {
                 f,
                 "unsupported schema version {found}; this binary supports up to {supported}"
             ),
+            Self::StateCompatibility(message) => write!(f, "state compatibility error: {message}"),
             Self::Database(message) => write!(f, "database error: {message}"),
             Self::Json(message) => write!(f, "json error: {message}"),
             Self::Io(message) => write!(f, "io error: {message}"),
@@ -121,6 +123,7 @@ impl From<StoreError> for AfsError {
             StoreError::SchemaVersion { found, supported } => Self::Io(format!(
                 "unsupported schema version {found}; this binary supports up to {supported}"
             )),
+            StoreError::StateCompatibility(message) => Self::Io(message),
             StoreError::Database(message) | StoreError::Json(message) => Self::Io(message),
             StoreError::Io(message) => Self::Io(message),
             other => Self::Io(other.to_string()),

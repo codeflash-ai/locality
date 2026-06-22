@@ -365,9 +365,6 @@ fn indexed_entity_score(
 
     let normalized_query = normalize_search_text(query);
     let phrase = normalized_query.trim();
-    if phrase.len() < 2 {
-        return None;
-    }
 
     let title = normalize_search_text(&entity.title);
     let path = normalize_search_text(&entity.path.to_string_lossy());
@@ -380,7 +377,7 @@ fn indexed_entity_score(
     let haystack = format!("{title} {path} {observed_title} {observed_path}");
     let tokens = phrase
         .split_whitespace()
-        .filter(|token| token.len() >= 2)
+        .filter(|token| search_token_allowed(token))
         .collect::<Vec<_>>();
     if tokens.is_empty() {
         return None;
@@ -444,6 +441,10 @@ fn indexed_entity_score(
     })
 }
 
+fn search_token_allowed(token: &str) -> bool {
+    token.len() >= 2 || token.chars().any(|character| character.is_ascii_digit())
+}
+
 fn remote_state(
     entity: &EntityRecord,
     observation: Option<&RemoteObservationRecord>,
@@ -461,7 +462,8 @@ fn remote_state(
 
     SearchRemoteState {
         observed_title: title_changed.then(|| observation.title.clone()),
-        observed_path: path_changed.then(|| observation.projected_path.display().to_string()),
+        observed_path: path_changed
+            .then(|| afs_platform::logical_path_display(&observation.projected_path)),
         observed_at: Some(observation.observed_at.clone()),
         changed,
         deleted: observation.deleted,

@@ -9,22 +9,25 @@ fn segments_common_markdown_blocks_with_source_spans() {
     let body = "# Title\n\nParagraph text.\n\n- one\n- two\n\n```rust\nfn main() {}\n```\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n::afs{id=media-1 type=image title=\"Diagram\"}\n";
     let blocks = segment_markdown_body(body, 10);
 
-    assert_eq!(blocks.len(), 6);
+    assert_eq!(blocks.len(), 7);
     assert_eq!(blocks[0].kind, MarkdownBlockKind::Heading);
     assert_eq!(blocks[0].source_span.start_line, 10);
     assert_eq!(blocks[1].kind, MarkdownBlockKind::Paragraph);
     assert_eq!(blocks[2].kind, MarkdownBlockKind::List);
-    assert_eq!(blocks[3].kind, MarkdownBlockKind::CodeFence);
-    assert_eq!(blocks[4].kind, MarkdownBlockKind::Table);
+    assert_eq!(blocks[2].text, "- one");
+    assert_eq!(blocks[3].kind, MarkdownBlockKind::List);
+    assert_eq!(blocks[3].text, "- two");
+    assert_eq!(blocks[4].kind, MarkdownBlockKind::CodeFence);
+    assert_eq!(blocks[5].kind, MarkdownBlockKind::Table);
     assert!(matches!(
-        blocks[5].kind,
+        blocks[6].kind,
         MarkdownBlockKind::Directive {
             directive_type: Some(_),
             malformed: false,
             ..
         }
     ));
-    assert_eq!(blocks[5].remote_id, Some(RemoteId::new("media-1")));
+    assert_eq!(blocks[6].remote_id, Some(RemoteId::new("media-1")));
 }
 
 #[test]
@@ -81,6 +84,61 @@ fn appending_a_paragraph_produces_append_after_last_existing_block() {
         }]
     );
     assert_eq!(plan.summary.blocks_created, 1);
+}
+
+#[test]
+fn appending_consecutive_list_items_produces_one_append_per_item() {
+    let shadow = shadow("Existing paragraph.", ["paragraph-1"]);
+    let edited =
+        CanonicalDocument::new("", "Existing paragraph.\n\n- First\n- Second\n- [ ] Third");
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: "- First".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: "- Second".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: "- [ ] Third".to_string(),
+            },
+        ]
+    );
+    assert_eq!(plan.summary.blocks_created, 3);
+}
+
+#[test]
+fn list_item_continuation_lines_stay_with_their_item() {
+    let body = "- first\n  continuation\n- second";
+    let blocks = segment_markdown_body(body, 1);
+
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].text, "- first\n  continuation");
+    assert_eq!(blocks[1].text, "- second");
+}
+
+#[test]
+fn compacting_blank_lines_between_list_items_is_not_a_remote_change() {
+    let shadow = shadow("- First\n\n- Second", ["list-1", "list-2"]);
+    let edited = CanonicalDocument::new("", "- First\n- Second");
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert!(plan.operations.is_empty());
 }
 
 #[test]

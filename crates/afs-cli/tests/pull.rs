@@ -19,9 +19,11 @@ use afs_notion::dto::{
     RichTextDto, SelectOptionDto, SelectPropertySchemaDto, TextRichTextDto, TitleBlockDto,
 };
 use afs_notion::{NotionConfig, NotionConnector};
+#[cfg(target_os = "macos")]
+use afs_store::MountConfig;
 use afs_store::{
-    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ProjectionMode, ShadowRepository,
+    EntityRecord, EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode,
+    ShadowRepository,
 };
 use afsd::virtual_fs::{source_root_directory_name, virtual_fs_content_root};
 

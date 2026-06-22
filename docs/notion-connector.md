@@ -92,7 +92,12 @@ export AFS_NOTION_LIVE_PARENT_PAGE='https://app.notion.com/...'
 cargo test -p afs-cli --test e2e_push_workflow live_scratch_page_mount_edit_push_verifies_notion -- --ignored --exact
 ```
 
-GitHub Actions has a manual `notion-live-e2e` workflow for these tests. The workflow should be backed by a disposable Notion workspace/account and secrets named `NOTION_TOKEN` and `AFS_NOTION_LIVE_PARENT_PAGE`.
+GitHub Actions has a manual and `main`-branch `notion-live-e2e` workflow for
+these tests. The workflow should be backed by a disposable Notion
+workspace/account and secrets named `NOTION_TOKEN` and
+`AFS_NOTION_LIVE_PARENT_PAGE`. The Windows job also mounts a live Cloud Files
+sync root and runs `afs doctor --json` against that live state before exercising
+provider file operations.
 
 ## Initial Block Rendering
 

@@ -1,0 +1,179 @@
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fmt::{Display, Formatter};
+use std::path::{Path, PathBuf};
+
+pub trait HostPaths {
+    fn state_root(&self) -> PathBuf;
+    fn logs_dir(&self) -> PathBuf {
+        self.state_root().join("logs")
+    }
+    fn default_mount_root(&self) -> PathBuf;
+    fn user_home(&self) -> Option<PathBuf>;
+}
+
+#[derive(Clone, Debug)]
+pub struct DefaultHostPaths {
+    target_os: String,
+    env: BTreeMap<String, OsString>,
+}
+
+impl DefaultHostPaths {
+    pub fn current() -> Self {
+        Self::for_target(std::env::consts::OS)
+    }
+
+    pub fn for_target(target_os: impl Into<String>) -> Self {
+        Self {
+            target_os: target_os.into(),
+            env: std::env::vars_os()
+                .map(|(key, value)| (key.to_string_lossy().to_string(), value))
+                .collect(),
+        }
+    }
+
+    pub fn for_target_with_env<K, V>(
+        target_os: impl Into<String>,
+        vars: impl IntoIterator<Item = (K, V)>,
+    ) -> Self
+    where
+        K: Into<String>,
+        V: Into<OsString>,
+    {
+        Self {
+            target_os: target_os.into(),
+            env: vars
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        }
+    }
+
+    fn var_path(&self, key: &str) -> Option<PathBuf> {
+        self.env
+            .get(key)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
+}
+
+impl HostPaths for DefaultHostPaths {
+    fn state_root(&self) -> PathBuf {
+        if let Some(path) = self.var_path("AFS_STATE_DIR") {
+            return path;
+        }
+
+        if self.target_os == "windows" {
+            if let Some(path) = self.var_path("LOCALAPPDATA") {
+                return path.join("AgentFS");
+            }
+            if let Some(path) = self.var_path("USERPROFILE") {
+                return path.join("AppData").join("Local").join("AgentFS");
+            }
+        }
+
+        self.user_home()
+            .map(|home| home.join(".afs"))
+            .unwrap_or_else(|| PathBuf::from(".afs"))
+    }
+
+    fn default_mount_root(&self) -> PathBuf {
+        self.user_home()
+            .map(|home| home.join("AgentFS"))
+            .unwrap_or_else(|| PathBuf::from("AgentFS"))
+    }
+
+    fn user_home(&self) -> Option<PathBuf> {
+        if self.target_os == "windows" {
+            return self
+                .var_path("USERPROFILE")
+                .or_else(|| self.var_path("HOME"))
+                .or_else(|| {
+                    let drive = self.env.get("HOMEDRIVE")?;
+                    let path = self.env.get("HOMEPATH")?;
+                    let mut combined = OsString::from(drive);
+                    combined.push(path);
+                    Some(PathBuf::from(combined))
+                });
+        }
+
+        self.var_path("HOME")
+    }
+}
+
+pub enum ReportPath<'a> {
+    Logical(&'a Path),
+    Host(&'a Path),
+}
+
+impl Display for ReportPath<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Logical(path) => f.write_str(&logical_path_display(path)),
+            Self::Host(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+pub fn default_state_root() -> PathBuf {
+    DefaultHostPaths::current().state_root()
+}
+
+pub fn default_mount_root() -> PathBuf {
+    DefaultHostPaths::current().default_mount_root()
+}
+
+pub fn user_home() -> Option<PathBuf> {
+    DefaultHostPaths::current().user_home()
+}
+
+pub fn logical_path_display(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DefaultHostPaths, HostPaths, logical_path_display};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn windows_state_root_uses_local_app_data() {
+        let paths = DefaultHostPaths::for_target_with_env(
+            "windows",
+            [("LOCALAPPDATA", r"C:\Users\Ada\AppData\Local")],
+        );
+
+        assert_eq!(
+            paths.state_root(),
+            PathBuf::from(r"C:\Users\Ada\AppData\Local").join("AgentFS")
+        );
+    }
+
+    #[test]
+    fn unix_state_root_preserves_home_dot_afs() {
+        let paths = DefaultHostPaths::for_target_with_env("linux", [("HOME", "/home/ada")]);
+
+        assert_eq!(paths.state_root(), PathBuf::from("/home/ada/.afs"));
+    }
+
+    #[test]
+    fn env_state_root_overrides_platform_default() {
+        let paths = DefaultHostPaths::for_target_with_env(
+            "windows",
+            [
+                ("AFS_STATE_DIR", r"D:\afs-state"),
+                ("LOCALAPPDATA", r"C:\Users\Ada\AppData\Local"),
+            ],
+        );
+
+        assert_eq!(paths.state_root(), PathBuf::from(r"D:\afs-state"));
+    }
+
+    #[test]
+    fn logical_paths_render_with_forward_slashes() {
+        assert_eq!(
+            logical_path_display(Path::new(r"Teamspace Home\Launch Plan\page.md")),
+            "Teamspace Home/Launch Plan/page.md"
+        );
+    }
+}

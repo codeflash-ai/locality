@@ -1,21 +1,21 @@
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
+use afs_platform::{
+    DaemonManager, DaemonProcessError, DaemonProcessManager, DaemonProcessPaths,
+    DaemonProcessStartConfig, DaemonProcessStartReport, DaemonStartMode,
+    DefaultDaemonProcessManager,
+};
 use afsd::ipc::{
-    DaemonClientError, DaemonReloadReport, DaemonRequest, DaemonStatusReport,
-    send_request_with_timeout,
+    DaemonClientError, DaemonEndpoint, DaemonReloadReport, DaemonRequest, DaemonResponse,
+    DaemonStatusReport, send_endpoint_request_with_timeout,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-const LABEL: &str = "ai.codeflash.afs.afsd";
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -79,24 +79,6 @@ impl DaemonRunState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DaemonManager {
-    Launchd,
-    Session,
-    Unknown,
-}
-
-impl DaemonManager {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Launchd => "launchd",
-            Self::Session => "session",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DaemonAction {
     Start,
@@ -129,12 +111,7 @@ impl DaemonAction {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StartMode {
-    Auto,
-    Launchd,
-    Session,
-}
+type StartMode = DaemonStartMode;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DaemonOptions {
@@ -146,22 +123,7 @@ struct DaemonOptions {
     include_env: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
-struct DaemonPaths {
-    state_root: PathBuf,
-    socket: PathBuf,
-    pid_file: PathBuf,
-    metadata_file: PathBuf,
-    stdout_log: PathBuf,
-    stderr_log: PathBuf,
-    launch_agent: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug)]
-struct StartArtifacts {
-    manager: DaemonManager,
-    afsd_bin: PathBuf,
-}
+type DaemonPaths = DaemonProcessPaths;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct DaemonMetadata {
@@ -181,7 +143,7 @@ pub fn run_daemon_control(args: &[String]) -> Result<DaemonControlReport, Daemon
         DaemonAction::Reload => reload_daemon(&options, &paths),
         DaemonAction::Restart => {
             if let Err(error) = stop_daemon(&options, &paths)
-                && is_running(&paths)
+                && is_running(&options, &paths)
             {
                 return Err(error);
             }
@@ -238,7 +200,7 @@ fn start_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
-    if is_running(paths) {
+    if is_running(options, paths) {
         return Ok(report(
             options.action,
             DaemonRunState::Running,
@@ -253,19 +215,23 @@ fn start_daemon(
     fs::create_dir_all(&paths.state_root)
         .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
     let afsd_bin = find_afsd_binary(options.afsd_bin.as_deref())?;
-    let manager = resolve_start_manager(options.mode)?;
-    let artifacts = match manager {
-        DaemonManager::Launchd => start_launchd(options, paths, &afsd_bin)?,
-        DaemonManager::Session => start_session(options, paths, &afsd_bin)?,
-        DaemonManager::Unknown => {
-            return Err(DaemonControlError::new(
-                "unsupported",
-                "daemon start manager could not be resolved",
-            ));
-        }
-    };
+    let process_manager = DefaultDaemonProcessManager;
+    process_manager
+        .resolve_start_manager(options.mode)
+        .map_err(daemon_process_error)?;
+    validate_start_endpoint(options)?;
+    let environment = included_environment(options)?;
+    let artifacts = process_manager
+        .start(&DaemonProcessStartConfig {
+            mode: options.mode,
+            paths,
+            afsd_bin: &afsd_bin,
+            tcp_addr: options.tcp_addr.as_deref(),
+            environment,
+        })
+        .map_err(daemon_process_error)?;
 
-    if !wait_for_state(paths, DaemonRunState::Running, START_TIMEOUT) {
+    if !wait_for_state(options, paths, DaemonRunState::Running, START_TIMEOUT) {
         return Err(DaemonControlError::new(
             "start_failed",
             format!(
@@ -291,38 +257,31 @@ fn stop_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
-    let was_running = is_running(paths);
-    let mut stopped_managed_process = false;
-
-    if should_use_launchd(options.mode)
-        && paths
-            .launch_agent
-            .as_ref()
-            .is_some_and(|path| path.exists())
-    {
-        stop_launchd(paths)?;
-        stopped_managed_process = true;
-    }
-
-    if paths.pid_file.exists() {
-        stop_session(paths)?;
-        stopped_managed_process = true;
-    }
-    let _ = fs::remove_file(&paths.metadata_file);
+    let was_running = is_running(options, paths);
+    let mut stopped_managed_process = DefaultDaemonProcessManager
+        .stop(options.mode, paths)
+        .map_err(daemon_process_error)?
+        .stopped_managed_process;
 
     if was_running
         && !stopped_managed_process
-        && wait_for_state(paths, DaemonRunState::Stopped, Duration::from_millis(250))
+        && wait_for_state(
+            options,
+            paths,
+            DaemonRunState::Stopped,
+            Duration::from_millis(250),
+        )
     {
         stopped_managed_process = true;
     }
 
-    if !wait_for_state(paths, DaemonRunState::Stopped, STOP_TIMEOUT) {
+    if !wait_for_state(options, paths, DaemonRunState::Stopped, STOP_TIMEOUT) {
         return Err(DaemonControlError::new(
             "stop_failed",
             "daemon is still responding; if it was started manually, stop the afsd process directly",
         ));
     }
+    let _ = fs::remove_file(&paths.metadata_file);
 
     let message = if was_running || stopped_managed_process {
         "daemon stopped"
@@ -346,7 +305,7 @@ fn status_report(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> DaemonControlReport {
-    let state = if is_running(paths) {
+    let state = if is_running(options, paths) {
         DaemonRunState::Running
     } else {
         DaemonRunState::Stopped
@@ -358,7 +317,7 @@ fn status_report(
     };
     let message = format!("daemon {}", state.as_str());
     let daemon_status = if state == DaemonRunState::Running {
-        send_daemon_report::<DaemonStatusReport>(paths, &DaemonRequest::Status).ok()
+        send_daemon_report::<DaemonStatusReport>(options, paths, &DaemonRequest::Status).ok()
     } else {
         None
     };
@@ -371,15 +330,16 @@ fn reload_daemon(
     options: &DaemonOptions,
     paths: &DaemonPaths,
 ) -> Result<DaemonControlReport, DaemonControlError> {
-    if !is_running(paths) {
+    if !is_running(options, paths) {
         return Err(DaemonControlError::new(
             "daemon_not_running",
             "daemon is not running",
         ));
     }
-    let reload = send_daemon_report::<DaemonReloadReport>(paths, &DaemonRequest::ReloadMounts)?;
+    let reload =
+        send_daemon_report::<DaemonReloadReport>(options, paths, &DaemonRequest::ReloadMounts)?;
     let daemon_status =
-        send_daemon_report::<DaemonStatusReport>(paths, &DaemonRequest::Status).ok();
+        send_daemon_report::<DaemonStatusReport>(options, paths, &DaemonRequest::Status).ok();
     let mut report = report(
         DaemonAction::Reload,
         DaemonRunState::Running,
@@ -444,20 +404,20 @@ fn report(
 }
 
 fn send_daemon_report<T>(
+    options: &DaemonOptions,
     paths: &DaemonPaths,
     request: &DaemonRequest,
 ) -> Result<T, DaemonControlError>
 where
     T: DeserializeOwned,
 {
-    let response =
-        send_request_with_timeout(&paths.state_root, request, DAEMON_CONTROL_REQUEST_TIMEOUT)
-            .map_err(|error| {
-                DaemonControlError::new(
-                    "daemon_error",
-                    format!("daemon request failed: {}", error.message()),
-                )
-            })?;
+    let response = send_daemon_request(options, paths, request, DAEMON_CONTROL_REQUEST_TIMEOUT)
+        .map_err(|error| {
+            DaemonControlError::new(
+                "daemon_error",
+                format!("daemon request failed: {}", error.message()),
+            )
+        })?;
     if let Some(error) = response.error {
         return Err(DaemonControlError::new(
             "daemon_error",
@@ -477,7 +437,7 @@ where
 fn write_metadata(
     options: &DaemonOptions,
     paths: &DaemonPaths,
-    artifacts: &StartArtifacts,
+    artifacts: &DaemonProcessStartReport,
 ) -> Result<(), DaemonControlError> {
     let metadata = DaemonMetadata {
         manager: artifacts.manager,
@@ -498,190 +458,111 @@ fn read_metadata(paths: &DaemonPaths) -> Option<DaemonMetadata> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn resolve_start_manager(mode: StartMode) -> Result<DaemonManager, DaemonControlError> {
-    match mode {
-        StartMode::Session => Ok(DaemonManager::Session),
-        StartMode::Launchd => {
-            if cfg!(target_os = "macos") {
-                Ok(DaemonManager::Launchd)
-            } else {
-                Err(DaemonControlError::new(
-                    "unsupported",
-                    "--launchd is only supported on macOS",
-                ))
-            }
-        }
-        StartMode::Auto => {
-            if cfg!(target_os = "macos") {
-                Ok(DaemonManager::Launchd)
-            } else {
-                Ok(DaemonManager::Session)
-            }
-        }
+fn daemon_process_error(error: DaemonProcessError) -> DaemonControlError {
+    DaemonControlError::new(error.code(), error.message())
+}
+
+fn included_environment(
+    options: &DaemonOptions,
+) -> Result<Vec<(String, String)>, DaemonControlError> {
+    let mut environment = Vec::new();
+    for key in &options.include_env {
+        let value = env::var(key).map_err(|_| {
+            DaemonControlError::new(
+                "env_missing",
+                format!("environment variable `{key}` is not set"),
+            )
+        })?;
+        environment.push((key.clone(), value));
     }
+    Ok(environment)
 }
 
-fn should_use_launchd(mode: StartMode) -> bool {
-    matches!(mode, StartMode::Auto | StartMode::Launchd) && cfg!(target_os = "macos")
+fn validate_start_endpoint(options: &DaemonOptions) -> Result<(), DaemonControlError> {
+    #[cfg(windows)]
+    {
+        let value = options
+            .tcp_addr
+            .as_deref()
+            .unwrap_or(afsd::ipc::DEFAULT_TCP_ADDR);
+        if tcp_addr_disabled(value) {
+            return Err(DaemonControlError::new(
+                "unsupported",
+                "Windows daemon session mode requires TCP IPC; omit --tcp-addr off or pass --tcp-addr <host:port>",
+            ));
+        }
+        parse_tcp_addr(value).map_err(|error| DaemonControlError::new("usage", error))?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = options;
+    }
+
+    Ok(())
 }
 
-fn start_session(
+fn send_daemon_request(
     options: &DaemonOptions,
     paths: &DaemonPaths,
-    afsd_bin: &Path,
-) -> Result<StartArtifacts, DaemonControlError> {
-    fs::create_dir_all(paths.stdout_log.parent().unwrap_or(&paths.state_root))
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.stdout_log)
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-    let stderr = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.stderr_log)
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-
-    let mut command = Command::new(afsd_bin);
-    command
-        .env("AFS_STATE_DIR", &paths.state_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    if let Some(tcp_addr) = &options.tcp_addr {
-        command.env("AFS_DAEMON_TCP_ADDR", tcp_addr);
-    }
-    detach_session_process(&mut command);
-
-    let child = command
-        .spawn()
-        .map_err(|error| DaemonControlError::new("start_failed", error.to_string()))?;
-    fs::write(&paths.pid_file, child.id().to_string())
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-
-    Ok(StartArtifacts {
-        manager: DaemonManager::Session,
-        afsd_bin: afsd_bin.to_path_buf(),
-    })
+    request: &DaemonRequest,
+    timeout: Duration,
+) -> Result<DaemonResponse, DaemonClientError> {
+    let endpoint = control_endpoint(options, paths)?;
+    send_endpoint_request_with_timeout(&endpoint, request, timeout)
 }
 
-#[cfg(unix)]
-fn detach_session_process(command: &mut Command) {
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn detach_session_process(_command: &mut Command) {}
-
-#[cfg(target_os = "macos")]
-fn start_launchd(
+fn control_endpoint(
     options: &DaemonOptions,
     paths: &DaemonPaths,
-    afsd_bin: &Path,
-) -> Result<StartArtifacts, DaemonControlError> {
-    let Some(launch_agent) = &paths.launch_agent else {
-        return Err(DaemonControlError::new(
-            "unsupported",
-            "launchd requires a user LaunchAgents directory",
+) -> Result<DaemonEndpoint, DaemonClientError> {
+    #[cfg(windows)]
+    {
+        control_tcp_addr(options, paths).map(DaemonEndpoint::LocalTcp)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = options;
+        Ok(DaemonEndpoint::UnixSocket(paths.socket.clone()))
+    }
+}
+
+#[cfg(windows)]
+fn control_tcp_addr(
+    options: &DaemonOptions,
+    paths: &DaemonPaths,
+) -> Result<std::net::SocketAddr, DaemonClientError> {
+    let value = options
+        .tcp_addr
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| read_metadata(paths).map(|metadata| metadata.tcp_addr))
+        .unwrap_or_else(|| afsd::ipc::DEFAULT_TCP_ADDR.to_string());
+    if tcp_addr_disabled(&value) {
+        return Err(DaemonClientError::NotAvailable(
+            "daemon TCP IPC is disabled".to_string(),
         ));
-    };
-    fs::create_dir_all(launch_agent.parent().unwrap_or(Path::new(".")))
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-    fs::create_dir_all(paths.stdout_log.parent().unwrap_or(&paths.state_root))
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-
-    let plist = launch_agent_plist(options, paths, afsd_bin)?;
-    fs::write(launch_agent, plist)
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
-
-    let domain = launchd_domain()?;
-    let _ = Command::new("launchctl")
-        .arg("bootout")
-        .arg(&domain)
-        .arg(launch_agent)
-        .output();
-    run_launchctl(
-        Command::new("launchctl")
-            .arg("bootstrap")
-            .arg(&domain)
-            .arg(launch_agent),
-    )?;
-    run_launchctl(
-        Command::new("launchctl")
-            .arg("enable")
-            .arg(format!("{domain}/{LABEL}")),
-    )?;
-    run_launchctl(
-        Command::new("launchctl")
-            .arg("kickstart")
-            .arg("-k")
-            .arg(format!("{domain}/{LABEL}")),
-    )?;
-
-    Ok(StartArtifacts {
-        manager: DaemonManager::Launchd,
-        afsd_bin: afsd_bin.to_path_buf(),
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-fn start_launchd(
-    _options: &DaemonOptions,
-    _paths: &DaemonPaths,
-    _afsd_bin: &Path,
-) -> Result<StartArtifacts, DaemonControlError> {
-    Err(DaemonControlError::new(
-        "unsupported",
-        "launchd is only supported on macOS",
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn stop_launchd(paths: &DaemonPaths) -> Result<(), DaemonControlError> {
-    let Some(launch_agent) = &paths.launch_agent else {
-        return Ok(());
-    };
-    let domain = launchd_domain()?;
-    let _ = Command::new("launchctl")
-        .arg("bootout")
-        .arg(&domain)
-        .arg(launch_agent)
-        .output();
-    if launch_agent.exists() {
-        fs::remove_file(launch_agent)
-            .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?;
     }
-    Ok(())
+    parse_tcp_addr(&value).map_err(DaemonClientError::Protocol)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn stop_launchd(_paths: &DaemonPaths) -> Result<(), DaemonControlError> {
-    Ok(())
+#[cfg(windows)]
+fn tcp_addr_disabled(value: &str) -> bool {
+    matches!(value, "0" | "off" | "none" | "disabled")
 }
 
-fn stop_session(paths: &DaemonPaths) -> Result<(), DaemonControlError> {
-    let pid = fs::read_to_string(&paths.pid_file)
-        .map_err(|error| DaemonControlError::new("io_error", error.to_string()))?
-        .trim()
-        .to_string();
-    if !pid.is_empty() {
-        let _ = Command::new("kill").arg(&pid).output();
-    }
-    let _ = fs::remove_file(&paths.pid_file);
-    Ok(())
+#[cfg(windows)]
+fn parse_tcp_addr(value: &str) -> Result<std::net::SocketAddr, String> {
+    value
+        .parse()
+        .map_err(|error| format!("invalid daemon TCP address `{value}`: {error}"))
 }
 
-fn is_running(paths: &DaemonPaths) -> bool {
-    match send_request_with_timeout(
-        &paths.state_root,
+fn is_running(options: &DaemonOptions, paths: &DaemonPaths) -> bool {
+    match send_daemon_request(
+        options,
+        paths,
         &DaemonRequest::Ping,
         DAEMON_CONTROL_REQUEST_TIMEOUT,
     ) {
@@ -693,10 +574,15 @@ fn is_running(paths: &DaemonPaths) -> bool {
     }
 }
 
-fn wait_for_state(paths: &DaemonPaths, state: DaemonRunState, timeout: Duration) -> bool {
+fn wait_for_state(
+    options: &DaemonOptions,
+    paths: &DaemonPaths,
+    state: DaemonRunState,
+    timeout: Duration,
+) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        let running = is_running(paths);
+        let running = is_running(options, paths);
         if (state == DaemonRunState::Running && running)
             || (state == DaemonRunState::Stopped && !running)
         {
@@ -708,17 +594,7 @@ fn wait_for_state(paths: &DaemonPaths, state: DaemonRunState, timeout: Duration)
 }
 
 fn detected_manager(paths: &DaemonPaths) -> DaemonManager {
-    if paths.pid_file.exists() {
-        return DaemonManager::Session;
-    }
-    if paths
-        .launch_agent
-        .as_ref()
-        .is_some_and(|path| path.exists())
-    {
-        return DaemonManager::Launchd;
-    }
-    DaemonManager::Unknown
+    DefaultDaemonProcessManager.detected_manager(paths)
 }
 
 fn find_afsd_binary(explicit: Option<&Path>) -> Result<PathBuf, DaemonControlError> {
@@ -789,156 +665,6 @@ fn binary_name(name: &str) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn launchd_domain() -> Result<String, DaemonControlError> {
-    let output = Command::new("id")
-        .arg("-u")
-        .output()
-        .map_err(|error| DaemonControlError::new("launchctl_failed", error.to_string()))?;
-    if !output.status.success() {
-        return Err(DaemonControlError::new(
-            "launchctl_failed",
-            "could not determine current user id",
-        ));
-    }
-    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(format!("gui/{uid}"))
-}
-
-#[cfg(target_os = "macos")]
-fn run_launchctl(command: &mut Command) -> Result<(), DaemonControlError> {
-    let output = command
-        .output()
-        .map_err(|error| DaemonControlError::new("launchctl_failed", error.to_string()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let message = if !stderr.is_empty() { stderr } else { stdout };
-    Err(DaemonControlError::new(
-        "launchctl_failed",
-        if message.is_empty() {
-            format!("launchctl exited with {}", output.status)
-        } else {
-            message
-        },
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn launch_agent_plist(
-    options: &DaemonOptions,
-    paths: &DaemonPaths,
-    afsd_bin: &Path,
-) -> Result<String, DaemonControlError> {
-    let mut env_vars = vec![
-        ("HOME".to_string(), home_dir()?.display().to_string()),
-        (
-            "AFS_STATE_DIR".to_string(),
-            paths.state_root.display().to_string(),
-        ),
-    ];
-    if let Some(tcp_addr) = &options.tcp_addr {
-        env_vars.push(("AFS_DAEMON_TCP_ADDR".to_string(), tcp_addr.clone()));
-    }
-    for key in &options.include_env {
-        let value = env::var(key).map_err(|_| {
-            DaemonControlError::new(
-                "env_missing",
-                format!("environment variable `{key}` is not set"),
-            )
-        })?;
-        env_vars.push((key.clone(), value));
-    }
-    env_vars.sort_by(|a, b| a.0.cmp(&b.0));
-    env_vars.dedup_by(|a, b| a.0 == b.0);
-
-    let env_xml = env_vars
-        .iter()
-        .map(|(key, value)| {
-            format!(
-                "    <key>{}</key>\n    <string>{}</string>\n",
-                xml_escape(key),
-                xml_escape(value)
-            )
-        })
-        .collect::<String>();
-
-    Ok(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{afsd_bin}</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-{env_xml}  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>{stdout}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr}</string>
-</dict>
-</plist>
-"#,
-        label = LABEL,
-        afsd_bin = xml_escape(&afsd_bin.display().to_string()),
-        env_xml = env_xml,
-        stdout = xml_escape(&paths.stdout_log.display().to_string()),
-        stderr = xml_escape(&paths.stderr_log.display().to_string()),
-    ))
-}
-
-#[cfg(test)]
-fn test_launch_agent_plist(
-    options: &DaemonOptions,
-    paths: &DaemonPaths,
-    afsd_bin: &Path,
-) -> Result<String, DaemonControlError> {
-    #[cfg(target_os = "macos")]
-    {
-        launch_agent_plist(options, paths, afsd_bin)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (options, paths, afsd_bin);
-        Ok(String::new())
-    }
-}
-
-impl DaemonPaths {
-    fn new(state_root: PathBuf) -> Self {
-        let socket = afsd::ipc::socket_path(&state_root);
-        let pid_file = state_root.join("afsd.pid");
-        let metadata_file = state_root.join("afsd.manager.json");
-        let stdout_log = state_root.join("logs/afsd.out.log");
-        let stderr_log = state_root.join("logs/afsd.err.log");
-        let launch_agent = home_dir().ok().map(|home| {
-            home.join("Library/LaunchAgents")
-                .join(format!("{LABEL}.plist"))
-        });
-        Self {
-            state_root,
-            socket,
-            pid_file,
-            metadata_file,
-            stdout_log,
-            stderr_log,
-            launch_agent,
-        }
-    }
-}
-
 fn first_positional(args: &[String]) -> Option<&str> {
     let mut skip_next = false;
     for arg in args {
@@ -995,31 +721,7 @@ fn takes_value(arg: &str) -> bool {
 }
 
 fn default_state_root() -> PathBuf {
-    if let Ok(value) = env::var("AFS_STATE_DIR") {
-        return PathBuf::from(value);
-    }
-
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home).join(".afs");
-    }
-
-    PathBuf::from(".afs")
-}
-
-fn home_dir() -> Result<PathBuf, DaemonControlError> {
-    env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| DaemonControlError::new("env_missing", "HOME is not set"))
-}
-
-#[allow(dead_code)]
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    afs_platform::default_state_root()
 }
 
 #[cfg(test)]
@@ -1056,36 +758,74 @@ mod tests {
         assert_eq!(error.code(), "usage");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn escapes_xml_special_characters() {
-        assert_eq!(
-            xml_escape("a&b<c>d\"e'f"),
-            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
-        );
-    }
-
-    #[test]
-    fn launch_agent_test_hook_is_available() {
+    fn windows_start_rejects_disabled_tcp_endpoint() {
         let options = DaemonOptions {
             action: DaemonAction::Start,
-            mode: StartMode::Launchd,
-            state_root: PathBuf::from("/tmp/afs-state"),
+            mode: StartMode::Session,
+            state_root: PathBuf::from(r"C:\afs-state"),
             afsd_bin: None,
-            tcp_addr: Some("127.0.0.1:38567".to_string()),
+            tcp_addr: Some("off".to_string()),
             include_env: Vec::new(),
         };
-        let paths = DaemonPaths::new(PathBuf::from("/tmp/afs-state"));
 
-        let plist =
-            test_launch_agent_plist(&options, &paths, Path::new("/tmp/afsd")).expect("plist");
+        let error = validate_start_endpoint(&options).expect_err("tcp off rejected");
 
-        if cfg!(target_os = "macos") {
-            assert!(plist.contains("<string>/tmp/afsd</string>"));
-            assert!(plist.contains("<key>AFS_STATE_DIR</key>"));
-            assert!(plist.contains("<string>/tmp/afs-state</string>"));
-        } else {
-            assert!(plist.is_empty());
-        }
+        assert_eq!(error.code(), "unsupported");
+        assert!(error.message().contains("requires TCP IPC"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_control_tcp_addr_prefers_cli_then_metadata() {
+        let root = temp_root("afs-daemon-control-tcp");
+        std::fs::create_dir_all(&root).expect("state root");
+        let paths = DaemonPaths::new(root.clone());
+        std::fs::write(
+            &paths.metadata_file,
+            r#"{"manager":"session","afsd_bin":"afsd.exe","tcp_addr":"127.0.0.1:40100"}"#,
+        )
+        .expect("metadata");
+        let mut options = DaemonOptions {
+            action: DaemonAction::Status,
+            mode: StartMode::Auto,
+            state_root: root.clone(),
+            afsd_bin: None,
+            tcp_addr: None,
+            include_env: Vec::new(),
+        };
+
+        assert_eq!(
+            control_tcp_addr(&options, &paths)
+                .expect("metadata tcp")
+                .to_string(),
+            "127.0.0.1:40100"
+        );
+
+        options.tcp_addr = Some("127.0.0.1:40200".to_string());
+        assert_eq!(
+            control_tcp_addr(&options, &paths)
+                .expect("option tcp")
+                .to_string(),
+            "127.0.0.1:40200"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn temp_root(prefix: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}-{suffix}", std::process::id()))
     }
 
     fn strings(values: &[&str]) -> Vec<String> {

@@ -1,20 +1,21 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use afs_core::AfsError;
 use afs_core::canonical::render_canonical_markdown;
 use afs_core::freshness::{ChangeHintKind, FreshnessTier, SyncJob, SyncJobKind};
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::pull::PullMode;
 use afs_core::shadow::ShadowDocument;
+use afs_core::{AfsError, AfsResult};
 use afs_store::{
-    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    HydrationJobRecord, HydrationJobRepository, MountConfig, MountRepository, ProjectionMode,
-    ShadowRepository, SqliteStateStore,
+    AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, EntityRecord, EntityRepository,
+    FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
+    MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
 };
 use afsd::DaemonConfig;
 use afsd::execution::{DaemonEventReport, PushJob};
@@ -22,8 +23,8 @@ use afsd::freshness::freshness_timestamp;
 use afsd::hydration::HydrationOutcome;
 use afsd::ipc::{DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use afsd::runtime::{
-    DaemonRuntime, DefaultRuntimeJobRunner, FileEventRuntimeReport, FreshnessRuntimeReport,
-    RuntimeJobRunner, ScheduledPullRuntimeReport,
+    DaemonRuntime, DaemonRuntimeHandle, DefaultRuntimeJobRunner, FileEventRuntimeReport,
+    FreshnessRuntimeReport, RuntimeJobRunner, ScheduledPullRuntimeReport,
 };
 use afsd::scheduler::PullSchedulerTick;
 use afsd::virtual_fs::{ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport};
@@ -138,6 +139,62 @@ fn runtime_answers_virtual_fs_children_while_pull_worker_is_blocked() {
             ROOT_CONTAINER_IDENTIFIER.to_string()
         )
     );
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_file_provider_children_bypasses_active_background_refreshes() {
+    let config = relay_config("file-provider-bypasses-background");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                temp_root("file-provider-bypasses-background-root"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    drop(store);
+
+    let (background_tx, background_rx) = mpsc::channel();
+    let (foreground_tx, foreground_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        BlockingBackgroundRefreshRunner {
+            background_tx,
+            foreground_tx,
+            release: Arc::clone(&release),
+        },
+    )
+    .expect("spawn runtime");
+
+    runtime
+        .handle()
+        .prime_virtual_mounts()
+        .expect("prime virtual mounts");
+    background_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("background refresh started");
+
+    let foreground_handle = runtime.handle();
+    let response_thread = thread::spawn(move || {
+        foreground_handle.request(DaemonRequest::FileProviderChildren {
+            mount_id: "notion-main".to_string(),
+            container_identifier: "source:notion".to_string(),
+        })
+    });
+
+    assert_eq!(
+        foreground_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("foreground children request"),
+        ("notion-main".to_string(), "source:notion".to_string())
+    );
+    assert!(response_thread.join().expect("foreground response").ok);
+    release_blocked_runner(&release);
     runtime.shutdown();
 }
 
@@ -305,25 +362,226 @@ fn runtime_prime_virtual_mounts_queues_root_and_source_refreshes() {
         .prime_virtual_mounts()
         .expect("prime virtual mounts");
 
-    let first = refresh_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("root refresh");
-    let second = refresh_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("source refresh");
+    let mut refreshes = vec![
+        refresh_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first refresh"),
+        refresh_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second refresh"),
+    ];
+    refreshes.sort();
 
     assert_eq!(
-        first,
-        (
-            "notion-main".to_string(),
-            ROOT_CONTAINER_IDENTIFIER.to_string()
-        )
-    );
-    assert_eq!(
-        second,
-        ("notion-main".to_string(), "source:notion".to_string())
+        refreshes,
+        vec![
+            (
+                "notion-main".to_string(),
+                ROOT_CONTAINER_IDENTIFIER.to_string()
+            ),
+            ("notion-main".to_string(), "source:notion".to_string()),
+        ]
     );
     runtime.shutdown();
+}
+
+#[test]
+fn runtime_background_virtual_refreshes_walk_breadth_first() {
+    let config = relay_config("prime-virtual-breadth-first");
+    let mount_id = MountId::new("notion-main");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                temp_root("prime-virtual-breadth-first-root"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    drop(store);
+
+    let (refresh_tx, refresh_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        BreadthFirstRefreshRunner {
+            refresh_tx,
+            mount_id,
+        },
+    )
+    .expect("spawn runtime");
+
+    runtime
+        .handle()
+        .prime_virtual_mounts()
+        .expect("prime virtual mounts");
+
+    let mut refreshed = Vec::new();
+    for _ in 0..6 {
+        refreshed.push(
+            refresh_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("background refresh"),
+        );
+    }
+
+    let root = (
+        "notion-main".to_string(),
+        ROOT_CONTAINER_IDENTIFIER.to_string(),
+    );
+    let source = ("notion-main".to_string(), "source:notion".to_string());
+    let page_a = ("notion-main".to_string(), "children:page-a".to_string());
+    let page_b = ("notion-main".to_string(), "children:page-b".to_string());
+    let page_a1 = ("notion-main".to_string(), "children:page-a1".to_string());
+    let page_b1 = ("notion-main".to_string(), "children:page-b1".to_string());
+
+    for expected in [&root, &source, &page_a, &page_b, &page_a1, &page_b1] {
+        assert!(
+            refreshed.contains(expected),
+            "missing refresh {expected:?}; saw {refreshed:?}"
+        );
+    }
+    assert!(
+        max_position(&refreshed, [&root, &source]) < min_position(&refreshed, [&page_a, &page_b]),
+        "depth-1 containers must wait for depth-0 refreshes: {refreshed:?}"
+    );
+    assert!(
+        max_position(&refreshed, [&page_a, &page_b])
+            < min_position(&refreshed, [&page_a1, &page_b1]),
+        "depth-2 containers must wait for depth-1 refreshes: {refreshed:?}"
+    );
+    assert!(
+        refresh_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "background refresh should stop after all discovered containers are drained"
+    );
+    runtime.shutdown();
+}
+
+#[test]
+fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
+    let mut simulation = SchedulerPolicySimulation::spawn("mixed-scheduler-policy");
+
+    simulation.advance_to(0, SchedulerInputAction::InitialEnumeration);
+    simulation.prime_virtual_mounts();
+    let [root_refresh, source_refresh] = simulation.expect_started_set([
+        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, ROOT_CONTAINER_IDENTIFIER),
+        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "source:notion"),
+    ]);
+
+    simulation.advance_to(
+        10,
+        SchedulerInputAction::InteractiveDirectoryOpen("children:page-a"),
+    );
+    let directory_open = simulation.request(DaemonRequest::FileProviderChildren {
+        mount_id: "notion-main".to_string(),
+        container_identifier: "children:page-a".to_string(),
+    });
+    let page_a_children = simulation.expect_started(SchedulerExpectedStart::new(
+        SchedulerOpKind::FileProviderChildren,
+        "children:page-a",
+    ));
+
+    simulation.advance_to(20, SchedulerInputAction::InteractiveFileOpen("page-open"));
+    let file_open = simulation.request(DaemonRequest::FileProviderRead {
+        mount_id: "notion-main".to_string(),
+        identifier: "page-open".to_string(),
+    });
+    simulation.expect_no_start();
+
+    simulation.advance_to(
+        30,
+        SchedulerInputAction::Complete(SchedulerOpKind::FileProviderChildren, "children:page-a"),
+    );
+    simulation.release(page_a_children);
+    simulation.assert_response_ok(directory_open);
+    let page_open = simulation.expect_started(SchedulerExpectedStart::new(
+        SchedulerOpKind::FileProviderRead,
+        "page-open",
+    ));
+
+    simulation.advance_to(40, SchedulerInputAction::OtherOperation("ManualSync.md"));
+    let pull = simulation.request(DaemonRequest::Pull {
+        path: PathBuf::from("ManualSync.md"),
+    });
+    simulation.expect_no_start();
+
+    simulation.advance_to(
+        50,
+        SchedulerInputAction::Complete(SchedulerOpKind::FileProviderRead, "page-open"),
+    );
+    simulation.release(page_open);
+    simulation.assert_response_ok(file_open);
+    let manual_pull = simulation.expect_started(SchedulerExpectedStart::new(
+        SchedulerOpKind::Pull,
+        "ManualSync.md",
+    ));
+
+    simulation.advance_to(
+        60,
+        SchedulerInputAction::Complete(SchedulerOpKind::Pull, "ManualSync.md"),
+    );
+    simulation.release(manual_pull);
+    simulation.assert_response_ok(pull);
+    let interactive_descendant = simulation.expect_started(SchedulerExpectedStart::new(
+        SchedulerOpKind::RefreshChildren,
+        "children:page-a1",
+    ));
+
+    simulation.advance_to(
+        70,
+        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "source:notion"),
+    );
+    simulation.release(source_refresh);
+    simulation.expect_no_start();
+
+    simulation.advance_to(
+        80,
+        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, ROOT_CONTAINER_IDENTIFIER),
+    );
+    simulation.release(root_refresh);
+    let page_b_refresh = simulation.expect_started(SchedulerExpectedStart::new(
+        SchedulerOpKind::RefreshChildren,
+        "children:page-b",
+    ));
+
+    simulation.advance_to(
+        90,
+        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-b"),
+    );
+    simulation.release(page_b_refresh);
+    let page_b_descendant = simulation.expect_started(SchedulerExpectedStart::new(
+        SchedulerOpKind::RefreshChildren,
+        "children:page-b1",
+    ));
+
+    simulation.advance_to(
+        100,
+        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-a1"),
+    );
+    simulation.release(interactive_descendant);
+    simulation.advance_to(
+        110,
+        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-b1"),
+    );
+    simulation.release(page_b_descendant);
+    simulation.expect_no_start();
+
+    simulation.assert_timeline([
+        SchedulerTimelineEntry::new(
+            0,
+            SchedulerOpKind::RefreshChildren,
+            ROOT_CONTAINER_IDENTIFIER,
+        ),
+        SchedulerTimelineEntry::new(0, SchedulerOpKind::RefreshChildren, "source:notion"),
+        SchedulerTimelineEntry::new(10, SchedulerOpKind::FileProviderChildren, "children:page-a"),
+        SchedulerTimelineEntry::new(30, SchedulerOpKind::FileProviderRead, "page-open"),
+        SchedulerTimelineEntry::new(50, SchedulerOpKind::Pull, "ManualSync.md"),
+        SchedulerTimelineEntry::new(60, SchedulerOpKind::RefreshChildren, "children:page-a1"),
+        SchedulerTimelineEntry::new(80, SchedulerOpKind::RefreshChildren, "children:page-b"),
+        SchedulerTimelineEntry::new(90, SchedulerOpKind::RefreshChildren, "children:page-b1"),
+    ]);
+    simulation.shutdown();
 }
 
 #[test]
@@ -653,6 +911,51 @@ fn runtime_drains_freshness_queued_by_virtual_write() {
 }
 
 #[test]
+fn runtime_queues_auto_push_for_enrolled_virtual_write() {
+    let config = relay_config("virtual-write-auto-push");
+    let mount_root = temp_root("virtual-write-auto-push-root");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(MountId::new("notion-main"), "notion", mount_root.clone())
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    let mut enrollment = AutoSaveEnrollmentRecord::new(
+        MountId::new("notion-main"),
+        "Roadmap.md",
+        AutoSaveOrigin::AfsCreated,
+        "now",
+    );
+    enrollment.remote_id = Some(RemoteId::new("page-1"));
+    store
+        .save_auto_save_enrollment(enrollment)
+        .expect("save enrollment");
+    drop(store);
+
+    let (push_tx, push_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(config, VirtualWriteAutoPushRunner { push_tx })
+        .expect("spawn runtime");
+
+    let response = runtime
+        .handle()
+        .request(DaemonRequest::VirtualFsCommitWrite {
+            mount_id: "notion-main".to_string(),
+            identifier: "page-1".to_string(),
+            contents_base64: "ZWRpdGVk".to_string(),
+        });
+
+    assert!(response.ok);
+    let job = push_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("auto-push job");
+    assert_eq!(job.target_path, mount_root.join("Roadmap.md"));
+    assert!(job.assume_yes);
+    assert!(!job.confirm_dangerous);
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_queues_remote_fast_forward_from_freshness_report() {
     let config = relay_config("remote-fast-forward");
     let mount_root = temp_root("remote-fast-forward-mount");
@@ -675,7 +978,7 @@ fn runtime_queues_remote_fast_forward_from_freshness_report() {
         .expect("submit freshness event");
 
     let request = hydrated_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(5))
         .expect("auto fast-forward hydration drained");
     assert_eq!(request.mount_id, MountId::new("notion-main"));
     assert_eq!(request.remote_id, RemoteId::new("page-1"));
@@ -779,6 +1082,483 @@ fn assert_hydration_jobs_drained(state_root: PathBuf) {
     }
 }
 
+struct SchedulerPolicySimulation {
+    runtime: DaemonRuntime,
+    handle: DaemonRuntimeHandle,
+    state: Arc<ScriptedSchedulerState>,
+    started_rx: mpsc::Receiver<SchedulerStartedOperation>,
+    current_tick: u64,
+    input_log: Vec<SchedulerInputEvent>,
+    timeline: Vec<SchedulerTimelineEntry>,
+}
+
+impl SchedulerPolicySimulation {
+    fn spawn(name: &str) -> Self {
+        let config = relay_config(name);
+        let mount_id = MountId::new("notion-main");
+        let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+        store
+            .save_mount(
+                MountConfig::new(
+                    mount_id.clone(),
+                    "notion",
+                    temp_root(&format!("{name}-mount")),
+                )
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        drop(store);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let state = Arc::new(ScriptedSchedulerState {
+            started_tx,
+            next_sequence: AtomicUsize::new(0),
+            released: Mutex::new(BTreeSet::new()),
+            release_condvar: Condvar::new(),
+            mount_id,
+        });
+        let runtime = DaemonRuntime::spawn_with_runner(
+            config,
+            ScriptedSchedulerRunner {
+                state: Arc::clone(&state),
+            },
+        )
+        .expect("spawn runtime");
+        let handle = runtime.handle();
+
+        Self {
+            runtime,
+            handle,
+            state,
+            started_rx,
+            current_tick: 0,
+            input_log: Vec::new(),
+            timeline: Vec::new(),
+        }
+    }
+
+    fn advance_to(&mut self, tick: u64, action: SchedulerInputAction) {
+        assert!(
+            tick >= self.current_tick,
+            "scheduler simulation ticks must be monotonic: {} -> {}",
+            self.current_tick,
+            tick
+        );
+        self.current_tick = tick;
+        self.input_log.push(SchedulerInputEvent {
+            tick,
+            action: action.describe(),
+        });
+    }
+
+    fn prime_virtual_mounts(&self) {
+        self.handle
+            .prime_virtual_mounts()
+            .expect("prime virtual mounts");
+    }
+
+    fn request(&self, request: DaemonRequest) -> thread::JoinHandle<DaemonResponse> {
+        let handle = self.handle.clone();
+        thread::spawn(move || handle.request(request))
+    }
+
+    fn expect_started(&mut self, expected: SchedulerExpectedStart) -> SchedulerStartedOperation {
+        let operation = self
+            .started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "expected scheduler operation {expected:?}; input log: {:?}; error: {error}",
+                    self.input_log
+                )
+            });
+        assert_eq!(
+            operation.expected_start(),
+            expected,
+            "unexpected scheduler operation; input log: {:?}",
+            self.input_log
+        );
+        self.record_started(&[operation.clone()]);
+        operation
+    }
+
+    fn expect_started_set<const N: usize>(
+        &mut self,
+        expected: [SchedulerExpectedStart; N],
+    ) -> [SchedulerStartedOperation; N] {
+        let expected_set = expected
+            .into_iter()
+            .map(|expected| (expected.kind, expected.target))
+            .collect::<BTreeSet<_>>();
+        let mut operations = Vec::with_capacity(N);
+        for _ in 0..N {
+            operations.push(
+                self.started_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "expected scheduler operations {expected_set:?}; input log: {:?}; error: {error}",
+                            self.input_log
+                        )
+                    }),
+            );
+        }
+        let actual_set = operations
+            .iter()
+            .map(|operation| (operation.kind, operation.target.clone()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual_set, expected_set,
+            "unexpected scheduler operation set; input log: {:?}",
+            self.input_log
+        );
+        operations.sort_by(|left, right| {
+            left.kind
+                .cmp(&right.kind)
+                .then_with(|| left.target.cmp(&right.target))
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
+        self.record_started(&operations);
+        operations
+            .try_into()
+            .unwrap_or_else(|_| panic!("operation count should match expected count"))
+    }
+
+    fn expect_no_start(&self) {
+        match self.started_rx.recv_timeout(Duration::from_millis(75)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("scheduler operation channel disconnected")
+            }
+            Ok(operation) => panic!(
+                "unexpected scheduler operation {operation:?}; input log: {:?}",
+                self.input_log
+            ),
+        }
+    }
+
+    fn release(&self, operation: SchedulerStartedOperation) {
+        self.state.release(operation.sequence);
+    }
+
+    fn assert_response_ok(&self, response: thread::JoinHandle<DaemonResponse>) {
+        let response = response.join().expect("request thread");
+        assert!(response.ok, "request failed: {response:?}");
+    }
+
+    fn assert_timeline<const N: usize>(&self, expected: [SchedulerTimelineEntry; N]) {
+        assert_eq!(
+            self.timeline.as_slice(),
+            &expected,
+            "unexpected scheduler timeline; input log: {:?}",
+            self.input_log
+        );
+    }
+
+    fn shutdown(self) {
+        self.runtime.shutdown();
+    }
+
+    fn record_started(&mut self, operations: &[SchedulerStartedOperation]) {
+        self.timeline.extend(operations.iter().map(|operation| {
+            SchedulerTimelineEntry::new(
+                self.current_tick,
+                operation.kind,
+                operation.target.as_str(),
+            )
+        }));
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SchedulerInputEvent {
+    tick: u64,
+    action: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SchedulerInputAction {
+    InitialEnumeration,
+    InteractiveDirectoryOpen(&'static str),
+    InteractiveFileOpen(&'static str),
+    OtherOperation(&'static str),
+    Complete(SchedulerOpKind, &'static str),
+}
+
+impl SchedulerInputAction {
+    fn describe(&self) -> String {
+        match self {
+            Self::InitialEnumeration => "initial enumeration".to_string(),
+            Self::InteractiveDirectoryOpen(container) => {
+                format!("interactive directory open {container}")
+            }
+            Self::InteractiveFileOpen(identifier) => {
+                format!("interactive file open {identifier}")
+            }
+            Self::OtherOperation(path) => format!("other operation {path}"),
+            Self::Complete(kind, target) => format!("complete {kind:?} {target}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SchedulerOpKind {
+    RefreshChildren,
+    FileProviderChildren,
+    FileProviderRead,
+    Pull,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SchedulerExpectedStart {
+    kind: SchedulerOpKind,
+    target: String,
+}
+
+impl SchedulerExpectedStart {
+    fn new(kind: SchedulerOpKind, target: &str) -> Self {
+        Self {
+            kind,
+            target: target.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SchedulerStartedOperation {
+    sequence: usize,
+    kind: SchedulerOpKind,
+    target: String,
+}
+
+impl SchedulerStartedOperation {
+    fn expected_start(&self) -> SchedulerExpectedStart {
+        SchedulerExpectedStart {
+            kind: self.kind,
+            target: self.target.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SchedulerTimelineEntry {
+    tick: u64,
+    kind: SchedulerOpKind,
+    target: String,
+}
+
+impl SchedulerTimelineEntry {
+    fn new(tick: u64, kind: SchedulerOpKind, target: &str) -> Self {
+        Self {
+            tick,
+            kind,
+            target: target.to_string(),
+        }
+    }
+}
+
+struct ScriptedSchedulerState {
+    started_tx: mpsc::Sender<SchedulerStartedOperation>,
+    next_sequence: AtomicUsize,
+    released: Mutex<BTreeSet<usize>>,
+    release_condvar: Condvar,
+    mount_id: MountId,
+}
+
+impl ScriptedSchedulerState {
+    fn start_blocking(&self, kind: SchedulerOpKind, target: String) {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
+        self.started_tx
+            .send(SchedulerStartedOperation {
+                sequence,
+                kind,
+                target,
+            })
+            .expect("send scheduler operation");
+
+        let mut released = self.released.lock().expect("release lock");
+        while !released.remove(&sequence) {
+            released = self
+                .release_condvar
+                .wait(released)
+                .expect("wait operation release");
+        }
+    }
+
+    fn release(&self, sequence: usize) {
+        let mut released = self.released.lock().expect("release lock");
+        released.insert(sequence);
+        self.release_condvar.notify_all();
+    }
+
+    fn save_refresh_results(
+        &self,
+        state_root: PathBuf,
+        container_identifier: &str,
+    ) -> AfsResult<usize> {
+        let entries = match container_identifier {
+            "source:notion" => vec![
+                EntityRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new("page-a"),
+                    EntityKind::Page,
+                    "A",
+                    "A/page.md",
+                ),
+                EntityRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new("page-b"),
+                    EntityKind::Page,
+                    "B",
+                    "B/page.md",
+                ),
+            ],
+            "children:page-a" => vec![EntityRecord::new(
+                self.mount_id.clone(),
+                RemoteId::new("page-a1"),
+                EntityKind::Page,
+                "A1",
+                "A/A1/page.md",
+            )],
+            "children:page-b" => vec![EntityRecord::new(
+                self.mount_id.clone(),
+                RemoteId::new("page-b1"),
+                EntityKind::Page,
+                "B1",
+                "B/B1/page.md",
+            )],
+            _ => Vec::new(),
+        };
+        self.save_entities(state_root, entries)
+    }
+
+    fn save_interactive_children(
+        &self,
+        state_root: PathBuf,
+        container_identifier: &str,
+    ) -> AfsResult<usize> {
+        let entries = match container_identifier {
+            "children:page-a" => vec![
+                EntityRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new("page-a"),
+                    EntityKind::Page,
+                    "A",
+                    "A/page.md",
+                ),
+                EntityRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new("page-a1"),
+                    EntityKind::Page,
+                    "A1",
+                    "A/A1/page.md",
+                ),
+            ],
+            _ => Vec::new(),
+        };
+        self.save_entities(state_root, entries)
+    }
+
+    fn save_entities(&self, state_root: PathBuf, entries: Vec<EntityRecord>) -> AfsResult<usize> {
+        let saved = entries.len();
+        let mut store = SqliteStateStore::open(state_root).map_err(AfsError::from)?;
+        for entry in entries {
+            store.save_entity(entry).map_err(AfsError::from)?;
+        }
+        Ok(saved)
+    }
+}
+
+#[derive(Clone)]
+struct ScriptedSchedulerRunner {
+    state: Arc<ScriptedSchedulerState>,
+}
+
+impl RuntimeJobRunner for ScriptedSchedulerRunner {
+    fn run_pull(&self, _state_root: PathBuf, path: PathBuf) -> DaemonResponse {
+        self.state
+            .start_blocking(SchedulerOpKind::Pull, path.display().to_string());
+        DaemonResponse::ok(json!({ "command": "pull" }))
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> AfsResult<HydrationOutcome> {
+        Err(AfsError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_virtual_fs_refresh_children(
+        &self,
+        state_root: PathBuf,
+        _mount_id: String,
+        container_identifier: String,
+    ) -> AfsResult<usize> {
+        self.state.start_blocking(
+            SchedulerOpKind::RefreshChildren,
+            container_identifier.clone(),
+        );
+        self.state
+            .save_refresh_results(state_root, &container_identifier)
+    }
+
+    fn run_file_provider_children(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> DaemonResponse {
+        self.state.start_blocking(
+            SchedulerOpKind::FileProviderChildren,
+            container_identifier.clone(),
+        );
+        match self
+            .state
+            .save_interactive_children(state_root, &container_identifier)
+        {
+            Ok(_) => DaemonResponse::ok(json!({
+                "mount_id": mount_id,
+                "container_identifier": container_identifier,
+                "children": []
+            })),
+            Err(error) => DaemonResponse::error("test_store_error", error.to_string()),
+        }
+    }
+
+    fn run_file_provider_read(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        identifier: String,
+    ) -> DaemonResponse {
+        self.state
+            .start_blocking(SchedulerOpKind::FileProviderRead, identifier.clone());
+        DaemonResponse::ok(json!({
+            "mount_id": mount_id,
+            "path": format!("{identifier}.md"),
+            "contents_base64": ""
+        }))
+    }
+}
+
 #[derive(Clone)]
 struct BlockingPullRunner {
     started: mpsc::Sender<()>,
@@ -828,6 +1608,12 @@ struct BlockingVirtualFsRunner {
     release: Arc<(Mutex<bool>, Condvar)>,
     children_tx: mpsc::Sender<(String, String)>,
     refresh_tx: mpsc::Sender<(String, String)>,
+}
+
+struct BlockingBackgroundRefreshRunner {
+    background_tx: mpsc::Sender<(String, String)>,
+    foreground_tx: mpsc::Sender<(String, String)>,
+    release: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl RuntimeJobRunner for BlockingVirtualFsRunner {
@@ -892,6 +1678,70 @@ impl RuntimeJobRunner for BlockingVirtualFsRunner {
             .send((mount_id, container_identifier))
             .expect("notify refresh");
         Ok(0)
+    }
+}
+
+impl RuntimeJobRunner for BlockingBackgroundRefreshRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        Err(AfsError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_virtual_fs_refresh_children(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> afs_core::AfsResult<usize> {
+        self.background_tx
+            .send((mount_id, container_identifier))
+            .expect("notify background refresh");
+        let (lock, condvar) = &*self.release;
+        let mut released = lock.lock().expect("lock release");
+        while !*released {
+            released = condvar.wait(released).expect("wait release");
+        }
+        Ok(0)
+    }
+
+    fn run_file_provider_children(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> DaemonResponse {
+        self.foreground_tx
+            .send((mount_id.clone(), container_identifier.clone()))
+            .expect("notify foreground children");
+        DaemonResponse::ok(json!({
+            "mount_id": mount_id,
+            "container_identifier": container_identifier,
+            "children": []
+        }))
     }
 }
 
@@ -1018,6 +1868,10 @@ struct FreshnessFromEventRunner {
     freshness_tx: mpsc::Sender<SyncJob>,
 }
 
+struct VirtualWriteAutoPushRunner {
+    push_tx: mpsc::Sender<PushJob>,
+}
+
 struct AutoFastForwardRunner {
     hydrated: mpsc::Sender<HydrationRequest>,
 }
@@ -1028,6 +1882,11 @@ struct PushRequestRunner {
 
 struct RefreshRecordingRunner {
     refresh_tx: mpsc::Sender<(String, String)>,
+}
+
+struct BreadthFirstRefreshRunner {
+    refresh_tx: mpsc::Sender<(String, String)>,
+    mount_id: MountId,
 }
 
 impl RuntimeJobRunner for PushRequestRunner {
@@ -1102,6 +1961,88 @@ impl RuntimeJobRunner for RefreshRecordingRunner {
             .send((mount_id, container_identifier))
             .expect("send refresh");
         Ok(0)
+    }
+}
+
+impl RuntimeJobRunner for BreadthFirstRefreshRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        Err(AfsError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_virtual_fs_refresh_children(
+        &self,
+        state_root: PathBuf,
+        mount_id: String,
+        container_identifier: String,
+    ) -> afs_core::AfsResult<usize> {
+        self.refresh_tx
+            .send((mount_id.clone(), container_identifier.clone()))
+            .expect("send refresh");
+
+        let mut store = SqliteStateStore::open(state_root).map_err(AfsError::from)?;
+        let entries = match container_identifier.as_str() {
+            "source:notion" => vec![
+                EntityRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new("page-a"),
+                    EntityKind::Page,
+                    "A",
+                    "A/page.md",
+                ),
+                EntityRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new("page-b"),
+                    EntityKind::Page,
+                    "B",
+                    "B/page.md",
+                ),
+            ],
+            "children:page-a" => vec![EntityRecord::new(
+                self.mount_id.clone(),
+                RemoteId::new("page-a1"),
+                EntityKind::Page,
+                "A1",
+                "A/A1/page.md",
+            )],
+            "children:page-b" => vec![EntityRecord::new(
+                self.mount_id.clone(),
+                RemoteId::new("page-b1"),
+                EntityKind::Page,
+                "B1",
+                "B/B1/page.md",
+            )],
+            _ => Vec::new(),
+        };
+        let saved = entries.len();
+        for entry in entries {
+            store.save_entity(entry).map_err(AfsError::from)?;
+        }
+        Ok(saved)
     }
 }
 
@@ -1282,6 +2223,72 @@ impl RuntimeJobRunner for FreshnessFromEventRunner {
     }
 }
 
+impl RuntimeJobRunner for VirtualWriteAutoPushRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_auto_push(&self, _state_root: PathBuf, job: PushJob) -> DaemonResponse {
+        self.push_tx.send(job).expect("send auto-push job");
+        DaemonResponse::ok(json!({ "command": "auto_push" }))
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> afs_core::AfsResult<ScheduledPullRuntimeReport> {
+        Err(AfsError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> afs_core::AfsResult<HydrationOutcome> {
+        Err(AfsError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_virtual_fs_commit_write(
+        &self,
+        _state_root: PathBuf,
+        mount_id: String,
+        identifier: String,
+        _contents_base64: String,
+    ) -> DaemonResponse {
+        DaemonResponse::ok(json!({
+            "mount_id": mount_id,
+            "identifier": identifier,
+            "remote_id": "page-1",
+            "path": "Roadmap.md",
+            "bytes_written": 6,
+            "hydration": "dirty"
+        }))
+    }
+
+    fn run_freshness_job(
+        &self,
+        _state_root: PathBuf,
+        job: SyncJob,
+    ) -> afs_core::AfsResult<FreshnessRuntimeReport> {
+        Ok(FreshnessRuntimeReport {
+            job,
+            remote_hint_pending: false,
+            queued_hydrations: Vec::new(),
+            follow_up_jobs: Vec::new(),
+        })
+    }
+}
+
 impl RuntimeJobRunner for AutoFastForwardRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
         DaemonResponse::error("unexpected_pull", "pull should not run")
@@ -1396,6 +2403,38 @@ fn release_blocked_runner(release: &Arc<(Mutex<bool>, Condvar)>) {
     let mut released = lock.lock().expect("lock release");
     *released = true;
     condvar.notify_all();
+}
+
+fn min_position<const N: usize>(
+    values: &[(String, String)],
+    needles: [&(String, String); N],
+) -> usize {
+    needles
+        .into_iter()
+        .map(|needle| {
+            values
+                .iter()
+                .position(|value| value == needle)
+                .expect("needle present")
+        })
+        .min()
+        .expect("at least one needle")
+}
+
+fn max_position<const N: usize>(
+    values: &[(String, String)],
+    needles: [&(String, String); N],
+) -> usize {
+    needles
+        .into_iter()
+        .map(|needle| {
+            values
+                .iter()
+                .position(|value| value == needle)
+                .expect("needle present")
+        })
+        .max()
+        .expect("at least one needle")
 }
 
 fn relay_config(name: &str) -> DaemonConfig {

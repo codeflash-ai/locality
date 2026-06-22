@@ -41,3 +41,32 @@ jobs:
       - name: Run mounted workflow live e2e
         if: steps.live-secrets.outputs.configured == 'true'
         run: cargo test -p afs-cli --test e2e_push_workflow live_ -- --ignored --test-threads=1
+
+  windows-cloud-files-live:
+    name: Windows Cloud Files live e2e
+    runs-on: windows-latest
+    timeout-minutes: 30
+    environment: notion-live-e2e
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      AFS_NOTION_LIVE_PARENT_PAGE: ${{ secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
+      AFS_WINDOWS_CLOUD_FILES_LIVE: "1"
+      AFS_WINDOWS_CLOUD_FILES_LIVE_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check live Notion secrets
+        id: live-secrets
+        shell: pwsh
+        run: |
+          if ($env:NOTION_TOKEN -and $env:AFS_NOTION_LIVE_PARENT_PAGE) {
+            "configured=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "::notice::Skipping Windows Cloud Files live e2e because NOTION_TOKEN or AFS_NOTION_LIVE_PARENT_PAGE is not configured."
+            "configured=false" >> $env:GITHUB_OUTPUT
+          }
+      - name: Run Windows Cloud Files live Notion e2e
+        if: steps.live-secrets.outputs.configured == 'true'
+        shell: pwsh
+        run: ./tests/windows_cloud_files_live.ps1

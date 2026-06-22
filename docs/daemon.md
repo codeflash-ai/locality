@@ -34,9 +34,12 @@ management lives in `afs daemon ...`:
   current shell environment and writes `~/.afs/afsd.pid`. This is useful for
   development credentials and temporary test state, but it does not survive
   logout.
-- `afs daemon status` pings the daemon socket and reports the state root, socket,
-  manager, log path, runtime queue counts, scheduler mode, and watched mount
-  roots.
+- On Windows, session mode uses localhost TCP control IPC. `--tcp-addr off` is
+  rejected for daemon start because Windows does not have the Unix socket
+  fallback used by macOS/Linux CLI control.
+- `afs daemon status` pings the daemon control endpoint and reports the state
+  root, socket path, TCP address, manager, log path, runtime queue counts,
+  scheduler mode, and watched mount roots.
 - `afs daemon reload` asks the running daemon to reconcile file watches with the
   current SQLite mount table.
 - `afs daemon stop` unloads the LaunchAgent or kills the session pid file when
@@ -52,15 +55,17 @@ storage instead of plist environment variables.
 ## Foreground Daemon
 
 `afsd` now runs a foreground Unix-socket server at `AFS_STATE_DIR/afsd.sock`
-or `~/.afs/afsd.sock`, plus a localhost TCP listener at `127.0.0.1:38567` by
-default. It also serves a lightweight MCP-over-HTTP endpoint at
-`http://127.0.0.1:38568/mcp` by default. CLI `pull` and `push` try the Unix
-socket first. If the socket is unavailable, they fall back to the same
-in-process executor; if the daemon accepts a request but does not answer within
-the CLI timeout, `pull` falls back to direct execution while `push` fails closed
-to avoid duplicate remote writes. The macOS File Provider extension uses the TCP
-listener because the extension is sandboxed. Set `AFS_DAEMON_TCP_ADDR=off` to
-disable daemon TCP, or set it to `host:port` to move the listener. Set
+or `~/.afs/afsd.sock` on Unix, plus a localhost TCP listener at
+`127.0.0.1:38567` by default. On Windows, the TCP listener is the daemon control
+endpoint. It also serves a lightweight MCP-over-HTTP endpoint at
+`http://127.0.0.1:38568/mcp` by default. On Unix, CLI `pull` and `push` try the
+Unix socket first. On Windows, they use the TCP control endpoint. If the daemon
+endpoint is unavailable, they fall back to the same in-process executor; if the
+daemon accepts a request but does not answer within the CLI timeout, `pull`
+falls back to direct execution while `push` fails closed to avoid duplicate
+remote writes. The macOS File Provider extension uses the TCP listener because
+the extension is sandboxed. Set `AFS_DAEMON_TCP_ADDR=off` to disable daemon TCP
+on Unix, or set it to `host:port` to move the listener. Set
 `AFS_MCP_ADDR=off` to disable the MCP endpoint, or set it to `host:port` to move
 the endpoint. Setting `AFS_DAEMON_DISABLE=1` forces the CLI fallback path, which
 is useful for tests and recovery. Set `AFS_DAEMON_REQUEST_TIMEOUT_MS` to tune the
@@ -87,6 +92,14 @@ queued behind a single active worker. A slow Notion enumerate/fetch/apply call
 therefore does not block the daemon from accepting other requests or responding
 to pings, and two pull/push/hydration mutations cannot advance durable state at
 the same time.
+
+For macOS File Provider mounts, the Swift extension normally sends writes to the
+daemon through `modifyItem`. AFS also has a narrow reconciliation fallback at
+review and push boundaries: explicit-path status, diff, push, auto-save, and
+desktop file actions can import a newer visible CloudStorage file into the
+daemon content cache before planning. This fallback is intentionally scoped to
+explicit targets; startup, tray refreshes, and bare status do not scan the whole
+projection.
 
 ## Operator Guide
 

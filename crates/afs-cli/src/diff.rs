@@ -398,7 +398,7 @@ impl From<PushOperation> for PushOperationOutput {
                 caption,
             } => Self::UpdateMedia {
                 block_id: block_id.0,
-                local_path: local_path.display().to_string(),
+                local_path: afs_platform::logical_path_display(&local_path),
                 caption,
             },
             PushOperation::ArchiveBlock { block_id } => Self::ArchiveBlock {

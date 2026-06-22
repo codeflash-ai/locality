@@ -482,7 +482,7 @@ fn classify_virtual_mutation(
         absolute_path: projected_absolute_path(mount, &mutation.projected_path)
             .display()
             .to_string(),
-        path: mutation.projected_path.display().to_string(),
+        path: afs_platform::logical_path_display(&mutation.projected_path),
         entity_id,
         kind: "page".to_string(),
         title: mutation.title,
@@ -546,7 +546,7 @@ where
     }
 
     StatusEntry {
-        path: entity.path.display().to_string(),
+        path: afs_platform::logical_path_display(&entity.path),
         absolute_path: absolute_path.display().to_string(),
         entity_id: entity.remote_id.0,
         kind: entity_kind_name(&entity.kind).to_string(),
@@ -1137,10 +1137,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf, StatusError> {
 }
 
 fn default_state_root() -> PathBuf {
-    std::env::var("AFS_STATE_DIR")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".afs")))
-        .unwrap_or_else(|_| PathBuf::from(".afs"))
+    afs_platform::default_state_root()
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {

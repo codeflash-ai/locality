@@ -1,0 +1,183 @@
+name: release Mac App Store
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to package for the Mac App Store, for example v0.1.1"
+        required: true
+        type: string
+      validate_with_apple:
+        description: "Validate the signed package with App Store Connect"
+        required: false
+        default: true
+        type: boolean
+      upload:
+        description: "Upload the signed package to App Store Connect"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  mas-arm64:
+    name: Build Mac App Store package
+    runs-on: macos-15
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      PUBLISH_CHANNEL: app-store
+      MAS_VALIDATE_WITH_APPLE: ${{ inputs.validate_with_apple && '1' || '0' }}
+      MAS_UPLOAD: ${{ inputs.upload && '1' || '0' }}
+      MAS_APP_CERTIFICATE_P12_BASE64: ${{ secrets.MAS_APP_CERTIFICATE_P12_BASE64 }}
+      MAS_APP_CERTIFICATE_PASSWORD: ${{ secrets.MAS_APP_CERTIFICATE_PASSWORD }}
+      MAS_INSTALLER_CERTIFICATE_P12_BASE64: ${{ secrets.MAS_INSTALLER_CERTIFICATE_P12_BASE64 }}
+      MAS_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MAS_INSTALLER_CERTIFICATE_PASSWORD }}
+      MAS_APP_PROVISIONING_PROFILE_BASE64: ${{ secrets.MAS_APP_PROVISIONING_PROFILE_BASE64 }}
+      MAS_FILE_PROVIDER_PROVISIONING_PROFILE_BASE64: ${{ secrets.MAS_FILE_PROVIDER_PROVISIONING_PROFILE_BASE64 }}
+      MAS_APP_SIGNING_IDENTITY: ${{ secrets.MAS_APP_SIGNING_IDENTITY }}
+      MAS_INSTALLER_SIGNING_IDENTITY: ${{ secrets.MAS_INSTALLER_SIGNING_IDENTITY }}
+      APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+      APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+      APP_STORE_CONNECT_API_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_API_PRIVATE_KEY }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Verify release tag is current main
+        run: |
+          git fetch --force --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          main_commit="$(git rev-parse "origin/main^{commit}")"
+          if [[ "${tag_commit}" != "${main_commit}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} must point at current origin/main (${main_commit}); got ${tag_commit}."
+            exit 1
+          fi
+          echo "Release tag ${RELEASE_TAG} points at current origin/main (${main_commit})."
+
+      - name: Verify Apple Silicon runner
+        run: |
+          if [[ "$(uname -m)" != "arm64" ]]; then
+            echo "::error::Mac App Store workflow must run on an Apple Silicon runner."
+            exit 1
+          fi
+
+      - name: Verify tag matches app version
+        run: |
+          version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' apps/desktop/src-tauri/tauri.conf.json | head -n 1)"
+          if [[ -z "${version}" ]]; then
+            echo "::error::Could not read Tauri app version."
+            exit 1
+          fi
+          expected="v${version}"
+          if [[ "${RELEASE_TAG}" != "${expected}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} does not match app version ${version}; expected ${expected}."
+            exit 1
+          fi
+          echo "APP_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Select stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node dependencies
+        run: npm ci
+        working-directory: apps/desktop
+
+      - name: Import Mac App Store certificates
+        env:
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          missing=0
+          for name in \
+            MAS_APP_CERTIFICATE_P12_BASE64 \
+            MAS_APP_CERTIFICATE_PASSWORD \
+            MAS_INSTALLER_CERTIFICATE_P12_BASE64 \
+            MAS_INSTALLER_CERTIFICATE_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required secret or environment value: ${name}"
+              missing=1
+            fi
+          done
+          if [[ "${missing}" != "0" ]]; then
+            exit 1
+          fi
+
+          keychain_path="${RUNNER_TEMP}/afs-mas-signing.keychain-db"
+          app_certificate_path="${RUNNER_TEMP}/mas-app.p12"
+          installer_certificate_path="${RUNNER_TEMP}/mas-installer.p12"
+
+          printf '%s' "${MAS_APP_CERTIFICATE_P12_BASE64}" | base64 --decode > "${app_certificate_path}" 2>/dev/null \
+            || printf '%s' "${MAS_APP_CERTIFICATE_P12_BASE64}" | base64 -D > "${app_certificate_path}"
+          printf '%s' "${MAS_INSTALLER_CERTIFICATE_P12_BASE64}" | base64 --decode > "${installer_certificate_path}" 2>/dev/null \
+            || printf '%s' "${MAS_INSTALLER_CERTIFICATE_P12_BASE64}" | base64 -D > "${installer_certificate_path}"
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+          security import "${app_certificate_path}" \
+            -P "${MAS_APP_CERTIFICATE_PASSWORD}" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "${keychain_path}"
+          security import "${installer_certificate_path}" \
+            -P "${MAS_INSTALLER_CERTIFICATE_PASSWORD}" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${keychain_path}"
+
+      - name: Verify Mac App Store inputs
+        run: |
+          missing=0
+          for name in \
+            MAS_APP_PROVISIONING_PROFILE_BASE64 \
+            MAS_FILE_PROVIDER_PROVISIONING_PROFILE_BASE64; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required secret or environment value: ${name}"
+              missing=1
+            fi
+          done
+          if [[ "${MAS_VALIDATE_WITH_APPLE}" == "1" || "${MAS_UPLOAD}" == "1" ]]; then
+            for name in \
+              APP_STORE_CONNECT_API_KEY_ID \
+              APP_STORE_CONNECT_API_ISSUER_ID \
+              APP_STORE_CONNECT_API_PRIVATE_KEY; do
+              if [[ -z "${!name}" ]]; then
+                echo "::error::Missing required App Store Connect API value: ${name}"
+                missing=1
+              fi
+            done
+          fi
+          exit "${missing}"
+
+      - name: Build, sign, package, and optionally upload
+        run: make publish-mas
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: afs-mas-${{ inputs.tag }}
+          path: |
+            target/release/bundle/mas/*.pkg
+            target/release/bundle/mas/*.pkg.sha256
+          if-no-files-found: error
+          retention-days: 14

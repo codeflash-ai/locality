@@ -155,6 +155,30 @@ fn search_uses_sqlite_candidate_index_without_changing_report() {
 }
 
 #[test]
+fn search_matches_numeric_short_title_terms() {
+    let fixture = SearchFixture::new();
+    let mut store = fixture.sqlite_store();
+    fixture.seed_entities(&mut store);
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("cccccccccccccccccccccccccccccccc"),
+                EntityKind::Page,
+                "1:1 Notes",
+                "Meetings/1-1 Notes/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save numbered notes");
+
+    let report = run_search(&store, SearchOptions::new("1")).expect("numeric search");
+
+    assert_eq!(report.results[0].title, "1:1 Notes");
+    assert_eq!(report.results[0].path, "Meetings/1-1 Notes/page.md");
+}
+
+#[test]
 fn search_filters_connectors_and_rejects_empty_queries() {
     let fixture = SearchFixture::new();
     let mut store = fixture.store();

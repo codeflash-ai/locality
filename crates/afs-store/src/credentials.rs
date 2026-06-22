@@ -195,6 +195,125 @@ impl CredentialStore for KeychainCredentialStore {
     }
 }
 
+#[cfg(windows)]
+#[derive(Clone, Debug, Default)]
+pub struct WindowsCredentialStore;
+
+#[cfg(windows)]
+impl CredentialStore for WindowsCredentialStore {
+    fn put(&self, secret_ref: &str, secret: &str) -> CredentialResult<()> {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Security::Credentials::{
+            CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
+        };
+
+        let mut target_name = wide_null(&windows_target_name(secret_ref));
+        let mut blob = secret.as_bytes().to_vec();
+        let blob_size = u32::try_from(blob.len()).map_err(|_| {
+            CredentialError::Unavailable(
+                "credential is too large for Windows Credential Manager".to_string(),
+            )
+        })?;
+        let mut credential = CREDENTIALW {
+            Flags: 0,
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target_name.as_mut_ptr(),
+            Comment: null_mut(),
+            LastWritten: unsafe { std::mem::zeroed() },
+            CredentialBlobSize: blob_size,
+            CredentialBlob: blob.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            AttributeCount: 0,
+            Attributes: null_mut(),
+            TargetAlias: null_mut(),
+            UserName: null_mut(),
+        };
+
+        let ok = unsafe { CredWriteW(&mut credential, 0) };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(last_windows_credential_error("write"))
+        }
+    }
+
+    fn get(&self, secret_ref: &str) -> CredentialResult<String> {
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, GetLastError};
+        use windows_sys::Win32::Security::Credentials::{
+            CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+        };
+
+        let target_name = wide_null(&windows_target_name(secret_ref));
+        let mut credential: *mut CREDENTIALW = null_mut();
+        let ok = unsafe { CredReadW(target_name.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            if code == ERROR_NOT_FOUND || code == ERROR_FILE_NOT_FOUND {
+                return Err(CredentialError::NotFound(secret_ref.to_string()));
+            }
+            return Err(windows_credential_error("read", code));
+        }
+
+        let credential_ref = unsafe { &*credential };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                credential_ref.CredentialBlob,
+                credential_ref.CredentialBlobSize as usize,
+            )
+        };
+        let secret = String::from_utf8(bytes.to_vec()).map_err(|error| {
+            CredentialError::Unavailable(format!("Windows credential is not valid UTF-8: {error}"))
+        });
+        unsafe {
+            CredFree(credential.cast());
+        }
+        secret
+    }
+
+    fn delete(&self, secret_ref: &str) -> CredentialResult<()> {
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, GetLastError};
+        use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
+
+        let target_name = wide_null(&windows_target_name(secret_ref));
+        let ok = unsafe { CredDeleteW(target_name.as_ptr(), CRED_TYPE_GENERIC, 0) };
+        if ok != 0 {
+            return Ok(());
+        }
+
+        let code = unsafe { GetLastError() };
+        if code == ERROR_NOT_FOUND || code == ERROR_FILE_NOT_FOUND {
+            Ok(())
+        } else {
+            Err(windows_credential_error("delete", code))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_target_name(secret_ref: &str) -> String {
+    format!("ai.codeflash.afs:{secret_ref}")
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn last_windows_credential_error(operation: &str) -> CredentialError {
+    use windows_sys::Win32::Foundation::GetLastError;
+
+    windows_credential_error(operation, unsafe { GetLastError() })
+}
+
+#[cfg(windows)]
+fn windows_credential_error(operation: &str, code: u32) -> CredentialError {
+    CredentialError::Unavailable(format!(
+        "Windows Credential Manager {operation} failed with error {code}"
+    ))
+}
+
 #[cfg(any(test, target_os = "macos"))]
 fn keychain_output_password(output: &[u8]) -> String {
     String::from_utf8_lossy(output)
@@ -259,7 +378,13 @@ pub fn open_credential_store(state_root: &Path) -> Box<dyn CredentialStore> {
         Box::new(KeychainCredentialStore)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let _ = state_root;
+        Box::new(WindowsCredentialStore)
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     {
         Box::new(FileCredentialStore::new(state_root))
     }

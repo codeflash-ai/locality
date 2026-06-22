@@ -9,7 +9,7 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs profiles [--json]`
 - `afs connection show <id> [--json]`
 - `afs disconnect <id> [--json]`
-- `afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse] [--read-only] [--json]`
+- `afs mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `afs daemon status [--json]`
 - `afs info [path] [--json]`
 - `afs status [path] [--json]`
@@ -19,12 +19,13 @@ The `afs` command is the single supported control surface for users and coding a
 - `afs pull <path> [--json]`
 - `afs push [path] [-y|--yes] [--confirm] [--json]`
 - `afs daemon start|stop|status|reload|restart [--session|--launchd] [--afsd-bin <path>] [--state-dir <path>] [--tcp-addr <host:port|off>] [--include-env <KEY>] [--json]`
+- `afs doctor [--json]`
 - `afs diff [path] [--json]`
 - `afs restore <path> [--force] [--json]`
 - `afs undo [push-id] [--json]`
 - `afs log [path] [--json]`
 - `afs config set <key=value>`
-- `afs file-provider register|unregister|list|reset [target] [--json]`
+- `afs file-provider register|start|run|stop|status|restart|open|unregister|list|reset [target] [--json]`
 
 ## Exit-code contract
 
@@ -77,6 +78,43 @@ Auth error JSON uses stable codes:
 - `connection_probe_failed`: Notion rejected the token during `connect`.
 
 Auth failures exit `1` and include `suggested_command` when there is an obvious recovery command.
+
+## Diagnostics
+
+`afs doctor [--json]` runs read-only local diagnostics. It inspects daemon
+status, SQLite compatibility, configured connections, credential availability,
+mount roots, projection support for the current platform, and native provider
+lifecycle state for macOS File Provider, Linux FUSE, or Windows Cloud Files.
+
+The command does not initialize missing SQLite state, run migrations, write
+credentials, register providers, start daemons, or reset anything. Recovery is
+reported as explicit suggested commands, for example `afs connect notion`,
+`afs daemon start`, or `afs file-provider start <mount>`.
+
+Human output is a compact checklist. JSON output uses stable finding codes and
+never includes credential values:
+
+```json
+{
+  "ok": false,
+  "command": "doctor",
+  "status": "error",
+  "platform": "windows",
+  "findings": [
+    {
+      "severity": "error",
+      "code": "daemon_stopped_for_virtual_mount",
+      "mount_id": "notion-main",
+      "message": "Virtual mount `notion-main` needs afsd running.",
+      "suggested_command": "afs daemon start"
+    }
+  ],
+  "suggested_commands": ["afs daemon start"]
+}
+```
+
+`doctor` exits `0` for `ok` and `warning` reports, and exits `3` when any
+finding has `error` severity.
 
 ## Local Search
 
@@ -185,24 +223,43 @@ Workspace Notion mounts use the access granted to the connected integration. If 
 
 Projection choices are platform-specific. Linux binaries accept `plain-files` and
 `linux-fuse`; macOS binaries accept `plain-files` and `macos-file-provider`;
-Windows currently accepts `plain-files` only.
+Windows binaries accept `plain-files` and `windows-cloud-files`.
 
-`afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. On Linux, `--projection linux-fuse` records the equivalent virtual projection and registers the per-mount FUSE service. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension lists dataless files from the daemon and materializes a file on open.
+`afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. On Linux, `--projection linux-fuse` records the equivalent virtual projection and registers the per-mount FUSE service. On Windows, `--projection windows-cloud-files` records a Cloud Files sync root. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension, FUSE helper, or Cloud Files provider lists dataless files from the daemon and materializes a file on open.
 
 Linux should expose the same online-only behavior through a FUSE projection
 helper rather than through inotify-triggered placeholder files. The daemon API for
 that path is platform-neutral `virtual_fs`; macOS File Provider commands are
 compatibility aliases over it.
 
+For macOS File Provider mounts, `afs status <path>`, `afs diff`, and `afs push`
+also reconcile visible CloudStorage edits into the daemon content cache before
+planning. This is a command-boundary fallback for rare File Provider callback
+misses: normal writes should still arrive through `modifyItem`, but targeted
+review and push commands should not ignore a newer visible `page.md` replica.
+
 `afs file-provider register <mount-id-or-path>` validates the mount against the
-current platform's virtual projection: `macos_file_provider` on macOS and
-`linux_fuse` on Linux. The macOS path shells out to the signed app-bundle helper
-at `AgentFS.app/Contents/MacOS/agentfs-file-providerctl`; `AFS_FILE_PROVIDERCTL`
+current platform's virtual projection: `macos_file_provider` on macOS,
+`linux_fuse` on Linux, and `windows_cloud_files` on Windows. The macOS path
+shells out to the signed app-bundle helper at
+`AgentFS.app/Contents/MacOS/agentfs-file-providerctl`; `AFS_FILE_PROVIDERCTL`
 can override the helper path for development. On Linux this command can be rerun
 to repair or restart the per-mount systemd user service for `afs-fuse`;
-`AFS_FUSE_BIN` can override the helper binary path for development. `afs
-file-provider unregister <mount>` stops and removes that Linux service. `list`
-and `reset` still target the macOS File Provider helper.
+`AFS_FUSE_BIN` can override the helper binary path for development.
+
+On Windows, `afs file-provider start <mount>` registers or repairs the sync
+root, starts `afs-cloud-files.exe` as a detached per-mount provider process, and
+writes per-mount PID and log metadata under the AFS state directory. `status`
+reports provider state, daemon reachability, sync-root registration, PID
+metadata, and log paths. `stop` stops the provider runtime without unregistering
+the sync root; `restart` performs stop then start. `AFS_CLOUD_FILES_BIN` can
+override the helper binary path for development.
+
+`afs file-provider unregister <mount>` unregisters the current platform's
+virtual projection. On Linux it stops and removes the systemd user service. On
+Windows it removes the Cloud Files sync-root registration; use `stop` first when
+you only want to stop the runtime. `list` and `reset` target the platform helper
+for the current host.
 
 `afs pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads image media under `.afs/media/`, and persists the root page Synced Tree shadow snapshot. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. `afs pull <page-file>` hydrates one known entity and downloads its image media. Pull refuses to overwrite a hydrated file if its body no longer matches the Synced Tree shadow, returning a dirty skip instead.
 
@@ -225,6 +282,12 @@ when `--session` is passed, the CLI starts a detached child process and writes
 `~/.afs/afsd.pid`; session mode inherits the current shell environment but does
 not survive logout.
 
+On Windows, the daemon manager uses detached session mode and localhost TCP
+control IPC. `--tcp-addr off` is not valid for Windows daemon start because
+there is no Unix socket fallback. A custom `--tcp-addr <host:port>` is persisted
+in daemon manager metadata so `status`, `reload`, and `stop` can find the same
+daemon later.
+
 Useful forms:
 
 ```sh
@@ -238,11 +301,12 @@ afs daemon restart
 
 `--state-dir <path>` starts or queries a daemon for an isolated state root.
 `--tcp-addr <host:port|off>` persists the TCP listener setting for that managed
-daemon. `--afsd-bin <path>` points the manager at a specific daemon binary. For
-development-only environment variables that launchd would not otherwise know
-about, `--include-env <KEY>` copies the current value into the LaunchAgent plist;
-do not use it for long-lived secrets once keychain-backed `afs connect` is
-available.
+daemon. On Windows this TCP listener is also the CLI control endpoint.
+`--afsd-bin <path>` points the manager at a specific daemon binary. For
+development-only environment variables that the process manager would not
+otherwise know about, `--include-env <KEY>` copies the current value into the
+managed daemon environment; do not use it for long-lived secrets once
+keychain-backed `afs connect` is available.
 
 ## Initial `afs info --json` Shape
 
@@ -265,6 +329,11 @@ mount/entity mapping, compares hydrated page bodies against their Synced Tree
 shadow snapshots, reports stubs, conflicted files with unresolved inline markers,
 dirty files, missing projections, and pending or failed push journals touching
 each entity. It does not call remote connectors itself.
+
+For macOS File Provider mounts, status with an explicit path first makes a
+best-effort reconciliation from that visible CloudStorage target into daemon
+state. If that repair fails, status continues and reports the daemon's current
+view. Bare `afs status` does not scan the whole File Provider projection.
 
 The production state directory defaults to `~/.afs`; `AFS_STATE_DIR` is a developer/test override for isolated runs. When no path is supplied, `afs status` first checks the current working directory: inside a mount it scopes to that subtree, and outside all mounts it reports every registered mount in the active state directory.
 
@@ -401,7 +470,11 @@ afs status ~/afs/notion
 
 ## `afs daemon status`
 
-`afs daemon status [--json]` checks the configured Unix socket and, when the daemon is running, requests a daemon status snapshot. JSON output includes process-manager state, runtime queue counts, scheduler mode, watched mount count, and watched roots.
+`afs daemon status [--json]` checks the configured daemon control endpoint and,
+when the daemon is running, requests a daemon status snapshot. On macOS/Linux
+the CLI uses the Unix socket; on Windows it uses the configured or persisted
+localhost TCP address. JSON output includes process-manager state, runtime queue
+counts, scheduler mode, watched mount count, and watched roots.
 Runtime queue counts include mutating requests, hydration work, scheduled pulls,
 and freshness work. Freshness metrics report pending/ready/deferred jobs plus
 ready and total budget units, which helps diagnose sync pressure without

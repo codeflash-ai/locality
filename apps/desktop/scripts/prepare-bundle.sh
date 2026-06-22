@@ -10,6 +10,9 @@ case "$(uname -s)" in
   Linux)
     exec "${SCRIPT_DIR}/prepare-linux-bundle.sh"
     ;;
+  MINGW*|MSYS*|CYGWIN*)
+    exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${SCRIPT_DIR}/prepare-windows-bundle.ps1"
+    ;;
   *)
     printf 'prepare-bundle: unsupported OS: %s\n' "$(uname -s)" >&2
     exit 1
