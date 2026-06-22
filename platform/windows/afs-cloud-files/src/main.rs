@@ -1059,14 +1059,17 @@ fn local_change_worker(
                     }
                 }
             }
-            Ok(event) if is_modify_like_event(&event.kind) => {
+            Ok(event) if local_modify_event_kind(&event.kind).is_some() => {
+                let modify_kind = local_modify_event_kind(&event.kind)
+                    .expect("modify-like event kind should be classified");
                 trace_cloud_files(format!(
                     "local modify-like event kind={:?} paths={:?}",
                     event.kind, event.paths
                 ));
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 for path in event.paths {
-                    if let Err(error) = handle_local_modify_like_path(&context, &path) {
+                    if let Err(error) = handle_local_modify_like_path(&context, &path, modify_kind)
+                    {
                         eprintln!(
                             "{COMMAND_NAME}: local modify mapping failed for `{}`: {error}",
                             path.display()
@@ -1119,13 +1122,28 @@ fn is_remove_like_event(kind: &notify::event::EventKind) -> bool {
 
 #[cfg(target_os = "windows")]
 fn is_modify_like_event(kind: &notify::event::EventKind) -> bool {
+    local_modify_event_kind(kind).is_some()
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalModifyEventKind {
+    Content,
+    MetadataProbe,
+}
+
+#[cfg(target_os = "windows")]
+fn local_modify_event_kind(kind: &notify::event::EventKind) -> Option<LocalModifyEventKind> {
     use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind};
 
-    matches!(
-        kind,
+    match kind {
         EventKind::Modify(ModifyKind::Data(_))
-            | EventKind::Access(AccessKind::Close(AccessMode::Write))
-    )
+        | EventKind::Access(AccessKind::Close(AccessMode::Write)) => {
+            Some(LocalModifyEventKind::Content)
+        }
+        EventKind::Modify(ModifyKind::Metadata(_)) => Some(LocalModifyEventKind::MetadataProbe),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1186,6 +1204,7 @@ fn handle_local_create_like_path(
 fn handle_local_modify_like_path(
     context: &ProviderContext,
     path: &Path,
+    event_kind: LocalModifyEventKind,
 ) -> Result<(), HelperError> {
     let path = absolute_cloud_path(context, path);
     if !path_is_under_sync_root(context, &path) || same_cloud_path(&path, &context.sync_root) {
@@ -1194,7 +1213,7 @@ fn handle_local_modify_like_path(
     let placeholder = placeholder_info_for_path(&path)?;
     let identifier = if let Some(info) = placeholder {
         context.remember_path_identity(&path, &info.identity);
-        if info.in_sync {
+        if info.in_sync && event_kind == LocalModifyEventKind::MetadataProbe {
             trace_cloud_files(format!(
                 "local modify skipped path=`{}` reason=placeholder_in_sync",
                 path.display()
@@ -2913,21 +2932,24 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn watcher_modify_events_ignore_metadata_and_non_write_closes() {
+    fn watcher_modify_events_classify_metadata_probes_and_content_writes() {
         use notify::event::{
             AccessKind, AccessMode, DataChange, EventKind, MetadataKind, ModifyKind,
         };
 
-        assert!(is_modify_like_event(&EventKind::Modify(ModifyKind::Data(
-            DataChange::Content
-        ))));
-        assert!(is_modify_like_event(&EventKind::Access(AccessKind::Close(
-            AccessMode::Write
-        ))));
+        assert_eq!(
+            local_modify_event_kind(&EventKind::Modify(ModifyKind::Data(DataChange::Content))),
+            Some(LocalModifyEventKind::Content)
+        );
+        assert_eq!(
+            local_modify_event_kind(&EventKind::Access(AccessKind::Close(AccessMode::Write))),
+            Some(LocalModifyEventKind::Content)
+        );
+        assert_eq!(
+            local_modify_event_kind(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any))),
+            Some(LocalModifyEventKind::MetadataProbe)
+        );
         assert!(!is_modify_like_event(&EventKind::Any));
-        assert!(!is_modify_like_event(&EventKind::Modify(
-            ModifyKind::Metadata(MetadataKind::Any)
-        )));
         assert!(!is_modify_like_event(&EventKind::Access(
             AccessKind::Close(AccessMode::Any)
         )));
