@@ -69,17 +69,26 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
         rendered
             .document
             .body
-            .contains("[External video](https://www.youtube.com/watch?v=dQw4w9WgXcQ)")
+            .contains("[External video](../.afs/media/live-integrity/block-coverage/video-")
     );
-    assert!(rendered.document.body.contains(
-        "[External file](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)"
-    ));
-    assert!(rendered.document.body.contains(
-        "[External PDF](https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf)"
-    ));
-    assert!(rendered.document.body.contains(
-        "[External audio](https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3)"
-    ));
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[External file](../.afs/media/live-integrity/block-coverage/file-")
+    );
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[External PDF](../.afs/media/live-integrity/block-coverage/pdf-")
+    );
+    assert!(
+        rendered
+            .document
+            .body
+            .contains("[External audio](../.afs/media/live-integrity/block-coverage/audio-")
+    );
     assert!(
         rendered
             .document
