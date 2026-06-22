@@ -2472,7 +2472,8 @@ unsafe fn restart_hydration_with_size(
 ) -> Result<(), HelperError> {
     use windows::Win32::Storage::CloudFilters::{
         CF_OPERATION_PARAMETERS, CF_OPERATION_PARAMETERS_0, CF_OPERATION_PARAMETERS_0_3,
-        CF_OPERATION_RESTART_HYDRATION_FLAG_NONE, CF_OPERATION_TYPE_RESTART_HYDRATION, CfExecute,
+        CF_OPERATION_RESTART_HYDRATION_FLAG_MARK_IN_SYNC, CF_OPERATION_TYPE_RESTART_HYDRATION,
+        CfExecute,
     };
 
     let info = unsafe { callback_info.as_ref() }.ok_or_else(|| {
@@ -2488,7 +2489,7 @@ unsafe fn restart_hydration_with_size(
         ParamSize: operation_parameter_size::<CF_OPERATION_PARAMETERS_0_3>(),
         Anonymous: CF_OPERATION_PARAMETERS_0 {
             RestartHydration: CF_OPERATION_PARAMETERS_0_3 {
-                Flags: CF_OPERATION_RESTART_HYDRATION_FLAG_NONE,
+                Flags: CF_OPERATION_RESTART_HYDRATION_FLAG_MARK_IN_SYNC,
                 FsMetadata: &metadata,
                 FileIdentity: identity.as_ptr().cast(),
                 FileIdentityLength: identity.len() as u32,
@@ -2709,12 +2710,10 @@ fn register_shell_sync_root(
         .map_err(winrt_error("set display name"))?;
     info.SetIconResource(&provider_icon_resource())
         .map_err(winrt_error("set icon resource"))?;
-    info.SetHydrationPolicy(StorageProviderHydrationPolicy::Partial)
+    info.SetHydrationPolicy(StorageProviderHydrationPolicy::Full)
         .map_err(winrt_error("set hydration policy"))?;
     info.SetHydrationPolicyModifier(
-        StorageProviderHydrationPolicyModifier::StreamingAllowed
-            | StorageProviderHydrationPolicyModifier::AllowFullRestartHydration
-            | StorageProviderHydrationPolicyModifier::AutoDehydrationAllowed,
+        StorageProviderHydrationPolicyModifier::AllowFullRestartHydration,
     )
     .map_err(winrt_error("set hydration modifier"))?;
     info.SetPopulationPolicy(StorageProviderPopulationPolicy::Full)
