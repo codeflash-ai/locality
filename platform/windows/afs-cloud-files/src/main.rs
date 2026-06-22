@@ -1568,6 +1568,15 @@ unsafe extern "system" fn on_fetch_placeholders(
         }
     }) {
         eprintln!("{COMMAND_NAME}: fetch placeholders panicked: {error:?}");
+        unsafe {
+            let _ = complete_fetch_placeholders_with_status(
+                callback_info,
+                status_unsuccessful(),
+                std::ptr::null_mut(),
+                0,
+                0,
+            );
+        }
     }
 }
 
@@ -1592,6 +1601,15 @@ unsafe extern "system" fn on_fetch_data(
         }
     }) {
         eprintln!("{COMMAND_NAME}: fetch data panicked: {error:?}");
+        unsafe {
+            let _ = complete_fetch_data_with_status(
+                callback_info,
+                status_unsuccessful(),
+                std::ptr::null(),
+                0,
+                0,
+            );
+        }
     }
 }
 

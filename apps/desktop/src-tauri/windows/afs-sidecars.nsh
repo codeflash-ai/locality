@@ -37,6 +37,8 @@
     ${EndIf}
 
     DetailPrint "Timed out waiting for ${IMAGE_NAME} to stop."
+    MessageBox MB_ICONSTOP|MB_OK "Could not stop ${IMAGE_NAME}. Close AFS and retry the installation."
+    Abort
 
   stop_process_done_${UniqueID}:
   ClearErrors
@@ -59,9 +61,13 @@
 
   StrCpy $0 0
   delete_file_loop_${UniqueID}:
+    ${IfNot} ${FileExists} "$INSTDIR\${FILE_NAME}"
+      Goto delete_file_done_${UniqueID}
+    ${EndIf}
+
     ClearErrors
     Delete "$INSTDIR\${FILE_NAME}"
-    ${IfNot} ${Errors}
+    ${IfNot} ${FileExists} "$INSTDIR\${FILE_NAME}"
       Goto delete_file_done_${UniqueID}
     ${EndIf}
 
@@ -72,6 +78,8 @@
     ${EndIf}
 
     DetailPrint "Timed out waiting for $INSTDIR\${FILE_NAME} to be writable."
+    MessageBox MB_ICONSTOP|MB_OK "Could not replace $INSTDIR\${FILE_NAME}. Close AFS and retry the installation."
+    Abort
 
   delete_file_done_${UniqueID}:
   ClearErrors

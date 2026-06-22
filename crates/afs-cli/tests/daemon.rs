@@ -13,6 +13,8 @@ fn daemon_status_reports_stopped_when_socket_is_absent() {
         "status".to_string(),
         "--state-dir".to_string(),
         root.display().to_string(),
+        "--tcp-addr".to_string(),
+        "off".to_string(),
     ];
     let report = run_daemon_control(&args).expect("daemon status");
 
@@ -31,6 +33,8 @@ fn daemon_reload_requires_running_daemon() {
         "reload".to_string(),
         "--state-dir".to_string(),
         root.display().to_string(),
+        "--tcp-addr".to_string(),
+        "off".to_string(),
     ];
     let error = run_daemon_control(&args).expect_err("reload should fail");
 
