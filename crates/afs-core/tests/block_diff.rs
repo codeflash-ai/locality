@@ -64,6 +64,75 @@ fn editing_one_paragraph_produces_one_block_update() {
 }
 
 #[test]
+fn changing_paragraph_to_list_item_produces_block_replace() {
+    let shadow = shadow("Old paragraph.", ["paragraph-1"]);
+    let edited = CanonicalDocument::new("", "- New bullet");
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::ReplaceBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "- New bullet".to_string(),
+        }]
+    );
+    assert_eq!(plan.summary.blocks_replaced, 1);
+    assert_eq!(plan.summary.blocks_updated, 0);
+    assert_eq!(plan.summary.blocks_created, 0);
+    assert_eq!(plan.summary.blocks_archived, 0);
+    assert!(plan.degradations.is_empty());
+}
+
+#[test]
+fn changing_rendered_line_break_checklist_to_bullet_produces_block_replace() {
+    let shadow = shadow(
+        "- [ ] Define launch positioning<br>- [ ] Finalize platform install paths<br>- [ ] Validate auto-update end to end",
+        ["todo-list-1"],
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "- Safety: diff, push confirmation, undo, and prompt-injection guidance",
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::ReplaceBlock {
+            block_id: RemoteId::new("todo-list-1"),
+            content: "- Safety: diff, push confirmation, undo, and prompt-injection guidance"
+                .to_string(),
+        }]
+    );
+    assert_eq!(plan.summary.blocks_replaced, 1);
+    assert_eq!(plan.summary.blocks_updated, 0);
+}
+
+#[test]
+fn changing_heading_level_produces_block_replace() {
+    let shadow = shadow("# Heading", ["heading-1"]);
+    let edited = CanonicalDocument::new("", "## Heading");
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::ReplaceBlock {
+            block_id: RemoteId::new("heading-1"),
+            content: "## Heading".to_string(),
+        }]
+    );
+    assert_eq!(plan.summary.blocks_replaced, 1);
+}
+
+#[test]
 fn appending_a_paragraph_produces_append_after_last_existing_block() {
     let shadow = shadow(
         "# Roadmap\n\nExisting paragraph.",
@@ -237,6 +306,44 @@ fn moving_an_unchanged_directive_produces_move_not_validation_error() {
             after: None,
         }]
     );
+}
+
+#[test]
+fn moving_native_blocks_recreates_them_for_connectors_without_native_move() {
+    let shadow = shadow(
+        "- A\n\n## Section\n\n- B\n\n- C",
+        ["a", "section", "b", "c"],
+    );
+    let edited = CanonicalDocument::new("", "- A\n\n- B\n\n- C\n\n## Section");
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("a")),
+                content: "- B".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("a")),
+                content: "- C".to_string(),
+            },
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("b"),
+            },
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("c"),
+            },
+        ]
+    );
+    assert_eq!(plan.summary.blocks_created, 2);
+    assert_eq!(plan.summary.blocks_archived, 2);
+    assert_eq!(plan.summary.blocks_moved, 0);
 }
 
 #[test]

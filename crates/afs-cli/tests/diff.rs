@@ -592,6 +592,7 @@ impl OperationOutputExt for afs_cli::diff::PushOperationOutput {
     fn operation_type(&self) -> &'static str {
         match self {
             Self::UpdateBlock { .. } => "update_block",
+            Self::ReplaceBlock { .. } => "replace_block",
             Self::AppendBlock { .. } => "append_block",
             Self::MoveBlock { .. } => "move_block",
             Self::ArchiveBlock { .. } => "archive_block",

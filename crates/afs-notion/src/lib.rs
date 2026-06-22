@@ -182,6 +182,7 @@ impl Connector for NotionConnector {
     fn supported_push_operations(&self) -> BTreeSet<PushOperationKind> {
         [
             PushOperationKind::UpdateBlock,
+            PushOperationKind::ReplaceBlock,
             PushOperationKind::AppendBlock,
             PushOperationKind::UpdateMedia,
             PushOperationKind::ArchiveBlock,

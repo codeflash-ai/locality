@@ -91,6 +91,37 @@ fn status_treats_content_cache_absolute_media_href_as_clean() {
 }
 
 #[test]
+fn status_reports_clean_when_dirty_hint_has_equivalent_body() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(entity_record(
+            &fixture.mount_id,
+            "page-1",
+            "Roadmap.md",
+            HydrationState::Dirty,
+        ))
+        .expect("save entity");
+    store
+        .save_shadow(&fixture.mount_id, shadow("page-1", "- One\n\n- Two"))
+        .expect("save shadow");
+    fixture.write_page("Roadmap.md", "page-1", "- One\n- Two");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(report.clean, "{report:#?}");
+    assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
+    assert!(status_entry(&report, "Roadmap.md").issues.is_empty());
+}
+
+#[test]
 fn status_scopes_to_subdirectory_and_reports_stub() {
     let fixture = StatusFixture::new();
     let mut store = fixture.store();

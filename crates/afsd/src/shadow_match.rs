@@ -2,6 +2,7 @@ use afs_core::canonical::{
     AfsMetadata, Frontmatter, ParsedCanonicalDocument, parse_canonical_markdown,
     render_canonical_markdown,
 };
+use afs_core::diff::{BlockDiffEngine, DiffEngine};
 use afs_core::model::CanonicalDocument;
 use afs_core::shadow::{ShadowDocument, rendered_bodies_equivalent};
 
@@ -9,7 +10,7 @@ pub(crate) fn parsed_matches_shadow(
     parsed: &ParsedCanonicalDocument,
     shadow: &ShadowDocument,
 ) -> bool {
-    if !rendered_bodies_equivalent(&parsed.document.body, &shadow.rendered_body) {
+    if !parsed_body_matches_shadow(parsed, shadow) {
         return false;
     }
 
@@ -18,6 +19,15 @@ pub(crate) fn parsed_matches_shadow(
     };
 
     frontmatter_matches_ignoring_sync_metadata(&parsed.frontmatter, &shadow_parsed.frontmatter)
+}
+
+fn parsed_body_matches_shadow(parsed: &ParsedCanonicalDocument, shadow: &ShadowDocument) -> bool {
+    rendered_bodies_equivalent(&parsed.document.body, &shadow.rendered_body)
+        || BlockDiffEngine::new()
+            .with_edited_body_start_line(parsed.body_start_line)
+            .plan_push(shadow, &parsed.document)
+            .map(|plan| plan.operations.is_empty() && plan.degradations.is_empty())
+            .unwrap_or(false)
 }
 
 pub(crate) fn shadows_match(left: &ShadowDocument, right: &ShadowDocument) -> bool {

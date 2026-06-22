@@ -5184,6 +5184,9 @@ fn diff_report_message(report: &DiffReport) -> String {
     if plan.summary.blocks_updated > 0 {
         parts.push(format!("{} updated", plan.summary.blocks_updated));
     }
+    if plan.summary.blocks_replaced > 0 {
+        parts.push(format!("{} replaced", plan.summary.blocks_replaced));
+    }
     if plan.summary.blocks_created > 0 {
         parts.push(format!("{} created", plan.summary.blocks_created));
     }

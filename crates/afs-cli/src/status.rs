@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use afs_core::canonical::parse_canonical_markdown;
 use afs_core::conflict::unresolved_conflict_marker_line;
+use afs_core::diff::{BlockDiffEngine, DiffEngine};
 use afs_core::freshness::FreshnessTier;
 use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
@@ -937,7 +938,8 @@ fn dirty_state_with_entity_issue(
     mut issues: Vec<StatusIssue>,
 ) -> (StatusState, Vec<StatusIssue>) {
     match state {
-        StatusState::Clean | StatusState::Dirty => {
+        StatusState::Clean => (StatusState::Clean, Vec::new()),
+        StatusState::Dirty => {
             if !issues.iter().any(|issue| issue.code == "entity_dirty") {
                 issues.insert(
                     0,
@@ -1033,9 +1035,9 @@ where
         );
     }
 
-    let shadow = match store.get_shadow_record(&mount.mount_id, &entity.remote_id) {
-        Ok(Some(shadow)) => shadow,
-        Ok(None) => {
+    let shadow = match store.load_shadow(&mount.mount_id, &entity.remote_id) {
+        Ok(shadow) => shadow,
+        Err(StoreError::ShadowMissing { .. }) => {
             return (
                 StatusState::Error,
                 vec![StatusIssue::new(
@@ -1055,7 +1057,14 @@ where
         }
     };
 
-    if rendered_bodies_equivalent(&parsed.document.body, &shadow.rendered_body) {
+    let body_clean = rendered_bodies_equivalent(&parsed.document.body, &shadow.rendered_body)
+        || BlockDiffEngine::new()
+            .with_edited_body_start_line(parsed.body_start_line)
+            .plan_push(&shadow, &parsed.document)
+            .map(|plan| plan.operations.is_empty() && plan.degradations.is_empty())
+            .unwrap_or(false);
+
+    if body_clean {
         (StatusState::Clean, Vec::new())
     } else {
         (

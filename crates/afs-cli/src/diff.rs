@@ -307,6 +307,7 @@ impl From<PushPlan> for PushPlanOutput {
 pub struct PlanSummaryOutput {
     pub blocks_created: usize,
     pub blocks_updated: usize,
+    pub blocks_replaced: usize,
     pub blocks_moved: usize,
     pub media_updated: usize,
     pub blocks_archived: usize,
@@ -320,6 +321,7 @@ impl From<PlanSummary> for PlanSummaryOutput {
         Self {
             blocks_created: value.blocks_created,
             blocks_updated: value.blocks_updated,
+            blocks_replaced: value.blocks_replaced,
             blocks_moved: value.blocks_moved,
             media_updated: value.media_updated,
             blocks_archived: value.blocks_archived,
@@ -334,6 +336,10 @@ impl From<PlanSummary> for PlanSummaryOutput {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PushOperationOutput {
     UpdateBlock {
+        block_id: String,
+        content: String,
+    },
+    ReplaceBlock {
         block_id: String,
         content: String,
     },
@@ -376,6 +382,10 @@ impl From<PushOperation> for PushOperationOutput {
     fn from(value: PushOperation) -> Self {
         match value {
             PushOperation::UpdateBlock { block_id, content } => Self::UpdateBlock {
+                block_id: block_id.0,
+                content,
+            },
+            PushOperation::ReplaceBlock { block_id, content } => Self::ReplaceBlock {
                 block_id: block_id.0,
                 content,
             },

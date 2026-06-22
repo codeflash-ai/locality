@@ -168,7 +168,9 @@ pub fn evaluate_guardrails(
     let archive_count = plan.summary.destructive_archive_count();
 
     if archive_count > policy.max_archives_without_confirm {
-        reasons.push(format!("{archive_count} blocks or pages would be archived"));
+        reasons.push(format!(
+            "{archive_count} blocks or pages would be archived or replaced"
+        ));
     }
 
     if let Some(total_mount_entities) = total_mount_entities

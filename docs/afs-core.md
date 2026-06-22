@@ -70,6 +70,11 @@ The first planner is deliberately conservative:
 - directive IDs are anchored and validated before planning;
 - residual unmatched native blocks align by order for simple edits;
 - ambiguous residual alignment adds an explicit degradation note to the plan;
+- one-to-one block type changes are represented as `ReplaceBlock` instead of
+  lossy in-place updates;
+- exact native Markdown block moves are represented as append-at-new-position
+  plus archive-old-block so connectors without a native move API can still
+  converge remote order;
 - directive edits fail validation instead of becoming lossy updates;
 - directive moves are represented as block moves.
 
@@ -99,6 +104,13 @@ Execution prepares the journal before any remote mutation, moves status through 
 
 Each approved operation also receives a deterministic `PushOperationId` derived from the push ID, operation index, operation kind, and target remote ID. Connectors return operation-level `JournalApplyEffect` values after apply. Those effects record durable facts such as updated blocks, archived blocks, and created remote block/entity IDs so resume, reconcile, and undo do not have to infer what happened from the remote alone.
 
+`ReplaceBlock` is the connector-neutral shape for Markdown edits that change the
+remote block type, such as paragraph to bullet item or heading level changes.
+Connectors should apply it as an in-place semantic replacement: create the new
+block next to the old block, journal the created block ID, then archive the old
+block. Auto-save treats replacements as review-required because the old remote
+block ID is removed.
+
 `CreateEntity` is the connector-neutral shape for local file creation. For the filesystem projection it carries the parent remote ID, user title, initial property values, initial body, and the source path that produced the create request. Connectors assign the real remote ID and return a `CreatedEntity` apply effect; reconciliation then reads the created remote entity back, materializes the canonical projected path, saves the shadow, and lets undo archive the created entity by ID.
 
 ## Undo Contract
@@ -106,6 +118,8 @@ Each approved operation also receives a deterministic `PushOperationId` derived 
 Journal entries now include shadow preimages for affected entities. The undo planner uses those preimages to derive reverse operations without guessing:
 
 - block updates reverse to the previous block text;
+- block replacements reverse to archiving the replacement block and restoring
+  the original block from the preimage when the replacement ID was journaled;
 - block moves reverse to the previous sibling position;
 - archived blocks reverse to a restore operation with original content and position;
 - appends reverse to archiving the created block when apply journaled the created block ID;

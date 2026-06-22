@@ -427,6 +427,11 @@ The production command path uses the SQLite store. A real diff requires persiste
 
 The push implementation runs the same path resolution, parsing, validation, diffing, and guardrail evaluation as `afs diff`. It refuses `unresolved_conflict_markers`; edit the file to the intended final content and remove every marker line before pushing. When the plan is approved, it enters the journaled connector-apply executor. It supports `-y`/`--yes` for safe plans and `--confirm` for dangerous plans.
 
+Markdown edits that change a block's remote type are reported as
+`replace_block` operations. For Notion, that means AFS creates the replacement
+block at the old block's position and archives the old block after the new ID is
+journaled.
+
 The JSON report has the same validation, plan, degradation, guardrail, and stage fields as `afs diff`. Its `action` is one of:
 
 - `fix_validation`;

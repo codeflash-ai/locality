@@ -65,6 +65,7 @@ impl PushOperationId {
     ) -> Self {
         let target = match operation {
             PushOperation::UpdateBlock { block_id, .. }
+            | PushOperation::ReplaceBlock { block_id, .. }
             | PushOperation::MoveBlock { block_id, .. }
             | PushOperation::UpdateMedia { block_id, .. }
             | PushOperation::ArchiveBlock { block_id } => block_id.0.as_str(),
@@ -166,6 +167,7 @@ pub trait JournalStore {
 fn operation_kind(operation: &PushOperation) -> &'static str {
     match operation {
         PushOperation::UpdateBlock { .. } => "update_block",
+        PushOperation::ReplaceBlock { .. } => "replace_block",
         PushOperation::AppendBlock { .. } => "append_block",
         PushOperation::MoveBlock { .. } => "move_block",
         PushOperation::UpdateMedia { .. } => "update_media",

@@ -91,14 +91,20 @@ pub fn plan_block_diff(
         .iter()
         .filter_map(|shadow_index| *shadow_index)
         .collect::<BTreeSet<_>>();
+    let mut recreated_shadow = BTreeSet::new();
+    let mut moved_existing_ids = BTreeSet::new();
     let mut previous_existing_id: Option<RemoteId> = None;
 
     for (edited_index, edited_block) in edited_blocks.iter().enumerate() {
         match matches[edited_index] {
             Some(shadow_index) => {
                 let shadow_block = &shadow.blocks[shadow_index];
-                let previous_retained_id =
-                    previous_retained_shadow_id(shadow, shadow_index, &retained_shadow);
+                let previous_retained_id = previous_retained_shadow_id(
+                    shadow,
+                    shadow_index,
+                    &retained_shadow,
+                    &recreated_shadow,
+                );
 
                 if should_move_block(
                     shadow_block,
@@ -110,13 +116,40 @@ pub fn plan_block_diff(
                         block_id: shadow_block.remote_id.clone(),
                         after: previous_existing_id.clone(),
                     });
+                    moved_existing_ids.insert(shadow_block.remote_id.clone());
                 }
 
-                if !rendered_bodies_equivalent(&shadow_block.text, &edited_block.text) {
-                    operations.push(PushOperation::UpdateBlock {
-                        block_id: shadow_block.remote_id.clone(),
+                if should_recreate_moved_native_block(
+                    shadow_block,
+                    edited_block,
+                    previous_retained_id,
+                    previous_existing_id.as_ref(),
+                    &moved_existing_ids,
+                ) {
+                    operations.push(PushOperation::AppendBlock {
+                        parent_id: shadow.entity_id.clone(),
+                        after: previous_existing_id.clone(),
                         content: edited_block.text.clone(),
                     });
+                    recreated_shadow.insert(shadow_index);
+                    continue;
+                }
+
+                let write_kind_changed = should_replace_block(shadow_block, edited_block);
+                if write_kind_changed
+                    || !rendered_bodies_equivalent(&shadow_block.text, &edited_block.text)
+                {
+                    if write_kind_changed {
+                        operations.push(PushOperation::ReplaceBlock {
+                            block_id: shadow_block.remote_id.clone(),
+                            content: edited_block.text.clone(),
+                        });
+                    } else {
+                        operations.push(PushOperation::UpdateBlock {
+                            block_id: shadow_block.remote_id.clone(),
+                            content: edited_block.text.clone(),
+                        });
+                    }
                 }
 
                 previous_existing_id = Some(shadow_block.remote_id.clone());
@@ -132,7 +165,7 @@ pub fn plan_block_diff(
     }
 
     for (index, shadow_block) in shadow.blocks.iter().enumerate() {
-        if !retained_shadow.contains(&index) {
+        if !retained_shadow.contains(&index) || recreated_shadow.contains(&index) {
             operations.push(PushOperation::ArchiveBlock {
                 block_id: shadow_block.remote_id.clone(),
             });
@@ -462,14 +495,131 @@ fn same_alignment_kind(left: &MarkdownBlockKind, right: &MarkdownBlockKind) -> b
     }
 }
 
+fn should_replace_block(shadow_block: &ShadowBlock, edited_block: &SegmentedBlock) -> bool {
+    markdown_write_kind(&shadow_block.kind, &shadow_block.text)
+        != markdown_write_kind(&edited_block.kind, &edited_block.text)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkdownWriteKind {
+    Heading(usize),
+    Paragraph,
+    Quote,
+    Callout,
+    BulletedList,
+    NumberedList,
+    ToDo,
+    Code,
+    Table,
+    Divider,
+    Equation,
+    Directive,
+}
+
+fn markdown_write_kind(kind: &MarkdownBlockKind, text: &str) -> MarkdownWriteKind {
+    let trimmed = text.trim_end_matches('\n');
+    match kind {
+        MarkdownBlockKind::Heading => parse_heading_level(trimmed)
+            .map(MarkdownWriteKind::Heading)
+            .unwrap_or(MarkdownWriteKind::Heading(0)),
+        MarkdownBlockKind::Paragraph => paragraph_write_kind(trimmed),
+        MarkdownBlockKind::List => list_write_kind(trimmed),
+        MarkdownBlockKind::CodeFence => MarkdownWriteKind::Code,
+        MarkdownBlockKind::Table | MarkdownBlockKind::TableWithRows { .. } => {
+            MarkdownWriteKind::Table
+        }
+        MarkdownBlockKind::Directive { .. } => MarkdownWriteKind::Directive,
+    }
+}
+
+fn paragraph_write_kind(markdown: &str) -> MarkdownWriteKind {
+    let trimmed = markdown.trim();
+    if trimmed == "---" {
+        return MarkdownWriteKind::Divider;
+    }
+    if is_display_equation(trimmed) {
+        return MarkdownWriteKind::Equation;
+    }
+    if is_callout(markdown) {
+        return MarkdownWriteKind::Callout;
+    }
+    if is_quote(markdown) {
+        return MarkdownWriteKind::Quote;
+    }
+
+    MarkdownWriteKind::Paragraph
+}
+
+fn list_write_kind(markdown: &str) -> MarkdownWriteKind {
+    let trimmed = markdown.trim_start();
+    if is_to_do_item(trimmed) {
+        MarkdownWriteKind::ToDo
+    } else if is_numbered_item(trimmed) {
+        MarkdownWriteKind::NumberedList
+    } else {
+        MarkdownWriteKind::BulletedList
+    }
+}
+
+fn parse_heading_level(markdown: &str) -> Option<usize> {
+    let trimmed = markdown.trim_start();
+    let level = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if (1..=6).contains(&level) && trimmed[level..].starts_with(' ') {
+        Some(level)
+    } else {
+        None
+    }
+}
+
+fn is_to_do_item(trimmed: &str) -> bool {
+    trimmed.starts_with("- [ ] ")
+        || trimmed.starts_with("- [] ")
+        || trimmed.starts_with("- [x] ")
+        || trimmed.starts_with("- [X] ")
+}
+
+fn is_numbered_item(trimmed: &str) -> bool {
+    let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digit_count > 0 && trimmed[digit_count..].starts_with(". ")
+}
+
+fn is_display_equation(trimmed: &str) -> bool {
+    trimmed.starts_with("$$") && trimmed.ends_with("$$") && trimmed.len() >= 4
+}
+
+fn is_callout(markdown: &str) -> bool {
+    let mut lines = markdown.lines();
+    let Some(marker) = lines.next().map(str::trim_start) else {
+        return false;
+    };
+    marker
+        .strip_prefix("> ")
+        .is_some_and(|marker| marker.starts_with("[!") && marker.ends_with(']'))
+}
+
+fn is_quote(markdown: &str) -> bool {
+    let mut saw_line = false;
+    for line in markdown.lines() {
+        saw_line = true;
+        let Some(text) = line.trim_start().strip_prefix("> ") else {
+            return false;
+        };
+        if text.starts_with("[!") {
+            return false;
+        }
+    }
+    saw_line
+}
+
 fn previous_retained_shadow_id<'a>(
     shadow: &'a ShadowDocument,
     shadow_index: usize,
     retained_shadow: &BTreeSet<usize>,
+    recreated_shadow: &BTreeSet<usize>,
 ) -> Option<&'a RemoteId> {
     (0..shadow_index)
         .rev()
-        .find(|index| retained_shadow.contains(index))
+        .find(|index| retained_shadow.contains(index) && !recreated_shadow.contains(index))
         .map(|index| &shadow.blocks[index].remote_id)
 }
 
@@ -482,6 +632,20 @@ fn should_move_block(
     previous_retained_id != previous_existing_id
         && shadow_block.kind.is_directive()
         && edited_block.is_directive()
+        && shadow_block.content_hash == edited_block.content_hash
+}
+
+fn should_recreate_moved_native_block(
+    shadow_block: &ShadowBlock,
+    edited_block: &SegmentedBlock,
+    previous_retained_id: Option<&RemoteId>,
+    previous_existing_id: Option<&RemoteId>,
+    moved_existing_ids: &BTreeSet<RemoteId>,
+) -> bool {
+    previous_retained_id != previous_existing_id
+        && !previous_existing_id.is_some_and(|remote_id| moved_existing_ids.contains(remote_id))
+        && !shadow_block.kind.is_directive()
+        && !edited_block.is_directive()
         && shadow_block.content_hash == edited_block.content_hash
 }
 

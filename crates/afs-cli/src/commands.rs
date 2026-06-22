@@ -2725,8 +2725,9 @@ fn print_log_report(report: &LogReport) {
             println!("  failure: {failure}");
         }
         println!(
-            "  summary: {} updated, {} media updated, {} created, {} moved, {} archived",
+            "  summary: {} updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
             entry.plan_summary.blocks_updated,
+            entry.plan_summary.blocks_replaced,
             entry.plan_summary.media_updated,
             entry.plan_summary.blocks_created,
             entry.plan_summary.blocks_moved,
@@ -3800,8 +3801,9 @@ fn print_diff_report_fields(
     };
 
     println!(
-        "{} blocks updated, {} media updated, {} created, {} moved, {} archived",
+        "{} blocks updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
         plan.summary.blocks_updated,
+        plan.summary.blocks_replaced,
         plan.summary.media_updated,
         plan.summary.blocks_created,
         plan.summary.blocks_moved,

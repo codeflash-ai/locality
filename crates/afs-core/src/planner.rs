@@ -54,6 +54,10 @@ pub enum PushOperation {
         block_id: RemoteId,
         content: String,
     },
+    ReplaceBlock {
+        block_id: RemoteId,
+        content: String,
+    },
     AppendBlock {
         parent_id: RemoteId,
         after: Option<RemoteId>,
@@ -97,6 +101,7 @@ pub enum PushOperation {
 #[serde(rename_all = "snake_case")]
 pub enum PushOperationKind {
     UpdateBlock,
+    ReplaceBlock,
     AppendBlock,
     MoveBlock,
     UpdateMedia,
@@ -110,6 +115,7 @@ impl PushOperationKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::UpdateBlock => "update_block",
+            Self::ReplaceBlock => "replace_block",
             Self::AppendBlock => "append_block",
             Self::MoveBlock => "move_block",
             Self::UpdateMedia => "update_media",
@@ -120,9 +126,10 @@ impl PushOperationKind {
         }
     }
 
-    pub fn all() -> [Self; 8] {
+    pub fn all() -> [Self; 9] {
         [
             Self::UpdateBlock,
+            Self::ReplaceBlock,
             Self::AppendBlock,
             Self::MoveBlock,
             Self::UpdateMedia,
@@ -138,6 +145,7 @@ impl PushOperation {
     pub fn kind(&self) -> PushOperationKind {
         match self {
             Self::UpdateBlock { .. } => PushOperationKind::UpdateBlock,
+            Self::ReplaceBlock { .. } => PushOperationKind::ReplaceBlock,
             Self::AppendBlock { .. } => PushOperationKind::AppendBlock,
             Self::MoveBlock { .. } => PushOperationKind::MoveBlock,
             Self::UpdateMedia { .. } => PushOperationKind::UpdateMedia,
@@ -153,6 +161,8 @@ impl PushOperation {
 pub struct PlanSummary {
     pub blocks_created: usize,
     pub blocks_updated: usize,
+    #[serde(default)]
+    pub blocks_replaced: usize,
     pub blocks_moved: usize,
     #[serde(default)]
     pub media_updated: usize,
@@ -169,6 +179,7 @@ impl PlanSummary {
         for operation in operations {
             match operation {
                 PushOperation::UpdateBlock { .. } => summary.blocks_updated += 1,
+                PushOperation::ReplaceBlock { .. } => summary.blocks_replaced += 1,
                 PushOperation::AppendBlock { .. } => summary.blocks_created += 1,
                 PushOperation::MoveBlock { .. } => summary.blocks_moved += 1,
                 PushOperation::UpdateMedia { .. } => summary.media_updated += 1,
@@ -185,7 +196,7 @@ impl PlanSummary {
     }
 
     pub fn destructive_archive_count(&self) -> usize {
-        self.blocks_archived + self.entities_archived
+        self.blocks_archived + self.blocks_replaced + self.entities_archived
     }
 }
 

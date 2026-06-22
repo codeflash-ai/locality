@@ -103,6 +103,45 @@ pub fn apply_plan(
                     block_id: block_id.clone(),
                 });
             }
+            PushOperation::ReplaceBlock { block_id, content } => {
+                current_block(&current_blocks, block_id)?;
+                let parent_id = block_parents
+                    .direct_parents
+                    .get(block_id)
+                    .or_else(|| block_parents.containing_pages.get(block_id))
+                    .ok_or_else(|| {
+                        AfsError::InvalidState(format!(
+                            "push referenced block `{}` without a containing Notion parent",
+                            block_id.0
+                        ))
+                    })?
+                    .clone();
+                let patch = parse_supported_block(content, None, None)?;
+                let body = append_body(patch.append_child(), Some(block_id));
+                let result = api.append_block_children(parent_id.as_str(), body)?;
+                let created = result.results.first().ok_or_else(|| {
+                    AfsError::InvalidState(
+                        "notion append block children returned no replacement block".to_string(),
+                    )
+                })?;
+                let created_id = RemoteId::new(created.id.clone());
+                append_chains.insert(
+                    (parent_id.clone(), Some(block_id.clone())),
+                    created_id.clone(),
+                );
+                effects.push(JournalApplyEffect::CreatedBlock {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    parent_id,
+                    block_id: created_id,
+                });
+                api.delete_block(block_id.as_str())?;
+                effects.push(JournalApplyEffect::ArchivedBlock {
+                    operation_id: request.operation_ids[operation_index].clone(),
+                    operation_index,
+                    block_id: block_id.clone(),
+                });
+            }
             PushOperation::UpdateMedia {
                 block_id,
                 local_path,

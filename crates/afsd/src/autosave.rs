@@ -98,6 +98,9 @@ pub fn auto_save_plan_block_reason(plan: &PushPlan) -> Option<String> {
             | PushOperation::UpdateBlock { .. }
             | PushOperation::AppendBlock { .. }
             | PushOperation::UpdateProperties { .. } => {}
+            PushOperation::ReplaceBlock { .. } => {
+                return Some("block replacements require review".to_string());
+            }
             PushOperation::MoveBlock { .. } => {
                 return Some("block moves require review".to_string());
             }
@@ -283,6 +286,18 @@ mod tests {
         assert_eq!(
             auto_save_plan_block_reason(&archive),
             Some("deletions require review".to_string())
+        );
+
+        let replace = PushPlan::new(
+            vec![RemoteId::new("page-1")],
+            vec![PushOperation::ReplaceBlock {
+                block_id: RemoteId::new("block-1"),
+                content: "- Replacement".to_string(),
+            }],
+        );
+        assert_eq!(
+            auto_save_plan_block_reason(&replace),
+            Some("block replacements require review".to_string())
         );
 
         let degraded =

@@ -1023,7 +1023,7 @@ mod tests {
 
     use afs_core::canonical::render_canonical_markdown;
     use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
-    use afs_core::shadow::{ShadowDocument, stable_hash};
+    use afs_core::shadow::{ShadowDocument, segment_markdown_body};
     use afs_store::{EntityRecord, EntityRepository, InMemoryStateStore, ShadowRepository};
 
     use super::{can_replace_file, write_atomic};
@@ -1036,6 +1036,30 @@ mod tests {
             HydrationState::Dirty,
             fixture.document("Roadmap", "# Roadmap\n\nOriginal body.\n"),
         );
+
+        assert!(
+            can_replace_file(
+                &store,
+                &fixture.mount,
+                &fixture.entity(HydrationState::Dirty),
+                &fixture.page_path,
+            )
+            .expect("check replace")
+        );
+    }
+
+    #[test]
+    fn can_replace_stale_dirty_file_when_block_diff_is_noop() {
+        let fixture = PullFixture::new();
+        let store = fixture.store_with_shadow(
+            HydrationState::Dirty,
+            fixture.document("Roadmap", "- One\n\n- Two\n"),
+        );
+        write_atomic(
+            &fixture.page_path,
+            render_canonical_markdown(&fixture.document("Roadmap", "- One\n- Two\n")),
+        )
+        .expect("write compacted projection");
 
         assert!(
             can_replace_file(
@@ -1177,13 +1201,21 @@ mod tests {
             document: CanonicalDocument,
         ) -> InMemoryStateStore {
             let mut store = InMemoryStateStore::new();
-            let shadow = ShadowDocument {
-                entity_id: self.remote_id.clone(),
-                frontmatter: document.frontmatter.clone(),
-                body_hash: stable_hash(&document.body),
-                rendered_body: document.body.clone(),
-                blocks: Vec::new(),
-            };
+            let body_start_line = document.frontmatter.lines().count() + 3;
+            let native_block_count = segment_markdown_body(&document.body, body_start_line)
+                .into_iter()
+                .filter(|block| !block.is_directive())
+                .count();
+            let block_ids =
+                (0..native_block_count).map(|index| RemoteId::new(format!("block-{index}")));
+            let shadow = ShadowDocument::from_synced_body(
+                self.remote_id.clone(),
+                document.body.clone(),
+                body_start_line,
+                block_ids,
+            )
+            .expect("shadow")
+            .with_frontmatter(document.frontmatter.clone());
 
             store
                 .save_shadow(&self.mount_id, shadow)

@@ -132,6 +132,110 @@ fn apply_updates_appends_and_archives_supported_blocks() {
 }
 
 #[test]
+fn apply_replaces_block_by_appending_after_old_block_then_archiving_old_block() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::ReplaceBlock {
+                block_id: RemoteId::new("paragraph-1"),
+                content: "- Replacement bullet".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: "After replacement.".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    assert_eq!(
+        result.effects,
+        vec![
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[0].clone(),
+                operation_index: 0,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-1"),
+            },
+            JournalApplyEffect::ArchivedBlock {
+                operation_id: operation_ids[0].clone(),
+                operation_index: 0,
+                block_id: RemoteId::new("paragraph-1"),
+            },
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[1].clone(),
+                operation_index: 1,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-2"),
+            },
+        ]
+    );
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "bulleted_list_item",
+                        "bulleted_list_item": {
+                            "rich_text": rich_text_json("Replacement bullet"),
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "paragraph-1",
+                        },
+                    },
+                }),
+            },
+            WriteCall::Delete {
+                block_id: "paragraph-1".to_string(),
+            },
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": rich_text_json("After replacement."),
+                        },
+                    }],
+                    "position": {
+                        "type": "after_block",
+                        "after_block": {
+                            "id": "created-1",
+                        },
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_decodes_rendered_rich_text_line_breaks() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());

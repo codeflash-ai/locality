@@ -87,6 +87,33 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                     None => unsupported.push(missing_block_preimage(operation_index, block_id)),
                 }
             }
+            PushOperation::ReplaceBlock { block_id, .. } => {
+                let created_block_id = find_created_block_effect(entry, operation_index);
+                let preimage_position = find_preimage_block_position(entry, block_id);
+                let preimage_block = find_preimage_block(entry, block_id);
+
+                match (created_block_id, preimage_position, preimage_block) {
+                    (Some(created_block_id), Some((shadow, after)), Some((_, block))) => {
+                        operations.push(UndoOperation::ArchiveCreatedBlock {
+                            block_id: created_block_id,
+                        });
+                        operations.push(UndoOperation::RestoreArchivedBlock {
+                            block_id: block_id.clone(),
+                            parent_id: shadow.entity_id.clone(),
+                            after,
+                            content: block.text.clone(),
+                        });
+                    }
+                    (None, _, _) => unsupported.push(UnsupportedUndoOperation::new(
+                        operation_index,
+                        "replace_block_missing_created_id",
+                        "cannot undo a replaced block until apply journals the replacement remote block id",
+                    )),
+                    (_, None, _) | (_, _, None) => {
+                        unsupported.push(missing_block_preimage(operation_index, block_id));
+                    }
+                }
+            }
             PushOperation::UpdateMedia { block_id, .. } => {
                 match find_preimage_block(entry, block_id) {
                     Some((_, block)) => operations.push(UndoOperation::RestoreBlockContent {
