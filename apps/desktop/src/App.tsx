@@ -2398,6 +2398,34 @@ function FileChangeList({
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [details, setDetails] = useState<Record<string, FileDetailStatus>>({});
   const [editors, setEditors] = useState<Record<string, FileEditorStatus>>({});
+  const [autoSaveOverrides, setAutoSaveOverrides] = useState<Record<string, PendingChange["autoSave"]>>({});
+
+  useEffect(() => {
+    setAutoSaveOverrides((current) => {
+      let changed = false;
+      const next = { ...current };
+      const activePaths = new Set(changes.map((change) => change.localPath));
+      for (const path of Object.keys(next)) {
+        if (!activePaths.has(path)) {
+          delete next[path];
+          changed = true;
+        }
+      }
+      for (const change of changes) {
+        const override = next[change.localPath];
+        if (
+          override &&
+          override.enabled === change.autoSave.enabled &&
+          override.state === change.autoSave.state &&
+          override.label === change.autoSave.label
+        ) {
+          delete next[change.localPath];
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [changes]);
 
   async function loadFileDetails(change: PendingChange) {
     setDetails((current) => ({
@@ -2545,6 +2573,17 @@ function FileChangeList({
 
   async function toggleAutoSave(change: PendingChange, enabled: boolean) {
     const path = joinMountPath(mountPath, change.localPath);
+    const optimisticState: PendingChange["autoSave"] = {
+      ...change.autoSave,
+      enabled,
+      state: enabled ? "active" : "off",
+      label: enabled ? "Auto-save on" : "Auto-save off",
+      reason: null,
+    };
+    setAutoSaveOverrides((current) => ({
+      ...current,
+      [change.localPath]: optimisticState,
+    }));
     setActions((current) => ({
       ...current,
       [change.localPath]: { state: "working", message: enabled ? "Turning on auto-save..." : "Turning off auto-save..." },
@@ -2561,8 +2600,18 @@ function FileChangeList({
           message: report.message,
         },
       }));
+      if (!report.ok) {
+        setAutoSaveOverrides((current) => ({
+          ...current,
+          [change.localPath]: change.autoSave,
+        }));
+      }
       await onRefresh?.().catch(() => undefined);
     } catch (error) {
+      setAutoSaveOverrides((current) => ({
+        ...current,
+        [change.localPath]: change.autoSave,
+      }));
       setActions((current) => ({
         ...current,
         [change.localPath]: { state: "error", message: errorMessage(error) },
@@ -2582,6 +2631,7 @@ function FileChangeList({
         const shouldReviewBeforePush = Boolean(!confirmDangerous && change.state === "needs_review" && onReview);
         const actionNeedsReview = Boolean(action?.state === "error" && pushNeedsReview(action.message) && onReview);
         const isSelected = selectedPath === change.localPath;
+        const autoSave = autoSaveOverrides[change.localPath] ?? change.autoSave;
         return (
           <article className={`file-row ${change.state} ${isSelected ? "expanded" : ""}`} key={change.localPath}>
             <div className="file-state">
@@ -2626,14 +2676,14 @@ function FileChangeList({
               )}
             </div>
             <div className="file-row-actions">
-              <div className={`auto-save-control ${change.autoSave.state}`}>
-                <span title={change.autoSave.reason || change.autoSave.label}>{change.autoSave.label}</span>
+              <div className={`auto-save-control ${autoSave.state}`}>
+                <span title={autoSave.reason || autoSave.label}>{autoSave.label}</span>
                 <button
-                  className={`toggle ${change.autoSave.enabled ? "enabled" : ""}`}
+                  className={`toggle ${autoSave.enabled ? "enabled" : ""}`}
                   type="button"
                   disabled={isWorking}
-                  aria-label={`${change.autoSave.enabled ? "Turn off" : "Turn on"} auto-save for ${change.title}`}
-                  onClick={() => void toggleAutoSave(change, !change.autoSave.enabled)}
+                  aria-label={`${autoSave.enabled ? "Turn off" : "Turn on"} auto-save for ${change.title}`}
+                  onClick={() => void toggleAutoSave(change, !autoSave.enabled)}
                 >
                   <i />
                 </button>

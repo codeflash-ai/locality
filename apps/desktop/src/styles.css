@@ -1653,7 +1653,7 @@ p {
 }
 
 .toggle.enabled {
-  background: var(--accent);
+  background: var(--green);
 }
 
 .toggle.enabled i {
