@@ -2290,14 +2290,14 @@ impl InlineParser<'_> {
             "[",
             "_",
         ] {
-            if let Some(offset) = self.input[start..].find(marker) {
-                next = next.min(start + offset);
+            if let Some(index) = find_unescaped_marker(self.input, start, marker) {
+                next = next.min(index);
             }
         }
         if let Some(closing) = closing
-            && let Some(offset) = self.input[start..].find(closing)
+            && let Some(index) = find_unescaped_marker(self.input, start, closing)
         {
-            next = next.min(start + offset);
+            next = next.min(index);
         }
         if self.allow_preimage {
             for token in self.preimage_tokens {
@@ -2324,7 +2324,31 @@ fn parse_nested(
 }
 
 fn find_closing(input: &str, start: usize, marker: &str) -> Option<usize> {
-    input[start..].find(marker).map(|offset| start + offset)
+    find_unescaped_marker(input, start, marker)
+}
+
+fn find_unescaped_marker(input: &str, start: usize, marker: &str) -> Option<usize> {
+    let mut search_start = start;
+    while search_start <= input.len() {
+        let offset = input[search_start..].find(marker)?;
+        let index = search_start + offset;
+        if !is_escaped_marker(input, index) {
+            return Some(index);
+        }
+        search_start = index + marker.len();
+    }
+    None
+}
+
+fn is_escaped_marker(input: &str, marker_index: usize) -> bool {
+    let mut slash_count = 0;
+    let mut index = marker_index;
+    let bytes = input.as_bytes();
+    while index > 0 && bytes[index - 1] == b'\\' {
+        slash_count += 1;
+        index -= 1;
+    }
+    slash_count % 2 == 1
 }
 
 fn parse_date_mention_args(input: &str) -> AfsResult<(String, Option<String>, Option<String>)> {
@@ -2739,7 +2763,7 @@ fn unescape_markdown_text(value: &str) -> String {
     let mut rest = value;
 
     while !rest.is_empty() {
-        if let Some(tag) = escaped_break_tag_prefix(rest) {
+        if let Some(tag) = escaped_literal_inline_tag_prefix(rest) {
             unescaped.push_str(tag);
             rest = &rest[tag.len() + 1..];
             continue;
@@ -3134,7 +3158,7 @@ fn escape_markdown_text(text: &str) -> String {
     let mut rest = text;
 
     while !rest.is_empty() {
-        if let Some(tag) = break_tag_prefix(rest) {
+        if let Some(tag) = literal_inline_tag_prefix(rest) {
             escaped.push('\\');
             escaped.push_str(tag);
             rest = &rest[tag.len()..];
@@ -3159,11 +3183,21 @@ fn escape_markdown_link_label(text: &str) -> String {
         .replace(']', "\\]")
 }
 
-fn escaped_break_tag_prefix(value: &str) -> Option<&'static str> {
-    ["<br />", "<br/>", "<br>"].into_iter().find(|tag| {
-        value
-            .strip_prefix('\\')
-            .is_some_and(|rest| rest.starts_with(tag))
+fn escaped_literal_inline_tag_prefix(value: &str) -> Option<&'static str> {
+    ["<br />", "<br/>", "<br>", "</u>", "<u>"]
+        .into_iter()
+        .find(|tag| {
+            value
+                .strip_prefix('\\')
+                .is_some_and(|rest| rest.starts_with(tag))
+        })
+}
+
+fn literal_inline_tag_prefix(value: &str) -> Option<&'static str> {
+    break_tag_prefix(value).or_else(|| {
+        ["</u>", "<u>"]
+            .into_iter()
+            .find(|tag| value.starts_with(tag))
     })
 }
 

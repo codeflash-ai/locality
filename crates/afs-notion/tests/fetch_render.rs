@@ -253,6 +253,22 @@ fn render_rich_text_escapes_literal_break_tags() {
 }
 
 #[test]
+fn render_rich_text_escapes_literal_underline_tags() {
+    let bundle = afs_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: paragraph_block("paragraph-1", vec![rich_text("Literal <u>tag</u>")]),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = afs_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(rendered.document.body, "Literal \\<u>tag\\</u>\n");
+    assert_eq!(rendered.shadow.blocks.len(), 1);
+}
+
+#[test]
 fn fetch_does_not_inline_child_page_or_database_content_into_parent_body() {
     let api = FixtureNotionApi::parent_with_child_boundaries();
     let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));

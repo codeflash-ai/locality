@@ -1008,7 +1008,7 @@ fn escape_markdown_text(text: &str) -> String {
     let mut rest = text;
 
     while !rest.is_empty() {
-        if let Some(tag) = break_tag_prefix(rest) {
+        if let Some(tag) = literal_inline_tag_prefix(rest) {
             escaped.push('\\');
             escaped.push_str(tag);
             rest = &rest[tag.len()..];
@@ -1037,6 +1037,14 @@ fn break_tag_prefix(value: &str) -> Option<&'static str> {
     ["<br />", "<br/>", "<br>"]
         .into_iter()
         .find(|tag| value.starts_with(tag))
+}
+
+fn literal_inline_tag_prefix(value: &str) -> Option<&'static str> {
+    break_tag_prefix(value).or_else(|| {
+        ["</u>", "<u>"]
+            .into_iter()
+            .find(|tag| value.starts_with(tag))
+    })
 }
 
 fn escape_directive_value(value: &str) -> String {
