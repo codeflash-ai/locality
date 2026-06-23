@@ -13,6 +13,7 @@ use afs_core::diff::{BlockDiffEngine, DiffEngine};
 use afs_core::freshness::FreshnessTier;
 use afs_core::journal::{JournalEntry, JournalStatus};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+use afs_core::planner::PushOperation;
 use afs_core::shadow::rendered_bodies_equivalent;
 use afs_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
@@ -1057,23 +1058,46 @@ where
         }
     };
 
-    let body_clean = rendered_bodies_equivalent(&parsed.document.body, &shadow.rendered_body)
-        || BlockDiffEngine::new()
-            .with_edited_body_start_line(parsed.body_start_line)
-            .plan_push(&shadow, &parsed.document)
-            .map(|plan| plan.operations.is_empty() && plan.degradations.is_empty())
+    let body_equivalent = rendered_bodies_equivalent(&parsed.document.body, &shadow.rendered_body);
+    let plan = BlockDiffEngine::new()
+        .with_edited_body_start_line(parsed.body_start_line)
+        .plan_push(&shadow, &parsed.document);
+    let has_frontmatter_changes = plan
+        .as_ref()
+        .map(|plan| {
+            plan.operations
+                .iter()
+                .any(|operation| matches!(operation, PushOperation::UpdateProperties { .. }))
+        })
+        .unwrap_or(false);
+    let body_clean = body_equivalent
+        || plan
+            .as_ref()
+            .map(|plan| {
+                plan.degradations.is_empty()
+                    && plan.operations.iter().all(|operation| {
+                        matches!(operation, PushOperation::UpdateProperties { .. })
+                    })
+            })
             .unwrap_or(false);
 
-    if body_clean {
+    if body_clean && !has_frontmatter_changes {
         (StatusState::Clean, Vec::new())
     } else {
-        (
-            StatusState::Dirty,
-            vec![StatusIssue::new(
+        let mut issues = Vec::new();
+        if !body_clean {
+            issues.push(StatusIssue::new(
                 "local_body_changed",
                 "local body differs from the last synced shadow",
-            )],
-        )
+            ));
+        }
+        if has_frontmatter_changes {
+            issues.push(StatusIssue::new(
+                "local_frontmatter_changed",
+                "local frontmatter differs from the last synced shadow",
+            ));
+        }
+        (StatusState::Dirty, issues)
     }
 }
 

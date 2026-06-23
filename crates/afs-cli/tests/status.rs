@@ -91,6 +91,53 @@ fn status_treats_content_cache_absolute_media_href_as_clean() {
 }
 
 #[test]
+fn status_reports_frontmatter_only_property_edit_as_dirty() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow("page-1", "# Roadmap\n\nSame paragraph.").with_frontmatter(
+                "afs:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+            ),
+        )
+        .expect("save shadow with frontmatter");
+    fixture.write_raw(
+        "Roadmap.md",
+        &canonical_markdown_with_title("page-1", "Roadmap v2", "# Roadmap\n\nSame paragraph."),
+    );
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.join("Roadmap.md")),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.clean);
+    assert_eq!(report.summary.clean, 0);
+    assert_eq!(report.summary.dirty, 1);
+    assert_eq!(report.summary.pending_local_changes, 1);
+    assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Dirty);
+    assert_eq!(
+        entry_sync_state(&report, "Roadmap.md"),
+        StatusSyncState::PendingLocalChanges
+    );
+    assert_eq!(
+        entry_issue(&report, "Roadmap.md"),
+        "local_frontmatter_changed"
+    );
+}
+
+#[test]
 fn status_reports_clean_when_dirty_hint_has_equivalent_body() {
     let fixture = StatusFixture::new();
     let mut store = fixture.store();
@@ -898,8 +945,12 @@ fn unique_temp_path(prefix: &str) -> PathBuf {
 }
 
 fn canonical_markdown(remote_id: &str, body: &str) -> String {
+    canonical_markdown_with_title(remote_id, "Roadmap", body)
+}
+
+fn canonical_markdown_with_title(remote_id: &str, title: &str, body: &str) -> String {
     format!(
-        "---\nafs:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\n{body}"
+        "---\nafs:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: {title}\n---\n{body}"
     )
 }
 
