@@ -1531,6 +1531,99 @@ fn live_local_image_media_edit_uploads_and_reconciles_bytes() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_local_file_like_media_appends_upload_and_reconcile_local_links() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live local files {}", unique_suffix()),
+        vec![paragraph_child("Base body before local file-like uploads.")],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    let media_dir = fixture
+        .root
+        .join(".afs")
+        .join("media")
+        .join(format!("live-local-files-{}", unique_suffix()));
+    fs::create_dir_all(&media_dir).expect("create local file media dir");
+    let video_path = media_dir.join("cars.mp4");
+    let pdf_path = media_dir.join("brief.pdf");
+    let audio_path = media_dir.join("theme.wav");
+    let html_path = media_dir.join("index.html");
+    fs::write(&video_path, tiny_mp4_bytes()).expect("write local video");
+    fs::write(&pdf_path, tiny_pdf_bytes()).expect("write local pdf");
+    fs::write(&audio_path, tiny_wav_bytes()).expect("write local audio");
+    fs::write(&html_path, tiny_html_bytes()).expect("write local html");
+
+    let edited = format!(
+        "{original}\n[Uploaded video]({})\n\n[Uploaded PDF]({})\n\n[Uploaded audio]({})\n\n[Uploaded HTML]({})\n",
+        video_path.display(),
+        pdf_path.display(),
+        audio_path.display(),
+        html_path.display()
+    );
+    fs::write(&page_path, edited).expect("write file-like media append markdown");
+
+    let diff = run_diff(&store, &page_path).expect("diff file-like media append");
+    let plan = diff.plan.as_ref().expect("file-like media append plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert_eq!(plan.summary.blocks_created, 4, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push file-like media append");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean file-like media status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let reconciled = fs::read_to_string(&page_path).expect("read reconciled file-like media page");
+    for caption in [
+        "Uploaded video",
+        "Uploaded PDF",
+        "Uploaded audio",
+        "Uploaded HTML",
+    ] {
+        assert_local_media_link_markdown(&reconciled, caption);
+        let local_path = local_media_link_path(&fixture.root, &page_path, &reconciled, caption);
+        assert!(
+            local_path.is_file(),
+            "reconciled local media path should exist for {caption:?}: {local_path:?}"
+        );
+        assert!(
+            !fs::read(&local_path)
+                .expect("read reconciled local media")
+                .is_empty(),
+            "reconciled local media path should be non-empty for {caption:?}: {local_path:?}"
+        );
+    }
+
+    let verified = render_live_page(&connector, &scratch.id, &page_path);
+    assert_local_media_link_markdown(&verified, "Uploaded video");
+    assert_local_media_link_markdown(&verified, "Uploaded PDF");
+    assert_local_media_link_markdown(&verified, "Uploaded audio");
+    assert_local_media_link_markdown(&verified, "Uploaded HTML");
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
@@ -3025,6 +3118,15 @@ fn assert_local_media_href(line: &str, caption: &str) {
 
 fn local_image_path(root: &Path, page_path: &Path, markdown: &str, caption: &str) -> PathBuf {
     let line = markdown_image_line(markdown, caption);
+    local_media_path_from_line(root, page_path, line)
+}
+
+fn local_media_link_path(root: &Path, page_path: &Path, markdown: &str, caption: &str) -> PathBuf {
+    let line = markdown_link_line(markdown, caption);
+    local_media_path_from_line(root, page_path, line)
+}
+
+fn local_media_path_from_line(root: &Path, page_path: &Path, line: &str) -> PathBuf {
     let href = markdown_link_href(line);
     let relative_page = page_path
         .strip_prefix(root)
@@ -3032,6 +3134,22 @@ fn local_image_path(root: &Path, page_path: &Path, markdown: &str, caption: &str
     let local_path = resolve_media_href_with_content_root(relative_page, href, root)
         .unwrap_or_else(|| panic!("image href {href:?} is not a local media href"));
     root.join(local_path)
+}
+
+fn tiny_mp4_bytes() -> &'static [u8] {
+    b"\0\0\0\x18ftypmp42\0\0\0\0mp42isom\0\0\0\x08free\0\0\0\x08mdat"
+}
+
+fn tiny_pdf_bytes() -> &'static [u8] {
+    b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
+}
+
+fn tiny_wav_bytes() -> &'static [u8] {
+    b"RIFF$\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0@\x1f\0\0@\x1f\0\0\x01\0\x08\0data\0\0\0\0"
+}
+
+fn tiny_html_bytes() -> &'static [u8] {
+    b"<!doctype html><title>AFS upload</title><p>hello</p>\n"
 }
 
 fn tiny_png_bytes() -> &'static [u8] {
