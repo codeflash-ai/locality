@@ -11,6 +11,7 @@ use afs_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
 use afs_core::conflict::{
     has_unresolved_conflict_markers, render_inline_conflict_markdown_with_base,
 };
+use afs_core::freshness::RemoteVersion;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, TreeEntry};
 use afs_core::path_projection::{is_page_document_path, page_container_path};
@@ -63,7 +64,8 @@ where
         + EntityRepository
         + ShadowRepository
         + afs_store::VirtualMutationRepository
-        + afs_store::FreshnessStateRepository,
+        + afs_store::FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
     Source: SourceAdapter + Clone,
 {
     run_pull_with_state_root(store, source, target_path, None)
@@ -80,7 +82,8 @@ where
         + EntityRepository
         + ShadowRepository
         + afs_store::VirtualMutationRepository
-        + afs_store::FreshnessStateRepository,
+        + afs_store::FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
     Source: SourceAdapter + Clone,
 {
     let target_path = absolute_path(target_path.as_ref())?;
@@ -194,7 +197,10 @@ fn pull_mount_root<S, Source>(
     state_root: Option<&Path>,
 ) -> Result<PullReport, PullError>
 where
-    S: EntityRepository + ShadowRepository,
+    S: EntityRepository
+        + ShadowRepository
+        + afs_store::FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
     Source: SourceAdapter,
 {
     let entries = source
@@ -404,7 +410,10 @@ fn pull_entity_path<S, Source>(
     state_root: Option<&Path>,
 ) -> Result<PullReport, PullError>
 where
-    S: EntityRepository + ShadowRepository,
+    S: EntityRepository
+        + ShadowRepository
+        + afs_store::FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
     Source: SourceAdapter,
 {
     let entity = store
@@ -598,7 +607,10 @@ fn hydrate_entity<S, Source>(
     state_root: Option<&Path>,
 ) -> Result<HydrationOutcome, PullError>
 where
-    S: EntityRepository + ShadowRepository,
+    S: EntityRepository
+        + ShadowRepository
+        + afs_store::FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
     Source: SourceAdapter,
 {
     let path = projection_content_path(state_root, mount, &entity.path)?;
@@ -700,7 +712,10 @@ fn accept_remote_projection<S>(
     rendered: HydratedEntity,
 ) -> Result<(), PullError>
 where
-    S: EntityRepository + ShadowRepository,
+    S: EntityRepository
+        + ShadowRepository
+        + afs_store::FreshnessStateRepository
+        + afs_store::RemoteObservationRepository,
 {
     let markdown =
         render_document_with_absolute_media_hrefs(&rendered.document, &entity.path, output_root);
@@ -708,13 +723,51 @@ where
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
         .map_err(PullError::Store)?;
+    let remote_edited_at = rendered.remote_edited_at.clone();
+    let entity = hydrated_record(entity, rendered.shadow, remote_edited_at.clone());
     store
-        .save_entity(hydrated_record(
-            entity,
-            rendered.shadow,
-            rendered.remote_edited_at,
-        ))
+        .save_entity(entity.clone())
         .map_err(PullError::Store)?;
+    record_synced_remote_observation(store, mount, &entity, remote_edited_at)?;
+
+    Ok(())
+}
+
+fn record_synced_remote_observation<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    remote_edited_at: Option<String>,
+) -> Result<(), PullError>
+where
+    S: afs_store::FreshnessStateRepository + afs_store::RemoteObservationRepository,
+{
+    let observed_at = crate::freshness::freshness_timestamp();
+    let mut observation = afs_store::RemoteObservationRecord::new(
+        mount.mount_id.clone(),
+        entity.remote_id.clone(),
+        entity.kind.clone(),
+        entity.title.clone(),
+        entity.path.clone(),
+        observed_at.clone(),
+    );
+    if let Some(remote_edited_at) = remote_edited_at {
+        observation = observation.with_remote_version(RemoteVersion::new(remote_edited_at));
+    }
+    store
+        .save_remote_observation(observation)
+        .map_err(PullError::Store)?;
+
+    if let Some(mut freshness) = store
+        .get_freshness_state(&mount.mount_id, &entity.remote_id)
+        .map_err(PullError::Store)?
+    {
+        freshness.remote_hint_pending = false;
+        freshness.last_checked_at = Some(observed_at);
+        store
+            .save_freshness_state(freshness)
+            .map_err(PullError::Store)?;
+    }
 
     Ok(())
 }

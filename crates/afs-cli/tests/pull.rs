@@ -7,11 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::pull::{run_pull, run_pull_with_state_root};
+use afs_cli::status::{StatusOptions, StatusSyncState, run_status};
 use afs_core::canonical::render_canonical_markdown;
 use afs_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
     has_unresolved_conflict_markers,
 };
+use afs_core::freshness::{FreshnessTier, RemoteVersion};
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
@@ -23,8 +25,9 @@ use afs_notion::{NotionConfig, NotionConnector};
 #[cfg(target_os = "macos")]
 use afs_store::MountConfig;
 use afs_store::{
-    EntityRecord, EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode,
-    ShadowRepository,
+    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
+    InMemoryStateStore, MountRepository, ProjectionMode, RemoteObservationRecord,
+    RemoteObservationRepository, ShadowRepository,
 };
 use afsd::virtual_fs::{source_root_directory_name, virtual_fs_content_root};
 
@@ -77,6 +80,62 @@ fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
         store
             .load_shadow(&fixture.mount_id, &fixture.canonical_root_page_id)
             .is_ok()
+    );
+}
+
+#[test]
+fn pull_fast_forward_refreshes_stale_remote_observation_for_status() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+    run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
+    store
+        .save_remote_observation(
+            RemoteObservationRecord::new(
+                fixture.mount_id.clone(),
+                fixture.canonical_root_page_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "roadmap/page.md",
+                "unix_ms:1",
+            )
+            .with_remote_version(RemoteVersion::new("2026-06-09T00:00:00.000Z")),
+        )
+        .expect("save stale observation");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                fixture.mount_id.clone(),
+                fixture.canonical_root_page_id.clone(),
+                FreshnessTier::Hot,
+            )
+            .checked_at("unix_ms:1"),
+        )
+        .expect("save freshness state");
+
+    run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Remote body.", "2026-06-11T00:00:00.000Z"),
+        fixture.root_file("roadmap"),
+    )
+    .expect("fast-forward pull");
+
+    let status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root_file("roadmap")),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status after fast-forward pull");
+    let entry = &status.mounts[0].entries[0];
+    assert_eq!(entry.sync_state, StatusSyncState::AllSynced);
+    assert_eq!(status.summary.remote_update_available, 0);
+    assert_eq!(status.summary.review_needed, 0);
+    assert!(!entry.remote.changed);
+    assert_eq!(
+        entry.remote.remote_tree_version.as_deref(),
+        Some("2026-06-11T00:00:00.000Z")
     );
 }
 
