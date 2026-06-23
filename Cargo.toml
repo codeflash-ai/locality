@@ -8,7 +8,7 @@ members = [
   "crates/afs-platform",
   "crates/afs-store",
   "crates/afs-notion",
-  "crates/afs-fuse",
+  "platform/linux/afs-fuse",
   "platform/windows/afs-cloud-files",
 ]
 resolver = "2"

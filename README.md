@@ -78,7 +78,7 @@ Common targets:
 
 - `crates/afs-cli`: `afs` command surface for humans and agents.
 - `crates/afsd`: per-user daemon supervising mounts, virtual filesystem projection requests, watchers, hydration, pull, and push orchestration.
-- `crates/afs-fuse`: Linux FUSE projection helper for `linux_fuse` mounts.
+- `platform/linux/afs-fuse`: Linux FUSE projection helper for `linux_fuse` mounts.
 - `crates/afs-core`: connector-agnostic sync engine, three-tree model, diff, planning, conflicts, hydration state, validation, and journal abstractions.
 - `crates/afs-connector`: connector SDK trait for enumerate, fetch, render, parse, and apply.
 - `crates/afs-notion`: first-party Notion connector with live page/block reads, database row projection, schema rendering, narrow block writes, and supported page-property writes.

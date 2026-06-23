@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 afs-core.workspace = true
-afsd = { path = "../afsd" }
+afsd = { path = "../../../crates/afsd" }
 base64 = "0.22"
 bytes = "1"
 fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }

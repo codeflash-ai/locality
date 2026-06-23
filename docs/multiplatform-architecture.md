@@ -262,7 +262,8 @@ Non-responsibilities:
 
 ### Linux: FUSE
 
-Keep `afs-fuse`, but make the crate Linux-only in workspace/package selection.
+Keep `afs-fuse` under `platform/linux/afs-fuse`, with Linux-only dependency
+selection.
 
 Responsibilities:
 

@@ -715,7 +715,7 @@
                 <p>macOS File Provider and Linux FUSE expose online-only trees while delegating state and network work to <code>afsd</code>.</p>
                 <div class="links">
                   <a class="code-link" href="../platform/macos/AgentFSFileProvider/Sources/AgentFSFileProvider/AgentFSFileProviderExtension.swift">Extension.swift:6</a>
-                  <a class="code-link" href="../crates/afs-fuse/src/main.rs">afs-fuse:376</a>
+                  <a class="code-link" href="../platform/linux/afs-fuse/src/main.rs">afs-fuse:376</a>
                 </div>
               </article>
             </div>
@@ -1064,7 +1064,7 @@
               <div class="step">
                 <strong>Bytes served</strong>
                 <p>FUSE serves cached bytes; File Provider copies materialized Markdown to its transfer path.</p>
-                <a class="code-link" href="../crates/afs-fuse/src/main.rs">main.rs:646</a>
+                <a class="code-link" href="../platform/linux/afs-fuse/src/main.rs">main.rs:646</a>
               </div>
               <div class="step">
                 <strong>Write committed</strong>
@@ -1194,7 +1194,7 @@
               <td>How are online-only files served?</td>
               <td>
                 <a class="code-link" href="../crates/afsd/src/virtual_fs.rs">virtual_fs.rs:98</a>
-                <a class="code-link" href="../crates/afs-fuse/src/main.rs">afs-fuse:571</a>
+                <a class="code-link" href="../platform/linux/afs-fuse/src/main.rs">afs-fuse:571</a>
                 <a class="code-link" href="../platform/macos/AgentFSFileProvider/Sources/AgentFSFileProvider/AgentFSDaemonClient.swift">DaemonClient.swift:139</a>
               </td>
               <td>Adapters map OS callbacks into <code>VirtualFsItem</code>, <code>children</code>, <code>materialize</code>, and write/mutation IPC calls.</td>
