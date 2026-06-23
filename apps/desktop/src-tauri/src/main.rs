@@ -37,9 +37,9 @@ use afs_cli::push::{
 use afs_cli::search::{
     SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
 };
+use afs_cli::status::StatusState;
 #[cfg(test)]
 use afs_cli::status::StatusSyncState;
-use afs_cli::status::{StatusOptions, StatusState, run_status};
 use afs_core::canonical::parse_canonical_markdown;
 use afs_core::conflict::has_unresolved_conflict_markers;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
@@ -54,10 +54,10 @@ use afs_platform::{
 };
 use afs_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-    ConnectionRecord, ConnectionRepository, EntityRepository, HydrationJobRecord,
+    ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
-    VirtualMutationRepository, open_credential_store,
+    VirtualMutationRecord, VirtualMutationRepository, open_credential_store,
 };
 use afsd::autosave::auto_save_timestamp;
 use afsd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
@@ -382,11 +382,11 @@ struct ScreenBounds {
 
 #[tauri::command]
 async fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
-    let snapshot = tauri::async_runtime::spawn_blocking(load_desktop_snapshot)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_else(sample_snapshot);
+    let snapshot = match tauri::async_runtime::spawn_blocking(load_desktop_snapshot).await {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(message)) => degraded_snapshot(message),
+        Err(error) => degraded_snapshot(format!("Could not load AFS desktop state: {error}")),
+    };
     refresh_tray_icon_for_snapshot(&app, &snapshot);
     snapshot
 }
@@ -644,7 +644,7 @@ async fn review_push_plan() -> PushPlan {
         .ok()
         .and_then(Result::ok)
         .map(|snapshot| snapshot.pending_changes)
-        .unwrap_or_else(sample_pending_changes);
+        .unwrap_or_default();
     let pages_updated = files.len();
     PushPlan {
         title: "Review Push".to_string(),
@@ -714,7 +714,10 @@ async fn pull_notion_file(app: AppHandle, path: String) -> ActionReport {
                 ok: true,
                 message: pull_report_message(&report),
             },
-            Err(message) => ActionReport { ok: false, message },
+            Err(message) => ActionReport {
+                ok: false,
+                message: pull_error_message(&message),
+            },
         }
     })
     .await
@@ -1002,6 +1005,47 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
             state: "planned".to_string(),
         }],
     })
+}
+
+fn degraded_snapshot(message: String) -> DesktopSnapshot {
+    DesktopSnapshot {
+        health: AppHealth {
+            state: "runtime_stopped".to_string(),
+            attention_count: 0,
+        },
+        connection: ConnectionSummary {
+            connector: "notion".to_string(),
+            workspace_name: "AFS state unavailable".to_string(),
+            account_label: "Open Settings to repair".to_string(),
+            status: "error".to_string(),
+        },
+        mount: MountSummary {
+            connector: "notion".to_string(),
+            workspace_name: "AFS state unavailable".to_string(),
+            local_path: absolute_display_path(&default_notion_access_root()),
+            notion_url: None,
+            access_scope: "State load failed".to_string(),
+            projection: projection_label(&desktop_projection_mode()).to_string(),
+            read_only: false,
+            status: "error".to_string(),
+            provider: None,
+        },
+        settings: desktop_settings(),
+        pending_changes: Vec::new(),
+        activity: vec![ActivityItem {
+            title: "Could not load AFS state".to_string(),
+            detail: message,
+            when: "Now".to_string(),
+            occurred_at: Some(activity_timestamp()),
+            kind: "error".to_string(),
+            undo_available: false,
+        }],
+        suggestions: vec![ConnectorSuggestion {
+            connector: "Linear".to_string(),
+            description: "Mount issues and projects as local files.".to_string(),
+            state: "planned".to_string(),
+        }],
+    }
 }
 
 fn choose_mount(mounts: &[MountConfig]) -> Option<MountConfig> {
@@ -1476,6 +1520,9 @@ fn status_issue_message<'a>(
 }
 
 fn failed_push_summary(message: &str) -> String {
+    if is_notion_access_lost_message(message) {
+        return notion_access_lost_recovery_message();
+    }
     if is_remote_changed_push_message(message) || message.contains("changed since last sync") {
         return "Notion changed since last sync. Resolve pulls the latest version and may create conflict markers.".to_string();
     }
@@ -4634,6 +4681,12 @@ fn refresh_notion_mount_after_connect(
         .map_err(|error| format!("Could not load connected Notion metadata: {error}"))?;
     let connection_changed =
         connection_metadata_changed(previous_connection, next_connection.as_ref());
+    let has_unfinished_journals = mount_has_unfinished_journals(store, &mount.mount_id)?;
+    let preserved = if mount_has_pending_local_changes(store, state_root, &mount.mount_id)? {
+        preserve_mount_pending_local_changes(store, state_root, &mount.mount_id)?
+    } else {
+        None
+    };
 
     mount.connection_id = Some(connection_id);
     store
@@ -4641,10 +4694,10 @@ fn refresh_notion_mount_after_connect(
         .map_err(|error| format!("Could not update Notion mount connection: {error}"))?;
 
     ensure_daemon_running(state_root)?;
-    if mount_has_pending_local_changes(store, state_root, &mount.mount_id)? {
+    if has_unfinished_journals {
         reload_daemon_mounts(state_root)?;
         return Ok(
-            "AFS updated the connection metadata, but kept the current mount cache because there are pending local changes to review."
+            "AFS updated the connection metadata, but kept the current mount cache because a push is still in progress. Try Change Notion Access again after it finishes."
                 .to_string(),
         );
     }
@@ -4654,6 +4707,15 @@ fn refresh_notion_mount_after_connect(
 
     if mount.projection.uses_virtual_filesystem() {
         activate_virtual_projection_mount(state_root, &mount, true)?;
+    }
+
+    if let Some(preserved) = preserved {
+        return Ok(format!(
+            "AFS preserved {} local Notion change{} at `{}` and refreshed the mounted folder for the latest Notion access.",
+            preserved.count,
+            if preserved.count == 1 { "" } else { "s" },
+            preserved.directory.display()
+        ));
     }
 
     if connection_changed {
@@ -4683,7 +4745,7 @@ fn connection_metadata_key(
 
 fn mount_has_pending_local_changes(
     store: &SqliteStateStore,
-    state_root: &Path,
+    _state_root: &Path,
     mount_id: &MountId,
 ) -> Result<bool, String> {
     if !store
@@ -4694,26 +4756,244 @@ fn mount_has_pending_local_changes(
         return Ok(true);
     }
 
-    let status = run_status(
-        store,
-        StatusOptions {
-            path: None,
-            state_root: Some(state_root.to_path_buf()),
-        },
-    )
-    .map_err(|error| error.message())?;
-
-    Ok(status
-        .mounts
+    if store
+        .list_entities(mount_id)
+        .map_err(|error| format!("Could not inspect cached Notion items: {error}"))?
         .iter()
-        .find(|mount| mount.mount_id == mount_id.0)
-        .is_some_and(|mount| {
-            mount.entries.iter().any(|entry| {
-                matches!(entry.state, StatusState::Dirty | StatusState::Conflicted)
-                    || entry.pending_journal_count > 0
-                    || entry.failed_journal_count > 0
-            })
+        .any(|entity| {
+            matches!(
+                entity.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        })
+    {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn mount_has_unfinished_journals(
+    store: &SqliteStateStore,
+    mount_id: &MountId,
+) -> Result<bool, String> {
+    Ok(store
+        .list_journal()
+        .map_err(|error| format!("Could not inspect push journals: {error}"))?
+        .iter()
+        .any(|journal| {
+            journal.mount_id == *mount_id
+                && matches!(
+                    journal.status,
+                    JournalStatus::Prepared | JournalStatus::Applying | JournalStatus::Applied
+                )
         }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PreservedLocalChanges {
+    directory: PathBuf,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct PreservedLocalChangeManifest {
+    mount_id: String,
+    preserved_at: String,
+    items: Vec<PreservedLocalChangeItem>,
+}
+
+#[derive(Serialize)]
+struct PreservedLocalChangeItem {
+    kind: String,
+    title: String,
+    path: String,
+    remote_id: Option<String>,
+    hydration: Option<String>,
+    source_path: Option<String>,
+    preserved_path: Option<String>,
+}
+
+fn preserve_mount_pending_local_changes(
+    store: &SqliteStateStore,
+    state_root: &Path,
+    mount_id: &MountId,
+) -> Result<Option<PreservedLocalChanges>, String> {
+    let pending_entities = store
+        .list_entities(mount_id)
+        .map_err(|error| format!("Could not inspect cached Notion items: {error}"))?
+        .into_iter()
+        .filter(|entity| {
+            matches!(
+                entity.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        })
+        .collect::<Vec<_>>();
+    let pending_mutations = store
+        .list_virtual_mutations(mount_id)
+        .map_err(|error| format!("Could not inspect pending virtual changes: {error}"))?;
+
+    if pending_entities.is_empty() && pending_mutations.is_empty() {
+        return Ok(None);
+    }
+
+    let preserved_at = activity_timestamp();
+    let directory = state_root
+        .join("recovered")
+        .join(&mount_id.0)
+        .join(preserved_at.replace(':', "-"));
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "Could not create local change recovery folder at `{}`: {error}",
+            directory.display()
+        )
+    })?;
+
+    let mut items = Vec::new();
+    for entity in pending_entities {
+        items.push(preserve_entity_local_change(
+            state_root, mount_id, &directory, entity,
+        )?);
+    }
+    for mutation in pending_mutations {
+        items.push(preserve_virtual_mutation_local_change(
+            state_root, mount_id, &directory, mutation,
+        )?);
+    }
+
+    let manifest = PreservedLocalChangeManifest {
+        mount_id: mount_id.0.clone(),
+        preserved_at,
+        items,
+    };
+    let manifest_path = directory.join("manifest.json");
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| format!("Could not serialize local change manifest: {error}"))?;
+    fs::write(&manifest_path, manifest_json).map_err(|error| {
+        format!(
+            "Could not write local change manifest at `{}`: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let readme_path = directory.join("README.md");
+    fs::write(
+        &readme_path,
+        "AFS preserved these local Notion edits before refreshing the active mount for a changed Notion access scope.\n\nThe active mount was cleared so old pages outside the current Notion access do not keep appearing as pending changes. Review these files manually if you need to copy edits into the newly mounted workspace.\n",
+    )
+    .map_err(|error| {
+        format!(
+            "Could not write local change recovery README at `{}`: {error}",
+            readme_path.display()
+        )
+    })?;
+
+    Ok(Some(PreservedLocalChanges {
+        directory,
+        count: manifest.items.len(),
+    }))
+}
+
+fn preserve_entity_local_change(
+    state_root: &Path,
+    mount_id: &MountId,
+    recovery_dir: &Path,
+    entity: EntityRecord,
+) -> Result<PreservedLocalChangeItem, String> {
+    let source_path = virtual_fs_content_path(state_root, mount_id, &entity.path).ok();
+    let preserved_path = copy_preserved_file(source_path.as_deref(), recovery_dir, &entity.path)?;
+    Ok(PreservedLocalChangeItem {
+        kind: "entity".to_string(),
+        title: entity.title,
+        path: afs_platform::logical_path_display(&entity.path),
+        remote_id: Some(entity.remote_id.0),
+        hydration: Some(hydration_name(&entity.hydration).to_string()),
+        source_path: source_path.map(|path| path.display().to_string()),
+        preserved_path: preserved_path.map(|path| path.display().to_string()),
+    })
+}
+
+fn preserve_virtual_mutation_local_change(
+    state_root: &Path,
+    mount_id: &MountId,
+    recovery_dir: &Path,
+    mutation: VirtualMutationRecord,
+) -> Result<PreservedLocalChangeItem, String> {
+    let fallback_path =
+        virtual_fs_content_path(state_root, mount_id, &mutation.projected_path).ok();
+    let source_path = mutation
+        .content_path
+        .clone()
+        .filter(|path| path.exists())
+        .or(fallback_path);
+    let preserved_path = copy_preserved_file(
+        source_path.as_deref(),
+        recovery_dir,
+        &mutation.projected_path,
+    )?;
+    Ok(PreservedLocalChangeItem {
+        kind: format!("virtual_{:?}", mutation.mutation_kind).to_lowercase(),
+        title: mutation.title,
+        path: afs_platform::logical_path_display(&mutation.projected_path),
+        remote_id: mutation.target_remote_id.map(|remote_id| remote_id.0),
+        hydration: None,
+        source_path: source_path.map(|path| path.display().to_string()),
+        preserved_path: preserved_path.map(|path| path.display().to_string()),
+    })
+}
+
+fn copy_preserved_file(
+    source_path: Option<&Path>,
+    recovery_dir: &Path,
+    relative_path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let Some(source_path) = source_path.filter(|path| path.is_file()) else {
+        return Ok(None);
+    };
+    let destination = safe_recovery_path(recovery_dir, relative_path)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Could not create local change recovery folder at `{}`: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::copy(source_path, &destination).map_err(|error| {
+        format!(
+            "Could not preserve local change from `{}` to `{}`: {error}",
+            source_path.display(),
+            destination.display()
+        )
+    })?;
+    Ok(Some(destination))
+}
+
+fn safe_recovery_path(recovery_dir: &Path, relative_path: &Path) -> Result<PathBuf, String> {
+    let mut destination = recovery_dir.to_path_buf();
+    for component in relative_path.components() {
+        match component {
+            std::path::Component::Normal(part) => destination.push(part),
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "Could not preserve local change with unsafe path `{}`",
+                    relative_path.display()
+                ));
+            }
+        }
+    }
+    Ok(destination)
+}
+
+fn hydration_name(state: &HydrationState) -> &'static str {
+    match state {
+        HydrationState::Stub => "stub",
+        HydrationState::Virtual => "virtual",
+        HydrationState::Hydrated => "hydrated",
+        HydrationState::Dirty => "dirty",
+        HydrationState::Conflicted => "conflicted",
+    }
 }
 
 fn clear_mount_cached_projection(
@@ -4721,46 +5001,9 @@ fn clear_mount_cached_projection(
     state_root: &Path,
     mount_id: &MountId,
 ) -> Result<(), String> {
-    let entities = store
-        .list_entities(mount_id)
-        .map_err(|error| format!("Could not list cached Notion items: {error}"))?;
-    for entity in entities {
-        store
-            .delete_hydration_job(mount_id, &entity.remote_id)
-            .map_err(|error| format!("Could not clear hydration job: {error}"))?;
-        store
-            .delete_entity(mount_id, &entity.remote_id)
-            .map_err(|error| format!("Could not clear cached Notion item: {error}"))?;
-    }
-
-    for mutation in store
-        .list_virtual_mutations(mount_id)
-        .map_err(|error| format!("Could not list virtual mutations: {error}"))?
-    {
-        store
-            .delete_virtual_mutation(mount_id, &mutation.local_id)
-            .map_err(|error| format!("Could not clear virtual mutation: {error}"))?;
-    }
-
-    for enrollment in store
-        .list_auto_save_enrollments(mount_id)
-        .map_err(|error| format!("Could not list auto-save enrollments: {error}"))?
-    {
-        store
-            .delete_auto_save_enrollment(mount_id, &enrollment.path)
-            .map_err(|error| format!("Could not clear auto-save enrollment: {error}"))?;
-    }
-
-    for job in store
-        .list_hydration_jobs()
-        .map_err(|error| format!("Could not list hydration jobs: {error}"))?
-        .into_iter()
-        .filter(|job| job.mount_id == *mount_id)
-    {
-        store
-            .delete_hydration_job(mount_id, &job.remote_id)
-            .map_err(|error| format!("Could not clear hydration job: {error}"))?;
-    }
+    store
+        .clear_mount_source_state(mount_id)
+        .map_err(|error| format!("Could not clear cached Notion mount state: {error}"))?;
 
     let content_root = virtual_fs_content_root(state_root, mount_id);
     if content_root.exists() {
@@ -5129,6 +5372,9 @@ fn push_report_message(report: &PushReport) -> String {
 
 fn push_action_message(action: &str, ok: bool, message: Option<&str>) -> String {
     match message {
+        Some(message) if is_notion_access_lost_message(message) => {
+            notion_access_lost_recovery_message()
+        }
         Some(message) if is_remote_changed_push_message(message) => {
             "Notion has newer changes than your last sync. Click Resolve on this file to pull the latest version, resolve any conflict markers if AFS writes them, then push again.".to_string()
         }
@@ -5145,6 +5391,13 @@ fn push_action_message(action: &str, ok: bool, message: Option<&str>) -> String 
         }
         _ => format!("Push stopped: {action}"),
     }
+}
+
+fn pull_error_message(message: &str) -> String {
+    if is_notion_access_lost_message(message) {
+        return notion_access_lost_recovery_message();
+    }
+    message.to_string()
 }
 
 fn pull_report_message(report: &PullReport) -> String {
@@ -5214,6 +5467,19 @@ fn is_remote_changed_push_message(message: &str) -> bool {
     message.contains("changed since last sync") && message.contains("remote entity")
 }
 
+fn is_notion_access_lost_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("notion api returned http 404")
+        && (lower.contains("object_not_found")
+            || lower.contains("could not find page")
+            || lower.contains("could not find block")
+            || lower.contains("could not find database"))
+}
+
+fn notion_access_lost_recovery_message() -> String {
+    "This local page belongs to a Notion page that is outside the current selected access. Use Change Notion Access to include that page or teamspace, or keep the local copy as a recovered draft before refreshing the mount.".to_string()
+}
+
 fn join_mount_path(mount_path: &str, relative_path: &str) -> String {
     if relative_path.starts_with('/') || relative_path.starts_with("~/") {
         return relative_path.to_string();
@@ -5239,28 +5505,32 @@ mod tests {
 
     use afs_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
     use afs_core::canonical::render_canonical_markdown;
+    use afs_core::journal::{JournalEntry, JournalStatus, PushId};
     use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+    use afs_core::planner::PushPlan;
     use afs_core::shadow::ShadowDocument;
     use afs_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
-        ConnectionRecord, EntityRecord, EntityRepository, InMemoryStateStore, MountConfig,
-        MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+        ConnectionRecord, EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository,
+        MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
     };
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
         DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TerminalCliLinkState,
-        TrayVisualState, clear_state_root_contents, conflict_preview, connection_metadata_changed,
-        current_daemon_build_id, current_desktop_build_id, diff_report_message,
-        failed_push_summary, hydration_after_editor_write, inspect_install_state,
-        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
-        is_unsupported_schema_version_message, load_desktop_activity, notion_id_from_url,
-        pending_changes_from_status, pull_report_message, push_action_message,
-        record_current_install_marker, record_desktop_activity, shell_single_quote,
-        should_hide_tray_popover, should_prioritize_located_result,
-        state_event_path_requires_refresh, terminal_cli_link_state, tray_icon_image,
-        tray_popover_position, validate_mount_root, virtual_projection_refresh_signal_identifiers,
-        write_terminal_cli_path_section,
+        TrayVisualState, clear_mount_cached_projection, clear_state_root_contents,
+        conflict_preview, connection_metadata_changed, current_daemon_build_id,
+        current_desktop_build_id, diff_report_message, failed_push_summary,
+        hydration_after_editor_write, inspect_install_state, install_terminal_cli_link_at,
+        install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
+        is_unsupported_schema_version_message, load_desktop_activity,
+        mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
+        pending_changes_from_status, preserve_mount_pending_local_changes, pull_error_message,
+        pull_report_message, push_action_message, record_current_install_marker,
+        record_desktop_activity, shell_single_quote, should_hide_tray_popover,
+        should_prioritize_located_result, state_event_path_requires_refresh,
+        terminal_cli_link_state, tray_icon_image, tray_popover_position, validate_mount_root,
+        virtual_projection_refresh_signal_identifiers, write_terminal_cli_path_section,
     };
 
     #[test]
@@ -5626,6 +5896,149 @@ mod tests {
 
         assert!(message.contains("Notion changed since last sync"));
         assert!(message.contains("Resolve pulls"));
+    }
+
+    #[test]
+    fn notion_access_lost_messages_explain_selected_access_recovery() {
+        let raw = "io error: notion api returned HTTP 404 Not Found: {\"object\":\"error\",\"status\":404,\"code\":\"object_not_found\",\"message\":\"Could not find page with ID: page-1. Make sure the relevant pages and databases are shared with your integration \\\"AgentFS\\\".\"}";
+
+        assert!(is_notion_access_lost_message(raw));
+        assert!(pull_error_message(raw).contains("outside the current selected access"));
+        assert!(failed_push_summary(raw).contains("Change Notion Access"));
+        assert!(
+            push_action_message("apply_failed", false, Some(raw)).contains("Change Notion Access")
+        );
+    }
+
+    #[test]
+    fn failed_journal_audit_alone_does_not_block_access_refresh() {
+        let temp = TestTempDir::new("failed-journal-access-refresh");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+
+        store
+            .save_mount(MountConfig::new(mount_id.clone(), "notion", temp.path()))
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Page",
+                    "page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save entity");
+        store
+            .append_journal(JournalEntry::new(
+                PushId("push-1".to_string()),
+                mount_id.clone(),
+                vec![remote_id.clone()],
+                PushPlan::new(vec![remote_id], Vec::new()),
+                JournalStatus::Failed("old failure".to_string()),
+            ))
+            .expect("append journal");
+
+        assert!(
+            !mount_has_pending_local_changes(&store, temp.path(), &mount_id)
+                .expect("inspect pending")
+        );
+        assert!(
+            !mount_has_unfinished_journals(&store, &mount_id).expect("inspect unfinished journals")
+        );
+    }
+
+    #[test]
+    fn unfinished_journal_blocks_access_cache_clear_until_push_finishes() {
+        let temp = TestTempDir::new("unfinished-journal-access-refresh");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+
+        store
+            .save_mount(MountConfig::new(mount_id.clone(), "notion", temp.path()))
+            .expect("save mount");
+        store
+            .append_journal(JournalEntry::new(
+                PushId("push-1".to_string()),
+                mount_id.clone(),
+                vec![remote_id.clone()],
+                PushPlan::new(vec![remote_id], Vec::new()),
+                JournalStatus::Applying,
+            ))
+            .expect("append journal");
+
+        assert!(
+            mount_has_unfinished_journals(&store, &mount_id).expect("inspect unfinished journals")
+        );
+    }
+
+    #[test]
+    fn dirty_files_are_preserved_before_access_cache_clear() {
+        let temp = TestTempDir::new("preserve-dirty-access-refresh");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let relative_path = Path::new("Team/Page/page.md");
+        let frontmatter = "afs:\n  id: page-1\n  type: page\ntitle: Page\n";
+        let body = "Original body.\n";
+        let entity = EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "Page",
+            relative_path,
+        )
+        .with_hydration(HydrationState::Dirty);
+
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", temp.path())
+                    .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save mount");
+        store.save_entity(entity).expect("save entity");
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    remote_id,
+                    body,
+                    6,
+                    vec![RemoteId::new("block-1")],
+                )
+                .expect("shadow")
+                .with_frontmatter(frontmatter),
+            )
+            .expect("save shadow");
+
+        let content_path =
+            afsd::virtual_fs::virtual_fs_content_path(temp.path(), &mount_id, relative_path)
+                .expect("content path");
+        fs::create_dir_all(content_path.parent().expect("content parent"))
+            .expect("create content parent");
+        fs::write(&content_path, "local edit\n").expect("write local edit");
+
+        let preserved = preserve_mount_pending_local_changes(&store, temp.path(), &mount_id)
+            .expect("preserve")
+            .expect("preserved changes");
+        assert_eq!(preserved.count, 1);
+        assert!(preserved.directory.join(relative_path).exists());
+
+        clear_mount_cached_projection(&mut store, temp.path(), &mount_id).expect("clear cache");
+
+        assert!(
+            store
+                .list_entities(&mount_id)
+                .expect("list entities")
+                .is_empty()
+        );
+        assert!(store.list_journal().expect("list journals").is_empty());
+        assert!(!afsd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id).exists());
+        assert!(preserved.directory.join(relative_path).exists());
     }
 
     #[test]
@@ -6363,108 +6776,6 @@ mod tests {
             remote: SearchRemoteState::default(),
             score: 0,
         }
-    }
-}
-
-fn sample_snapshot() -> DesktopSnapshot {
-    DesktopSnapshot {
-        health: AppHealth {
-            state: "ready".to_string(),
-            attention_count: 3,
-        },
-        connection: ConnectionSummary {
-            connector: "notion".to_string(),
-            workspace_name: "CodeFlash".to_string(),
-            account_label: "saurabh@codeflash.ai".to_string(),
-            status: "ready".to_string(),
-        },
-        mount: MountSummary {
-            connector: "notion".to_string(),
-            workspace_name: "CodeFlash".to_string(),
-            local_path: absolute_display_path(&default_notion_mount_root()),
-            notion_url: Some("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972".to_string()),
-            access_scope: "Initial Idea".to_string(),
-            projection: "macOS File Provider".to_string(),
-            read_only: false,
-            status: "ready".to_string(),
-            provider: None,
-        },
-        settings: DesktopSettings {
-            launch_at_login: true,
-            show_menu_bar: true,
-        },
-        pending_changes: sample_pending_changes(),
-        activity: vec![
-            ActivityItem {
-                title: "Pushed Roadmap 2026 to Notion".to_string(),
-                detail: "2 block edits".to_string(),
-                when: "Today".to_string(),
-                occurred_at: Some("unix_ms:1782033300000".to_string()),
-                kind: "push".to_string(),
-                undo_available: true,
-            },
-            ActivityItem {
-                title: "Located Launch Plan".to_string(),
-                detail: "Prepared local path for an agent".to_string(),
-                when: "Today".to_string(),
-                occurred_at: Some("unix_ms:1782028800000".to_string()),
-                kind: "locate".to_string(),
-                undo_available: false,
-            },
-            ActivityItem {
-                title: "Connected Notion workspace CodeFlash".to_string(),
-                detail: "Credentials stored in the OS credential store".to_string(),
-                when: "Earlier".to_string(),
-                occurred_at: Some("unix_ms:1781942400000".to_string()),
-                kind: "connect".to_string(),
-                undo_available: false,
-            },
-        ],
-        suggestions: vec![ConnectorSuggestion {
-            connector: "Linear".to_string(),
-            description: "Mount issues and projects as local files.".to_string(),
-            state: "planned".to_string(),
-        }],
-    }
-}
-
-fn sample_pending_changes() -> Vec<PendingChange> {
-    vec![
-        PendingChange {
-            title: "Roadmap 2026".to_string(),
-            local_path: "Engineering/Roadmap 2026/page.md".to_string(),
-            summary: "2 text edits".to_string(),
-            state: "safe".to_string(),
-            auto_save: sample_auto_save_status(false),
-        },
-        PendingChange {
-            title: "Launch Plan".to_string(),
-            local_path: "Marketing/Launch Plan/page.md".to_string(),
-            summary: "needs review: large deletion".to_string(),
-            state: "needs_review".to_string(),
-            auto_save: sample_auto_save_status(false),
-        },
-        PendingChange {
-            title: "Customer Notes".to_string(),
-            local_path: "Sales/Customer Notes/page.md".to_string(),
-            summary: "1 property edit".to_string(),
-            state: "safe".to_string(),
-            auto_save: sample_auto_save_status(true),
-        },
-    ]
-}
-
-fn sample_auto_save_status(enabled: bool) -> AutoSaveFileStatus {
-    AutoSaveFileStatus {
-        enabled,
-        state: if enabled { "active" } else { "off" }.to_string(),
-        label: if enabled {
-            "Auto-save on"
-        } else {
-            "Auto-save off"
-        }
-        .to_string(),
-        reason: None,
     }
 }
 

@@ -2822,14 +2822,15 @@ function FileChangeList({
                   <i />
                 </button>
               </div>
-              <SecondaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "diff")}>
+              <SecondaryButton compact disabled={isWorking} icon={<Search />} onClick={() => void runFileAction(change, "diff")}>
                 Diff
               </SecondaryButton>
-              <SecondaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "resolve")}>
+              <SecondaryButton compact disabled={isWorking} icon={<RefreshCw />} onClick={() => void runFileAction(change, "resolve")}>
                 Resolve
               </SecondaryButton>
               <PrimaryButton
                 compact
+                icon={shouldReviewBeforePush ? <ListChecks /> : <ShieldCheck />}
                 disabled={isWorking}
                 onClick={() => {
                   if (shouldReviewBeforePush) {
@@ -2844,6 +2845,7 @@ function FileChangeList({
               <SecondaryButton
                 compact
                 disabled={isWorking}
+                icon={<FolderOpen />}
                 onClick={() =>
                   void callCommand("open_path", { path: joinMountPath(mountPath, change.localPath) }, { ok: true })
                 }

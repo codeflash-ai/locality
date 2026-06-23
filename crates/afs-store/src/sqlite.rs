@@ -165,6 +165,11 @@ impl SqliteStateStore {
         Ok(store)
     }
 
+    pub fn clear_mount_source_state(&mut self, mount_id: &MountId) -> StoreResult<()> {
+        let connection = self.connection()?;
+        clear_mount_source_state(&connection, mount_id)
+    }
+
     fn connection(&self) -> StoreResult<Connection> {
         let connection = Connection::open(&self.db_path)?;
         connection.execute_batch(

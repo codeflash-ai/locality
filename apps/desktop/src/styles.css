@@ -1292,7 +1292,7 @@ p {
 
 .file-row {
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) 224px;
+  grid-template-columns: 32px minmax(0, 1fr) 312px;
   align-items: center;
   gap: 16px;
   padding: 16px;
@@ -1363,9 +1363,10 @@ p {
 
 .file-row-actions {
   display: grid;
-  grid-template-columns: repeat(2, minmax(76px, 1fr));
-  gap: 8px;
-  min-width: 224px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  align-items: center;
+  gap: 7px;
+  min-width: 312px;
 }
 
 .auto-save-control {
@@ -1389,6 +1390,26 @@ p {
 .file-row-actions .primary-button,
 .file-row-actions .secondary-button {
   margin-top: 0;
+  width: 100%;
+  min-height: 31px;
+  padding: 0 9px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 750;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.file-row-actions .primary-button svg,
+.file-row-actions .secondary-button svg {
+  width: 13px;
+  height: 13px;
+}
+
+.file-row-actions .primary-button span,
+.file-row-actions .secondary-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .file-action-message {
