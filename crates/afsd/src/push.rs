@@ -19,7 +19,7 @@ use afs_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-use afs_core::path_projection::{is_page_document_path, page_document_path};
+use afs_core::path_projection::{is_page_document_path, page_container_path, page_document_path};
 use afs_core::planner::GuardrailDecision;
 use afs_core::planner::{GuardrailPolicy, PushOperation, PushPlan};
 use afs_core::push::{
@@ -1917,17 +1917,21 @@ where
                     ..
                 } => {
                     let Some(PushOperation::CreateEntity {
-                        title, source_path, ..
+                        title,
+                        source_path,
+                        parent_kind,
+                        ..
                     }) = request.plan.operations.get(*operation_index)
                     else {
                         continue;
                     };
+                    let entity_path = created_entity_reconcile_path(source_path, parent_kind);
                     let mut entity = EntityRecord::new(
                         request.mount_id.clone(),
                         entity_id.clone(),
                         EntityKind::Page,
                         title.clone(),
-                        source_path.clone(),
+                        entity_path,
                     )
                     .with_hydration(HydrationState::Stub);
                     self.store
@@ -1952,6 +1956,12 @@ where
                         &path,
                         &output_root,
                         rendered,
+                    )?;
+                    remove_stale_created_entity_source_path(
+                        self.state_root.as_deref(),
+                        &mount,
+                        source_path,
+                        &entity.path,
                     )?;
                     if let Some(mutation) = self
                         .store
@@ -2022,6 +2032,37 @@ where
         Ok(PushReconcileResult {
             reconciled_remote_ids,
         })
+    }
+}
+
+fn created_entity_reconcile_path(source_path: &Path, parent_kind: &Option<EntityKind>) -> PathBuf {
+    if matches!(parent_kind, Some(EntityKind::Database)) && !is_page_document_path(source_path) {
+        return page_document_path(&page_container_path(source_path));
+    }
+
+    source_path.to_path_buf()
+}
+
+fn remove_stale_created_entity_source_path(
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    source_path: &Path,
+    entity_path: &Path,
+) -> AfsResult<()> {
+    if source_path == entity_path {
+        return Ok(());
+    }
+
+    let stale_path = projection_write_path(state_root, mount, source_path);
+    let canonical_path = projection_write_path(state_root, mount, entity_path);
+    if stale_path == canonical_path {
+        return Ok(());
+    }
+
+    match std::fs::remove_file(&stale_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 

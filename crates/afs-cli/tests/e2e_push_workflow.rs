@@ -3638,8 +3638,27 @@ fn live_cyclic_database_rows_mount_edit_create_and_verify_notion() {
         .expect("created row id")
         .clone();
     cleanup.block_ids.push(created_row_id.clone());
+    let reconciled_row_path = database_dir.join("new-cyclic-row").join("page.md");
+    assert!(
+        reconciled_row_path.exists(),
+        "direct database row create should reconcile to a page document at {}",
+        reconciled_row_path.display()
+    );
+    assert!(
+        !new_row_path.exists(),
+        "temporary direct row file should be replaced by the canonical page document"
+    );
+    let created_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(reconciled_row_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("created row status");
+    assert!(created_status.clean, "{created_status:#?}");
 
-    let created = render_live_markdown(&connector, &created_row_id, &new_row_path);
+    let created = render_live_markdown(&connector, &created_row_id, &reconciled_row_path);
     for expected in [
         "title: \"AFS cyclic created row\"",
         "\"Notes\": \"Created **row** notes and [docs](https://example.com/created-notes)\"",

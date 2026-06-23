@@ -30,7 +30,7 @@ use afsd::push::{
 };
 use afsd::scheduler::PullScheduler;
 use afsd::supervisor::DaemonSupervisor;
-use afsd::virtual_fs::virtual_fs_content_path;
+use afsd::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 use afsd::watcher::FileWatcher;
 
 #[test]
@@ -570,6 +570,74 @@ fn auto_save_push_applies_pending_virtual_create_and_tracks_created_remote() {
             .expect("find mutation")
             .is_none()
     );
+}
+
+#[test]
+fn daemon_push_reconciles_direct_database_row_create_to_page_document_path() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let projection_root = fixture.root.join("afs");
+    let source_path = Path::new("Tasks/new-task.md");
+    let target_path = projection_root.join(source_path);
+    fs::create_dir_all(target_path.parent().expect("target parent")).expect("target parent");
+    fs::write(
+        &target_path,
+        "---\ntitle: New task\nStatus: Todo\n---\n# New task\n\nBody.\n",
+    )
+    .expect("write direct row file");
+
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    fs::create_dir_all(content_root.join("Tasks")).expect("schema parent");
+    fs::write(content_root.join("Tasks/_schema.yaml"), tasks_schema()).expect("write schema");
+
+    let database_id = RemoteId::new("database-1");
+    let created_remote_id = RemoteId::new("row-1");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &projection_root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            database_id.clone(),
+            EntityKind::Database,
+            "Tasks",
+            "Tasks",
+        ))
+        .expect("save database");
+    let source = FakePushSource::default()
+        .with_created_entity(created_remote_id.clone(), rendered_entity("row-1", "Body."))
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-row".to_string()),
+            operation_index: 0,
+            parent_id: database_id,
+            entity_id: created_remote_id.clone(),
+        }]);
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path,
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("push direct database row");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let row = store
+        .get_entity(&fixture.mount_id, &created_remote_id)
+        .expect("get row")
+        .expect("row entity");
+    assert_eq!(row.path, PathBuf::from("Tasks/new-task/page.md"));
+    assert_eq!(source.requested_paths(), vec![row.path.clone()]);
+    assert!(content_root.join("Tasks/new-task/page.md").exists());
+    assert!(!content_root.join(source_path).exists());
 }
 
 #[test]
