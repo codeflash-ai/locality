@@ -532,10 +532,11 @@ where
     }
 
     fn remove_cached_path(&self, path: &Path) {
+        let path = normalize_path(path);
         self.cache
             .lock()
             .expect("fuse item cache")
-            .remove(&normalize_path(path));
+            .retain(|cached_path, _| cached_path != &path && !cached_path.starts_with(&path));
     }
 
     fn open_handle(&self, fh: u64) -> Result<OpenHandle, FuseError> {
@@ -1374,6 +1375,7 @@ mod tests {
     fn trash_path_accepts_folder_items_for_page_directory_delete() {
         let root = test_root_item();
         let page_dir = test_named_item("children:page-draft", "Draft", VirtualFsItemKind::Folder);
+        let page_file = test_named_item("page-draft", "page.md", VirtualFsItemKind::File);
         let fs = AgentFuse {
             client: FakeClient {
                 state_root: std::env::temp_dir(),
@@ -1385,6 +1387,7 @@ mod tests {
             cache: Mutex::new(BTreeMap::from([
                 (PathBuf::from(ROOT_PATH), root),
                 (PathBuf::from("/Draft"), page_dir),
+                (PathBuf::from("/Draft/page.md"), page_file),
             ])),
             handles: Mutex::new(BTreeMap::new()),
             next_handle: AtomicU64::new(1),
@@ -1402,6 +1405,12 @@ mod tests {
                 .lock()
                 .expect("fuse item cache")
                 .contains_key(Path::new("/Draft"))
+        );
+        assert!(
+            !fs.cache
+                .lock()
+                .expect("fuse item cache")
+                .contains_key(Path::new("/Draft/page.md"))
         );
     }
 
