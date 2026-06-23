@@ -800,7 +800,7 @@ fn rich_text_part_to_markdown(part: &RichTextDto) -> String {
 }
 
 fn text_rich_text_to_markdown(part: &RichTextDto) -> String {
-    escape_markdown_text(&rich_text_part_plain_text(part))
+    escape_markdown_text_with_options(&rich_text_part_plain_text(part), !part.annotations.code)
 }
 
 fn equation_to_markdown(part: &RichTextDto) -> String {
@@ -1004,6 +1004,10 @@ fn wrap_preserving_whitespace(value: &str, wrap: impl FnOnce(&str) -> String) ->
 }
 
 fn escape_markdown_text(text: &str) -> String {
+    escape_markdown_text_with_options(text, true)
+}
+
+fn escape_markdown_text_with_options(text: &str, escape_equation_markers: bool) -> String {
     let mut escaped = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -1018,6 +1022,7 @@ fn escape_markdown_text(text: &str) -> String {
         let ch = rest.chars().next().expect("non-empty rest");
         match ch {
             '\\' => escaped.push_str("\\\\"),
+            '$' if escape_equation_markers => escaped.push_str("\\$"),
             '\n' => escaped.push_str("<br>"),
             _ => escaped.push(ch),
         }
