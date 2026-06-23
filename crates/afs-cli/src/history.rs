@@ -8,15 +8,20 @@
 use std::path::{Path, PathBuf};
 
 use afs_core::AfsError;
+use afs_core::canonical::render_canonical_markdown;
 use afs_core::journal::{JournalApplyEffect, JournalEntry, JournalStatus, PushId};
-use afs_core::model::{MountId, RemoteId};
+use afs_core::model::{CanonicalDocument, HydrationState, MountId, RemoteId};
 use afs_core::path_projection::page_document_path;
 use afs_core::undo::{
     UndoApplier, UndoApplyRequest, UndoOperation, UndoPlan, UndoPlanStatus,
     UnsupportedUndoOperation, plan_journal_undo,
 };
-use afs_store::{EntityRepository, JournalRepository, MountConfig, MountRepository, StoreError};
+use afs_store::{
+    EntityRecord, EntityRepository, JournalRepository, MountConfig, MountRepository,
+    ShadowRepository, StoreError,
+};
 use afsd::file_provider;
+use afsd::virtual_fs::virtual_fs_content_path;
 use serde::Serialize;
 
 use crate::diff::PlanSummaryOutput;
@@ -166,7 +171,20 @@ pub fn run_undo_with_applier<S, A>(
     applier: &mut A,
 ) -> Result<UndoReport, HistoryError>
 where
-    S: JournalRepository,
+    S: JournalRepository + MountRepository + EntityRepository + ShadowRepository,
+    A: UndoApplier,
+{
+    run_undo_with_applier_at_state_root(store, push_id, applier, None)
+}
+
+pub fn run_undo_with_applier_at_state_root<S, A>(
+    store: &mut S,
+    push_id: impl Into<String>,
+    applier: &mut A,
+    state_root: Option<&Path>,
+) -> Result<UndoReport, HistoryError>
+where
+    S: JournalRepository + MountRepository + EntityRepository + ShadowRepository,
     A: UndoApplier,
 {
     let push_id = PushId(push_id.into());
@@ -223,6 +241,8 @@ where
         }
     };
 
+    reconcile_undo_preimages(store, &entry, &apply_result.changed_remote_ids, state_root)?;
+
     store
         .update_journal_status(&push_id, JournalStatus::Reverted)
         .map_err(HistoryError::Store)?;
@@ -244,6 +264,116 @@ where
         undo_plan: Some(UndoPlanOutput::from(undo_plan)),
         entry: Some(JournalEntryOutput::from(reverted)),
     })
+}
+
+fn reconcile_undo_preimages<S>(
+    store: &mut S,
+    entry: &JournalEntry,
+    changed_remote_ids: &[RemoteId],
+    state_root: Option<&Path>,
+) -> Result<(), HistoryError>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+{
+    if changed_remote_ids.is_empty() || entry.preimages.is_empty() {
+        return Ok(());
+    }
+    let mounts = store.load_mounts().map_err(HistoryError::Store)?;
+    let mount = mounts
+        .iter()
+        .find(|mount| mount.mount_id == entry.mount_id)
+        .ok_or_else(|| HistoryError::MountNotFound(PathBuf::from(entry.mount_id.0.clone())))?
+        .clone();
+
+    for preimage in entry
+        .preimages
+        .iter()
+        .filter(|preimage| changed_remote_ids.contains(&preimage.entity_id))
+    {
+        let Some(mut entity) = store
+            .get_entity(&entry.mount_id, &preimage.entity_id)
+            .map_err(HistoryError::Store)?
+        else {
+            continue;
+        };
+        let write_path = undo_projection_write_path(state_root, &mount, &entity.path)?;
+        let frontmatter = if preimage.shadow.frontmatter.trim().is_empty() {
+            frontmatter_from_entity(&entity)
+        } else {
+            preimage.shadow.frontmatter.clone()
+        };
+        let document = CanonicalDocument::new(frontmatter, preimage.shadow.rendered_body.clone());
+        write_atomic(&write_path, render_canonical_markdown(&document).as_bytes())?;
+
+        entity.hydration = HydrationState::Hydrated;
+        entity.content_hash = Some(preimage.shadow.body_hash.clone());
+        store
+            .save_shadow(&entry.mount_id, preimage.shadow.clone())
+            .map_err(HistoryError::Store)?;
+        store.save_entity(entity).map_err(HistoryError::Store)?;
+    }
+
+    Ok(())
+}
+
+fn undo_projection_write_path(
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Result<PathBuf, HistoryError> {
+    if mount.projection.uses_virtual_filesystem() {
+        let Some(state_root) = state_root else {
+            return Err(HistoryError::Store(StoreError::Io(
+                "virtual filesystem undo reconciliation requires a state root".to_string(),
+            )));
+        };
+        return virtual_fs_content_path(state_root, &mount.mount_id, relative_path)
+            .map_err(|error| HistoryError::Store(StoreError::Io(error.to_string())));
+    }
+
+    Ok(mount.root.join(relative_path))
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), HistoryError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| HistoryError::Store(StoreError::Io(error.to_string())))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("undo");
+    let temp_path = path.with_file_name(format!(".{file_name}.afs-undo-tmp"));
+    std::fs::write(&temp_path, contents)
+        .map_err(|error| HistoryError::Store(StoreError::Io(error.to_string())))?;
+    #[cfg(windows)]
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(HistoryError::Store(StoreError::Io(error.to_string()))),
+    }
+    std::fs::rename(&temp_path, path)
+        .map_err(|error| HistoryError::Store(StoreError::Io(error.to_string())))
+}
+
+fn frontmatter_from_entity(entity: &EntityRecord) -> String {
+    let mut frontmatter = format!("afs:\n  id: {}\n  type: page\n", entity.remote_id.0);
+    if let Some(remote_edited_at) = &entity.remote_edited_at {
+        frontmatter.push_str(&format!("  remote_edited_at: {remote_edited_at}\n"));
+    }
+    frontmatter.push_str(&format!("title: {}\n", yaml_string(&entity.title)));
+    frontmatter
+}
+
+fn yaml_string(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.'))
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 pub fn undo_report_exit_code(report: &UndoReport) -> i32 {

@@ -43,7 +43,7 @@ use crate::diff::{DiffError, run_diff_with_state_root};
 use crate::doctor::{DoctorOptions, doctor_exit_code, print_doctor_report, run_doctor};
 use crate::file_provider as file_provider_helper;
 use crate::history::{
-    HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier,
+    HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier_at_state_root,
     undo_report_exit_code,
 };
 use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
@@ -2351,7 +2351,12 @@ fn undo(args: &[String], json: bool) -> i32 {
         };
     let mut undo_applier = ConnectorUndoApplier::new(&connector);
 
-    match run_undo_with_applier(&mut store, push_id, &mut undo_applier) {
+    match run_undo_with_applier_at_state_root(
+        &mut store,
+        push_id,
+        &mut undo_applier,
+        Some(&state_root),
+    ) {
         Ok(report) if json => {
             let exit_code = undo_report_exit_code(&report);
             print_json(&report);

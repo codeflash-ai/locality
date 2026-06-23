@@ -16,7 +16,7 @@ use afs_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult};
 use afs_core::{AfsError, AfsResult};
 use afs_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, SqliteStateStore,
+    MountRepository, ShadowRepository, SqliteStateStore,
 };
 
 #[test]
@@ -308,6 +308,43 @@ fn undo_with_applier_reverses_complete_plan_and_marks_journal_reverted() {
 }
 
 #[test]
+fn undo_with_applier_restores_local_projection_from_preimage() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    let pushed_body = "# Roadmap\n\nUpdated paragraph.";
+    fs::write(
+        fixture.root.join("Roadmap.md"),
+        canonical_markdown("page-1", pushed_body),
+    )
+    .expect("write pushed projection");
+    store
+        .save_shadow(&fixture.mount_id, shadow_with_body("page-1", pushed_body))
+        .expect("save pushed shadow");
+    store
+        .save_entity(
+            entity_record(&fixture, "page-1", "Roadmap.md")
+                .with_content_hash(shadow_with_body("page-1", pushed_body).body_hash),
+        )
+        .expect("save pushed entity");
+    store
+        .append_journal(journal_entry("push-1", "page-1", JournalStatus::Reconciled))
+        .expect("append journal");
+    let mut applier = FakeUndoApplier::default();
+
+    let report = run_undo_with_applier(&mut store, "push-1", &mut applier).expect("undo report");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "reverse_applied");
+    let restored = fs::read_to_string(fixture.root.join("Roadmap.md")).expect("restored file");
+    assert!(restored.contains("# Roadmap\n\nOriginal paragraph."));
+    assert!(!restored.contains("Updated paragraph."));
+    let shadow = store
+        .load_shadow(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("restored shadow");
+    assert_eq!(shadow.rendered_body, "# Roadmap\n\nOriginal paragraph.");
+}
+
+#[test]
 fn undo_with_applier_reports_reverse_apply_failure_without_status_change() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();
@@ -492,9 +529,13 @@ fn journal_entry_with_operations(
 }
 
 fn shadow(remote_id: &str) -> ShadowDocument {
+    shadow_with_body(remote_id, "# Roadmap\n\nOriginal paragraph.")
+}
+
+fn shadow_with_body(remote_id: &str, body: &str) -> ShadowDocument {
     ShadowDocument::from_synced_body(
         RemoteId::new(remote_id),
-        "# Roadmap\n\nOriginal paragraph.",
+        body,
         9,
         [
             RemoteId::new(format!("{remote_id}-heading-1")),
@@ -502,4 +543,10 @@ fn shadow(remote_id: &str) -> ShadowDocument {
         ],
     )
     .expect("shadow")
+}
+
+fn canonical_markdown(remote_id: &str, body: &str) -> String {
+    format!(
+        "---\nafs:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\n{body}"
+    )
 }
