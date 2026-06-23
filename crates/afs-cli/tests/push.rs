@@ -430,7 +430,7 @@ fn push_daemon_suggests_parent_pull_when_new_page_parent_changed_since_last_sync
         "Roadmap/Draft/page.md",
         "---\ntitle: Draft\n---\n# Draft\n\nCreated locally.\n",
     );
-    let parent_path = fixture.write_raw(
+    fixture.write_raw(
         "Roadmap/page.md",
         &canonical_markdown("page-parent", "# Roadmap\n\nParent body.\n"),
     );
@@ -453,6 +453,7 @@ fn push_daemon_suggests_parent_pull_when_new_page_parent_changed_since_last_sync
 
     assert!(!report.ok);
     assert_eq!(report.action, "apply_failed");
+    let parent_path = fixture.root.join("Roadmap").join("page.md");
     let expected = format!(
         "run `afs pull {}` to update the parent from remote, then rerun `afs push {} -y`",
         parent_path.display(),

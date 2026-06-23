@@ -86,7 +86,7 @@ fn inspect_page_directory_targets_page_document() {
             shadow("page-1", "# Roadmap\n\nBase body."),
         )
         .expect("save shadow");
-    let page_path = fixture.write_page("Roadmap/page.md", "# Roadmap\n\nBase body.");
+    fixture.write_page("Roadmap/page.md", "# Roadmap\n\nBase body.");
     let source = FakeInspectSource::new(rendered_entity("page-1", "# Roadmap\n\nBase body."));
 
     let report = run_inspect(
@@ -101,7 +101,15 @@ fn inspect_page_directory_targets_page_document() {
 
     assert!(report.ok);
     assert_eq!(report.entity_id, "page-1");
-    assert_eq!(report.local_read_path, page_path.display().to_string());
+    assert_eq!(
+        report.local_read_path,
+        fixture
+            .root
+            .join("Roadmap")
+            .join("page.md")
+            .display()
+            .to_string()
+    );
     assert_eq!(report.explanation.state, RemoteChangeState::AllSynced);
 }
 

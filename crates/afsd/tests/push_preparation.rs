@@ -127,7 +127,10 @@ fn prepare_push_plans_content_cache_absolute_media_byte_update() {
     let absolute_media = content_root.join(&media_path);
     fixture.write_virtual_page(
         "Roadmap/page.md",
-        &canonical_markdown("page-1", &format!("![Image]({})", absolute_media.display())),
+        &canonical_markdown(
+            "page-1",
+            &format!("![Image]({})", markdown_href(&absolute_media)),
+        ),
     );
 
     let prepared = prepare_push(
@@ -184,9 +187,7 @@ fn prepare_push_plans_media_update_with_escaped_parenthesized_href() {
     fixture.write_virtual_media_manifest(&media_path, "image-1", b"original image bytes");
     fixture.write_virtual_media(&media_path, b"updated image bytes");
     let absolute_media = content_root.join(&media_path);
-    let escaped_absolute_media = absolute_media
-        .display()
-        .to_string()
+    let escaped_absolute_media = markdown_href(&absolute_media)
         .replace('(', "\\(")
         .replace(')', "\\)");
     fixture.write_virtual_page(
@@ -250,7 +251,10 @@ fn prepare_push_plans_content_cache_absolute_file_media_byte_update() {
     let absolute_media = content_root.join(&media_path);
     fixture.write_virtual_page(
         "Roadmap/page.md",
-        &canonical_markdown("page-1", &format!("[Demo]({})", absolute_media.display())),
+        &canonical_markdown(
+            "page-1",
+            &format!("[Demo]({})", markdown_href(&absolute_media)),
+        ),
     );
 
     let prepared = prepare_push(
@@ -1169,6 +1173,10 @@ fn canonical_markdown(remote_id: &str, body: &str) -> String {
     format!(
         "---\nafs:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\n{body}"
     )
+}
+
+fn markdown_href(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn row_frontmatter(status: &str) -> String {

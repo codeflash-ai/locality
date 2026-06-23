@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -2582,7 +2583,7 @@ fn apply_uploads_local_image_media_before_block_append() {
         vec![PushOperation::AppendBlock {
             parent_id: RemoteId::new("page-1"),
             after: Some(RemoteId::new("paragraph-1")),
-            content: format!("![night sky]({})", media_path.display()),
+            content: format!("![night sky]({})", markdown_href(&media_path)),
         }],
     );
     let push_id = PushId("push-1".to_string());
@@ -2656,7 +2657,7 @@ fn apply_uploads_local_video_media_before_block_append() {
         vec![PushOperation::AppendBlock {
             parent_id: RemoteId::new("page-1"),
             after: Some(RemoteId::new("paragraph-1")),
-            content: format!("[cars]({})", media_path.display()),
+            content: format!("[cars]({})", markdown_href(&media_path)),
         }],
     );
     let push_id = PushId("push-1".to_string());
@@ -2737,22 +2738,22 @@ fn apply_uploads_common_local_file_media_before_block_append() {
             PushOperation::AppendBlock {
                 parent_id: RemoteId::new("page-1"),
                 after: Some(RemoteId::new("paragraph-1")),
-                content: format!("[Brief]({})", pdf_path.display()),
+                content: format!("[Brief]({})", markdown_href(&pdf_path)),
             },
             PushOperation::AppendBlock {
                 parent_id: RemoteId::new("page-1"),
                 after: Some(RemoteId::new("paragraph-1")),
-                content: format!("[Theme]({})", audio_path.display()),
+                content: format!("[Theme]({})", markdown_href(&audio_path)),
             },
             PushOperation::AppendBlock {
                 parent_id: RemoteId::new("page-1"),
                 after: Some(RemoteId::new("paragraph-1")),
-                content: format!("[Index]({})", html_path.display()),
+                content: format!("[Index]({})", markdown_href(&html_path)),
             },
             PushOperation::AppendBlock {
                 parent_id: RemoteId::new("page-1"),
                 after: Some(RemoteId::new("paragraph-1")),
-                content: format!("[Slides]({})", slides_path.display()),
+                content: format!("[Slides]({})", markdown_href(&slides_path)),
             },
         ],
     );
@@ -2927,7 +2928,7 @@ fn apply_rejects_local_media_uploads_over_single_file_cap() {
         vec![PushOperation::AppendBlock {
             parent_id: RemoteId::new("page-1"),
             after: Some(RemoteId::new("paragraph-1")),
-            content: format!("[Large PDF]({})", media_path.display()),
+            content: format!("[Large PDF]({})", markdown_href(&media_path)),
         }],
     );
     let push_id = PushId("push-1".to_string());
@@ -3767,6 +3768,10 @@ fn operation_ids(push_id: &PushId, plan: &PushPlan) -> Vec<PushOperationId> {
         .enumerate()
         .map(|(index, operation)| PushOperationId::for_operation(push_id, index, operation))
         .collect()
+}
+
+fn markdown_href(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[derive(Debug)]

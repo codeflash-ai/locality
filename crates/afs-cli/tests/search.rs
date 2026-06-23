@@ -282,7 +282,10 @@ fn search_reports_linux_fuse_absolute_path_under_source_root() {
 
     let expected = fixture
         .root
-        .join("notion/Product/Initial Idea/page.md")
+        .join("notion")
+        .join("Product")
+        .join("Initial Idea")
+        .join("page.md")
         .display()
         .to_string();
     assert_eq!(report.results[0].absolute_path, expected);
