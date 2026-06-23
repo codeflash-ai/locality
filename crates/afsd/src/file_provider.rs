@@ -856,15 +856,43 @@ fn absolute_reconcile_path(path: &Path) -> AfsResult<PathBuf> {
 
 fn relative_to_access_root(path: &Path, access_root: &Path) -> Option<PathBuf> {
     if let Ok(relative_path) = path.strip_prefix(access_root) {
-        return Some(relative_path.to_path_buf());
+        let relative_path = safe_mount_relative_path(relative_path)?;
+        if canonicalized_path_escapes_access_root(path, access_root) {
+            return None;
+        }
+        return Some(relative_path);
     }
 
     let canonical_path = canonicalize_existing_prefix(path)?;
     let canonical_root = canonicalize_existing_prefix(access_root)?;
     canonical_path
         .strip_prefix(canonical_root)
-        .map(Path::to_path_buf)
         .ok()
+        .and_then(safe_mount_relative_path)
+}
+
+fn safe_mount_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => safe.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(safe)
+}
+
+fn canonicalized_path_escapes_access_root(path: &Path, access_root: &Path) -> bool {
+    let Some(canonical_path) = canonicalize_existing_prefix(path) else {
+        return false;
+    };
+    let Some(canonical_root) = canonicalize_existing_prefix(access_root) else {
+        return false;
+    };
+    !canonical_path.starts_with(canonical_root)
 }
 
 fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
@@ -907,7 +935,7 @@ fn macos_file_provider_access_roots(mount: &MountConfig) -> Vec<PathBuf> {
     let source_directory = source_root_directory_name(&mount.connector);
     domain_roots
         .into_iter()
-        .flat_map(|domain_root| [domain_root.join(&source_directory), domain_root])
+        .map(|domain_root| domain_root.join(&source_directory))
         .collect()
 }
 
@@ -1045,6 +1073,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn match_mount_path_rejects_parent_traversal() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS/notion");
+
+        assert!(match_mount_path(&mount, Path::new("/tmp/AFS/notion/../linear/page.md")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn match_mount_path_rejects_symlink_escape() {
+        let root = temp_root("afs-file-provider-symlink-root");
+        let outside = temp_root("afs-file-provider-symlink-outside");
+        let mount_root = root.join("notion");
+        fs::create_dir_all(&mount_root).expect("mount root");
+        fs::create_dir_all(&outside).expect("outside root");
+        std::os::unix::fs::symlink(&outside, mount_root.join("escape")).expect("symlink");
+
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", &mount_root);
+
+        assert!(match_mount_path(&mount, &mount_root.join("escape/page.md")).is_none());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_file_provider_access_roots_strip_cloudstorage_domain_prefix() {
@@ -1061,7 +1114,6 @@ mod tests {
         assert!(roots.contains(&PathBuf::from(
             "/Users/test/Library/CloudStorage/AFS/notion"
         )));
-        assert!(roots.contains(&home.join("Library").join("CloudStorage").join("AFS")));
         assert!(
             roots.contains(
                 &home
@@ -1086,6 +1138,7 @@ mod tests {
                     .join("Library")
                     .join("CloudStorage")
                     .join("AgentFS-AFS")
+                    .join("notion")
             )
         );
         let matched = match_mount_path(
@@ -1099,6 +1152,18 @@ mod tests {
         )
         .expect("AFS-AFS connector path matches");
         assert_eq!(matched.relative_path, PathBuf::from("Page.md"));
+        assert!(
+            match_mount_path(
+                &mount,
+                &home
+                    .join("Library")
+                    .join("CloudStorage")
+                    .join("AFS-AFS")
+                    .join("Page.md"),
+            )
+            .is_none(),
+            "the File Provider domain root must not masquerade as the connector root"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1464,7 +1529,6 @@ mod tests {
         )
     }
 
-    #[cfg(target_os = "macos")]
     fn temp_root(prefix: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = SystemTime::now()

@@ -565,7 +565,10 @@ where
 }
 
 fn projected_absolute_path(mount: &MountConfig, relative_path: &Path) -> PathBuf {
-    if mount.projection == ProjectionMode::LinuxFuse {
+    if matches!(
+        mount.projection,
+        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
+    ) {
         return afs_platform::join_logical_path(
             &mount
                 .root

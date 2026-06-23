@@ -84,3 +84,32 @@ afs-connector trait
       v
 afs-notion direct API now, relay later
 ```
+
+## Projection path model and safety
+
+AFS exposes one product-level shape across platforms:
+
+```text
+AFS/
+  notion/
+  linear/
+  github/
+```
+
+The physical root is platform-specific (`~/Library/CloudStorage/AFS` on macOS,
+`~/AFS` or a Cloud Files root on Windows, and `~/AFS` on Linux), but command
+handling treats `AFS/<connector>` as the mount boundary. macOS File Provider
+may expose legacy compatibility aliases such as `AFS-AFS/notion` for older
+per-mount domain registrations; those aliases are accepted only at the connector
+folder, not at the File Provider domain root.
+
+Every file operation resolves through this boundary:
+
+```text
+input path -> canonical connector root -> mount_id -> connection_id -> remote_id
+```
+
+Path normalization rejects traversal components and symlink escapes before a
+path can resolve to a mount. A local path alone is never enough to write remote
+content; push still validates the mounted entity, current connection, remote
+freshness, conflict markers, and connector guardrails before apply.

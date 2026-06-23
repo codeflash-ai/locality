@@ -227,6 +227,14 @@ Windows binaries accept `plain-files` and `windows-cloud-files`.
 
 `afs mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. On Linux, `--projection linux-fuse` records the equivalent virtual projection and registers the per-mount FUSE service. On Windows, `--projection windows-cloud-files` records a Cloud Files sync root. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension, FUSE helper, or Cloud Files provider lists dataless files from the daemon and materializes a file on open.
 
+The canonical user-facing virtual projection shape is `AFS/<connector>/...`,
+for example `~/Library/CloudStorage/AFS/notion` on macOS. Older macOS File
+Provider registrations may also appear under compatibility aliases such as
+`AFS-AFS/notion`; AFS accepts those connector folders for existing installs, but
+does not treat the File Provider domain root itself as a mount. Command paths
+are normalized before matching and path traversal or symlink escapes outside the
+connector folder are rejected.
+
 Linux should expose the same online-only behavior through a FUSE projection
 helper rather than through inotify-triggered placeholder files. The daemon API for
 that path is platform-neutral `virtual_fs`; macOS File Provider commands are
