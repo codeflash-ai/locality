@@ -643,13 +643,17 @@ fn live_link_to_page_line_move_preserves_notion_block_type() {
             line.starts_with("[Linked page](") && line.contains(&compact_notion_id(&target.id))
         })
         .expect("rendered link_to_page line");
-    let original_order = format!("{anchor_text}\n\n{link_line}\n");
+    let anchor_line = original
+        .lines()
+        .find(|line| line.replace("\\_", "_") == anchor_text)
+        .expect("rendered anchor paragraph");
+    let original_order = format!("{anchor_line}\n\n{link_line}\n");
     assert!(original.contains(&original_order), "{original}");
     fs::write(
         &page_path,
         original.replace(
             &original_order,
-            &format!("{link_line}\n\n{anchor_text}\n\n"),
+            &format!("{link_line}\n\n{anchor_line}\n\n"),
         ),
     )
     .expect("write live link_to_page move");
@@ -710,7 +714,7 @@ fn live_link_to_page_line_move_preserves_notion_block_type() {
         .expect("reconciled link_to_page line");
     let anchor_index = verified
         .lines()
-        .position(|line| line == anchor_text)
+        .position(|line| line.replace("\\_", "_") == anchor_text)
         .expect("reconciled anchor paragraph");
     assert!(link_index < anchor_index, "{verified}");
 }
