@@ -83,3 +83,7 @@ title: "New task"
 ```
 
 On push, AgentFS creates the Notion row under the parent data source, reads back the assigned remote ID, and rewrites the file into the normal projected filename with generated `afs` metadata.
+New page and row creation supports the same common block shapes as appends, plus
+simple Markdown tables. Header text creates a Notion column-header row; an empty
+Markdown header row creates a headerless Notion table. Table cell rich text uses
+the same inline Markdown parser as paragraphs.

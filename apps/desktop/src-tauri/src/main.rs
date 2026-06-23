@@ -2145,9 +2145,10 @@ fn inspect_install_state(state_root: &Path) -> InstallStateReview {
     let state_exists = state_root.exists();
     let current_build_id = current_desktop_build_id();
     let previous_build_id = marker.as_ref().map(install_marker_display_build_id);
+    let should_prompt = marker.is_none() && !sqlite_exists;
 
     InstallStateReview {
-        should_prompt: false,
+        should_prompt,
         state_exists,
         sqlite_exists,
         previous_build_id,
@@ -5903,6 +5904,18 @@ mod tests {
         assert!(!review.should_prompt);
         assert!(review.state_exists);
         assert!(review.sqlite_exists);
+        assert_eq!(review.previous_build_id, None);
+    }
+
+    #[test]
+    fn install_state_prompts_for_fresh_install_without_state() {
+        let temp = TestTempDir::new("install-state-fresh");
+
+        let review = inspect_install_state(temp.path());
+
+        assert!(review.should_prompt);
+        assert!(review.state_exists);
+        assert!(!review.sqlite_exists);
         assert_eq!(review.previous_build_id, None);
     }
 

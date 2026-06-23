@@ -50,6 +50,10 @@ setup flow.
 ## First-Run Onboarding
 
 The first-run flow should be a compact wizard with a single primary path.
+On a fresh local install with no AFS SQLite state yet, the packaged desktop app
+should open this flow automatically after runtime startup instead of dropping the
+user on the dashboard. Existing local state should continue to open normally
+without forcing setup again.
 
 ### 1. Welcome
 

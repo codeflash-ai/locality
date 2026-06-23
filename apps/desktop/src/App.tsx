@@ -130,6 +130,14 @@ type ActionReport = {
   message: string;
 };
 
+type InstallStateReview = {
+  shouldPrompt: boolean;
+  stateExists: boolean;
+  sqliteExists: boolean;
+  previousBuildId?: string | null;
+  currentBuildId: string;
+};
+
 type UpdateStatus = {
   state: "idle" | "checking" | "available" | "installing" | "current" | "error";
   message: string;
@@ -405,6 +413,13 @@ export default function App() {
   const refreshSnapshotPromise = useRef<Promise<void> | null>(null);
   const refreshSnapshotQueued = useRef(false);
 
+  async function loadDesktopSnapshot() {
+    const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
+    setSnapshot(nextSnapshot);
+    setSnapshotLoaded(true);
+    return nextSnapshot;
+  }
+
   async function refreshSnapshot() {
     if (refreshSnapshotPromise.current) {
       refreshSnapshotQueued.current = true;
@@ -414,9 +429,7 @@ export default function App() {
     const run = async () => {
       do {
         refreshSnapshotQueued.current = false;
-        const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
-        setSnapshot(nextSnapshot);
-        setSnapshotLoaded(true);
+        await loadDesktopSnapshot();
       } while (refreshSnapshotQueued.current);
     };
 
@@ -521,19 +534,42 @@ export default function App() {
   }
 
   useEffect(() => {
+    let cancelled = false;
+
     void (async () => {
+      let installReview: InstallStateReview | null = null;
       if (isTauriRuntime()) {
+        installReview = await callCommand<InstallStateReview>(
+          "install_state_review",
+          undefined,
+          {
+            shouldPrompt: false,
+            stateExists: true,
+            sqliteExists: true,
+            previousBuildId: null,
+            currentBuildId: "unknown",
+          },
+        ).catch(() => null);
         await callCommand<ActionReport>("acknowledge_install_state").catch(() => undefined);
         if (!appStoreDistribution) {
           await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
         }
         await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
       }
-      await refreshSnapshot();
+      await loadDesktopSnapshot();
+      if (!cancelled && installReview?.shouldPrompt && window.location.hash !== "#tray") {
+        setOnboardingInitialStep(1);
+        setOnboardingKey((key) => key + 1);
+        setShowOnboarding(true);
+      }
     })().catch(() => {
       setSnapshot(sampleSnapshot);
       setSnapshotLoaded(true);
     });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -558,8 +594,12 @@ export default function App() {
       return;
     }
 
+    if (showOnboarding) {
+      return;
+    }
+
     setShowOnboarding(false);
-  }, [route, snapshotLoaded]);
+  }, [route, showOnboarding, snapshotLoaded]);
 
   useEffect(() => {
     const handleOpenView = (event: Event) => {
@@ -2493,6 +2533,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
 type FileActionStatus = {
   state: "working" | "success" | "error";
   message: string;
+  action?: "diff" | "push" | "resolve" | "autosave";
 };
 
 type FileDetailStatus = {
@@ -2671,7 +2712,7 @@ function FileChangeList({
       action === "diff" ? "Checking diff..." : action === "push" ? "Pushing this file..." : "Pulling latest...";
     setActions((current) => ({
       ...current,
-      [change.localPath]: { state: "working", message: workingMessage },
+      [change.localPath]: { state: "working", message: workingMessage, action },
     }));
 
     try {
@@ -2689,6 +2730,7 @@ function FileChangeList({
         [change.localPath]: {
           state: report.ok ? "success" : "error",
           message: report.message,
+          action,
         },
       }));
       if (report.ok && action === "resolve" && selectedPath === change.localPath) {
@@ -2700,7 +2742,7 @@ function FileChangeList({
     } catch (error) {
       setActions((current) => ({
         ...current,
-        [change.localPath]: { state: "error", message: errorMessage(error) },
+        [change.localPath]: { state: "error", message: errorMessage(error), action },
       }));
     }
   }
@@ -2720,7 +2762,11 @@ function FileChangeList({
     }));
     setActions((current) => ({
       ...current,
-      [change.localPath]: { state: "working", message: enabled ? "Turning on auto-save..." : "Turning off auto-save..." },
+      [change.localPath]: {
+        state: "working",
+        message: enabled ? "Turning on auto-save..." : "Turning off auto-save...",
+        action: "autosave",
+      },
     }));
 
     try {
@@ -2732,6 +2778,7 @@ function FileChangeList({
         [change.localPath]: {
           state: report.ok ? "success" : "error",
           message: report.message,
+          action: "autosave",
         },
       }));
       if (!report.ok) {
@@ -2748,7 +2795,7 @@ function FileChangeList({
       }));
       setActions((current) => ({
         ...current,
-        [change.localPath]: { state: "error", message: errorMessage(error) },
+        [change.localPath]: { state: "error", message: errorMessage(error), action: "autosave" },
       }));
     }
   }
@@ -2760,6 +2807,7 @@ function FileChangeList({
         const detail = details[change.localPath];
         const editor = editors[change.localPath];
         const isWorking = action?.state === "working";
+        const isPushingFile = isWorking && action?.action === "push";
         const isSaving = editor?.state === "saving";
         const hasUnsavedEditorChanges = editor !== undefined && editor.contents !== editor.savedContents;
         const shouldReviewBeforePush = Boolean(!confirmDangerous && change.state === "needs_review" && onReview);
@@ -2831,6 +2879,7 @@ function FileChangeList({
               <PrimaryButton
                 compact
                 disabled={isWorking}
+                icon={isPushingFile ? <Loader2 className="spin-icon" /> : undefined}
                 onClick={() => {
                   if (shouldReviewBeforePush) {
                     onReview?.();
@@ -2839,7 +2888,7 @@ function FileChangeList({
                   void runFileAction(change, "push");
                 }}
               >
-                {shouldReviewBeforePush ? "Review" : "Push"}
+                {isPushingFile ? "Pushing..." : shouldReviewBeforePush ? "Review" : "Push"}
               </PrimaryButton>
               <SecondaryButton
                 compact
@@ -2904,6 +2953,7 @@ function FileChangeList({
                       <PrimaryButton
                         compact
                         disabled={isSaving || hasUnsavedEditorChanges || isWorking}
+                        icon={isPushingFile ? <Loader2 className="spin-icon" /> : undefined}
                         onClick={() => {
                           if (shouldReviewBeforePush) {
                             onReview?.();
@@ -2912,7 +2962,7 @@ function FileChangeList({
                           void runFileAction(change, "push");
                         }}
                       >
-                        {shouldReviewBeforePush ? "Review Saved" : "Push Saved"}
+                        {isPushingFile ? "Pushing..." : shouldReviewBeforePush ? "Review Saved" : "Push Saved"}
                       </PrimaryButton>
                     </div>
                   </>
@@ -3255,7 +3305,7 @@ function WindowsWindowControls() {
         type="button"
         aria-label="Close"
         title="Close"
-        onClick={() => void getCurrentWindow().close()}
+        onClick={() => void getCurrentWindow().hide()}
       >
         <X />
       </button>
