@@ -448,14 +448,23 @@ where
         if path == Path::new(ROOT_PATH) {
             return self.root_item();
         }
-        if let Some(item) = self
-            .cache
-            .lock()
-            .expect("fuse item cache")
-            .get(&path)
-            .cloned()
-        {
-            return Ok(item);
+        let cached = {
+            self.cache
+                .lock()
+                .expect("fuse item cache")
+                .get(&path)
+                .cloned()
+        };
+        if let Some(item) = cached {
+            if is_local_cached_identifier(&item.identifier) {
+                if let Ok(report) = self.client.item(&item.identifier) {
+                    self.cache_item_at(path.clone(), report.item.clone());
+                    return Ok(report.item);
+                }
+                self.remove_cached_path(&path);
+            } else {
+                return Ok(item);
+            }
         }
         let parent = path.parent().unwrap_or_else(|| Path::new(ROOT_PATH));
         let filename = path
@@ -579,6 +588,10 @@ where
         }
         Ok(())
     }
+}
+
+fn is_local_cached_identifier(identifier: &str) -> bool {
+    identifier.starts_with("local:") || identifier.starts_with("children:local:")
 }
 
 impl<C> PathFilesystem for AgentFuse<C>
@@ -1266,6 +1279,7 @@ mod tests {
                 state_root: std::env::temp_dir(),
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
+                children: BTreeMap::new(),
             },
             cache: Mutex::new(BTreeMap::new()),
             handles: Mutex::new(BTreeMap::new()),
@@ -1281,6 +1295,61 @@ mod tests {
                 .expect("fuse item cache")
                 .get(Path::new(ROOT_PATH)),
             Some(&root)
+        );
+    }
+
+    #[test]
+    fn resolve_path_refreshes_stale_local_cached_item() {
+        let root = test_root_item();
+        let parent = test_named_item("children:page-root", "Page", VirtualFsItemKind::Folder);
+        let stale_dir = test_named_item("children:local:draft", "Draft", VirtualFsItemKind::Folder);
+        let stale_page = test_named_item("local:draft", "page.md", VirtualFsItemKind::File);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::from([
+                    (
+                        "children:page-root".to_string(),
+                        vec![test_named_item(
+                            "children:page-draft",
+                            "Draft",
+                            VirtualFsItemKind::Folder,
+                        )],
+                    ),
+                    (
+                        "children:page-draft".to_string(),
+                        vec![test_named_item(
+                            "page-draft",
+                            "page.md",
+                            VirtualFsItemKind::File,
+                        )],
+                    ),
+                ]),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Page"), parent),
+                (PathBuf::from("/Page/Draft"), stale_dir),
+                (PathBuf::from("/Page/Draft/page.md"), stale_page),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let item = fs
+            .resolve_path(Path::new("/Page/Draft/page.md"))
+            .expect("resolve refreshed item");
+
+        assert_eq!(item.identifier, "page-draft");
+        assert_eq!(
+            fs.cache
+                .lock()
+                .expect("fuse item cache")
+                .get(Path::new("/Page/Draft/page.md"))
+                .map(|item| item.identifier.as_str()),
+            Some("page-draft")
         );
     }
 
@@ -1305,6 +1374,23 @@ mod tests {
         }
     }
 
+    fn test_named_item(identifier: &str, filename: &str, kind: VirtualFsItemKind) -> VirtualFsItem {
+        VirtualFsItem {
+            identifier: identifier.to_string(),
+            parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
+            filename: filename.to_string(),
+            kind,
+            entity_kind: None,
+            remote_id: None,
+            path: filename.to_string(),
+            hydration: None,
+            content_type: "public.data".to_string(),
+            remote_edited_at: None,
+            materialized_path: None,
+            byte_size: None,
+        }
+    }
+
     fn test_root_item() -> VirtualFsItem {
         VirtualFsItem {
             identifier: ROOT_CONTAINER_IDENTIFIER.to_string(),
@@ -1326,6 +1412,7 @@ mod tests {
         state_root: PathBuf,
         mount_id: String,
         root: VirtualFsItem,
+        children: BTreeMap<String, Vec<VirtualFsItem>>,
     }
 
     impl VirtualFsClient for FakeClient {
@@ -1338,7 +1425,9 @@ mod tests {
         }
 
         fn item(&self, identifier: &str) -> Result<VirtualFsItemReport, FuseError> {
-            assert_eq!(identifier, ROOT_CONTAINER_IDENTIFIER);
+            if identifier != ROOT_CONTAINER_IDENTIFIER {
+                return Err(FuseError::Daemon(format!("missing item {identifier}")));
+            }
             Ok(VirtualFsItemReport {
                 mount_id: self.mount_id.clone(),
                 item: self.root.clone(),
@@ -1347,9 +1436,18 @@ mod tests {
 
         fn children(
             &self,
-            _container_identifier: &str,
+            container_identifier: &str,
         ) -> Result<VirtualFsChildrenReport, FuseError> {
-            Err(FuseError::Daemon("unexpected children request".to_string()))
+            let children = self.children.get(container_identifier).ok_or_else(|| {
+                FuseError::Daemon(format!(
+                    "unexpected children request {container_identifier}"
+                ))
+            })?;
+            Ok(VirtualFsChildrenReport {
+                mount_id: self.mount_id.clone(),
+                container_identifier: container_identifier.to_string(),
+                children: children.clone(),
+            })
         }
 
         fn materialize(&self, _identifier: &str) -> Result<VirtualFsMaterializeReport, FuseError> {
