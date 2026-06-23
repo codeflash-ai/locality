@@ -1432,16 +1432,58 @@ where
     }
     let parsed = match parse_canonical_markdown(&contents) {
         Ok(parsed) => parsed,
-        Err(error) => {
-            return Ok(PreparedPush {
-                absolute_path,
-                mount,
-                entity: parent,
-                shadows: Vec::new(),
-                pipeline: validation_pipeline(parse_error_issue(&pending.projected_path, error)),
-            });
-        }
+        Err(error) => match pending_create_projected_parse_fallback(&read_path, &absolute_path) {
+            Some(parsed) => {
+                return prepare_pending_create_from_parsed(
+                    job,
+                    state_root,
+                    absolute_path,
+                    mount,
+                    pending,
+                    parent,
+                    parsed,
+                    validator,
+                );
+            }
+            None => {
+                return Ok(PreparedPush {
+                    absolute_path,
+                    mount,
+                    entity: parent,
+                    shadows: Vec::new(),
+                    pipeline: validation_pipeline(parse_error_issue(
+                        &pending.projected_path,
+                        error,
+                    )),
+                });
+            }
+        },
     };
+    prepare_pending_create_from_parsed(
+        job,
+        state_root,
+        absolute_path,
+        mount,
+        pending,
+        parent,
+        parsed,
+        validator,
+    )
+}
+
+fn prepare_pending_create_from_parsed<Validator>(
+    job: &PushJob,
+    state_root: Option<&Path>,
+    absolute_path: PathBuf,
+    mount: MountConfig,
+    pending: VirtualMutationRecord,
+    parent: EntityRecord,
+    parsed: afs_core::canonical::ParsedCanonicalDocument,
+    validator: &Validator,
+) -> Result<PreparedPush, PushPrepareError>
+where
+    Validator: SourcePushValidator + ?Sized,
+{
     let schema_validation = validator.validate_create_frontmatter(SourceValidationContext {
         state_root,
         mount: &mount,
@@ -1468,6 +1510,30 @@ where
         shadows: Vec::new(),
         pipeline,
     })
+}
+
+fn pending_create_projected_parse_fallback(
+    read_path: &Path,
+    absolute_path: &Path,
+) -> Option<afs_core::canonical::ParsedCanonicalDocument> {
+    if same_path_text(read_path, absolute_path) {
+        return None;
+    }
+    let contents = std::fs::read_to_string(absolute_path).ok()?;
+    if unresolved_conflict_marker_line(&contents).is_some() {
+        return None;
+    }
+    parse_canonical_markdown(&contents).ok()
+}
+
+fn same_path_text(left: &Path, right: &Path) -> bool {
+    let left = left.to_string_lossy();
+    let right = right.to_string_lossy();
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(&right)
+    } else {
+        left == right
+    }
 }
 
 fn pending_create_read_path(

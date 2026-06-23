@@ -902,6 +902,45 @@ fn prepare_push_prefers_content_cache_for_linux_fuse_pending_create() {
 }
 
 #[test]
+fn prepare_push_uses_projected_file_when_pending_create_cache_has_not_settled() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("fake");
+    fixture.save_parent_page(&mut store);
+    let source_path = Path::new("Roadmap/Draft/page.md");
+    let cache_path = fixture.write_virtual_page(source_path.to_str().expect("source path"), "");
+    let projected_path = fixture.write_raw(
+        source_path.to_str().expect("source path"),
+        "---\ntitle: Projected Draft\n---\nProjected body.\n",
+    );
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:draft",
+            Some(RemoteId::new("page-parent")),
+            source_path.to_str().expect("source path"),
+            cache_path,
+        ))
+        .expect("save mutation");
+
+    let prepared = prepare_push(
+        &store,
+        &job(projected_path),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+
+    let plan = prepared.pipeline.plan.expect("plan");
+    match &plan.operations[0] {
+        PushOperation::CreateEntity { title, body, .. } => {
+            assert_eq!(title, "Projected Draft");
+            assert_eq!(body, "Projected body.\n");
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[test]
 fn prepare_push_uses_page_directory_parent_for_new_page_document() {
     let fixture = PrepareFixture::new();
     let validator = RecordingValidator::default();
