@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -47,9 +48,15 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
     let rendered = connector
         .render_native_entity_for_path(&native, page_path)
         .expect("render with media paths");
-    connector
+    let media_report = connector
         .download_rendered_media(&rendered, &env.local_dir)
         .expect("download rendered media");
+    assert_eq!(media_report.failed, 0, "{media_report:#?}");
+    assert_eq!(
+        media_report.downloaded,
+        rendered.media_assets.len(),
+        "{media_report:#?}"
+    );
 
     assert!(rendered.document.body.contains("# Heading one"));
     assert!(rendered.document.body.contains("## Heading two"));
@@ -116,11 +123,21 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
             .body
             .contains("[AFS nested child page](https://www.notion.so/")
     );
-    assert!(
-        rendered.media_assets.iter().any(|asset| {
-            asset.kind == "image" && env.local_dir.join(&asset.local_path).is_file()
-        })
-    );
+    for kind in ["image", "video", "file", "pdf", "audio"] {
+        let asset = rendered
+            .media_assets
+            .iter()
+            .find(|asset| asset.kind == kind)
+            .unwrap_or_else(|| panic!("missing rendered {kind} media asset"));
+        let local_path = env.local_dir.join(&asset.local_path);
+        let metadata = fs::metadata(&local_path).unwrap_or_else(|error| {
+            panic!("missing downloaded {kind} media at {local_path:?}: {error}")
+        });
+        assert!(
+            metadata.len() > 0,
+            "downloaded {kind} media should be non-empty at {local_path:?}"
+        );
+    }
 
     let bundle: NotionPageBundle = serde_json::from_slice(&native.raw).expect("native bundle");
     let paragraph_id = first_block_id(&bundle, "paragraph");

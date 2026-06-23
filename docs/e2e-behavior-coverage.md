@@ -93,7 +93,7 @@ Coverage labels:
 
 | Test | Kind | Behaviors covered |
 |---|---|---|
-| `crates/afs-notion/tests/live_integrity.rs::live_page_read_edit_write_verify_integrity_with_media_download` | Live connector | Fetch/render rich page content, media download, update supported blocks, append block, fetch/verify rendered Notion content. Covers E2E-006, E2E-008, E2E-010, E2E-014. |
+| `crates/afs-notion/tests/live_integrity.rs::live_page_read_edit_write_verify_integrity_with_media_download` | Live connector | Fetch/render rich page content, download image/video/file/PDF/audio assets into local media files, update supported blocks, append block, fetch/verify rendered Notion content. Covers E2E-006, E2E-008, E2E-010, E2E-014. |
 | `crates/afs-notion/tests/live_integrity.rs::live_database_row_property_create_edit_verify_integrity` | Live connector | Create live database, get schema, validate row frontmatter, create row, update supported properties, fetch/verify row. Covers E2E-017, E2E-018. |
 | `crates/afs-notion/tests/observe.rs::live_notion_observe_page_reads_metadata_without_hydrating_blocks` | Live connector | Create scratch page with a child block, observe page metadata, update title metadata, observe changed metadata/title, and assert the live connector made zero block-children calls. Covers E2E-023. |
 | `crates/afs-cli/tests/e2e_push_workflow.rs::live_scratch_page_mount_edit_push_verifies_notion` | Live mounted workflow, plain files | Create scratch page, mount, pull, edit Markdown, diff, dirty status, push, clean status, fetch/verify Notion. Covers E2E-006, E2E-011, E2E-012, E2E-013. |
@@ -122,7 +122,7 @@ Coverage labels:
 | Notion page read/write integrity | Strong | Scratch pages are created, edited, pushed, fetched, and verified. |
 | Rich block coverage | Strong for supported block types | Representative supported blocks are read and edited live. Unsupported/layout blocks are read/no-op protected. |
 | Database schema and row writes | Strong | Schema, validation, property update, body update, and row create are covered. |
-| Media download | Covered for images | Live test downloads image assets locally. Video/file/PDF/audio are rendered as links, not downloaded. |
+| Media download | Covered for common file-like media | Live test downloads image, video, file, PDF, and audio assets locally and verifies non-empty files. Broader media pruning/cache lifecycle is not covered. |
 | Mounted workflow | Good for core, partial for platform kernels | Live tests cover plain-file mounted workflow, virtual filesystem lazy paths, and Windows Cloud Files registration against live Notion. Linux FUSE live Notion and macOS File Provider live Notion remain open. |
 | Desktop onboarding/tray/review UI | Manual only | Important product surface, but not currently covered by automated live e2e. |
 | Freshness/drift/auto-fast-forward | Partial live | Live tests cover drift preflight, dirty-pull conflict recovery, and fast-forward apply/skip behavior. Scheduler trigger policy remains local-only. |
