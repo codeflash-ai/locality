@@ -10,7 +10,7 @@ use afs_cli::history::{LogOptions, run_log, run_undo_with_applier};
 use afs_cli::inspect::{InspectOptions, run_inspect};
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::pull::run_pull;
-use afs_cli::push::{PushOptions, run_push_with_daemon};
+use afs_cli::push::{PushOptions, run_push_with_daemon, run_push_with_daemon_at_state_root};
 use afs_cli::search::{SearchOptions, run_search};
 use afs_cli::status::{StatusOptions, run_status};
 use afs_connector::{Connector, ConnectorUndoApplier, FetchRequest};
@@ -30,12 +30,14 @@ use afs_notion::dto::{
 };
 use afs_notion::media::resolve_media_href_with_content_root;
 use afs_notion::{NotionConfig, NotionConnector};
-use afs_store::{ConnectionId, EntityRepository, InMemoryStateStore, ProjectionMode};
+use afs_store::{
+    ConnectionId, EntityRepository, InMemoryStateStore, ProjectionMode, VirtualMutationRepository,
+};
 use afsd::hydration::{HydrationExecutor, HydrationOutcome};
 use afsd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, materialize_virtual_fs_item_with_content_root,
-    refresh_virtual_fs_children, source_root_identifier, virtual_fs_children_with_content_root,
-    virtual_fs_content_root,
+    refresh_virtual_fs_children, source_root_identifier, trash_virtual_fs_item,
+    virtual_fs_children_with_content_root, virtual_fs_content_root,
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -696,6 +698,139 @@ fn live_page_directory_create_pushes_child_page_and_refreshes_parent() {
     assert!(
         remote_parent.contains(&child_title),
         "remote parent should render the new child page link:\n{remote_parent}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_virtual_page_directory_delete_archives_remote_child_page() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let parent = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live virtual delete parent {}", unique_suffix()),
+        vec![paragraph_child("Parent body before child page delete.")],
+    );
+    let child_title = format!("AFS live virtual delete child {}", unique_suffix());
+    let child = cleanup.create_page(
+        &parent.id,
+        &child_title,
+        vec![paragraph_child("Child body before delete.")],
+    );
+    let connector = NotionConnector::new(
+        NotionConfig::default().with_root_page_id(RemoteId::new(parent.id.clone())),
+    );
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    mount_virtual_workspace(&fixture, &mut store, &parent.id);
+    let content_root = fixture.content_root();
+    let source_root = source_root_identifier("notion");
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
+        .expect("refresh source root");
+    let source_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &source_root,
+    )
+    .expect("list source root");
+    let parent_folder = find_virtual_folder(&source_children.children, &parent.id);
+    refresh_virtual_fs_children(
+        &mut store,
+        &connector,
+        &fixture.mount_id,
+        &parent_folder.identifier,
+    )
+    .expect("refresh parent children");
+    let parent_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &parent_folder.identifier,
+    )
+    .expect("list parent children");
+    let child_folder = find_virtual_folder(&parent_children.children, &child.id);
+    materialize_virtual_fs_item_with_content_root(
+        &mut store,
+        &connector,
+        &content_root,
+        &fixture.mount_id,
+        &child.id,
+    )
+    .expect("hydrate child before delete");
+
+    let deleted = trash_virtual_fs_item(
+        &mut store,
+        &content_root,
+        &fixture.mount_id,
+        &child_folder.identifier,
+    )
+    .expect("record virtual child page delete");
+    assert_eq!(deleted.identifier, child_folder.identifier);
+    let pending_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+        },
+    )
+    .expect("pending delete status");
+    let delete_entry = pending_status
+        .mounts
+        .iter()
+        .flat_map(|mount| mount.entries.iter())
+        .find(|entry| entry.entity_id == child.id)
+        .expect("pending delete status entry");
+    assert_eq!(delete_entry.state.as_str(), "dirty");
+    assert_eq!(delete_entry.sync_state.as_str(), "pending_local_changes");
+    assert_eq!(delete_entry.issues[0].code, "pending_virtual_delete");
+
+    let diff = run_diff(&store, &fixture.root).expect("diff virtual delete");
+    let plan = diff.plan.as_ref().expect("virtual delete plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert_eq!(plan.summary.entities_archived, 1, "{plan:#?}");
+    assert_eq!(plan.affected_entities, vec![child.id.clone()]);
+
+    let push = run_push_with_daemon_at_state_root(
+        &mut store,
+        &connector,
+        &fixture.root,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        Some(&fixture.state_root),
+    )
+    .expect("push virtual child page delete");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.journal_status.as_deref(), Some("reconciled"));
+    assert_eq!(push.changed_remote_ids, vec![child.id.clone()]);
+    assert_eq!(push.reconciled_remote_ids, vec![child.id.clone()]);
+    assert_eq!(push.apply_effect_count, 1);
+
+    let archived = cleanup
+        .api
+        .retrieve_page(&child.id)
+        .expect("retrieve archived child page");
+    assert!(
+        archived.archived || archived.in_trash,
+        "child page should be archived after virtual delete: {archived:#?}"
+    );
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &RemoteId::new(child.id.clone()))
+            .expect("get deleted child entity")
+            .is_none(),
+        "reconcile should remove archived child entity from local state"
+    );
+    assert!(
+        store
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list mutations after delete push")
+            .is_empty(),
+        "reconcile should clear the pending delete mutation"
     );
 }
 
