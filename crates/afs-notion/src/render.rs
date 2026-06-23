@@ -110,6 +110,7 @@ pub fn render_page_bundle_with_options(
 struct RenderedBlock {
     markdown: String,
     shadow_id: Option<RemoteId>,
+    native_kind: Option<String>,
     metadata: RenderedBlockMetadata,
     spacing: RenderedBlockSpacing,
     media_asset: Option<MediaAsset>,
@@ -207,7 +208,7 @@ fn render_block_trees_with_indent(
 
 fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
     let shadow_id = Some(RemoteId::new(block.id.clone()));
-    match block.kind.as_str() {
+    let mut rendered = match block.kind.as_str() {
         "paragraph" => paragraph_block(block, block.paragraph.as_ref()),
         "heading_1" => rich_text_block(
             block,
@@ -331,7 +332,11 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
         "tab" | "ai_block" | "custom_block" | "button" => directive_block(block, &block.kind, None),
         "unsupported" => directive_block(block, "unsupported", None),
         other => directive_block(block, &format!("unsupported_{other}"), None),
+    };
+    if rendered.shadow_id.is_some() {
+        rendered.native_kind = Some(block.kind.clone());
     }
+    rendered
 }
 
 fn paragraph_block(block: &BlockDto, content: Option<&RichTextBlockDto>) -> RenderedBlock {
@@ -555,6 +560,7 @@ fn directive_block_with_attrs(
     RenderedBlock {
         markdown,
         shadow_id: None,
+        native_kind: None,
         metadata: RenderedBlockMetadata::None,
         spacing: RenderedBlockSpacing::Normal,
         media_asset: None,
@@ -565,6 +571,7 @@ fn rendered_block(markdown: String, shadow_id: Option<RemoteId>) -> RenderedBloc
     RenderedBlock {
         markdown,
         shadow_id,
+        native_kind: None,
         metadata: RenderedBlockMetadata::None,
         spacing: RenderedBlockSpacing::Normal,
         media_asset: None,
@@ -651,6 +658,7 @@ fn render_table_tree(tree: &BlockTreeDto) -> Option<RenderedBlock> {
     Some(RenderedBlock {
         markdown,
         shadow_id: Some(RemoteId::new(tree.block.id.clone())),
+        native_kind: Some(tree.block.kind.clone()),
         metadata: RenderedBlockMetadata::Table {
             row_ids,
             has_column_header: table.has_column_header,
@@ -719,6 +727,7 @@ fn apply_shadow_metadata(shadow: &mut ShadowDocument, rendered_blocks: &[Rendere
             .iter()
             .filter(|block| !block.markdown.trim().is_empty()),
     ) {
+        shadow_block.native_kind = rendered_block.native_kind.clone();
         if let RenderedBlockMetadata::Table {
             row_ids,
             has_column_header,

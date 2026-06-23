@@ -581,6 +581,8 @@ pub struct ShadowBlockRecord {
     pub source_span: SourceSpan,
     pub content_hash: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_kind: Option<String>,
 }
 
 impl From<ShadowBlock> for ShadowBlockRecord {
@@ -591,6 +593,7 @@ impl From<ShadowBlock> for ShadowBlockRecord {
             source_span: value.source_span,
             content_hash: value.content_hash,
             text: value.text,
+            native_kind: value.native_kind,
         }
     }
 }
@@ -603,6 +606,7 @@ impl From<ShadowBlockRecord> for ShadowBlock {
             source_span: value.source_span,
             content_hash: value.content_hash,
             text: value.text,
+            native_kind: value.native_kind,
         }
     }
 }

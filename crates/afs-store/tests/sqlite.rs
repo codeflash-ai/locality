@@ -426,7 +426,8 @@ fn mount_entity_and_shadow_round_trip_after_reopen() {
     let mut store = fixture.open();
     let mount = fixture.mount_config();
     let entity = entity_record();
-    let shadow = shadow_document("# Roadmap\n\nSame paragraph.");
+    let mut shadow = shadow_document("# Roadmap\n\nSame paragraph.");
+    shadow.blocks[1].native_kind = Some("paragraph".to_string());
 
     store.save_mount(mount.clone()).expect("save mount");
     store.save_entity(entity.clone()).expect("save entity");

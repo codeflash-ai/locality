@@ -812,6 +812,16 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
             .collect::<Vec<_>>(),
         vec!["image", "video", "file", "pdf", "audio"]
     );
+    let link_preview_shadow = rendered
+        .shadow
+        .blocks
+        .iter()
+        .find(|block| block.remote_id == RemoteId::new("link-preview-1"))
+        .expect("link_preview shadow block");
+    assert_eq!(
+        link_preview_shadow.native_kind.as_deref(),
+        Some("link_preview")
+    );
 }
 
 #[test]

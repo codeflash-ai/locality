@@ -588,6 +588,20 @@ fn notion_pre_apply_semantic_validation(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    let moved_link_preview_block_ids = plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::AppendBlock { content, .. } => moved_rendered_native_block(
+                &shadow_blocks,
+                &archived_block_ids,
+                content,
+                "link_preview",
+            )
+            .map(|block| block.remote_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let mut validation = ValidationReport::clean();
     for operation in &plan.operations {
         match operation {
@@ -596,6 +610,15 @@ fn notion_pre_apply_semantic_validation(
                 let Some(shadow_block) = shadow_blocks.get(block_id).copied() else {
                     continue;
                 };
+                if rendered_native_kind(shadow_block, "link_preview") {
+                    validation.push(ValidationIssue::new(
+                        "notion_link_preview_edit_unsupported",
+                        relative_path,
+                        Some(shadow_block.source_span.start_line),
+                        "editing a rendered Notion link-preview block is not supported from Markdown",
+                        Some("restore the link-preview line exactly".to_string()),
+                    ));
+                }
                 if rendered_child_page_link_block(shadow_block) {
                     validation.push(ValidationIssue::new(
                         "notion_child_page_link_edit_unsupported",
@@ -630,6 +653,22 @@ fn notion_pre_apply_semantic_validation(
                     continue;
                 }
 
+                if let Some(shadow_block) = moved_rendered_native_block(
+                    &shadow_blocks,
+                    &archived_block_ids,
+                    content,
+                    "link_preview",
+                ) {
+                    validation.push(ValidationIssue::new(
+                        "notion_link_preview_move_unsupported",
+                        relative_path,
+                        Some(shadow_block.source_span.start_line),
+                        "moving a rendered Notion link-preview block is not supported from Markdown",
+                        Some("restore the link-preview line to its original position".to_string()),
+                    ));
+                    continue;
+                }
+
                 let Some(shadow_block) = moved_rendered_child_page_link_block(
                     &shadow_blocks,
                     &archived_block_ids,
@@ -650,12 +689,23 @@ fn notion_pre_apply_semantic_validation(
                 ));
             }
             PushOperation::ArchiveBlock { block_id } => {
-                if moved_child_page_block_ids.contains(block_id) {
+                if moved_child_page_block_ids.contains(block_id)
+                    || moved_link_preview_block_ids.contains(block_id)
+                {
                     continue;
                 }
                 let Some(shadow_block) = shadow_blocks.get(block_id).copied() else {
                     continue;
                 };
+                if rendered_native_kind(shadow_block, "link_preview") {
+                    validation.push(ValidationIssue::new(
+                        "notion_link_preview_delete_unsupported",
+                        relative_path,
+                        Some(shadow_block.source_span.start_line),
+                        "deleting a rendered Notion link-preview block is not supported from Markdown",
+                        Some("restore the link-preview line".to_string()),
+                    ));
+                }
                 if rendered_child_page_link_block(shadow_block) {
                     validation.push(ValidationIssue::new(
                         "notion_child_page_link_delete_unsupported",
@@ -674,6 +724,10 @@ fn notion_pre_apply_semantic_validation(
     }
 
     validation
+}
+
+fn rendered_native_kind(block: &ShadowBlock, native_kind: &str) -> bool {
+    block.native_kind.as_deref() == Some(native_kind)
 }
 
 fn notion_table_shape_change_validation(
@@ -733,6 +787,19 @@ fn moved_rendered_child_page_link_block<'a>(
     shadow_blocks.values().copied().find(|block| {
         archived_block_ids.contains(&block.remote_id)
             && compact_notion_id(block.remote_id.as_str()) == linked_notion_id
+            && rendered_bodies_equivalent(&block.text, content)
+    })
+}
+
+fn moved_rendered_native_block<'a>(
+    shadow_blocks: &BTreeMap<&RemoteId, &'a ShadowBlock>,
+    archived_block_ids: &BTreeSet<RemoteId>,
+    content: &str,
+    native_kind: &str,
+) -> Option<&'a ShadowBlock> {
+    shadow_blocks.values().copied().find(|block| {
+        archived_block_ids.contains(&block.remote_id)
+            && rendered_native_kind(block, native_kind)
             && rendered_bodies_equivalent(&block.text, content)
     })
 }

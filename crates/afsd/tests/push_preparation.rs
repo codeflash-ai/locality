@@ -373,6 +373,97 @@ fn prepare_push_blocks_rendered_link_to_page_retarget_before_apply() {
 }
 
 #[test]
+fn prepare_push_blocks_rendered_link_preview_edit_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        "[Preview](https://example.com/preview)",
+        8,
+        [RemoteId::new("link-preview-1")],
+    )
+    .expect("shadow");
+    shadow.blocks[0].native_kind = Some("link_preview".to_string());
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", "[Changed](https://example.com/preview)");
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_link_preview_edit_unsupported"
+    );
+}
+
+#[test]
+fn prepare_push_blocks_rendered_link_preview_move_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let link = "[Preview](https://example.com/preview)";
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        format!("Intro.\n\n{link}"),
+        8,
+        [
+            RemoteId::new("paragraph-1"),
+            RemoteId::new("link-preview-1"),
+        ],
+    )
+    .expect("shadow");
+    shadow.blocks[1].native_kind = Some("link_preview".to_string());
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", &format!("{link}\n\nIntro."));
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_link_preview_move_unsupported"
+    );
+}
+
+#[test]
+fn prepare_push_blocks_rendered_link_preview_delete_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("notion");
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        "Intro.\n\n[Preview](https://example.com/preview)",
+        8,
+        [
+            RemoteId::new("paragraph-1"),
+            RemoteId::new("link-preview-1"),
+        ],
+    )
+    .expect("shadow");
+    shadow.blocks[1].native_kind = Some("link_preview".to_string());
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", "Intro.");
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "notion_link_preview_delete_unsupported"
+    );
+}
+
+#[test]
 fn prepare_push_blocks_notion_table_width_change_before_apply() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.store("notion");

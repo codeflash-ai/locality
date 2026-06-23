@@ -46,7 +46,7 @@ Support terms:
 | Table | Read/write with stable shape | Markdown table | Cell edits, row appends, and trailing row deletes are supported. Width/header-mode changes are blocked before journaled apply. |
 | Bookmark | Read/write for existing blocks | Markdown link | Caption and URL edits update the existing block. |
 | Embed | Read/write for existing blocks | Markdown link | Caption and URL edits update the existing block. |
-| Link preview | Read-only | Markdown link | The current Notion API rejects safe creation/write shapes for this block. |
+| Link preview | Read-only | Markdown link | The current Notion API rejects safe creation/write shapes for this block, so edits, moves, and deletes are blocked before journaled apply. |
 | Child page link | Read; direct edit/move/delete blocked | Markdown link to Notion page | The link target carries the stable page ID for lookup. Edit, move, rename, or delete the child page through its projected page directory rather than the parent link. |
 | Link to page | Read; move/delete allowed; retarget blocked | Markdown link to Notion page | Direct target PATCH is not reliable in the Notion API, so retargeting is blocked before journaled apply. |
 | Link to database | Read; move/delete allowed; retarget blocked | Markdown link to Notion database | Replacement needs undo-aware block identity support before AFS can write it safely, so retargeting is blocked before journaled apply. |

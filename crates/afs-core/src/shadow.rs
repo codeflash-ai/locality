@@ -60,6 +60,7 @@ impl ShadowDocument {
                 source_span: block.source_span,
                 content_hash: block.content_hash,
                 text: block.text,
+                native_kind: None,
             });
         }
 
@@ -141,6 +142,8 @@ pub struct ShadowBlock {
     pub source_span: SourceSpan,
     pub content_hash: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
