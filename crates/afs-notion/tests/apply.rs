@@ -1778,6 +1778,90 @@ fn apply_preserves_link_to_page_when_native_move_is_planned_as_append_archive() 
 }
 
 #[test]
+fn apply_preserves_link_to_database_when_native_move_is_planned_as_append_archive() {
+    let target_id = "11111111-1111-1111-1111-111111111111";
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            paragraph_block("paragraph-1", "Anchor.", false),
+            link_to_page_block("database-link-1", "database_id", target_id),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: None,
+                content:
+                    "[Linked database](https://www.notion.so/11111111111111111111111111111111)"
+                        .to_string(),
+            },
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("database-link-1"),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    assert_eq!(
+        result.effects,
+        vec![
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[0].clone(),
+                operation_index: 0,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-1"),
+            },
+            JournalApplyEffect::ArchivedBlock {
+                operation_id: operation_ids[1].clone(),
+                operation_index: 1,
+                block_id: RemoteId::new("database-link-1"),
+            },
+        ]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        *writes,
+        vec![
+            WriteCall::Append {
+                block_id: "page-1".to_string(),
+                body: json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "link_to_page",
+                        "link_to_page": {
+                            "type": "database_id",
+                            "database_id": target_id,
+                        },
+                    }],
+                    "position": {
+                        "type": "start",
+                    },
+                }),
+            },
+            WriteCall::Delete {
+                block_id: "database-link-1".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
 fn apply_undo_restores_archived_block_by_appending_replacement() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",

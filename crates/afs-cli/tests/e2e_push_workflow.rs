@@ -721,6 +721,125 @@ fn live_link_to_page_line_move_preserves_notion_block_type() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_link_to_database_line_move_preserves_notion_block_type() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let target = cleanup.create_database(
+        &env.parent_page_id,
+        &format!("AFS live database link move target {}", unique_suffix()),
+    );
+    let anchor_text = "Anchor before link_to_database.";
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live database link move source {}", unique_suffix()),
+        vec![
+            paragraph_child(anchor_text),
+            json!({
+                "object": "block",
+                "type": "link_to_page",
+                "link_to_page": { "type": "database_id", "database_id": target.id }
+            }),
+        ],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let before = live_block_snapshot(&connector, &source.id);
+    let original_link_id = before
+        .as_array()
+        .and_then(|blocks| {
+            blocks.iter().find_map(|entry| {
+                (entry["block"]["type"] == "link_to_page")
+                    .then(|| entry["block"]["id"].as_str())
+                    .flatten()
+            })
+        })
+        .expect("link_to_database block id")
+        .to_string();
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    let link_line = original
+        .lines()
+        .find(|line| {
+            line.starts_with("[Linked database](") && line.contains(&compact_notion_id(&target.id))
+        })
+        .expect("rendered link_to_database line");
+    let anchor_line = original
+        .lines()
+        .find(|line| line.replace("\\_", "_") == anchor_text)
+        .expect("rendered anchor paragraph");
+    let original_order = format!("{anchor_line}\n\n{link_line}\n");
+    assert!(original.contains(&original_order), "{original}");
+    fs::write(
+        &page_path,
+        original.replace(
+            &original_order,
+            &format!("{link_line}\n\n{anchor_line}\n\n"),
+        ),
+    )
+    .expect("write live link_to_database move");
+
+    let diff = run_diff(&store, &page_path).expect("diff live link_to_database move");
+    let plan = diff.plan.as_ref().expect("link_to_database move plan");
+    assert_eq!(diff.action, "confirm_plan");
+    assert_eq!(plan.summary.blocks_created, 1, "{plan:#?}");
+    assert_eq!(plan.summary.blocks_archived, 1, "{plan:#?}");
+    assert_eq!(plan.summary.blocks_moved, 0, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live link_to_database move");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    assert_eq!(push.apply_effect_count, 2);
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean link_to_database move status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let after = live_block_snapshot(&connector, &source.id);
+    let first = after
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("first live block after link_to_database move");
+    assert_ne!(first["block"]["id"], original_link_id);
+    assert_eq!(first["block"]["type"], "link_to_page");
+    assert_eq!(
+        compact_notion_id(
+            first["block"]["link_to_page"]["database_id"]
+                .as_str()
+                .expect("moved link target database id")
+        ),
+        compact_notion_id(&target.id)
+    );
+
+    let verified = render_live_page(&connector, &source.id, &page_path);
+    let link_index = verified
+        .lines()
+        .position(|line| {
+            line.starts_with("[Linked database](") && line.contains(&compact_notion_id(&target.id))
+        })
+        .expect("reconciled link_to_database line");
+    let anchor_index = verified
+        .lines()
+        .position(|line| line.replace("\\_", "_") == anchor_text)
+        .expect("reconciled anchor paragraph");
+    assert!(link_index < anchor_index, "{verified}");
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_link_to_page_retarget_blocks_before_journaled_apply() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
@@ -784,6 +903,79 @@ fn live_link_to_page_retarget_blocks_before_journaled_apply() {
         },
     )
     .expect("push live link_to_page retarget");
+    assert!(!push.ok, "{push:#?}");
+    assert_eq!(push.action, "fix_validation", "{push:#?}");
+    assert_eq!(push.push_id, None, "{push:#?}");
+    assert_eq!(push.journal_status, None, "{push:#?}");
+    assert!(store.list_journal().expect("journal").is_empty());
+    assert_eq!(live_block_snapshot(&connector, &source.id), before);
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_link_to_database_retarget_blocks_before_journaled_apply() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let original_target = cleanup.create_database(
+        &env.parent_page_id,
+        &format!(
+            "AFS live database link retarget original {}",
+            unique_suffix()
+        ),
+    );
+    let replacement_target = cleanup.create_database(
+        &env.parent_page_id,
+        &format!(
+            "AFS live database link retarget replacement {}",
+            unique_suffix()
+        ),
+    );
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live database link retarget source {}", unique_suffix()),
+        vec![json!({
+            "object": "block",
+            "type": "link_to_page",
+            "link_to_page": { "type": "database_id", "database_id": original_target.id }
+        })],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let before = live_block_snapshot(&connector, &source.id);
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    let link_line = original
+        .lines()
+        .find(|line| {
+            line.starts_with("[Linked database](")
+                && line.contains(&compact_notion_id(&original_target.id))
+        })
+        .expect("rendered link_to_database line");
+    let edited_link_line = link_line.replace(
+        &compact_notion_id(&original_target.id),
+        &compact_notion_id(&replacement_target.id),
+    );
+    assert_ne!(link_line, edited_link_line);
+    fs::write(&page_path, original.replace(link_line, &edited_link_line))
+        .expect("write live link_to_database retarget");
+
+    let diff = run_diff(&store, &page_path).expect("diff live link_to_database retarget");
+    assert_eq!(diff.action, "fix_validation", "{diff:#?}");
+    assert!(diff.plan.is_none(), "{diff:#?}");
+    assert_eq!(
+        diff.validation[0].code,
+        "notion_link_to_page_retarget_unsupported"
+    );
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live link_to_database retarget");
     assert!(!push.ok, "{push:#?}");
     assert_eq!(push.action, "fix_validation", "{push:#?}");
     assert_eq!(push.push_id, None, "{push:#?}");
