@@ -12,7 +12,7 @@ use afs_core::undo::{UndoOperation, UndoPlan, UndoPlanStatus};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
-    BlockDto, BlockListDto, ColorOnlyBlockDto, DataSourceDto, DataSourcePropertyDto,
+    BlockDto, BlockListDto, CodeBlockDto, ColorOnlyBlockDto, DataSourceDto, DataSourcePropertyDto,
     DataSourceSummaryDto, DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto,
     FileBlockDto, IdRefDto, LinkDto, LinkToPageBlockDto, MentionRichTextDto, PageDto, PageListDto,
     PagePropertyDto, PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto,
@@ -540,6 +540,55 @@ fn apply_appends_tier_one_markdown_block_shapes() {
                 }),
             ),
         ]
+    );
+}
+
+#[test]
+fn apply_parses_long_code_fences_from_rendered_code_blocks() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![code_block(
+            "code-1",
+            "markdown",
+            "Before\n```python\nprint('nested')\n```\nAfter",
+        )],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("code-1"),
+            content: "````markdown\nBefore\n```python\nprint('nested')\n```\nAfter updated\n````"
+                .to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Update {
+            block_id: "code-1".to_string(),
+            body: json!({
+                "code": {
+                    "rich_text": rich_text_json("Before\n```python\nprint('nested')\n```\nAfter updated"),
+                    "language": "markdown",
+                },
+            }),
+        }]
     );
 }
 
@@ -3565,6 +3614,15 @@ fn equation_block(id: &str, expression: &str) -> BlockDto {
     let mut block = block(id, "equation");
     block.equation = Some(EquationBlockDto {
         expression: expression.to_string(),
+    });
+    block
+}
+
+fn code_block(id: &str, language: &str, text: &str) -> BlockDto {
+    let mut block = block(id, "code");
+    block.code = Some(CodeBlockDto {
+        rich_text: rich_text(text),
+        language: Some(language.to_string()),
     });
     block
 }

@@ -2272,6 +2272,74 @@ fn live_cyclic_diverse_page_read_noop_preserves_notion() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_code_block_with_embedded_fence_edits_round_trip() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let source = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live embedded code fence {}", unique_suffix()),
+        vec![json!({
+            "object": "block",
+            "type": "code",
+            "code": {
+                "rich_text": rich_text_json("Before\n```python\nprint('nested')\n```\nAfter"),
+                "language": "markdown",
+            }
+        })],
+    );
+
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (fixture, mut store, page_path, original) = pull_live_page(&connector, &source.id);
+    let expected_original = "````markdown\nBefore\n```python\nprint('nested')\n```\nAfter\n````";
+    assert!(
+        original.contains(expected_original),
+        "code block should render with a longer outer fence:\n{original}"
+    );
+
+    fs::write(
+        &page_path,
+        original.replace("After\n````", "After updated\n````"),
+    )
+    .expect("write edited embedded code fence");
+
+    let diff = run_diff(&store, &page_path).expect("diff embedded code fence edit");
+    let plan = diff.plan.as_ref().expect("plan");
+    assert_eq!(plan.summary.blocks_updated, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push embedded code fence edit");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let verified = render_live_page(&connector, &source.id, &page_path);
+    assert!(
+        verified
+            .contains("````markdown\nBefore\n```python\nprint('nested')\n```\nAfter updated\n````"),
+        "verified markdown should preserve the embedded fence:\n{verified}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_cyclic_supported_block_edits_push_and_verify_notion() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());

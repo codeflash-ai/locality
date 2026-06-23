@@ -3098,23 +3098,31 @@ fn escape_markdown_link_label(text: &str) -> String {
 fn parse_code_fence(markdown: &str) -> Option<(String, String)> {
     let mut lines = markdown.lines();
     let first = lines.next()?.trim_start();
-    let fence = if first.starts_with("```") {
-        "```"
-    } else if first.starts_with("~~~") {
-        "~~~"
-    } else {
+    let marker = first.chars().next()?;
+    if !matches!(marker, '`' | '~') {
         return None;
-    };
-    let language = first[fence.len()..].trim();
+    }
+    let fence_len = first.chars().take_while(|ch| *ch == marker).count();
+    if fence_len < 3 {
+        return None;
+    }
+
+    let language = first[fence_len..].trim();
     let mut body = lines.collect::<Vec<_>>();
     if !body
         .last()
-        .is_some_and(|line| line.trim_start().starts_with(fence))
+        .is_some_and(|line| is_closing_code_fence(line, marker, fence_len))
     {
         return None;
     }
     body.pop();
     Some((language.to_string(), body.join("\n")))
+}
+
+fn is_closing_code_fence(line: &str, marker: char, opening_len: usize) -> bool {
+    let trimmed = line.trim_start();
+    let closing_len = trimmed.chars().take_while(|ch| *ch == marker).count();
+    closing_len >= opening_len && trimmed[closing_len..].trim().is_empty()
 }
 
 fn parse_display_equation(markdown: &str) -> Option<String> {

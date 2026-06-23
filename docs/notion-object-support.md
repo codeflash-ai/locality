@@ -39,7 +39,7 @@ Sources used for the baseline:
 | `to_do` | Native Markdown checkbox | Yes | fixture, live | Checked state round-trips through `- [ ]` / `- [x]`. |
 | `quote` | Native Markdown quote | Yes | fixture, live | `>` quote. |
 | `callout` | Native Markdown callout | Yes | fixture, live read | `> [!NOTE]` callouts update and append as Notion callout blocks. |
-| `code` | Native fenced code | Yes | fixture, live | Language is preserved on simple code fences. |
+| `code` | Native fenced code | Yes | fixture, live | Language is preserved on simple and variable-length code fences. |
 | `divider` | Native Markdown rule | Yes | fixture, live | `---`. |
 | `equation` | Native display math | Yes | fixture, live | `$$ ... $$`. |
 | `table` | Native Markdown table | Yes for existing tables with stable width/header mode | fixture, live read/write, live width-blocked, live middle-delete-blocked | Existing cell edits update table rows. Added Markdown rows append Notion `table_row` children; removed trailing rows archive row blocks. Width/header-mode changes and detected non-trailing row deletes are blocked before journaled apply. |
