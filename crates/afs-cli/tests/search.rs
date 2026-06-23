@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -55,9 +55,11 @@ fn search_ranks_title_path_and_remote_id_matches() {
     assert!(id.results[0].safety.agent_readable);
     assert_eq!(id.results[0].safety.labels, vec!["ready"]);
     assert!(
-        id.results[0]
-            .absolute_path
-            .ends_with("Product/Initial Idea/page.md")
+        Path::new(&id.results[0].absolute_path).ends_with(
+            PathBuf::from("Product")
+                .join("Initial Idea")
+                .join("page.md")
+        )
     );
 }
 
@@ -243,7 +245,7 @@ fn notion_url_locate_prefers_page_file_over_workspace_fallback() {
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].kind, "page");
     assert_eq!(report.results[0].path, "Product/Initial Idea/page.md");
-    assert!(report.results[0].absolute_path.ends_with("/page.md"));
+    assert!(Path::new(&report.results[0].absolute_path).ends_with("page.md"));
 }
 
 #[test]
@@ -282,7 +284,10 @@ fn search_reports_linux_fuse_absolute_path_under_source_root() {
 
     let expected = fixture
         .root
-        .join("notion/Product/Initial Idea/page.md")
+        .join("notion")
+        .join("Product")
+        .join("Initial Idea")
+        .join("page.md")
         .display()
         .to_string();
     assert_eq!(report.results[0].absolute_path, expected);

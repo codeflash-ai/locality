@@ -131,9 +131,34 @@ pub fn logical_path_display(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+pub fn host_path_from_logical_path(path: &Path) -> PathBuf {
+    let logical = logical_path_display(path);
+    let mut host_path = PathBuf::new();
+    for component in logical.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => host_path.push(".."),
+            component => host_path.push(component),
+        }
+    }
+    host_path
+}
+
+pub fn join_logical_path(root: &Path, logical_path: &Path) -> PathBuf {
+    let host_relative_path = host_path_from_logical_path(logical_path);
+    if host_relative_path.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(host_relative_path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DefaultHostPaths, HostPaths, logical_path_display};
+    use super::{
+        DefaultHostPaths, HostPaths, host_path_from_logical_path, join_logical_path,
+        logical_path_display,
+    };
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -174,6 +199,30 @@ mod tests {
         assert_eq!(
             logical_path_display(Path::new(r"Teamspace Home\Launch Plan\page.md")),
             "Teamspace Home/Launch Plan/page.md"
+        );
+    }
+
+    #[test]
+    fn logical_paths_convert_to_host_relative_paths() {
+        assert_eq!(
+            host_path_from_logical_path(Path::new(r"Teamspace Home\Launch Plan/page.md")),
+            PathBuf::from("Teamspace Home")
+                .join("Launch Plan")
+                .join("page.md")
+        );
+    }
+
+    #[test]
+    fn logical_paths_join_to_host_roots_with_host_separators() {
+        assert_eq!(
+            join_logical_path(
+                Path::new("mount"),
+                Path::new("Teamspace Home/Launch Plan/page.md")
+            ),
+            PathBuf::from("mount")
+                .join("Teamspace Home")
+                .join("Launch Plan")
+                .join("page.md")
         );
     }
 }

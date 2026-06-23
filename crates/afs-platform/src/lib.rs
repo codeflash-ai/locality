@@ -32,6 +32,6 @@ pub use daemon::{
 };
 pub use paths::{
     DefaultHostPaths, HostPaths, ReportPath, default_mount_root, default_state_root,
-    logical_path_display, user_home,
+    host_path_from_logical_path, join_logical_path, logical_path_display, user_home,
 };
 pub use process::{DefaultSessionProcessManager, ProcessStopCommand, SessionProcessManager};

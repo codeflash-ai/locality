@@ -255,14 +255,18 @@ fn resolve_media_href_inner(
     }
 }
 
-fn unescape_markdown_href(href: &str) -> String {
+pub(crate) fn unescape_markdown_href(href: &str) -> String {
     let mut unescaped = String::with_capacity(href.len());
     let mut chars = href.chars();
 
     while let Some(ch) = chars.next() {
         if ch == '\\' {
             match chars.next() {
-                Some(next) => unescaped.push(next),
+                Some(next) if is_escaped_href_punctuation(next) => unescaped.push(next),
+                Some(next) => {
+                    unescaped.push('\\');
+                    unescaped.push(next);
+                }
                 None => unescaped.push('\\'),
             }
         } else {
@@ -271,6 +275,10 @@ fn unescape_markdown_href(href: &str) -> String {
     }
 
     unescaped
+}
+
+fn is_escaped_href_punctuation(ch: char) -> bool {
+    matches!(ch, '(' | ')' | '[' | ']')
 }
 
 fn markdown_parent_dir(page_path: &Path) -> PathBuf {
@@ -529,7 +537,10 @@ fn write_atomic(path: &Path, contents: &[u8]) -> AfsResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaAsset, local_media_href, media_local_path, resolve_media_href};
+    use super::{
+        MediaAsset, local_media_href, media_local_path, resolve_media_href,
+        resolve_media_href_with_content_root,
+    };
     use std::path::Path;
 
     #[test]
@@ -623,6 +634,23 @@ mod tests {
             Some(
                 Path::new(".afs/media/Tasks/Fix login (new)/image-0123456789ab.png").to_path_buf()
             )
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_windows_absolute_media_href_without_stripping_separators() {
+        let content_root =
+            Path::new("C:\\Users\\runner\\AppData\\Local\\Temp\\afs\\.content\\notion-main\\files");
+        let media_path = content_root.join(".afs\\media\\Roadmap\\image-1.png");
+
+        assert_eq!(
+            resolve_media_href_with_content_root(
+                Path::new("Roadmap/page.md"),
+                &media_path.display().to_string(),
+                content_root,
+            ),
+            Some(Path::new(".afs\\media\\Roadmap\\image-1.png").to_path_buf())
         );
     }
 

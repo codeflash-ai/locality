@@ -566,13 +566,15 @@ where
 
 fn projected_absolute_path(mount: &MountConfig, relative_path: &Path) -> PathBuf {
     if mount.projection == ProjectionMode::LinuxFuse {
-        return mount
-            .root
-            .join(source_root_directory_name(&mount.connector))
-            .join(relative_path);
+        return afs_platform::join_logical_path(
+            &mount
+                .root
+                .join(source_root_directory_name(&mount.connector)),
+            relative_path,
+        );
     }
 
-    mount.root.join(relative_path)
+    afs_platform::join_logical_path(&mount.root, relative_path)
 }
 
 fn classify_remote_state<S>(

@@ -290,8 +290,10 @@ pub fn search_indexed_entities(
                 title: entity.title.clone(),
                 kind: entity_kind_name(&entity.kind).to_string(),
                 remote_id: entity.remote_id.0.clone(),
-                path: result_path.display().to_string(),
-                absolute_path: access_root.join(&result_path).display().to_string(),
+                path: afs_platform::logical_path_display(&result_path),
+                absolute_path: afs_platform::join_logical_path(access_root, &result_path)
+                    .display()
+                    .to_string(),
                 state,
                 safety: search_safety(&entity.hydration, &remote),
                 remote,
@@ -341,8 +343,10 @@ fn search_entity_result(
         title: entity.title.clone(),
         kind: entity_kind_name(&entity.kind).to_string(),
         remote_id: entity.remote_id.0.clone(),
-        path: result_path.display().to_string(),
-        absolute_path: access_root.join(&result_path).display().to_string(),
+        path: afs_platform::logical_path_display(&result_path),
+        absolute_path: afs_platform::join_logical_path(access_root, &result_path)
+            .display()
+            .to_string(),
         state,
         safety: search_safety(&entity.hydration, &remote),
         remote,

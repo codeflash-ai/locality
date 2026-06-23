@@ -27,7 +27,7 @@ use crate::dto::{
 };
 use crate::fetch::fetch_page_bundle;
 use crate::markdown_table::{parse_markdown_table_row, validate_markdown_table_separator};
-use crate::media::resolve_media_href_with_content_root;
+use crate::media::{resolve_media_href_with_content_root, unescape_markdown_href};
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> AfsResult<()> {
     let database_create_parent_ids = database_create_parent_ids(&request.plan.operations);
@@ -2472,27 +2472,9 @@ fn parse_markdown_link(input: &str) -> Option<(String, String, usize)> {
     let href_end = find_markdown_link_href_end(input, href_start)?;
     Some((
         input[1..label_end].to_string(),
-        unescape_markdown_link_href(&input[href_start..href_end]),
+        unescape_markdown_href(&input[href_start..href_end]),
         href_end + 1,
     ))
-}
-
-fn unescape_markdown_link_href(href: &str) -> String {
-    let mut unescaped = String::with_capacity(href.len());
-    let mut chars = href.chars();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some(next) => unescaped.push(next),
-                None => unescaped.push('\\'),
-            }
-        } else {
-            unescaped.push(ch);
-        }
-    }
-
-    unescaped
 }
 
 fn find_markdown_link_label_end(input: &str) -> Option<usize> {

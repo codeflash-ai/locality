@@ -201,7 +201,7 @@ fn info_runner_works_with_sqlite_state_store() {
 fn info_for_linux_fuse_reports_entity_absolute_path_under_source_root() {
     let fixture = InfoFixture::new();
     let visible_root = fixture.root.join("notion");
-    let visible_file = visible_root.join("roadmap/page.md");
+    let visible_file = visible_root.join("roadmap").join("page.md");
     if let Some(parent) = visible_file.parent() {
         fs::create_dir_all(parent).expect("visible parent");
     }

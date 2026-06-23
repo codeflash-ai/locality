@@ -425,7 +425,9 @@ fn info_entity(access_root: &Path, entity: &EntityRecord) -> InfoEntity {
         kind: entity_kind_name(&entity.kind).to_string(),
         title: entity.title.clone(),
         path: afs_platform::logical_path_display(&entity.path),
-        absolute_path: access_root.join(&entity.path).display().to_string(),
+        absolute_path: afs_platform::join_logical_path(access_root, &entity.path)
+            .display()
+            .to_string(),
         hydration: hydration_name(&entity.hydration).to_string(),
         content_hash: entity.content_hash.clone(),
         remote_edited_at: entity.remote_edited_at.clone(),
