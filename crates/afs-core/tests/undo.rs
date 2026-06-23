@@ -87,6 +87,53 @@ fn move_block_reverses_to_original_position() {
 }
 
 #[test]
+fn copy_archive_move_reverses_to_archive_copy_then_restore_original() {
+    let mut entry = journal_entry(vec![PushOperation::MoveBlock {
+        block_id: RemoteId::new("paragraph-1"),
+        after: None,
+    }]);
+    entry.apply_effects = vec![
+        JournalApplyEffect::CreatedBlock {
+            operation_id: PushOperationId::for_operation(
+                &entry.push_id,
+                0,
+                &entry.plan.operations[0],
+            ),
+            operation_index: 0,
+            parent_id: RemoteId::new("page-1"),
+            block_id: RemoteId::new("moved-copy-1"),
+        },
+        JournalApplyEffect::ArchivedBlock {
+            operation_id: PushOperationId::for_operation(
+                &entry.push_id,
+                0,
+                &entry.plan.operations[0],
+            ),
+            operation_index: 0,
+            block_id: RemoteId::new("paragraph-1"),
+        },
+    ];
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![
+            UndoOperation::ArchiveCreatedBlock {
+                block_id: RemoteId::new("moved-copy-1"),
+            },
+            UndoOperation::RestoreArchivedBlock {
+                block_id: RemoteId::new("paragraph-1"),
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("heading-1")),
+                content: "Old paragraph.".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
 fn reverse_plan_orders_dependent_moves_for_safe_apply() {
     let entry = journal_entry_with_shadow(
         vec![

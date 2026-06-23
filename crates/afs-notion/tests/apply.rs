@@ -3,11 +3,12 @@ use std::fs;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use afs_connector::{ApplyPlanRequest, Connector};
+use afs_connector::{ApplyPlanRequest, ApplyUndoRequest, Connector};
 use afs_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use afs_core::model::{EntityKind, MountId, RemoteId};
 use afs_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
 use afs_core::push::RemotePrecondition;
+use afs_core::undo::{UndoOperation, UndoPlan, UndoPlanStatus};
 use afs_core::{AfsError, AfsResult};
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
@@ -1241,6 +1242,106 @@ fn apply_preserves_link_to_page_when_native_move_is_planned_as_append_archive() 
                 block_id: "page-link-1".to_string(),
             },
         ]
+    );
+}
+
+#[test]
+fn apply_undo_restores_archived_block_by_appending_replacement() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![paragraph_block("paragraph-1", "Old paragraph.", false)],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let undo_plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![UndoOperation::RestoreArchivedBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            parent_id: RemoteId::new("page-1"),
+            after: None,
+            content: "Old paragraph.".to_string(),
+        }],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    let result = connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &undo_plan,
+        })
+        .expect("apply undo");
+
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        *writes,
+        vec![WriteCall::Append {
+            block_id: "page-1".to_string(),
+            body: json!({
+                "children": [{
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": rich_text_json("Old paragraph."),
+                    },
+                }],
+                "position": {
+                    "type": "start",
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
+fn apply_undo_restores_archived_directive_by_appending_replacement() {
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![paragraph_block("paragraph-1", "Anchor.", false)],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let undo_plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![UndoOperation::RestoreArchivedBlock {
+            block_id: RemoteId::new("toc-1"),
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("paragraph-1")),
+            content: "::afs{id=toc-1 type=table_of_contents color=\"default\"}".to_string(),
+        }],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &undo_plan,
+        })
+        .expect("apply undo");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        *writes,
+        vec![append_call(
+            "paragraph-1",
+            json!({
+                "object": "block",
+                "type": "table_of_contents",
+                "table_of_contents": {
+                    "color": "default",
+                },
+            }),
+        )]
     );
 }
 

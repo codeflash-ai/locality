@@ -124,12 +124,47 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                 }
             }
             PushOperation::MoveBlock { block_id, .. } => {
-                match find_preimage_block_position(entry, block_id) {
-                    Some((_, after)) => operations.push(UndoOperation::MoveBlock {
-                        block_id: block_id.clone(),
-                        after,
-                    }),
-                    None => unsupported.push(missing_block_preimage(operation_index, block_id)),
+                let created_block_id = find_created_block_effect(entry, operation_index);
+                let archived_block_id = find_archived_block_effect(entry, operation_index);
+                let preimage_position = find_preimage_block_position(entry, block_id);
+                let preimage_block = find_preimage_block(entry, block_id);
+
+                match (
+                    created_block_id,
+                    archived_block_id,
+                    preimage_position,
+                    preimage_block,
+                ) {
+                    (Some(created_block_id), Some(archived_block_id), Some((shadow, after)), Some((_, block)))
+                        if archived_block_id == *block_id =>
+                    {
+                        operations.push(UndoOperation::ArchiveCreatedBlock {
+                            block_id: created_block_id,
+                        });
+                        operations.push(UndoOperation::RestoreArchivedBlock {
+                            block_id: block_id.clone(),
+                            parent_id: shadow.entity_id.clone(),
+                            after,
+                            content: block.text.clone(),
+                        });
+                    }
+                    (None, None, Some((_, after)), _) => {
+                        operations.push(UndoOperation::MoveBlock {
+                            block_id: block_id.clone(),
+                            after,
+                        });
+                    }
+                    (_, _, None, _) | (_, _, _, None) => {
+                        unsupported.push(missing_block_preimage(operation_index, block_id));
+                    }
+                    _ => unsupported.push(UnsupportedUndoOperation::new(
+                        operation_index,
+                        "move_block_incomplete_apply_effects",
+                        format!(
+                            "cannot undo moved block `{}` because its journaled apply effects are incomplete",
+                            block_id.0
+                        ),
+                    )),
                 }
             }
             PushOperation::ArchiveBlock { block_id } => {
@@ -274,6 +309,17 @@ fn missing_block_preimage(operation_index: usize, block_id: &RemoteId) -> Unsupp
 fn find_created_block_effect(entry: &JournalEntry, operation_index: usize) -> Option<RemoteId> {
     entry.apply_effects.iter().find_map(|effect| match effect {
         JournalApplyEffect::CreatedBlock {
+            operation_index: effect_operation_index,
+            block_id,
+            ..
+        } if *effect_operation_index == operation_index => Some(block_id.clone()),
+        _ => None,
+    })
+}
+
+fn find_archived_block_effect(entry: &JournalEntry, operation_index: usize) -> Option<RemoteId> {
+    entry.apply_effects.iter().find_map(|effect| match effect {
+        JournalApplyEffect::ArchivedBlock {
             operation_index: effect_operation_index,
             block_id,
             ..

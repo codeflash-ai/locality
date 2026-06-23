@@ -545,7 +545,7 @@ Human output is a compact git-log-style list headed by `push <push-id>`.
 - `reverted` entries return `already_reverted`;
 - `applied` and `reconciled` entries derive an `undo_plan` from journaled preimages and apply effects;
 - complete plans are handed to the connector reverse-apply hook, then marked `reverted` on success;
-- Notion currently returns `reverse_apply_not_implemented` with a `NotImplemented` message until its reverse API implementation exists;
+- Notion reverse apply supports block content restore, archiving journaled created blocks/entities, and restoring archived block content by appending a replacement at the original position when the public API cannot unarchive the original block;
 - `applying` and `failed` entries return `undo_unsafe_journal_status` because partial remote effects may still be in flight or unknown.
 
 Undo plans are `complete`, `partial`, or `blocked`. Complete plans currently include reverse operations for block updates, block moves, archived blocks, appended blocks with journaled created IDs, and created entities with journaled created IDs. Property updates and archived entities remain explicitly unsupported until richer property/entity preimages are journaled.

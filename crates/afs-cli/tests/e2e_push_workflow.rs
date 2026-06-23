@@ -498,6 +498,109 @@ fn live_directive_block_move_pushes_and_reconciles_notion() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_directive_block_move_undo_restores_remote_order() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let anchor_text = "Undo move anchor paragraph.";
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live directive move undo {}", unique_suffix()),
+        vec![
+            paragraph_child(anchor_text),
+            json!({
+                "object": "block",
+                "type": "table_of_contents",
+                "table_of_contents": { "color": "default" }
+            }),
+        ],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let before = live_block_snapshot(&connector, &scratch.id);
+    let table_of_contents_id = before
+        .as_array()
+        .and_then(|blocks| {
+            blocks.iter().find_map(|entry| {
+                (entry["block"]["type"] == "table_of_contents")
+                    .then(|| entry["block"]["id"].as_str())
+                    .flatten()
+            })
+        })
+        .expect("table_of_contents block id")
+        .to_string();
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    let directive_line = original
+        .lines()
+        .find(|line| line.contains(&table_of_contents_id))
+        .expect("table_of_contents directive line");
+    let original_order = format!("{anchor_text}\n\n{directive_line}\n");
+    assert!(original.contains(&original_order), "{original}");
+    fs::write(
+        &page_path,
+        original.replace(
+            &original_order,
+            &format!("{directive_line}\n\n{anchor_text}\n\n"),
+        ),
+    )
+    .expect("write live directive move for undo");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push live directive move for undo");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    let push_id = push.push_id.clone().expect("push id");
+    let moved = render_live_page(&connector, &scratch.id, &page_path);
+    let moved_directive_index = moved
+        .lines()
+        .position(|line| line.contains("type=table_of_contents"))
+        .expect("moved directive line");
+    let moved_anchor_index = moved
+        .lines()
+        .position(|line| line == anchor_text)
+        .expect("moved anchor paragraph");
+    assert!(moved_directive_index < moved_anchor_index, "{moved}");
+
+    let mut undo_applier = ConnectorUndoApplier::new(&connector);
+    let undo = run_undo_with_applier(&mut store, push_id.clone(), &mut undo_applier)
+        .expect("undo live directive move");
+    assert!(undo.ok, "{undo:#?}");
+    assert_eq!(undo.action, "reverse_applied", "{undo:#?}");
+    assert_eq!(undo.status, "reverted");
+    assert_eq!(undo.changed_remote_ids, vec![scratch.id.clone()]);
+
+    let restored = render_live_page(&connector, &scratch.id, &page_path);
+    let restored_anchor_index = restored
+        .lines()
+        .position(|line| line == anchor_text)
+        .expect("restored anchor paragraph");
+    let restored_directive_index = restored
+        .lines()
+        .position(|line| line.contains("type=table_of_contents"))
+        .expect("restored directive line");
+    assert!(
+        restored_anchor_index < restored_directive_index,
+        "{restored}"
+    );
+    assert_eq!(
+        restored
+            .lines()
+            .filter(|line| line.contains("type=table_of_contents"))
+            .count(),
+        1,
+        "{restored}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_link_to_page_line_move_preserves_notion_block_type() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());

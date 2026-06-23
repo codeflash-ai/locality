@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
 use afs_connector::{ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult};
+use afs_core::canonical::{Directive, parse_directive_line};
 use afs_core::journal::JournalApplyEffect;
 use afs_core::model::RemoteId;
 use afs_core::planner::{PropertyValue, PushOperation};
@@ -374,6 +375,15 @@ pub fn apply_undo(
             UndoOperation::ArchiveCreatedBlock { block_id } => {
                 api.delete_block(block_id.as_str())?;
             }
+            UndoOperation::RestoreArchivedBlock {
+                parent_id,
+                after,
+                content,
+                ..
+            } => {
+                let child = restore_archived_block_child(api, content)?;
+                api.append_block_children(parent_id.as_str(), append_body(child, after.as_ref()))?;
+            }
             UndoOperation::ArchiveCreatedEntity { entity_id } => {
                 api.delete_block(entity_id.as_str())?;
             }
@@ -384,6 +394,67 @@ pub fn apply_undo(
     Ok(ApplyUndoResult {
         changed_remote_ids: request.plan.affected_entities.clone(),
     })
+}
+
+fn restore_archived_block_child(api: &dyn NotionApi, content: &str) -> AfsResult<Value> {
+    let trimmed = content.trim();
+    if let Some(directive) = parse_directive_line(trimmed, 1) {
+        return restore_directive_child(&directive);
+    }
+
+    if let Some((label, href, consumed)) = parse_markdown_link(trimmed)
+        && consumed == trimmed.len()
+        && let Some(target_id) = notion_page_id_from_href(href)
+    {
+        match label.as_str() {
+            "Linked page" => {
+                return Ok(json!({
+                    "object": "block",
+                    "type": "link_to_page",
+                    "link_to_page": {
+                        "type": "page_id",
+                        "page_id": target_id,
+                    },
+                }));
+            }
+            "Linked database" => {
+                return Ok(json!({
+                    "object": "block",
+                    "type": "link_to_page",
+                    "link_to_page": {
+                        "type": "database_id",
+                        "database_id": target_id,
+                    },
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    parse_append_block(api, content, None).map(|patch| patch.append_child())
+}
+
+fn restore_directive_child(directive: &Directive) -> AfsResult<Value> {
+    let directive_type = directive.directive_type.as_deref().ok_or_else(|| {
+        AfsError::Unsupported("restoring archived Notion directive blocks without a type")
+    })?;
+    match directive_type {
+        "table_of_contents" => {
+            let payload = directive
+                .attributes
+                .get("color")
+                .map(|color| json!({ "color": color }))
+                .unwrap_or_else(|| json!({}));
+            Ok(json!({
+                "object": "block",
+                "type": "table_of_contents",
+                "table_of_contents": payload,
+            }))
+        }
+        _ => Err(AfsError::Unsupported(
+            "restoring this archived Notion directive block type",
+        )),
+    }
 }
 
 fn validate_operation_ids(request: &ApplyPlanRequest<'_>) -> AfsResult<()> {
