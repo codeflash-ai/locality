@@ -1263,6 +1263,7 @@ fn apply_undo_restores_archived_block_by_appending_replacement() {
             parent_id: RemoteId::new("page-1"),
             after: None,
             content: "Old paragraph.".to_string(),
+            native_kind: None,
         }],
         unsupported: vec![],
         status: UndoPlanStatus::Complete,
@@ -1299,6 +1300,66 @@ fn apply_undo_restores_archived_block_by_appending_replacement() {
 }
 
 #[test]
+fn apply_undo_restores_archived_paragraph_link_labeled_like_link_to_page_as_paragraph() {
+    let target_id = "11111111111111111111111111111111";
+    let api = Arc::new(RecordingNotionApi::with_blocks(
+        "2026-06-10T00:00:00.000Z",
+        vec![paragraph_block("paragraph-1", "Anchor.", false)],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let undo_plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![UndoOperation::RestoreArchivedBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            parent_id: RemoteId::new("page-1"),
+            after: None,
+            content: format!("[Linked page](https://www.notion.so/{target_id})"),
+            native_kind: Some("paragraph".to_string()),
+        }],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &undo_plan,
+        })
+        .expect("apply undo");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        *writes,
+        vec![WriteCall::Append {
+            block_id: "page-1".to_string(),
+            body: json!({
+                "children": [{
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [{
+                            "type": "mention",
+                            "mention": {
+                                "type": "page",
+                                "page": { "id": target_id },
+                            },
+                        }],
+                    },
+                }],
+                "position": {
+                    "type": "start",
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_undo_restores_archived_directive_by_appending_replacement() {
     let api = Arc::new(RecordingNotionApi::with_blocks(
         "2026-06-10T00:00:00.000Z",
@@ -1316,6 +1377,7 @@ fn apply_undo_restores_archived_directive_by_appending_replacement() {
             parent_id: RemoteId::new("page-1"),
             after: Some(RemoteId::new("paragraph-1")),
             content: "::afs{id=toc-1 type=table_of_contents color=\"default\"}".to_string(),
+            native_kind: None,
         }],
         unsupported: vec![],
         status: UndoPlanStatus::Complete,

@@ -123,7 +123,9 @@ Journal entries now include shadow preimages for affected entities. The undo pla
 - block replacements reverse to archiving the replacement block and restoring
   the original block from the preimage when the replacement ID was journaled;
 - block moves reverse to the previous sibling position;
-- archived blocks reverse to a restore operation with original content and position;
+- archived blocks reverse to a restore operation with original content, position,
+  and native block kind when the preimage carries it, so connectors can avoid
+  restoring Markdown lookalikes as the wrong native block type;
 - appends reverse to archiving the created block when apply journaled the created block ID;
 - created entities reverse to archiving the created entity when apply journaled the created entity ID;
 - property updates and archived entities are reported as unsupported until apply journals property/entity preimages.

@@ -367,6 +367,7 @@ impl From<UndoOperation> for UndoOperationOutput {
                 parent_id,
                 after,
                 content,
+                native_kind: _,
             } => Self::RestoreArchivedBlock {
                 block_id: block_id.0,
                 parent_id: parent_id.0,

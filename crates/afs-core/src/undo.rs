@@ -46,6 +46,8 @@ pub enum UndoOperation {
         parent_id: RemoteId,
         after: Option<RemoteId>,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_kind: Option<String>,
     },
     ArchiveCreatedBlock {
         block_id: RemoteId,
@@ -102,6 +104,7 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                             parent_id: shadow.entity_id.clone(),
                             after,
                             content: block.text.clone(),
+                            native_kind: block.native_kind.clone(),
                         });
                     }
                     (None, _, _) => unsupported.push(UnsupportedUndoOperation::new(
@@ -146,6 +149,7 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                             parent_id: shadow.entity_id.clone(),
                             after,
                             content: block.text.clone(),
+                            native_kind: block.native_kind.clone(),
                         });
                     }
                     (None, None, Some((_, after)), _) => {
@@ -179,6 +183,7 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                             parent_id: shadow.entity_id.clone(),
                             after,
                             content: block.text.clone(),
+                            native_kind: block.native_kind.clone(),
                         });
                     }
                     None => unsupported.push(missing_block_preimage(operation_index, block_id)),

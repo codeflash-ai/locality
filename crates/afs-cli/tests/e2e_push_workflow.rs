@@ -1452,6 +1452,75 @@ fn live_push_log_and_undo_restores_remote_content() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_undo_archive_restores_paragraph_link_without_link_to_page_promotion() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let target = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live undo paragraph link target {}", unique_suffix()),
+        vec![paragraph_child("Target for paragraph-link undo.")],
+    );
+    let target_url = notion_object_url(&target.id);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("AFS live undo paragraph link source {}", unique_suffix()),
+        vec![json!({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": { "rich_text": [linked_text_part("Linked page", &target_url)] }
+        })],
+    );
+    let connector = NotionConnector::new(NotionConfig::default());
+    let (_fixture, mut store, page_path, original) = pull_live_page(&connector, &scratch.id);
+    let link_line = format!("[Linked page]({target_url})");
+    assert!(original.contains(&link_line), "{original}");
+    fs::write(&page_path, original.replace(&format!("{link_line}\n"), ""))
+        .expect("archive paragraph link locally");
+
+    let diff = run_diff(&store, &page_path).expect("diff paragraph link archive");
+    let plan = diff.plan.as_ref().expect("paragraph link archive plan");
+    assert_eq!(plan.summary.blocks_archived, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push paragraph link archive");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+    let push_id = push.push_id.clone().expect("push id");
+
+    let archived = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(!archived.contains(&link_line), "{archived}");
+
+    let mut undo_applier = ConnectorUndoApplier::new(&connector);
+    let undo = run_undo_with_applier(&mut store, push_id.clone(), &mut undo_applier)
+        .expect("undo paragraph link archive");
+    assert!(undo.ok, "{undo:#?}");
+    assert_eq!(undo.action, "reverse_applied", "{undo:#?}");
+    assert_eq!(undo.status, "reverted");
+
+    let after = live_block_snapshot(&connector, &scratch.id);
+    let first = after
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .expect("restored paragraph-link block");
+    assert_eq!(first["block"]["type"], "paragraph", "{after:#?}");
+    let first_json = serde_json::to_string(first).expect("paragraph block json");
+    assert!(
+        first_json.contains(&target.id) || first_json.contains(&compact_notion_id(&target.id)),
+        "{after:#?}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and AFS_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_page_directory_create_pushes_child_page_and_refreshes_parent() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());

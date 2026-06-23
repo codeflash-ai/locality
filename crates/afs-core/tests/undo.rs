@@ -63,6 +63,33 @@ fn archive_block_reverses_to_restore_with_original_position() {
             parent_id: RemoteId::new("page-1"),
             after: Some(RemoteId::new("heading-1")),
             content: "Old paragraph.".to_string(),
+            native_kind: None,
+        }]
+    );
+}
+
+#[test]
+fn archive_block_restore_carries_native_kind_from_preimage() {
+    let mut shadow = shadow();
+    shadow.blocks[1].native_kind = Some("paragraph".to_string());
+    let entry = journal_entry_with_shadow(
+        vec![PushOperation::ArchiveBlock {
+            block_id: RemoteId::new("paragraph-1"),
+        }],
+        shadow,
+    );
+
+    let plan = plan_journal_undo(&entry);
+
+    assert_eq!(plan.status, UndoPlanStatus::Complete);
+    assert_eq!(
+        plan.operations,
+        vec![UndoOperation::RestoreArchivedBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("heading-1")),
+            content: "Old paragraph.".to_string(),
+            native_kind: Some("paragraph".to_string()),
         }]
     );
 }
@@ -128,6 +155,7 @@ fn copy_archive_move_reverses_to_archive_copy_then_restore_original() {
                 parent_id: RemoteId::new("page-1"),
                 after: Some(RemoteId::new("heading-1")),
                 content: "Old paragraph.".to_string(),
+                native_kind: None,
             },
         ]
     );
@@ -249,6 +277,7 @@ fn replace_block_reverses_to_archive_replacement_then_restore_original() {
                 parent_id: RemoteId::new("page-1"),
                 after: Some(RemoteId::new("heading-1")),
                 content: "Old paragraph.".to_string(),
+                native_kind: None,
             },
         ]
     );

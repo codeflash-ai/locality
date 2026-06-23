@@ -380,9 +380,10 @@ pub fn apply_undo(
                 parent_id,
                 after,
                 content,
+                native_kind,
                 ..
             } => {
-                let child = restore_archived_block_child(api, content)?;
+                let child = restore_archived_block_child(api, content, native_kind.as_deref())?;
                 api.append_block_children(parent_id.as_str(), append_body(child, after.as_ref()))?;
             }
             UndoOperation::ArchiveCreatedEntity { entity_id } => {
@@ -397,13 +398,18 @@ pub fn apply_undo(
     })
 }
 
-fn restore_archived_block_child(api: &dyn NotionApi, content: &str) -> AfsResult<Value> {
+fn restore_archived_block_child(
+    api: &dyn NotionApi,
+    content: &str,
+    native_kind: Option<&str>,
+) -> AfsResult<Value> {
     let trimmed = content.trim();
     if let Some(directive) = parse_directive_line(trimmed, 1) {
         return restore_directive_child(&directive);
     }
 
-    if let Some((label, href, consumed)) = parse_markdown_link(trimmed)
+    if native_kind.unwrap_or("link_to_page") == "link_to_page"
+        && let Some((label, href, consumed)) = parse_markdown_link(trimmed)
         && consumed == trimmed.len()
         && let Some(target_id) = notion_page_id_from_href(href)
     {
