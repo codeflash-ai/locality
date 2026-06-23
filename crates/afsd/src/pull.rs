@@ -16,7 +16,8 @@ use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, TreeEntry};
 use afs_core::path_projection::{is_page_document_path, page_container_path};
 use afs_core::shadow::ShadowDocument;
 use afs_store::{
-    EntityRecord, EntityRepository, MountConfig, MountRepository, ShadowRepository, StoreError,
+    EntityRecord, EntityRepository, MountConfig, MountRepository, ProjectionMode, ShadowRepository,
+    StoreError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -764,9 +765,27 @@ where
 
 fn pull_conflict(mount: &MountConfig, entity: &EntityRecord) -> PullConflict {
     PullConflict {
-        path: mount.root.join(&entity.path).display().to_string(),
+        path: projected_report_path(mount, &entity.path)
+            .display()
+            .to_string(),
         remote_id: entity.remote_id.0.clone(),
     }
+}
+
+fn projected_report_path(mount: &MountConfig, relative_path: &Path) -> PathBuf {
+    if matches!(
+        mount.projection,
+        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
+    ) {
+        return mount
+            .root
+            .join(crate::virtual_fs::source_root_directory_name(
+                &mount.connector,
+            ))
+            .join(relative_path);
+    }
+
+    mount.root.join(relative_path)
 }
 
 fn hydrated_record(

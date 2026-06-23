@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use afs_cli::mount::{MountOptions, run_mount};
 use afs_cli::pull::{run_pull, run_pull_with_state_root};
@@ -13,7 +13,6 @@ use afs_core::conflict::{
     has_unresolved_conflict_markers,
 };
 use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
-use afs_core::shadow::ShadowDocument;
 use afs_notion::client::NotionApi;
 use afs_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
@@ -265,7 +264,7 @@ fn pull_macos_file_provider_refreshes_clean_visible_replica_after_conflict_pull(
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed clean visible replica");
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(std::time::Duration::from_millis(20));
     fs::write(
         &content_path,
         render_canonical_markdown(&CanonicalDocument::new(
@@ -332,7 +331,7 @@ fn pull_macos_file_provider_preserves_older_visible_replica_after_cache_fast_for
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed stale visible replica");
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(std::time::Duration::from_millis(20));
     seed_remote_fast_forward_cache(
         &mut store,
         &content_path,
@@ -399,7 +398,7 @@ fn pull_macos_file_provider_preserves_older_visible_edit_after_cache_fast_forwar
         "---\nafs:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal visible edit.\n",
     )
     .expect("missed visible edit");
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(std::time::Duration::from_millis(20));
     seed_remote_fast_forward_cache(
         &mut store,
         &content_path,
@@ -490,6 +489,58 @@ fn pull_virtual_file_accepts_source_directory_target() {
             .join("roadmap/design-notes/page.md")
             .exists()
     );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn pull_virtual_file_conflict_reports_source_directory_path() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    let connector = fixture.connector("Roadmap");
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("initial pull");
+
+    let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
+        .join("roadmap")
+        .join("page.md");
+    fs::write(
+        &content_path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            root_frontmatter(&fixture.canonical_root_page_id, "2026-06-10T00:00:00.000Z"),
+            "Local conflict body.".to_string(),
+        )),
+    )
+    .expect("write dirty daemon cache");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get root entity")
+        .expect("root entity");
+    entity.hydration = HydrationState::Dirty;
+    store.save_entity(entity).expect("mark cache dirty");
+
+    let target = fixture.source_root().join("roadmap").join("page.md");
+    let report = run_pull_with_state_root(
+        &mut store,
+        &fixture.connector_with(
+            "Roadmap",
+            "Remote conflict body.",
+            "2026-06-11T00:00:00.000Z",
+        ),
+        &target,
+        Some(&state_root),
+    )
+    .expect("pull conflicted virtual file");
+
+    assert!(!report.ok);
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(report.conflicts[0].path, target.display().to_string());
+    let contents = fs::read_to_string(&content_path).expect("read conflict cache");
+    assert!(contents.contains("Local conflict body."));
+    assert!(contents.contains("Remote conflict body."));
+    assert!(contents.contains(CONFLICT_LOCAL_MARKER));
 
     let _ = fs::remove_dir_all(state_root);
 }
@@ -1024,6 +1075,7 @@ fn unique_temp_path(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}-{unique}-{suffix}", std::process::id()))
 }
 
+#[cfg(target_os = "macos")]
 fn seed_remote_fast_forward_cache(
     store: &mut InMemoryStateStore,
     content_path: &PathBuf,
@@ -1032,7 +1084,7 @@ fn seed_remote_fast_forward_cache(
     body: &str,
 ) {
     let markdown_body = format!("# Roadmap\n\n{body}\n");
-    let shadow = ShadowDocument::from_synced_body(
+    let shadow = afs_core::shadow::ShadowDocument::from_synced_body(
         remote_id.clone(),
         markdown_body.clone(),
         7,
