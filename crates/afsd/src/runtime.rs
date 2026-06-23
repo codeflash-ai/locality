@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use afs_connector::{Connector, ObserveRequest};
 use afs_core::AfsError;
 use afs_core::canonical::parse_canonical_markdown;
-use afs_core::freshness::{ChangeHintKind, RemoteObservation, SyncJob, SyncJobKind};
+use afs_core::freshness::{ChangeHintKind, FreshnessTier, RemoteObservation, SyncJob, SyncJobKind};
 use afs_core::hydration::{HydrationPolicy, HydrationReason, HydrationRequest};
 use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use afs_core::pull::PullMode;
@@ -35,7 +35,8 @@ use crate::autosave::{auto_save_target_for_write, pause_auto_save_for_remote_cha
 use crate::execution::{DaemonEventReport, PushJob};
 use crate::file_provider::{self, FileProviderReadReport};
 use crate::freshness::{
-    FreshnessQueue, freshness_timestamp, record_file_opened, record_local_change,
+    FreshnessQueue, freshness_timestamp, parse_freshness_timestamp, record_file_opened,
+    record_local_change,
 };
 use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationQueue};
 use crate::ipc::{DaemonActiveJobStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
@@ -66,6 +67,7 @@ pub struct DaemonRuntimeHandle {
 
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const FRESHNESS_JOB_BUDGET_UNITS: u16 = 5;
+const MAX_WORKSPACE_FRESHNESS_JOBS_PER_TICK: usize = 100;
 const AUTO_FAST_FORWARD_ACTIVE_LEASE_MS: u64 = 30_000;
 const MAX_CHILD_REFRESH_WORKERS: usize = 3;
 const MAX_BACKGROUND_CHILD_REFRESH_WORKERS: usize = 2;
@@ -379,6 +381,7 @@ pub struct FileEventRuntimeReport {
 pub struct ScheduledPullRuntimeReport {
     pub report: ScheduledPullReport,
     pub queued_hydrations: Vec<HydrationRequest>,
+    pub freshness_jobs: Vec<SyncJob>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -482,10 +485,12 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             &policy,
             Some(&state_root),
         )?;
+        let freshness_jobs = workspace_virtual_freshness_jobs(&store, &mounts, &tick)?;
 
         Ok(ScheduledPullRuntimeReport {
             report,
             queued_hydrations: hydration.into_requests(),
+            freshness_jobs,
         })
     }
 
@@ -1470,6 +1475,9 @@ impl RuntimeState {
                     for request in result.queued_hydrations {
                         self.queue_hydration(request);
                     }
+                    for job in result.freshness_jobs {
+                        self.queue_freshness(job);
+                    }
                 }
                 Err(error) => eprintln!("afsd scheduled pull failed: {error}"),
             },
@@ -2109,6 +2117,198 @@ fn active_lease_until(freshness: &FreshnessStateRecord, now: &str) -> Option<Str
 
 fn parse_unix_ms(value: &str) -> Option<u64> {
     value.strip_prefix("unix_ms:")?.parse().ok()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceFreshnessCandidate {
+    mount_id: MountId,
+    remote_id: RemoteId,
+    path: PathBuf,
+    reason: ChangeHintKind,
+    tier: FreshnessTier,
+    last_checked_at: Option<String>,
+}
+
+/// Select bounded per-page freshness checks for desktop workspace virtual mounts.
+///
+/// Workspace-level virtual projections avoid scheduled full enumeration. This
+/// helper uses only already-known local state so active or hydrated pages can
+/// still be observed without crawling the workspace.
+pub fn workspace_virtual_freshness_jobs<S>(
+    store: &S,
+    mounts: &[MountConfig],
+    tick: &PullSchedulerTick,
+) -> afs_core::AfsResult<Vec<SyncJob>>
+where
+    S: EntityRepository + FreshnessStateRepository,
+{
+    if tick.is_idle() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = Vec::new();
+    for mount in mounts
+        .iter()
+        .filter(|mount| is_workspace_virtual_mount(mount))
+    {
+        let freshness_by_remote_id = store
+            .list_freshness_states(&mount.mount_id)
+            .map_err(AfsError::from)?
+            .into_iter()
+            .map(|state| (state.remote_id.clone(), state))
+            .collect::<BTreeMap<_, _>>();
+
+        for entity in store
+            .list_entities(&mount.mount_id)
+            .map_err(AfsError::from)?
+        {
+            if !is_workspace_freshness_entity(&entity) {
+                continue;
+            }
+
+            let freshness = freshness_by_remote_id
+                .get(&entity.remote_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    FreshnessStateRecord::new(
+                        entity.mount_id.clone(),
+                        entity.remote_id.clone(),
+                        default_workspace_freshness_tier(&entity),
+                    )
+                });
+            let selected_by_active_tick =
+                tick.poll_active && is_active_workspace_freshness_candidate(&entity, &freshness);
+            let selected_by_cold_tick = tick.poll_cold;
+            if !selected_by_active_tick && !selected_by_cold_tick {
+                continue;
+            }
+
+            let reason = workspace_freshness_reason(&entity, &freshness, selected_by_active_tick);
+            let tier = workspace_freshness_tier(&entity, &freshness, &reason);
+            candidates.push(WorkspaceFreshnessCandidate {
+                mount_id: entity.mount_id,
+                remote_id: entity.remote_id,
+                path: entity.path,
+                reason,
+                tier,
+                last_checked_at: freshness.last_checked_at,
+            });
+        }
+    }
+
+    candidates.sort_by(compare_workspace_freshness_candidates);
+    candidates.truncate(MAX_WORKSPACE_FRESHNESS_JOBS_PER_TICK);
+
+    Ok(candidates
+        .into_iter()
+        .map(|candidate| {
+            SyncJob::new(
+                candidate.mount_id,
+                Some(candidate.remote_id),
+                SyncJobKind::ObserveEntity,
+                candidate.reason,
+            )
+            .with_tier(candidate.tier)
+        })
+        .collect())
+}
+
+fn is_workspace_virtual_mount(mount: &MountConfig) -> bool {
+    mount.projection.uses_virtual_filesystem() && mount.remote_root_id.is_none()
+}
+
+fn is_workspace_freshness_entity(entity: &EntityRecord) -> bool {
+    entity.kind == EntityKind::Page
+        && matches!(
+            entity.hydration,
+            HydrationState::Hydrated | HydrationState::Dirty | HydrationState::Conflicted
+        )
+}
+
+fn is_active_workspace_freshness_candidate(
+    entity: &EntityRecord,
+    freshness: &FreshnessStateRecord,
+) -> bool {
+    matches!(
+        entity.hydration,
+        HydrationState::Dirty | HydrationState::Conflicted
+    ) || freshness.remote_hint_pending
+        || matches!(
+            freshness.tier,
+            FreshnessTier::Immediate | FreshnessTier::Hot
+        )
+}
+
+fn workspace_freshness_reason(
+    entity: &EntityRecord,
+    freshness: &FreshnessStateRecord,
+    selected_by_active_tick: bool,
+) -> ChangeHintKind {
+    if matches!(
+        entity.hydration,
+        HydrationState::Dirty | HydrationState::Conflicted
+    ) {
+        return ChangeHintKind::LocalEdited;
+    }
+    if freshness.remote_hint_pending {
+        return ChangeHintKind::RemoteMaybeChanged;
+    }
+    if selected_by_active_tick {
+        return ChangeHintKind::FileOpened;
+    }
+    ChangeHintKind::BackgroundPoll
+}
+
+fn workspace_freshness_tier(
+    entity: &EntityRecord,
+    freshness: &FreshnessStateRecord,
+    reason: &ChangeHintKind,
+) -> FreshnessTier {
+    let mut tier = freshness.tier.clone();
+    let reason_tier = reason.recommended_tier();
+    if reason_tier.is_more_urgent_than(&tier) {
+        tier = reason_tier;
+    }
+    let default_tier = default_workspace_freshness_tier(entity);
+    if default_tier.is_more_urgent_than(&tier) {
+        tier = default_tier;
+    }
+    tier
+}
+
+fn default_workspace_freshness_tier(entity: &EntityRecord) -> FreshnessTier {
+    match entity.hydration {
+        HydrationState::Dirty | HydrationState::Conflicted => FreshnessTier::Hot,
+        HydrationState::Hydrated => FreshnessTier::Warm,
+        HydrationState::Virtual | HydrationState::Stub => FreshnessTier::Cold,
+    }
+}
+
+fn compare_workspace_freshness_candidates(
+    left: &WorkspaceFreshnessCandidate,
+    right: &WorkspaceFreshnessCandidate,
+) -> std::cmp::Ordering {
+    left.tier
+        .cmp(&right.tier)
+        .then_with(|| compare_workspace_last_checked(&left.last_checked_at, &right.last_checked_at))
+        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| left.mount_id.cmp(&right.mount_id))
+        .then_with(|| left.remote_id.cmp(&right.remote_id))
+}
+
+fn compare_workspace_last_checked(
+    left: &Option<String>,
+    right: &Option<String>,
+) -> std::cmp::Ordering {
+    match (
+        left.as_deref().and_then(parse_freshness_timestamp),
+        right.as_deref().and_then(parse_freshness_timestamp),
+    ) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left), Some(right)) => left.cmp(&right),
+    }
 }
 
 fn run_job(
