@@ -497,6 +497,20 @@ where
         Ok(PathBuf::from(report.path))
     }
 
+    fn trash_path(&self, path: &Path, expected_kind: VirtualFsItemKind) -> Result<(), FuseError> {
+        let item = self.resolve_path(path)?;
+        if item.kind != expected_kind {
+            return Err(match expected_kind {
+                VirtualFsItemKind::File => FuseError::NotFile,
+                VirtualFsItemKind::Folder => FuseError::NotDirectory,
+            });
+        }
+        ensure_writable_item(&item)?;
+        self.client.trash(&item.identifier)?;
+        self.remove_cached_path(path);
+        Ok(())
+    }
+
     fn update_cached_materialized_path(&self, identifier: &str, materialized_path: &str) {
         let mut cache = self.cache.lock().expect("fuse item cache");
         let byte_size = std::fs::metadata(materialized_path)
@@ -933,13 +947,13 @@ where
 
     async fn unlink(&self, _req: Request, parent: &OsStr, name: &OsStr) -> FuseResult<()> {
         let path = child_path(Path::new(parent), &name.to_string_lossy());
-        let item = self.resolve_path(&path)?;
-        if item.kind != VirtualFsItemKind::File {
-            return Err(FuseError::NotFile.into());
-        }
-        ensure_writable_item(&item)?;
-        self.client.trash(&item.identifier)?;
-        self.remove_cached_path(&path);
+        self.trash_path(&path, VirtualFsItemKind::File)?;
+        Ok(())
+    }
+
+    async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> FuseResult<()> {
+        let path = child_path(Path::new(parent), &name.to_string_lossy());
+        self.trash_path(&path, VirtualFsItemKind::Folder)?;
         Ok(())
     }
 
@@ -1186,6 +1200,7 @@ fn attr_time_for_item(item: &VirtualFsItem) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     #[test]
     fn folder_attrs_do_not_stat_materialized_path() {
@@ -1280,6 +1295,7 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
+                trashed: RefCell::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::new()),
             handles: Mutex::new(BTreeMap::new()),
@@ -1327,6 +1343,7 @@ mod tests {
                         )],
                     ),
                 ]),
+                trashed: RefCell::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([
                 (PathBuf::from(ROOT_PATH), root),
@@ -1350,6 +1367,41 @@ mod tests {
                 .get(Path::new("/Page/Draft/page.md"))
                 .map(|item| item.identifier.as_str()),
             Some("page-draft")
+        );
+    }
+
+    #[test]
+    fn trash_path_accepts_folder_items_for_page_directory_delete() {
+        let root = test_root_item();
+        let page_dir = test_named_item("children:page-draft", "Draft", VirtualFsItemKind::Folder);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::new(),
+                trashed: RefCell::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Draft"), page_dir),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        fs.trash_path(Path::new("/Draft"), VirtualFsItemKind::Folder)
+            .expect("trash folder");
+
+        assert_eq!(
+            fs.client.trashed.borrow().as_slice(),
+            &["children:page-draft".to_string()]
+        );
+        assert!(
+            !fs.cache
+                .lock()
+                .expect("fuse item cache")
+                .contains_key(Path::new("/Draft"))
         );
     }
 
@@ -1413,6 +1465,7 @@ mod tests {
         mount_id: String,
         root: VirtualFsItem,
         children: BTreeMap<String, Vec<VirtualFsItem>>,
+        trashed: RefCell<Vec<String>>,
     }
 
     impl VirtualFsClient for FakeClient {
@@ -1492,7 +1545,13 @@ mod tests {
         }
 
         fn trash(&self, _identifier: &str) -> Result<VirtualFsMutationReport, FuseError> {
-            Err(FuseError::Daemon("unexpected trash request".to_string()))
+            self.trashed.borrow_mut().push(_identifier.to_string());
+            Ok(VirtualFsMutationReport {
+                mount_id: self.mount_id.clone(),
+                identifier: _identifier.to_string(),
+                path: _identifier.to_string(),
+                item: test_named_item(_identifier, _identifier, VirtualFsItemKind::Folder),
+            })
         }
     }
 
