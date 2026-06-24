@@ -1,7 +1,7 @@
 # Local Diagnostics Log Strategy
 
 This is the working plan for a local-first diagnostics trail that helps users and
-support debug AgentFS without leaking workspace data or slowing normal sync.
+support debug Locality without leaking workspace data or slowing normal sync.
 
 ## Goals
 
@@ -17,13 +17,13 @@ support debug AgentFS without leaking workspace data or slowing normal sync.
 
 ## Event Sources
 
-AgentFS already has partial activity and journal data. The next reliable shape is
+Locality already has partial activity and journal data. The next reliable shape is
 to normalize these sources into ordered local events:
 
 | Source | Examples | Storage now | Target |
 | --- | --- | --- | --- |
 | Desktop app | connect, change access, create mount, repair, open folder, user-triggered push | `desktop-activity.json` | rolling JSONL plus UI activity projection |
-| Daemon | start, stop, reload mounts, socket ping, hydration queue, scheduled pull | `~/.afs/logs/afsd.log` | structured JSONL with source sequence |
+| Daemon | start, stop, reload mounts, socket ping, hydration queue, scheduled pull | `~/.loc/logs/localityd.log` | structured JSONL with source sequence |
 | Push journal | planned ops, confirmation boundary, apply success/failure | SQLite journals | redacted summary events linked by journal id |
 | File provider | provider registration, materialization, unavailable states | platform-specific logs | normalized provider lifecycle events |
 | Connector | request class, status, retry, rate limit, auth failure | mixed stderr/errors | sanitized connector operation events |
@@ -35,10 +35,10 @@ to normalize these sources into ordered local events:
 Use the state root as the only default location:
 
 ```text
-~/.afs/
+~/.loc/
   logs/
     desktop.jsonl
-    afsd.jsonl
+    localityd.jsonl
     provider.jsonl
     connector.jsonl
     autosave.jsonl
@@ -58,7 +58,7 @@ The JSONL shape should stay stable enough for support tooling:
   "event": "mount.open_folder.failed",
   "mount_id": "notion-main",
   "connector": "notion",
-  "path": "/Users/example/Library/CloudStorage/AFS-AFS/notion",
+  "path": "/Users/example/Library/CloudStorage/Locality-Locality/notion",
   "message": "Could not open folder",
   "code": "open_folder_failed"
 }
@@ -81,25 +81,25 @@ The JSONL shape should stay stable enough for support tooling:
 Add a future command:
 
 ```bash
-afs logs collect --since 24h --out ~/Desktop/afs-support.zip
+loc logs collect --since 24h --out ~/Desktop/loc-support.zip
 ```
 
 The collector should:
 
 1. Read all JSONL log files and journal summaries.
-2. Add `afs doctor --json` output.
+2. Add `loc doctor --json` output.
 3. Add mount and connection metadata without secrets.
 4. Sort entries by timestamp, then by source sequence.
 5. Write both `timeline.jsonl` and a human `timeline.md`.
-6. Include a manifest with AgentFS version, OS, state schema version, and redaction mode.
+6. Include a manifest with Locality version, OS, state schema version, and redaction mode.
 
 This gives support a single chronological view like:
 
 ```text
 10:12:00 desktop mount created
-10:12:03 afsd reload_mounts failed unsupported schema version 10
+10:12:03 localityd reload_mounts failed unsupported schema version 10
 10:12:05 desktop repair requested
-10:12:08 afsd listening
+10:12:08 localityd listening
 10:13:21 autosave blocked remote_changed
 ```
 
@@ -120,7 +120,7 @@ relevant timeline slice so users do not have to search raw files.
 
 ## Implementation Phases
 
-1. Add a small `afs-diagnostics` crate or shared module with `DiagnosticEvent`,
+1. Add a small `loc-diagnostics` crate or shared module with `DiagnosticEvent`,
    redaction, rotation, and append-only JSONL writer.
 2. Convert desktop activity writes to emit structured events while keeping the
    current activity projection.
@@ -128,7 +128,7 @@ relevant timeline slice so users do not have to search raw files.
    and auto-save boundaries.
 4. Add connector event hooks for request class, status code, retry, auth, and
    rate-limit outcomes.
-5. Implement `afs logs collect` and wire `Export Support Bundle` in the desktop
+5. Implement `loc logs collect` and wire `Export Support Bundle` in the desktop
    diagnostics panel.
 6. Add an indexed diagnostics view only after JSONL volume or filtering needs it.
 

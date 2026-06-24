@@ -7,7 +7,7 @@ const DEFAULT_NOTION_REDIRECT_URIS = [
 ];
 
 export function allowedNotionRedirectUris(env: BrokerEnv): string[] {
-  return splitList(env.AFS_NOTION_REDIRECT_URIS) ?? DEFAULT_NOTION_REDIRECT_URIS;
+  return splitList(env.LOCALITY_NOTION_REDIRECT_URIS) ?? DEFAULT_NOTION_REDIRECT_URIS;
 }
 
 export function validateNotionRedirectUri(env: BrokerEnv, redirectUri: string): string {

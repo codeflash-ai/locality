@@ -1,6 +1,6 @@
-# AFS Agent Guide
+# Locality Agent Guide
 
-AFS turns remote systems of record, especially Notion, into local files that can
+Locality turns remote systems of record, especially Notion, into local files that can
 be read, edited, reviewed, and safely pushed back. This repo is organized around
 that filesystem contract.
 
@@ -13,7 +13,7 @@ that filesystem contract.
   directories.
 - The containing directory determines the remote parent. Do not infer parents
   from search or titles.
-- Preserve existing AFS frontmatter unless the task is explicitly about
+- Preserve existing Locality frontmatter unless the task is explicitly about
   identity, migration, or rendering.
 
 ## Working In This Repo
@@ -51,10 +51,10 @@ that filesystem contract.
 
 - Live Mode is the desktop background sync loop. When it is enabled, safe local
   edits can be pushed and clean remote changes can be pulled without an agent
-  manually running `afs pull` or `afs push` after every file edit.
+  manually running `loc pull` or `loc push` after every file edit.
 - Agent guidance should tell agents to edit mounted Markdown directly and stop
-  unless the user asks for review or push. Use `afs status`/`afs diff` for
-  inspection; reserve `afs pull`/`afs push` for explicit requests, recovery, or
+  unless the user asks for review or push. Use `loc status`/`loc diff` for
+  inspection; reserve `loc pull`/`loc push` for explicit requests, recovery, or
   cases where Live Mode reports paused/review-needed/conflicted state.
 - Live Mode must stay conservative. It should pause for conflicts, remote drift,
   destructive or large plans, unsupported operations, and anything requiring
@@ -64,7 +64,7 @@ that filesystem contract.
 
 - The CloudStorage-visible file, the File Provider local replica, and daemon
   state can diverge. When debugging writes, verify both the visible file and
-  `afs status`/`afs diff`.
+  `loc status`/`loc diff`.
 - Atomic writes through temp files and renames are normal editor and agent
   behavior; File Provider and daemon paths should support them.
 - For File Provider changes, a passing build is not enough. Verify the installed

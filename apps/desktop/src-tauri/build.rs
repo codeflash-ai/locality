@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=AFS_BUILD_ID_OVERRIDE");
-    println!("cargo:rerun-if-env-changed=AFS_DESKTOP_BUILD_ID_OVERRIDE");
-    println!("cargo:rerun-if-env-changed=AFS_DISTRIBUTION_CHANNEL");
+    println!("cargo:rerun-if-env-changed=LOCALITY_BUILD_ID_OVERRIDE");
+    println!("cargo:rerun-if-env-changed=LOCALITY_DESKTOP_BUILD_ID_OVERRIDE");
+    println!("cargo:rerun-if-env-changed=LOCALITY_DISTRIBUTION_CHANNEL");
     println!("cargo:rerun-if-changed=build.rs");
     let workspace = workspace_root();
     println!(
@@ -16,13 +16,13 @@ fn main() {
         "cargo:rerun-if-changed={}",
         workspace.join(".git/index").display()
     );
-    let build_id = env::var("AFS_DESKTOP_BUILD_ID_OVERRIDE")
-        .or_else(|_| env::var("AFS_BUILD_ID_OVERRIDE"))
+    let build_id = env::var("LOCALITY_DESKTOP_BUILD_ID_OVERRIDE")
+        .or_else(|_| env::var("LOCALITY_BUILD_ID_OVERRIDE"))
         .unwrap_or_else(|_| git_build_id(&workspace));
-    println!("cargo:rustc-env=AFS_DESKTOP_BUILD_ID={build_id}");
+    println!("cargo:rustc-env=LOCALITY_DESKTOP_BUILD_ID={build_id}");
     let distribution_channel =
-        env::var("AFS_DISTRIBUTION_CHANNEL").unwrap_or_else(|_| "direct".to_string());
-    println!("cargo:rustc-env=AFS_DISTRIBUTION_CHANNEL={distribution_channel}");
+        env::var("LOCALITY_DISTRIBUTION_CHANNEL").unwrap_or_else(|_| "direct".to_string());
+    println!("cargo:rustc-env=LOCALITY_DISTRIBUTION_CHANNEL={distribution_channel}");
 
     tauri_build::build();
 }

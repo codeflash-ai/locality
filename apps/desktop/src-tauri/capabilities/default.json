@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default permissions for the AFS desktop window",
+  "description": "Default permissions for the Locality desktop window",
   "windows": ["main", "tray"],
   "permissions": [
     "core:window:allow-hide",

@@ -2,7 +2,7 @@
 
 ## Goals
 
-- Do not ship provider client secrets in the AFS CLI.
+- Do not ship provider client secrets in the Locality CLI.
 - Keep the local desktop OAuth UX seamless.
 - Avoid broker-side persistence of user content or tokens in the initial design.
 - Make the broker reusable for future confidential OAuth connectors.
@@ -11,7 +11,7 @@
 
 - The broker is not a content relay.
 - The broker is not an account system.
-- The broker does not prove that the caller is the official AFS binary. Open
+- The broker does not prove that the caller is the official Locality binary. Open
   source desktop clients cannot keep such an attestation secret.
 
 ## Secret Handling
@@ -43,18 +43,18 @@ The broker supports two refresh modes:
 
 The broker intentionally exposes a narrow token-exchange API. Anyone can call
 it, but a successful exchange still requires a valid provider authorization code
-or refresh handle for the AFS OAuth app.
+or refresh handle for the Locality OAuth app.
 
 Deployment controls to add before public launch:
 
 - provider-specific rate limits on `/exchange` and `/refresh`;
 - structured logs that exclude request bodies and Authorization headers;
 - alerting on OAuth error spikes;
-- optional per-release client metadata so abuse can be segmented by AFS version;
+- optional per-release client metadata so abuse can be segmented by Locality version;
 - strict redirect URI allowlists.
 
 ## Redirects
 
-The broker accepts only configured loopback redirect URIs for Notion. The AFS
+The broker accepts only configured loopback redirect URIs for Notion. The Locality
 CLI should use a stable localhost callback so the Notion integration can keep a
 small static redirect allowlist.

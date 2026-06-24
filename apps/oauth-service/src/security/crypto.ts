@@ -62,12 +62,12 @@ export async function encryptJsonHandle(value: unknown, secret: string): Promise
   crypto.getRandomValues(iv);
   const plaintext = encoder.encode(JSON.stringify(value));
   const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
-  return `afsrh_v1.${base64UrlEncode(iv)}.${base64UrlEncode(new Uint8Array(ciphertext))}`;
+  return `locrh_v1.${base64UrlEncode(iv)}.${base64UrlEncode(new Uint8Array(ciphertext))}`;
 }
 
 export async function decryptJsonHandle<T>(handle: string, secret: string): Promise<T> {
   const [prefix, ivText, ciphertextText] = handle.split(".");
-  if (prefix !== "afsrh_v1" || !ivText || !ciphertextText) {
+  if (prefix !== "locrh_v1" || !ivText || !ciphertextText) {
     throw new Error("invalid refresh handle");
   }
   const key = await aesKey(secret);

@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![allow(clippy::items_after_test_module)]
 
 use std::collections::BTreeMap;
 use std::env;
@@ -17,67 +18,69 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use afs_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
-use afs_cli::daemon::{DaemonRunState, run_daemon_control};
-use afs_cli::diff::{DiffReport, run_diff};
+use loc_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
+use loc_cli::daemon::{DaemonRunState, run_daemon_control};
+use loc_cli::diff::{DiffReport, run_diff};
 #[cfg(target_os = "windows")]
-use afs_cli::file_provider::{
+use loc_cli::file_provider::{
     WindowsCloudFilesLifecycleAction, open_windows_cloud_files_sync_root,
     register_windows_cloud_files_sync_root, run_windows_cloud_files_lifecycle,
 };
 #[cfg(target_os = "macos")]
-use afs_cli::file_provider::{
+use loc_cli::file_provider::{
     macos_file_provider_domain_url, open_macos_file_provider_domain,
     register_macos_file_provider_domain, run_macos_file_provider_helper,
 };
-use afs_cli::local_oauth::run_local_oauth_authorization;
-use afs_cli::mount::{MountOptions, run_mount};
-use afs_cli::pull::{PullReport, run_pull_with_state_root};
-use afs_cli::push::{
+use loc_cli::local_oauth::run_local_oauth_authorization;
+use loc_cli::mount::{MountOptions, run_mount};
+use loc_cli::pull::{PullReport, run_pull_with_state_root};
+use loc_cli::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
 };
-use afs_cli::search::{
+use loc_cli::search::{
     SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
 };
 #[cfg(test)]
-use afs_cli::status::StatusState;
+use loc_cli::status::StatusState;
 #[cfg(test)]
-use afs_cli::status::StatusSyncState;
-use afs_core::canonical::parse_canonical_markdown;
-use afs_core::conflict::has_unresolved_conflict_markers;
-use afs_core::hydration::{HydrationReason, HydrationRequest};
-use afs_core::journal::{JournalEntry, JournalStatus};
-use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use loc_cli::status::StatusSyncState;
+use locality_core::canonical::parse_canonical_markdown;
+use locality_core::conflict::has_unresolved_conflict_markers;
+use locality_core::hydration::{HydrationReason, HydrationRequest};
+use locality_core::journal::{JournalEntry, JournalStatus};
+use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 #[cfg(test)]
-use afs_notion::NotionConfig;
+use locality_notion::NotionConfig;
 #[cfg(test)]
-use afs_notion::client::{HttpNotionApi, NotionApi};
+use locality_notion::client::{HttpNotionApi, NotionApi};
 #[cfg(test)]
-use afs_notion::dto::{BlockDto, RichTextBlockDto, RichTextDto};
+use locality_notion::dto::{BlockDto, RichTextBlockDto, RichTextDto};
 #[cfg(test)]
-use afs_notion::oauth::StoredNotionCredential;
-use afs_notion::oauth::{
-    DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
+use locality_notion::oauth::StoredNotionCredential;
+use locality_notion::oauth::{
+    DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
-use afs_platform::{
+use locality_platform::{
     append_service_log, bundled_binary_next_to_current_exe,
     default_state_root as platform_default_state_root, logs_dir as platform_logs_dir,
     user_home as platform_user_home,
 };
-use afs_store::{
+use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository, open_credential_store,
 };
-use afsd::autosave::auto_save_timestamp;
-use afsd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
-use afsd::hydration::{HydrationExecutor, HydrationOutcome, HydrationSource};
-use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
-use afsd::push::execute_auto_save_push_job_with_content_root;
-use afsd::source::{resolve_source_for_mount_id, resolve_source_for_path, source_display_name};
-use afsd::virtual_fs::{
+use localityd::autosave::auto_save_timestamp;
+use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
+use localityd::hydration::{HydrationExecutor, HydrationOutcome, HydrationSource};
+use localityd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
+use localityd::push::execute_auto_save_push_job_with_content_root;
+use localityd::source::{
+    resolve_source_for_mount_id, resolve_source_for_path, source_display_name,
+};
+use localityd::virtual_fs::{
     commit_virtual_fs_write, materialize_virtual_fs_item_with_content_root,
     source_root_directory_name, source_root_identifier, virtual_fs_content_base,
     virtual_fs_content_path, virtual_fs_content_root,
@@ -100,19 +103,20 @@ use agent_guidance::{
 };
 
 #[cfg(any(not(windows), test))]
-const TERMINAL_CLI_PATH_MANAGED_START: &str = "# >>> AFS_TERMINAL_CLI_PATH >>>";
+const TERMINAL_CLI_PATH_MANAGED_START: &str = "# >>> LOCALITY_TERMINAL_CLI_PATH >>>";
 #[cfg(any(not(windows), test))]
-const TERMINAL_CLI_PATH_MANAGED_END: &str = "# <<< AFS_TERMINAL_CLI_PATH <<<";
+const TERMINAL_CLI_PATH_MANAGED_END: &str = "# <<< LOCALITY_TERMINAL_CLI_PATH <<<";
 #[cfg(windows)]
-const WINDOWS_TERMINAL_CLI_SHIM_MARKER: &str = "AFS_TERMINAL_CLI_SHIM";
+const WINDOWS_TERMINAL_CLI_SHIM_MARKER: &str = "LOCALITY_TERMINAL_CLI_SHIM";
 #[cfg(windows)]
 const WINDOWS_RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
-const WINDOWS_RUN_VALUE_NAME: &str = "AFS";
+const WINDOWS_RUN_VALUE_NAME: &str = "Locality";
 #[cfg(windows)]
-const WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX: &str = r"Local\CodeFlash.AFS.Desktop.SingleInstance";
+const WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX: &str =
+    r"Local\CodeFlash.Locality.Desktop.SingleInstance";
 #[cfg(windows)]
-const WINDOWS_DESKTOP_ACTIVATION_EVENT: &str = r"Local\CodeFlash.AFS.Desktop.Activate";
+const WINDOWS_DESKTOP_ACTIVATION_EVENT: &str = r"Local\CodeFlash.Locality.Desktop.Activate";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -410,7 +414,7 @@ async fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
     let snapshot = match tauri::async_runtime::spawn_blocking(load_desktop_snapshot).await {
         Ok(Ok(snapshot)) => snapshot,
         Ok(Err(message)) => degraded_snapshot(message),
-        Err(error) => degraded_snapshot(format!("Could not load AFS desktop state: {error}")),
+        Err(error) => degraded_snapshot(format!("Could not load Locality desktop state: {error}")),
     };
     refresh_tray_icon_for_snapshot(&app, &snapshot);
     snapshot
@@ -533,17 +537,17 @@ async fn acknowledge_install_state() -> ActionReport {
     {
         Ok(()) => ActionReport {
             ok: true,
-            message: "AFS install state recorded.".to_string(),
+            message: "Locality install state recorded.".to_string(),
         },
         Err(message) => ActionReport { ok: false, message },
     }
 }
 
 #[tauri::command]
-async fn reset_local_afs_state(app: AppHandle) -> ActionReport {
+async fn reset_locality_state(app: AppHandle) -> ActionReport {
     match tauri::async_runtime::spawn_blocking(|| {
         let state_root = default_state_root();
-        reset_local_afs_state_at(&state_root)
+        reset_locality_state_at(&state_root)
             .and_then(|_| record_current_install_marker(&state_root))
     })
     .await
@@ -554,7 +558,8 @@ async fn reset_local_afs_state(app: AppHandle) -> ActionReport {
             refresh_desktop_surfaces(&app);
             ActionReport {
                 ok: true,
-                message: "AFS local state was reset. Local files were left in place.".to_string(),
+                message: "Locality local state was reset. Local files were left in place."
+                    .to_string(),
             }
         }
         Err(message) => ActionReport { ok: false, message },
@@ -592,7 +597,7 @@ async fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
             refresh_desktop_surfaces(&app);
             ActionReport {
                 ok: true,
-                message: "AFS runtime is running.".to_string(),
+                message: "Locality runtime is running.".to_string(),
             }
         }
         Err(message) => ActionReport { ok: false, message },
@@ -608,7 +613,7 @@ async fn ensure_terminal_cli_available() -> ActionReport {
     {
         Ok(path) => ActionReport {
             ok: true,
-            message: format!("AFS terminal command is ready at {}.", path.display()),
+            message: format!("Locality terminal command is ready at {}.", path.display()),
         },
         Err(message) => ActionReport { ok: false, message },
     }
@@ -868,7 +873,7 @@ fn push_to_notion_blocking(confirm_dangerous: bool) -> ActionReport {
     let Ok(snapshot) = load_desktop_snapshot() else {
         return ActionReport {
             ok: false,
-            message: "No AFS mount is available to push.".to_string(),
+            message: "No Locality mount is available to push.".to_string(),
         };
     };
     if snapshot.pending_changes.is_empty() {
@@ -1016,7 +1021,7 @@ fn live_mode_has_mounted_folder(snapshot: &DesktopSnapshot) -> bool {
 fn live_mode_next_remote_pull_target() -> Result<Option<LiveModeRemoteTarget>, String> {
     let state_root = default_state_root();
     let store = SqliteStateStore::open(state_root)
-        .map_err(|error| format!("Live Mode could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
     let mounts = store
         .load_mounts()
         .map_err(|error| format!("Live Mode could not inspect mounted folders: {error}"))?;
@@ -1083,7 +1088,7 @@ where
 fn live_mode_reconcile_local_target(target: &LiveModeRemoteTarget) -> Result<(), String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Live Mode could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
     live_mode_reconcile_local_target_with_store(&mut store, &state_root, target)
 }
 
@@ -1138,7 +1143,7 @@ fn live_mode_should_reconcile_local_target_for_key(
 fn live_mode_pull_remote_target_if_changed(target: &LiveModeRemoteTarget) -> Result<bool, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Live Mode could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
     let entity = store
         .get_entity(&target.mount_id, &target.remote_id)
         .map_err(|error| format!("Live Mode could not inspect mounted pages: {error}"))?
@@ -1222,10 +1227,10 @@ fn live_mode_pull_remote_target_if_changed(target: &LiveModeRemoteTarget) -> Res
 fn live_mode_load_shadow(
     store: &SqliteStateStore,
     target: &LiveModeRemoteTarget,
-) -> Result<Option<afs_core::shadow::ShadowDocument>, String> {
+) -> Result<Option<locality_core::shadow::ShadowDocument>, String> {
     match store.load_shadow(&target.mount_id, &target.remote_id) {
         Ok(shadow) => Ok(Some(shadow)),
-        Err(afs_store::StoreError::ShadowMissing { .. }) => Ok(None),
+        Err(locality_store::StoreError::ShadowMissing { .. }) => Ok(None),
         Err(error) => Err(format!(
             "Live Mode could not inspect the current page shadow: {error}"
         )),
@@ -1320,7 +1325,7 @@ fn show_main_window(app: AppHandle, view: Option<String>) -> ActionReport {
     show_main_window_with_view(&app, view.as_deref());
     ActionReport {
         ok: true,
-        message: "Opened AFS.".to_string(),
+        message: "Opened Locality.".to_string(),
     }
 }
 
@@ -1361,7 +1366,7 @@ fn quit_completely(app: AppHandle) -> ActionReport {
     app.exit(0);
     ActionReport {
         ok: true,
-        message: "AFS is quitting.".to_string(),
+        message: "Locality is quitting.".to_string(),
     }
 }
 
@@ -1415,13 +1420,13 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
         },
         connection: ConnectionSummary {
             connector: "notion".to_string(),
-            workspace_name: "AFS state unavailable".to_string(),
+            workspace_name: "Locality state unavailable".to_string(),
             account_label: "Open Settings to repair".to_string(),
             status: "error".to_string(),
         },
         mount: MountSummary {
             connector: "notion".to_string(),
-            workspace_name: "AFS state unavailable".to_string(),
+            workspace_name: "Locality state unavailable".to_string(),
             local_path: absolute_display_path(&default_notion_access_root()),
             notion_url: None,
             access_scope: "State load failed".to_string(),
@@ -1433,7 +1438,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
         settings: desktop_settings(),
         pending_changes: Vec::new(),
         activity: vec![ActivityItem {
-            title: "Could not load AFS state".to_string(),
+            title: "Could not load Locality state".to_string(),
             detail: message,
             when: "Now".to_string(),
             occurred_at: Some(activity_timestamp()),
@@ -1639,7 +1644,7 @@ fn windows_cloud_files_provider_status(
 #[cfg(test)]
 fn pending_changes_from_status<S>(
     store: &S,
-    status: &afs_cli::status::StatusReport,
+    status: &loc_cli::status::StatusReport,
 ) -> Vec<PendingChange>
 where
     S: AutoSaveRepository,
@@ -1685,7 +1690,7 @@ fn pending_changes_from_store(
                 };
                 changes.push(PendingChange {
                     title: mutation.title,
-                    local_path: afs_platform::logical_path_display(&mutation.projected_path),
+                    local_path: locality_platform::logical_path_display(&mutation.projected_path),
                     summary: summary.to_string(),
                     state: "safe".to_string(),
                     auto_save: auto_save_status_for_path(store, mount_id, &mutation.projected_path),
@@ -1733,7 +1738,7 @@ fn pending_changes_from_store(
 
             changes.push(PendingChange {
                 title: entity.title,
-                local_path: afs_platform::logical_path_display(&entity.path),
+                local_path: locality_platform::logical_path_display(&entity.path),
                 summary,
                 state: state.to_string(),
                 auto_save: auto_save_status_for_path(store, mount_id, &entity.path),
@@ -1772,7 +1777,7 @@ fn desktop_journal_counts(
 fn auto_save_status_for_entry(
     store: &impl AutoSaveRepository,
     mount_id: &MountId,
-    entry: &afs_cli::status::StatusEntry,
+    entry: &loc_cli::status::StatusEntry,
 ) -> AutoSaveFileStatus {
     auto_save_status_for_path(store, mount_id, Path::new(&entry.path))
 }
@@ -1819,7 +1824,7 @@ fn auto_save_status_for_path(
 }
 
 #[cfg(test)]
-fn pending_state_for_entry(entry: &afs_cli::status::StatusEntry) -> &'static str {
+fn pending_state_for_entry(entry: &loc_cli::status::StatusEntry) -> &'static str {
     if matches!(entry.sync_state, StatusSyncState::Conflicted) {
         "conflict"
     } else if matches!(entry.state, StatusState::Error | StatusState::Missing)
@@ -1841,7 +1846,7 @@ fn pending_state_for_entry(entry: &afs_cli::status::StatusEntry) -> &'static str
 }
 
 #[cfg(test)]
-fn status_summary_for_entry(entry: &afs_cli::status::StatusEntry) -> String {
+fn status_summary_for_entry(entry: &loc_cli::status::StatusEntry) -> String {
     if entry.failed_journal_count > 0 {
         if let Some(last_failure) = status_issue_message(entry, "last_failure") {
             return failed_push_summary(last_failure);
@@ -1872,7 +1877,7 @@ fn status_summary_for_entry(entry: &afs_cli::status::StatusEntry) -> String {
 }
 
 #[cfg(test)]
-fn status_entry_needs_desktop_attention(entry: &afs_cli::status::StatusEntry) -> bool {
+fn status_entry_needs_desktop_attention(entry: &loc_cli::status::StatusEntry) -> bool {
     if matches!(
         entry.state,
         StatusState::Dirty | StatusState::Conflicted | StatusState::Missing | StatusState::Error
@@ -1897,7 +1902,7 @@ fn status_entry_needs_desktop_attention(entry: &afs_cli::status::StatusEntry) ->
 }
 
 #[cfg(test)]
-fn failed_journal_only(entry: &afs_cli::status::StatusEntry) -> bool {
+fn failed_journal_only(entry: &loc_cli::status::StatusEntry) -> bool {
     entry.failed_journal_count > 0
         && matches!(entry.state, StatusState::Clean)
         && entry.pending_journal_count == 0
@@ -1909,7 +1914,7 @@ fn failed_journal_only(entry: &afs_cli::status::StatusEntry) -> bool {
 
 #[cfg(test)]
 fn status_issue_message<'a>(
-    entry: &'a afs_cli::status::StatusEntry,
+    entry: &'a loc_cli::status::StatusEntry,
     code: &str,
 ) -> Option<&'a str> {
     entry
@@ -1986,7 +1991,7 @@ fn activity_from_journals(
 
     if items.is_empty() {
         items.push(ActivityItem {
-            title: "AFS desktop opened".to_string(),
+            title: "Locality desktop opened".to_string(),
             detail: "Ready to connect and review workspace changes".to_string(),
             when: "Today".to_string(),
             occurred_at: Some(activity_timestamp()),
@@ -2109,7 +2114,7 @@ fn refresh_tray_icon(app: &AppHandle) {
         return;
     }
 
-    set_tray_icon_and_tooltip(app, TrayVisualState::Reconnect, "AFS needs attention");
+    set_tray_icon_and_tooltip(app, TrayVisualState::Reconnect, "Locality needs attention");
 }
 
 fn refresh_tray_icon_for_snapshot(app: &AppHandle, snapshot: &DesktopSnapshot) {
@@ -2170,12 +2175,15 @@ fn tray_state_for_health(state: &str) -> TrayVisualState {
 
 fn tray_tooltip(snapshot: &DesktopSnapshot) -> String {
     match snapshot.health.state.as_str() {
-        "needs_review" => format!("AFS: {} pending changes", snapshot.health.attention_count),
-        "checking_freshness" => "AFS: checking freshness".to_string(),
-        "reconnect_needed" => "AFS: reconnect Notion".to_string(),
-        "stopped" => "AFS: daemon stopped".to_string(),
-        "runtime_stopped" => "AFS: provider needs repair".to_string(),
-        _ => "AFS: ready".to_string(),
+        "needs_review" => format!(
+            "Locality: {} pending changes",
+            snapshot.health.attention_count
+        ),
+        "checking_freshness" => "Locality: checking freshness".to_string(),
+        "reconnect_needed" => "Locality: reconnect Notion".to_string(),
+        "stopped" => "Locality: daemon stopped".to_string(),
+        "runtime_stopped" => "Locality: provider needs repair".to_string(),
+        _ => "Locality: ready".to_string(),
     }
 }
 
@@ -2318,9 +2326,7 @@ fn notion_access_miss_message() -> String {
         .as_ref()
         .map(|mount| notion_access_scope_label(Some(&store), mount))
         .unwrap_or_else(|| "No mounted Notion access yet".to_string());
-    let root_url = mount
-        .as_ref()
-        .and_then(|mount| notion_access_scope_url(mount));
+    let root_url = mount.as_ref().and_then(notion_access_scope_url);
 
     notion_access_miss_message_from_parts(&workspace, &scope, root_url.as_deref())
 }
@@ -2397,10 +2403,10 @@ fn search_notion_results(query: &str, limit: usize) -> Result<Vec<SearchResult>,
     }
 
     let store = SqliteStateStore::open(default_state_root())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let mounts = store
         .load_mounts()
-        .map_err(|error| format!("Could not load AFS mounts: {error}"))?
+        .map_err(|error| format!("Could not load Locality mounts: {error}"))?
         .into_iter()
         .filter(|mount| mount.connector == "notion")
         .collect::<Vec<_>>();
@@ -2545,9 +2551,9 @@ fn set_menu_bar_visible(app: &AppHandle, visible: bool) -> Result<ActionReport, 
     Ok(ActionReport {
         ok: true,
         message: if visible {
-            "AFS is shown in the menu bar.".to_string()
+            "Locality is shown in the menu bar.".to_string()
         } else {
-            "AFS is hidden from the menu bar.".to_string()
+            "Locality is hidden from the menu bar.".to_string()
         },
     })
 }
@@ -2555,7 +2561,9 @@ fn set_menu_bar_visible(app: &AppHandle, visible: bool) -> Result<ActionReport, 
 fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
     if enabled {
         if running_from_read_only_volume()? {
-            return Err("Move AFS to Applications before enabling launch at login.".to_string());
+            return Err(
+                "Move Locality to Applications before enabling launch at login.".to_string(),
+            );
         }
         install_launch_at_login()?;
     } else {
@@ -2570,9 +2578,9 @@ fn set_launch_at_login(enabled: bool) -> Result<ActionReport, String> {
     Ok(ActionReport {
         ok: true,
         message: if enabled {
-            "AFS will launch at login.".to_string()
+            "Locality will launch at login.".to_string()
         } else {
-            "AFS will not launch at login.".to_string()
+            "Locality will not launch at login.".to_string()
         },
     })
 }
@@ -2616,7 +2624,7 @@ fn load_install_marker(state_root: &Path) -> Result<Option<DesktopInstallMarker>
 
 fn record_current_install_marker(state_root: &Path) -> Result<(), String> {
     fs::create_dir_all(state_root)
-        .map_err(|error| format!("Could not create AFS state folder: {error}"))?;
+        .map_err(|error| format!("Could not create Locality state folder: {error}"))?;
     let marker = current_install_marker();
     let contents = serde_json::to_string_pretty(&marker)
         .map_err(|error| format!("Could not serialize install marker: {error}"))?;
@@ -2642,7 +2650,7 @@ fn install_marker_display_build_id(marker: &DesktopInstallMarker) -> String {
 }
 
 fn current_desktop_build_id() -> String {
-    option_env!("AFS_DESKTOP_BUILD_ID")
+    option_env!("LOCALITY_DESKTOP_BUILD_ID")
         .unwrap_or("unknown")
         .to_string()
 }
@@ -2655,7 +2663,7 @@ fn install_marker_path(state_root: &Path) -> PathBuf {
     state_root.join("desktop-install.json")
 }
 
-fn reset_local_afs_state_at(state_root: &Path) -> Result<(), String> {
+fn reset_locality_state_at(state_root: &Path) -> Result<(), String> {
     let secret_refs = connection_secret_refs(state_root);
     stop_daemon_for_reset(state_root);
     reset_platform_projection_state();
@@ -2668,14 +2676,15 @@ fn reset_local_afs_state_at(state_root: &Path) -> Result<(), String> {
 fn clear_state_root_contents(state_root: &Path) -> Result<(), String> {
     if !state_root.exists() {
         fs::create_dir_all(state_root)
-            .map_err(|error| format!("Could not create AFS state folder: {error}"))?;
+            .map_err(|error| format!("Could not create Locality state folder: {error}"))?;
         return Ok(());
     }
 
     for entry in fs::read_dir(state_root)
-        .map_err(|error| format!("Could not inspect AFS state folder: {error}"))?
+        .map_err(|error| format!("Could not inspect Locality state folder: {error}"))?
     {
-        let entry = entry.map_err(|error| format!("Could not inspect AFS state entry: {error}"))?;
+        let entry =
+            entry.map_err(|error| format!("Could not inspect Locality state entry: {error}"))?;
         remove_path_if_exists(&entry.path())?;
     }
     Ok(())
@@ -2707,9 +2716,9 @@ fn stop_daemon_for_reset(state_root: &Path) {
     if let Err(error) = run_daemon_control(&daemon_control_args_any_manager("stop", state_root)) {
         desktop_log(
             "warn",
-            "reset.stop_afsd_failed",
+            "reset.stop_localityd_failed",
             format!(
-                "could not stop afsd during local state reset: {}",
+                "could not stop localityd during local state reset: {}",
                 error.message()
             ),
         );
@@ -2751,12 +2760,12 @@ fn remove_desktop_support_state() -> Result<(), String> {
     {
         let home = home_dir().map_err(|error| format!("HOME is not set: {error}"))?;
         for path in [
-            home.join("Library/LaunchAgents/ai.codeflash.afs.afsd.plist"),
-            home.join("Library/Group Containers/group.ai.codeflash.afs"),
-            home.join("Library/Application Support/ai.codeflash.afs"),
-            home.join("Library/Caches/ai.codeflash.afs"),
-            home.join("Library/HTTPStorages/ai.codeflash.afs"),
-            home.join("Library/Saved Application State/ai.codeflash.afs.savedState"),
+            home.join("Library/LaunchAgents/ai.codeflash.locality.localityd.plist"),
+            home.join("Library/Group Containers/group.ai.codeflash.locality"),
+            home.join("Library/Application Support/ai.codeflash.locality"),
+            home.join("Library/Caches/ai.codeflash.locality"),
+            home.join("Library/HTTPStorages/ai.codeflash.locality"),
+            home.join("Library/Saved Application State/ai.codeflash.locality.savedState"),
         ] {
             remove_path_if_exists(&path)?;
         }
@@ -2888,7 +2897,7 @@ fn debounce_state_events_require_refresh(
             Ok(event) => {
                 should_refresh |= state_event_requires_refresh(&event, state_root, content_roots);
             }
-            Err(error) => eprintln!("afs desktop state watcher event failed: {error}"),
+            Err(error) => eprintln!("loc desktop state watcher event failed: {error}"),
         }
     }
     should_refresh
@@ -2940,7 +2949,7 @@ fn state_event_path_requires_refresh(
 fn is_virtual_content_temp_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with('.') && name.ends_with(".afs-tmp"))
+        .is_some_and(|name| name.starts_with('.') && name.ends_with(".loc-tmp"))
 }
 
 fn refresh_desktop_surfaces(app: &AppHandle) {
@@ -2956,7 +2965,7 @@ fn schedule_tray_icon_refresh(app: AppHandle) {
         if let Some(snapshot) = snapshot {
             refresh_tray_icon_for_snapshot(&app, &snapshot);
         } else {
-            set_tray_icon_and_tooltip(&app, TrayVisualState::Reconnect, "AFS needs attention");
+            set_tray_icon_and_tooltip(&app, TrayVisualState::Reconnect, "Locality needs attention");
         }
     });
 }
@@ -3008,7 +3017,7 @@ fn dispatch_window_snapshot_refresh(app: &AppHandle) -> bool {
             if !window.is_visible().unwrap_or(false) {
                 continue;
             }
-            let _ = window.eval("window.dispatchEvent(new CustomEvent('afs-refresh-snapshot'));");
+            let _ = window.eval("window.dispatchEvent(new CustomEvent('loc-refresh-snapshot'));");
             dispatched = true;
         }
     }
@@ -3017,7 +3026,7 @@ fn dispatch_window_snapshot_refresh(app: &AppHandle) -> bool {
 
 fn running_from_read_only_volume() -> Result<bool, String> {
     let executable = std::env::current_exe()
-        .map_err(|error| format!("Could not resolve the AFS app executable: {error}"))?;
+        .map_err(|error| format!("Could not resolve the Locality app executable: {error}"))?;
     Ok(executable.starts_with("/Volumes"))
 }
 
@@ -3067,14 +3076,14 @@ fn uninstall_launch_at_login() -> Result<(), String> {
 #[cfg(not(windows))]
 fn install_launch_agent() -> Result<(), String> {
     let Some(path) = launch_agent_path() else {
-        return Err("HOME is not set, so AFS cannot install a login item.".to_string());
+        return Err("HOME is not set, so Locality cannot install a login item.".to_string());
     };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create launch agent folder: {error}"))?;
     }
     let executable = std::env::current_exe()
-        .map_err(|error| format!("Could not resolve the AFS app executable: {error}"))?;
+        .map_err(|error| format!("Could not resolve the Locality app executable: {error}"))?;
     let plist = launch_agent_plist(&executable);
     fs::write(&path, plist)
         .map_err(|error| format!("Could not write launch agent `{}`: {error}", path.display()))
@@ -3089,7 +3098,7 @@ fn launch_agent_plist(executable: &Path) -> String {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>ai.codeflash.afs.desktop</string>
+  <string>ai.codeflash.locality.desktop</string>
   <key>ProgramArguments</key>
   <array>
     <string>{executable}</string>
@@ -3105,7 +3114,7 @@ fn launch_agent_plist(executable: &Path) -> String {
 #[cfg(windows)]
 fn install_windows_login_item() -> Result<(), String> {
     let executable = std::env::current_exe()
-        .map_err(|error| format!("Could not resolve the AFS app executable: {error}"))?;
+        .map_err(|error| format!("Could not resolve the Locality app executable: {error}"))?;
     let value = windows_run_value_for_executable(&executable);
     let mut command = Command::new("reg");
     configure_hidden_windows_command(&mut command);
@@ -3219,7 +3228,7 @@ fn launch_agent_path() -> Option<PathBuf> {
     home_dir().ok().map(|home| {
         home.join("Library")
             .join("LaunchAgents")
-            .join("ai.codeflash.afs.desktop.plist")
+            .join("ai.codeflash.locality.desktop.plist")
     })
 }
 
@@ -3230,15 +3239,16 @@ fn action_error(message: String) -> ActionReport {
 fn desktop_log(level: &str, event: &str, message: impl AsRef<str>) {
     let message = message.as_ref();
     let _ = append_service_log(&default_state_root(), "desktop", level, event, message);
-    eprintln!("afs desktop [{event}] {message}");
+    eprintln!("loc desktop [{event}] {message}");
 }
 
 fn mount_access_root(mount: &MountConfig) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if mount.projection == ProjectionMode::MacosFileProvider
-            && let Ok(url) =
-                macos_file_provider_domain_url(afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+            && let Ok(url) = macos_file_provider_domain_url(
+                localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+            )
         {
             return url.join(source_root_directory_name(&mount.connector));
         }
@@ -3305,23 +3315,23 @@ fn absolute_display_path(path: &Path) -> String {
 fn default_notion_mount_root() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        macos_afs_cloud_storage_root().join(source_root_directory_name("notion"))
+        macos_locality_cloud_storage_root().join(source_root_directory_name("notion"))
     }
 
     #[cfg(target_os = "linux")]
     {
         if let Ok(home) = home_dir() {
-            return home.join("Documents").join("AFS");
+            return home.join("Documents").join("Locality");
         }
-        PathBuf::from("AFS")
+        PathBuf::from("Locality")
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         if let Ok(home) = home_dir() {
-            return home.join("Documents").join("AFS").join("Notion");
+            return home.join("Documents").join("Locality").join("Notion");
         }
-        PathBuf::from("AFS").join("Notion")
+        PathBuf::from("Locality").join("Notion")
     }
 }
 
@@ -3342,11 +3352,11 @@ fn macos_cloud_storage_dir() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_afs_cloud_storage_root() -> PathBuf {
+fn macos_locality_cloud_storage_root() -> PathBuf {
     macos_file_provider_cloud_storage_roots()
         .into_iter()
         .next()
-        .unwrap_or_else(|| macos_cloud_storage_dir().join("AFS"))
+        .unwrap_or_else(|| macos_cloud_storage_dir().join("Locality"))
 }
 
 #[cfg(target_os = "macos")]
@@ -3354,14 +3364,14 @@ fn macos_file_provider_cloud_storage_roots() -> Vec<PathBuf> {
     let cloud_storage = macos_cloud_storage_dir();
     let mut roots = Vec::new();
     if let Ok(root) =
-        macos_file_provider_domain_url(afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+        macos_file_provider_domain_url(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
     {
         roots.push(root);
     }
-    roots.push(cloud_storage.join("AFS"));
-    roots.push(cloud_storage.join("AgentFS"));
-    roots.push(cloud_storage.join("AFS-AFS"));
-    roots.push(cloud_storage.join("AgentFS-AFS"));
+    roots.push(cloud_storage.join("Locality"));
+    roots.push(cloud_storage.join("Locality"));
+    roots.push(cloud_storage.join("Locality-Locality"));
+    roots.push(cloud_storage.join("Locality-Locality"));
     dedupe_path_list(roots)
 }
 
@@ -3403,7 +3413,7 @@ fn resolve_desktop_mount_root(path: &str) -> Result<PathBuf, String> {
             return Err("Choose a CloudStorage folder for the Notion mount.".to_string());
         }
         if !path.contains('/') && !path.starts_with('~') {
-            return Ok(macos_afs_cloud_storage_root().join(source_root_directory_name(path)));
+            return Ok(macos_locality_cloud_storage_root().join(source_root_directory_name(path)));
         }
     }
 
@@ -3416,7 +3426,7 @@ fn normalize_desktop_mount_root(root: &Path) -> Result<PathBuf, String> {
 
     #[cfg(target_os = "macos")]
     {
-        if root == macos_cloud_storage_dir() || root == macos_afs_cloud_storage_root() {
+        if root == macos_cloud_storage_dir() || root == macos_locality_cloud_storage_root() {
             return Ok(default_notion_mount_root());
         }
         if macos_file_provider_cloud_storage_roots()
@@ -3462,7 +3472,7 @@ fn validate_desktop_mount_root(
                 .any(|provider_root| root.starts_with(provider_root) && root != *provider_root);
             if !inside_provider_root {
                 return Err(format!(
-                    "Choose a source folder inside the AFS File Provider root, for example {}.",
+                    "Choose a source folder inside the Locality File Provider root, for example {}.",
                     absolute_display_path(&default_notion_mount_root())
                 ));
             }
@@ -3481,7 +3491,7 @@ fn validate_mount_root(root: &Path, state_root: &Path) -> Result<(), String> {
     let root = absolute_path(root)?;
     let state_root = absolute_path(state_root)?;
     if root.starts_with(&state_root) {
-        return Err("Choose a folder outside the AFS state directory.".to_string());
+        return Err("Choose a folder outside the Locality state directory.".to_string());
     }
 
     if let Ok(metadata) = fs::metadata(&root) {
@@ -3710,10 +3720,10 @@ fn reveal_missing_virtual_mount_path(path: &Path, mount: &MountConfig) -> Result
                     return reveal_macos_path_in_finder(&target);
                 }
                 open_virtual_projection(mount)?;
-                return Err(format!(
-                    "The file is still being materialized. Finder opened the AFS folder; try Reveal again once {} appears.",
+                Err(format!(
+                    "The file is still being materialized. Finder opened the Locality folder; try Reveal again once {} appears.",
                     target.display()
-                ));
+                ))
             }
 
             #[cfg(not(target_os = "macos"))]
@@ -3733,7 +3743,7 @@ fn ensure_visible_virtual_file_for_reveal(path: &Path, mount: &MountConfig) -> R
 
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let Some(entity) = store
         .find_entity_by_path(&mount.mount_id, &path_match.relative_path)
         .map_err(|error| format!("Could not inspect mounted pages: {error}"))?
@@ -3811,7 +3821,7 @@ fn write_visible_file_from_cache_for_reveal(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("page.md");
-    let temp_path = visible_path.with_file_name(format!(".{file_name}.afs-reveal-tmp"));
+    let temp_path = visible_path.with_file_name(format!(".{file_name}.loc-reveal-tmp"));
     fs::write(&temp_path, contents).map_err(|error| {
         format!(
             "Could not write Finder temp file `{}`: {error}",
@@ -3870,9 +3880,9 @@ fn choose_folder_with_dialog(
     } else {
         #[cfg(target_os = "macos")]
         {
-            let afs_root = macos_afs_cloud_storage_root();
-            if afs_root.exists() {
-                dialog = dialog.set_directory(afs_root);
+            let loc_root = macos_locality_cloud_storage_root();
+            if loc_root.exists() {
+                dialog = dialog.set_directory(loc_root);
             } else {
                 let cloud_storage = macos_cloud_storage_dir();
                 if cloud_storage.exists() {
@@ -3897,7 +3907,7 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
     let root = resolve_desktop_mount_root(path)?;
     validate_desktop_mount_root(&root, &state_root, &projection)?;
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let connection_id = preferred_notion_connection_id(&store)?;
 
     let mount_report = run_mount(
@@ -3920,7 +3930,7 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
     let mount = store
         .get_mount(&MountId::new(mount_report.mount_id.clone()))
         .map_err(|error| format!("Could not reload created mount: {error}"))?
-        .ok_or_else(|| "Created mount was not found in AFS state.".to_string())?;
+        .ok_or_else(|| "Created mount was not found in Locality state.".to_string())?;
 
     if mount.projection.uses_virtual_filesystem() {
         activate_virtual_projection_mount(&state_root, &mount, false)?;
@@ -3994,7 +4004,7 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
                 "warn",
                 "daemon.build_mismatch",
                 format!(
-                    "detected running afsd build {} but bundled afsd is {}; restarting afsd",
+                    "detected running localityd build {} but bundled localityd is {}; restarting localityd",
                     build.build_id, current_build.build_id
                 ),
             );
@@ -4004,7 +4014,7 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
             desktop_log(
                 "warn",
                 "daemon.missing_build_metadata",
-                "detected an older afsd without build metadata; restarting afsd",
+                "detected an older localityd without build metadata; restarting localityd",
             );
             return restart_daemon_for_current_binary(state_root);
         }
@@ -4016,11 +4026,11 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
 
 fn start_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
     let report = run_daemon_control(&daemon_control_args("start", state_root))
-        .map_err(|error| format!("Could not start afsd: {}", error.message()))?;
+        .map_err(|error| format!("Could not start localityd: {}", error.message()))?;
     if report.state == DaemonRunState::Running {
         Ok(())
     } else {
-        Err("afsd did not start.".to_string())
+        Err("localityd did not start.".to_string())
     }
 }
 
@@ -4030,11 +4040,11 @@ fn restart_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
     match running_daemon_build(state_root) {
         Some(build) if build == DaemonBuildInfo::current() => Ok(()),
         Some(build) => Err(format!(
-            "afsd restarted, but reported build {} instead of {}.",
+            "localityd restarted, but reported build {} instead of {}.",
             build.build_id,
             DaemonBuildInfo::current().build_id
         )),
-        None => Err("afsd restarted, but did not report build metadata.".to_string()),
+        None => Err("localityd restarted, but did not report build metadata.".to_string()),
     }
 }
 
@@ -4045,15 +4055,15 @@ fn daemon_control_args(action: &str, state_root: &Path) -> Vec<String> {
         "--state-dir".to_string(),
         state_root.display().to_string(),
     ];
-    if let Ok(tcp_addr) = std::env::var("AFS_DAEMON_TCP_ADDR")
+    if let Ok(tcp_addr) = std::env::var("LOCALITY_DAEMON_TCP_ADDR")
         && !tcp_addr.is_empty()
     {
         args.push("--tcp-addr".to_string());
         args.push(tcp_addr);
     }
-    if let Some(afsd_bin) = bundled_afsd_binary() {
-        args.push("--afsd-bin".to_string());
-        args.push(afsd_bin.display().to_string());
+    if let Some(localityd_bin) = bundled_localityd_binary() {
+        args.push("--localityd-bin".to_string());
+        args.push(localityd_bin.display().to_string());
     }
     args
 }
@@ -4064,7 +4074,7 @@ fn daemon_control_args_any_manager(action: &str, state_root: &Path) -> Vec<Strin
         "--state-dir".to_string(),
         state_root.display().to_string(),
     ];
-    if let Ok(tcp_addr) = std::env::var("AFS_DAEMON_TCP_ADDR")
+    if let Ok(tcp_addr) = std::env::var("LOCALITY_DAEMON_TCP_ADDR")
         && !tcp_addr.is_empty()
     {
         args.push("--tcp-addr".to_string());
@@ -4073,46 +4083,48 @@ fn daemon_control_args_any_manager(action: &str, state_root: &Path) -> Vec<Strin
     args
 }
 
-fn bundled_afsd_binary() -> Option<PathBuf> {
-    bundled_binary_next_to_current_exe("afsd")
+fn bundled_localityd_binary() -> Option<PathBuf> {
+    bundled_binary_next_to_current_exe("localityd")
 }
 
-fn bundled_afs_cli_binary() -> Option<PathBuf> {
-    bundled_binary_next_to_current_exe("afs")
+fn bundled_loc_cli_binary() -> Option<PathBuf> {
+    bundled_binary_next_to_current_exe("loc")
 }
 
 fn app_store_distribution() -> bool {
-    option_env!("AFS_DISTRIBUTION_CHANNEL")
+    option_env!("LOCALITY_DISTRIBUTION_CHANNEL")
         .is_some_and(|channel| channel.eq_ignore_ascii_case("mas"))
 }
 
 fn desktop_smoke_test_requested() -> bool {
-    std::env::var_os("AFS_DESKTOP_SMOKE_TEST").is_some()
+    std::env::var_os("LOCALITY_DESKTOP_SMOKE_TEST").is_some()
 }
 
 fn install_terminal_cli_link() -> Result<PathBuf, String> {
     if app_store_distribution() {
-        if let Some(path) = find_command_in_path("afs") {
+        if let Some(path) = find_command_in_path("loc") {
             return Ok(path);
         }
         return Err(
-            "The Mac App Store build does not install a terminal command. Install AFS from Homebrew or the direct download to use the bundled CLI."
+            "The Mac App Store build does not install a terminal command. Install Locality from Homebrew or the direct download to use the bundled CLI."
                 .to_string(),
         );
     }
 
     if running_from_read_only_volume()? {
-        if let Some(path) = find_command_in_path("afs") {
+        if let Some(path) = find_command_in_path("loc") {
             return Ok(path);
         }
-        return Err("Move AFS to Applications before installing the terminal command.".to_string());
+        return Err(
+            "Move Locality to Applications before installing the terminal command.".to_string(),
+        );
     }
 
-    let Some(cli_path) = bundled_afs_cli_binary() else {
-        if let Some(path) = find_command_in_path("afs") {
+    let Some(cli_path) = bundled_loc_cli_binary() else {
+        if let Some(path) = find_command_in_path("loc") {
             return Ok(path);
         }
-        return Err("The packaged AFS CLI was not found in this app bundle.".to_string());
+        return Err("The packaged Locality CLI was not found in this app bundle.".to_string());
     };
 
     install_terminal_cli_link_in_path(&cli_path)
@@ -4127,11 +4139,11 @@ enum TerminalCliLinkState {
 fn terminal_cli_command_filename() -> &'static str {
     #[cfg(windows)]
     {
-        "afs.cmd"
+        "loc.cmd"
     }
     #[cfg(not(windows))]
     {
-        "afs"
+        "loc"
     }
 }
 
@@ -4139,7 +4151,7 @@ fn install_terminal_cli_link_at(cli_path: &Path, link_path: &Path) -> Result<Pat
     let cli_path = absolute_path(cli_path)?;
     if !cli_path.is_file() {
         return Err(format!(
-            "The bundled AFS CLI was not found at {}.",
+            "The bundled Locality CLI was not found at {}.",
             cli_path.display()
         ));
     }
@@ -4151,7 +4163,7 @@ fn install_terminal_cli_link_at(cli_path: &Path, link_path: &Path) -> Result<Pat
 
     if let Err(error) = install_terminal_cli_link_direct(&cli_path, link_path) {
         return Err(format!(
-            "Could not install the AFS terminal command at {}: {error}",
+            "Could not install the Locality terminal command at {}: {error}",
             link_path.display()
         ));
     }
@@ -4159,7 +4171,7 @@ fn install_terminal_cli_link_at(cli_path: &Path, link_path: &Path) -> Result<Pat
     match terminal_cli_link_state(link_path, &cli_path)? {
         TerminalCliLinkState::Current => Ok(link_path.to_path_buf()),
         TerminalCliLinkState::NeedsInstall => Err(format!(
-            "Could not verify the AFS terminal command at {}.",
+            "Could not verify the Locality terminal command at {}.",
             link_path.display()
         )),
     }
@@ -4222,7 +4234,7 @@ fn install_terminal_cli_link_in_sorted_path_dirs(
         .unwrap_or_default();
 
     Err(format!(
-        "Could not install the AFS terminal command without administrator privileges. Add a user-writable directory such as ~/.local/bin to PATH, then try again. Checked PATH directories: {checked}.{detail}"
+        "Could not install the Locality terminal command without administrator privileges. Add a user-writable directory such as ~/.local/bin to PATH, then try again. Checked PATH directories: {checked}.{detail}"
     ))
 }
 
@@ -4240,14 +4252,14 @@ fn default_user_terminal_cli_dir() -> Option<PathBuf> {
             if terminal_cli_dir_is_on_path(&windows_apps) {
                 windows_apps
             } else {
-                local_app_data.join("AgentFS").join("bin")
+                local_app_data.join("Locality").join("bin")
             }
         })
         .or_else(|| {
             home_dir().ok().map(|home| {
                 home.join("AppData")
                     .join("Local")
-                    .join("AgentFS")
+                    .join("Locality")
                     .join("bin")
             })
         })
@@ -4278,7 +4290,7 @@ fn ensure_terminal_cli_dir_registered(installed: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
         return Err(format!(
-            "Installed the AFS terminal command at {}, but {} is not on PATH. Add that directory to your user PATH, then open a new terminal.",
+            "Installed the Locality terminal command at {}, but {} is not on PATH. Add that directory to your user PATH, then open a new terminal.",
             installed.display(),
             directory.display()
         ));
@@ -4288,13 +4300,13 @@ fn ensure_terminal_cli_dir_registered(installed: &Path) -> Result<(), String> {
     {
         let Some(config_path) = terminal_cli_shell_config_path() else {
             return Err(format!(
-                "Installed the AFS terminal command at {}, but could not find your home directory to add it to PATH.",
+                "Installed the Locality terminal command at {}, but could not find your home directory to add it to PATH.",
                 installed.display()
             ));
         };
         write_terminal_cli_path_section(&config_path, directory).map_err(|error| {
         format!(
-            "Installed the AFS terminal command at {}, but could not update {} to add it to PATH: {error}",
+            "Installed the Locality terminal command at {}, but could not update {} to add it to PATH: {error}",
             installed.display(),
             config_path.display()
         )
@@ -4344,12 +4356,12 @@ fn terminal_cli_path_shell_block(directory: &Path) -> String {
     let directory = shell_single_quote(&directory.display().to_string());
     format!(
         "{TERMINAL_CLI_PATH_MANAGED_START}\n\
-_afs_cli_dir={directory}\n\
+_loc_cli_dir={directory}\n\
 case \":$PATH:\" in\n\
-  *\":$_afs_cli_dir:\"*) ;;\n\
-  *) export PATH=\"$_afs_cli_dir:$PATH\" ;;\n\
+  *\":$_loc_cli_dir:\"*) ;;\n\
+  *) export PATH=\"$_loc_cli_dir:$PATH\" ;;\n\
 esac\n\
-unset _afs_cli_dir\n\
+unset _loc_cli_dir\n\
 {TERMINAL_CLI_PATH_MANAGED_END}\n"
     )
 }
@@ -4473,7 +4485,7 @@ fn is_windows_user_terminal_cli_path(path: &Path) -> bool {
         .to_string()
         .replace('/', "\\")
         .to_ascii_lowercase();
-    value.ends_with(r"\microsoft\windowsapps") || value.ends_with(r"\agentfs\bin")
+    value.ends_with(r"\microsoft\windowsapps") || value.ends_with(r"\locality\bin")
 }
 
 #[cfg(windows)]
@@ -4554,7 +4566,7 @@ fn terminal_cli_link_state(
     }
 
     Err(format!(
-        "A file already exists at {}. Move it aside so AFS can install the bundled CLI there.",
+        "A file already exists at {}. Move it aside so Locality can install the bundled CLI there.",
         link_path.display()
     ))
 }
@@ -4587,7 +4599,7 @@ fn windows_terminal_cli_shim_state(
     })?;
     if !contents.contains(WINDOWS_TERMINAL_CLI_SHIM_MARKER) {
         return Err(format!(
-            "A file already exists at {}. Move it aside so AFS can install the bundled CLI there.",
+            "A file already exists at {}. Move it aside so Locality can install the bundled CLI there.",
             link_path.display()
         ));
     }
@@ -4605,7 +4617,7 @@ fn windows_terminal_cli_shim_state(
 fn windows_terminal_cli_shim_contents(cli_path: &Path) -> String {
     let cli_path = batch_file_literal(&cli_path.display().to_string());
     format!(
-        "@echo off\r\nrem {WINDOWS_TERMINAL_CLI_SHIM_MARKER}\r\nset \"_afs_cli={cli_path}\"\r\n\"%_afs_cli%\" %*\r\n"
+        "@echo off\r\nrem {WINDOWS_TERMINAL_CLI_SHIM_MARKER}\r\nset \"_loc_cli={cli_path}\"\r\n\"%_loc_cli%\" %*\r\n"
     )
 }
 
@@ -4724,19 +4736,22 @@ fn reload_daemon_mounts(state_root: &Path) -> Result<(), String> {
                 "warn",
                 "daemon.reload_stale_schema",
                 format!(
-                    "detected a stale afsd schema reader during reload: {}",
+                    "detected a stale localityd schema reader during reload: {}",
                     error.message
                 ),
             );
             restart_daemon_for_current_binary(state_root)?;
             reload_daemon_mounts_once(state_root).map_err(|retry_error| {
                 format!(
-                    "Could not reload afsd mounts after restarting afsd for the current state schema: {}",
+                    "Could not reload localityd mounts after restarting localityd for the current state schema: {}",
                     retry_error.message
                 )
             })
         }
-        Err(error) => Err(format!("Could not reload afsd mounts: {}", error.message)),
+        Err(error) => Err(format!(
+            "Could not reload localityd mounts: {}",
+            error.message
+        )),
     }
 }
 
@@ -4826,7 +4841,7 @@ fn prefetch_virtual_projection_container(
             })
             .unwrap_or_else(|| "Could not load the top-level Notion folder.".to_string())),
         Err(error) => Err(format!(
-            "Could not ask afsd to load the top-level Notion folder: {}",
+            "Could not ask localityd to load the top-level Notion folder: {}",
             error.message()
         )),
     }
@@ -4893,7 +4908,7 @@ impl WindowsCloudFilesProviderSupervisor {
         for mount in windows_cloud_files_mounts(state_root) {
             if let Err(error) = self.stop_mount(state_root, &mount) {
                 eprintln!(
-                    "afs desktop could not stop Windows Cloud Files provider `{}`: {error}",
+                    "loc desktop could not stop Windows Cloud Files provider `{}`: {error}",
                     mount.mount_id.0
                 );
             }
@@ -4957,7 +4972,7 @@ fn ensure_windows_cloud_files_providers_for_state(state_root: &Path) -> Result<(
 #[cfg(target_os = "windows")]
 fn load_windows_cloud_files_mounts(state_root: &Path) -> Result<Vec<MountConfig>, String> {
     let store = SqliteStateStore::open(state_root.to_path_buf())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     Ok(store
         .load_mounts()
         .map_err(|error| format!("Could not load mounts: {error}"))?
@@ -4969,7 +4984,7 @@ fn load_windows_cloud_files_mounts(state_root: &Path) -> Result<Vec<MountConfig>
 #[cfg(target_os = "windows")]
 fn windows_cloud_files_mounts(state_root: &Path) -> Vec<MountConfig> {
     load_windows_cloud_files_mounts(state_root).unwrap_or_else(|error| {
-        eprintln!("afs desktop could not load Windows Cloud Files mounts: {error}");
+        eprintln!("loc desktop could not load Windows Cloud Files mounts: {error}");
         Vec::new()
     })
 }
@@ -4982,7 +4997,7 @@ fn start_windows_cloud_files_provider_supervisor() {
             loop {
                 if let Err(error) = ensure_virtual_projection_runtimes_for_state(&state_root) {
                     eprintln!(
-                        "afs desktop could not supervise Windows Cloud Files provider: {error}"
+                        "loc desktop could not supervise Windows Cloud Files provider: {error}"
                     );
                 }
                 std::thread::sleep(std::time::Duration::from_secs(30));
@@ -5000,7 +5015,7 @@ fn stop_windows_cloud_files_provider_supervisor() {
         match supervisor.lock() {
             Ok(mut supervisor) => supervisor.stop_all(&default_state_root()),
             Err(_) => {
-                eprintln!("afs desktop could not stop Windows Cloud Files providers: lock poisoned")
+                eprintln!("loc desktop could not stop Windows Cloud Files providers: lock poisoned")
             }
         }
     }
@@ -5067,7 +5082,7 @@ fn signal_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(
         "signal",
         vec![
             "--mount-id".to_string(),
-            afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
+            localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
             "--identifier".to_string(),
             provider_identifier,
         ],
@@ -5142,8 +5157,8 @@ fn register_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result
 #[cfg(target_os = "macos")]
 fn register_macos_virtual_projection(_mount_id: &str, _root: &str) -> Result<(), String> {
     register_macos_file_provider_domain(
-        afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
-        afsd::file_provider::MACOS_FILE_PROVIDER_DISPLAY_NAME,
+        localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+        localityd::file_provider::MACOS_FILE_PROVIDER_DISPLAY_NAME,
     )
     .map(|_| ())
     .map_err(|error| {
@@ -5161,7 +5176,7 @@ fn register_macos_virtual_projection(_mount_id: &str, _root: &str) -> Result<(),
 
 #[cfg(target_os = "linux")]
 fn register_linux_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
-    afs_cli::file_provider::register_linux_fuse_mount(state_root, mount)
+    loc_cli::file_provider::register_linux_fuse_mount(state_root, mount)
         .map(|_| ())
         .map_err(|error| format!("Could not register Linux FUSE mount: {}", error.message()))
 }
@@ -5231,7 +5246,7 @@ fn open_virtual_projection(mount: &MountConfig) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
-    match macos_file_provider_domain_url(afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID) {
+    match macos_file_provider_domain_url(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID) {
         Ok(provider_root) => {
             let source_root = provider_root.join(source_root_directory_name(&mount.connector));
             if source_root.exists() {
@@ -5246,7 +5261,7 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
                 "file_provider.open_domain_failed",
                 format!(
                     "could not open macOS File Provider domain `{}`: {first_error}",
-                    afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID
+                    localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID
                 ),
             );
 
@@ -5260,7 +5275,7 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
                     format!("could not re-register macOS File Provider domain: {error}"),
                 );
             } else if open_macos_file_provider_domain(
-                afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+                localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
             )
             .is_ok()
             {
@@ -5287,7 +5302,7 @@ fn open_windows_virtual_projection(mount: &MountConfig) -> Result<(), String> {
                 if let Err(error) = ensure_windows_cloud_files_provider_running(&state_root, &mount)
                 {
                     eprintln!(
-                        "afs desktop could not prepare Windows Cloud Files provider while opening `{}`: {error}",
+                        "loc desktop could not prepare Windows Cloud Files provider while opening `{}`: {error}",
                         mount.mount_id.0
                     );
                 }
@@ -5325,12 +5340,18 @@ fn open_macos_virtual_projection(_mount: &MountConfig) -> Result<(), String> {
 
 fn connect_notion_with_broker(state_root: PathBuf) -> Result<String, String> {
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let credentials = open_credential_store(&state_root);
-    let broker_url = env_first(&["AFS_NOTION_OAUTH_BROKER_URL", "AFS_AUTH_BROKER_URL"])
-        .unwrap_or_else(|| DEFAULT_AFS_NOTION_OAUTH_BROKER_URL.to_string());
-    let redirect_uri = env_first(&["AFS_NOTION_OAUTH_REDIRECT_URI", "NOTION_OAUTH_REDIRECT_URI"])
-        .unwrap_or_else(|| "http://localhost:8757/oauth/notion/callback".to_string());
+    let broker_url = env_first(&[
+        "LOCALITY_NOTION_OAUTH_BROKER_URL",
+        "LOCALITY_AUTH_BROKER_URL",
+    ])
+    .unwrap_or_else(|| DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = env_first(&[
+        "LOCALITY_NOTION_OAUTH_REDIRECT_URI",
+        "NOTION_OAUTH_REDIRECT_URI",
+    ])
+    .unwrap_or_else(|| "http://localhost:8757/oauth/notion/callback".to_string());
     let broker = HttpNotionOAuthBrokerClient::new(broker_url.clone());
     let start = broker
         .start(&NotionOAuthBrokerStart {
@@ -5431,7 +5452,7 @@ fn refresh_notion_mount_after_connect(
     if has_unfinished_journals {
         reload_daemon_mounts(state_root)?;
         return Ok(
-            "AFS updated the connection metadata, but kept the current mount cache because a push is still in progress. Try Change Notion Access again after it finishes."
+            "Locality updated the connection metadata, but kept the current mount cache because a push is still in progress. Try Change Notion Access again after it finishes."
                 .to_string(),
         );
     }
@@ -5455,15 +5476,15 @@ fn refresh_notion_mount_after_connect(
 
     let mut message = if let Some(preserved) = preserved {
         format!(
-            "AFS preserved {} local Notion change{} at `{}` and refreshed the mounted folder for the latest Notion access.",
+            "Locality preserved {} local Notion change{} at `{}` and refreshed the mounted folder for the latest Notion access.",
             preserved.count,
             if preserved.count == 1 { "" } else { "s" },
             preserved.directory.display()
         )
     } else if connection_changed {
-        "AFS refreshed the mounted folder for the newly connected workspace.".to_string()
+        "Locality refreshed the mounted folder for the newly connected workspace.".to_string()
     } else {
-        "AFS refreshed the mounted folder for the latest Notion access.".to_string()
+        "Locality refreshed the mounted folder for the latest Notion access.".to_string()
     };
 
     if let Some(warning) = projection_warning {
@@ -5482,7 +5503,7 @@ fn connection_metadata_changed(
 
 fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
     message.contains("The application cannot be used right now")
-        || message.contains("agentfs-file-providerctl was not found")
+        || message.contains("locality-file-providerctl was not found")
 }
 
 fn connection_metadata_key(
@@ -5632,7 +5653,7 @@ fn preserve_mount_pending_local_changes(
     let readme_path = directory.join("README.md");
     fs::write(
         &readme_path,
-        "AFS preserved these local Notion edits before refreshing the active mount for a changed Notion access scope.\n\nThe active mount was cleared so old pages outside the current Notion access do not keep appearing as pending changes. Review these files manually if you need to copy edits into the newly mounted workspace.\n",
+        "Locality preserved these local Notion edits before refreshing the active mount for a changed Notion access scope.\n\nThe active mount was cleared so old pages outside the current Notion access do not keep appearing as pending changes. Review these files manually if you need to copy edits into the newly mounted workspace.\n",
     )
     .map_err(|error| {
         format!(
@@ -5658,7 +5679,7 @@ fn preserve_entity_local_change(
     Ok(PreservedLocalChangeItem {
         kind: "entity".to_string(),
         title: entity.title,
-        path: afs_platform::logical_path_display(&entity.path),
+        path: locality_platform::logical_path_display(&entity.path),
         remote_id: Some(entity.remote_id.0),
         hydration: Some(hydration_name(&entity.hydration).to_string()),
         source_path: source_path.map(|path| path.display().to_string()),
@@ -5687,7 +5708,7 @@ fn preserve_virtual_mutation_local_change(
     Ok(PreservedLocalChangeItem {
         kind: format!("virtual_{:?}", mutation.mutation_kind).to_lowercase(),
         title: mutation.title,
-        path: afs_platform::logical_path_display(&mutation.projected_path),
+        path: locality_platform::logical_path_display(&mutation.projected_path),
         remote_id: mutation.target_remote_id.map(|remote_id| remote_id.0),
         hydration: None,
         source_path: source_path.map(|path| path.display().to_string()),
@@ -5799,7 +5820,7 @@ fn reusable_notion_connection_id(store: &SqliteStateStore) -> Option<ConnectionI
 fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     reconcile_desktop_projection_changes(&mut store, &state_root, Some(target))?;
     let credentials = open_credential_store(&state_root);
     let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
@@ -5821,7 +5842,7 @@ fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushRepo
 fn set_auto_save_for_file_blocking(change: AutoSaveFileChange) -> Result<ActionReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let target = expand_tilde(&change.path).unwrap_or_else(|_| PathBuf::from(&change.path));
     let target = absolute_path(&target)?;
     let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
@@ -5870,20 +5891,19 @@ fn auto_save_origin_for_path(
     mount_id: &MountId,
     relative_path: &Path,
 ) -> AutoSaveOrigin {
-    if store
+    let is_locality_created = store
         .find_virtual_mutation_by_path(mount_id, relative_path)
         .ok()
         .flatten()
         .is_some_and(|mutation| mutation.mutation_kind == VirtualMutationKind::Create)
-    {
-        AutoSaveOrigin::AfsCreated
-    } else if store
-        .find_entity_by_path(mount_id, relative_path)
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        AutoSaveOrigin::AfsCreated
+        || store
+            .find_entity_by_path(mount_id, relative_path)
+            .ok()
+            .flatten()
+            .is_none();
+
+    if is_locality_created {
+        AutoSaveOrigin::LocalityCreated
     } else {
         AutoSaveOrigin::UserEnabled
     }
@@ -5896,7 +5916,7 @@ fn resolve_desktop_mount_path(
     let mounts = store.load_mounts().map_err(|error| error.to_string())?;
     daemon_file_provider::find_mount_for_path(&mounts, target)
         .map(|(mount, matched)| (mount.clone(), matched.relative_path))
-        .ok_or_else(|| format!("Path is not inside an AFS mount: {}", target.display()))
+        .ok_or_else(|| format!("Path is not inside an Locality mount: {}", target.display()))
 }
 
 fn reconcile_desktop_projection_changes(
@@ -5912,14 +5932,14 @@ fn reconcile_desktop_projection_changes(
 fn auto_save_target_direct(target: &Path) -> Result<PushReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     reconcile_desktop_projection_changes(&mut store, &state_root, Some(target))?;
     let credentials = open_credential_store(&state_root);
     let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
         .map_err(|error| error.message())?;
     let report = execute_auto_save_push_job_with_content_root(
         &mut store,
-        afsd::execution::PushJob {
+        localityd::execution::PushJob {
             target_path: target.to_path_buf(),
             assume_yes: true,
             confirm_dangerous: false,
@@ -5934,7 +5954,7 @@ fn auto_save_target_direct(target: &Path) -> Result<PushReport, String> {
 fn pull_target_direct(target: &Path) -> Result<PullReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let credentials = open_credential_store(&state_root);
     let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
         .map_err(|error| error.message())?;
@@ -5946,7 +5966,7 @@ fn pull_target_direct(target: &Path) -> Result<PullReport, String> {
 fn diff_target_direct(target: &Path) -> Result<DiffReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     reconcile_desktop_projection_changes(&mut store, &state_root, Some(target))?;
 
     run_diff(&store, target).map_err(|error| error.message())
@@ -6001,19 +6021,27 @@ fn read_notion_file_blocking(target: &Path) -> FileEditorReport {
 fn save_notion_file_blocking(target: &Path, contents: &str) -> Result<String, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let mounts = store
         .load_mounts()
-        .map_err(|error| format!("Could not inspect AFS mounts: {error}"))?;
+        .map_err(|error| format!("Could not inspect Locality mounts: {error}"))?;
     let Some((mount, matched)) = daemon_file_provider::find_mount_for_path(&mounts, target) else {
-        return Err(format!("No AFS mount contains `{}`.", target.display()));
+        return Err(format!(
+            "No Locality mount contains `{}`.",
+            target.display()
+        ));
     };
     let mount = mount.clone();
     let relative_path = matched.relative_path;
     let entity = store
         .find_entity_by_path(&mount.mount_id, &relative_path)
         .map_err(|error| format!("Could not find mounted file metadata: {error}"))?
-        .ok_or_else(|| format!("No AFS file metadata found for `{}`.", target.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "No Locality file metadata found for `{}`.",
+                target.display()
+            )
+        })?;
 
     let hydration = if mount.projection.uses_virtual_filesystem() {
         let report = commit_virtual_fs_write(
@@ -6045,7 +6073,7 @@ fn save_notion_file_blocking(target: &Path, contents: &str) -> Result<String, St
 
 fn update_entity_after_editor_write(
     store: &mut SqliteStateStore,
-    mut entity: afs_store::EntityRecord,
+    mut entity: locality_store::EntityRecord,
     contents: &str,
 ) -> Result<HydrationState, String> {
     let next = hydration_after_editor_write(store, &entity, contents);
@@ -6058,7 +6086,7 @@ fn update_entity_after_editor_write(
 
 fn hydration_after_editor_write(
     store: &SqliteStateStore,
-    entity: &afs_store::EntityRecord,
+    entity: &locality_store::EntityRecord,
     contents: &str,
 ) -> HydrationState {
     if has_unresolved_conflict_markers(contents) {
@@ -6072,7 +6100,7 @@ fn hydration_after_editor_write(
 
 fn editor_contents_match_shadow(
     store: &SqliteStateStore,
-    entity: &afs_store::EntityRecord,
+    entity: &locality_store::EntityRecord,
     contents: &str,
 ) -> bool {
     parse_canonical_markdown(contents)
@@ -6092,12 +6120,15 @@ fn editor_contents_match_shadow(
 fn read_projected_file_contents(target: &Path) -> Result<String, String> {
     let state_root = default_state_root();
     let store = SqliteStateStore::open(state_root.clone())
-        .map_err(|error| format!("Could not open AFS state: {error}"))?;
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let mounts = store
         .load_mounts()
-        .map_err(|error| format!("Could not inspect AFS mounts: {error}"))?;
+        .map_err(|error| format!("Could not inspect Locality mounts: {error}"))?;
     let Some((mount, matched)) = daemon_file_provider::find_mount_for_path(&mounts, target) else {
-        return Err(format!("No AFS mount contains `{}`.", target.display()));
+        return Err(format!(
+            "No Locality mount contains `{}`.",
+            target.display()
+        ));
     };
     let read_path = if mount.projection.uses_virtual_filesystem() {
         virtual_fs_content_path(&state_root, &mount.mount_id, &matched.relative_path)
@@ -6114,7 +6145,7 @@ fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp-afs-desktop");
+    let tmp = path.with_extension("tmp-locality-desktop");
     fs::write(&tmp, contents)?;
     fs::rename(tmp, path)
 }
@@ -6129,7 +6160,7 @@ fn push_action_message(action: &str, ok: bool, message: Option<&str>) -> String 
             notion_access_lost_recovery_message()
         }
         Some(message) if is_remote_changed_push_message(message) => {
-            "Notion has newer changes than your last sync. Click Resolve on this file to pull the latest version, resolve any conflict markers if AFS writes them, then push again.".to_string()
+            "Notion has newer changes than your last sync. Click Resolve on this file to pull the latest version, resolve any conflict markers if Locality writes them, then push again.".to_string()
         }
         Some(message) if !message.is_empty() => message.to_string(),
         _ if ok => "Pushed changes to Notion.".to_string(),
@@ -6140,7 +6171,7 @@ fn push_action_message(action: &str, ok: bool, message: Option<&str>) -> String 
             "This push needs review before it writes to Notion. Open Review Push to approve it.".to_string()
         }
         _ if action == "read_only_blocked" => {
-            "This mount is read-only, so AFS cannot push local edits to Notion.".to_string()
+            "This mount is read-only, so Locality cannot push local edits to Notion.".to_string()
         }
         _ => format!("Push stopped: {action}"),
     }
@@ -6161,7 +6192,7 @@ fn pull_report_message(report: &PullReport) -> String {
         return "Synced the latest Notion version for this file.".to_string();
     }
     if report.skipped_dirty > 0 {
-        return "AFS kept your local edits because the file is still dirty. Review the diff, then push or restore the file.".to_string();
+        return "Locality kept your local edits because the file is still dirty. Review the diff, then push or restore the file.".to_string();
     }
     if report.enumerated > 0 || report.stubbed > 0 {
         return "Synced the latest Notion index for this mount.".to_string();
@@ -6257,13 +6288,13 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use afs_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
-    use afs_core::canonical::render_canonical_markdown;
-    use afs_core::journal::{JournalEntry, JournalStatus, PushId};
-    use afs_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
-    use afs_core::planner::PushPlan;
-    use afs_core::shadow::ShadowDocument;
-    use afs_store::{
+    use loc_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
+    use locality_core::canonical::render_canonical_markdown;
+    use locality_core::journal::{JournalEntry, JournalStatus, PushId};
+    use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+    use locality_core::planner::PushPlan;
+    use locality_core::shadow::ShadowDocument;
+    use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository,
         MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
@@ -6296,7 +6327,7 @@ mod tests {
 
     #[test]
     fn desktop_state_root_absolutizes_relative_fallbacks() {
-        assert!(super::absolute_state_root(PathBuf::from(".afs")).is_absolute());
+        assert!(super::absolute_state_root(PathBuf::from(".loc")).is_absolute());
     }
 
     #[test]
@@ -6350,7 +6381,7 @@ mod tests {
     fn live_mode_tick_pulls_remote_candidate_without_pending_changes() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes.clear();
-        let target = live_mode_target("/tmp/AFS/notion/teamspace-home/hello-world/page.md");
+        let target = live_mode_target("/tmp/Locality/notion/teamspace-home/hello-world/page.md");
         let mut sync_calls = 0usize;
         let mut pulled = Vec::new();
 
@@ -6380,7 +6411,7 @@ mod tests {
     fn live_mode_tick_reports_remote_pull_when_file_changed() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes.clear();
-        let target = live_mode_target("/tmp/AFS/notion/teamspace-home/hello-world/page.md");
+        let target = live_mode_target("/tmp/Locality/notion/teamspace-home/hello-world/page.md");
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
@@ -6405,8 +6436,8 @@ mod tests {
     fn live_mode_local_reconcile_is_throttled_per_target() {
         let mut times = BTreeMap::new();
         let now = Instant::now();
-        let page = PathBuf::from("/tmp/AFS/notion/teamspace-home/hello-world/page.md");
-        let other = PathBuf::from("/tmp/AFS/notion/teamspace-home/other/page.md");
+        let page = PathBuf::from("/tmp/Locality/notion/teamspace-home/hello-world/page.md");
+        let other = PathBuf::from("/tmp/Locality/notion/teamspace-home/other/page.md");
 
         assert!(live_mode_should_reconcile_local_target_for_key(
             &mut times,
@@ -6436,23 +6467,23 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "requires AFS_DESKTOP_LIVE_MODE_E2E=1, a scratch CloudStorage page path, and live Notion auth; mutates then cleans up the page"]
+    #[ignore = "requires LOCALITY_DESKTOP_LIVE_MODE_E2E=1, a scratch CloudStorage page path, and live Notion auth; mutates then cleans up the page"]
     fn live_mode_bidirectional_cloudstorage_markdown_e2e() {
         assert_eq!(
-            std::env::var("AFS_DESKTOP_LIVE_MODE_E2E").as_deref(),
+            std::env::var("LOCALITY_DESKTOP_LIVE_MODE_E2E").as_deref(),
             Ok("1"),
-            "set AFS_DESKTOP_LIVE_MODE_E2E=1 to confirm this live destructive test"
+            "set LOCALITY_DESKTOP_LIVE_MODE_E2E=1 to confirm this live destructive test"
         );
         let page_path = live_mode_e2e_page_path();
         assert!(
             page_path
                 .to_string_lossy()
                 .contains("/Library/CloudStorage/"),
-            "AFS_DESKTOP_LIVE_MODE_E2E_PAGE must be a CloudStorage-visible page.md path"
+            "LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE must be a CloudStorage-visible page.md path"
         );
         let page_id = live_mode_e2e_page_id(&page_path);
         let api = live_mode_e2e_notion_api(&page_path);
-        let run_id = format!("afs-desktop-live-e2e-{}", unique_suffix());
+        let run_id = format!("locality-desktop-live-e2e-{}", unique_suffix());
         let cleanup = LiveModeE2eCleanup {
             api: api.clone(),
             page_id: page_id.clone(),
@@ -6512,7 +6543,7 @@ mod tests {
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
-            Some(&live_mode_target("/tmp/AFS/notion/Other/page.md")),
+            Some(&live_mode_target("/tmp/Locality/notion/Other/page.md")),
             |change, target| {
                 synced.push((change.title.clone(), target.to_path_buf()));
                 Ok(())
@@ -6541,7 +6572,7 @@ mod tests {
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
-            Some(&live_mode_target("/tmp/AFS/notion/Other/page.md")),
+            Some(&live_mode_target("/tmp/Locality/notion/Other/page.md")),
             |_, _| {
                 calls += 1;
                 Ok(())
@@ -6558,7 +6589,7 @@ mod tests {
     #[test]
     fn live_mode_remote_pull_candidates_include_only_hydrated_pages() {
         let mount_id = MountId::new("notion-main");
-        let mount = MountConfig::new(mount_id.clone(), "notion", "/tmp/AFS/notion");
+        let mount = MountConfig::new(mount_id.clone(), "notion", "/tmp/Locality/notion");
         let mut store = InMemoryStateStore::default();
         store.save_mount(mount.clone()).expect("save mount");
         store
@@ -6606,7 +6637,7 @@ mod tests {
                 .map(|candidate| candidate.path)
                 .collect::<Vec<_>>(),
             vec![PathBuf::from(
-                "/tmp/AFS/notion/teamspace-home/hello-world/page.md"
+                "/tmp/Locality/notion/teamspace-home/hello-world/page.md"
             )]
         );
     }
@@ -6640,7 +6671,7 @@ mod tests {
         fs::write(&file, "not a folder").expect("write test file");
 
         let error =
-            validate_mount_root(&file, &temp.path().join(".afs")).expect_err("file rejected");
+            validate_mount_root(&file, &temp.path().join(".loc")).expect_err("file rejected");
 
         assert!(error.contains("not a file"));
     }
@@ -6648,12 +6679,12 @@ mod tests {
     #[test]
     fn mount_validation_rejects_state_directory() {
         let temp = TestTempDir::new("state-dir");
-        let state_root = temp.path().join(".afs");
+        let state_root = temp.path().join(".loc");
         fs::create_dir_all(&state_root).expect("create state dir");
 
         let error = validate_mount_root(&state_root, &state_root).expect_err("state dir rejected");
 
-        assert!(error.contains("outside the AFS state directory"));
+        assert!(error.contains("outside the Locality state directory"));
     }
 
     #[test]
@@ -6661,39 +6692,39 @@ mod tests {
         let temp = TestTempDir::new("new-child");
         let root = temp.path().join("Notion");
 
-        validate_mount_root(&root, &temp.path().join(".afs")).expect("valid child path");
+        validate_mount_root(&root, &temp.path().join(".loc")).expect("valid child path");
     }
 
     #[test]
     fn linux_fuse_mount_access_root_points_at_connector_directory() {
-        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/Locality")
             .projection(ProjectionMode::LinuxFuse);
 
         assert_eq!(
             super::mount_access_root(&mount),
-            std::path::PathBuf::from("/tmp/AFS/notion")
+            std::path::PathBuf::from("/tmp/Locality/notion")
         );
     }
 
     #[test]
     fn plain_mount_access_root_stays_at_mount_root() {
-        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/Locality")
             .projection(ProjectionMode::PlainFiles);
 
         assert_eq!(
             super::mount_access_root(&mount),
-            std::path::PathBuf::from("/tmp/AFS")
+            std::path::PathBuf::from("/tmp/Locality")
         );
     }
 
     #[test]
     fn windows_cloud_files_mount_access_root_stays_at_sync_root() {
-        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/Locality")
             .projection(ProjectionMode::WindowsCloudFiles);
 
         assert_eq!(
             super::mount_access_root(&mount),
-            std::path::PathBuf::from("/tmp/AFS")
+            std::path::PathBuf::from("/tmp/Locality")
         );
     }
 
@@ -6702,7 +6733,7 @@ mod tests {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            "/Users/test/Library/CloudStorage/AFS/notion",
+            "/Users/test/Library/CloudStorage/Locality/notion",
         )
         .projection(ProjectionMode::MacosFileProvider);
 
@@ -6717,7 +6748,9 @@ mod tests {
     fn reveal_materializes_visible_file_from_content_cache() {
         let temp = TestTempDir::new("reveal-cache");
         let cache = temp.path().join("cache/page.md");
-        let visible = temp.path().join("CloudStorage/AFS/notion/Page/page.md");
+        let visible = temp
+            .path()
+            .join("CloudStorage/Locality/notion/Page/page.md");
         fs::create_dir_all(cache.parent().expect("cache parent")).expect("create cache parent");
         fs::write(&cache, "# Page\n\nCached body").expect("write cache");
 
@@ -6732,7 +6765,7 @@ mod tests {
 
     #[test]
     fn missing_non_macos_virtual_reveal_opens_projection_root() {
-        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS")
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/Locality")
             .projection(ProjectionMode::LinuxFuse);
 
         assert_eq!(
@@ -6756,12 +6789,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_default_notion_mount_root_is_shared_afs_root() {
+    fn linux_default_notion_mount_root_is_shared_loc_root() {
         let home = super::home_dir().expect("home dir");
 
         assert_eq!(
             super::default_notion_mount_root(),
-            home.join("Documents").join("AFS")
+            home.join("Documents").join("Locality")
         );
     }
 
@@ -6772,7 +6805,7 @@ mod tests {
 
         assert_eq!(
             super::default_notion_access_root(),
-            home.join("Documents").join("AFS").join("notion")
+            home.join("Documents").join("Locality").join("notion")
         );
     }
 
@@ -6789,12 +6822,12 @@ mod tests {
     #[test]
     fn linux_desktop_mount_normalizes_selected_connector_directory_to_shared_root() {
         let home = super::home_dir().expect("home dir");
-        let selected = home.join("Documents").join("AFS").join("notion");
+        let selected = home.join("Documents").join("Locality").join("notion");
 
         assert_eq!(
             super::resolve_desktop_mount_root(&selected.display().to_string())
                 .expect("resolve mount root"),
-            home.join("Documents").join("AFS")
+            home.join("Documents").join("Locality")
         );
     }
 
@@ -6803,7 +6836,10 @@ mod tests {
     fn macos_desktop_mount_resolves_bare_name_under_cloudstorage() {
         let root = super::resolve_desktop_mount_root("Notion").expect("resolve mount root");
 
-        assert_eq!(root, super::macos_afs_cloud_storage_root().join("notion"));
+        assert_eq!(
+            root,
+            super::macos_locality_cloud_storage_root().join("notion")
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -6814,12 +6850,12 @@ mod tests {
 
         let error = super::validate_desktop_mount_root(
             &root,
-            &temp.path().join(".afs"),
-            &afs_store::ProjectionMode::MacosFileProvider,
+            &temp.path().join(".loc"),
+            &locality_store::ProjectionMode::MacosFileProvider,
         )
         .expect_err("non-CloudStorage path rejected");
 
-        assert!(error.contains("inside the AFS File Provider root"));
+        assert!(error.contains("inside the Locality File Provider root"));
     }
 
     #[test]
@@ -6936,7 +6972,7 @@ mod tests {
         assert!(super::WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX.starts_with(r"Local\"));
         assert!(super::WINDOWS_DESKTOP_ACTIVATION_EVENT.starts_with(r"Local\"));
 
-        let wide = super::windows_wide_null("AFS");
+        let wide = super::windows_wide_null("Locality");
         assert_eq!(wide.last().copied(), Some(0));
         assert_eq!(&wide[..3], &['A' as u16, 'F' as u16, 'S' as u16]);
     }
@@ -6958,7 +6994,7 @@ mod tests {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            "/tmp/CloudStorage/AFS/notion",
+            "/tmp/CloudStorage/Locality/notion",
         )
         .projection(ProjectionMode::MacosFileProvider);
 
@@ -7006,7 +7042,7 @@ mod tests {
 
     #[test]
     fn notion_access_lost_messages_explain_selected_access_recovery() {
-        let raw = "io error: notion api returned HTTP 404 Not Found: {\"object\":\"error\",\"status\":404,\"code\":\"object_not_found\",\"message\":\"Could not find page with ID: page-1. Make sure the relevant pages and databases are shared with your integration \\\"AgentFS\\\".\"}";
+        let raw = "io error: notion api returned HTTP 404 Not Found: {\"object\":\"error\",\"status\":404,\"code\":\"object_not_found\",\"message\":\"Could not find page with ID: page-1. Make sure the relevant pages and databases are shared with your integration \\\"Locality\\\".\"}";
 
         assert!(is_notion_access_lost_message(raw));
         assert!(pull_error_message(raw).contains("outside the current selected access"));
@@ -7089,7 +7125,7 @@ mod tests {
         let mount_id = MountId::new("notion-main");
         let remote_id = RemoteId::new("page-1");
         let relative_path = Path::new("Team/Page/page.md");
-        let frontmatter = "afs:\n  id: page-1\n  type: page\ntitle: Page\n";
+        let frontmatter = "loc:\n  id: page-1\n  type: page\ntitle: Page\n";
         let body = "Original body.\n";
         let entity = EntityRecord::new(
             mount_id.clone(),
@@ -7122,7 +7158,7 @@ mod tests {
             .expect("save shadow");
 
         let content_path =
-            afsd::virtual_fs::virtual_fs_content_path(temp.path(), &mount_id, relative_path)
+            localityd::virtual_fs::virtual_fs_content_path(temp.path(), &mount_id, relative_path)
                 .expect("content path");
         fs::create_dir_all(content_path.parent().expect("content parent"))
             .expect("create content parent");
@@ -7143,15 +7179,15 @@ mod tests {
                 .is_empty()
         );
         assert!(store.list_journal().expect("list journals").is_empty());
-        assert!(!afsd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id).exists());
+        assert!(!localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id).exists());
         assert!(preserved.directory.join(relative_path).exists());
     }
 
     #[test]
     fn pending_changes_hide_clean_failed_journal_audit_entries() {
         let status = status_report_with_entry(status_entry(
-            afs_cli::status::StatusState::Clean,
-            afs_cli::status::StatusSyncState::ReviewNeeded,
+            loc_cli::status::StatusState::Clean,
+            loc_cli::status::StatusSyncState::ReviewNeeded,
             1,
             vec![
                 status_issue("failed_journal", "1 push journal(s) failed"),
@@ -7166,8 +7202,8 @@ mod tests {
     #[test]
     fn pending_changes_keep_failed_journal_with_dirty_file() {
         let status = status_report_with_entry(status_entry(
-            afs_cli::status::StatusState::Dirty,
-            afs_cli::status::StatusSyncState::ReviewNeeded,
+            loc_cli::status::StatusState::Dirty,
+            loc_cli::status::StatusSyncState::ReviewNeeded,
             1,
             vec![
                 status_issue("failed_journal", "1 push journal(s) failed"),
@@ -7185,8 +7221,8 @@ mod tests {
     #[test]
     fn pending_changes_include_auto_save_state_for_enrolled_file() {
         let status = status_report_with_entry(status_entry(
-            afs_cli::status::StatusState::Dirty,
-            afs_cli::status::StatusSyncState::ReviewNeeded,
+            loc_cli::status::StatusState::Dirty,
+            loc_cli::status::StatusSyncState::ReviewNeeded,
             0,
             vec![],
         ));
@@ -7196,7 +7232,7 @@ mod tests {
                 AutoSaveEnrollmentRecord::new(
                     MountId::new("notion-main"),
                     "page.md",
-                    AutoSaveOrigin::AfsCreated,
+                    AutoSaveOrigin::LocalityCreated,
                     "now",
                 )
                 .blocked("deletions require review", "now"),
@@ -7217,7 +7253,7 @@ mod tests {
 
     #[test]
     fn pull_report_message_explains_conflict_markers() {
-        let report = afs_cli::pull::PullReport {
+        let report = loc_cli::pull::PullReport {
             ok: false,
             command: "pull".to_string(),
             via: "cli".to_string(),
@@ -7228,7 +7264,7 @@ mod tests {
             stubbed: 0,
             hydrated: 0,
             skipped_dirty: 1,
-            conflicts: vec![afsd::pull::PullConflict {
+            conflicts: vec![localityd::pull::PullConflict {
                 path: "page.md".to_string(),
                 remote_id: "abc".to_string(),
             }],
@@ -7238,15 +7274,15 @@ mod tests {
     }
 
     fn status_report_with_entry(
-        entry: afs_cli::status::StatusEntry,
-    ) -> afs_cli::status::StatusReport {
-        afs_cli::status::StatusReport {
+        entry: loc_cli::status::StatusEntry,
+    ) -> loc_cli::status::StatusReport {
+        loc_cli::status::StatusReport {
             ok: true,
             clean: false,
             command: "status",
             target: None,
-            summary: afs_cli::status::StatusSummary::default(),
-            mounts: vec![afs_cli::status::StatusMountReport {
+            summary: loc_cli::status::StatusSummary::default(),
+            mounts: vec![loc_cli::status::StatusMountReport {
                 mount_id: "notion-main".to_string(),
                 connector: "notion".to_string(),
                 root: "/tmp/notion".to_string(),
@@ -7256,12 +7292,12 @@ mod tests {
     }
 
     fn status_entry(
-        state: afs_cli::status::StatusState,
-        sync_state: afs_cli::status::StatusSyncState,
+        state: loc_cli::status::StatusState,
+        sync_state: loc_cli::status::StatusSyncState,
         failed_journal_count: usize,
-        issues: Vec<afs_cli::status::StatusIssue>,
-    ) -> afs_cli::status::StatusEntry {
-        afs_cli::status::StatusEntry {
+        issues: Vec<loc_cli::status::StatusIssue>,
+    ) -> loc_cli::status::StatusEntry {
+        loc_cli::status::StatusEntry {
             path: "page.md".to_string(),
             absolute_path: "/tmp/notion/page.md".to_string(),
             entity_id: "abc".to_string(),
@@ -7270,15 +7306,15 @@ mod tests {
             hydration: "hydrated".to_string(),
             state,
             sync_state,
-            remote: afs_cli::status::StatusRemoteState::default(),
+            remote: loc_cli::status::StatusRemoteState::default(),
             issues,
             pending_journal_count: 0,
             failed_journal_count,
         }
     }
 
-    fn status_issue(code: &str, message: &str) -> afs_cli::status::StatusIssue {
-        afs_cli::status::StatusIssue {
+    fn status_issue(code: &str, message: &str) -> loc_cli::status::StatusIssue {
+        loc_cli::status::StatusIssue {
             code: code.to_string(),
             message: message.to_string(),
         }
@@ -7286,7 +7322,7 @@ mod tests {
 
     #[test]
     fn diff_report_message_handles_noop() {
-        let report = afs_cli::diff::DiffReport {
+        let report = loc_cli::diff::DiffReport {
             ok: true,
             command: "diff",
             path: "/tmp/notion/page.md".to_string(),
@@ -7294,7 +7330,7 @@ mod tests {
             entity_id: "abc".to_string(),
             validation: Vec::new(),
             plan: None,
-            guardrail: afs_cli::diff::GuardrailOutput {
+            guardrail: loc_cli::diff::GuardrailOutput {
                 decision: "proceed".to_string(),
                 reasons: Vec::new(),
             },
@@ -7343,7 +7379,7 @@ mod tests {
         let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
         let mount_id = MountId::new("notion-main");
         let remote_id = RemoteId::new("page-1");
-        let frontmatter = "afs:\n  id: page-1\n  type: page\ntitle: Page\n";
+        let frontmatter = "loc:\n  id: page-1\n  type: page\ntitle: Page\n";
         let body = "Original body.\n";
         let entity = EntityRecord::new(
             mount_id.clone(),
@@ -7497,10 +7533,10 @@ mod tests {
     #[test]
     fn terminal_cli_installer_creates_path_link() {
         let temp = TestTempDir::new("terminal-cli-link");
-        let cli = temp.path().join("AFS.app/Contents/MacOS/afs");
-        let link = temp.path().join("bin/afs");
+        let cli = temp.path().join("Locality.app/Contents/MacOS/loc");
+        let link = temp.path().join("bin/loc");
         fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
-        fs::write(&cli, b"afs cli").expect("write cli");
+        fs::write(&cli, b"loc cli").expect("write cli");
 
         let installed = install_terminal_cli_link_at(&cli, &link).expect("install cli link");
 
@@ -7516,10 +7552,10 @@ mod tests {
     #[test]
     fn terminal_cli_installer_creates_windows_cmd_shim() {
         let temp = TestTempDir::new("terminal-cli-windows-shim");
-        let cli = temp.path().join("app/afs.exe");
-        let link = temp.path().join("bin/afs.cmd");
+        let cli = temp.path().join("app/loc.exe");
+        let link = temp.path().join("bin/loc.cmd");
         fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
-        fs::write(&cli, b"afs cli").expect("write cli");
+        fs::write(&cli, b"loc cli").expect("write cli");
 
         let installed = install_terminal_cli_link_at(&cli, &link).expect("install cli shim");
 
@@ -7538,14 +7574,14 @@ mod tests {
     #[test]
     fn terminal_cli_installer_updates_stale_windows_cmd_shim() {
         let temp = TestTempDir::new("terminal-cli-windows-shim-refresh");
-        let old_cli = temp.path().join("old/afs.exe");
-        let new_cli = temp.path().join("new/afs.exe");
-        let link = temp.path().join("bin/afs.cmd");
+        let old_cli = temp.path().join("old/loc.exe");
+        let new_cli = temp.path().join("new/loc.exe");
+        let link = temp.path().join("bin/loc.cmd");
         fs::create_dir_all(old_cli.parent().expect("old cli parent")).expect("create old parent");
         fs::create_dir_all(new_cli.parent().expect("new cli parent")).expect("create new parent");
         fs::create_dir_all(link.parent().expect("link parent")).expect("create link parent");
-        fs::write(&old_cli, b"old afs cli").expect("write old cli");
-        fs::write(&new_cli, b"new afs cli").expect("write new cli");
+        fs::write(&old_cli, b"old loc cli").expect("write old cli");
+        fs::write(&new_cli, b"new loc cli").expect("write new cli");
         fs::write(&link, super::windows_terminal_cli_shim_contents(&old_cli))
             .expect("write stale shim");
 
@@ -7560,16 +7596,16 @@ mod tests {
     #[test]
     fn terminal_cli_installer_uses_cmd_file_on_windows() {
         let temp = TestTempDir::new("terminal-cli-windows-path-dir");
-        let cli = temp.path().join("app/afs.exe");
+        let cli = temp.path().join("app/loc.exe");
         let writable = temp.path().join("writable-bin");
         fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
         fs::create_dir_all(&writable).expect("create writable dir");
-        fs::write(&cli, b"afs cli").expect("write cli");
+        fs::write(&cli, b"loc cli").expect("write cli");
 
         let installed = install_terminal_cli_link_in_path_dirs(&cli, vec![writable.clone()])
             .expect("install cli shim in path");
 
-        assert_eq!(installed, writable.join("afs.cmd"));
+        assert_eq!(installed, writable.join("loc.cmd"));
         assert!(installed.is_file());
     }
 
@@ -7577,18 +7613,20 @@ mod tests {
     #[test]
     fn windows_terminal_lookup_checks_exe_and_cmd_extensions() {
         assert_eq!(
-            super::command_path_candidates("afs"),
-            vec!["afs.exe", "afs.cmd", "afs.bat", "afs"]
+            super::command_path_candidates("loc"),
+            vec!["loc.exe", "loc.cmd", "loc.bat", "loc"]
         );
-        assert_eq!(super::terminal_cli_command_filename(), "afs.cmd");
+        assert_eq!(super::terminal_cli_command_filename(), "loc.cmd");
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_login_run_value_quotes_executable() {
         assert_eq!(
-            super::windows_run_value_for_executable(Path::new(r"C:\Program Files\AFS\AFS.exe")),
-            r#""C:\Program Files\AFS\AFS.exe""#
+            super::windows_run_value_for_executable(Path::new(
+                r"C:\Program Files\Locality\Locality.exe"
+            )),
+            r#""C:\Program Files\Locality\Locality.exe""#
         );
     }
 
@@ -7596,14 +7634,14 @@ mod tests {
     #[test]
     fn terminal_cli_installer_updates_stale_symlink() {
         let temp = TestTempDir::new("terminal-cli-refresh");
-        let old_cli = temp.path().join("old/afs");
-        let new_cli = temp.path().join("new/afs");
-        let link = temp.path().join("bin/afs");
+        let old_cli = temp.path().join("old/loc");
+        let new_cli = temp.path().join("new/loc");
+        let link = temp.path().join("bin/loc");
         fs::create_dir_all(old_cli.parent().expect("old cli parent")).expect("create old parent");
         fs::create_dir_all(new_cli.parent().expect("new cli parent")).expect("create new parent");
         fs::create_dir_all(link.parent().expect("link parent")).expect("create link parent");
-        fs::write(&old_cli, b"old afs cli").expect("write old cli");
-        fs::write(&new_cli, b"new afs cli").expect("write new cli");
+        fs::write(&old_cli, b"old loc cli").expect("write old cli");
+        fs::write(&new_cli, b"new loc cli").expect("write new cli");
         std::os::unix::fs::symlink(&old_cli, &link).expect("create stale link");
 
         install_terminal_cli_link_at(&new_cli, &link).expect("refresh cli link");
@@ -7615,11 +7653,11 @@ mod tests {
     #[test]
     fn terminal_cli_installer_does_not_replace_regular_file() {
         let temp = TestTempDir::new("terminal-cli-existing-file");
-        let cli = temp.path().join("app/afs");
-        let link = temp.path().join("bin/afs");
+        let cli = temp.path().join("app/loc");
+        let link = temp.path().join("bin/loc");
         fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
         fs::create_dir_all(link.parent().expect("link parent")).expect("create link parent");
-        fs::write(&cli, b"afs cli").expect("write cli");
+        fs::write(&cli, b"loc cli").expect("write cli");
         fs::write(&link, b"existing command").expect("write existing command");
 
         let error = install_terminal_cli_link_at(&cli, &link).expect_err("regular file rejected");
@@ -7635,23 +7673,23 @@ mod tests {
     #[test]
     fn terminal_cli_installer_uses_later_path_directory_without_admin() {
         let temp = TestTempDir::new("terminal-cli-path-dirs");
-        let cli = temp.path().join("app/afs");
+        let cli = temp.path().join("app/loc");
         let occupied = temp.path().join("occupied-bin");
         let writable = temp.path().join("writable-bin");
         fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
         fs::create_dir_all(&occupied).expect("create occupied dir");
         fs::create_dir_all(&writable).expect("create writable dir");
-        fs::write(&cli, b"afs cli").expect("write cli");
-        fs::write(occupied.join("afs"), b"existing command").expect("write occupied command");
+        fs::write(&cli, b"loc cli").expect("write cli");
+        fs::write(occupied.join("loc"), b"existing command").expect("write occupied command");
 
         let installed =
             install_terminal_cli_link_in_path_dirs(&cli, vec![occupied.clone(), writable.clone()])
                 .expect("install cli link in path");
 
-        assert_eq!(installed, writable.join("afs"));
+        assert_eq!(installed, writable.join("loc"));
         assert_eq!(fs::read_link(&installed).expect("read cli link"), cli);
         assert_eq!(
-            fs::read_to_string(occupied.join("afs")).expect("read occupied command"),
+            fs::read_to_string(occupied.join("loc")).expect("read occupied command"),
             "existing command"
         );
     }
@@ -7660,31 +7698,31 @@ mod tests {
     #[test]
     fn terminal_cli_installer_prefers_user_path_before_homebrew_fallback() {
         let temp = TestTempDir::new("terminal-cli-user-path");
-        let cli = temp.path().join("app/afs");
+        let cli = temp.path().join("app/loc");
         let homebrew = temp.path().join("opt/homebrew/bin");
         let user_bin = temp.path().join(".local/bin");
         fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
         fs::create_dir_all(&homebrew).expect("create homebrew dir");
         fs::create_dir_all(&user_bin).expect("create user dir");
-        fs::write(&cli, b"afs cli").expect("write cli");
+        fs::write(&cli, b"loc cli").expect("write cli");
 
         let installed =
             install_terminal_cli_link_in_path_dirs(&cli, vec![homebrew.clone(), user_bin.clone()])
                 .expect("install cli link in user path");
 
-        assert_eq!(installed, user_bin.join("afs"));
+        assert_eq!(installed, user_bin.join("loc"));
         assert_eq!(fs::read_link(&installed).expect("read cli link"), cli);
-        assert!(!homebrew.join("afs").exists());
+        assert!(!homebrew.join("loc").exists());
     }
 
     #[cfg(unix)]
     #[test]
     fn terminal_cli_installer_uses_user_fallback_before_protected_system_paths() {
         let temp = TestTempDir::new("terminal-cli-user-fallback");
-        let cli = temp.path().join("app/afs");
+        let cli = temp.path().join("app/loc");
         let user_bin = temp.path().join(".local/bin");
         fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
-        fs::write(&cli, b"afs cli").expect("write cli");
+        fs::write(&cli, b"loc cli").expect("write cli");
 
         let mut dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/sbin")];
         super::insert_user_terminal_cli_fallback_dir(&mut dirs, &user_bin);
@@ -7692,7 +7730,7 @@ mod tests {
         let installed = super::install_terminal_cli_link_in_sorted_path_dirs(&cli, dirs)
             .expect("install fallback");
 
-        assert_eq!(installed, user_bin.join("afs"));
+        assert_eq!(installed, user_bin.join("loc"));
         assert_eq!(fs::read_link(&installed).expect("read cli link"), cli);
     }
 
@@ -7708,19 +7746,19 @@ mod tests {
 
         let contents = fs::read_to_string(&profile).expect("read profile");
         assert!(contents.contains("export EXISTING=1"));
-        assert_eq!(contents.matches("AFS_TERMINAL_CLI_PATH").count(), 2);
-        assert!(contents.contains("export PATH=\"$_afs_cli_dir:$PATH\""));
+        assert_eq!(contents.matches("LOCALITY_TERMINAL_CLI_PATH").count(), 2);
+        assert!(contents.contains("export PATH=\"$_loc_cli_dir:$PATH\""));
     }
 
     #[test]
     fn terminal_cli_shell_quote_escapes_single_quotes() {
-        assert_eq!(shell_single_quote("/tmp/it's/afs"), "'/tmp/it'\"'\"'s/afs'");
+        assert_eq!(shell_single_quote("/tmp/it's/loc"), "'/tmp/it'\"'\"'s/loc'");
     }
 
     #[test]
     fn state_clear_removes_metadata_but_preserves_state_root() {
         let temp = TestTempDir::new("clear-state-root");
-        let state_root = temp.path().join(".afs");
+        let state_root = temp.path().join(".loc");
         fs::create_dir_all(state_root.join("content/notion-main")).expect("create content");
         fs::write(state_root.join("state.sqlite3"), b"db").expect("write db");
 
@@ -7738,7 +7776,7 @@ mod tests {
     #[test]
     fn state_watcher_ignores_sqlite_and_settings_churn() {
         let temp = TestTempDir::new("state-watch-ignore");
-        let state_root = temp.path().join(".afs");
+        let state_root = temp.path().join(".loc");
         let content_root = temp.path().join("group-content");
         let content_roots = vec![content_root];
 
@@ -7748,7 +7786,7 @@ mod tests {
             state_root.join("state.sqlite3-shm"),
             state_root.join("desktop.json"),
             state_root.join("desktop-install.json"),
-            state_root.join("logs/afsd.log"),
+            state_root.join("logs/localityd.log"),
         ] {
             assert!(
                 !state_event_path_requires_refresh(&path, &state_root, &content_roots),
@@ -7761,7 +7799,7 @@ mod tests {
     #[test]
     fn state_watcher_refreshes_for_user_visible_state_changes() {
         let temp = TestTempDir::new("state-watch-refresh");
-        let state_root = temp.path().join(".afs");
+        let state_root = temp.path().join(".loc");
         let content_root = temp.path().join("group-content");
         let content_roots = vec![content_root.clone()];
 
@@ -7776,7 +7814,7 @@ mod tests {
             &content_roots
         ));
         assert!(!state_event_path_requires_refresh(
-            &content_root.join("notion-main/files/Roadmap/.page.md.afs-tmp"),
+            &content_root.join("notion-main/files/Roadmap/.page.md.loc-tmp"),
             &state_root,
             &content_roots
         ));
@@ -7789,7 +7827,7 @@ mod tests {
             record_desktop_activity(
                 temp.path(),
                 &format!("Changed Notion access {index}"),
-                "Connected Notion workspace. AFS refreshed the mounted folder.",
+                "Connected Notion workspace. Locality refreshed the mounted folder.",
                 "access",
             )
             .expect("record desktop activity");
@@ -7827,7 +7865,7 @@ mod tests {
                 .expect("time after epoch")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "afs-desktop-{label}-{}-{nanos}",
+                "locality-desktop-{label}-{}-{nanos}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).expect("create test temp dir");
@@ -7873,7 +7911,7 @@ mod tests {
             kind: kind.to_string(),
             remote_id: "page-1".to_string(),
             path: "Roadmap/page.md".to_string(),
-            absolute_path: "/tmp/afs/Roadmap/page.md".to_string(),
+            absolute_path: "/tmp/loc/Roadmap/page.md".to_string(),
             state: state.to_string(),
             safety: SearchSafety {
                 agent_readable: state == "ready",
@@ -7973,8 +8011,8 @@ impl Drop for LiveModeE2eCleanup {
 
 #[cfg(test)]
 fn live_mode_e2e_page_path() -> PathBuf {
-    let raw = std::env::var("AFS_DESKTOP_LIVE_MODE_E2E_PAGE")
-        .expect("set AFS_DESKTOP_LIVE_MODE_E2E_PAGE to a scratch CloudStorage page.md path");
+    let raw = std::env::var("LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE")
+        .expect("set LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE to a scratch CloudStorage page.md path");
     let expanded = expand_tilde(&raw).unwrap_or_else(|_| PathBuf::from(raw));
     if expanded.is_absolute() {
         expanded
@@ -7985,16 +8023,16 @@ fn live_mode_e2e_page_path() -> PathBuf {
 
 #[cfg(test)]
 fn live_mode_e2e_page_id(page_path: &Path) -> String {
-    if let Ok(page_id) = std::env::var("AFS_DESKTOP_LIVE_MODE_E2E_PAGE_ID")
+    if let Ok(page_id) = std::env::var("LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE_ID")
         && !page_id.trim().is_empty()
     {
         return page_id.trim().to_string();
     }
     let contents = fs::read_to_string(page_path).expect("read CloudStorage page.md");
-    afs_core::canonical::parse_canonical_markdown(&contents)
-        .expect("parse AFS page.md frontmatter")
+    locality_core::canonical::parse_canonical_markdown(&contents)
+        .expect("parse Locality page.md frontmatter")
         .remote_id()
-        .expect("page.md frontmatter must include afs.id")
+        .expect("page.md frontmatter must include loc.id")
         .0
         .clone()
 }
@@ -8008,9 +8046,9 @@ fn live_mode_e2e_notion_api(page_path: &Path) -> HttpNotionApi {
     }
 
     let state_root = default_state_root();
-    let store = SqliteStateStore::open(state_root.clone()).expect("open AFS state");
+    let store = SqliteStateStore::open(state_root.clone()).expect("open Locality state");
     let credentials = open_credential_store(&state_root);
-    afsd::notion::resolve_notion_connector_for_path(&store, credentials.as_ref(), page_path)
+    localityd::notion::resolve_notion_connector_for_path(&store, credentials.as_ref(), page_path)
         .expect("resolve Notion connector from desktop auth");
     let (mount, _) =
         resolve_desktop_mount_path(&store, page_path).expect("resolve CloudStorage mount path");
@@ -8083,7 +8121,7 @@ fn live_mode_e2e_wait_until<F>(label: &str, mut condition: F)
 where
     F: FnMut() -> bool,
 {
-    let timeout = std::env::var("AFS_DESKTOP_LIVE_MODE_E2E_TIMEOUT_SECS")
+    let timeout = std::env::var("LOCALITY_DESKTOP_LIVE_MODE_E2E_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(90);
@@ -8226,7 +8264,7 @@ fn acquire_desktop_single_instance() -> Option<DesktopSingleInstanceGuard> {
     let mutex_name = windows_wide_null(WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX);
     let mutex_handle = unsafe { CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr()) };
     if mutex_handle.is_null() {
-        eprintln!("afs desktop could not create single-instance mutex");
+        eprintln!("loc desktop could not create single-instance mutex");
         return Some(DesktopSingleInstanceGuard {
             mutex_handle,
             activation_event_handle: std::ptr::null_mut(),
@@ -8246,7 +8284,7 @@ fn acquire_desktop_single_instance() -> Option<DesktopSingleInstanceGuard> {
     let activation_event_handle =
         unsafe { CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr()) };
     if activation_event_handle.is_null() {
-        eprintln!("afs desktop could not create single-instance activation event");
+        eprintln!("loc desktop could not create single-instance activation event");
     }
 
     Some(DesktopSingleInstanceGuard {
@@ -8311,7 +8349,7 @@ fn windows_wide_null(value: &str) -> Vec<u16> {
 }
 
 fn main() {
-    desktop_log("info", "app.start", "AFS desktop starting");
+    desktop_log("info", "app.start", "Locality desktop starting");
     let Some(single_instance_guard) = acquire_desktop_single_instance() else {
         return;
     };
@@ -8346,7 +8384,7 @@ fn main() {
                 return Ok(());
             }
             if let Err(error) = apply_launch_at_login_preference() {
-                eprintln!("afs desktop could not apply launch-at-login preference: {error}");
+                eprintln!("loc desktop could not apply launch-at-login preference: {error}");
             }
             refresh_launch_at_login_cache_async();
             configure_main_window_chrome(app);
@@ -8365,7 +8403,7 @@ fn main() {
             notion_login_link,
             install_state_review,
             acknowledge_install_state,
-            reset_local_afs_state,
+            reset_locality_state,
             choose_mount_folder,
             ensure_runtime_ready,
             ensure_terminal_cli_available,
@@ -8393,7 +8431,7 @@ fn main() {
             quit_completely,
         ])
         .run(tauri::generate_context!())
-        .expect("failed to run AFS desktop app");
+        .expect("failed to run Locality desktop app");
 }
 
 fn should_hide_tray_popover(window_label: &str, event: &tauri::WindowEvent) -> bool {
@@ -8415,7 +8453,7 @@ fn configure_main_window_chrome(app: &mut tauri::App) {
     {
         if let Some(window) = app.get_webview_window("main") {
             if let Err(error) = window.set_decorations(false) {
-                eprintln!("afs desktop could not configure Windows window chrome: {error}");
+                eprintln!("loc desktop could not configure Windows window chrome: {error}");
             }
         }
     }
@@ -8439,7 +8477,7 @@ fn refresh_agent_guidance_best_effort() {
             .map(|target| target.detail.as_str())
             .collect::<Vec<_>>()
             .join("; ");
-        eprintln!("afs desktop could not refresh agent guidance: {failed}");
+        eprintln!("loc desktop could not refresh agent guidance: {failed}");
     }
 }
 
@@ -8451,7 +8489,7 @@ fn agent_guidance_mount_path() -> Option<String> {
 }
 
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "Open AFS", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "Open Locality", true, None::<&str>)?;
     let open_folder =
         MenuItem::with_id(app, "open_folder", "Open Notion Folder", true, None::<&str>)?;
     let review = MenuItem::with_id(
@@ -8482,7 +8520,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     TrayIconBuilder::with_id("main")
         .icon(icon)
         .icon_as_template(false)
-        .tooltip("AFS")
+        .tooltip("Locality")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, event| {
@@ -8519,7 +8557,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .build(app)?;
 
     if let Err(error) = build_tray_popover(app) {
-        eprintln!("afs desktop could not build tray popover: {error}");
+        eprintln!("loc desktop could not build tray popover: {error}");
     }
     refresh_tray_icon(app.app_handle());
 
@@ -8528,7 +8566,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
 fn build_tray_popover(app: &mut tauri::App) -> tauri::Result<()> {
     WebviewWindowBuilder::new(app, "tray", WebviewUrl::App("index.html#tray".into()))
-        .title("AFS")
+        .title("Locality")
         .inner_size(TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT)
         .resizable(false)
         .decorations(false)
@@ -8566,7 +8604,7 @@ fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
     let screen_bounds = screen_bounds_for_tray_anchor(app, position);
     let popover_position = tray_popover_position(position, popover_size, screen_bounds);
     let _ = window.set_position(Position::Physical(popover_position));
-    let _ = window.eval("window.dispatchEvent(new CustomEvent('afs-refresh-snapshot'));");
+    let _ = window.eval("window.dispatchEvent(new CustomEvent('loc-refresh-snapshot'));");
     let _ = window.show();
     let _ = window.set_focus();
 }
@@ -8646,7 +8684,7 @@ fn show_main_window_with_view(app: &AppHandle, view: Option<&str>) {
         if let Some(view) = view {
             let escaped = view.replace('\\', "\\\\").replace('\'', "\\'");
             let _ = window.eval(format!(
-                "window.dispatchEvent(new CustomEvent('afs-open-view', {{ detail: '{}' }}));",
+                "window.dispatchEvent(new CustomEvent('loc-open-view', {{ detail: '{}' }}));",
                 escaped
             ));
         }

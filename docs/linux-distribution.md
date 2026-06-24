@@ -1,9 +1,9 @@
 # Linux Distribution
 
-AFS ships on Linux as Tauri-generated `.deb` and `.rpm` packages. The Linux
+Locality ships on Linux as Tauri-generated `.deb` and `.rpm` packages. The Linux
 packages do not need signing, notarization, or stapling, but they do need the
-same runtime sidecars that the macOS app bundle carries: the `afs` CLI, the
-`afsd` daemon, and the `afs-fuse` projection helper.
+same runtime sidecars that the macOS app bundle carries: the `loc` CLI, the
+`localityd` daemon, and the `locality-fuse` projection helper.
 
 ## Local Package Build
 
@@ -20,14 +20,14 @@ apps/desktop/scripts/prepare-bundle.sh
 ```
 
 On Linux that dispatches to `apps/desktop/scripts/prepare-linux-bundle.sh`,
-which builds `afs`, `afsd`, and `afs-fuse` in release mode and stages them under
+which builds `loc`, `localityd`, and `locality-fuse` in release mode and stages them under
 `apps/desktop/src-tauri/linux/`. Tauri includes those staged binaries in both
 Linux package formats at:
 
 ```text
-/usr/bin/afs
-/usr/bin/afsd
-/usr/bin/afs-fuse
+/usr/bin/loc
+/usr/bin/localityd
+/usr/bin/locality-fuse
 ```
 
 Expected local artifacts:
@@ -44,14 +44,14 @@ for local throwaway builds.
 Final artifacts are copied to:
 
 ```text
-target/release/bundle/linux/AFS-beta-YYYYMMDD-<commit>-<arch>.deb
-target/release/bundle/linux/AFS-beta-YYYYMMDD-<commit>-<arch>.deb.sha256
-target/release/bundle/linux/AFS-beta-YYYYMMDD-<commit>-<arch>.rpm
-target/release/bundle/linux/AFS-beta-YYYYMMDD-<commit>-<arch>.rpm.sha256
-target/release/bundle/linux/AFS-beta-linux-<arch>.deb
-target/release/bundle/linux/AFS-beta-linux-<arch>.deb.sha256
-target/release/bundle/linux/AFS-beta-linux-<arch>.rpm
-target/release/bundle/linux/AFS-beta-linux-<arch>.rpm.sha256
+target/release/bundle/linux/Locality-beta-YYYYMMDD-<commit>-<arch>.deb
+target/release/bundle/linux/Locality-beta-YYYYMMDD-<commit>-<arch>.deb.sha256
+target/release/bundle/linux/Locality-beta-YYYYMMDD-<commit>-<arch>.rpm
+target/release/bundle/linux/Locality-beta-YYYYMMDD-<commit>-<arch>.rpm.sha256
+target/release/bundle/linux/Locality-beta-linux-<arch>.deb
+target/release/bundle/linux/Locality-beta-linux-<arch>.deb.sha256
+target/release/bundle/linux/Locality-beta-linux-<arch>.rpm
+target/release/bundle/linux/Locality-beta-linux-<arch>.rpm.sha256
 ```
 
 Useful overrides:
@@ -65,15 +65,15 @@ Release builds with `TAURI_UPDATER_PUBKEY` and `TAURI_SIGNING_PRIVATE_KEY`
 also produce a signed AppImage updater artifact:
 
 ```text
-target/release/bundle/updater/AFS-release-YYYYMMDD-<commit>-linux-<arch>.AppImage
-target/release/bundle/updater/AFS-release-YYYYMMDD-<commit>-linux-<arch>.AppImage.sig
-target/release/bundle/updater/AFS-release-linux-<arch>.AppImage
-target/release/bundle/updater/AFS-release-linux-<arch>.AppImage.sig
+target/release/bundle/updater/Locality-release-YYYYMMDD-<commit>-linux-<arch>.AppImage
+target/release/bundle/updater/Locality-release-YYYYMMDD-<commit>-linux-<arch>.AppImage.sig
+target/release/bundle/updater/Locality-release-linux-<arch>.AppImage
+target/release/bundle/updater/Locality-release-linux-<arch>.AppImage.sig
 ```
 
 ## Runtime Requirements
 
-The package metadata declares `fuse3` and `systemd` dependencies. AFS needs
+The package metadata declares `fuse3` and `systemd` dependencies. Locality needs
 `fusermount3` and `/dev/fuse` for Linux FUSE mounts, and it uses `systemctl
 --user` to manage one per-mount FUSE service.
 
@@ -86,16 +86,16 @@ temporary pkg-config metadata from `ldconfig` so the package build can continue.
 Linux package validation checks that both packages contain:
 
 ```text
-/usr/bin/afs
-/usr/bin/afsd
-/usr/bin/afs-fuse
+/usr/bin/loc
+/usr/bin/localityd
+/usr/bin/locality-fuse
 ```
 
 The existing FUSE smoke test remains the runtime check for actual mount
 behavior:
 
 ```sh
-AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_REQUIRED=1 make test-linux-fuse
+LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 make test-linux-fuse
 ```
 
 ## GitHub Release Workflow
@@ -111,7 +111,7 @@ GitHub Release uploads use stable asset names so latest-release install URLs do
 not need to know the version or commit:
 
 ```sh
-curl -L -o /tmp/afs.deb https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.deb && sudo apt install /tmp/afs.deb
+curl -L -o /tmp/loc.deb https://github.com/codeflash-ai/locality/releases/latest/download/Locality-release-linux-x86_64.deb && sudo apt install /tmp/loc.deb
 ```
 
 The workflow still renders versioned package files inside the APT/RPM
@@ -123,7 +123,7 @@ The same workflow renders static APT and RPM repository metadata under
 builds. The default repository base URL is:
 
 ```text
-https://codeflash-ai.github.io/afs
+https://codeflash-ai.github.io/locality
 ```
 
 Set the optional `LINUX_REPO_BASE_URL` repository variable if the package
@@ -150,19 +150,19 @@ apt/dists/stable/Release
 apt/dists/stable/InRelease
 apt/dists/stable/main/binary-amd64/Packages
 apt/dists/stable/main/binary-amd64/Packages.gz
-apt/pool/main/a/afs/*.deb
+apt/pool/main/a/loc/*.deb
 ```
 
 User install command:
 
 ```sh
-curl -fsSL https://codeflash-ai.github.io/afs/apt/codeflash-afs.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-afs.gpg && echo "deb [signed-by=/usr/share/keyrings/codeflash-afs.gpg] https://codeflash-ai.github.io/afs/apt stable main" | sudo tee /etc/apt/sources.list.d/afs.list >/dev/null && sudo apt update && sudo apt install afs
+curl -fsSL https://codeflash-ai.github.io/locality/apt/codeflash-loc.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-loc.gpg && echo "deb [signed-by=/usr/share/keyrings/codeflash-loc.gpg] https://codeflash-ai.github.io/locality/apt stable main" | sudo tee /etc/apt/sources.list.d/loc.list >/dev/null && sudo apt update && sudo apt install loc
 ```
 
 Updates then use the normal distro path:
 
 ```sh
-sudo apt update && sudo apt upgrade afs
+sudo apt update && sudo apt upgrade loc
 ```
 
 ## RPM/DNF Repository
@@ -172,25 +172,25 @@ RPM metadata is generated with `createrepo_c`:
 ```text
 rpm/x86_64/repodata/repomd.xml
 rpm/x86_64/*.rpm
-rpm/afs.repo
+rpm/loc.repo
 ```
 
 When `LINUX_REPO_GPG_PRIVATE_KEY` is set, the workflow signs `repomd.xml` and
-writes the public key to `rpm/RPM-GPG-KEY-codeflash-afs`. The generated
-`afs.repo` enables `repo_gpgcheck=1` in that case. RPM package payload signing
+writes the public key to `rpm/RPM-GPG-KEY-codeflash-loc`. The generated
+`loc.repo` enables `repo_gpgcheck=1` in that case. RPM package payload signing
 is separate and not enabled yet, so `gpgcheck=0` remains in the generated repo
 file until package signing is added.
 
 User install command:
 
 ```sh
-sudo curl -fsSL -o /etc/yum.repos.d/afs.repo https://codeflash-ai.github.io/afs/rpm/afs.repo && sudo dnf install afs
+sudo curl -fsSL -o /etc/yum.repos.d/loc.repo https://codeflash-ai.github.io/locality/rpm/loc.repo && sudo dnf install loc
 ```
 
 Updates then use:
 
 ```sh
-sudo dnf upgrade afs
+sudo dnf upgrade loc
 ```
 
 ## Linux Tauri Self-Update
@@ -209,7 +209,7 @@ who want Tauri-managed self-update should run the AppImage channel instead.
 AppImage install command:
 
 ```sh
-mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/AFS.AppImage https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.AppImage && chmod +x ~/.local/bin/AFS.AppImage
+mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/Locality.AppImage https://github.com/codeflash-ai/locality/releases/latest/download/Locality-release-linux-x86_64.AppImage && chmod +x ~/.local/bin/Locality.AppImage
 ```
 
 The workflow shares the same release concurrency group as the macOS workflow so

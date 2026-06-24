@@ -6,15 +6,15 @@ OUT="${ROOT}/apps/desktop/src-tauri/linux"
 
 (
   cd "${ROOT}"
-  cargo build -p afs-cli -p afsd -p afs-fuse --release
+  cargo build -p loc-cli -p localityd -p locality-fuse --release
 )
 
 mkdir -p "${OUT}"
-cp "${ROOT}/target/release/afs" "${OUT}/afs"
-cp "${ROOT}/target/release/afsd" "${OUT}/afsd"
-cp "${ROOT}/target/release/afs-fuse" "${OUT}/afs-fuse"
-chmod 755 "${OUT}/afs" "${OUT}/afsd" "${OUT}/afs-fuse"
+cp "${ROOT}/target/release/loc" "${OUT}/loc"
+cp "${ROOT}/target/release/localityd" "${OUT}/localityd"
+cp "${ROOT}/target/release/locality-fuse" "${OUT}/locality-fuse"
+chmod 755 "${OUT}/loc" "${OUT}/localityd" "${OUT}/locality-fuse"
 
-echo "Prepared Linux CLI in ${OUT}/afs"
-echo "Prepared Linux daemon in ${OUT}/afsd"
-echo "Prepared Linux FUSE helper in ${OUT}/afs-fuse"
+echo "Prepared Linux CLI in ${OUT}/loc"
+echo "Prepared Linux daemon in ${OUT}/localityd"
+echo "Prepared Linux FUSE helper in ${OUT}/locality-fuse"

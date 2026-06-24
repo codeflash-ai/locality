@@ -1,9 +1,9 @@
 {
-  "name": "@codeflash-ai/afs-auth-broker",
+  "name": "@codeflash-ai/locality-auth-broker",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Minimal OAuth broker for AgentFS connector auth.",
+  "description": "Minimal OAuth broker for Locality connector auth.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",

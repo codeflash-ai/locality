@@ -6,23 +6,23 @@ Build Overleaf as a first-party Git-backed connector, not a Notion-style block
 API connector. Overleaf's supported integration surface is project Git remotes
 with token-based authentication, so v1 should mount one Overleaf project per
 local directory and keep project files verbatim: `.tex`, `.bib`, images, style
-files, and other repository content. AgentFS should not inject YAML frontmatter
+files, and other repository content. Locality should not inject YAML frontmatter
 into LaTeX or project files.
 
 ## Key Changes
 
-- Add `crates/afs-overleaf` with `OverleafConfig { remote_url, token,
+- Add `crates/loc-overleaf` with `OverleafConfig { remote_url, token,
   token_key, branch }`, an `OverleafGitBackend` trait for testable Git
   operations, and a default implementation backed by the system `git` CLI.
-- Add CLI support for `afs connect overleaf --token-stdin [--name <id>]` and
-  `afs mount overleaf <path> --remote-url <git-url> [--connection <id>]
+- Add CLI support for `loc connect overleaf --token-stdin [--name <id>]` and
+  `loc mount overleaf <path> --remote-url <git-url> [--connection <id>]
   [--mount-id <id>] [--branch main] [--read-only]`.
 - Extend the daemon source registry with `ResolvedSource::Overleaf`, an
   Overleaf source descriptor, default mount id `overleaf-main`, connector
   guidance, and credential resolution from the existing connection store.
-- Treat Overleaf mounts as raw Git project worktrees. `afs pull <path>` should
-  run authenticated fetch plus safe fast-forward behavior, and `afs push <path>`
-  should stage project changes, create one AFS-generated commit, and push to
+- Treat Overleaf mounts as raw Git project worktrees. `loc pull <path>` should
+  run authenticated fetch plus safe fast-forward behavior, and `loc push <path>`
+  should stage project changes, create one Locality-generated commit, and push to
   the Overleaf remote.
 - Stop push when remote and local changes diverge. Report a clear conflict and
   require the user or agent to resolve via pull/rebase before retrying.
@@ -54,7 +54,7 @@ into LaTeX or project files.
 ## Assumptions
 
 - v1 targets Overleaf project Git sync with Git authentication tokens.
-- One Overleaf project maps to one AgentFS mount.
+- One Overleaf project maps to one Locality mount.
 - No OAuth broker is needed for v1.
 - Overleaf comments, compile logs, collaborators, history UI, and
   workspace-wide project discovery are out of scope.

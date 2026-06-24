@@ -1,7 +1,7 @@
 # Local development only. Never commit .dev.vars.
-AFS_BROKER_SESSION_SECRET=replace-with-at-least-32-random-bytes
-AFS_REFRESH_HANDLE_KEY=replace-with-at-least-32-random-bytes
-AFS_NOTION_CLIENT_ID=notion-oauth-client-id
-AFS_NOTION_CLIENT_SECRET=notion-oauth-client-secret
-AFS_TOKEN_MODE=handle
-AFS_NOTION_REDIRECT_URIS=http://localhost:8757/oauth/notion/callback,http://127.0.0.1:8757/oauth/notion/callback
+LOCALITY_BROKER_SESSION_SECRET=replace-with-at-least-32-random-bytes
+LOCALITY_REFRESH_HANDLE_KEY=replace-with-at-least-32-random-bytes
+LOCALITY_NOTION_CLIENT_ID=notion-oauth-client-id
+LOCALITY_NOTION_CLIENT_SECRET=notion-oauth-client-secret
+LOCALITY_TOKEN_MODE=handle
+LOCALITY_NOTION_REDIRECT_URIS=http://localhost:8757/oauth/notion/callback,http://127.0.0.1:8757/oauth/notion/callback

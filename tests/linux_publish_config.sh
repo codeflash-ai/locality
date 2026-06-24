@@ -36,7 +36,7 @@ grep -q '^render-linux-repositories:' "${MAKEFILE}" \
 [[ "$(json_value '.build.beforeBundleCommand' "${TAURI_CONF}")" == "./scripts/prepare-bundle.sh" ]] \
   || fail "Tauri beforeBundleCommand must dispatch per platform"
 
-for binary in afs afsd afs-fuse; do
+for binary in loc localityd locality-fuse; do
   [[ "$(json_value ".bundle.linux.deb.files[\"/usr/bin/${binary}\"]" "${TAURI_CONF}")" == "linux/${binary}" ]] \
     || fail "Debian package must install ${binary} into /usr/bin"
   [[ "$(json_value ".bundle.linux.rpm.files[\"/usr/bin/${binary}\"]" "${TAURI_CONF}")" == "linux/${binary}" ]] \

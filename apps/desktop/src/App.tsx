@@ -33,7 +33,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const distributionChannel = (import.meta.env.VITE_AFS_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
+const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
 
 type AppView = "home" | "mount" | "pending" | "review" | "activity" | "settings";
@@ -184,7 +184,7 @@ const sampleSnapshot: DesktopSnapshot = {
   mount: {
     connector: "notion",
     workspaceName: "CodeFlash",
-    localPath: "~/Library/CloudStorage/AFS/notion",
+    localPath: "~/Library/CloudStorage/Locality/notion",
     notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
     accessScope: "Initial Idea",
     projection: "macOS File Provider",
@@ -269,7 +269,7 @@ const loadingSnapshot: DesktopSnapshot = {
   mount: {
     ...sampleSnapshot.mount,
     workspaceName: "Loading",
-    localPath: "~/Library/CloudStorage/AFS",
+    localPath: "~/Library/CloudStorage/Locality",
     notionUrl: null,
     accessScope: "Checking access",
     status: "loading",
@@ -310,19 +310,19 @@ const sampleSearchResults: LocatedItem[] = [
   {
     title: "Roadmap 2026",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
     state: "ready",
   },
   {
     title: "Launch Plan",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/AFS/notion/Marketing/Launch Plan/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion/Marketing/Launch Plan/page.md",
     state: "online_only",
   },
 ];
 
 function suggestedAgentPrompt(mountPath: string) {
-  return `Use AFS to edit my Notion workspace. Open the Notion files under ${mountPath}, make the requested edits directly in Markdown, and leave the changes pending for AFS review.`;
+  return `Use Locality to edit my Notion workspace. Open the Notion files under ${mountPath}, make the requested edits directly in Markdown, and leave the changes pending for Locality review.`;
 }
 
 function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallReport {
@@ -334,20 +334,20 @@ function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallRepor
       {
         agent: "Claude Code / Claude Desktop / Claude Cowork",
         status: "installed",
-        path: "~/.claude/skills/afs/SKILL.md",
-        detail: "Installed the AFS skill for Claude local agents.",
+        path: "~/.claude/skills/loc/SKILL.md",
+        detail: "Installed the Locality skill for Claude local agents.",
       },
       {
         agent: "Codex",
         status: "installed",
-        path: "~/.codex/skills/afs/SKILL.md",
-        detail: "Installed the AFS skill for Codex.",
+        path: "~/.codex/skills/loc/SKILL.md",
+        detail: "Installed the Locality skill for Codex.",
       },
       {
         agent: "Warp",
         status: "installed",
-        path: "~/.agents/skills/afs/SKILL.md",
-        detail: "Installed the AFS skill for Warp.",
+        path: "~/.agents/skills/loc/SKILL.md",
+        detail: "Installed the Locality skill for Warp.",
       },
     ],
   };
@@ -379,7 +379,7 @@ function liveModeReportNeedsRefresh(message: string) {
 function liveModeTooltip(enabled: boolean) {
   return enabled
     ? "Live Mode is watching safe local edits, pushing them to Notion, and pulling remote Notion changes when no review is needed. It pauses when a change needs review."
-    : "Turn on Live Mode to keep this local Notion folder in sync while you work. AFS still pauses for conflicts, large changes, or anything that needs review.";
+    : "Turn on Live Mode to keep this local Notion folder in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
 }
 
 function emptyUpdateStatus(): UpdateStatus {
@@ -512,14 +512,14 @@ export default function App() {
       const update = await check();
       if (!update) {
         if (!options.silent) {
-          setUpdateStatus({ state: "current", message: "AFS is up to date.", update: null });
+          setUpdateStatus({ state: "current", message: "Locality is up to date.", update: null });
         }
         return;
       }
 
       setUpdateStatus({
         state: "available",
-        message: `AFS ${update.version} is ready to install.`,
+        message: `Locality ${update.version} is ready to install.`,
         update,
         version: update.version,
       });
@@ -552,19 +552,19 @@ export default function App() {
     setUpdateStatus((current) => ({
       ...current,
       state: "installing",
-      message: current.version ? `Installing AFS ${current.version}.` : "Installing update.",
+      message: current.version ? `Installing Locality ${current.version}.` : "Installing update.",
     }));
 
     try {
       const update = updateStatus.update ?? (await check());
       if (!update) {
-        setUpdateStatus({ state: "current", message: "AFS is up to date.", update: null });
+        setUpdateStatus({ state: "current", message: "Locality is up to date.", update: null });
         return;
       }
       await update.downloadAndInstall();
       setUpdateStatus({
         state: "installing",
-        message: "Restarting AFS to finish the update.",
+        message: "Restarting Locality to finish the update.",
         update: null,
         version: update.version,
       });
@@ -625,8 +625,8 @@ export default function App() {
       setView(nextView);
     };
 
-    window.addEventListener("afs-open-view", handleOpenView);
-    return () => window.removeEventListener("afs-open-view", handleOpenView);
+    window.addEventListener("loc-open-view", handleOpenView);
+    return () => window.removeEventListener("loc-open-view", handleOpenView);
   }, []);
 
   useEffect(() => {
@@ -634,9 +634,9 @@ export default function App() {
       void refreshSnapshot().catch(() => undefined);
     };
 
-    window.addEventListener("afs-refresh-snapshot", refresh);
+    window.addEventListener("loc-refresh-snapshot", refresh);
     return () => {
-      window.removeEventListener("afs-refresh-snapshot", refresh);
+      window.removeEventListener("loc-refresh-snapshot", refresh);
     };
   }, []);
 
@@ -895,7 +895,7 @@ function Onboarding({
     const report = await callCommand<ActionReport>(
       "ensure_terminal_cli_available",
       undefined,
-      { ok: true, message: "AFS terminal command is ready." },
+      { ok: true, message: "Locality terminal command is ready." },
     );
     if (!report.ok) {
       setMountError(report.message);
@@ -950,7 +950,7 @@ function Onboarding({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -966,14 +966,14 @@ function Onboarding({
   return (
     <main className="setup-shell">
       <section className="setup-window">
-        <WindowChrome title="AFS Setup" meta={`${step} of 4`} />
+        <WindowChrome title="Locality Setup" meta={`${step} of 4`} />
         {step === 1 && (
-          <SetupContent mark={<BrandTile>AFS</BrandTile>}>
+          <SetupContent mark={<BrandTile>Locality</BrandTile>}>
             <div>
               <h1>Let your agents edit Notion as local files.</h1>
               <p>
                 Mount your Notion workspace in CloudStorage. Agents edit local
-                files, then AFS syncs reviewed changes back to Notion.
+                files, then Locality syncs reviewed changes back to Notion.
               </p>
             </div>
             <PrimaryButton onClick={startConnect}>Connect Notion</PrimaryButton>
@@ -999,8 +999,8 @@ function Onboarding({
                 {oauthReady
                   ? `${
                       connectedWorkspace || "Your workspace"
-                    } is ready. Next, choose where AFS should place the local folder.`
-                  : "A browser window is open. Choose your workspace, pick the pages AFS can use, then approve access."}
+                    } is ready. Next, choose where Locality should place the local folder.`
+                  : "A browser window is open. Choose your workspace, pick the pages Locality can use, then approve access."}
               </p>
             </div>
             <ProgressList
@@ -1027,7 +1027,7 @@ function Onboarding({
             <div>
               <h1>Where should your Notion files appear?</h1>
               <p>
-                AFS keeps every source under one CloudStorage root. Notion will appear as the
+                Locality keeps every source under one CloudStorage root. Notion will appear as the
                 live folder Finder and agents open.
               </p>
             </div>
@@ -1057,9 +1057,9 @@ function Onboarding({
         {step === 4 && (
           <SetupContent mark={<BrandTile variant="ready" />} variant="final">
             <div>
-              <h1>AFS is ready</h1>
+              <h1>Locality is ready</h1>
               <p>
-                Your Notion folder is mounted. AFS will keep syncing the workspace quietly in the
+                Your Notion folder is mounted. Locality will keep syncing the workspace quietly in the
                 background while agents edit local Markdown.
               </p>
             </div>
@@ -1105,7 +1105,7 @@ function Onboarding({
               <div className="agent-prompt-row">
                 <div className="agent-demo-command">
                   {agentGuidanceReport?.prompt ||
-                    `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for AFS review.`}
+                    `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for Locality review.`}
                 </div>
                 <SecondaryButton
                   compact
@@ -1113,7 +1113,7 @@ function Onboarding({
                   onClick={() =>
                     copyText(
                       agentGuidanceReport?.prompt ||
-                        `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for AFS review.`,
+                        `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for Locality review.`,
                     )
                   }
                 >
@@ -1145,7 +1145,7 @@ function AgentGuidanceSummary({
       : failed
         ? "Agent skills need attention"
         : report
-          ? "Agents can use AFS"
+          ? "Agents can use Locality"
           : "Preparing agents";
 
   return (
@@ -1154,10 +1154,10 @@ function AgentGuidanceSummary({
         {state === "installing" ? <Loader2 className="spin-icon" /> : failed ? <AlertTriangle /> : <Bot />}
         <span>{title}</span>
       </div>
-      {state === "installing" && <p>Installing the AFS skill for local agents.</p>}
+      {state === "installing" && <p>Installing the Locality skill for local agents.</p>}
       {state !== "installing" && installedAgents.length > 0 && (
         <p>
-          Now your agents know how to use <code>afs</code> to view and edit Notion. Installed for{" "}
+          Now your agents know how to use <code>loc</code> to view and edit Notion. Installed for{" "}
           <strong>{formatList(installedAgents)}</strong>.
         </p>
       )}
@@ -1165,7 +1165,7 @@ function AgentGuidanceSummary({
         <p>{fallbackTargets[0].detail}</p>
       )}
       {state !== "installing" && installedAgents.length === 0 && fallbackTargets.length === 0 && !failed && (
-        <p>AFS is preparing local agent instructions for this Notion folder.</p>
+        <p>Locality is preparing local agent instructions for this Notion folder.</p>
       )}
       {failed && report?.targets.find((target) => target.status === "failed")?.detail && (
         <p>{report.targets.find((target) => target.status === "failed")?.detail}</p>
@@ -1221,7 +1221,7 @@ function MainShell({
   return (
     <main className="app-frame">
       <WindowChrome
-        title="AFS"
+        title="Locality"
         meta={meta}
         metaTitle={statusTitle}
         onMetaClick={statusTarget ? () => onViewChange(statusTarget) : undefined}
@@ -1230,7 +1230,7 @@ function MainShell({
         <aside className="sidebar">
           <div className="sidebar-brand">
             <ApertureIcon />
-            <strong>AFS</strong>
+            <strong>Locality</strong>
           </div>
           <nav>
             <SidebarButton active={view === "home"} icon={<Home />} onClick={() => onViewChange("home")}>
@@ -1352,7 +1352,7 @@ function UpdateBanner({
   return (
     <div className="update-banner">
       <div>
-        <strong>{status.version ? `AFS ${status.version} available` : "AFS update available"}</strong>
+        <strong>{status.version ? `Locality ${status.version} available` : "Locality update available"}</strong>
         <p>{status.message}</p>
       </div>
       <div className="update-banner-actions">
@@ -1534,7 +1534,7 @@ function HomeView({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1563,7 +1563,7 @@ function HomeView({
           <BrandTile variant="notion">N</BrandTile>
           <div>
             <h2>Connect your Notion workspace</h2>
-            <p>AFS needs access before it can create local files for agents.</p>
+            <p>Locality needs access before it can create local files for agents.</p>
           </div>
           <PrimaryButton icon={<ChevronRight />} onClick={() => void connectNotion()}>
             Connect Notion
@@ -1575,7 +1575,7 @@ function HomeView({
           <BrandTile variant="folder" />
           <div>
             <h2>Create your Notion folder</h2>
-            <p>Use the default source folder under the shared AFS CloudStorage root.</p>
+            <p>Use the default source folder under the shared Locality CloudStorage root.</p>
           </div>
           <PrimaryButton
             icon={<FolderOpen />}
@@ -1768,7 +1768,7 @@ function MountDetailView({
           <p className="label">Notion folder</p>
           <h2>{snapshot.mount.localPath}</h2>
           <p>
-            AFS follows your Notion workspace hierarchy here, starting with the pages and databases
+            Locality follows your Notion workspace hierarchy here, starting with the pages and databases
             your connection can access.
           </p>
         </div>
@@ -1840,8 +1840,8 @@ function MountDetailView({
         <summary>Advanced diagnostics</summary>
         <div className="settings-grid compact-settings">
           <div className="panel">
-            <SettingRow title="AFS process" value={snapshot.health.state === "stopped" ? "Stopped" : "Running"} />
-            <SettingRow title="State folder" value="~/.afs" />
+            <SettingRow title="Locality process" value={snapshot.health.state === "stopped" ? "Stopped" : "Running"} />
+            <SettingRow title="State folder" value="~/.loc" />
             <SettingRow title="Connector" value={snapshot.mount.connector} />
           </div>
           <div className="panel">
@@ -2032,7 +2032,7 @@ function ReviewView({
       <ViewHeader title={plan.title}>
         <StatusPill
           tone={pushState === "error" ? "danger" : isPushing ? "warn" : "ready"}
-          title={isPushing ? "AFS is writing the approved local changes to Notion." : "This push is ready for review."}
+          title={isPushing ? "Locality is writing the approved local changes to Notion." : "This push is ready for review."}
         >
           {pushState === "error" ? "Needs Attention" : isPushing ? "Pushing" : pushSucceeded ? "Pushed" : "Safe"}
         </StatusPill>
@@ -2040,7 +2040,7 @@ function ReviewView({
       <p className="view-copy">{plan.summary}</p>
       {isPushing && (
         <p className="quiet-note inline-note">
-          Writing changes to Notion. You can keep reviewing this window while AFS finishes.
+          Writing changes to Notion. You can keep reviewing this window while Locality finishes.
         </p>
       )}
       {pushSucceeded && (
@@ -2227,7 +2227,7 @@ function SettingsView({
     const report = await callCommand<ActionReport>(
       "ensure_runtime_ready",
       undefined,
-      { ok: true, message: "AFS runtime is running." },
+      { ok: true, message: "Locality runtime is running." },
     );
     setDiagnosticMessage(report.message);
     await onRefresh().catch(() => undefined);
@@ -2235,9 +2235,9 @@ function SettingsView({
 
   function copyDiagnostics() {
     const summary = [
-      `AFS process: ${daemonStopped ? "Stopped" : "Running"}`,
+      `Locality process: ${daemonStopped ? "Stopped" : "Running"}`,
       snapshot.mount.provider ? `Provider: ${providerStatusLabel(snapshot.mount.provider)}` : null,
-      "State folder: ~/.afs",
+      "State folder: ~/.loc",
       `Projection: ${snapshot.mount.projection}`,
       `Connection: ${snapshot.connection.status}`,
       `Mount: ${snapshot.mount.status}`,
@@ -2287,7 +2287,7 @@ function SettingsView({
 
   async function resetLocalState() {
     const confirmed = window.confirm(
-      "Reset local AFS state? This clears AFS metadata, cache, mount registration, and connector credentials. It does not delete your local files.",
+      "Reset local Locality state? This clears Locality metadata, cache, mount registration, and connector credentials. It does not delete your local files.",
     );
     if (!confirmed) {
       return;
@@ -2297,9 +2297,9 @@ function SettingsView({
     setResettingState(true);
     try {
       const report = await callCommand<ActionReport>(
-        "reset_local_afs_state",
+        "reset_locality_state",
         undefined,
-        { ok: true, message: "AFS local state was reset." },
+        { ok: true, message: "Locality local state was reset." },
       );
       setResetMessage(report.message);
       if (report.ok) {
@@ -2339,24 +2339,24 @@ function SettingsView({
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Settings" }]} />
-      <ViewHeader title="AFS controls" />
+      <ViewHeader title="Locality controls" />
 
       <section className="settings-grid">
         <div className="panel">
           <PanelTitle title="Startup" />
           <ToggleRow
-            title="Launch AFS at login"
+            title="Launch Locality at login"
             enabled={localSettings.launchAtLogin}
             busy={busySetting === "launch_at_login"}
             onToggle={(enabled) => void updateDesktopSetting("launch_at_login", enabled)}
           />
           <ToggleRow
-            title="Show AFS in the menu bar"
+            title="Show Locality in the menu bar"
             enabled={localSettings.showMenuBar}
             busy={busySetting === "show_menu_bar"}
             onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
           />
-          <SettingRow title="Default folder" value="~/Library/CloudStorage/AFS" />
+          <SettingRow title="Default folder" value="~/Library/CloudStorage/Locality" />
           {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
         </div>
 
@@ -2400,7 +2400,7 @@ function SettingsView({
         <div className="panel">
           <PanelTitle title="Agent Instructions" />
           <SettingRow title="Local agents" value="Claude, Codex, Warp, Cursor, Gemini, Cline/Roo" />
-          <SettingRow title="Notion guidance" value="Installed under /AFS/notion" />
+          <SettingRow title="Notion guidance" value="Installed under /Locality/notion" />
           <SecondaryButton
             compact
             icon={installingAgents ? <Loader2 className="spin-icon" /> : <Bot />}
@@ -2414,11 +2414,11 @@ function SettingsView({
 
         <div className="panel">
           <PanelTitle title="Diagnostics" />
-          <SettingRow title="AFS process" value={daemonStopped ? "Stopped" : "Running"} />
+          <SettingRow title="Locality process" value={daemonStopped ? "Stopped" : "Running"} />
           {snapshot.mount.provider && (
             <SettingRow title="Provider" value={providerStatusLabel(snapshot.mount.provider)} />
           )}
-          <SettingRow title="State folder" value="~/.afs" />
+          <SettingRow title="State folder" value="~/.loc" />
           <SettingRow title="Projection" value={snapshot.mount.projection} />
           <div className="button-row">
             <SecondaryButton compact onClick={copyDiagnostics}>
@@ -2428,7 +2428,7 @@ function SettingsView({
               Open Logs
             </SecondaryButton>
             <SecondaryButton compact disabled={!runtimeNeedsRepair} onClick={() => void repairRuntime()}>
-              {runtimeNeedsRepair ? "Start AFS" : "Repair AFS"}
+              {runtimeNeedsRepair ? "Start Locality" : "Repair Locality"}
             </SecondaryButton>
           </div>
           {diagnosticMessage && <p className="quiet-note inline-note">{diagnosticMessage}</p>}
@@ -2436,7 +2436,7 @@ function SettingsView({
 
         <div className="panel">
           <PanelTitle title="Developer" />
-          <SettingRow title="Local database" value="~/.afs/state.sqlite3" />
+          <SettingRow title="Local database" value="~/.loc/state.sqlite3" />
           <SettingRow title="Reset behavior" value="Preserve local files" />
           <SecondaryButton
             compact
@@ -2516,7 +2516,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -2545,7 +2545,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
       <header className="tray-header">
         <div className="tray-title">
           <ApertureIcon state={healthIconState(snapshot.health.state)} />
-          <strong>AFS</strong>
+          <strong>Locality</strong>
         </div>
         <StatusPill
           tone={healthTone(snapshot.health.state)}
@@ -3779,16 +3779,16 @@ function healthDescription(state: string, attentionCount: number) {
     return `${attentionCount} local change${attentionCount === 1 ? "" : "s"} waiting for review or push.`;
   }
   if (state === "reconnect_needed") {
-    return "Notion needs to be reconnected before AFS can sync this workspace.";
+    return "Notion needs to be reconnected before Locality can sync this workspace.";
   }
   if (state === "stopped") {
-    return "The AFS daemon is stopped. Background sync, hydration, and auto-save are paused; direct actions can still run from the app.";
+    return "The Locality daemon is stopped. Background sync, hydration, and auto-save are paused; direct actions can still run from the app.";
   }
   if (state === "runtime_stopped") {
-    return "The filesystem provider is stopped or unregistered. Use Repair AFS in Settings to restore online-only file access.";
+    return "The filesystem provider is stopped or unregistered. Use Repair Locality in Settings to restore online-only file access.";
   }
   if (state === "checking_freshness") {
-    return "AFS is checking the local mount and Notion freshness state.";
+    return "Locality is checking the local mount and Notion freshness state.";
   }
   return "Notion is connected, the mount is ready, and remote writes remain explicit.";
 }

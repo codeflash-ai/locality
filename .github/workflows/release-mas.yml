@@ -118,7 +118,7 @@ jobs:
             exit 1
           fi
 
-          keychain_path="${RUNNER_TEMP}/afs-mas-signing.keychain-db"
+          keychain_path="${RUNNER_TEMP}/loc-mas-signing.keychain-db"
           app_certificate_path="${RUNNER_TEMP}/mas-app.p12"
           installer_certificate_path="${RUNNER_TEMP}/mas-installer.p12"
 
@@ -175,7 +175,7 @@ jobs:
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
-          name: afs-mas-${{ inputs.tag }}
+          name: loc-mas-${{ inputs.tag }}
           path: |
             target/release/bundle/mas/*.pkg
             target/release/bundle/mas/*.pkg.sha256

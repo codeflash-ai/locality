@@ -1,4 +1,4 @@
-name = "afs-oauth-broker"
+name = "loc-oauth-broker"
 main = "src/index.ts"
 compatibility_date = "2026-06-11"
 workers_dev = true
@@ -7,5 +7,5 @@ workers_dev = true
 enabled = true
 
 [vars]
-AFS_TOKEN_MODE = "handle"
-AFS_NOTION_REDIRECT_URIS = "http://localhost:8757/oauth/notion/callback,http://127.0.0.1:8757/oauth/notion/callback"
+LOCALITY_TOKEN_MODE = "handle"
+LOCALITY_NOTION_REDIRECT_URIS = "http://localhost:8757/oauth/notion/callback,http://127.0.0.1:8757/oauth/notion/callback"

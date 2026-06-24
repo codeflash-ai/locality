@@ -8,7 +8,7 @@ None.
 
 ## Temporary Implementation Gaps
 
-- Desktop UI command handlers now read the local AFS store, daemon health,
+- Desktop UI command handlers now read the local Locality store, daemon health,
   status reports, mounts, connections, journals, and the Notion OAuth broker.
   They still fall back to sample data when the local store cannot be opened so
   the UI remains reviewable before a first real connection.
@@ -40,4 +40,4 @@ None.
 - Hydration aggressiveness remains configurable. The code defaults to the 90-day policy and no eager-under-size threshold.
 - `_view.csv` remains read-only unless the plan is updated.
 - Journals now store core shadow preimages and apply effects for undo planning; native connector preimages remain undecided.
-- `afs` remains the working title.
+- `loc` remains the working title.

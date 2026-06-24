@@ -3,14 +3,14 @@
 ## Changelog
 
 - 2026-06-17: Added template apply drafts, broader macOS File Provider path matching, and desktop status/push affordances for pending Notion changes.
-- 2026-06-17: Added the first local template-pack foundation with bundled Founder Proof of Work and Focused Inbox packs plus `afs templates list|validate|new`.
+- 2026-06-17: Added the first local template-pack foundation with bundled Founder Proof of Work and Focused Inbox packs plus `loc templates list|validate|new`.
 - 2026-06-16: Added search-result safety labels so future MCP/agent readers can distinguish clean hydrated content from metadata-only, stale, dirty, conflicted, or deleted results.
 - 2026-06-16: Added a rebuildable SQLite FTS candidate index for local metadata search while preserving the shared CLI/desktop search report contract.
 - 2026-06-16: Added hydration-on-locate plumbing: explicit daemon hydration requests and desktop locate prioritization for online-only pages.
 - 2026-06-16: Queued the next implementation slices after local metadata search: desktop shared-search adoption, hydration-on-locate, SQLite FTS, knowledge bundles, security labels, MCP, and templates.
-- 2026-06-16: Added local metadata search direction with `afs search`, connector filtering, remote-observation safety labels, and regression coverage.
+- 2026-06-16: Added local metadata search direction with `loc search`, connector filtering, remote-observation safety labels, and regression coverage.
 - 2026-06-11: Added end-to-end local Notion OAuth connect flow with localhost callback, OAuth credential bundles in the credential store, PAT fallback, refresh support, and docs.
-- 2026-06-11: Started state-of-the-art connector/auth hardening by adding connector profiles/auth-config records, SQLite v9 migration, profile-aware Notion connections, and `afs profiles`.
+- 2026-06-11: Started state-of-the-art connector/auth hardening by adding connector profiles/auth-config records, SQLite v9 migration, profile-aware Notion connections, and `loc profiles`.
 - 2026-06-11: Added first block-support follow-up: callout write/apply support, Tier 1 append regression coverage, and updated Notion block support docs.
 - 2026-06-11: Completed production-hardening sprint phases A-E: Notion block move apply, push preflight, restore/status recovery UX, local provider connections, daemon status/via reporting, and E2E push workflow regression coverage.
 
@@ -21,7 +21,7 @@ small enough to ship with `cargo fmt --all -- --check`, `cargo test --workspace`
 and clippy when the workspace is already clippy-clean.
 
 1. **Desktop shared search backend** — make the desktop locate/typeahead path use
-   `afs_cli::search` so CLI, app, and future agent surfaces share one ranking
+   `loc_cli::search` so CLI, app, and future agent surfaces share one ranking
    and state-label contract.
 2. **Hydration on locate** — when search/locate finds an online-only entity,
    enqueue or request high-priority hydration without waiting for a full
@@ -47,7 +47,7 @@ and clippy when the workspace is already clippy-clean.
 
 Actionable prompts from manual E2E testing (June 2026). Each prompt is self-contained for a Codex session. Read `plan.md` and `docs/` before starting any task.
 
-Repo: `/Users/saga4/orgs/research/afs` (AgentFS). Workspace crates: `afs-core`, `afs-store`, `afs-cli`, `afsd`, `afs-notion`, `afs-connector`.
+Repo: `/Users/saga4/orgs/research/loc` (Locality). Workspace crates: `locality-core`, `locality-store`, `loc-cli`, `localityd`, `locality-notion`, `locality-connector`.
 
 ---
 
@@ -57,20 +57,20 @@ Repo: `/Users/saga4/orgs/research/afs` (AgentFS). Workspace crates: `afs-core`, 
 
 A real Notion mount worked for pull/hydrate, but push failed on a simple edit:
 
-- Mount: `afs mount notion ~/afs/notion --root-page 37b3ac0ebb88802cbcf4d53c9cfc4972`
+- Mount: `loc mount notion ~/loc/notion --root-page 37b3ac0ebb88802cbcf4d53c9cfc4972`
 - User added paragraph `"Just Testing 101"` mid-page in `initial-idea/page.md`
-- `afs diff` planned: **1 append_block, 6 move_block, 0 update**
-- `afs push -y` failed with journal status `failed`
-- `afs log` failure message: **`unsupported feature: moving Notion blocks`**
-- File stuck **dirty** with **2 failed journals**; `afs pull` correctly skipped dirty file
+- `loc diff` planned: **1 append_block, 6 move_block, 0 update**
+- `loc push -y` failed with journal status `failed`
+- `loc log` failure message: **`unsupported feature: moving Notion blocks`**
+- File stuck **dirty** with **2 failed journals**; `loc pull` correctly skipped dirty file
 
-Root cause: `crates/afs-notion/src/apply.rs` rejects `PushOperation::MoveBlock` in `unsupported_operation_name()`. The diff engine in `crates/afs-core/src/diff.rs` correctly emits moves when inserting content shifts block indices (especially directives). Apply is not implemented.
+Root cause: `crates/locality-notion/src/apply.rs` rejects `PushOperation::MoveBlock` in `unsupported_operation_name()`. The diff engine in `crates/locality-core/src/diff.rs` correctly emits moves when inserting content shifts block indices (especially directives). Apply is not implemented.
 
-Secondary UX bug: push journals the plan **before** discovering unsupported ops at apply time. `afs diff` returns `confirm_plan` / `proceed` even though apply will fail.
+Secondary UX bug: push journals the plan **before** discovering unsupported ops at apply time. `loc diff` returns `confirm_plan` / `proceed` even though apply will fail.
 
 ### Task
 
-1. **Implement `MoveBlock` in `afs-notion` apply path**
+1. **Implement `MoveBlock` in `locality-notion` apply path**
    - Use Notion API block reposition (PATCH block with parent/`after` as appropriate for API version `2026-03-11` in `client.rs`)
    - Add `NotionApi` method if needed; implement in `HttpNotionApi` and test fakes
    - Handle chained moves in one push plan (operation order matters)
@@ -83,7 +83,7 @@ Secondary UX bug: push journals the plan **before** discovering unsupported ops 
 
 3. **Add regression tests**
    - Unit test: mid-page insert produces append + moves; apply succeeds with fake API recording PATCH calls
-   - Integration-style test mirroring `crates/afs-cli/tests/pull.rs` pattern
+   - Integration-style test mirroring `crates/loc-cli/tests/pull.rs` pattern
    - Golden case: insert one paragraph between existing blocks on a page with multiple blocks/directives
 
 4. **Improve human push failure output**
@@ -93,20 +93,20 @@ Secondary UX bug: push journals the plan **before** discovering unsupported ops 
 
 ```bash
 # After editing mid-page with one new paragraph:
-afs diff <page.md> --json   # may include moves, but no surprise at push
-afs push <page.md> -y       # exits 0, action reconciled
-afs status <mount>          # clean (no dirty, no failed_journal)
+loc diff <page.md> --json   # may include moves, but no surprise at push
+loc push <page.md> -y       # exits 0, action reconciled
+loc status <mount>          # clean (no dirty, no failed_journal)
 ```
 
 Notion page shows the new paragraph in correct position.
 
 ### Key files
 
-- `crates/afs-notion/src/apply.rs` — MoveBlock stub at ~1595
-- `crates/afs-notion/src/client.rs` — HTTP client
-- `crates/afs-core/src/diff.rs` — `should_move_block`, `plan_block_diff`
-- `crates/afs-core/src/push.rs` — pipeline + journaled execution
-- `crates/afs-cli/src/push.rs`, `crates/afsd/src/push.rs` — CLI/daemon wiring
+- `crates/locality-notion/src/apply.rs` — MoveBlock stub at ~1595
+- `crates/locality-notion/src/client.rs` — HTTP client
+- `crates/locality-core/src/diff.rs` — `should_move_block`, `plan_block_diff`
+- `crates/locality-core/src/push.rs` — pipeline + journaled execution
+- `crates/loc-cli/src/push.rs`, `crates/localityd/src/push.rs` — CLI/daemon wiring
 
 ### Constraints
 
@@ -122,20 +122,20 @@ Notion page shows the new paragraph in correct position.
 
 After failed push, user was stuck:
 
-- `afs status` human output only shows: `failed_journal notion-main initial-idea/page.md`
+- `loc status` human output only shows: `failed_journal notion-main initial-idea/page.md`
 - Does **not** print `issues[]` details (dirty reason, journal failure text) — details only in `--json`
-- `afs pull` skips dirty files (correct) but there is **no `--discard-local`** or restore command
+- `loc pull` skips dirty files (correct) but there is **no `--discard-local`** or restore command
 - No way to reset without manually editing the file back to shadow content
 - `failed_journal` line_state hides that entity is also `dirty`
 
 ### Task
 
-1. **Enhance human `afs status` output**
+1. **Enhance human `loc status` output**
    - For each non-clean entry, print: state, hydration, and each issue `code: message`
    - If `failed_journal_count > 0`, include latest journal failure message from store (query most recent failed journal for entity)
    - Keep compact; one entry block per file
 
-2. **Add `afs restore <path>`** (or `afs pull <path> --discard-local`)
+2. **Add `loc restore <path>`** (or `loc pull <path> --discard-local`)
    - Load entity + shadow from store
    - Overwrite local file with last synced canonical render (frontmatter + shadow body)
    - Reset hydration state from `dirty` → `hydrated` when restore succeeds
@@ -147,20 +147,20 @@ After failed push, user was stuck:
 ### Acceptance criteria
 
 ```bash
-afs status ~/afs/notion
+loc status ~/loc/notion
 # shows: dirty, failed_journal, and "unsupported feature: moving Notion blocks"
 
-afs restore ~/afs/notion/initial-idea/page.md
-afs status ~/afs/notion
+loc restore ~/loc/notion/initial-idea/page.md
+loc status ~/loc/notion
 # clean (failed journals may still list in log but not block restore)
 ```
 
 ### Key files
 
-- `crates/afs-cli/src/status.rs` — `print_status_report` in `commands.rs`
-- `crates/afs-cli/src/commands.rs`
-- `crates/afs-store` — journal queries
-- `crates/afs-core/src/canonical.rs` — render from shadow
+- `crates/loc-cli/src/status.rs` — `print_status_report` in `commands.rs`
+- `crates/loc-cli/src/commands.rs`
+- `crates/locality-store` — journal queries
+- `crates/locality-core/src/canonical.rs` — render from shadow
 
 ---
 
@@ -168,25 +168,25 @@ afs status ~/afs/notion
 
 ### Context from manual testing
 
-- `afsd` runs **foreground only** (blocks terminal); user hit Ctrl-C to stop it
-- No `afs daemon status` / `afs daemon start` commands
-- Checking if daemon is running requires `pgrep -fl afsd` or probing `~/.afs/afsd.sock` manually
-- `afs pull` / `afs push` silently fall back to in-process execution when daemon unavailable (`AFS_DAEMON_DISABLE` or socket missing) — user may not know which path ran
+- `localityd` runs **foreground only** (blocks terminal); user hit Ctrl-C to stop it
+- No `loc daemon status` / `loc daemon start` commands
+- Checking if daemon is running requires `pgrep -fl localityd` or probing `~/.loc/localityd.sock` manually
+- `loc pull` / `loc push` silently fall back to in-process execution when daemon unavailable (`LOCALITY_DAEMON_DISABLE` or socket missing) — user may not know which path ran
 - Daemon supports `DaemonRequest::Ping` over Unix socket but no CLI exposes it
 - Recent commits added runtime loop, file watcher, stub-read hydration — needs hardening
 
 ### Task
 
-1. **Add `afs daemon status`**
-   - Check socket at `$AFS_STATE_DIR/afsd.sock` (default `~/.afs`)
+1. **Add `loc daemon status`**
+   - Check socket at `$LOCALITY_STATE_DIR/localityd.sock` (default `~/.loc`)
    - Send `Ping` IPC request; report running/stopped + pid if discoverable
    - JSON: `{ "running": true, "socket": "...", "ping": "ok" }`
 
 2. **Indicate execution path in pull/push output**
    - When daemon handled request: include `"via": "daemon"` in JSON; human line `via daemon`
-   - When fallback: `"via": "cli"` and stderr hint if socket missing: `afsd not running; using direct execution`
+   - When fallback: `"via": "cli"` and stderr hint if socket missing: `localityd not running; using direct execution`
 
-3. **Optional: `afs daemon run` alias** for `afsd` binary with startup banner showing socket path and watched mounts
+3. **Optional: `loc daemon run` alias** for `localityd` binary with startup banner showing socket path and watched mounts
 
 4. **Fix/strengthen daemon edge cases found in testing**
    - Ensure `NOTION_TOKEN` is required in daemon process env (document clearly)
@@ -198,19 +198,19 @@ afs status ~/afs/notion
 ### Acceptance criteria
 
 ```bash
-afsd &   # or separate terminal
-afs daemon status        # running: true, ping ok
-afs pull ~/afs/notion    # reports via daemon
-pkill afsd
-afs daemon status        # running: false
-afs pull ~/afs/notion    # reports via cli + hint to start afsd
+localityd &   # or separate terminal
+loc daemon status        # running: true, ping ok
+loc pull ~/loc/notion    # reports via daemon
+pkill localityd
+loc daemon status        # running: false
+loc pull ~/loc/notion    # reports via cli + hint to start localityd
 ```
 
 ### Key files
 
-- `crates/afsd/src/ipc.rs` — Ping, socket_path
-- `crates/afsd/src/server.rs`, `runtime.rs`
-- `crates/afs-cli/src/commands.rs` — `run_daemon_report`, fallback logic
+- `crates/localityd/src/ipc.rs` — Ping, socket_path
+- `crates/localityd/src/server.rs`, `runtime.rs`
+- `crates/loc-cli/src/commands.rs` — `run_daemon_report`, fallback logic
 - `docs/daemon.md`
 
 ### Out of scope for this prompt
@@ -220,14 +220,14 @@ afs pull ~/afs/notion    # reports via cli + hint to start afsd
 
 ---
 
-## Prompt 4: Auth Phase 1 — `afs connect notion` + connections table (local, no OAuth yet)
+## Prompt 4: Auth Phase 1 — `loc connect notion` + connections table (local, no OAuth yet)
 
 ### Context
 
 Current auth is **env-var only**:
 
-- `crates/afs-notion/src/client.rs:173` reads `NOTION_TOKEN` (or `NotionConfig.token_key`)
-- `afs connect notion` is a **stub** in `crates/afs-cli/src/commands.rs`
+- `crates/locality-notion/src/client.rs:173` reads `NOTION_TOKEN` (or `NotionConfig.token_key`)
+- `loc connect notion` is a **stub** in `crates/loc-cli/src/commands.rs`
 - `MountConfig` has `connector: String` but no `connection_id`
 - CLI and daemon both call `default_notion_connector()` — no credential store
 - Manual dev flow: `export NOTION_TOKEN=...` then mount/pull/push
@@ -236,15 +236,15 @@ Current auth is **env-var only**:
 
 Three separate concepts:
 
-1. **`afs login`** — optional AgentFS **cloud** identity (relay/team/billing). **NOT required for local v1.** Defer.
-2. **`afs connect notion`** — required **provider connection**. Stores credential in OS keychain; metadata in SQLite.
-3. **`afs mount notion ...`** — local projection referencing a `connection_id`, not storing secrets.
+1. **`loc login`** — optional Locality **cloud** identity (relay/team/billing). **NOT required for local v1.** Defer.
+2. **`loc connect notion`** — required **provider connection**. Stores credential in OS keychain; metadata in SQLite.
+3. **`loc mount notion ...`** — local projection referencing a `connection_id`, not storing secrets.
 
-**Do NOT require global `afs login` for local Notion mounts.**
+**Do NOT require global `loc login` for local Notion mounts.**
 
 ### Task — Phase 1 only (token connect, no browser OAuth)
 
-1. **Schema: `connections` table** in `afs-store` SQLite (migration):
+1. **Schema: `connections` table** in `locality-store` SQLite (migration):
 
 ```sql
 CREATE TABLE connections (
@@ -270,23 +270,23 @@ ALTER TABLE mounts ADD COLUMN connection_id TEXT;
 
 3. **Credential store abstraction**
    - Trait: `CredentialStore { put(secret_ref, secret), get(secret_ref), delete(secret_ref) }`
-   - macOS: Keychain implementation (service `afs`, account `connection:<id>`)
-   - Dev fallback: file in `AFS_STATE_DIR` with mode 0600 + warning log (for Linux CI)
+   - macOS: Keychain implementation (service `loc`, account `connection:<id>`)
+   - Dev fallback: file in `LOCALITY_STATE_DIR` with mode 0600 + warning log (for Linux CI)
 
 4. **CLI commands**
-   - `afs connect notion [--name <id>] [--token-stdin]` — read token, probe Notion API, store in keychain, insert connection row
-   - `afs connections` — list connections
-   - `afs connection show <id>` — metadata only, no secrets
-   - `afs disconnect <id>` — revoke row + delete keychain entry
+   - `loc connect notion [--name <id>] [--token-stdin]` — read token, probe Notion API, store in keychain, insert connection row
+   - `loc connections` — list connections
+   - `loc connection show <id>` — metadata only, no secrets
+   - `loc disconnect <id>` — revoke row + delete keychain entry
 
 5. **Mount wiring**
-   - `afs mount notion <path> --root-page <id> [--connection <id>]`
-   - If exactly one active Notion connection, auto-select; if zero, error with `suggested_command: afs connect notion`
+   - `loc mount notion <path> --root-page <id> [--connection <id>]`
+   - If exactly one active Notion connection, auto-select; if zero, error with `suggested_command: loc connect notion`
    - Save `connection_id` on mount record
 
 6. **Connector resolution**
    - Replace `default_notion_connector()` with resolver: `mount.connection_id → keychain token → NotionConnector`
-   - Use in CLI fallback path AND `afsd/runtime.rs`
+   - Use in CLI fallback path AND `localityd/runtime.rs`
    - Keep `NOTION_TOKEN` env as deprecated fallback when no connection_id (log warning once)
 
 7. **Auth error contract** — stable codes with `suggested_command`:
@@ -295,39 +295,39 @@ ALTER TABLE mounts ADD COLUMN connection_id TEXT;
 8. **Tests**
    - SQLite migration test for connections table
    - In-memory credential store for tests
-   - `afs connect notion --token-stdin` E2E with fake Notion API probe
+   - `loc connect notion --token-stdin` E2E with fake Notion API probe
    - Mount fails without connection; succeeds after connect
 
 ### Acceptance criteria
 
 ```bash
 unset NOTION_TOKEN
-afs mount notion ~/afs/notion --root-page <id>
-# → error: missing_connection, suggested_command: afs connect notion
+loc mount notion ~/loc/notion --root-page <id>
+# → error: missing_connection, suggested_command: loc connect notion
 
-echo "secret_..." | afs connect notion --token-stdin --name work
+echo "secret_..." | loc connect notion --token-stdin --name work
 # → connected notion workspace "..." connection: work
 
-afs mount notion ~/afs/notion --root-page <id> --connection work
-afs pull ~/afs/notion    # works without NOTION_TOKEN in env
+loc mount notion ~/loc/notion --root-page <id> --connection work
+loc pull ~/loc/notion    # works without NOTION_TOKEN in env
 ```
 
-Secrets never appear in `afs connections --json`, logs, or SQLite rows.
+Secrets never appear in `loc connections --json`, logs, or SQLite rows.
 
 ### Key files
 
-- `crates/afs-store/src/sqlite.rs` — schema + migrations
-- `crates/afs-store/src/records.rs` — MountConfig
-- `crates/afs-notion/src/client.rs` — accept token from config, not only env
-- `crates/afs-cli/src/commands.rs` — connect stub → real impl
-- `crates/afsd/src/runtime.rs` — connector resolution
-- New: `crates/afs-auth/` or `crates/afs-store/src/credentials.rs` (follow repo conventions)
+- `crates/locality-store/src/sqlite.rs` — schema + migrations
+- `crates/locality-store/src/records.rs` — MountConfig
+- `crates/locality-notion/src/client.rs` — accept token from config, not only env
+- `crates/loc-cli/src/commands.rs` — connect stub → real impl
+- `crates/localityd/src/runtime.rs` — connector resolution
+- New: `crates/loc-auth/` or `crates/locality-store/src/credentials.rs` (follow repo conventions)
 
 ### Out of scope (Phase 2 — separate prompt later)
 
 - Browser OAuth flow
-- `afs login` / relay auth
-- `afs reauth`
+- `loc login` / relay auth
+- `loc reauth`
 
 ---
 
@@ -337,22 +337,22 @@ Secrets never appear in `afs connections --json`, logs, or SQLite rows.
 
 Manual test path that should become CI/canary:
 
-1. `afs mount notion ~/afs/notion --root-page <uuid>`
-2. `afsd` running with `NOTION_TOKEN`
-3. `afs pull ~/afs/notion` — stubs + hydrate root
+1. `loc mount notion ~/loc/notion --root-page <uuid>`
+2. `localityd` running with `NOTION_TOKEN`
+3. `loc pull ~/loc/notion` — stubs + hydrate root
 4. Edit hydrated page: insert paragraph mid-body
-5. `afs diff` — expect append (+ possibly moves)
-6. `afs push -y` — must reconcile
-7. `afs status` — clean
+5. `loc diff` — expect append (+ possibly moves)
+6. `loc push -y` — must reconcile
+7. `loc status` — clean
 
 Currently no CLI E2E covers this with fake Notion API. `tests/simulation/README.md` describes desired harness.
 
 ### Task
 
 1. Extend fake `NotionApi` in tests to support block move PATCH, append, update
-2. Add `crates/afs-cli/tests/e2e_push.rs` (or extend existing) covering mount → pull → edit → diff → push → status
-3. Add daemon IPC variant test in `crates/afsd/tests/`
-4. Mark live Notion test `#[ignore]` with `NOTION_TOKEN` + `AFS_NOTION_PAGE_ID`
+2. Add `crates/loc-cli/tests/e2e_push.rs` (or extend existing) covering mount → pull → edit → diff → push → status
+3. Add daemon IPC variant test in `crates/localityd/tests/`
+4. Mark live Notion test `#[ignore]` with `NOTION_TOKEN` + `LOCALITY_NOTION_PAGE_ID`
 
 ### Acceptance
 
@@ -373,16 +373,16 @@ Currently no CLI E2E covers this with fake Notion API. `tests/simulation/README.
 ## Manual test environment reference
 
 ```bash
-export PATH="/path/to/afs/target/debug:$PATH"
+export PATH="/path/to/loc/target/debug:$PATH"
 export NOTION_TOKEN="..."   # until Prompt 4 lands
-afs mount notion ~/afs/notion --root-page <notion-page-uuid>
-afsd   # foreground, separate terminal
-afs pull ~/afs/notion
+loc mount notion ~/loc/notion --root-page <notion-page-uuid>
+localityd   # foreground, separate terminal
+loc pull ~/loc/notion
 # edit initial-idea/page.md
-afs diff ~/afs/notion/<page-dir>/page.md --json
-afs push ~/afs/notion/<page-dir>/page.md -y
-afs status ~/afs/notion --json
-afs log
+loc diff ~/loc/notion/<page-dir>/page.md --json
+loc push ~/loc/notion/<page-dir>/page.md -y
+loc status ~/loc/notion --json
+loc log
 ```
 
-State dir: `~/.afs/` (SQLite + `afsd.sock`). Override with `AFS_STATE_DIR`.
+State dir: `~/.loc/` (SQLite + `localityd.sock`). Override with `LOCALITY_STATE_DIR`.

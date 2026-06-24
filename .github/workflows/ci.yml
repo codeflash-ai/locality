@@ -64,7 +64,7 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
       - name: Run real Linux FUSE smoke test
-        run: AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
+        run: LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
       - name: Install desktop dependencies
         run: npm ci
         working-directory: apps/desktop
@@ -82,20 +82,20 @@ jobs:
       - name: Run Windows Rust tests
         run: >
           cargo test
-          -p afs-core
-          -p afs-connector
-          -p afs-store
-          -p afs-platform
-          -p afs-notion
-          -p afsd
-          -p afs-cli
-          -p afs-cloud-files
+          -p locality-core
+          -p locality-connector
+          -p locality-store
+          -p locality-platform
+          -p locality-notion
+          -p localityd
+          -p loc-cli
+          -p locality-cloud-files
           --all-targets
           --no-fail-fast
       - name: Check Linux-only FUSE stub
-        run: cargo check -p afs-fuse
+        run: cargo check -p locality-fuse
       - name: Check Windows desktop shell
-        run: cargo check -p afs-desktop
+        run: cargo check -p locality-desktop
 
   macos:
     name: macOS tests
@@ -115,7 +115,7 @@ jobs:
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
       - name: Build macOS File Provider package
-        run: swift build --package-path platform/macos/AgentFSFileProvider
+        run: swift build --package-path platform/macos/LocalityFileProvider
       - name: Install desktop dependencies
         run: npm ci
         working-directory: apps/desktop

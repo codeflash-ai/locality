@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DMG_DIR="${HOMEBREW_DMG_DIR:-${ROOT}/target/release/bundle/dmg}"
-OUTPUT="${HOMEBREW_CASK_OUTPUT:-${ROOT}/target/release/homebrew/Casks/afs.rb}"
+OUTPUT="${HOMEBREW_CASK_OUTPUT:-${ROOT}/target/release/homebrew/Casks/loc.rb}"
 VERSION="${HOMEBREW_VERSION:-}"
 RELEASE_TAG="${HOMEBREW_RELEASE_TAG:-}"
 BASE_URL="${HOMEBREW_BASE_URL:-}"
@@ -53,28 +53,28 @@ write_cask() {
   sha="$(sha256_file "${dmg}")"
 
   cat >"${OUTPUT}" <<EOF
-cask "afs" do
+cask "loc" do
   version "${VERSION}"
   sha256 "${sha}"
 
   url "${url}",
-      verified: "github.com/codeflash-ai/afs/"
-  name "AFS"
+      verified: "github.com/codeflash-ai/locality/"
+  name "Locality"
   desc "Mount workspaces as local files for agents"
-  homepage "https://github.com/codeflash-ai/afs"
+  homepage "https://github.com/codeflash-ai/locality"
 
   auto_updates true
   depends_on arch: :arm64
   depends_on macos: :sonoma
 
-  app "AFS.app"
-  binary "#{appdir}/AFS.app/Contents/MacOS/afs"
+  app "Locality.app"
+  binary "#{appdir}/Locality.app/Contents/MacOS/loc"
 
   zap trash: [
-    "~/.afs",
-    "~/Library/Application Support/ai.codeflash.afs",
-    "~/Library/Caches/ai.codeflash.afs",
-    "~/Library/Preferences/ai.codeflash.afs.plist",
+    "~/.loc",
+    "~/Library/Application Support/ai.codeflash.locality",
+    "~/Library/Caches/ai.codeflash.locality",
+    "~/Library/Preferences/ai.codeflash.locality.plist",
   ]
 end
 EOF
@@ -87,7 +87,7 @@ main() {
   VERSION="${VERSION:-$(version_from_tauri_config)}"
   [[ -n "${VERSION}" ]] || fail "set HOMEBREW_VERSION or define bundle.version in tauri.conf.json"
   if [[ -z "${BASE_URL}" && -n "${RELEASE_TAG}" ]]; then
-    BASE_URL="https://github.com/codeflash-ai/afs/releases/download/${RELEASE_TAG}"
+    BASE_URL="https://github.com/codeflash-ai/locality/releases/download/${RELEASE_TAG}"
   fi
 
   local dmg

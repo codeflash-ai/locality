@@ -1,23 +1,23 @@
-# AgentFS
+# Locality
 
-AgentFS mounts systems of record as real Markdown files that agents and editors can read, grep, and edit locally. Reads are implicit through the daemon. Writes are explicit by default through `afs push`, which validates, plans, journals, and applies changes back to the source with connector-specific APIs.
+Locality mounts systems of record as real Markdown files that agents and editors can read, grep, and edit locally. Reads are implicit through the daemon. Writes are explicit by default through `loc push`, which validates, plans, journals, and applies changes back to the source with connector-specific APIs.
 
 This repository contains the Rust workspace for the `plan.md` design and the first functional slices of the core sync engine, CLI, store, daemon hydration loop, and Notion connector.
 
 ## Install on macOS
 
-AFS publishes an Apple Silicon macOS build through Homebrew:
+Locality publishes an Apple Silicon macOS build through Homebrew:
 
 ```sh
 brew tap codeflash-ai/tap
-brew install --cask afs
+brew install --cask loc
 ```
 
 To update an existing Homebrew install:
 
 ```sh
 brew update
-brew upgrade --cask afs
+brew upgrade --cask loc
 ```
 
 The public Homebrew build currently requires an Apple Silicon Mac running macOS 14 Sonoma or newer.
@@ -27,13 +27,13 @@ The public Homebrew build currently requires an Apple Silicon Mac running macOS 
 Linux packages are published through distro package repositories. On Debian or Ubuntu:
 
 ```sh
-curl -fsSL https://codeflash-ai.github.io/afs/apt/codeflash-afs.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-afs.gpg && echo "deb [signed-by=/usr/share/keyrings/codeflash-afs.gpg] https://codeflash-ai.github.io/afs/apt stable main" | sudo tee /etc/apt/sources.list.d/afs.list >/dev/null && sudo apt update && sudo apt install afs
+curl -fsSL https://codeflash-ai.github.io/locality/apt/codeflash-loc.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-loc.gpg && echo "deb [signed-by=/usr/share/keyrings/codeflash-loc.gpg] https://codeflash-ai.github.io/locality/apt stable main" | sudo tee /etc/apt/sources.list.d/loc.list >/dev/null && sudo apt update && sudo apt install loc
 ```
 
 On Fedora, RHEL, or compatible distributions:
 
 ```sh
-sudo curl -fsSL -o /etc/yum.repos.d/afs.repo https://codeflash-ai.github.io/afs/rpm/afs.repo && sudo dnf install afs
+sudo curl -fsSL -o /etc/yum.repos.d/loc.repo https://codeflash-ai.github.io/locality/rpm/loc.repo && sudo dnf install loc
 ```
 
 Linux packages require `fuse3` and `systemd`; the package metadata declares both dependencies.
@@ -41,7 +41,7 @@ APT/DNF installs update through the system package manager. For Tauri-managed
 self-update, use the AppImage channel:
 
 ```sh
-mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/AFS.AppImage https://github.com/codeflash-ai/afs/releases/latest/download/AFS-release-linux-x86_64.AppImage && chmod +x ~/.local/bin/AFS.AppImage
+mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/Locality.AppImage https://github.com/codeflash-ai/locality/releases/latest/download/Locality-release-linux-x86_64.AppImage && chmod +x ~/.local/bin/Locality.AppImage
 ```
 
 ## Development
@@ -71,21 +71,21 @@ Common targets:
 | `make dev-desktop` | Starts the desktop Vite dev server at `http://127.0.0.1:1420/`. |
 | `make dev-tauri` | Builds fresh debug desktop sidecars, then starts the Tauri desktop app in development mode. |
 | `make build-tauri` | Builds the packaged Tauri desktop app. |
-| `make run-cli ARGS='status --json'` | Runs the `afs` CLI with custom arguments. |
+| `make run-cli ARGS='status --json'` | Runs the `loc` CLI with custom arguments. |
 | `make clean` | Removes Rust and desktop build outputs. |
 
 ## Workspace layout
 
-- `crates/afs-cli`: `afs` command surface for humans and agents.
-- `crates/afsd`: per-user daemon supervising mounts, virtual filesystem projection requests, watchers, hydration, pull, and push orchestration.
-- `platform/linux/afs-fuse`: Linux FUSE projection helper for `linux_fuse` mounts.
-- `crates/afs-core`: connector-agnostic sync engine, three-tree model, diff, planning, conflicts, hydration state, validation, and journal abstractions.
-- `crates/afs-connector`: connector SDK trait for enumerate, fetch, render, parse, and apply.
-- `crates/afs-notion`: first-party Notion connector with live page/block reads, database row projection, schema rendering, narrow block writes, and supported page-property writes.
-- `crates/afs-store`: state-store abstraction and SQLite implementation.
+- `crates/loc-cli`: `loc` command surface for humans and agents.
+- `crates/localityd`: per-user daemon supervising mounts, virtual filesystem projection requests, watchers, hydration, pull, and push orchestration.
+- `platform/linux/locality-fuse`: Linux FUSE projection helper for `linux_fuse` mounts.
+- `crates/locality-core`: connector-agnostic sync engine, three-tree model, diff, planning, conflicts, hydration state, validation, and journal abstractions.
+- `crates/locality-connector`: connector SDK trait for enumerate, fetch, render, parse, and apply.
+- `crates/locality-notion`: first-party Notion connector with live page/block reads, database row projection, schema rendering, narrow block writes, and supported page-property writes.
+- `crates/locality-store`: state-store abstraction and SQLite implementation.
 - `templates/mount/AGENTS.md`: generated mount guidance template for coding agents.
 - `docs/`: design notes split by implementation surface.
 
 ## Current status
 
-The implementation is still early, but the main module boundaries are now exercised end to end: mount writes concise agent guidance, mount and pull can project a Notion root page into files, database rows appear as page stubs with property frontmatter, selected pages can hydrate, info explains local source context, status reports local dirty/stub/conflict state, simple block and supported property edits can push with journaling and reconciliation, daemon hydration requests and virtual filesystem metadata/write requests have tested execution paths, Linux FUSE has an initial mount helper, and `afs daemon start|stop|status` can run `afsd` as a user-managed background process.
+The implementation is still early, but the main module boundaries are now exercised end to end: mount writes concise agent guidance, mount and pull can project a Notion root page into files, database rows appear as page stubs with property frontmatter, selected pages can hydrate, info explains local source context, status reports local dirty/stub/conflict state, simple block and supported property edits can push with journaling and reconciliation, daemon hydration requests and virtual filesystem metadata/write requests have tested execution paths, Linux FUSE has an initial mount helper, and `loc daemon start|stop|status` can run `localityd` as a user-managed background process.

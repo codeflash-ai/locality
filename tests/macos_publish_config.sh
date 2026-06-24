@@ -41,17 +41,17 @@ grep -q 'dmg_status="unnotarized"' "${PUBLISH_SCRIPT}" \
 grep -q 'dmg_status="notarized"' "${PUBLISH_SCRIPT}" \
   || fail "notarized artifacts must keep the notarized naming suffix"
 
-tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/afs-macos-publish-config.XXXXXX")"
+tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-macos-publish-config.XXXXXX")"
 cleanup() {
   rm -rf "${tmp_root}"
 }
 trap cleanup EXIT
 
 dmg_dir="${tmp_root}/dmg"
-cask_output="${tmp_root}/afs.rb"
+cask_output="${tmp_root}/loc.rb"
 mkdir -p "${dmg_dir}"
-printf 'old notarized dmg\n' >"${dmg_dir}/AFS-release-20260619-abcdefg-notarized-aarch64.dmg"
-printf 'new unnotarized dmg\n' >"${dmg_dir}/AFS-release-20260620-abcdefg-unnotarized-aarch64.dmg"
+printf 'old notarized dmg\n' >"${dmg_dir}/Locality-release-20260619-abcdefg-notarized-aarch64.dmg"
+printf 'new unnotarized dmg\n' >"${dmg_dir}/Locality-release-20260620-abcdefg-unnotarized-aarch64.dmg"
 
 HOMEBREW_DMG_DIR="${dmg_dir}" \
   HOMEBREW_CASK_OUTPUT="${cask_output}" \
@@ -59,8 +59,8 @@ HOMEBREW_DMG_DIR="${dmg_dir}" \
   HOMEBREW_VERSION="0.1.0" \
   "${HOMEBREW_SCRIPT}" >/dev/null
 
-grep -q 'AFS-release-20260619-abcdefg-notarized-aarch64.dmg' "${cask_output}" \
+grep -q 'Locality-release-20260619-abcdefg-notarized-aarch64.dmg' "${cask_output}" \
   || fail "Homebrew cask should auto-select notarized DMGs"
-if grep -q 'AFS-release-20260620-abcdefg-unnotarized-aarch64.dmg' "${cask_output}"; then
+if grep -q 'Locality-release-20260620-abcdefg-unnotarized-aarch64.dmg' "${cask_output}"; then
   fail "Homebrew cask must not auto-select unnotarized DMGs"
 fi

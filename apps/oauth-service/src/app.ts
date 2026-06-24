@@ -36,9 +36,9 @@ const app = new Hono<{ Bindings: BrokerEnv }>();
 
 app.get("/healthz", (c) => c.json({ ok: true }));
 
-app.get("/.well-known/afs-auth-broker", (c) =>
+app.get("/.well-known/loc-auth-broker", (c) =>
   c.json({
-    issuer: "afs-oauth-broker",
+    issuer: "loc-oauth-broker",
     version: 1,
     connectors: {
       notion: {
@@ -68,11 +68,11 @@ app.post("/v1/oauth/notion/start", async (c) => {
       exp: now + SESSION_TTL_SECONDS,
       nonce: randomBase64Url()
     },
-    requireOperationalSecret(c.env.AFS_BROKER_SESSION_SECRET, "AFS_BROKER_SESSION_SECRET")
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
   );
   return c.json({
     connector: "notion",
-    client_id: c.env.AFS_NOTION_CLIENT_ID,
+    client_id: c.env.LOCALITY_NOTION_CLIENT_ID,
     authorization_url: notionAuthorizeUrl(c.env, redirectUri, state),
     redirect_uri: redirectUri,
     session,
@@ -89,7 +89,7 @@ app.post("/v1/oauth/notion/exchange", async (c) => {
   const redirectUri = validateNotionRedirectUri(c.env, requireString(body.redirect_uri, "redirect_uri"));
   const payload = await verifySession(
     session,
-    requireOperationalSecret(c.env.AFS_BROKER_SESSION_SECRET, "AFS_BROKER_SESSION_SECRET")
+    requireOperationalSecret(c.env.LOCALITY_BROKER_SESSION_SECRET, "LOCALITY_BROKER_SESSION_SECRET")
   );
   if (payload.connector !== "notion" || payload.state !== state || payload.redirect_uri !== redirectUri) {
     throw badRequest("oauth_session_mismatch", "OAuth callback did not match the broker session");
@@ -143,7 +143,7 @@ async function shapeRefreshToken(env: BrokerEnv, refreshToken: string | undefine
       refresh_token: refreshToken
     };
   }
-  const secret = requireOperationalSecret(env.AFS_REFRESH_HANDLE_KEY, "AFS_REFRESH_HANDLE_KEY");
+  const secret = requireOperationalSecret(env.LOCALITY_REFRESH_HANDLE_KEY, "LOCALITY_REFRESH_HANDLE_KEY");
   const handle = await encryptJsonHandle(
     {
       v: 1,
@@ -164,7 +164,7 @@ async function resolveRefreshToken(env: BrokerEnv, body: RefreshRequest): Promis
     try {
       const payload = await decryptJsonHandle<RefreshHandlePayload>(
         body.refresh_token_handle,
-        requireOperationalSecret(env.AFS_REFRESH_HANDLE_KEY, "AFS_REFRESH_HANDLE_KEY")
+        requireOperationalSecret(env.LOCALITY_REFRESH_HANDLE_KEY, "LOCALITY_REFRESH_HANDLE_KEY")
       );
       if (payload.v !== 1 || payload.connector !== "notion") {
         throw new Error("invalid refresh handle payload");
@@ -203,9 +203,9 @@ function requireString(value: string | undefined, field: string): string {
 }
 
 function tokenMode(env: BrokerEnv): "handle" | "raw" {
-  const mode = env.AFS_TOKEN_MODE ?? (env.AFS_REFRESH_HANDLE_KEY ? "handle" : "raw");
+  const mode = env.LOCALITY_TOKEN_MODE ?? (env.LOCALITY_REFRESH_HANDLE_KEY ? "handle" : "raw");
   if (mode !== "handle" && mode !== "raw") {
-    throw configError("AFS_TOKEN_MODE must be either handle or raw");
+    throw configError("LOCALITY_TOKEN_MODE must be either handle or raw");
   }
   return mode;
 }

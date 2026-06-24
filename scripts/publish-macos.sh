@@ -5,11 +5,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DESKTOP_DIR="${ROOT}/apps/desktop"
 DMG_DIR="${ROOT}/target/release/bundle/dmg"
 UPDATER_DIR="${ROOT}/target/release/bundle/updater"
-PRODUCT_NAME="${PUBLISH_PRODUCT_NAME:-AFS}"
+PRODUCT_NAME="${PUBLISH_PRODUCT_NAME:-Locality}"
 CHANNEL="${PUBLISH_CHANNEL:-beta}"
 DATE_STAMP="${PUBLISH_DATE:-$(date +%Y%m%d)}"
-NOTARY_PROFILE="${APPLE_NOTARY_KEYCHAIN_PROFILE:-${NOTARY_KEYCHAIN_PROFILE:-afs-notary}}"
-UPDATER_ENDPOINT="${TAURI_UPDATER_ENDPOINT:-https://github.com/codeflash-ai/afs/releases/latest/download/latest-macos.json}"
+NOTARY_PROFILE="${APPLE_NOTARY_KEYCHAIN_PROFILE:-${NOTARY_KEYCHAIN_PROFILE:-loc-notary}}"
+UPDATER_ENDPOINT="${TAURI_UPDATER_ENDPOINT:-https://github.com/codeflash-ai/locality/releases/latest/download/latest-macos.json}"
 
 log() {
   printf 'publish: %s\n' "$*"
@@ -184,20 +184,20 @@ verify_signed_app_in_dmg() (
   hdiutil attach "${dmg}" -readonly -noverify -noautoopen -mountpoint "${mountpoint}" -quiet
   app="${mountpoint}/${PRODUCT_NAME}.app"
   codesign --verify --deep --strict --verbose=2 "${app}"
-  [[ -x "${app}/Contents/MacOS/afs" ]] \
-    || fail "${PRODUCT_NAME}.app does not include an executable afs CLI"
-  [[ -x "${app}/Contents/MacOS/afsd" ]] \
-    || fail "${PRODUCT_NAME}.app does not include an executable afsd sidecar"
+  [[ -x "${app}/Contents/MacOS/loc" ]] \
+    || fail "${PRODUCT_NAME}.app does not include an executable loc CLI"
+  [[ -x "${app}/Contents/MacOS/localityd" ]] \
+    || fail "${PRODUCT_NAME}.app does not include an executable localityd sidecar"
   local app_signature appex_signature
   app_signature="$(codesign -dv --verbose=4 "${app}" 2>&1)"
-  appex_signature="$(codesign -dv --verbose=4 "${app}/Contents/PlugIns/AgentFSFileProvider.appex" 2>&1)"
+  appex_signature="$(codesign -dv --verbose=4 "${app}/Contents/PlugIns/LocalityFileProvider.appex" 2>&1)"
   if [[ "${require_developer_id}" == "1" ]]; then
     [[ "${app_signature}" == *"Developer ID Application"* ]] \
       || fail "${PRODUCT_NAME}.app is not signed with a Developer ID Application identity"
     [[ "${appex_signature}" == *"Developer ID Application"* ]] \
-      || fail "AgentFSFileProvider.appex is not signed with a Developer ID Application identity"
+      || fail "LocalityFileProvider.appex is not signed with a Developer ID Application identity"
   fi
-  grep -a -F -q "${expected_build}" "${app}/Contents/MacOS/afsd"
+  grep -a -F -q "${expected_build}" "${app}/Contents/MacOS/localityd"
   smoke_test_desktop_app "${app}"
 )
 
@@ -217,7 +217,7 @@ smoke_test_desktop_app() (
   }
   trap cleanup EXIT
 
-  AFS_DESKTOP_SMOKE_TEST=1 "${app}/Contents/MacOS/afs-desktop" >"${stdout}" 2>"${stderr}" &
+  LOCALITY_DESKTOP_SMOKE_TEST=1 "${app}/Contents/MacOS/locality-desktop" >"${stdout}" 2>"${stderr}" &
   pid="$!"
 
   for _ in {1..20}; do
@@ -261,10 +261,10 @@ validate_notarized_dmg() {
     hdiutil attach "${dmg}" -readonly -noverify -noautoopen -mountpoint "${mountpoint}" -quiet
     app="${mountpoint}/${PRODUCT_NAME}.app"
     codesign --verify --deep --strict --verbose=2 "${app}"
-    [[ -x "${app}/Contents/MacOS/afs" ]] \
-      || fail "${PRODUCT_NAME}.app does not include an executable afs CLI"
-    [[ -x "${app}/Contents/MacOS/afsd" ]] \
-      || fail "${PRODUCT_NAME}.app does not include an executable afsd sidecar"
+    [[ -x "${app}/Contents/MacOS/loc" ]] \
+      || fail "${PRODUCT_NAME}.app does not include an executable loc CLI"
+    [[ -x "${app}/Contents/MacOS/localityd" ]] \
+      || fail "${PRODUCT_NAME}.app does not include an executable localityd sidecar"
     spctl --assess --type execute --verbose "${app}"
   )
 }

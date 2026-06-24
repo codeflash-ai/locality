@@ -2,7 +2,7 @@
 
 ## Context
 
-`afs pull` and `afs push` can spend noticeable time waiting on the daemon,
+`loc pull` and `loc push` can spend noticeable time waiting on the daemon,
 falling back to direct connector execution, hydrating content, or applying remote
 changes. Today the CLI is silent until the command completes, which makes a
 human terminal session look stalled.
@@ -12,7 +12,7 @@ remain clean and must not include transient loading frames.
 
 ## Goals
 
-- Show a lightweight loading state while `afs pull` or `afs push` work is in
+- Show a lightweight loading state while `loc pull` or `loc push` work is in
   progress.
 - Suppress the loading state for `--json`.
 - Keep stdout stable for normal reports and JSON output.
@@ -40,11 +40,11 @@ The spinner is enabled only when both conditions are true:
 This preserves JSON output and avoids control characters in redirected logs.
 Spinner frames go to stderr so stdout remains reserved for command reports.
 
-`afs pull <path>` will show a single spinner around daemon execution and, when
+`loc pull <path>` will show a single spinner around daemon execution and, when
 needed, direct fallback execution. The label will be generic, for example
 `pulling <path>`.
 
-`afs push <path>` will show a spinner around each target push execution. For a
+`loc push <path>` will show a spinner around each target push execution. For a
 single file, that means one spinner. For a scoped directory push, each selected
 target gets its own spinner using a label like `pushing <path>`. Existing
 confirmation prompts still happen without a spinner active.

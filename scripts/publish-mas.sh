@@ -5,13 +5,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DESKTOP_DIR="${ROOT}/apps/desktop"
 APP_DIR="${ROOT}/target/release/bundle/macos"
 MAS_OUT_DIR="${ROOT}/target/release/bundle/mas"
-PRODUCT_NAME="${PUBLISH_PRODUCT_NAME:-AFS}"
+PRODUCT_NAME="${PUBLISH_PRODUCT_NAME:-Locality}"
 CHANNEL="${PUBLISH_CHANNEL:-app-store}"
 DATE_STAMP="${PUBLISH_DATE:-$(date +%Y%m%d)}"
-APP_BUNDLE_ID="${MAS_APP_BUNDLE_ID:-ai.codeflash.afs}"
-FILE_PROVIDER_BUNDLE_ID="${MAS_FILE_PROVIDER_BUNDLE_ID:-ai.codeflash.afs.AgentFS.FileProvider}"
-HOST_ENTITLEMENTS="${ROOT}/platform/macos/AgentFSFileProvider/App/AgentFS.entitlements"
-FILE_PROVIDER_ENTITLEMENTS="${ROOT}/platform/macos/AgentFSFileProvider/App/AgentFSFileProvider.entitlements"
+APP_BUNDLE_ID="${MAS_APP_BUNDLE_ID:-ai.codeflash.locality}"
+FILE_PROVIDER_BUNDLE_ID="${MAS_FILE_PROVIDER_BUNDLE_ID:-ai.codeflash.locality.Locality.FileProvider}"
+HOST_ENTITLEMENTS="${ROOT}/platform/macos/LocalityFileProvider/App/Locality.entitlements"
+FILE_PROVIDER_ENTITLEMENTS="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityFileProvider.entitlements"
 TEMP_SECRET_DIR=""
 
 log() {
@@ -197,7 +197,7 @@ resign_app_store_bundle() {
   local signing_identity="$2"
   local app_profile="$3"
   local file_provider_profile="$4"
-  local appex="${app}/Contents/PlugIns/AgentFSFileProvider.appex"
+  local appex="${app}/Contents/PlugIns/LocalityFileProvider.appex"
 
   [[ -d "${app}" ]] || fail "missing app bundle: ${app}"
   [[ -d "${appex}" ]] || fail "missing File Provider extension: ${appex}"
@@ -208,10 +208,10 @@ resign_app_store_bundle() {
   cp "${app_profile}" "${app}/Contents/embedded.provisionprofile"
   cp "${file_provider_profile}" "${appex}/Contents/embedded.provisionprofile"
 
-  sign_with_entitlements "${signing_identity}" "${HOST_ENTITLEMENTS}" "${app}/Contents/MacOS/agentfs-file-providerctl"
-  sign_with_entitlements "${signing_identity}" "${HOST_ENTITLEMENTS}" "${app}/Contents/MacOS/afs"
-  sign_with_entitlements "${signing_identity}" "${HOST_ENTITLEMENTS}" "${app}/Contents/MacOS/afsd"
-  sign_with_entitlements "${signing_identity}" "${FILE_PROVIDER_ENTITLEMENTS}" "${appex}/Contents/MacOS/AgentFSFileProvider"
+  sign_with_entitlements "${signing_identity}" "${HOST_ENTITLEMENTS}" "${app}/Contents/MacOS/locality-file-providerctl"
+  sign_with_entitlements "${signing_identity}" "${HOST_ENTITLEMENTS}" "${app}/Contents/MacOS/loc"
+  sign_with_entitlements "${signing_identity}" "${HOST_ENTITLEMENTS}" "${app}/Contents/MacOS/localityd"
+  sign_with_entitlements "${signing_identity}" "${FILE_PROVIDER_ENTITLEMENTS}" "${appex}/Contents/MacOS/LocalityFileProvider"
   sign_with_entitlements "${signing_identity}" "${FILE_PROVIDER_ENTITLEMENTS}" "${appex}"
   sign_with_entitlements "${signing_identity}" "${HOST_ENTITLEMENTS}" "${app}/Contents/MacOS/${PRODUCT_NAME}"
   sign_with_entitlements "${signing_identity}" "${HOST_ENTITLEMENTS}" "${app}"
@@ -272,13 +272,13 @@ main() {
     profile_path \
       MAS_APP_PROVISIONING_PROFILE \
       MAS_APP_PROVISIONING_PROFILE_BASE64 \
-      AFS_AppStore.provisionprofile
+      LOCALITY_AppStore.provisionprofile
   )"
   file_provider_profile="$(
     profile_path \
       MAS_FILE_PROVIDER_PROVISIONING_PROFILE \
       MAS_FILE_PROVIDER_PROVISIONING_PROFILE_BASE64 \
-      AFS_FileProvider_AppStore.provisionprofile
+      LOCALITY_FileProvider_AppStore.provisionprofile
   )"
 
   commit_short="$(git -C "${ROOT}" rev-parse --short=7 HEAD)"
@@ -294,8 +294,8 @@ main() {
   mkdir -p "${APP_DIR}" "${MAS_OUT_DIR}"
 
   log "building Mac App Store-channel app bundle"
-  VITE_AFS_DISTRIBUTION_CHANNEL=mas \
-  AFS_DISTRIBUTION_CHANNEL=mas \
+  VITE_LOCALITY_DISTRIBUTION_CHANNEL=mas \
+  LOCALITY_DISTRIBUTION_CHANNEL=mas \
   APPLE_SIGNING_IDENTITY="${app_signing_identity}" \
     npm --prefix "${DESKTOP_DIR}" run tauri -- build --bundles app --config "${config_json}"
 

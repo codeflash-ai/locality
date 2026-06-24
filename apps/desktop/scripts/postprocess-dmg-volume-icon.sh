@@ -6,11 +6,11 @@ DMG="${1:-}"
 ICON="${ROOT}/apps/desktop/src-tauri/icons/dmg-icon.icns"
 
 if [[ -z "${DMG}" ]]; then
-  DMG="$(find "${ROOT}/target/release/bundle/dmg" -maxdepth 1 -type f -name 'AFS_*.dmg' | sort | tail -n 1)"
+  DMG="$(find "${ROOT}/target/release/bundle/dmg" -maxdepth 1 -type f -name 'LOCALITY_*.dmg' | sort | tail -n 1)"
 fi
 
 if [[ -z "${DMG}" || ! -f "${DMG}" ]]; then
-  echo "No AFS DMG found to post-process." >&2
+  echo "No Locality DMG found to post-process." >&2
   exit 1
 fi
 if [[ ! -f "${ICON}" ]]; then
@@ -20,8 +20,8 @@ fi
 
 TMPDIR="$(mktemp -d)"
 MOUNTPOINT="${TMPDIR}/mount"
-RW_DMG="${TMPDIR}/afs-installer-rw.dmg"
-FINAL_DMG="${TMPDIR}/afs-installer-final.dmg"
+RW_DMG="${TMPDIR}/loc-installer-rw.dmg"
+FINAL_DMG="${TMPDIR}/loc-installer-final.dmg"
 
 cleanup() {
   if [[ -d "${MOUNTPOINT}" ]]; then

@@ -167,9 +167,9 @@ updateCargoLock(
 );
 
 if (changedFiles.length === 0) {
-  console.log(`AFS release version is already ${version}.`);
+  console.log(`Locality release version is already ${version}.`);
 } else {
-  console.log(`Bumped AFS release version to ${version}.`);
+  console.log(`Bumped Locality release version to ${version}.`);
   for (const path of changedFiles) {
     console.log(`  ${path}`);
   }

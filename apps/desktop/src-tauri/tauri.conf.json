@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AFS",
+  "productName": "Locality",
   "version": "0.1.3",
-  "identifier": "ai.codeflash.afs",
+  "identifier": "ai.codeflash.locality",
   "build": {
     "beforeDevCommand": "node ./scripts/dev-command.mjs",
     "devUrl": "http://127.0.0.1:1420",
@@ -16,7 +16,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "AFS",
+        "title": "Locality",
         "width": 960,
         "height": 680,
         "minWidth": 860,
@@ -45,16 +45,16 @@
     "targets": ["app", "dmg"],
     "category": "Productivity",
     "shortDescription": "Mount workspaces as local files for agents.",
-    "longDescription": "AFS lets agents edit connected workspaces through local files while keeping remote writes reviewable.",
+    "longDescription": "Locality lets agents edit connected workspaces through local files while keeping remote writes reviewable.",
     "icon": ["icons/icon.png", "icons/icon.ico"],
     "macOS": {
       "minimumSystemVersion": "14.0",
       "signingIdentity": "-",
       "files": {
-        "PlugIns/AgentFSFileProvider.appex": "macos/AgentFSFileProvider/AgentFSFileProvider.appex",
-        "MacOS/agentfs-file-providerctl": "macos/AgentFSFileProvider/agentfs-file-providerctl",
-        "MacOS/afs": "macos/afs",
-        "MacOS/afsd": "macos/afsd"
+        "PlugIns/LocalityFileProvider.appex": "macos/LocalityFileProvider/LocalityFileProvider.appex",
+        "MacOS/locality-file-providerctl": "macos/LocalityFileProvider/locality-file-providerctl",
+        "MacOS/loc": "macos/loc",
+        "MacOS/localityd": "macos/localityd"
       },
       "dmg": {
         "windowSize": {
@@ -75,17 +75,17 @@
       "deb": {
         "depends": ["fuse3", "systemd"],
         "files": {
-          "/usr/bin/afs": "linux/afs",
-          "/usr/bin/afsd": "linux/afsd",
-          "/usr/bin/afs-fuse": "linux/afs-fuse"
+          "/usr/bin/loc": "linux/loc",
+          "/usr/bin/localityd": "linux/localityd",
+          "/usr/bin/locality-fuse": "linux/locality-fuse"
         }
       },
       "rpm": {
         "depends": ["fuse3", "systemd"],
         "files": {
-          "/usr/bin/afs": "linux/afs",
-          "/usr/bin/afsd": "linux/afsd",
-          "/usr/bin/afs-fuse": "linux/afs-fuse"
+          "/usr/bin/loc": "linux/loc",
+          "/usr/bin/localityd": "linux/localityd",
+          "/usr/bin/locality-fuse": "linux/locality-fuse"
         }
       }
     }

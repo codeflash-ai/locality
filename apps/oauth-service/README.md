@@ -1,9 +1,9 @@
-# AFS Auth Broker
+# Locality Auth Broker
 
-Minimal OAuth broker for AgentFS connector auth.
+Minimal OAuth broker for Locality connector auth.
 
 The broker exists for providers whose OAuth REST API requires a confidential
-client secret. The local `afs` client keeps the normal desktop UX: start a
+client secret. The local `loc` client keeps the normal desktop UX: start a
 localhost callback, open the provider consent page, receive the authorization
 code, and store returned credentials in the OS credential store. This service
 only performs the confidential token exchange and refresh calls.
@@ -11,21 +11,21 @@ only performs the confidential token exchange and refresh calls.
 ## Flow
 
 ```text
-afs CLI -> broker /start
-afs CLI <- authorization_url, state, signed session
-afs CLI -> browser -> Notion OAuth consent
+loc CLI -> broker /start
+loc CLI <- authorization_url, state, signed session
+loc CLI -> browser -> Notion OAuth consent
 Notion -> localhost callback on the user's machine
-afs CLI -> broker /exchange with code, state, session, redirect_uri
+loc CLI -> broker /exchange with code, state, session, redirect_uri
 broker -> Notion token endpoint with client_secret
-broker -> afs CLI with access token and refresh handle
+broker -> loc CLI with access token and refresh handle
 ```
 
 Refresh is similarly narrow:
 
 ```text
-afs CLI -> broker /refresh with refresh_token_handle
+loc CLI -> broker /refresh with refresh_token_handle
 broker -> Notion token endpoint with client_secret
-broker -> afs CLI with new access token and new refresh handle
+broker -> loc CLI with new access token and new refresh handle
 ```
 
 The broker does not persist page content or tokens. In `handle` mode, it returns
@@ -71,7 +71,7 @@ Request:
 ```
 
 Response includes the provider access token and either `refresh_token_handle` or
-`refresh_token`, depending on `AFS_TOKEN_MODE`.
+`refresh_token`, depending on `LOCALITY_TOKEN_MODE`.
 
 ### `POST /v1/oauth/notion/refresh`
 
@@ -79,7 +79,7 @@ Request:
 
 ```json
 {
-  "refresh_token_handle": "afsrh_v1..."
+  "refresh_token_handle": "locrh_v1..."
 }
 ```
 
@@ -99,10 +99,10 @@ npm run check
 
 ## Required Secrets
 
-- `AFS_BROKER_SESSION_SECRET`: signs short-lived OAuth sessions.
-- `AFS_REFRESH_HANDLE_KEY`: encrypts opaque refresh handles in `handle` mode.
-- `AFS_NOTION_CLIENT_ID`: Notion OAuth client ID.
-- `AFS_NOTION_CLIENT_SECRET`: Notion OAuth client secret.
+- `LOCALITY_BROKER_SESSION_SECRET`: signs short-lived OAuth sessions.
+- `LOCALITY_REFRESH_HANDLE_KEY`: encrypts opaque refresh handles in `handle` mode.
+- `LOCALITY_NOTION_CLIENT_ID`: Notion OAuth client ID.
+- `LOCALITY_NOTION_CLIENT_SECRET`: Notion OAuth client secret.
 
 ## Deployment
 

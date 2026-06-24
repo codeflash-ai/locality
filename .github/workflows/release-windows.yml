@@ -78,14 +78,14 @@ jobs:
       - name: Run Windows Rust tests
         run: >
           cargo test
-          -p afs-core
-          -p afs-connector
-          -p afs-store
-          -p afs-platform
-          -p afs-notion
-          -p afsd
-          -p afs-cli
-          -p afs-cloud-files
+          -p locality-core
+          -p locality-connector
+          -p locality-store
+          -p locality-platform
+          -p locality-notion
+          -p localityd
+          -p loc-cli
+          -p locality-cloud-files
           --all-targets
           --locked
 
@@ -105,7 +105,7 @@ jobs:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       PUBLISH_CHANNEL: release
       PUBLISH_REQUIRE_SIGNING: "1"
-      AFS_WINDOWS_EXTERNAL_CODESIGN: "1"
+      LOCALITY_WINDOWS_EXTERNAL_CODESIGN: "1"
       PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
       TAURI_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest-windows.json
       TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
@@ -200,7 +200,7 @@ jobs:
       - name: Prepare unsigned Windows sidecars
         shell: pwsh
         env:
-          AFS_WINDOWS_EXTERNAL_CODESIGN: ""
+          LOCALITY_WINDOWS_EXTERNAL_CODESIGN: ""
         run: ./apps/desktop/scripts/prepare-windows-bundle.ps1
 
       - name: Sign Windows sidecars
@@ -218,14 +218,14 @@ jobs:
         shell: pwsh
         run: |
           . ./scripts/windows-codesign.ps1
-          foreach ($name in @("afs.exe", "afsd.exe", "afs-cloud-files.exe")) {
-            Assert-AfsWindowsSigned -Path (Join-Path "apps/desktop/src-tauri/windows" $name)
+          foreach ($name in @("loc.exe", "localityd.exe", "locality-cloud-files.exe")) {
+            Assert-LocalityWindowsSigned -Path (Join-Path "apps/desktop/src-tauri/windows" $name)
           }
 
       - name: Build, sign, and validate Windows installer
         shell: pwsh
         env:
-          AFS_WINDOWS_BUNDLE_PREPARED: "1"
+          LOCALITY_WINDOWS_BUNDLE_PREPARED: "1"
           PUBLISH_ALLOW_DIRTY: "1"
         run: ./scripts/publish-windows.ps1
 
@@ -245,7 +245,7 @@ jobs:
         run: |
           . ./scripts/windows-codesign.ps1
           Get-ChildItem target/release/bundle/windows -Filter *.exe -File | ForEach-Object {
-            Assert-AfsWindowsSigned -Path $_.FullName
+            Assert-LocalityWindowsSigned -Path $_.FullName
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
             "$hash  $($_.Name)" | Set-Content -Encoding ascii -LiteralPath "$($_.FullName).sha256"
           }
@@ -255,16 +255,16 @@ jobs:
         env:
           GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
           UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-windows.json
-          UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/updater/AFS-release-windows-x86_64.nsis.zip
-          UPDATER_NOTES: AFS ${{ env.APP_VERSION }} Windows update.
+          UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip
+          UPDATER_NOTES: Locality ${{ env.APP_VERSION }} Windows update.
         run: scripts/render-tauri-updater-manifest.sh
 
       - name: Collect release assets
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path target/release/github-assets | Out-Null
-          Copy-Item target/release/bundle/windows/AFS-release-windows-x86_64-setup.exe* target/release/github-assets/
-          Copy-Item target/release/bundle/updater/AFS-release-windows-x86_64.nsis.zip* target/release/github-assets/
+          Copy-Item target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe* target/release/github-assets/
+          Copy-Item target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip* target/release/github-assets/
           Copy-Item target/release/bundle/updater/latest-windows.json target/release/github-assets/
           Get-ChildItem target/release/github-assets -File |
             Sort-Object Name |
@@ -279,8 +279,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $createArgs = @("release", "create", $env:RELEASE_TAG, "--repo", $env:GITHUB_REPOSITORY, "--verify-tag", "--title", "AFS $env:APP_VERSION", "--generate-notes")
-          $editArgs = @("release", "edit", $env:RELEASE_TAG, "--repo", $env:GITHUB_REPOSITORY, "--title", "AFS $env:APP_VERSION")
+          $createArgs = @("release", "create", $env:RELEASE_TAG, "--repo", $env:GITHUB_REPOSITORY, "--verify-tag", "--title", "Locality $env:APP_VERSION", "--generate-notes")
+          $editArgs = @("release", "edit", $env:RELEASE_TAG, "--repo", $env:GITHUB_REPOSITORY, "--title", "Locality $env:APP_VERSION")
           if ($env:PRERELEASE -eq "true") {
             $createArgs += @("--prerelease", "--latest=false")
             $editArgs += @("--prerelease=true", "--latest=false")

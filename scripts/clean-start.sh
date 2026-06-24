@@ -5,25 +5,25 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/clean-start.sh [--yes] [--keep-credentials] [--state-dir PATH] [--app-path PATH]
 
-Reset this machine to a clean AFS testing state.
+Reset this machine to a clean Locality testing state.
 
 By default this is a dry run. Pass --yes to actually stop processes, unregister
-File Provider domains, remove local AFS state, remove the installed app, and
-delete AFS keychain connection credentials.
+File Provider domains, remove local Locality state, remove the installed app, and
+delete Locality keychain connection credentials.
 
 Options:
   --yes               Execute the cleanup. Without this flag, only print actions.
-  --keep-credentials  Do not delete AFS connection secrets from the keychain.
-  --state-dir PATH    State directory to delete. Defaults to AFS_STATE_DIR or ~/.afs.
-  --app-path PATH     Installed app bundle to delete. Defaults to /Applications/AFS.app.
+  --keep-credentials  Do not delete Locality connection secrets from the keychain.
+  --state-dir PATH    State directory to delete. Defaults to LOCALITY_STATE_DIR or ~/.loc.
+  --app-path PATH     Installed app bundle to delete. Defaults to /Applications/Locality.app.
   -h, --help          Show this help.
 USAGE
 }
 
 DRY_RUN=1
 KEEP_CREDENTIALS=0
-STATE_DIR="${AFS_STATE_DIR:-${HOME}/.afs}"
-APP_PATH="/Applications/AFS.app"
+STATE_DIR="${LOCALITY_STATE_DIR:-${HOME}/.loc}"
+APP_PATH="/Applications/Locality.app"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -125,16 +125,16 @@ read_keychain_accounts() {
 is_safe_mount_root_to_remove() {
   local path="$1"
   case "${path}" in
-    "${HOME}/Documents/AFS"|\
-    "${HOME}/Documents/AFS/"*|\
-    "${HOME}/Library/CloudStorage/AFS"|\
-    "${HOME}/Library/CloudStorage/AFS/"*|\
-    "${HOME}/Library/CloudStorage/AFS-"*|\
-    "${HOME}/Library/CloudStorage/AgentFS-"*|\
-    /tmp/afs|\
-    /tmp/afs/*|\
-    /tmp/AFS|\
-    /tmp/AFS/*)
+    "${HOME}/Documents/Locality"|\
+    "${HOME}/Documents/Locality/"*|\
+    "${HOME}/Library/CloudStorage/Locality"|\
+    "${HOME}/Library/CloudStorage/Locality/"*|\
+    "${HOME}/Library/CloudStorage/Locality-"*|\
+    "${HOME}/Library/CloudStorage/Locality-"*|\
+    /tmp/loc|\
+    /tmp/loc/*|\
+    /tmp/Locality|\
+    /tmp/Locality/*)
       return 0
       ;;
     *)
@@ -158,17 +158,17 @@ delete_keychain_account() {
   local account="$1"
   [[ -n "${account}" ]] || return 0
   if command -v security >/dev/null 2>&1; then
-    run_quiet security delete-generic-password -s afs -a "${account}"
+    run_quiet security delete-generic-password -s loc -a "${account}"
   fi
 }
 
 installed_helper() {
-  local helper="${APP_PATH}/Contents/MacOS/agentfs-file-providerctl"
+  local helper="${APP_PATH}/Contents/MacOS/locality-file-providerctl"
   [[ -x "${helper}" ]] && printf '%s\n' "${helper}"
 }
 
 repo_helper() {
-  local helper="${ROOT}/apps/desktop/src-tauri/macos/AgentFSFileProvider/agentfs-file-providerctl"
+  local helper="${ROOT}/apps/desktop/src-tauri/macos/LocalityFileProvider/locality-file-providerctl"
   [[ -x "${helper}" ]] && printf '%s\n' "${helper}"
 }
 
@@ -184,23 +184,23 @@ reset_file_provider_domains() {
   if [[ -n "${helper}" ]]; then
     run_quiet "${helper}" reset --json
   else
-    warn "agentfs-file-providerctl not found; skipping File Provider domain reset"
+    warn "locality-file-providerctl not found; skipping File Provider domain reset"
   fi
 }
 
 stop_processes() {
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    run_quiet osascript -e 'tell application id "ai.codeflash.afs" to quit'
-    run_quiet launchctl bootout "gui/${UID}/ai.codeflash.afs.afsd"
-    run_quiet launchctl bootout "gui/${UID}" "${HOME}/Library/LaunchAgents/ai.codeflash.afs.afsd.plist"
+    run_quiet osascript -e 'tell application id "ai.codeflash.locality" to quit'
+    run_quiet launchctl bootout "gui/${UID}/ai.codeflash.locality.localityd"
+    run_quiet launchctl bootout "gui/${UID}" "${HOME}/Library/LaunchAgents/ai.codeflash.locality.localityd.plist"
   fi
 
-  run_quiet pkill -x afs-desktop
-  run_quiet pkill -x AFS
-  run_quiet pkill -x AgentFSFileProvider
-  run_quiet pkill -x afsd
-  run_quiet pkill -f "${ROOT}/target/.*/afs-desktop"
-  run_quiet pkill -f "${ROOT}/target/.*/afsd"
+  run_quiet pkill -x locality-desktop
+  run_quiet pkill -x Locality
+  run_quiet pkill -x LocalityFileProvider
+  run_quiet pkill -x localityd
+  run_quiet pkill -f "${ROOT}/target/.*/locality-desktop"
+  run_quiet pkill -f "${ROOT}/target/.*/localityd"
   if [[ -n "${APP_PATH}" ]]; then
     run_quiet pkill -f "${APP_PATH}/Contents"
   fi
@@ -215,10 +215,10 @@ remove_mount_roots() {
   done < <(read_mount_roots)
 
   roots+=(
-    "${HOME}/Documents/AFS"
-    "${HOME}/Library/CloudStorage/AFS"
-    "${HOME}/Library/CloudStorage/AFS-Notion"
-    "${HOME}/Library/CloudStorage/AgentFS-Notion"
+    "${HOME}/Documents/Locality"
+    "${HOME}/Library/CloudStorage/Locality"
+    "${HOME}/Library/CloudStorage/Locality-Notion"
+    "${HOME}/Library/CloudStorage/Locality-Notion"
   )
 
   local unique_roots=()
@@ -264,13 +264,13 @@ remove_credentials() {
 
 remove_support_files() {
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    remove_path "${HOME}/Library/LaunchAgents/ai.codeflash.afs.afsd.plist"
-    remove_path "${HOME}/Library/Group Containers/group.ai.codeflash.afs"
-    remove_path "${HOME}/Library/Application Support/ai.codeflash.afs"
-    remove_path "${HOME}/Library/Caches/ai.codeflash.afs"
-    remove_path "${HOME}/Library/HTTPStorages/ai.codeflash.afs"
-    remove_path "${HOME}/Library/Preferences/ai.codeflash.afs.plist"
-    remove_path "${HOME}/Library/Saved Application State/ai.codeflash.afs.savedState"
+    remove_path "${HOME}/Library/LaunchAgents/ai.codeflash.locality.localityd.plist"
+    remove_path "${HOME}/Library/Group Containers/group.ai.codeflash.locality"
+    remove_path "${HOME}/Library/Application Support/ai.codeflash.locality"
+    remove_path "${HOME}/Library/Caches/ai.codeflash.locality"
+    remove_path "${HOME}/Library/HTTPStorages/ai.codeflash.locality"
+    remove_path "${HOME}/Library/Preferences/ai.codeflash.locality.plist"
+    remove_path "${HOME}/Library/Saved Application State/ai.codeflash.locality.savedState"
   fi
   remove_path "${STATE_DIR}"
 }
@@ -282,7 +282,7 @@ remove_app() {
   remove_path "${APP_PATH}"
 }
 
-log "AFS clean-start"
+log "Locality clean-start"
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   log "Mode: dry run. Re-run with --yes to execute."
 else
@@ -293,7 +293,7 @@ log "App path:  ${APP_PATH}"
 if [[ "${KEEP_CREDENTIALS}" -eq 1 ]]; then
   log "Credentials: preserving keychain entries."
 else
-  log "Credentials: deleting AFS connection keychain entries."
+  log "Credentials: deleting Locality connection keychain entries."
 fi
 log ""
 

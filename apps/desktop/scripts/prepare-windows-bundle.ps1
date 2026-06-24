@@ -6,12 +6,12 @@ $Out = Join-Path $Root "apps\desktop\src-tauri\windows"
 . (Join-Path $Root "scripts\windows-codesign.ps1")
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 $Sidecars = @(
-    (Join-Path $Out "afs.exe"),
-    (Join-Path $Out "afsd.exe"),
-    (Join-Path $Out "afs-cloud-files.exe")
+    (Join-Path $Out "loc.exe"),
+    (Join-Path $Out "localityd.exe"),
+    (Join-Path $Out "locality-cloud-files.exe")
 )
 
-if ($env:AFS_WINDOWS_BUNDLE_PREPARED -ne "1") {
+if ($env:LOCALITY_WINDOWS_BUNDLE_PREPARED -ne "1") {
     $Cargo = $env:CARGO
     if ([string]::IsNullOrWhiteSpace($Cargo)) {
         $CargoCommand = Get-Command cargo -ErrorAction SilentlyContinue
@@ -31,29 +31,29 @@ if ($env:AFS_WINDOWS_BUNDLE_PREPARED -ne "1") {
 
     Push-Location $Root
     try {
-        & $Cargo build -p afs-cli -p afsd -p afs-cloud-files --release
+        & $Cargo build -p loc-cli -p localityd -p locality-cloud-files --release
     } finally {
         Pop-Location
     }
 
-    Copy-Item -LiteralPath (Join-Path $Root "target\release\afs.exe") -Destination (Join-Path $Out "afs.exe") -Force
-    Copy-Item -LiteralPath (Join-Path $Root "target\release\afsd.exe") -Destination (Join-Path $Out "afsd.exe") -Force
-    Copy-Item -LiteralPath (Join-Path $Root "target\release\afs-cloud-files.exe") -Destination (Join-Path $Out "afs-cloud-files.exe") -Force
+    Copy-Item -LiteralPath (Join-Path $Root "target\release\loc.exe") -Destination (Join-Path $Out "loc.exe") -Force
+    Copy-Item -LiteralPath (Join-Path $Root "target\release\localityd.exe") -Destination (Join-Path $Out "localityd.exe") -Force
+    Copy-Item -LiteralPath (Join-Path $Root "target\release\locality-cloud-files.exe") -Destination (Join-Path $Out "locality-cloud-files.exe") -Force
 } else {
     foreach ($Sidecar in $Sidecars) {
         if (-not (Test-Path -LiteralPath $Sidecar)) {
-            throw "AFS_WINDOWS_BUNDLE_PREPARED=1 but missing prepared sidecar: $Sidecar"
+            throw "LOCALITY_WINDOWS_BUNDLE_PREPARED=1 but missing prepared sidecar: $Sidecar"
         }
     }
 }
 
-if (Test-AfsWindowsCodeSigningRequested) {
+if (Test-LocalityWindowsCodeSigningRequested) {
     foreach ($Sidecar in $Sidecars) {
-        [void] (Invoke-AfsWindowsCodeSign -Path $Sidecar)
-        Assert-AfsWindowsSigned -Path $Sidecar
+        [void] (Invoke-LocalityWindowsCodeSign -Path $Sidecar)
+        Assert-LocalityWindowsSigned -Path $Sidecar
     }
 }
 
-Write-Host "Prepared Windows CLI in $(Join-Path $Out 'afs.exe')"
-Write-Host "Prepared Windows daemon in $(Join-Path $Out 'afsd.exe')"
-Write-Host "Prepared Windows Cloud Files helper in $(Join-Path $Out 'afs-cloud-files.exe')"
+Write-Host "Prepared Windows CLI in $(Join-Path $Out 'loc.exe')"
+Write-Host "Prepared Windows daemon in $(Join-Path $Out 'localityd.exe')"
+Write-Host "Prepared Windows Cloud Files helper in $(Join-Path $Out 'locality-cloud-files.exe')"

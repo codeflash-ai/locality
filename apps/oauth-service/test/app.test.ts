@@ -20,14 +20,14 @@ interface BrokerTokenResponse {
 }
 
 const env: BrokerEnv = {
-  AFS_BROKER_SESSION_SECRET: "test-session-secret-with-enough-entropy",
-  AFS_REFRESH_HANDLE_KEY: "test-refresh-handle-key-with-enough-entropy",
-  AFS_TOKEN_MODE: "handle",
-  AFS_NOTION_CLIENT_ID: "notion-client-id",
-  AFS_NOTION_CLIENT_SECRET: "notion-client-secret",
-  AFS_NOTION_API_BASE_URL: "https://notion.example.test",
-  AFS_NOTION_AUTH_BASE_URL: "https://notion.example.test",
-  AFS_NOTION_REDIRECT_URIS: "http://localhost:8757/oauth/notion/callback"
+  LOCALITY_BROKER_SESSION_SECRET: "test-session-secret-with-enough-entropy",
+  LOCALITY_REFRESH_HANDLE_KEY: "test-refresh-handle-key-with-enough-entropy",
+  LOCALITY_TOKEN_MODE: "handle",
+  LOCALITY_NOTION_CLIENT_ID: "notion-client-id",
+  LOCALITY_NOTION_CLIENT_SECRET: "notion-client-secret",
+  LOCALITY_NOTION_API_BASE_URL: "https://notion.example.test",
+  LOCALITY_NOTION_AUTH_BASE_URL: "https://notion.example.test",
+  LOCALITY_NOTION_REDIRECT_URIS: "http://localhost:8757/oauth/notion/callback"
 };
 
 describe("auth broker", () => {
@@ -107,7 +107,7 @@ describe("auth broker", () => {
     expect(body.access_token).toBe("access-token");
     expect(body.refresh_token).toBeUndefined();
     expect(body.refresh_token_kind).toBe("handle");
-    expect(body.refresh_token_handle).toMatch(/^afsrh_v1\./);
+    expect(body.refresh_token_handle).toMatch(/^locrh_v1\./);
     expect(fetchMock).toHaveBeenCalledWith(
       "https://notion.example.test/v1/oauth/token",
       expect.objectContaining({
@@ -168,7 +168,7 @@ describe("auth broker", () => {
     expect(refreshed.status).toBe(200);
     const refreshBody = (await refreshed.json()) as BrokerTokenResponse;
     expect(refreshBody.access_token).toBe("new-access-token");
-    expect(refreshBody.refresh_token_handle).toMatch(/^afsrh_v1\./);
+    expect(refreshBody.refresh_token_handle).toMatch(/^locrh_v1\./);
     const refreshCall = fetchMock.mock.calls[1];
     expect(refreshCall).toBeDefined();
     const refreshRequest = JSON.parse((refreshCall?.[1] as RequestInit).body as string);
@@ -197,7 +197,7 @@ describe("auth broker", () => {
 
   it("rejects malformed signed session payloads without a 500", async () => {
     const body = utf8Base64Url("not-json");
-    const signature = await hmacSha256Base64Url(env.AFS_BROKER_SESSION_SECRET, body);
+    const signature = await hmacSha256Base64Url(env.LOCALITY_BROKER_SESSION_SECRET, body);
     const response = await app.request(
       "/v1/oauth/notion/exchange",
       {

@@ -1,6 +1,6 @@
 # Reliability Strategy
 
-Correctness belongs primarily in `afs-core` and `afs-store`.
+Correctness belongs primarily in `locality-core` and `locality-store`.
 
 ## Invariants
 
