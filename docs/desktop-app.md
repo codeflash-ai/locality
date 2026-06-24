@@ -321,6 +321,15 @@ Important language:
 - Use "review push" instead of "sync now" when remote writes are involved.
 - Use "restore local file" for local recovery from shadow state.
 - Use "undo push" only for journal-backed remote undo.
+- Live Mode is opt-in, rate-limited to one sync action per tick, and must keep
+  the same push guardrails: stop on conflicts, blocked files, and
+  review-required changes. The normal local-write path comes from File Provider
+  callbacks; a visible-file reconciliation fallback is throttled and scoped to
+  the active already-hydrated page. When there is no local pending change, Live
+  Mode fetches one already-hydrated page into the daemon content cache and
+  compares the rendered shadow before touching the visible CloudStorage
+  projection, so stale Notion metadata does not hide body edits and unchanged
+  files are not repeatedly read or rewritten.
 
 ## Main App Structure
 
@@ -331,6 +340,9 @@ Shows the current state in product terms:
 - connected workspaces;
 - mounted folders;
 - a Notion URL input for opening a page as a local file;
+- an explicit Live Mode toggle for users who want clean hydrated pages checked
+  for remote changes and safe pending changes pushed continuously without
+  opening the review flow;
 - pending changes;
 - attention items;
 - connector suggestions.

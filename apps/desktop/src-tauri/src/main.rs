@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io;
@@ -44,7 +45,15 @@ use afs_core::canonical::parse_canonical_markdown;
 use afs_core::conflict::has_unresolved_conflict_markers;
 use afs_core::hydration::{HydrationReason, HydrationRequest};
 use afs_core::journal::{JournalEntry, JournalStatus};
-use afs_core::model::{HydrationState, MountId, RemoteId};
+use afs_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+#[cfg(test)]
+use afs_notion::NotionConfig;
+#[cfg(test)]
+use afs_notion::client::{HttpNotionApi, NotionApi};
+#[cfg(test)]
+use afs_notion::dto::{BlockDto, RichTextBlockDto, RichTextDto};
+#[cfg(test)]
+use afs_notion::oauth::StoredNotionCredential;
 use afs_notion::oauth::{
     DEFAULT_AFS_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
@@ -61,9 +70,10 @@ use afs_store::{
 };
 use afsd::autosave::auto_save_timestamp;
 use afsd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
+use afsd::hydration::{HydrationExecutor, HydrationOutcome, HydrationSource};
 use afsd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
 use afsd::push::execute_auto_save_push_job_with_content_root;
-use afsd::source::{resolve_source_for_path, source_display_name};
+use afsd::source::{resolve_source_for_mount_id, resolve_source_for_path, source_display_name};
 use afsd::virtual_fs::{
     commit_virtual_fs_write, source_root_directory_name, source_root_identifier,
     virtual_fs_content_base, virtual_fs_content_path, virtual_fs_content_root,
@@ -239,6 +249,13 @@ struct ActionReport {
     message: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveModeRemoteTarget {
+    mount_id: MountId,
+    remote_id: RemoteId,
+    path: PathBuf,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FileDetailReport {
@@ -298,6 +315,9 @@ static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SURFACE_REFRESH_STATE: OnceLock<Mutex<SurfaceRefreshState>> = OnceLock::new();
 static LAUNCH_AT_LOGIN_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+static LIVE_MODE_REMOTE_PULL_CURSOR: OnceLock<Mutex<usize>> = OnceLock::new();
+static LIVE_MODE_LOCAL_RECONCILE_TIMES: OnceLock<Mutex<BTreeMap<PathBuf, Instant>>> =
+    OnceLock::new();
 #[cfg(target_os = "windows")]
 static WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR: OnceLock<
     Mutex<WindowsCloudFilesProviderSupervisor>,
@@ -309,6 +329,7 @@ const TRAY_POPOVER_WIDTH: f64 = 360.0;
 const TRAY_POPOVER_HEIGHT: f64 = 520.0;
 const TRAY_POPOVER_EDGE_MARGIN: f64 = 8.0;
 const TRAY_POPOVER_ANCHOR_OFFSET: f64 = 12.0;
+const LIVE_MODE_LOCAL_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct SurfaceRefreshState {
@@ -734,6 +755,20 @@ async fn pull_notion_file(app: AppHandle, path: String) -> ActionReport {
 }
 
 #[tauri::command]
+async fn live_mode_tick(app: AppHandle) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(live_mode_tick_blocking).await {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Live Mode worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
 async fn diff_notion_file(path: String) -> ActionReport {
     match tauri::async_runtime::spawn_blocking(move || {
         let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
@@ -858,6 +893,338 @@ fn push_to_notion_blocking(confirm_dangerous: bool) -> ActionReport {
             "Pushed {pushed} pending change{} to Notion.",
             if pushed == 1 { "" } else { "s" }
         ),
+    }
+}
+
+fn live_mode_tick_blocking() -> ActionReport {
+    let remote_target = match live_mode_next_remote_pull_target() {
+        Ok(target) => target,
+        Err(message) => {
+            return ActionReport { ok: false, message };
+        }
+    };
+    if let Some(target) = remote_target.as_ref()
+        && live_mode_should_reconcile_local_target(target)
+        && let Err(message) = live_mode_reconcile_local_target(target)
+    {
+        return ActionReport { ok: false, message };
+    }
+
+    match load_desktop_snapshot() {
+        Ok(snapshot) => live_mode_tick_from_snapshot(
+            &snapshot,
+            remote_target.as_ref(),
+            |_change, target| {
+                let push_report = push_target_direct(target, false)?;
+                if push_report_exit_code(&push_report) == 0 {
+                    Ok(())
+                } else {
+                    Err(push_report_message(&push_report))
+                }
+            },
+            live_mode_pull_remote_target_if_changed,
+        ),
+        Err(message) => ActionReport {
+            ok: false,
+            message: format!("Live Mode could not inspect the desktop state: {message}"),
+        },
+    }
+}
+
+fn live_mode_tick_from_snapshot<Sync, Pull>(
+    snapshot: &DesktopSnapshot,
+    remote_pull_target: Option<&LiveModeRemoteTarget>,
+    mut sync_target: Sync,
+    mut pull_remote_target: Pull,
+) -> ActionReport
+where
+    Sync: FnMut(&PendingChange, &Path) -> Result<(), String>,
+    Pull: FnMut(&LiveModeRemoteTarget) -> Result<bool, String>,
+{
+    if !live_mode_has_mounted_folder(snapshot) {
+        return ActionReport {
+            ok: false,
+            message: "Live Mode needs a mounted Notion folder.".to_string(),
+        };
+    }
+
+    let Some(change) = snapshot.pending_changes.first() else {
+        if let Some(target) = remote_pull_target {
+            match pull_remote_target(target) {
+                Ok(true) => {
+                    return ActionReport {
+                        ok: true,
+                        message: "Live Mode pulled 1 remote change.".to_string(),
+                    };
+                }
+                Ok(false) => {
+                    return ActionReport {
+                        ok: true,
+                        message: "Live Mode checked 1 page for remote changes.".to_string(),
+                    };
+                }
+                Err(message) => return ActionReport { ok: false, message },
+            }
+        }
+
+        return ActionReport {
+            ok: true,
+            message: "Live Mode checked for changes.".to_string(),
+        };
+    };
+    if change.state != "safe" {
+        return ActionReport {
+            ok: false,
+            message: format!(
+                "Live Mode paused for `{}`: {}.",
+                change.title, change.summary
+            ),
+        };
+    }
+
+    let target = expand_tilde(&join_mount_path(
+        &snapshot.mount.local_path,
+        &change.local_path,
+    ))
+    .unwrap_or_else(|_| PathBuf::from(&change.local_path));
+    if let Err(message) = sync_target(change, &target) {
+        return ActionReport { ok: false, message };
+    }
+
+    ActionReport {
+        ok: true,
+        message: "Live Mode synced 1 pending change.".to_string(),
+    }
+}
+
+fn live_mode_has_mounted_folder(snapshot: &DesktopSnapshot) -> bool {
+    snapshot.mount.status != "not_mounted" && !snapshot.mount.local_path.trim().is_empty()
+}
+
+fn live_mode_next_remote_pull_target() -> Result<Option<LiveModeRemoteTarget>, String> {
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root)
+        .map_err(|error| format!("Live Mode could not open AFS state: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Live Mode could not inspect mounted folders: {error}"))?;
+    let Some(mount) = choose_mount(&mounts) else {
+        return Ok(None);
+    };
+
+    live_mode_next_remote_pull_target_for_mount(&store, &mount)
+}
+
+fn live_mode_next_remote_pull_target_for_mount<S>(
+    store: &S,
+    mount: &MountConfig,
+) -> Result<Option<LiveModeRemoteTarget>, String>
+where
+    S: EntityRepository,
+{
+    let candidates = live_mode_remote_pull_candidates(store, mount)?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut cursor = live_mode_remote_pull_cursor()
+        .lock()
+        .map_err(|_| "Live Mode remote pull cursor is unavailable.".to_string())?;
+    let index = *cursor % candidates.len();
+    *cursor = cursor.wrapping_add(1);
+    Ok(Some(candidates[index].clone()))
+}
+
+fn live_mode_remote_pull_cursor() -> &'static Mutex<usize> {
+    LIVE_MODE_REMOTE_PULL_CURSOR.get_or_init(|| Mutex::new(0))
+}
+
+fn live_mode_remote_pull_candidates<S>(
+    store: &S,
+    mount: &MountConfig,
+) -> Result<Vec<LiveModeRemoteTarget>, String>
+where
+    S: EntityRepository,
+{
+    let access_root = mount_access_root(mount);
+    let mut candidates = store
+        .list_entities(&mount.mount_id)
+        .map_err(|error| format!("Live Mode could not inspect mounted pages: {error}"))?
+        .into_iter()
+        .filter(|entity| {
+            entity.kind == EntityKind::Page && entity.hydration == HydrationState::Hydrated
+        })
+        .map(|entity| LiveModeRemoteTarget {
+            mount_id: mount.mount_id.clone(),
+            remote_id: entity.remote_id,
+            path: access_root.join(entity.path),
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.remote_id.0.cmp(&right.remote_id.0))
+    });
+    Ok(candidates)
+}
+
+fn live_mode_reconcile_local_target(target: &LiveModeRemoteTarget) -> Result<(), String> {
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Live Mode could not open AFS state: {error}"))?;
+    live_mode_reconcile_local_target_with_store(&mut store, &state_root, target)
+}
+
+fn live_mode_reconcile_local_target_with_store(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    target: &LiveModeRemoteTarget,
+) -> Result<(), String> {
+    daemon_file_provider::reconcile_newer_macos_file_provider_projection(
+        store,
+        state_root,
+        Some(&target.path),
+    )
+    .map(|_| ())
+    .map_err(|error| format!("Live Mode could not inspect local File Provider edits: {error}"))
+}
+
+fn live_mode_should_reconcile_local_target(target: &LiveModeRemoteTarget) -> bool {
+    let Ok(mut times) = live_mode_local_reconcile_times().lock() else {
+        return true;
+    };
+    live_mode_should_reconcile_local_target_for_key(
+        &mut times,
+        target.path.clone(),
+        Instant::now(),
+        LIVE_MODE_LOCAL_RECONCILE_INTERVAL,
+    )
+}
+
+fn live_mode_local_reconcile_times() -> &'static Mutex<BTreeMap<PathBuf, Instant>> {
+    LIVE_MODE_LOCAL_RECONCILE_TIMES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn live_mode_should_reconcile_local_target_for_key(
+    times: &mut BTreeMap<PathBuf, Instant>,
+    key: PathBuf,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    if times
+        .get(&key)
+        .and_then(|last| now.checked_duration_since(*last))
+        .is_some_and(|elapsed| elapsed < interval)
+    {
+        return false;
+    }
+
+    times.insert(key, now);
+    true
+}
+
+fn live_mode_pull_remote_target_if_changed(target: &LiveModeRemoteTarget) -> Result<bool, String> {
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Live Mode could not open AFS state: {error}"))?;
+    let entity = store
+        .get_entity(&target.mount_id, &target.remote_id)
+        .map_err(|error| format!("Live Mode could not inspect mounted pages: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "Live Mode could not find `{}` in the mounted folder.",
+                target.remote_id.0
+            )
+        })?;
+    let previous_shadow = live_mode_load_shadow(&store, target)?;
+
+    let credentials = open_credential_store(&state_root);
+    let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &target.mount_id)
+        .map_err(|error| error.message())?;
+    let render_request = HydrationRequest::new(
+        target.mount_id.clone(),
+        target.remote_id.clone(),
+        entity.path.clone(),
+        HydrationState::Hydrated,
+        HydrationReason::RemoteFastForward,
+    );
+    let rendered = connector
+        .fetch_render(&render_request)
+        .map_err(|error| format!("Live Mode could not inspect Notion changes: {error}"))?;
+
+    let remote_changed = previous_shadow
+        .as_ref()
+        .is_none_or(|shadow| shadow != &rendered.shadow)
+        || live_mode_content_hash_changed(
+            entity.content_hash.as_deref(),
+            Some(rendered.shadow.body_hash.as_str()),
+        );
+    if !remote_changed {
+        return Ok(false);
+    }
+
+    live_mode_reconcile_local_target_with_store(&mut store, &state_root, target)?;
+    let entity = store
+        .get_entity(&target.mount_id, &target.remote_id)
+        .map_err(|error| format!("Live Mode could not inspect mounted pages: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "Live Mode could not find `{}` in the mounted folder.",
+                target.remote_id.0
+            )
+        })?;
+    let previous_shadow = live_mode_load_shadow(&store, target)?;
+    let content_path = virtual_fs_content_path(&state_root, &target.mount_id, &entity.path)
+        .map_err(|error| format!("Live Mode could not resolve local content cache: {error}"))?;
+    let output_root = virtual_fs_content_root(&state_root, &target.mount_id);
+    let request = HydrationRequest::new(
+        target.mount_id.clone(),
+        target.remote_id.clone(),
+        content_path,
+        HydrationState::Hydrated,
+        HydrationReason::RemoteFastForward,
+    );
+    let outcome = HydrationExecutor::new_with_output_root(&mut store, &connector, output_root)
+        .hydrate_request(request)
+        .map_err(|error| format!("Live Mode could not pull Notion changes: {error}"))?;
+    if outcome == HydrationOutcome::SkippedDirty {
+        return Ok(false);
+    }
+
+    if let Some(previous_shadow) = previous_shadow.as_ref() {
+        daemon_file_provider::refresh_macos_file_provider_entity_projection_if_clean(
+            &store,
+            &state_root,
+            &target.mount_id,
+            &target.remote_id,
+            previous_shadow,
+        )
+        .map_err(|error| {
+            format!("Live Mode could not refresh the visible File Provider file: {error}")
+        })?;
+    }
+
+    Ok(true)
+}
+
+fn live_mode_load_shadow(
+    store: &SqliteStateStore,
+    target: &LiveModeRemoteTarget,
+) -> Result<Option<afs_core::shadow::ShadowDocument>, String> {
+    match store.load_shadow(&target.mount_id, &target.remote_id) {
+        Ok(shadow) => Ok(Some(shadow)),
+        Err(afs_store::StoreError::ShadowMissing { .. }) => Ok(None),
+        Err(error) => Err(format!(
+            "Live Mode could not inspect the current page shadow: {error}"
+        )),
+    }
+}
+
+fn live_mode_content_hash_changed(before: Option<&str>, after: Option<&str>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => before != after,
+        (None, None) => false,
+        _ => true,
     }
 }
 
@@ -5499,9 +5866,10 @@ fn env_first(keys: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use afs_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
     use afs_core::canonical::render_canonical_markdown;
@@ -5517,20 +5885,27 @@ mod tests {
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
-        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, ScreenBounds, TerminalCliLinkState,
-        TrayVisualState, clear_mount_cached_projection, clear_state_root_contents,
-        conflict_preview, connection_metadata_changed, current_daemon_build_id,
-        current_desktop_build_id, diff_report_message, failed_push_summary,
-        hydration_after_editor_write, inspect_install_state, install_terminal_cli_link_at,
-        install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
-        is_unsupported_schema_version_message, load_desktop_activity,
-        mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
-        pending_changes_from_status, preserve_mount_pending_local_changes, pull_error_message,
-        pull_report_message, push_action_message, record_current_install_marker,
-        record_desktop_activity, shell_single_quote, should_hide_tray_popover,
+        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup, PendingChange,
+        ScreenBounds, TerminalCliLinkState, TrayVisualState, clear_mount_cached_projection,
+        clear_state_root_contents, conflict_preview, connection_metadata_changed,
+        current_daemon_build_id, current_desktop_build_id, diff_report_message,
+        failed_push_summary, hydration_after_editor_write, inspect_install_state,
+        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
+        is_notion_access_lost_message, is_unsupported_schema_version_message,
+        live_mode_content_hash_changed, live_mode_e2e_append_local_marker,
+        live_mode_e2e_append_remote_marker, live_mode_e2e_notion_api, live_mode_e2e_page_id,
+        live_mode_e2e_page_path, live_mode_e2e_remote_text, live_mode_e2e_wait_until,
+        live_mode_remote_pull_candidates, live_mode_should_reconcile_local_target_for_key,
+        live_mode_target, live_mode_tick_blocking, live_mode_tick_from_snapshot,
+        load_desktop_activity, mount_has_pending_local_changes, mount_has_unfinished_journals,
+        notion_id_from_url, pending_changes_from_status, preserve_mount_pending_local_changes,
+        pull_error_message, pull_report_message, push_action_message,
+        record_current_install_marker, record_desktop_activity, sample_auto_save_status,
+        sample_snapshot, shell_single_quote, should_hide_tray_popover,
         should_prioritize_located_result, state_event_path_requires_refresh,
-        terminal_cli_link_state, tray_icon_image, tray_popover_position, validate_mount_root,
-        virtual_projection_refresh_signal_identifiers, write_terminal_cli_path_section,
+        terminal_cli_link_state, tray_icon_image, tray_popover_position, unique_suffix,
+        validate_mount_root, virtual_projection_refresh_signal_identifiers,
+        write_terminal_cli_path_section,
     };
 
     #[test]
@@ -5557,6 +5932,297 @@ mod tests {
         let summary = super::mount_summary(None, None, None, None);
 
         assert!(Path::new(&summary.local_path).is_absolute());
+    }
+
+    #[test]
+    fn live_mode_tick_noops_without_pending_changes() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes.clear();
+        let mut sync_calls = 0usize;
+        let mut pull_calls = 0usize;
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            None,
+            |_, _| {
+                sync_calls += 1;
+                Ok(())
+            },
+            |_| {
+                pull_calls += 1;
+                Ok(false)
+            },
+        );
+
+        assert!(report.ok);
+        assert_eq!(report.message, "Live Mode checked for changes.");
+        assert_eq!(sync_calls, 0);
+        assert_eq!(pull_calls, 0);
+    }
+
+    #[test]
+    fn live_mode_tick_pulls_remote_candidate_without_pending_changes() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes.clear();
+        let target = live_mode_target("/tmp/AFS/notion/teamspace-home/hello-world/page.md");
+        let mut sync_calls = 0usize;
+        let mut pulled = Vec::new();
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            Some(&target),
+            |_, _| {
+                sync_calls += 1;
+                Ok(())
+            },
+            |target| {
+                pulled.push(target.path.clone());
+                Ok(false)
+            },
+        );
+
+        assert!(report.ok);
+        assert_eq!(
+            report.message,
+            "Live Mode checked 1 page for remote changes."
+        );
+        assert_eq!(sync_calls, 0);
+        assert_eq!(pulled, vec![target.path]);
+    }
+
+    #[test]
+    fn live_mode_tick_reports_remote_pull_when_file_changed() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes.clear();
+        let target = live_mode_target("/tmp/AFS/notion/teamspace-home/hello-world/page.md");
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            Some(&target),
+            |_, _| panic!("remote pull should not sync local changes"),
+            |_| Ok(true),
+        );
+
+        assert!(report.ok);
+        assert_eq!(report.message, "Live Mode pulled 1 remote change.");
+    }
+
+    #[test]
+    fn live_mode_content_hash_changed_detects_remote_body_change() {
+        assert!(live_mode_content_hash_changed(Some("old"), Some("new")));
+        assert!(!live_mode_content_hash_changed(Some("same"), Some("same")));
+        assert!(live_mode_content_hash_changed(None, Some("hydrated")));
+        assert!(!live_mode_content_hash_changed(None, None));
+    }
+
+    #[test]
+    fn live_mode_local_reconcile_is_throttled_per_target() {
+        let mut times = BTreeMap::new();
+        let now = Instant::now();
+        let page = PathBuf::from("/tmp/AFS/notion/teamspace-home/hello-world/page.md");
+        let other = PathBuf::from("/tmp/AFS/notion/teamspace-home/other/page.md");
+
+        assert!(live_mode_should_reconcile_local_target_for_key(
+            &mut times,
+            page.clone(),
+            now,
+            Duration::from_secs(5),
+        ));
+        assert!(!live_mode_should_reconcile_local_target_for_key(
+            &mut times,
+            page.clone(),
+            now + Duration::from_secs(1),
+            Duration::from_secs(5),
+        ));
+        assert!(live_mode_should_reconcile_local_target_for_key(
+            &mut times,
+            other,
+            now + Duration::from_secs(1),
+            Duration::from_secs(5),
+        ));
+        assert!(live_mode_should_reconcile_local_target_for_key(
+            &mut times,
+            page,
+            now + Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires AFS_DESKTOP_LIVE_MODE_E2E=1, a scratch CloudStorage page path, and live Notion auth; mutates then cleans up the page"]
+    fn live_mode_bidirectional_cloudstorage_markdown_e2e() {
+        assert_eq!(
+            std::env::var("AFS_DESKTOP_LIVE_MODE_E2E").as_deref(),
+            Ok("1"),
+            "set AFS_DESKTOP_LIVE_MODE_E2E=1 to confirm this live destructive test"
+        );
+        let page_path = live_mode_e2e_page_path();
+        assert!(
+            page_path
+                .to_string_lossy()
+                .contains("/Library/CloudStorage/"),
+            "AFS_DESKTOP_LIVE_MODE_E2E_PAGE must be a CloudStorage-visible page.md path"
+        );
+        let page_id = live_mode_e2e_page_id(&page_path);
+        let api = live_mode_e2e_notion_api(&page_path);
+        let run_id = format!("afs-desktop-live-e2e-{}", unique_suffix());
+        let cleanup = LiveModeE2eCleanup {
+            api: api.clone(),
+            page_id: page_id.clone(),
+            run_id: run_id.clone(),
+        };
+
+        live_mode_e2e_wait_until("initial page is clean", || {
+            live_mode_tick_blocking().ok
+                && fs::read_to_string(&page_path)
+                    .map(|contents| !contents.contains("<<<<<<<"))
+                    .unwrap_or(false)
+        });
+
+        for index in 1..=3 {
+            let marker = format!("{run_id} local-to-cloud {index}");
+            live_mode_e2e_append_local_marker(&page_path, &marker);
+            live_mode_e2e_wait_until(&format!("local marker {index} reaches Notion"), || {
+                live_mode_tick_blocking().ok
+                    && live_mode_e2e_remote_text(&api, &page_id).contains(&marker)
+            });
+        }
+
+        for index in 1..=3 {
+            let marker = format!("{run_id} cloud-to-local {index}");
+            live_mode_e2e_append_remote_marker(&api, &page_id, &marker);
+            live_mode_e2e_wait_until(
+                &format!("remote marker {index} reaches CloudStorage"),
+                || {
+                    live_mode_tick_blocking().ok
+                        && fs::read_to_string(&page_path)
+                            .map(|contents| contents.contains(&marker))
+                            .unwrap_or(false)
+                },
+            );
+        }
+
+        drop(cleanup);
+        live_mode_e2e_wait_until("cleanup reaches CloudStorage", || {
+            live_mode_tick_blocking().ok
+                && fs::read_to_string(&page_path)
+                    .map(|contents| !contents.contains(&run_id))
+                    .unwrap_or(false)
+        });
+    }
+
+    #[test]
+    fn live_mode_tick_syncs_safe_pending_changes() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes = vec![PendingChange {
+            title: "Roadmap".to_string(),
+            local_path: "Engineering/Roadmap/page.md".to_string(),
+            summary: "local edits pending review".to_string(),
+            state: "safe".to_string(),
+            auto_save: sample_auto_save_status(false),
+        }];
+        let mut synced = Vec::new();
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            Some(&live_mode_target("/tmp/AFS/notion/Other/page.md")),
+            |change, target| {
+                synced.push((change.title.clone(), target.to_path_buf()));
+                Ok(())
+            },
+            |_| panic!("pending changes should take the live mode tick"),
+        );
+
+        assert!(report.ok);
+        assert_eq!(report.message, "Live Mode synced 1 pending change.");
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].0, "Roadmap");
+        assert!(synced[0].1.ends_with("Engineering/Roadmap/page.md"));
+    }
+
+    #[test]
+    fn live_mode_tick_pauses_for_review_required_changes() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes = vec![PendingChange {
+            title: "Launch Plan".to_string(),
+            local_path: "Marketing/Launch Plan/page.md".to_string(),
+            summary: "needs review: large deletion".to_string(),
+            state: "needs_review".to_string(),
+            auto_save: sample_auto_save_status(false),
+        }];
+        let mut calls = 0usize;
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            Some(&live_mode_target("/tmp/AFS/notion/Other/page.md")),
+            |_, _| {
+                calls += 1;
+                Ok(())
+            },
+            |_| panic!("review-required changes should pause before remote pulls"),
+        );
+
+        assert!(!report.ok);
+        assert!(report.message.contains("Launch Plan"));
+        assert!(report.message.contains("needs review"));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn live_mode_remote_pull_candidates_include_only_hydrated_pages() {
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(mount_id.clone(), "notion", "/tmp/AFS/notion");
+        let mut store = InMemoryStateStore::default();
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("page-hydrated"),
+                    EntityKind::Page,
+                    "Hello World",
+                    "teamspace-home/hello-world/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save hydrated page");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("page-stub"),
+                    EntityKind::Page,
+                    "Stub",
+                    "teamspace-home/stub/page.md",
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save stub page");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id,
+                    RemoteId::new("db"),
+                    EntityKind::Database,
+                    "Database",
+                    "teamspace-home/database",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save database");
+
+        let candidates = live_mode_remote_pull_candidates(&store, &mount).expect("candidates");
+
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|candidate| candidate.path)
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from(
+                "/tmp/AFS/notion/teamspace-home/hello-world/page.md"
+            )]
+        );
     }
 
     #[test]
@@ -6779,6 +7445,339 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+fn sample_snapshot() -> DesktopSnapshot {
+    DesktopSnapshot {
+        health: AppHealth {
+            state: "ready".to_string(),
+            attention_count: 3,
+        },
+        connection: ConnectionSummary {
+            connector: "notion".to_string(),
+            workspace_name: "CodeFlash".to_string(),
+            account_label: "saurabh@codeflash.ai".to_string(),
+            status: "ready".to_string(),
+        },
+        mount: MountSummary {
+            connector: "notion".to_string(),
+            workspace_name: "CodeFlash".to_string(),
+            local_path: absolute_display_path(&default_notion_mount_root()),
+            notion_url: Some("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972".to_string()),
+            access_scope: "Initial Idea".to_string(),
+            projection: "macOS File Provider".to_string(),
+            read_only: false,
+            status: "ready".to_string(),
+            provider: None,
+        },
+        settings: DesktopSettings {
+            launch_at_login: true,
+            show_menu_bar: true,
+        },
+        pending_changes: sample_pending_changes(),
+        activity: vec![
+            ActivityItem {
+                title: "Pushed Roadmap 2026 to Notion".to_string(),
+                detail: "2 block edits".to_string(),
+                when: "Today".to_string(),
+                occurred_at: Some("unix_ms:1782033300000".to_string()),
+                kind: "push".to_string(),
+                undo_available: true,
+            },
+            ActivityItem {
+                title: "Located Launch Plan".to_string(),
+                detail: "Prepared local path for an agent".to_string(),
+                when: "Today".to_string(),
+                occurred_at: Some("unix_ms:1782028800000".to_string()),
+                kind: "locate".to_string(),
+                undo_available: false,
+            },
+            ActivityItem {
+                title: "Connected Notion workspace CodeFlash".to_string(),
+                detail: "Credentials stored in the OS credential store".to_string(),
+                when: "Earlier".to_string(),
+                occurred_at: Some("unix_ms:1781942400000".to_string()),
+                kind: "connect".to_string(),
+                undo_available: false,
+            },
+        ],
+        suggestions: vec![ConnectorSuggestion {
+            connector: "Linear".to_string(),
+            description: "Mount issues and projects as local files.".to_string(),
+            state: "planned".to_string(),
+        }],
+    }
+}
+
+#[cfg(test)]
+fn live_mode_target(path: &str) -> LiveModeRemoteTarget {
+    LiveModeRemoteTarget {
+        mount_id: MountId::new("notion-main"),
+        remote_id: RemoteId::new("page-1"),
+        path: PathBuf::from(path),
+    }
+}
+
+#[cfg(test)]
+struct LiveModeE2eCleanup {
+    api: HttpNotionApi,
+    page_id: String,
+    run_id: String,
+}
+
+#[cfg(test)]
+impl Drop for LiveModeE2eCleanup {
+    fn drop(&mut self) {
+        let _ = live_mode_e2e_delete_marker_blocks(&self.api, &self.page_id, &self.run_id);
+    }
+}
+
+#[cfg(test)]
+fn live_mode_e2e_page_path() -> PathBuf {
+    let raw = std::env::var("AFS_DESKTOP_LIVE_MODE_E2E_PAGE")
+        .expect("set AFS_DESKTOP_LIVE_MODE_E2E_PAGE to a scratch CloudStorage page.md path");
+    let expanded = expand_tilde(&raw).unwrap_or_else(|_| PathBuf::from(raw));
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir().expect("current dir").join(expanded)
+    }
+}
+
+#[cfg(test)]
+fn live_mode_e2e_page_id(page_path: &Path) -> String {
+    if let Ok(page_id) = std::env::var("AFS_DESKTOP_LIVE_MODE_E2E_PAGE_ID")
+        && !page_id.trim().is_empty()
+    {
+        return page_id.trim().to_string();
+    }
+    let contents = fs::read_to_string(page_path).expect("read CloudStorage page.md");
+    afs_core::canonical::parse_canonical_markdown(&contents)
+        .expect("parse AFS page.md frontmatter")
+        .remote_id()
+        .expect("page.md frontmatter must include afs.id")
+        .0
+        .clone()
+}
+
+#[cfg(test)]
+fn live_mode_e2e_notion_api(page_path: &Path) -> HttpNotionApi {
+    if let Ok(token) = std::env::var("NOTION_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return HttpNotionApi::new(NotionConfig::default().with_token(token));
+    }
+
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root.clone()).expect("open AFS state");
+    let credentials = open_credential_store(&state_root);
+    afsd::notion::resolve_notion_connector_for_path(&store, credentials.as_ref(), page_path)
+        .expect("resolve Notion connector from desktop auth");
+    let (mount, _) =
+        resolve_desktop_mount_path(&store, page_path).expect("resolve CloudStorage mount path");
+    let connection = mount
+        .connection_id
+        .as_ref()
+        .and_then(|connection_id| {
+            store
+                .get_connection(connection_id)
+                .expect("load mount connection")
+        })
+        .or_else(|| {
+            store
+                .list_connections()
+                .expect("list connections")
+                .into_iter()
+                .find(|connection| {
+                    connection.connector == "notion" && connection.status == "active"
+                })
+        })
+        .expect("desktop Notion connection or NOTION_TOKEN");
+    let secret = credentials
+        .get(&connection.secret_ref)
+        .expect("read Notion credential");
+    let token = if connection.auth_kind == "oauth" {
+        serde_json::from_str::<StoredNotionCredential>(&secret)
+            .expect("decode stored Notion OAuth credential")
+            .access_token
+    } else {
+        secret
+    };
+
+    HttpNotionApi::new(NotionConfig::default().with_token(token))
+}
+
+#[cfg(test)]
+fn live_mode_e2e_append_local_marker(page_path: &Path, marker: &str) {
+    let mut contents = fs::read_to_string(page_path).expect("read local page before edit");
+    if !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push('\n');
+    contents.push_str(marker);
+    contents.push('\n');
+    fs::write(page_path, contents).expect("write local live-mode marker");
+}
+
+#[cfg(test)]
+fn live_mode_e2e_append_remote_marker(api: &HttpNotionApi, page_id: &str, marker: &str) {
+    api.append_block_children(
+        page_id,
+        serde_json::json!({
+            "children": [{
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{
+                        "type": "text",
+                        "text": { "content": marker }
+                    }]
+                }
+            }]
+        }),
+    )
+    .expect("append remote Notion marker");
+}
+
+#[cfg(test)]
+fn live_mode_e2e_wait_until<F>(label: &str, mut condition: F)
+where
+    F: FnMut() -> bool,
+{
+    let timeout = std::env::var("AFS_DESKTOP_LIVE_MODE_E2E_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(90);
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    while Instant::now() < deadline {
+        if condition() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("{label} did not converge within {timeout}s");
+}
+
+#[cfg(test)]
+fn live_mode_e2e_remote_text(api: &HttpNotionApi, page_id: &str) -> String {
+    live_mode_e2e_remote_blocks(api, page_id)
+        .iter()
+        .map(live_mode_e2e_block_plain_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+fn live_mode_e2e_delete_marker_blocks(
+    api: &HttpNotionApi,
+    page_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    for block in live_mode_e2e_remote_blocks(api, page_id) {
+        if live_mode_e2e_block_plain_text(&block).contains(run_id) {
+            api.delete_block(&block.id)
+                .map_err(|error| format!("delete marker block `{}`: {error}", block.id))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn live_mode_e2e_remote_blocks(api: &HttpNotionApi, page_id: &str) -> Vec<BlockDto> {
+    let mut blocks = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = api
+            .retrieve_block_children(page_id, cursor.as_deref())
+            .expect("retrieve Notion page children");
+        blocks.extend(page.results);
+        if !page.has_more {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    blocks
+}
+
+#[cfg(test)]
+fn live_mode_e2e_block_plain_text(block: &BlockDto) -> String {
+    block
+        .paragraph
+        .as_ref()
+        .map(live_mode_e2e_rich_text_block_plain_text)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn live_mode_e2e_rich_text_block_plain_text(block: &RichTextBlockDto) -> String {
+    block
+        .rich_text
+        .iter()
+        .map(live_mode_e2e_rich_text_plain_text)
+        .collect::<String>()
+}
+
+#[cfg(test)]
+fn live_mode_e2e_rich_text_plain_text(text: &RichTextDto) -> String {
+    if !text.plain_text.is_empty() {
+        return text.plain_text.clone();
+    }
+    text.text
+        .as_ref()
+        .map(|text| text.content.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn unique_suffix() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    format!("{}-{millis}", std::process::id())
+}
+
+#[cfg(test)]
+fn sample_pending_changes() -> Vec<PendingChange> {
+    vec![
+        PendingChange {
+            title: "Roadmap 2026".to_string(),
+            local_path: "Engineering/Roadmap 2026/page.md".to_string(),
+            summary: "2 text edits".to_string(),
+            state: "safe".to_string(),
+            auto_save: sample_auto_save_status(false),
+        },
+        PendingChange {
+            title: "Launch Plan".to_string(),
+            local_path: "Marketing/Launch Plan/page.md".to_string(),
+            summary: "needs review: large deletion".to_string(),
+            state: "needs_review".to_string(),
+            auto_save: sample_auto_save_status(false),
+        },
+        PendingChange {
+            title: "Customer Notes".to_string(),
+            local_path: "Sales/Customer Notes/page.md".to_string(),
+            summary: "1 property edit".to_string(),
+            state: "safe".to_string(),
+            auto_save: sample_auto_save_status(true),
+        },
+    ]
+}
+
+#[cfg(test)]
+fn sample_auto_save_status(enabled: bool) -> AutoSaveFileStatus {
+    AutoSaveFileStatus {
+        enabled,
+        state: if enabled { "active" } else { "off" }.to_string(),
+        label: if enabled {
+            "Auto-save on"
+        } else {
+            "Auto-save off"
+        }
+        .to_string(),
+        reason: None,
+    }
+}
+
 #[cfg(windows)]
 fn acquire_desktop_single_instance() -> Option<DesktopSingleInstanceGuard> {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
@@ -6937,6 +7936,7 @@ fn main() {
             push_to_notion,
             push_notion_file,
             pull_notion_file,
+            live_mode_tick,
             diff_notion_file,
             inspect_notion_file,
             read_notion_file,

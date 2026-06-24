@@ -28,6 +28,7 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
+  Zap,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -328,6 +329,10 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>, f
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function liveModeReportNeedsRefresh(message: string) {
+  return message.includes("synced") || message.includes("pulled") || message.includes("paused");
 }
 
 function emptyUpdateStatus(): UpdateStatus {
@@ -1337,7 +1342,88 @@ function HomeView({
   const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [actionError, setActionError] = useState("");
+  const [liveModeEnabled, setLiveModeEnabled] = useState(false);
+  const [liveModeBusy, setLiveModeBusy] = useState(false);
+  const [liveModeState, setLiveModeState] = useState<"idle" | "active" | "error">("idle");
+  const [liveModeMessage, setLiveModeMessage] = useState("");
+  const liveModeInFlight = useRef(false);
+  const liveModeSnapshot = useRef(snapshot);
+  const refreshHomeSnapshot = useRef(onRefresh);
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
+
+  useEffect(() => {
+    liveModeSnapshot.current = snapshot;
+  }, [snapshot]);
+
+  useEffect(() => {
+    refreshHomeSnapshot.current = onRefresh;
+  }, [onRefresh]);
+
+  useEffect(() => {
+    if (!liveModeEnabled) {
+      setLiveModeBusy(false);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const runTick = async () => {
+      if (cancelled || liveModeInFlight.current) {
+        return;
+      }
+
+      const currentSnapshot = liveModeSnapshot.current;
+      if (connectionMissing(currentSnapshot) || mountMissing(currentSnapshot)) {
+        setLiveModeEnabled(false);
+        setLiveModeState("error");
+        setLiveModeMessage("Live Mode needs a connected Notion folder.");
+        return;
+      }
+
+      liveModeInFlight.current = true;
+      setLiveModeBusy(true);
+      try {
+        const report = await callCommand<ActionReport>(
+          "live_mode_tick",
+          undefined,
+          { ok: true, message: "Live Mode checked for changes." },
+        );
+        if (cancelled) {
+          return;
+        }
+        if (!report.ok) {
+          setLiveModeEnabled(false);
+          setLiveModeState("error");
+          setLiveModeMessage(report.message);
+          return;
+        }
+        setLiveModeState("active");
+        if (report.message) {
+          setLiveModeMessage((current) => (current === report.message ? current : report.message));
+        }
+        if (liveModeReportNeedsRefresh(report.message)) {
+          await refreshHomeSnapshot.current().catch(() => undefined);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setLiveModeEnabled(false);
+          setLiveModeState("error");
+          setLiveModeMessage(errorMessage(error));
+        }
+      } finally {
+        liveModeInFlight.current = false;
+        if (!cancelled) {
+          setLiveModeBusy(false);
+        }
+      }
+    };
+
+    void runTick();
+    const interval = window.setInterval(runTick, 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [liveModeEnabled]);
 
   async function connectNotion() {
     setActionError("");
@@ -1377,6 +1463,13 @@ function HomeView({
     if (!report.ok) {
       setActionError(report.message);
     }
+  }
+
+  function toggleLiveMode() {
+    setActionError("");
+    setLiveModeMessage("");
+    setLiveModeState(liveModeEnabled ? "idle" : "active");
+    setLiveModeEnabled((enabled) => !enabled);
   }
 
   async function locatePage() {
@@ -1452,6 +1545,14 @@ function HomeView({
               <p className="path-line">{snapshot.mount.localPath}</p>
             </div>
             <div className="button-row">
+              <button
+                className={`live-mode-button ${liveModeEnabled ? "active" : ""}`}
+                aria-pressed={liveModeEnabled}
+                onClick={toggleLiveMode}
+              >
+                {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+                <span>Live Mode</span>
+              </button>
               <SecondaryButton icon={<FolderOpen />} onClick={() => void openWorkspaceFolder(snapshot.mount.localPath)}>
                 Open Folder
               </SecondaryButton>
@@ -1461,6 +1562,11 @@ function HomeView({
             </div>
           </section>
           {actionError && <p className="field-error">{actionError}</p>}
+          {liveModeMessage && (
+            <p className={liveModeState === "error" ? "field-error" : "quiet-note inline-note"}>
+              {liveModeMessage}
+            </p>
+          )}
 
           <section className="panel locate-panel">
             <LocateBox

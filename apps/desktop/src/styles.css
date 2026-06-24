@@ -333,6 +333,7 @@ p {
 
 .primary-button,
 .secondary-button,
+.live-mode-button,
 .text-button {
   display: inline-flex;
   align-items: center;
@@ -369,6 +370,7 @@ p {
 
 .primary-button:active:not(:disabled),
 .secondary-button:active:not(:disabled),
+.live-mode-button:active:not(:disabled),
 .text-button:active:not(:disabled),
 .sidebar-link:active:not(:disabled),
 .option-row:active:not(:disabled),
@@ -400,6 +402,7 @@ p {
 .view-header .secondary-button,
 .workspace-card .primary-button,
 .workspace-card .secondary-button,
+.workspace-card .live-mode-button,
 .attention-panel .primary-button,
 .attention-panel .secondary-button,
 .suggestion-card .primary-button,
@@ -409,7 +412,8 @@ p {
 .footer-actions .primary-button,
 .footer-actions .secondary-button,
 .button-row .primary-button,
-.button-row .secondary-button {
+.button-row .secondary-button,
+.button-row .live-mode-button {
   margin-top: 0;
 }
 
@@ -424,6 +428,26 @@ p {
   border-color: var(--line-strong);
   background: #fff;
   box-shadow: 0 8px 20px rgba(20, 30, 43, 0.08);
+}
+
+.live-mode-button {
+  padding: 0 15px;
+  border: 1px solid rgba(8, 123, 114, 0.22);
+  background: rgba(232, 248, 244, 0.72);
+  color: var(--accent);
+}
+
+.live-mode-button:hover:not(:disabled) {
+  border-color: rgba(8, 123, 114, 0.35);
+  background: rgba(232, 248, 244, 0.95);
+  box-shadow: 0 8px 20px rgba(20, 30, 43, 0.08);
+}
+
+.live-mode-button.active {
+  border-color: rgba(8, 123, 114, 0.42);
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 12px 24px rgba(8, 123, 114, 0.2);
 }
 
 .secondary-button:disabled,
@@ -988,6 +1012,8 @@ p {
 
 .workspace-card .button-row {
   flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .workspace-card .path-line {

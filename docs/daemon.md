@@ -337,6 +337,15 @@ matches the previous shadow. Diverged visible files are left alone so background
 remote refresh cannot erase a local edit that missed the normal File Provider
 write callback.
 
+Desktop Live Mode uses the same boundary in a bounded loop. The primary
+local-write path is File Provider `modifyItem`; the visible CloudStorage
+reconciliation fallback is throttled and scoped to the selected
+already-hydrated page so the app does not poll the user-visible file every tick.
+Remote checks fetch one already-hydrated page into the daemon content cache and
+compare the rendered shadow before refreshing the visible projection. This avoids
+relying on Notion page metadata that can miss some body edits, while leaving
+unchanged CloudStorage replicas untouched.
+
 ## Scheduled Pull Reconciliation
 
 `reconcile_scheduled_pull` is the daemon-side counterpart to `afs pull` for

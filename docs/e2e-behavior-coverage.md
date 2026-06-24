@@ -27,6 +27,8 @@ Optional:
 ```sh
 export AFS_NOTION_LIVE_DIR=/tmp/afs-notion-live
 export AFS_WINDOWS_CLOUD_FILES_LIVE=1
+export AFS_DESKTOP_LIVE_MODE_E2E=1
+export AFS_DESKTOP_LIVE_MODE_E2E_PAGE=~/Library/CloudStorage/AFS-AFS/notion/path/to/scratch/page.md
 ```
 
 Run:
@@ -34,6 +36,9 @@ Run:
 ```sh
 cargo test -p afs-notion --test live_integrity -- --ignored --test-threads=1
 cargo test -p afs-cli --test e2e_push_workflow live_ -- --ignored --test-threads=1
+AFS_DESKTOP_LIVE_MODE_E2E=1 \
+  AFS_DESKTOP_LIVE_MODE_E2E_PAGE=~/Library/CloudStorage/AFS-AFS/notion/path/to/scratch/page.md \
+  cargo test -p afs-desktop live_mode_bidirectional_cloudstorage_markdown_e2e -- --ignored --exact --test-threads=1
 pwsh ./tests/windows_cloud_files_live.ps1
 ```
 
@@ -131,6 +136,7 @@ Coverage labels:
 | `crates/afs-cli/tests/e2e_push_workflow.rs::live_local_file_like_media_appends_upload_and_reconcile_local_links` | Live mounted workflow, plain files | Append local video, PDF, audio, and HTML links from `.afs/media`, push uploads to Notion, and verify reconciled Markdown uses local media links with non-empty materialized files. Covers file-like media upload behavior for E2E-010 and E2E-014. |
 | `crates/afs-cli/tests/e2e_push_workflow.rs::live_cyclic_database_rows_mount_edit_create_and_verify_notion` | Live mounted workflow, plain files | Create database, pull schema, hydrate row, no-op preserves row JSON, edit row properties/body, create row from new Markdown file, fetch/verify Notion. Covers E2E-016, E2E-018, E2E-019. |
 | `crates/afs-cli/tests/e2e_push_workflow.rs::live_database_row_directory_create_pushes_row_and_reconciles` | Live mounted workflow, plain files | Create a new database row as `database/new-row/page.md`, verify the create plan, push to Notion, and verify the reconciled row file is clean with the expected remote properties/body. Covers the page-directory row creation variant for E2E-019. |
+| `apps/desktop/src-tauri/src/main.rs::tests::live_mode_bidirectional_cloudstorage_markdown_e2e` | Live macOS CloudStorage desktop workflow | Runs the desktop Live Mode tick loop against an explicit scratch CloudStorage `page.md`, performs three local-to-Notion edits and three Notion-to-local edits, verifies each direction through the file and API, then removes test marker blocks. Covers Live Mode bidirectional sync on a real File Provider-visible page. |
 | `tests/windows_cloud_files_live.ps1` | Live Windows Cloud Files provider | Registers a real Cloud Files sync root, lazily enumerates a scratch Notion page, hydrates `page.md`, edits and pushes it, creates/renames/deletes a pending draft, creates a child page directory through the mount, pushes it to Notion, then deletes and pushes the child archive. Covers Windows provider paths for E2E-004, E2E-006, E2E-011, E2E-013, and E2E-020. |
 | `crates/afs-cli/tests/projection_contract.rs` | Local shared projection contract | Runs the same daemon virtual-filesystem browse, hydrate, write, create, rename, and delete contract against macOS File Provider, Linux FUSE, and Windows Cloud Files projection modes below the OS adapters. Covers the shared semantics behind E2E-004, E2E-005, E2E-006, E2E-011, and E2E-020. |
 | `crates/afs-cli/tests/doctor.rs` | Local diagnostics contract | Verifies `afs doctor` does not initialize missing state and reports mount, connection, profile, and credential findings with recovery commands. |
@@ -145,8 +151,8 @@ Coverage labels:
 | Rich block coverage | Strong for supported block types | Representative supported blocks are read and edited live. Unsupported/layout blocks are read/no-op protected. |
 | Database schema and row writes | Strong | Schema, validation, property update, body update, and row create are covered. |
 | Media download/upload | Covered for common file-like media | Live tests download image, video, file, PDF, and audio assets locally; upload edited image bytes; and append local video, PDF, audio, and HTML uploads while verifying local links after reconciliation. Broader media pruning/cache lifecycle is not covered. |
-| Mounted workflow | Good for core, partial for platform kernels | Live tests cover plain-file mounted workflow, virtual filesystem lazy paths, and Windows Cloud Files registration against live Notion. Linux FUSE live Notion and macOS File Provider live Notion remain open. |
-| Desktop onboarding/tray/review UI | Manual only | Important product surface, but not currently covered by automated live e2e. |
+| Mounted workflow | Good for core, partial for platform kernels | Live tests cover plain-file mounted workflow, virtual filesystem lazy paths, Windows Cloud Files registration, and macOS CloudStorage Live Mode against live Notion. Linux FUSE live Notion and broader macOS File Provider create/rename/delete coverage remain open. |
+| Desktop onboarding/tray/review UI | Partial live | Live Mode sync semantics are covered through the desktop tick loop against a real CloudStorage page; onboarding, tray, and review UI automation remain manual. |
 | Freshness/drift/auto-fast-forward | Partial live | Live tests cover drift preflight, dirty-pull conflict recovery, fast-forward apply/skip behavior, and scheduled pull queuing/applying a remote fast-forward. Long-running scheduler budget assertions remain local-only. |
 | OAuth broker | Local only | Secret separation is tested; real OAuth UX/broker round-trip is manual. |
 | Packaging/notarization | Manual/publish covered | `make publish` validates signing, stapling, and DMG integrity outside CI. |
@@ -162,8 +168,8 @@ locate coverage.
    Provider locally or on a dedicated Mac.
 2. **Daemon scheduler budget e2e**: run a long-lived live workspace scheduler
    test and assert bounded API work over time.
-3. **Desktop app smoke e2e**: run the Tauri app against a disposable state dir
-   and fake/live backend, verify onboarding reset, pending changes refresh,
+3. **Desktop app smoke e2e**: run the Tauri app UI against a disposable state
+   dir and fake/live backend, verify onboarding reset, pending changes refresh,
    non-blocking push, success confirmation, tray state, and low idle CPU.
 4. **OAuth broker smoke**: use a test Notion integration and broker deployment
    to verify the local client receives/stores only the broker refresh handle.
