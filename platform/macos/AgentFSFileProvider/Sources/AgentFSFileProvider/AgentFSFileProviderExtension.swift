@@ -34,11 +34,17 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     let progress = Progress(totalUnitCount: 1)
     let completion = UncheckedSendable(completionHandler)
     let progressHandle = UncheckedSendable(progress)
-    let mountId = self.mountId
-    let daemonIdentifier = AgentFSFileProviderItem.daemonIdentifier(identifier)
     let client: AgentFSDaemonClient
+    let resolved: AgentFSResolvedIdentifier
+    let sharedDomain = isSharedDomain
     do {
       client = try daemonClient()
+      if sharedDomain && identifier == .rootContainer {
+        completionHandler(AgentFSFileProviderItem(metadata: sharedRootItem()), nil)
+        progress.completedUnitCount = 1
+        return progress
+      }
+      resolved = try resolveIdentifier(identifier)
     } catch {
       completionHandler(nil, error)
       progress.completedUnitCount = 1
@@ -47,10 +53,10 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     DispatchQueue.global(qos: .userInitiated).async {
       do {
         let response = try client.item(
-          mountId: mountId,
-          identifier: daemonIdentifier
+          mountId: resolved.mountId,
+          identifier: resolved.daemonIdentifier
         )
-        completion.value(AgentFSFileProviderItem(metadata: response.item), nil)
+        completion.value(AgentFSFileProviderItem(metadata: providerMetadata(response.item, mountId: response.mountId, sharedDomain: sharedDomain)), nil)
         progressHandle.value.completedUnitCount = 1
       } catch {
         completion.value(nil, error)
@@ -67,11 +73,14 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
       return AgentFSEnumerator(empty: ())
     }
     let client = try daemonClient()
-    let daemonIdentifier = AgentFSFileProviderItem.daemonIdentifier(containerItemIdentifier)
+    if isSharedDomain && containerItemIdentifier == .rootContainer {
+      return AgentFSEnumerator(client: client, domainId: domain.identifier.rawValue)
+    }
+    let resolved = try resolveIdentifier(containerItemIdentifier)
     return AgentFSEnumerator(
       client: client,
-      mountId: mountId,
-      containerIdentifier: daemonIdentifier
+      mountId: resolved.mountId,
+      containerIdentifier: resolved.daemonIdentifier
     )
   }
 
@@ -84,12 +93,13 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     let progress = Progress(totalUnitCount: 1)
     let completion = UncheckedSendable(completionHandler)
     let progressHandle = UncheckedSendable(progress)
-    let mountId = self.mountId
-    let daemonIdentifier = AgentFSFileProviderItem.daemonIdentifier(itemIdentifier)
     let client: AgentFSDaemonClient
+    let resolved: AgentFSResolvedIdentifier
+    let sharedDomain = isSharedDomain
     let transferDirectory: URL
     do {
       client = try daemonClient()
+      resolved = try resolveIdentifier(itemIdentifier)
       transferDirectory = try temporaryDirectoryURL()
     } catch {
       completionHandler(nil, nil, error)
@@ -99,8 +109,8 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     DispatchQueue.global(qos: .userInitiated).async {
       do {
         let read = try client.read(
-          mountId: mountId,
-          identifier: daemonIdentifier
+          mountId: resolved.mountId,
+          identifier: resolved.daemonIdentifier
         )
         let transferURL = try writeToFileProviderTransferDirectory(
           contentsBase64: read.contentsBase64,
@@ -109,7 +119,7 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
         )
         completion.value(
           transferURL,
-          AgentFSFileProviderItem(metadata: read.item),
+          AgentFSFileProviderItem(metadata: providerMetadata(read.item, mountId: read.mountId, sharedDomain: sharedDomain)),
           nil
         )
         progressHandle.value.completedUnitCount = 1
@@ -132,13 +142,14 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     let progress = Progress(totalUnitCount: 2)
     let completion = UncheckedSendable(completionHandler)
     let progressHandle = UncheckedSendable(progress)
-    let mountId = self.mountId
-    let parentIdentifier = AgentFSFileProviderItem.daemonIdentifier(itemTemplate.parentItemIdentifier)
     let filename = itemTemplate.filename
     let isDirectory = itemTemplate.contentType?.conforms(to: .folder) ?? false
     let client: AgentFSDaemonClient
+    let parent: AgentFSResolvedIdentifier
+    let sharedDomain = isSharedDomain
     do {
       client = try daemonClient()
+      parent = try resolveIdentifier(itemTemplate.parentItemIdentifier)
     } catch {
       completionHandler(nil, [], false, error)
       progress.completedUnitCount = 2
@@ -149,20 +160,20 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
         let created: AgentFSMutationPayload
         if isDirectory {
           created = try client.createDirectory(
-            mountId: mountId,
-            parentIdentifier: parentIdentifier,
+            mountId: parent.mountId,
+            parentIdentifier: parent.daemonIdentifier,
             dirname: filename
           )
         } else {
           created = try client.createFile(
-            mountId: mountId,
-            parentIdentifier: parentIdentifier,
+            mountId: parent.mountId,
+            parentIdentifier: parent.daemonIdentifier,
             filename: filename
           )
           if let url {
             let data = try Data(contentsOf: url)
             _ = try client.write(
-              mountId: mountId,
+              mountId: parent.mountId,
               identifier: created.identifier,
               contentsBase64: data.base64EncodedString()
             )
@@ -170,7 +181,7 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
         }
         progressHandle.value.completedUnitCount = 1
         completion.value(
-          AgentFSFileProviderItem(metadata: created.item),
+          AgentFSFileProviderItem(metadata: providerMetadata(created.item, mountId: created.mountId, sharedDomain: sharedDomain)),
           [],
           false,
           nil
@@ -197,17 +208,24 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
     let progress = Progress(totalUnitCount: 2)
     let completion = UncheckedSendable(completionHandler)
     let progressHandle = UncheckedSendable(progress)
-    let mountId = self.mountId
-    let daemonIdentifier = AgentFSFileProviderItem.daemonIdentifier(item.itemIdentifier)
     let client: AgentFSDaemonClient
+    let resolved: AgentFSResolvedIdentifier
+    let newParent: AgentFSResolvedIdentifier?
+    let sharedDomain = isSharedDomain
     Self.writeLog.info(
-      "modifyItem started mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) filename=\(item.filename, privacy: .public) changedFields=\(changedFields.rawValue, privacy: .public) hasContents=\((newContents != nil), privacy: .public)"
+      "modifyItem started id=\(item.itemIdentifier.rawValue, privacy: .public) filename=\(item.filename, privacy: .public) changedFields=\(changedFields.rawValue, privacy: .public) hasContents=\((newContents != nil), privacy: .public)"
     )
     do {
       client = try daemonClient()
+      resolved = try resolveIdentifier(item.itemIdentifier)
+      if changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier) {
+        newParent = try resolveIdentifier(item.parentItemIdentifier)
+      } else {
+        newParent = nil
+      }
     } catch {
       Self.writeLog.error(
-        "modifyItem daemon client failed mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) error=\(String(describing: error), privacy: .public)"
+        "modifyItem daemon client failed id=\(item.itemIdentifier.rawValue, privacy: .public) error=\(String(describing: error), privacy: .public)"
       )
       completionHandler(nil, [], false, error)
       progress.completedUnitCount = 2
@@ -217,22 +235,27 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
       do {
         if changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier) {
           Self.writeLog.info(
-            "modifyItem rename started mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) filename=\(item.filename, privacy: .public)"
+            "modifyItem rename started mount=\(resolved.mountId, privacy: .public) id=\(resolved.daemonIdentifier, privacy: .public) filename=\(item.filename, privacy: .public)"
           )
+          guard let newParent else {
+            throw agentFSUnsupportedWriteError(
+              "Could not resolve the target folder for this rename."
+            )
+          }
           let renamed = try client.rename(
-            mountId: mountId,
-            identifier: daemonIdentifier,
-            newParentIdentifier: AgentFSFileProviderItem.daemonIdentifier(item.parentItemIdentifier),
+            mountId: resolved.mountId,
+            identifier: resolved.daemonIdentifier,
+            newParentIdentifier: newParent.daemonIdentifier,
             newFilename: item.filename
           )
           completion.value(
-            AgentFSFileProviderItem(metadata: renamed.item),
+            AgentFSFileProviderItem(metadata: providerMetadata(renamed.item, mountId: renamed.mountId, sharedDomain: sharedDomain)),
             [],
             false,
             nil
           )
           Self.writeLog.info(
-            "modifyItem rename succeeded mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public)"
+            "modifyItem rename succeeded mount=\(resolved.mountId, privacy: .public) id=\(resolved.daemonIdentifier, privacy: .public)"
           )
           progressHandle.value.completedUnitCount = 2
           return
@@ -240,14 +263,14 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
 
         guard let newContents else {
           Self.writeLog.info(
-            "modifyItem content missing mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) changedFields=\(changedFields.rawValue, privacy: .public)"
+            "modifyItem content missing mount=\(resolved.mountId, privacy: .public) id=\(resolved.daemonIdentifier, privacy: .public) changedFields=\(changedFields.rawValue, privacy: .public)"
           )
           let refreshed = try client.item(
-            mountId: mountId,
-            identifier: daemonIdentifier
+            mountId: resolved.mountId,
+            identifier: resolved.daemonIdentifier
           )
           completion.value(
-            AgentFSFileProviderItem(metadata: refreshed.item),
+            AgentFSFileProviderItem(metadata: providerMetadata(refreshed.item, mountId: refreshed.mountId, sharedDomain: sharedDomain)),
             [],
             false,
             nil
@@ -258,34 +281,34 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
 
         let data = try Data(contentsOf: newContents)
         Self.writeLog.info(
-          "modifyItem content read mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) bytes=\(data.count, privacy: .public)"
+          "modifyItem content read mount=\(resolved.mountId, privacy: .public) id=\(resolved.daemonIdentifier, privacy: .public) bytes=\(data.count, privacy: .public)"
         )
         _ = try client.write(
-          mountId: mountId,
-          identifier: daemonIdentifier,
+          mountId: resolved.mountId,
+          identifier: resolved.daemonIdentifier,
           contentsBase64: data.base64EncodedString()
         )
         Self.writeLog.info(
-          "modifyItem daemon write succeeded mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) bytes=\(data.count, privacy: .public)"
+          "modifyItem daemon write succeeded mount=\(resolved.mountId, privacy: .public) id=\(resolved.daemonIdentifier, privacy: .public) bytes=\(data.count, privacy: .public)"
         )
         progressHandle.value.completedUnitCount = 1
         let refreshed = try client.item(
-          mountId: mountId,
-          identifier: daemonIdentifier
+          mountId: resolved.mountId,
+          identifier: resolved.daemonIdentifier
         )
         completion.value(
-          AgentFSFileProviderItem(metadata: refreshed.item),
+          AgentFSFileProviderItem(metadata: providerMetadata(refreshed.item, mountId: refreshed.mountId, sharedDomain: sharedDomain)),
           [],
           false,
           nil
         )
         Self.writeLog.info(
-          "modifyItem completed mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public)"
+          "modifyItem completed mount=\(resolved.mountId, privacy: .public) id=\(resolved.daemonIdentifier, privacy: .public)"
         )
         progressHandle.value.completedUnitCount = 2
       } catch {
         Self.writeLog.error(
-          "modifyItem failed mount=\(mountId, privacy: .public) id=\(daemonIdentifier, privacy: .public) error=\(String(describing: error), privacy: .public)"
+          "modifyItem failed mount=\(resolved.mountId, privacy: .public) id=\(resolved.daemonIdentifier, privacy: .public) error=\(String(describing: error), privacy: .public)"
         )
         completion.value(nil, changedFields, false, agentFSFileProviderError(error))
         progressHandle.value.completedUnitCount = 2
@@ -309,6 +332,44 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
 
   private var mountId: String {
     domain.identifier.rawValue
+  }
+
+  private var isSharedDomain: Bool {
+    domain.identifier.rawValue == AgentFSSharedDomain.identifier
+  }
+
+  private func resolveIdentifier(_ identifier: NSFileProviderItemIdentifier) throws
+    -> AgentFSResolvedIdentifier
+  {
+    if isSharedDomain {
+      guard let resolved = AgentFSSharedDomain.resolve(identifier) else {
+        throw unsupportedWriteError(
+          "Create and edit files inside a connected source folder, such as Notion."
+        )
+      }
+      return resolved
+    }
+    return AgentFSResolvedIdentifier(
+      mountId: mountId,
+      daemonIdentifier: AgentFSFileProviderItem.daemonIdentifier(identifier)
+    )
+  }
+
+  private func sharedRootItem() -> AgentFSItemMetadata {
+    AgentFSItemMetadata(
+      identifier: AgentFSIdentifier.root,
+      parentIdentifier: nil,
+      filename: domain.displayName.isEmpty ? "AFS" : domain.displayName,
+      kind: "folder",
+      entityKind: nil,
+      remoteId: nil,
+      path: "",
+      hydration: nil,
+      contentType: "public.folder",
+      remoteEditedAt: nil,
+      materializedPath: nil,
+      byteSize: nil
+    )
   }
 
   private func daemonClient() throws -> AgentFSDaemonClient {
@@ -335,14 +396,18 @@ final class AgentFSFileProviderExtension: NSObject, NSFileProviderReplicatedExte
   }
 
   private func unsupportedWriteError(_ message: String) -> NSError {
-    NSError(
-      domain: NSCocoaErrorDomain,
-      code: NSFeatureUnsupportedError,
-      userInfo: [
-        NSLocalizedDescriptionKey: message
-      ]
-    )
+    agentFSUnsupportedWriteError(message)
   }
+}
+
+private func agentFSUnsupportedWriteError(_ message: String) -> NSError {
+  NSError(
+    domain: NSCocoaErrorDomain,
+    code: NSFeatureUnsupportedError,
+    userInfo: [
+      NSLocalizedDescriptionKey: message
+    ]
+  )
 }
 
 private func writeToFileProviderTransferDirectory(
@@ -367,6 +432,14 @@ private func writeToFileProviderTransferDirectory(
   try? FileManager.default.removeItem(at: transferURL)
   try contents.write(to: transferURL, options: .atomic)
   return transferURL
+}
+
+private func providerMetadata(
+  _ metadata: AgentFSItemMetadata,
+  mountId: String,
+  sharedDomain: Bool
+) -> AgentFSItemMetadata {
+  sharedDomain ? metadata.namespaced(for: mountId) : metadata
 }
 
 private struct UncheckedSendable<Value>: @unchecked Sendable {

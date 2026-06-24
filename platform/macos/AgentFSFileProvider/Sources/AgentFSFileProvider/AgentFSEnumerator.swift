@@ -5,11 +5,21 @@ final class AgentFSEnumerator: NSObject, NSFileProviderEnumerator {
     private let client: AgentFSDaemonClient?
     private let mountId: String?
     private let containerIdentifier: String?
+    private let domainId: String?
 
     init(client: AgentFSDaemonClient, mountId: String, containerIdentifier: String) {
         self.client = client
         self.mountId = mountId
         self.containerIdentifier = containerIdentifier
+        self.domainId = nil
+        super.init()
+    }
+
+    init(client: AgentFSDaemonClient, domainId: String) {
+        self.client = client
+        self.mountId = nil
+        self.containerIdentifier = nil
+        self.domainId = domainId
         super.init()
     }
 
@@ -17,6 +27,7 @@ final class AgentFSEnumerator: NSObject, NSFileProviderEnumerator {
         self.client = nil
         self.mountId = nil
         self.containerIdentifier = nil
+        self.domainId = nil
         super.init()
     }
 
@@ -26,18 +37,28 @@ final class AgentFSEnumerator: NSObject, NSFileProviderEnumerator {
         for observer: NSFileProviderEnumerationObserver,
         startingAt page: NSFileProviderPage
     ) {
-        guard let client, let mountId, let containerIdentifier else {
+        guard let client else {
             observer.didEnumerate([])
             observer.finishEnumerating(upTo: nil)
             return
         }
 
         do {
-            let response = try client.children(
-                mountId: mountId,
-                containerIdentifier: containerIdentifier
-            )
-            let items = response.children.map(AgentFSFileProviderItem.init(metadata:))
+            let items: [AgentFSFileProviderItem]
+            if let domainId {
+                let response = try client.domainChildren(domainId: domainId)
+                items = response.children.map { child in
+                    AgentFSFileProviderItem(metadata: child.item.namespaced(for: child.mountId))
+                }
+            } else if let mountId, let containerIdentifier {
+                let response = try client.children(
+                    mountId: mountId,
+                    containerIdentifier: containerIdentifier
+                )
+                items = response.children.map(AgentFSFileProviderItem.init(metadata:))
+            } else {
+                items = []
+            }
             observer.didEnumerate(items)
             observer.finishEnumerating(upTo: nil)
         } catch {

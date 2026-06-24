@@ -25,10 +25,21 @@ macOS IPC commands are compatibility aliases over the daemon's platform-neutral
   directories. A new directory is recorded as a pending page create whose
   writable body is the synthesized `page.md` file inside that directory.
 
-The File Provider domain identifier must be the AgentFS `mount_id`; the daemon
-uses that to resolve the mounted Notion tree. The extension talks to `afsd` over
-`127.0.0.1:38567` by default because sandboxed app extensions should not depend
-on a Unix socket in `~/.afs`.
+macOS uses one shared File Provider domain:
+
+```text
+identifier: afs
+display:    AFS
+```
+
+Each connected source is exposed as a top-level folder inside that domain, for
+example `AFS/notion`. The extension namespaces File Provider item identifiers
+with the internal AgentFS `mount_id`, then sends the unwrapped mount id and item
+identifier to `afsd`. This keeps Finder paths stable as more connectors are
+added without exposing mount ids in user-visible folder names.
+
+The extension talks to `afsd` over `127.0.0.1:38567` by default because
+sandboxed app extensions should not depend on a Unix socket in `~/.afs`.
 
 ## Development Build
 
@@ -48,6 +59,10 @@ afs file-provider open <mount-id-or-path>
 afs file-provider list
 afs file-provider unregister <mount-id-or-path>
 ```
+
+`register` is idempotent: every macOS File Provider mount registers the shared
+`afs` domain. Existing legacy per-mount domains can be removed with
+`afs file-provider reset` after local edits are backed up or reconciled.
 
 `open` asks macOS for the domain's user-visible File Provider URL and opens it
 in Finder. Opening the raw mount root is not enough to test lazy enumeration:

@@ -84,6 +84,9 @@ pub enum DaemonRequest {
         mount_id: String,
         identifier: String,
     },
+    FileProviderDomainChildren {
+        domain_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

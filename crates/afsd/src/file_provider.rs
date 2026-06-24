@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::hydration::HydrationSource;
 use crate::shadow_match::parsed_matches_shadow;
 use crate::virtual_fs;
-use crate::virtual_fs::source_root_directory_name;
+use crate::virtual_fs::{source_root_directory_name, source_root_identifier};
 
 pub use crate::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport as FileProviderChildrenReport,
@@ -29,6 +29,9 @@ pub use crate::virtual_fs::{
     VirtualFsMaterializeOutcome as FileProviderMaterializeOutcome,
     VirtualFsMaterializeReport as FileProviderMaterializeReport,
 };
+
+pub const MACOS_FILE_PROVIDER_DOMAIN_ID: &str = "afs";
+pub const MACOS_FILE_PROVIDER_DISPLAY_NAME: &str = "AFS";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileProviderReadReport {
@@ -42,6 +45,51 @@ pub struct FileProviderReadReport {
     pub contents_base64: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileProviderDomainChildrenReport {
+    pub domain_id: String,
+    pub children: Vec<FileProviderDomainChild>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileProviderDomainChild {
+    pub mount_id: String,
+    pub item: FileProviderItem,
+}
+
+pub fn file_provider_domain_children<S>(
+    store: &S,
+    domain_id: &str,
+) -> AfsResult<FileProviderDomainChildrenReport>
+where
+    S: MountRepository,
+{
+    let mut mounts = store
+        .load_mounts()
+        .map_err(AfsError::from)?
+        .into_iter()
+        .filter(|mount| mount.projection == ProjectionMode::MacosFileProvider)
+        .collect::<Vec<_>>();
+    mounts.sort_by(|left, right| {
+        left.connector
+            .cmp(&right.connector)
+            .then_with(|| left.mount_id.0.cmp(&right.mount_id.0))
+    });
+
+    let children = mounts
+        .into_iter()
+        .map(|mount| FileProviderDomainChild {
+            mount_id: mount.mount_id.0.clone(),
+            item: shared_domain_source_root_item(&mount),
+        })
+        .collect();
+
+    Ok(FileProviderDomainChildrenReport {
+        domain_id: domain_id.to_string(),
+        children,
+    })
+}
+
 pub fn file_provider_item<S>(
     store: &S,
     mount_id: &MountId,
@@ -51,6 +99,24 @@ where
     S: MountRepository + EntityRepository + VirtualMutationRepository,
 {
     virtual_fs::virtual_fs_item(store, mount_id, identifier)
+}
+
+fn shared_domain_source_root_item(mount: &MountConfig) -> FileProviderItem {
+    let filename = source_root_directory_name(&mount.connector);
+    FileProviderItem {
+        identifier: source_root_identifier(&mount.connector),
+        parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
+        filename: filename.clone(),
+        kind: FileProviderItemKind::Folder,
+        entity_kind: None,
+        remote_id: None,
+        path: filename,
+        hydration: None,
+        content_type: "public.folder".to_string(),
+        remote_edited_at: None,
+        materialized_path: Some(mount.root.display().to_string()),
+        byte_size: None,
+    }
 }
 
 pub fn file_provider_children<S>(
@@ -1019,6 +1085,46 @@ mod tests {
 
         assert_eq!(matched.access_root, PathBuf::from("/tmp/AFS/notion"));
         assert_eq!(matched.relative_path, PathBuf::from("roadmap/page.md"));
+    }
+
+    #[test]
+    fn shared_macos_file_provider_domain_children_lists_virtual_mount_roots() {
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/AFS/notion")
+                    .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save notion mount");
+        store
+            .save_mount(
+                MountConfig::new(MountId::new("linear-main"), "linear", "/tmp/AFS/linear")
+                    .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save linear mount");
+        store
+            .save_mount(MountConfig::new(
+                MountId::new("plain"),
+                "notes",
+                "/tmp/AFS/notes",
+            ))
+            .expect("save plain mount");
+
+        let report =
+            file_provider_domain_children(&store, MACOS_FILE_PROVIDER_DOMAIN_ID).expect("children");
+
+        assert_eq!(report.domain_id, MACOS_FILE_PROVIDER_DOMAIN_ID);
+        assert_eq!(report.children.len(), 2);
+        assert_eq!(report.children[0].mount_id, "linear-main");
+        assert_eq!(report.children[0].item.filename, "linear");
+        assert_eq!(report.children[0].item.identifier, "source:linear");
+        assert_eq!(
+            report.children[0].item.parent_identifier.as_deref(),
+            Some(ROOT_CONTAINER_IDENTIFIER)
+        );
+        assert_eq!(report.children[1].mount_id, "notion-main");
+        assert_eq!(report.children[1].item.filename, "notion");
+        assert_eq!(report.children[1].item.identifier, "source:notion");
     }
 
     #[test]

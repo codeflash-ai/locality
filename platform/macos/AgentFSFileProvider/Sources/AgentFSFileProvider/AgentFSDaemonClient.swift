@@ -66,6 +66,26 @@ struct AgentFSChildrenPayload: Decodable {
   }
 }
 
+struct AgentFSDomainChildrenPayload: Decodable {
+  let domainId: String
+  let children: [AgentFSDomainChild]
+
+  enum CodingKeys: String, CodingKey {
+    case domainId = "domain_id"
+    case children
+  }
+}
+
+struct AgentFSDomainChild: Decodable {
+  let mountId: String
+  let item: AgentFSItemMetadata
+
+  enum CodingKeys: String, CodingKey {
+    case mountId = "mount_id"
+    case item
+  }
+}
+
 struct AgentFSMaterializePayload: Decodable {
   let mountId: String
   let identifier: String
@@ -207,6 +227,13 @@ final class AgentFSDaemonClient: @unchecked Sendable {
       "command": "file_provider_children",
       "mount_id": mountId,
       "container_identifier": containerIdentifier,
+    ])
+  }
+
+  func domainChildren(domainId: String) throws -> AgentFSDomainChildrenPayload {
+    try request([
+      "command": "file_provider_domain_children",
+      "domain_id": domainId,
     ])
   }
 

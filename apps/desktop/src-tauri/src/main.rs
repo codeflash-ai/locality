@@ -25,9 +25,8 @@ use afs_cli::file_provider::{
 };
 #[cfg(target_os = "macos")]
 use afs_cli::file_provider::{
-    macos_file_provider_display_name, macos_file_provider_domain_url,
-    open_macos_file_provider_domain, register_macos_file_provider_domain,
-    run_macos_file_provider_helper,
+    macos_file_provider_domain_url, open_macos_file_provider_domain,
+    register_macos_file_provider_domain, run_macos_file_provider_helper,
 };
 use afs_cli::local_oauth::run_local_oauth_authorization;
 use afs_cli::mount::{MountOptions, run_mount};
@@ -3163,7 +3162,8 @@ fn mount_access_root(mount: &MountConfig) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if mount.projection == ProjectionMode::MacosFileProvider
-            && let Ok(url) = macos_file_provider_domain_url(&mount.mount_id.0)
+            && let Ok(url) =
+                macos_file_provider_domain_url(afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
         {
             return url.join(source_root_directory_name(&mount.connector));
         }
@@ -4756,13 +4756,14 @@ fn signal_virtual_projection_container(
 
 #[cfg(target_os = "macos")]
 fn signal_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(), String> {
+    let provider_identifier = macos_file_provider_item_identifier(mount_id, identifier);
     run_macos_file_provider_helper(
         "signal",
         vec![
             "--mount-id".to_string(),
-            mount_id.to_string(),
+            afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
             "--identifier".to_string(),
-            identifier.to_string(),
+            provider_identifier,
         ],
     )
     .map(|_| ())
@@ -4773,6 +4774,47 @@ fn signal_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(
             error.message()
         )
     })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_item_identifier(mount_id: &str, identifier: &str) -> String {
+    if identifier == ROOT_CONTAINER_IDENTIFIER {
+        return ROOT_CONTAINER_IDENTIFIER.to_string();
+    }
+    format!(
+        "m:{}:{}",
+        macos_file_provider_encode_identifier_component(mount_id),
+        macos_file_provider_encode_identifier_component(identifier)
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_encode_identifier_component(value: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let bytes = value.as_bytes();
+    let mut output = String::with_capacity((bytes.len() * 4).div_ceil(3));
+    let mut index = 0;
+    while index < bytes.len() {
+        let first = bytes[index];
+        let second = bytes.get(index + 1).copied();
+        let third = bytes.get(index + 2).copied();
+
+        output.push(TABLE[(first >> 2) as usize] as char);
+        output.push(
+            TABLE[(((first & 0b0000_0011) << 4) | second.unwrap_or(0) >> 4) as usize] as char,
+        );
+        if let Some(second) = second {
+            output.push(
+                TABLE[(((second & 0b0000_1111) << 2) | third.unwrap_or(0) >> 6) as usize] as char,
+            );
+        }
+        if let Some(third) = third {
+            output.push(TABLE[(third & 0b0011_1111) as usize] as char);
+        }
+
+        index += 3;
+    }
+    output
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -4792,10 +4834,10 @@ fn register_virtual_projection(state_root: &Path, mount: &MountConfig) -> Result
 }
 
 #[cfg(target_os = "macos")]
-fn register_macos_virtual_projection(mount_id: &str, root: &str) -> Result<(), String> {
+fn register_macos_virtual_projection(_mount_id: &str, _root: &str) -> Result<(), String> {
     register_macos_file_provider_domain(
-        mount_id,
-        &macos_file_provider_display_name(Path::new(root), "Notion"),
+        afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+        afsd::file_provider::MACOS_FILE_PROVIDER_DISPLAY_NAME,
     )
     .map(|_| ())
     .map_err(|error| {
@@ -4883,8 +4925,14 @@ fn open_virtual_projection(mount: &MountConfig) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
-    match open_macos_file_provider_domain(&mount.mount_id.0) {
-        Ok(_) => Ok(()),
+    match macos_file_provider_domain_url(afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID) {
+        Ok(provider_root) => {
+            let source_root = provider_root.join(source_root_directory_name(&mount.connector));
+            if source_root.exists() {
+                return open_in_file_manager(&source_root);
+            }
+            open_in_file_manager(&provider_root)
+        }
         Err(error) => {
             let first_error = error.message();
             eprintln!(
@@ -4897,7 +4945,11 @@ fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
                 &mount.root.display().to_string(),
             ) {
                 eprintln!("afs desktop could not re-register macOS File Provider domain: {error}");
-            } else if open_macos_file_provider_domain(&mount.mount_id.0).is_ok() {
+            } else if open_macos_file_provider_domain(
+                afsd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+            )
+            .is_ok()
+            {
                 return Ok(());
             }
 

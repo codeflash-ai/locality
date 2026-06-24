@@ -1283,20 +1283,17 @@ fn file_provider_register(args: &[String], json: bool) -> i32 {
 
     let mount_id = mount.mount_id.0.clone();
     match registration {
-        VirtualProjectionRegistration::MacosFileProvider => {
-            let display_name = file_provider_display_name(&mount);
-            run_file_provider_helper(
-                json,
-                "register",
-                vec![
-                    "--mount-id".to_string(),
-                    mount_id.clone(),
-                    "--display-name".to_string(),
-                    display_name,
-                ],
-                Some(mount_id),
-            )
-        }
+        VirtualProjectionRegistration::MacosFileProvider => run_file_provider_helper(
+            json,
+            "register",
+            vec![
+                "--mount-id".to_string(),
+                daemon_file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
+                "--display-name".to_string(),
+                daemon_file_provider::MACOS_FILE_PROVIDER_DISPLAY_NAME.to_string(),
+            ],
+            Some(mount_id),
+        ),
         VirtualProjectionRegistration::LinuxFuse => run_linux_fuse_register(json, &mount),
         VirtualProjectionRegistration::WindowsCloudFiles => {
             run_windows_cloud_files_register(json, &mount)
@@ -1469,7 +1466,10 @@ fn file_provider_open(args: &[String], json: bool) -> i32 {
         VirtualProjectionRegistration::MacosFileProvider => run_file_provider_helper(
             json,
             "open",
-            vec!["--mount-id".to_string(), mount.mount_id.0.clone()],
+            vec![
+                "--mount-id".to_string(),
+                daemon_file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
+            ],
             Some(mount.mount_id.0),
         ),
         VirtualProjectionRegistration::LinuxFuse => open_path_for_linux_fuse(json, &mount),
@@ -1507,6 +1507,9 @@ fn file_provider_unregister(args: &[String], json: bool) -> i32 {
     }
 
     let mount_id = match resolved_mount {
+        Some(mount) if mount.projection == ProjectionMode::MacosFileProvider => {
+            daemon_file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string()
+        }
         Some(mount) => mount.mount_id.0,
         None => target.to_string(),
     };

@@ -72,6 +72,96 @@ final class AgentFSFileProviderItem: NSObject, NSFileProviderItem {
   }
 }
 
+extension AgentFSItemMetadata {
+  func namespaced(for mountId: String) -> AgentFSItemMetadata {
+    AgentFSItemMetadata(
+      identifier: AgentFSSharedDomain.itemIdentifier(
+        mountId: mountId,
+        daemonIdentifier: identifier
+      ),
+      parentIdentifier: AgentFSSharedDomain.parentIdentifier(
+        mountId: mountId,
+        daemonParentIdentifier: parentIdentifier
+      ),
+      filename: filename,
+      kind: kind,
+      entityKind: entityKind,
+      remoteId: remoteId,
+      path: path,
+      hydration: hydration,
+      contentType: contentType,
+      remoteEditedAt: remoteEditedAt,
+      materializedPath: materializedPath,
+      byteSize: byteSize
+    )
+  }
+}
+
 enum AgentFSIdentifier {
   static let root = "root"
+}
+
+struct AgentFSResolvedIdentifier {
+  let mountId: String
+  let daemonIdentifier: String
+}
+
+enum AgentFSSharedDomain {
+  static let identifier = "afs"
+  private static let prefix = "m:"
+
+  static func itemIdentifier(mountId: String, daemonIdentifier: String) -> String {
+    "\(prefix)\(encode(mountId)):\(encode(daemonIdentifier))"
+  }
+
+  static func parentIdentifier(
+    mountId: String,
+    daemonParentIdentifier: String?
+  ) -> String? {
+    guard let daemonParentIdentifier else {
+      return nil
+    }
+    if daemonParentIdentifier == AgentFSIdentifier.root {
+      return AgentFSIdentifier.root
+    }
+    return itemIdentifier(mountId: mountId, daemonIdentifier: daemonParentIdentifier)
+  }
+
+  static func resolve(_ identifier: NSFileProviderItemIdentifier) -> AgentFSResolvedIdentifier? {
+    let raw = identifier.rawValue
+    guard raw.hasPrefix(prefix) else {
+      return nil
+    }
+    let remainder = raw.dropFirst(prefix.count)
+    let parts = remainder.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+    guard parts.count == 2,
+      let mountId = decode(String(parts[0])),
+      let daemonIdentifier = decode(String(parts[1]))
+    else {
+      return nil
+    }
+    return AgentFSResolvedIdentifier(mountId: mountId, daemonIdentifier: daemonIdentifier)
+  }
+
+  private static func encode(_ value: String) -> String {
+    Data(value.utf8)
+      .base64EncodedString()
+      .replacingOccurrences(of: "+", with: "-")
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "=", with: "")
+  }
+
+  private static func decode(_ value: String) -> String? {
+    var padded = value
+      .replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/")
+    let remainder = padded.count % 4
+    if remainder != 0 {
+      padded.append(String(repeating: "=", count: 4 - remainder))
+    }
+    guard let data = Data(base64Encoded: padded) else {
+      return nil
+    }
+    return String(data: data, encoding: .utf8)
+  }
 }

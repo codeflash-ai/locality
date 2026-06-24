@@ -356,6 +356,17 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
             "runtime runner does not handle File Provider file reads",
         )
     }
+
+    fn run_file_provider_domain_children(
+        &self,
+        _state_root: PathBuf,
+        _domain_id: String,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle File Provider domain enumeration",
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -673,6 +684,21 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             item,
             contents_base64: BASE64.encode(contents),
         })
+    }
+
+    fn run_file_provider_domain_children(
+        &self,
+        state_root: PathBuf,
+        domain_id: String,
+    ) -> DaemonResponse {
+        let store = match SqliteStateStore::open(state_root) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        match file_provider::file_provider_domain_children(&store, &domain_id) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(afs_error_code(&error), error.to_string()),
+        }
     }
 
     fn run_virtual_fs_commit_write(
@@ -1231,6 +1257,12 @@ impl RuntimeState {
                         respond_to,
                     });
                 self.maybe_start_next_job();
+            }
+            DaemonRequest::FileProviderDomainChildren { domain_id } => {
+                let response = self
+                    .runner
+                    .run_file_provider_domain_children(self.config.state_root.clone(), domain_id);
+                let _ = respond_to.send(response);
             }
             DaemonRequest::VirtualFsCommitWrite {
                 mount_id,
