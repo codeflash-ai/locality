@@ -17,7 +17,8 @@ use locality_core::{LocalityError, LocalityResult};
 use crate::client::{GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient};
 use crate::docs_dto::{
     BatchUpdateDocumentRequest, DeleteContentRangeRequest, DocsRequest, GoogleDocument,
-    InsertTextRequest, Location, Range, WriteControl,
+    InsertTextRequest, Location, Range, TextStyle, TextStylePatch, UpdateTextStyleRequest,
+    WriteControl,
 };
 use crate::drive_dto::{
     DRIVE_FOLDER_MIME_TYPE, DRIVE_GOOGLE_DOC_MIME_TYPE, DriveCreateFileRequest, DriveFile,
@@ -458,7 +459,8 @@ fn apply_plan(
 ) -> LocalityResult<ApplyPlanResult> {
     let mut changed = BTreeSet::new();
     let mut effects = Vec::new();
-    for (index, operation) in request.plan.operations.iter().enumerate() {
+    for index in apply_operation_order(&request.plan.operations) {
+        let operation = &request.plan.operations[index];
         let operation_id = request
             .operation_ids
             .get(index)
@@ -469,27 +471,26 @@ fn apply_plan(
             | PushOperation::ReplaceBlock { block_id, content } => {
                 let range = GoogleBlockRange::parse(block_id)?;
                 let document = docs.get_document(&range.document_id)?;
+                let mut requests = vec![DocsRequest::DeleteContentRange {
+                    delete_content_range: DeleteContentRangeRequest {
+                        range: Range {
+                            start_index: range.start_index,
+                            end_index: range.end_index,
+                        },
+                    },
+                }];
+                requests.extend(docs_text_requests_with_style_source(
+                    range.start_index,
+                    content,
+                    Some(DocsTextStyleSource {
+                        document: &document,
+                        start_index: range.start_index,
+                    }),
+                ));
                 docs.batch_update_document(
                     &range.document_id,
                     BatchUpdateDocumentRequest {
-                        requests: vec![
-                            DocsRequest::DeleteContentRange {
-                                delete_content_range: DeleteContentRangeRequest {
-                                    range: Range {
-                                        start_index: range.start_index,
-                                        end_index: range.end_index,
-                                    },
-                                },
-                            },
-                            DocsRequest::InsertText {
-                                insert_text: InsertTextRequest {
-                                    location: Location {
-                                        index: range.start_index,
-                                    },
-                                    text: docs_text(content),
-                                },
-                            },
-                        ],
+                        requests,
                         write_control: write_control(&document),
                     },
                 )?;
@@ -512,17 +513,13 @@ fn apply_plan(
                     .and_then(|after| GoogleBlockRange::parse(after).ok())
                     .map(|range| range.end_index)
                     .unwrap_or_else(|| document_end_index(&document));
+                let docs_text = docs_text(content);
+                let new_block_end = index_position + docs_text.text.encode_utf16().count();
+                let requests = docs_text_requests_from_parsed(index_position, docs_text, None);
                 docs.batch_update_document(
                     parent_id.as_str(),
                     BatchUpdateDocumentRequest {
-                        requests: vec![DocsRequest::InsertText {
-                            insert_text: InsertTextRequest {
-                                location: Location {
-                                    index: index_position,
-                                },
-                                text: docs_text(content),
-                            },
-                        }],
+                        requests,
                         write_control: write_control(&document),
                     },
                 )?;
@@ -533,9 +530,7 @@ fn apply_plan(
                     parent_id: parent_id.clone(),
                     block_id: RemoteId::new(format!(
                         "{}:{}:{}",
-                        parent_id.0,
-                        index_position,
-                        index_position + content.len()
+                        parent_id.0, index_position, new_block_end
                     )),
                 });
             }
@@ -605,12 +600,7 @@ fn apply_plan(
                     if let Err(error) = docs.batch_update_document(
                         created.id.as_str(),
                         BatchUpdateDocumentRequest {
-                            requests: vec![DocsRequest::InsertText {
-                                insert_text: InsertTextRequest {
-                                    location: Location { index: 1 },
-                                    text: docs_text(body),
-                                },
-                            }],
+                            requests: docs_text_requests(1, body),
                             write_control: write_control(&document),
                         },
                     ) {
@@ -641,18 +631,229 @@ fn apply_plan(
     })
 }
 
+fn apply_operation_order(operations: &[PushOperation]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(operations.len());
+    let mut index = 0;
+    while index < operations.len() {
+        let Some(first_range) = operation_block_range(&operations[index]) else {
+            order.push(index);
+            index += 1;
+            continue;
+        };
+
+        let document_id = first_range.document_id;
+        let mut group = Vec::new();
+        while index < operations.len() {
+            let Some(range) = operation_block_range(&operations[index]) else {
+                break;
+            };
+            if range.document_id != document_id {
+                break;
+            }
+            group.push((index, range.start_index));
+            index += 1;
+        }
+        group.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        order.extend(group.into_iter().map(|(index, _)| index));
+    }
+    order
+}
+
+fn operation_block_range(operation: &PushOperation) -> Option<GoogleBlockRange> {
+    match operation {
+        PushOperation::UpdateBlock { block_id, .. }
+        | PushOperation::ReplaceBlock { block_id, .. }
+        | PushOperation::ArchiveBlock { block_id } => GoogleBlockRange::parse(block_id).ok(),
+        _ => None,
+    }
+}
+
 fn write_control(document: &GoogleDocument) -> Option<WriteControl> {
     Some(WriteControl {
         required_revision_id: document.revision_id.clone(),
     })
 }
 
-fn docs_text(content: &str) -> String {
-    if content.ends_with('\n') {
-        content.to_string()
-    } else {
-        format!("{content}\n")
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DocsText {
+    text: String,
+    bold_ranges: Vec<DocsTextRange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsTextRange {
+    start: usize,
+    end: usize,
+}
+
+fn docs_text_requests(location_index: usize, content: &str) -> Vec<DocsRequest> {
+    docs_text_requests_with_style_source(location_index, content, None)
+}
+
+fn docs_text_requests_with_style_source(
+    location_index: usize,
+    content: &str,
+    style_source: Option<DocsTextStyleSource<'_>>,
+) -> Vec<DocsRequest> {
+    docs_text_requests_from_parsed(location_index, docs_text(content), style_source)
+}
+
+fn docs_text_requests_from_parsed(
+    location_index: usize,
+    docs_text: DocsText,
+    style_source: Option<DocsTextStyleSource<'_>>,
+) -> Vec<DocsRequest> {
+    let inserted_len = docs_text_len(&docs_text.text);
+    let mut requests = vec![DocsRequest::InsertText {
+        insert_text: InsertTextRequest {
+            location: Location {
+                index: location_index,
+            },
+            text: docs_text.text,
+        },
+    }];
+    if inserted_len > 0 {
+        requests.push(reset_text_style_request(
+            location_index,
+            location_index + inserted_len,
+        ));
     }
+    requests.extend(
+        docs_text
+            .bold_ranges
+            .into_iter()
+            .map(|range| bold_text_style_request(location_index, range, style_source)),
+    );
+    requests
+}
+
+#[derive(Clone, Copy)]
+struct DocsTextStyleSource<'a> {
+    document: &'a GoogleDocument,
+    start_index: usize,
+}
+
+fn reset_text_style_request(start_index: usize, end_index: usize) -> DocsRequest {
+    DocsRequest::UpdateTextStyle {
+        update_text_style: UpdateTextStyleRequest {
+            range: Range {
+                start_index,
+                end_index,
+            },
+            text_style: TextStylePatch {
+                bold: Some(false),
+                italic: Some(false),
+                underline: Some(false),
+                strikethrough: Some(false),
+                foreground_color: None,
+            },
+            fields: "bold,italic,underline,strikethrough,foregroundColor,link".to_string(),
+        },
+    }
+}
+
+fn bold_text_style_request(
+    location_index: usize,
+    range: DocsTextRange,
+    style_source: Option<DocsTextStyleSource<'_>>,
+) -> DocsRequest {
+    let existing_style = style_source
+        .and_then(|source| text_style_at(source.document, source.start_index + range.start));
+    let foreground_color = existing_style.and_then(|style| style.foreground_color.clone());
+    let mut fields = "bold".to_string();
+    if foreground_color.is_some() {
+        fields.push_str(",foregroundColor");
+    }
+    DocsRequest::UpdateTextStyle {
+        update_text_style: UpdateTextStyleRequest {
+            range: Range {
+                start_index: location_index + range.start,
+                end_index: location_index + range.end,
+            },
+            text_style: TextStylePatch {
+                bold: Some(true),
+                italic: None,
+                underline: None,
+                strikethrough: None,
+                foreground_color,
+            },
+            fields,
+        },
+    }
+}
+
+fn text_style_at(document: &GoogleDocument, index: usize) -> Option<&TextStyle> {
+    document
+        .body
+        .content
+        .iter()
+        .filter_map(|element| element.paragraph.as_ref())
+        .flat_map(|paragraph| paragraph.elements.iter())
+        .find(|element| {
+            let Some(start_index) = element.start_index else {
+                return false;
+            };
+            let Some(end_index) = element.end_index else {
+                return false;
+            };
+            start_index <= index && index < end_index && element.text_run.is_some()
+        })
+        .and_then(|element| element.text_run.as_ref())
+        .map(|text_run| &text_run.text_style)
+}
+
+fn docs_text(content: &str) -> DocsText {
+    let mut parsed = parse_docs_markdown_inline(content);
+    if !parsed.text.ends_with('\n') {
+        parsed.text.push('\n');
+    }
+    let final_newline_start = parsed.text.len().saturating_sub('\n'.len_utf8());
+    parsed.text = parsed
+        .text
+        .char_indices()
+        .map(|(index, ch)| {
+            if ch == '\n' && index < final_newline_start {
+                '\u{000b}'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    parsed
+}
+
+fn parse_docs_markdown_inline(content: &str) -> DocsText {
+    let mut parsed = DocsText::default();
+    let mut index = 0;
+    while index < content.len() {
+        if content[index..].starts_with("**") {
+            let inner_start = index + 2;
+            if let Some(close_offset) = content[inner_start..].find("**") {
+                let inner_end = inner_start + close_offset;
+                let inner = &content[inner_start..inner_end];
+                let start = docs_text_len(&parsed.text);
+                parsed.text.push_str(inner);
+                let end = docs_text_len(&parsed.text);
+                if end > start {
+                    parsed.bold_ranges.push(DocsTextRange { start, end });
+                }
+                index = inner_end + 2;
+                continue;
+            }
+        }
+
+        let ch = content[index..]
+            .chars()
+            .next()
+            .expect("index is inside content");
+        parsed.text.push(ch);
+        index += ch.len_utf8();
+    }
+    parsed
+}
+
+fn docs_text_len(value: &str) -> usize {
+    value.encode_utf16().count()
 }
 
 fn document_end_index(document: &GoogleDocument) -> usize {
@@ -830,7 +1031,7 @@ mod tests {
 
     use super::{GoogleDocsConfig, GoogleDocsConnector};
     use crate::client::{GoogleDocsApi, GoogleDriveApi};
-    use crate::docs_dto::{BatchUpdateDocumentRequest, GoogleDocument};
+    use crate::docs_dto::{BatchUpdateDocumentRequest, DocsRequest, GoogleDocument, Range};
     use crate::drive_dto::{
         DriveCreateFileRequest, DriveFile, DriveFileList, DriveUpdateFileRequest,
     };
@@ -1025,6 +1226,232 @@ mod tests {
                 .trashed,
             Some(true)
         );
+    }
+
+    #[test]
+    fn apply_converts_markdown_inline_styles_to_docs_text() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Pet Resume", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Pet Resume",
+            "rev-1",
+            "Age: 4 years\u{000b}Weight: 33 pounds\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:36"),
+                content: "**Age:** 4 years\n**Weight:** 34 pounds".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[1] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.text, "Age: 4 years\u{000b}Weight: 34 pounds\n");
+        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[2] else {
+            panic!("expected style reset request");
+        };
+        assert_eq!(update_text_style.range.start_index, 1);
+        assert_eq!(update_text_style.range.end_index, 32);
+        assert_eq!(update_text_style.text_style.bold, Some(false));
+        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[3] else {
+            panic!("expected age style request");
+        };
+        assert_eq!(update_text_style.range.start_index, 1);
+        assert_eq!(update_text_style.range.end_index, 5);
+        assert_eq!(update_text_style.text_style.bold, Some(true));
+        let DocsRequest::UpdateTextStyle { update_text_style } = &batch.requests[4] else {
+            panic!("expected weight style request");
+        };
+        assert_eq!(update_text_style.range.start_index, 14);
+        assert_eq!(update_text_style.range.end_index, 21);
+        assert_eq!(update_text_style.text_style.bold, Some(true));
+    }
+
+    #[test]
+    fn apply_resets_inherited_style_outside_markdown_inline_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Pet Resume", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Pet Resume",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 14,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 5,
+                                        "textRun": {
+                                            "content": "Age:",
+                                            "textStyle": {
+                                                "bold": true,
+                                                "foregroundColor": {
+                                                    "color": {
+                                                        "rgbColor": {
+                                                            "green": 0.67058825,
+                                                            "blue": 0.26666668
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 5,
+                                        "endIndex": 14,
+                                        "textRun": {
+                                            "content": " 4 years\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("styled document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:14"),
+                content: "**Age**: 5 years".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert_eq!(batch.requests.len(), 4);
+        assert_eq!(
+            serde_json::to_value(&batch.requests[2]).expect("style reset json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 1, "endIndex": 14 },
+                    "textStyle": {
+                        "bold": false,
+                        "italic": false,
+                        "underline": false,
+                        "strikethrough": false
+                    },
+                    "fields": "bold,italic,underline,strikethrough,foregroundColor,link"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[3]).expect("age style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 1, "endIndex": 4 },
+                    "textStyle": {
+                        "bold": true,
+                        "foregroundColor": {
+                            "color": {
+                                "rgbColor": {
+                                    "green": 0.67058825,
+                                    "blue": 0.26666668
+                                }
+                            }
+                        }
+                    },
+                    "fields": "bold,foregroundColor"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn apply_orders_same_document_block_updates_from_bottom_to_top() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Pet Resume", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Pet Resume",
+            "rev-1",
+            "First block\nSecond block\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![
+                PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("doc-1:1:13"),
+                    content: "First".to_string(),
+                },
+                PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("doc-1:13:26"),
+                    content: "Second".to_string(),
+                },
+            ],
+        );
+        let op_ids = vec![
+            PushOperationId("push-1:0:update_block:doc-1".to_string()),
+            PushOperationId("push-1:1:update_block:doc-1".to_string()),
+        ];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batches = docs.batches.lock().unwrap();
+        let first_delete = first_delete_range(&batches[0].1);
+        let second_delete = first_delete_range(&batches[1].1);
+        assert_eq!(first_delete.start_index, 13);
+        assert_eq!(second_delete.start_index, 1);
     }
 
     #[test]
@@ -1293,6 +1720,7 @@ mod tests {
     struct FakeDocs {
         docs: Mutex<std::collections::BTreeMap<String, GoogleDocument>>,
         last_batch: Mutex<Option<BatchUpdateDocumentRequest>>,
+        batches: Mutex<Vec<(String, BatchUpdateDocumentRequest)>>,
     }
 
     impl FakeDocs {
@@ -1322,9 +1750,26 @@ mod tests {
             document_id: &str,
             request: BatchUpdateDocumentRequest,
         ) -> locality_core::LocalityResult<GoogleDocument> {
+            self.batches
+                .lock()
+                .unwrap()
+                .push((document_id.to_string(), request.clone()));
             *self.last_batch.lock().unwrap() = Some(request);
             self.get_document(document_id)
         }
+    }
+
+    fn first_delete_range(request: &BatchUpdateDocumentRequest) -> Range {
+        request
+            .requests
+            .iter()
+            .find_map(|request| match request {
+                DocsRequest::DeleteContentRange {
+                    delete_content_range,
+                } => Some(delete_content_range.range.clone()),
+                _ => None,
+            })
+            .expect("delete request")
     }
 
     fn folder(id: &str, name: &str, parent: &str) -> DriveFile {

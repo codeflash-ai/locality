@@ -110,6 +110,8 @@ pub struct TextStyle {
     pub strikethrough: bool,
     #[serde(default)]
     pub link: Option<Link>,
+    #[serde(default)]
+    pub foreground_color: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +227,10 @@ pub enum DocsRequest {
         #[serde(rename = "insertText")]
         insert_text: InsertTextRequest,
     },
+    UpdateTextStyle {
+        #[serde(rename = "updateTextStyle")]
+        update_text_style: UpdateTextStyleRequest,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +242,29 @@ pub struct DeleteContentRangeRequest {
 pub struct InsertTextRequest {
     pub location: Location,
     pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTextStyleRequest {
+    pub range: Range,
+    pub text_style: TextStylePatch,
+    pub fields: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextStylePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underline: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strikethrough: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_color: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,7 +290,7 @@ pub struct WriteControl {
 mod tests {
     use super::{
         BatchUpdateDocumentRequest, DeleteContentRangeRequest, DocsRequest, GoogleDocument,
-        InsertTextRequest, Range, WriteControl,
+        InsertTextRequest, Range, TextStylePatch, UpdateTextStyleRequest, WriteControl,
     };
 
     #[test]
@@ -402,6 +431,19 @@ mod tests {
                         text: "Updated\n".to_string(),
                     },
                 },
+                DocsRequest::UpdateTextStyle {
+                    update_text_style: UpdateTextStyleRequest {
+                        range: Range {
+                            start_index: 1,
+                            end_index: 8,
+                        },
+                        text_style: TextStylePatch {
+                            bold: Some(true),
+                            ..TextStylePatch::default()
+                        },
+                        fields: "bold".to_string(),
+                    },
+                },
             ],
             write_control: Some(WriteControl {
                 required_revision_id: Some("rev-1".to_string()),
@@ -416,5 +458,10 @@ mod tests {
             1
         );
         assert_eq!(json["requests"][1]["insertText"]["text"], "Updated\n");
+        assert_eq!(json["requests"][2]["updateTextStyle"]["fields"], "bold");
+        assert_eq!(
+            json["requests"][2]["updateTextStyle"]["textStyle"]["bold"],
+            true
+        );
     }
 }
