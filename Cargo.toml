@@ -8,6 +8,7 @@ members = [
   "crates/locality-platform",
   "crates/locality-store",
   "crates/locality-notion",
+  "crates/locality-google-docs",
   "platform/linux/locality-fuse",
   "platform/windows/locality-cloud-files",
 ]
@@ -25,3 +26,4 @@ locality-connector = { path = "crates/locality-connector" }
 locality-platform = { path = "crates/locality-platform" }
 locality-store = { path = "crates/locality-store" }
 locality-notion = { path = "crates/locality-notion" }
+locality-google-docs = { path = "crates/locality-google-docs" }
