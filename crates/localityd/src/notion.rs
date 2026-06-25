@@ -36,6 +36,7 @@ pub enum ConnectorResolveError {
     },
     AuthRequired {
         connection_id: String,
+        message: Option<String>,
         suggested_command: String,
     },
     ConnectionRevoked {
@@ -69,9 +70,13 @@ impl ConnectorResolveError {
                 format!("connector `{connector}` is not supported by this build")
             }
             Self::MissingConnection { message, .. } => message.clone(),
-            Self::AuthRequired { connection_id, .. } => {
+            Self::AuthRequired {
+                connection_id,
+                message,
+                ..
+            } => message.clone().unwrap_or_else(|| {
                 format!("credential for connection `{connection_id}` was not found")
-            }
+            }),
             Self::ConnectionRevoked { connection_id, .. } => {
                 format!("connection `{connection_id}` is revoked")
             }
@@ -294,6 +299,7 @@ fn refresh_oauth_credential(
         if stored.refresh_token.is_none() && stored.refresh_token_handle.is_none() {
             return Err(ConnectorResolveError::AuthRequired {
                 connection_id: connection.connection_id.0.clone(),
+                message: None,
                 suggested_command: "loc connect notion".to_string(),
             });
         }
@@ -312,6 +318,7 @@ fn refresh_oauth_credential(
     ) else {
         return Err(ConnectorResolveError::AuthRequired {
             connection_id: connection.connection_id.0.clone(),
+            message: None,
             suggested_command: "loc connect notion".to_string(),
         });
     };
@@ -331,6 +338,7 @@ fn credential_error(
     match error {
         CredentialError::NotFound(_) => ConnectorResolveError::AuthRequired {
             connection_id: connection.connection_id.0.clone(),
+            message: None,
             suggested_command: "loc connect notion".to_string(),
         },
         CredentialError::Unavailable(message) | CredentialError::Io(message) => {

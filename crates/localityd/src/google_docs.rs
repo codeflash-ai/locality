@@ -116,22 +116,72 @@ fn refresh_oauth_credential(
     let Some(refresh_token_handle) = stored.refresh_token_handle.clone() else {
         return Err(ConnectorResolveError::AuthRequired {
             connection_id: connection.connection_id.0.clone(),
+            message: None,
             suggested_command: "loc connect google-docs".to_string(),
         });
     };
     let Some(broker_url) = stored.oauth_broker_url.clone() else {
         return Err(ConnectorResolveError::AuthRequired {
             connection_id: connection.connection_id.0.clone(),
+            message: None,
             suggested_command: "loc connect google-docs".to_string(),
         });
     };
 
-    HttpGoogleDocsOAuthBrokerClient::new(broker_url)
+    HttpGoogleDocsOAuthBrokerClient::new(broker_url.clone())
         .refresh_token(&OAuthBrokerRefresh {
             connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
             refresh_token_handle: Some(refresh_token_handle),
         })
-        .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))
+        .map_err(|error| google_docs_refresh_error(connection, &broker_url, error))
+}
+
+fn is_loopback_broker_url(url: &str) -> bool {
+    let Some(authority) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let host_port = authority
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(authority)
+        .to_ascii_lowercase();
+    let host = if host_port.starts_with('[') {
+        host_port
+            .split(']')
+            .next()
+            .map(|value| format!("{value}]"))
+            .unwrap_or(host_port)
+    } else {
+        host_port
+            .split(':')
+            .next()
+            .unwrap_or(host_port.as_str())
+            .to_string()
+    };
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+}
+
+fn google_docs_refresh_error(
+    connection: &ConnectionRecord,
+    broker_url: &str,
+    error: LocalityError,
+) -> ConnectorResolveError {
+    let hint = if is_loopback_broker_url(broker_url) {
+        "reconnect with the default hosted broker or keep the local broker running"
+    } else {
+        "reconnect to issue a fresh Google Docs refresh handle"
+    };
+    ConnectorResolveError::AuthRequired {
+        connection_id: connection.connection_id.0.clone(),
+        message: Some(format!(
+            "Google Docs credential for connection `{}` could not be refreshed through OAuth broker at `{broker_url}`: {error}; {hint}",
+            connection.connection_id.0
+        )),
+        suggested_command: "loc connect google-docs".to_string(),
+    }
 }
 
 fn active_google_docs_connections<S>(
@@ -187,6 +237,7 @@ fn credential_error(
     match error {
         CredentialError::NotFound(_) => ConnectorResolveError::AuthRequired {
             connection_id: connection.connection_id.0.clone(),
+            message: None,
             suggested_command: "loc connect google-docs".to_string(),
         },
         CredentialError::Unavailable(message) | CredentialError::Io(message) => {
