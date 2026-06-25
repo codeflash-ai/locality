@@ -28,6 +28,7 @@ use locality_store::{
 };
 use localityd::execution::PushJobReport;
 use localityd::file_provider as daemon_file_provider;
+use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::hydration::write_parent_database_schema_cache;
 use localityd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
 use localityd::virtual_fs::{
@@ -295,6 +296,8 @@ struct DaemonArgs {
 enum MountCommand {
     #[command(about = "Mount Notion content")]
     Notion(MountNotionArgs),
+    #[command(name = "google-docs", about = "Mount Google Docs content")]
+    GoogleDocs(MountGoogleDocsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -323,6 +326,40 @@ struct MountNotionArgs {
         long,
         value_name = "id",
         help = "Mount id to save. Defaults to notion-main."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        help = "Register the mount as read-only and block push operations."
+    )]
+    read_only: bool,
+}
+
+#[derive(Debug, Args)]
+struct MountGoogleDocsArgs {
+    #[arg(
+        value_name = "path",
+        help = "Local directory where the mount should be registered."
+    )]
+    path: String,
+    #[arg(
+        long,
+        value_name = "name-or-id",
+        help = "Google Drive workspace folder name, id, or folder URL."
+    )]
+    workspace_folder: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to google-docs-main."
     )]
     mount_id: Option<String>,
     #[arg(
@@ -718,6 +755,24 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         "--root-page",
                         options.root_page.as_deref(),
                     );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    push_flag(&mut args, "--read-only", options.read_only);
+                }
+                MountCommand::GoogleDocs(options) => {
+                    args.push("google-docs".to_string());
+                    args.push(options.path.clone());
+                    args.push("--workspace-folder".to_string());
+                    args.push(options.workspace_folder.clone());
                     push_optional_flag_value(
                         &mut args,
                         "--connection",
@@ -1694,14 +1749,14 @@ fn restore(args: &[String], json: bool) -> i32 {
 }
 
 fn mount(args: &[String], json: bool) -> i32 {
-    let descriptor = source_descriptor("notion");
-    if first_positional(args) != Some(descriptor.id()) {
+    let Some(connector) = first_positional(args) else {
         return command_error(
             json,
             CommandError::new("mount", "usage", mount_usage()),
             EXIT_USAGE,
         );
-    }
+    };
+    let descriptor = source_descriptor(connector);
 
     let Some(root) = nth_positional(args, 1) else {
         return command_error(
@@ -1710,37 +1765,6 @@ fn mount(args: &[String], json: bool) -> i32 {
             EXIT_USAGE,
         );
     };
-    let root_page_id = flag_value(args, "--root-page");
-    let workspace_mount = has_flag(args, "--workspace");
-    if root_page_id.is_some() && workspace_mount {
-        return command_error(
-            json,
-            CommandError::new(
-                "mount",
-                "usage",
-                format!(
-                    "loc mount {} accepts either --workspace or --root-page <page-id>, not both",
-                    descriptor.id()
-                ),
-            ),
-            EXIT_USAGE,
-        );
-    }
-    if root_page_id.is_none() && !workspace_mount {
-        return command_error(
-            json,
-            CommandError::new(
-                "mount",
-                "usage",
-                format!(
-                    "loc mount {} requires --workspace or --root-page <page-id>",
-                    descriptor.id()
-                ),
-            ),
-            EXIT_USAGE,
-        );
-    }
-
     let projection = match projection_mode(args) {
         Ok(projection) => projection,
         Err(message) => {
@@ -1763,22 +1787,41 @@ fn mount(args: &[String], json: bool) -> i32 {
             );
         }
     };
-    let connection_id = match resolve_mount_connection(&store, args) {
+    let connection_id = match resolve_mount_connection(&store, args, &descriptor) {
         Ok(connection_id) => connection_id,
         Err(error) => return command_error(json, error, EXIT_INTERNAL),
     };
+    let mount_id = MountId::new(
+        flag_value(args, "--mount-id")
+            .map(str::to_string)
+            .unwrap_or_else(|| descriptor.default_mount_id().to_string()),
+    );
+    let read_only = has_flag(args, "--read-only");
+    let remote_root_id = match mount_remote_root_id(
+        args,
+        &descriptor,
+        &store,
+        &state_root,
+        &mount_id,
+        root,
+        &connection_id,
+        read_only,
+        &projection,
+    ) {
+        Ok(remote_root_id) => remote_root_id,
+        Err(error) => {
+            let exit_code = mount_remote_root_error_exit_code(&error);
+            return command_error(json, error, exit_code);
+        }
+    };
 
     let options = MountOptions {
-        mount_id: MountId::new(
-            flag_value(args, "--mount-id")
-                .map(str::to_string)
-                .unwrap_or_else(|| descriptor.default_mount_id().to_string()),
-        ),
+        mount_id,
         connector: descriptor.id().to_string(),
         root: PathBuf::from(root),
-        remote_root_id: root_page_id.map(RemoteId::new),
+        remote_root_id,
         connection_id,
-        read_only: has_flag(args, "--read-only"),
+        read_only,
         projection,
     };
     let mount_id = options.mount_id.clone();
@@ -1797,6 +1840,94 @@ fn mount(args: &[String], json: bool) -> i32 {
             EXIT_SUCCESS
         }
         Err(error) => mount_command_error(json, error),
+    }
+}
+
+fn mount_remote_root_id(
+    args: &[String],
+    descriptor: &SourceDescriptor,
+    store: &SqliteStateStore,
+    state_root: &Path,
+    mount_id: &MountId,
+    root: &str,
+    connection_id: &Option<ConnectionId>,
+    read_only: bool,
+    projection: &ProjectionMode,
+) -> Result<Option<RemoteId>, CommandError> {
+    match descriptor.id() {
+        "notion" => {
+            let root_page_id = flag_value(args, "--root-page");
+            let workspace_mount = has_flag(args, "--workspace");
+            if root_page_id.is_some() && workspace_mount {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount notion accepts either --workspace or --root-page <page-id>, not both",
+                ));
+            }
+            if root_page_id.is_none() && !workspace_mount {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount notion requires --workspace or --root-page <page-id>",
+                ));
+            }
+            Ok(root_page_id.map(RemoteId::new))
+        }
+        GOOGLE_DOCS_CONNECTOR_ID => {
+            if has_flag(args, "--workspace") || flag_value(args, "--root-page").is_some() {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount google-docs uses --workspace-folder <name-or-id>, not Notion root flags",
+                ));
+            }
+            let Some(workspace_folder) = flag_value(args, "--workspace-folder") else {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount google-docs requires --workspace-folder <name-or-id>",
+                ));
+            };
+            let temp_mount = MountConfig {
+                mount_id: mount_id.clone(),
+                connector: descriptor.id().to_string(),
+                root: PathBuf::from(root),
+                remote_root_id: None,
+                connection_id: connection_id.clone(),
+                read_only,
+                projection: projection.clone(),
+            };
+            let credentials = open_credential_store(state_root);
+            let connector =
+                resolve_google_docs_connector_for_mount(store, credentials.as_ref(), &temp_mount)
+                    .map_err(|error| connector_resolve_command_error("mount", error))?;
+            let folder_id = connector
+                .resolve_workspace_folder(workspace_folder)
+                .map_err(|error| {
+                    CommandError::new(
+                        "mount",
+                        "workspace_folder_error",
+                        format!(
+                            "failed to resolve Google Docs workspace folder `{workspace_folder}`: {error}"
+                        ),
+                    )
+                    .with_suggested_command("loc connect google-docs")
+                })?;
+            Ok(Some(folder_id))
+        }
+        connector => Err(CommandError::new(
+            "mount",
+            "usage",
+            format!("loc mount {connector} is not supported by this build"),
+        )),
+    }
+}
+
+fn mount_remote_root_error_exit_code(error: &CommandError) -> i32 {
+    match error.code.as_str() {
+        "usage" => EXIT_USAGE,
+        _ => EXIT_INTERNAL,
     }
 }
 
@@ -4219,8 +4350,8 @@ fn pull_direct_fallback_error(
 fn resolve_mount_connection(
     store: &SqliteStateStore,
     args: &[String],
+    descriptor: &SourceDescriptor,
 ) -> Result<Option<ConnectionId>, CommandError> {
-    let descriptor = source_descriptor("notion");
     if let Some(connection_id) = flag_value(args, "--connection") {
         let connection_id = ConnectionId::new(connection_id);
         let connection = store
@@ -4513,6 +4644,17 @@ fn connector_command_error(command: &'static str, json: bool, error: ConnectorRe
         payload = payload.with_suggested_command(suggested_command);
     }
     command_error(json, payload, exit_code)
+}
+
+fn connector_resolve_command_error(
+    command: &'static str,
+    error: ConnectorResolveError,
+) -> CommandError {
+    let mut payload = CommandError::new(command, error.code(), error.message());
+    if let Some(suggested_command) = error.suggested_command() {
+        payload = payload.with_suggested_command(suggested_command);
+    }
+    payload
 }
 
 fn history_command_error(command: &'static str, json: bool, error: HistoryError) -> i32 {
@@ -4817,10 +4959,8 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 }
 
 fn mount_usage() -> String {
-    let descriptor = source_descriptor("notion");
     format!(
-        "usage: loc mount {} <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {}] [--read-only] [--json]",
-        descriptor.id(),
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -5289,7 +5429,13 @@ mod tests {
             ),
             (
                 vec!["mount", "--help"],
-                vec!["Usage: loc mount", "Commands:", "notion", "--json"],
+                vec![
+                    "Usage: loc mount",
+                    "Commands:",
+                    "notion",
+                    "google-docs",
+                    "--json",
+                ],
             ),
             (
                 vec!["mount", "notion", "--help"],
@@ -5298,6 +5444,14 @@ mod tests {
                     "Mount Notion content",
                     "--workspace",
                     "--root-page",
+                ],
+            ),
+            (
+                vec!["mount", "google-docs", "--help"],
+                vec![
+                    "Usage: loc mount google-docs",
+                    "Mount Google Docs content",
+                    "--workspace-folder",
                 ],
             ),
             (

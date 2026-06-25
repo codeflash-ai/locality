@@ -21,7 +21,7 @@ use locality_core::planner::PushOperationKind;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
-use locality_google_docs::GOOGLE_DOCS_CONNECTOR_ID;
+use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConnector};
 use locality_notion::NotionConnector;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use locality_store::{
@@ -30,6 +30,7 @@ use locality_store::{
 };
 
 use crate::file_provider;
+use crate::google_docs::resolve_google_docs_connector_for_mount;
 use crate::hydration::{HydratedEntity, HydrationSource};
 use crate::notion::{ConnectorResolveError, resolve_notion_connector_for_mount};
 use crate::reconcile::ScheduledPullSource;
@@ -39,6 +40,7 @@ const NOTION_AGENT_GUIDANCE: &str = include_str!("../../../templates/mount/AGENT
 #[derive(Clone, Debug)]
 pub enum ResolvedSource {
     Notion(NotionConnector),
+    GoogleDocs(GoogleDocsConnector),
 }
 
 pub trait SourceResolverStore: ConnectionRepository + ConnectorProfileRepository {}
@@ -74,8 +76,8 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
         id: GOOGLE_DOCS_CONNECTOR_ID,
         descriptor: google_docs_source_descriptor,
         resolve: resolve_google_docs_source,
-        validate_changed_frontmatter: clean_frontmatter_validation,
-        validate_create_frontmatter: clean_frontmatter_validation,
+        validate_changed_frontmatter: crate::google_docs::validate_google_docs_frontmatter,
+        validate_create_frontmatter: crate::google_docs::validate_google_docs_frontmatter,
     },
 ];
 
@@ -181,19 +183,12 @@ fn resolve_notion_source(
 }
 
 fn resolve_google_docs_source(
-    _store: &dyn SourceResolverStore,
-    _credentials: &dyn CredentialStore,
-    _mount: &MountConfig,
+    store: &dyn SourceResolverStore,
+    credentials: &dyn CredentialStore,
+    mount: &MountConfig,
 ) -> Result<ResolvedSource, ConnectorResolveError> {
-    Err(ConnectorResolveError::UnsupportedConnector(
-        GOOGLE_DOCS_CONNECTOR_ID.to_string(),
-    ))
-}
-
-fn clean_frontmatter_validation(
-    _context: SourceValidationContext<'_>,
-) -> LocalityResult<ValidationReport> {
-    Ok(ValidationReport::clean())
+    resolve_google_docs_connector_for_mount(store, credentials, mount)
+        .map(ResolvedSource::GoogleDocs)
 }
 
 fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
@@ -307,72 +302,84 @@ impl Connector for ResolvedSource {
     fn kind(&self) -> ConnectorKind {
         match self {
             Self::Notion(source) => source.kind(),
+            Self::GoogleDocs(source) => source.kind(),
         }
     }
 
     fn capabilities(&self) -> ConnectorCapabilities {
         match self {
             Self::Notion(source) => source.capabilities(),
+            Self::GoogleDocs(source) => source.capabilities(),
         }
     }
 
     fn supported_push_operations(&self) -> BTreeSet<PushOperationKind> {
         match self {
             Self::Notion(source) => source.supported_push_operations(),
+            Self::GoogleDocs(source) => source.supported_push_operations(),
         }
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
         match self {
             Self::Notion(source) => source.enumerate(request),
+            Self::GoogleDocs(source) => source.enumerate(request),
         }
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {
         match self {
             Self::Notion(source) => source.observe(request),
+            Self::GoogleDocs(source) => source.observe(request),
         }
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
         match self {
             Self::Notion(source) => source.list_children(request),
+            Self::GoogleDocs(source) => source.list_children(request),
         }
     }
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
         match self {
             Self::Notion(source) => source.fetch(request),
+            Self::GoogleDocs(source) => source.fetch(request),
         }
     }
 
     fn render(&self, entity: &NativeEntity) -> LocalityResult<CanonicalDocument> {
         match self {
             Self::Notion(source) => source.render(entity),
+            Self::GoogleDocs(source) => source.render(entity),
         }
     }
 
     fn parse(&self, document: &CanonicalDocument) -> LocalityResult<ParsedEntity> {
         match self {
             Self::Notion(source) => source.parse(document),
+            Self::GoogleDocs(source) => source.parse(document),
         }
     }
 
     fn check_concurrency(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
         match self {
             Self::Notion(source) => source.check_concurrency(request),
+            Self::GoogleDocs(source) => source.check_concurrency(request),
         }
     }
 
     fn apply(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<ApplyPlanResult> {
         match self {
             Self::Notion(source) => source.apply(request),
+            Self::GoogleDocs(source) => source.apply(request),
         }
     }
 
     fn apply_undo(&self, request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
         match self {
             Self::Notion(source) => source.apply_undo(request),
+            Self::GoogleDocs(source) => source.apply_undo(request),
         }
     }
 }
@@ -381,12 +388,14 @@ impl HydrationSource for ResolvedSource {
     fn fetch_render(&self, request: &HydrationRequest) -> LocalityResult<HydratedEntity> {
         match self {
             Self::Notion(source) => source.fetch_render(request),
+            Self::GoogleDocs(source) => source.fetch_render(request),
         }
     }
 
     fn fetch_database_schema_yaml(&self, database_id: &RemoteId) -> LocalityResult<Option<String>> {
         match self {
             Self::Notion(source) => source.fetch_database_schema_yaml(database_id),
+            Self::GoogleDocs(source) => source.fetch_database_schema_yaml(database_id),
         }
     }
 }
@@ -437,6 +446,7 @@ impl SourcePushValidator for ResolvedSource {
     ) -> LocalityResult<ValidationReport> {
         match self {
             Self::Notion(source) => source.validate_changed_frontmatter(context),
+            Self::GoogleDocs(source) => source.validate_changed_frontmatter(context),
         }
     }
 
@@ -446,6 +456,7 @@ impl SourcePushValidator for ResolvedSource {
     ) -> LocalityResult<ValidationReport> {
         match self {
             Self::Notion(source) => source.validate_create_frontmatter(context),
+            Self::GoogleDocs(source) => source.validate_create_frontmatter(context),
         }
     }
 }
@@ -457,12 +468,14 @@ impl SourceAdapter for ResolvedSource {
     {
         match self {
             Self::Notion(source) => Self::Notion(source.scoped_to_mount(mount)),
+            Self::GoogleDocs(source) => Self::GoogleDocs(source.scoped_to_mount(mount)),
         }
     }
 
     fn database_schema_yaml(&self, database_id: &RemoteId) -> LocalityResult<Option<String>> {
         match self {
             Self::Notion(source) => SourceAdapter::database_schema_yaml(source, database_id),
+            Self::GoogleDocs(source) => SourceAdapter::database_schema_yaml(source, database_id),
         }
     }
 }

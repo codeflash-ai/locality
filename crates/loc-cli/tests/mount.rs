@@ -161,6 +161,38 @@ fn mount_can_persist_workspace_root() {
     );
 }
 
+#[test]
+fn mount_can_persist_google_docs_workspace_folder() {
+    let fixture = MountFixture::new("loc-cli-mount-google-docs");
+    let mut store = InMemoryStateStore::new();
+
+    let report = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("google-docs-main"),
+            connector: "google-docs".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("workspace-folder")),
+            connection_id: Some(ConnectionId::new("google-docs-default")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount");
+
+    assert_eq!(report.connector, "google-docs");
+    assert_eq!(report.remote_root_id.as_deref(), Some("workspace-folder"));
+    assert_eq!(
+        store
+            .get_mount(&MountId::new("google-docs-main"))
+            .expect("get mount")
+            .expect("mount")
+            .remote_root_id,
+        Some(RemoteId::new("workspace-folder"))
+    );
+    assert!(read_to_string(fixture.agents_file()).contains("Google Docs"));
+}
+
 struct MountFixture {
     root: PathBuf,
 }

@@ -20,6 +20,7 @@ pub const GOOGLE_DOCS_OAUTH_SCOPES: &[&str] = &[
     "email",
     "profile",
     "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive.file",
 ];
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
@@ -171,7 +172,7 @@ pub fn google_docs_capabilities_json() -> Result<String, serde_json::Error> {
         supports_remote_observation: true,
         supports_lazy_child_enumeration: true,
         supports_media_download: false,
-        supports_undo: true,
+        supports_undo: false,
         supports_batch_observation: false,
     };
     serde_json::to_string(&capabilities)
@@ -190,15 +191,31 @@ fn ensure_reqwest_crypto_provider() {
 
 #[cfg(test)]
 mod tests {
+    use locality_connector::ConnectorCapabilities;
     use locality_connector::oauth_broker::OAuthBrokerToken;
 
-    use super::{GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential};
+    use super::{
+        GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential,
+        google_docs_capabilities_json,
+    };
 
     #[test]
-    fn oauth_scopes_do_not_request_google_drive_access() {
+    fn oauth_scopes_include_google_docs_and_drive_file_access() {
         assert!(GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/documents"));
         assert!(!GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive"));
-        assert!(!GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.file"));
+        assert!(GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.file"));
+    }
+
+    #[test]
+    fn stored_capabilities_match_google_docs_connector_support() {
+        let capabilities: ConnectorCapabilities =
+            serde_json::from_str(&google_docs_capabilities_json().expect("capabilities json"))
+                .expect("decode capabilities");
+
+        assert!(capabilities.supports_block_updates);
+        assert!(capabilities.supports_oauth);
+        assert!(!capabilities.supports_databases);
+        assert!(!capabilities.supports_undo);
     }
 
     #[test]

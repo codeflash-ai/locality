@@ -2,6 +2,7 @@ pub mod autosave;
 pub mod execution;
 pub mod file_provider;
 pub mod freshness;
+pub mod google_docs;
 pub mod hydration;
 pub mod ipc;
 pub mod mcp;

@@ -11,6 +11,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc connection show <id> [--json]`
 - `loc disconnect <id> [--json]`
 - `loc mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
+- `loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `loc daemon status [--json]`
 - `loc info [path] [--json]`
 - `loc status [path] [--json]`
@@ -64,7 +65,9 @@ Connections now point at connector profiles. A profile is Locality's local auth-
 
 The default connection ID is `notion-default` when no Notion connection exists. If a Notion connection already exists, pass `--name <id>` to avoid overwriting by accident.
 
-`loc connect google-docs [--name <id>]` uses the same Locality OAuth broker flow for Google Docs. The default broker is `https://loc-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GOOGLE_DOCS_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default callback is `http://localhost:8757/oauth/google-docs/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_DOCS_OAUTH_REDIRECT_URI`. The Google OAuth client must allow that callback and the broker must be configured with the Google Docs document scope.
+`loc connect google-docs [--name <id>]` uses the same Locality OAuth broker flow for Google Docs. The default broker is `https://loc-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GOOGLE_DOCS_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default callback is `http://localhost:8757/oauth/google-docs/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GOOGLE_DOCS_OAUTH_REDIRECT_URI`. The Google OAuth client must allow that callback and the broker must be configured with `openid`, `email`, `profile`, Google Docs document access, and Drive `drive.file` access.
+
+`loc mount google-docs <path> --workspace-folder <name-or-id>` registers a Google Docs mount rooted at a Locality-owned Google Drive folder. Folder URLs and ids are verified through Drive; names reuse an accessible matching folder or create a new Locality workspace folder. The resolved Drive folder id is stored as the mount `remote_root_id`. Google Docs files project as page directories containing `page.md`, and Drive folders project as local directories.
 
 `loc connections` and `loc connection show <id>` list connected-account metadata only, including the profile ID but never credentials. `loc profiles` lists connector auth profiles and contains no account secrets. `loc disconnect <id>` deletes the credential and marks the connection `revoked`; mounts remain registered and will report `connection_revoked` on the next pull/push until reconnected or remounted.
 

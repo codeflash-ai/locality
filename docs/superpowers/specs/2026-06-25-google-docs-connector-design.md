@@ -16,7 +16,7 @@ transport code in a new connector crate.
 
 - Add `loc connect google-docs` using the same broker-backed OAuth model as
   `loc connect notion`.
-- Add `loc mount google-docs` for a My Drive or Drive folder root.
+- Add `loc mount google-docs` for a Locality-owned Drive workspace folder.
 - Store Google connection metadata in the existing connector-neutral
   `ConnectionRecord` and `ConnectorProfileRecord` tables.
 - Store only local credential material and opaque broker refresh handles in the
@@ -52,7 +52,7 @@ New commands:
 
 ```bash
 loc connect google-docs [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>] [--json]
-loc mount google-docs <path> (--my-drive | --drive-folder <folder-url-or-id>) [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]
+loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]
 ```
 
 Defaults:
@@ -134,7 +134,8 @@ The broker returns a token payload:
     "openid",
     "email",
     "profile",
-    "https://www.googleapis.com/auth/documents"
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/drive.file"
   ]
 }
 ```
@@ -163,18 +164,22 @@ openid
 email
 profile
 https://www.googleapis.com/auth/documents
+https://www.googleapis.com/auth/drive.file
 ```
 
-`documents` is needed for Google Docs body read/write. Drive access is omitted
-from the initial OAuth request to keep local development consent narrow. A later
-Drive-backed mount implementation must add an explicit consent upgrade before it
-lists folders/docs, creates Docs, renames, moves, trashes/deletes, or inspects
-file metadata through Drive APIs.
+`documents` is needed for Google Docs body read/write. `drive.file` is needed
+for Locality-created or explicitly granted Drive files while keeping consent
+narrower than full Drive access. V1 mounts target a Locality-owned Drive
+workspace folder rather than arbitrary My Drive traversal.
 
-The broker project must enable Google Docs API. A later Drive-backed mount
-implementation must also enable Google Drive API. The OAuth consent screen must
-list exactly the scopes Locality requests, and the product must be prepared for
-Google's sensitive/restricted-scope review requirements.
+When `--workspace-folder` is a name, Locality resolves an accessible matching
+folder or creates a new Drive folder and persists the resolved folder id in the
+mount `remote_root_id`.
+
+The broker project must enable the Google Docs API and Google Drive API. The
+OAuth consent screen must list exactly the scopes Locality requests, and the
+product must be prepared for Google's sensitive/restricted-scope review
+requirements.
 
 ## Credential Shape
 
