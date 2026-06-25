@@ -15,6 +15,8 @@ pub struct GoogleDocument {
     pub body: DocumentBody,
     #[serde(default)]
     pub lists: BTreeMap<String, List>,
+    #[serde(default)]
+    pub inline_objects: BTreeMap<String, InlineObject>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +79,7 @@ pub struct ParagraphElement {
     #[serde(default)]
     pub text_run: Option<TextRun>,
     #[serde(default)]
-    pub inline_object_element: Option<serde_json::Value>,
+    pub inline_object_element: Option<InlineObjectElement>,
     #[serde(default)]
     pub page_break: Option<serde_json::Value>,
     #[serde(default)]
@@ -114,6 +116,49 @@ pub struct TextStyle {
 pub struct Link {
     #[serde(default)]
     pub url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineObjectElement {
+    #[serde(default)]
+    pub inline_object_id: Option<String>,
+    #[serde(default)]
+    pub text_style: TextStyle,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineObject {
+    #[serde(default)]
+    pub object_id: Option<String>,
+    #[serde(default)]
+    pub inline_object_properties: InlineObjectProperties,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineObjectProperties {
+    #[serde(default)]
+    pub embedded_object: Option<EmbeddedObject>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddedObject {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub image_properties: Option<ImageProperties>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageProperties {
+    #[serde(default)]
+    pub content_uri: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +327,20 @@ mod tests {
                     }
                 ]
             },
+            "inlineObjects": {
+                "obj-1": {
+                    "objectId": "obj-1",
+                    "inlineObjectProperties": {
+                        "embeddedObject": {
+                            "title": "Logo",
+                            "description": "A circle with logo written in the center",
+                            "imageProperties": {
+                                "contentUri": "https://example.test/circle.png"
+                            }
+                        }
+                    }
+                }
+            },
             "lists": {
                 "list-1": {
                     "listProperties": {
@@ -314,6 +373,15 @@ mod tests {
                 .bold
         );
         assert_eq!(doc.body.content[2].table.as_ref().unwrap().columns, Some(2));
+        assert_eq!(
+            doc.inline_objects["obj-1"]
+                .inline_object_properties
+                .embedded_object
+                .as_ref()
+                .and_then(|object| object.image_properties.as_ref())
+                .and_then(|properties| properties.content_uri.as_deref()),
+            Some("https://example.test/circle.png")
+        );
     }
 
     #[test]

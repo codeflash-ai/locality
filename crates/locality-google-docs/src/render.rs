@@ -4,10 +4,13 @@ use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Serialize};
 
 use crate::docs_dto::{
-    GoogleDocument, Paragraph, ParagraphElement, StructuralElement, Table, TextStyle,
+    GoogleDocument, InlineObjectElement, Paragraph, ParagraphElement, StructuralElement, Table,
+    TextStyle,
 };
 use crate::drive_dto::DriveFile;
 use crate::oauth::GOOGLE_DOCS_CONNECTOR_ID;
+
+pub const GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND: &str = "google_docs_inline_object";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoogleDocsNativeBundle {
@@ -33,14 +36,17 @@ pub fn render_google_document(
     for element in &bundle.document.body.content {
         let block_id = element_block_id(&bundle.document.document_id, element);
         if let Some(paragraph) = &element.paragraph {
-            let has_unsupported_inline = paragraph_has_unsupported_inline(paragraph);
             let paragraph = render_paragraph(&bundle.document, paragraph);
-            if !paragraph.trim().is_empty() {
-                rendered_blocks.push(paragraph);
+            if !paragraph.text.trim().is_empty() {
+                rendered_blocks.push(paragraph.text);
                 native_block_ids.push(RemoteId::new(block_id));
-                native_block_kinds.push(None);
+                native_block_kinds.push(
+                    paragraph
+                        .has_rendered_inline_object
+                        .then(|| GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND.to_string()),
+                );
             }
-            if has_unsupported_inline {
+            if paragraph.has_unsupported_inline {
                 push_blocking_directives = true;
                 rendered_blocks.push(format!(
                     "::loc{{id={}:unsupported type=google_docs_unsupported kind=\"inline_element\"}}",
@@ -48,13 +54,16 @@ pub fn render_google_document(
                 ));
             }
         } else if let Some(table) = &element.table {
-            let table = render_table(table);
+            let table = render_table(&bundle.document, table);
             if !table.trim().is_empty() {
                 rendered_blocks.push(table);
                 native_block_ids.push(RemoteId::new(block_id));
                 native_block_kinds.push(Some("google_docs_table".to_string()));
             }
         } else if unsupported_structural_element(element) {
+            if implicit_document_boundary_section_break(element) {
+                continue;
+            }
             push_blocking_directives = true;
             rendered_blocks.push(format!(
                 "::loc{{id={} type=google_docs_unsupported kind=\"{}\"}}",
@@ -120,14 +129,25 @@ pub fn combined_remote_version(file: &DriveFile, docs_revision_id: Option<&str>)
     }
 }
 
-fn render_paragraph(document: &GoogleDocument, paragraph: &Paragraph) -> String {
-    let text = paragraph_text(&paragraph.elements);
-    let text = trim_docs_newline(&text);
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RenderedParagraph {
+    text: String,
+    has_unsupported_inline: bool,
+    has_rendered_inline_object: bool,
+}
+
+fn render_paragraph(document: &GoogleDocument, paragraph: &Paragraph) -> RenderedParagraph {
+    let inline = paragraph_text(document, &paragraph.elements);
+    let text = trim_docs_newline(&inline.text);
     if text.trim().is_empty() {
-        return String::new();
+        return RenderedParagraph {
+            text: String::new(),
+            has_unsupported_inline: inline.has_unsupported_inline,
+            has_rendered_inline_object: inline.has_rendered_inline_object,
+        };
     }
 
-    if let Some(bullet) = &paragraph.bullet {
+    let text = if let Some(bullet) = &paragraph.bullet {
         let nesting = bullet.nesting_level.unwrap_or_default();
         let indent = "  ".repeat(nesting);
         let marker = bullet
@@ -138,26 +158,60 @@ fn render_paragraph(document: &GoogleDocument, paragraph: &Paragraph) -> String 
             .and_then(|level| level.glyph_type.as_deref())
             .map(list_marker)
             .unwrap_or("-");
-        return format!("{indent}{marker} {text}");
-    }
+        format!("{indent}{marker} {text}")
+    } else {
+        match paragraph
+            .paragraph_style
+            .as_ref()
+            .and_then(|style| style.named_style_type.as_deref())
+            .and_then(heading_level)
+        {
+            Some(level) => format!("{} {}", "#".repeat(level), text),
+            None => text.to_string(),
+        }
+    };
 
-    match paragraph
-        .paragraph_style
-        .as_ref()
-        .and_then(|style| style.named_style_type.as_deref())
-        .and_then(heading_level)
-    {
-        Some(level) => format!("{} {}", "#".repeat(level), text),
-        None => text.to_string(),
+    RenderedParagraph {
+        text,
+        has_unsupported_inline: inline.has_unsupported_inline,
+        has_rendered_inline_object: inline.has_rendered_inline_object,
     }
 }
 
-fn paragraph_text(elements: &[ParagraphElement]) -> String {
-    elements
-        .iter()
-        .filter_map(|element| element.text_run.as_ref())
-        .map(|text_run| render_text_run(&text_run.content, &text_run.text_style))
-        .collect::<String>()
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RenderedInlineContent {
+    text: String,
+    has_unsupported_inline: bool,
+    has_rendered_inline_object: bool,
+}
+
+fn paragraph_text(
+    document: &GoogleDocument,
+    elements: &[ParagraphElement],
+) -> RenderedInlineContent {
+    let mut rendered = RenderedInlineContent::default();
+    for element in elements {
+        if let Some(text_run) = element.text_run.as_ref() {
+            rendered
+                .text
+                .push_str(&render_text_run(&text_run.content, &text_run.text_style));
+        }
+        if let Some(inline_object) = element.inline_object_element.as_ref() {
+            if let Some(image) = render_inline_image(document, inline_object) {
+                rendered.text.push_str(&image);
+                rendered.has_rendered_inline_object = true;
+            } else {
+                rendered.has_unsupported_inline = true;
+            }
+        }
+        if element.page_break.is_some()
+            || element.footnote_reference.is_some()
+            || element.equation.is_some()
+        {
+            rendered.has_unsupported_inline = true;
+        }
+    }
+    rendered
 }
 
 fn render_text_run(content: &str, style: &TextStyle) -> String {
@@ -183,7 +237,7 @@ fn render_text_run(content: &str, style: &TextStyle) -> String {
     rendered
 }
 
-fn render_table(table: &Table) -> String {
+fn render_table(document: &GoogleDocument, table: &Table) -> String {
     let rows = table
         .table_rows
         .iter()
@@ -195,7 +249,8 @@ fn render_table(table: &Table) -> String {
                         .iter()
                         .filter_map(|element| element.paragraph.as_ref())
                         .map(|paragraph| {
-                            trim_docs_newline(&paragraph_text(&paragraph.elements)).to_string()
+                            trim_docs_newline(&paragraph_text(document, &paragraph.elements).text)
+                                .to_string()
                         })
                         .collect::<Vec<_>>()
                         .join("<br>")
@@ -267,13 +322,49 @@ fn unsupported_structural_element(element: &StructuralElement) -> bool {
     element.section_break.is_some() || element.table_of_contents.is_some()
 }
 
-fn paragraph_has_unsupported_inline(paragraph: &Paragraph) -> bool {
-    paragraph.elements.iter().any(|element| {
-        element.inline_object_element.is_some()
-            || element.page_break.is_some()
-            || element.footnote_reference.is_some()
-            || element.equation.is_some()
-    })
+fn implicit_document_boundary_section_break(element: &StructuralElement) -> bool {
+    element.section_break.is_some()
+        && element.start_index.unwrap_or_default() == 0
+        && element.end_index == Some(1)
+}
+
+fn render_inline_image(
+    document: &GoogleDocument,
+    inline_object: &InlineObjectElement,
+) -> Option<String> {
+    let object_id = inline_object.inline_object_id.as_deref()?;
+    let embedded_object = document
+        .inline_objects
+        .get(object_id)?
+        .inline_object_properties
+        .embedded_object
+        .as_ref()?;
+    let content_uri = embedded_object
+        .image_properties
+        .as_ref()?
+        .content_uri
+        .as_deref()?;
+    let alt = embedded_object
+        .description
+        .as_deref()
+        .or(embedded_object.title.as_deref())
+        .unwrap_or("Google Docs image");
+    Some(format!(
+        "![{}]({})",
+        markdown_image_alt(alt),
+        markdown_image_target(content_uri)
+    ))
+}
+
+fn markdown_image_alt(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
+fn markdown_image_target(value: &str) -> String {
+    value.replace(')', "%29")
 }
 
 fn unsupported_kind(element: &StructuralElement) -> &'static str {
@@ -425,6 +516,33 @@ mod tests {
     }
 
     #[test]
+    fn initial_document_section_break_is_not_rendered_as_unsupported_content() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Plain Doc"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Plain Doc",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "endIndex": 1, "sectionBreak": {} },
+                        { "startIndex": 1, "endIndex": 12, "paragraph": {
+                            "elements": [{ "textRun": { "content": "Hello doc\n" } }]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(rendered.document.body, "Hello doc\n");
+        assert!(!rendered.document.body.contains("google_docs_unsupported"));
+        assert!(!rendered.push_blocking_directives);
+    }
+
+    #[test]
     fn unsupported_inline_elements_render_as_push_blocking_directives() {
         let bundle = GoogleDocsNativeBundle {
             drive_file: drive_file("doc-1", "Inline Object Doc"),
@@ -457,6 +575,55 @@ mod tests {
                 .contains("type=google_docs_unsupported")
         );
         assert!(rendered.push_blocking_directives);
+    }
+
+    #[test]
+    fn inline_image_objects_render_as_markdown_images() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Logo Doc"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Logo Doc",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 2, "endIndex": 4, "paragraph": {
+                            "elements": [
+                                { "startIndex": 2, "endIndex": 3, "inlineObjectElement": { "inlineObjectId": "obj-1" } },
+                                { "startIndex": 3, "endIndex": 4, "textRun": { "content": "\n" } }
+                            ]
+                        }}
+                    ]
+                },
+                "inlineObjects": {
+                    "obj-1": {
+                        "objectId": "obj-1",
+                        "inlineObjectProperties": {
+                            "embeddedObject": {
+                                "description": "A circle with logo written in the center",
+                                "imageProperties": {
+                                    "contentUri": "https://example.test/circle.png"
+                                }
+                            }
+                        }
+                    }
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "![A circle with logo written in the center](https://example.test/circle.png)\n"
+        );
+        assert!(!rendered.document.body.contains("google_docs_unsupported"));
+        assert!(!rendered.push_blocking_directives);
+        assert_eq!(
+            rendered.shadow.blocks[0].native_kind.as_deref(),
+            Some("google_docs_inline_object")
+        );
     }
 
     fn drive_file(id: &str, name: &str) -> DriveFile {

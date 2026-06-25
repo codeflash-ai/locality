@@ -9,6 +9,7 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConfig, GoogleDocsConnector,
     HttpGoogleDocsOAuthBrokerClient, StoredGoogleDocsCredential,
+    render::GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND,
 };
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
@@ -299,6 +300,21 @@ pub(crate) fn validate_google_docs_frontmatter(
                 "editing Google Docs tables is not supported yet".to_string(),
                 Some(
                     "restore the rendered Markdown table or edit the table in Google Docs"
+                        .to_string(),
+                ),
+            ));
+        }
+        for block in shadow.blocks.iter().filter(|block| {
+            block.native_kind.as_deref() == Some(GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND)
+                && !context.parsed.document.body.contains(&block.text)
+        }) {
+            report.push(locality_core::validation::ValidationIssue::new(
+                "google_docs_inline_object_edit_unsupported",
+                context.relative_path,
+                Some(block.source_span.start_line),
+                "editing rendered Google Docs inline images is not supported yet".to_string(),
+                Some(
+                    "restore the rendered image Markdown or edit the image in Google Docs"
                         .to_string(),
                 ),
             ));

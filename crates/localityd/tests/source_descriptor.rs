@@ -285,3 +285,41 @@ fn local_google_docs_validator_blocks_markdown_table_edits() {
 
     assert_eq!(report.issues[0].code, "google_docs_table_edit_unsupported");
 }
+
+#[test]
+fn local_google_docs_validator_blocks_inline_image_block_edits() {
+    let mount = MountConfig::new(
+        MountId::new("google-docs-main"),
+        GOOGLE_DOCS_CONNECTOR_ID,
+        "/tmp/google-docs",
+    )
+    .with_remote_root_id(RemoteId::new("workspace-folder"));
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("doc-1"),
+        "![A circle with logo written in the center](https://example.test/circle.png)\n",
+        1,
+        [RemoteId::new("doc-1:2:4")],
+    )
+    .expect("shadow");
+    shadow.blocks[0].native_kind = Some("google_docs_inline_object".to_string());
+    let parsed = parse_canonical_markdown(
+        "---\nloc:\n  id: doc-1\n  type: page\n  connector: google-docs\ntitle: Logo Doc\n---\nEdited circle\n",
+    )
+    .expect("parse google docs markdown");
+
+    let report = LocalSourceValidator
+        .validate_changed_frontmatter(SourceValidationContext {
+            state_root: None,
+            mount: &mount,
+            parent: None,
+            relative_path: std::path::Path::new("logo-doc/page.md"),
+            parsed: &parsed,
+            shadow: Some(&shadow),
+        })
+        .expect("validate google docs");
+
+    assert_eq!(
+        report.issues[0].code,
+        "google_docs_inline_object_edit_unsupported"
+    );
+}

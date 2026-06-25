@@ -571,6 +571,35 @@ fn prepare_push_blocks_rendered_link_preview_delete_before_apply() {
 }
 
 #[test]
+fn prepare_push_blocks_google_docs_inline_image_move_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("google-docs");
+    let image = "![A circle with logo written in the center](https://example.test/circle.png)";
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        format!("Intro.\n\n{image}"),
+        8,
+        [RemoteId::new("page-1:1:8"), RemoteId::new("page-1:8:9")],
+    )
+    .expect("shadow");
+    shadow.blocks[1].native_kind = Some("google_docs_inline_object".to_string());
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", &format!("{image}\n\nIntro."));
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "google_docs_inline_object_move_unsupported"
+    );
+}
+
+#[test]
 fn prepare_push_blocks_notion_table_width_change_before_apply() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.store("notion");

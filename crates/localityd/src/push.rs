@@ -39,6 +39,7 @@ use locality_core::shadow::{
 };
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
+use locality_google_docs::render::GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND;
 use locality_notion::markdown_table::parse_markdown_table_shape;
 use locality_notion::media::{
     load_media_manifest, media_manifest_entry, resolve_media_href_with_content_root, sha256_hex,
@@ -606,6 +607,134 @@ fn validate_notion_pre_apply_semantics(
     pipeline.plan = None;
     pipeline.guardrail = GuardrailDecision::Proceed;
     pipeline.action = PushPipelineAction::FixValidation;
+}
+
+fn validate_google_docs_pre_apply_semantics(
+    mount: &MountConfig,
+    relative_path: &Path,
+    shadow: &ShadowDocument,
+    pipeline: &mut PushPipelineResult,
+) {
+    if mount.connector != "google-docs" {
+        return;
+    }
+    if !matches!(
+        pipeline.action,
+        PushPipelineAction::ProceedToApply
+            | PushPipelineAction::ConfirmPlan
+            | PushPipelineAction::ConfirmDangerousPlan
+    ) {
+        return;
+    }
+    let Some(plan) = pipeline.plan.as_ref() else {
+        return;
+    };
+    let validation = google_docs_pre_apply_semantic_validation(relative_path, shadow, plan);
+    if validation.is_clean() {
+        return;
+    }
+
+    pipeline.validation.extend(validation);
+    pipeline.plan = None;
+    pipeline.guardrail = GuardrailDecision::Proceed;
+    pipeline.action = PushPipelineAction::FixValidation;
+}
+
+fn google_docs_pre_apply_semantic_validation(
+    relative_path: &Path,
+    shadow: &ShadowDocument,
+    plan: &PushPlan,
+) -> ValidationReport {
+    let shadow_blocks = shadow
+        .blocks
+        .iter()
+        .map(|block| (&block.remote_id, block))
+        .collect::<BTreeMap<_, _>>();
+    let archived_block_ids = plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::ArchiveBlock { block_id } => Some(block_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let moved_inline_object_block_ids = plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::AppendBlock { content, .. } => moved_rendered_native_block(
+                &shadow_blocks,
+                &archived_block_ids,
+                content,
+                GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND,
+            )
+            .map(|block| block.remote_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut validation = ValidationReport::clean();
+    for operation in &plan.operations {
+        match operation {
+            PushOperation::UpdateBlock { block_id, .. }
+            | PushOperation::ReplaceBlock { block_id, .. } => {
+                let Some(shadow_block) = shadow_blocks.get(block_id).copied() else {
+                    continue;
+                };
+                if rendered_native_kind(shadow_block, GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND) {
+                    validation.push(ValidationIssue::new(
+                        "google_docs_inline_object_edit_unsupported",
+                        relative_path,
+                        Some(shadow_block.source_span.start_line),
+                        "editing rendered Google Docs inline images is not supported yet",
+                        Some(
+                            "restore the rendered image Markdown or edit the image in Google Docs"
+                                .to_string(),
+                        ),
+                    ));
+                }
+            }
+            PushOperation::AppendBlock { content, .. } => {
+                let Some(shadow_block) = moved_rendered_native_block(
+                    &shadow_blocks,
+                    &archived_block_ids,
+                    content,
+                    GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND,
+                ) else {
+                    continue;
+                };
+
+                validation.push(ValidationIssue::new(
+                    "google_docs_inline_object_move_unsupported",
+                    relative_path,
+                    Some(shadow_block.source_span.start_line),
+                    "moving rendered Google Docs inline images is not supported yet",
+                    Some(
+                        "restore the rendered image Markdown to its original position".to_string(),
+                    ),
+                ));
+            }
+            PushOperation::ArchiveBlock { block_id } => {
+                if moved_inline_object_block_ids.contains(block_id) {
+                    continue;
+                }
+                let Some(shadow_block) = shadow_blocks.get(block_id).copied() else {
+                    continue;
+                };
+                if rendered_native_kind(shadow_block, GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND) {
+                    validation.push(ValidationIssue::new(
+                        "google_docs_inline_object_delete_unsupported",
+                        relative_path,
+                        Some(shadow_block.source_span.start_line),
+                        "deleting rendered Google Docs inline images is not supported yet",
+                        Some("restore the rendered image Markdown".to_string()),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    validation
 }
 
 fn notion_pre_apply_semantic_validation(
@@ -1308,6 +1437,7 @@ where
         &mut pipeline,
     );
     validate_notion_pre_apply_semantics(&mount, &relative_path, &shadow, &mut pipeline);
+    validate_google_docs_pre_apply_semantics(&mount, &relative_path, &shadow, &mut pipeline);
 
     Ok(PreparedPush {
         absolute_path,
