@@ -3,6 +3,7 @@ node_modules/
 dist/
 /.loc/
 /.tmp/
+/.worktrees/
 /.idea/
 *.db
 *.db-shm
