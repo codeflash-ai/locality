@@ -367,6 +367,7 @@ fn align_blocks(
     align_directives(shadow, edited_blocks, &mut matches, &mut used_shadow);
     align_exact_hashes(shadow, edited_blocks, &mut matches, &mut used_shadow);
     align_equivalent_bodies(shadow, edited_blocks, &mut matches, &mut used_shadow);
+    align_heading_bounded_rewrites(shadow, edited_blocks, &mut matches, &mut used_shadow);
     let degradation =
         align_residual_by_order(shadow, edited_blocks, &mut matches, &mut used_shadow);
 
@@ -476,6 +477,108 @@ fn align_equivalent_bodies(
             used_shadow.insert(*shadow_index);
         }
     }
+}
+
+fn align_heading_bounded_rewrites(
+    shadow: &ShadowDocument,
+    edited_blocks: &[SegmentedBlock],
+    matches: &mut [Option<usize>],
+    used_shadow: &mut BTreeSet<usize>,
+) {
+    let ordered_anchors = ordered_alignment_anchors(matches);
+    if ordered_anchors.is_empty() {
+        return;
+    }
+
+    let mut previous_anchor: Option<(usize, usize)> = None;
+    for next_anchor in ordered_anchors.iter().copied() {
+        align_heading_bounded_gap(
+            shadow,
+            edited_blocks,
+            matches,
+            used_shadow,
+            previous_anchor,
+            Some(next_anchor),
+        );
+        previous_anchor = Some(next_anchor);
+    }
+
+    align_heading_bounded_gap(
+        shadow,
+        edited_blocks,
+        matches,
+        used_shadow,
+        previous_anchor,
+        None,
+    );
+}
+
+fn ordered_alignment_anchors(matches: &[Option<usize>]) -> Vec<(usize, usize)> {
+    let mut anchors = Vec::new();
+    let mut previous_shadow_index = None;
+    for (edited_index, shadow_index) in matches.iter().enumerate() {
+        let Some(shadow_index) = shadow_index else {
+            continue;
+        };
+        if previous_shadow_index.is_none_or(|previous| *shadow_index > previous) {
+            anchors.push((edited_index, *shadow_index));
+            previous_shadow_index = Some(*shadow_index);
+        }
+    }
+    anchors
+}
+
+fn align_heading_bounded_gap(
+    shadow: &ShadowDocument,
+    edited_blocks: &[SegmentedBlock],
+    matches: &mut [Option<usize>],
+    used_shadow: &mut BTreeSet<usize>,
+    previous_anchor: Option<(usize, usize)>,
+    next_anchor: Option<(usize, usize)>,
+) {
+    if !has_heading_anchor(shadow, previous_anchor, next_anchor) {
+        return;
+    }
+
+    let edited_start = previous_anchor.map_or(0, |(edited_index, _)| edited_index + 1);
+    let edited_end = next_anchor.map_or(edited_blocks.len(), |(edited_index, _)| edited_index);
+    let shadow_start = previous_anchor.map_or(0, |(_, shadow_index)| shadow_index + 1);
+    let shadow_end = next_anchor.map_or(shadow.blocks.len(), |(_, shadow_index)| shadow_index);
+
+    let residual_edited = (edited_start..edited_end)
+        .filter(|index| matches[*index].is_none() && !edited_blocks[*index].is_directive())
+        .collect::<Vec<_>>();
+    let residual_shadow = (shadow_start..shadow_end)
+        .filter(|index| !used_shadow.contains(index) && !shadow.blocks[*index].kind.is_directive())
+        .collect::<Vec<_>>();
+
+    if residual_edited.len() <= 1
+        || residual_edited.len() != residual_shadow.len()
+        || residual_kinds_match_common_prefix(
+            shadow,
+            edited_blocks,
+            &residual_shadow,
+            &residual_edited,
+        )
+    {
+        return;
+    }
+
+    for (edited_index, shadow_index) in residual_edited.iter().zip(residual_shadow.iter()) {
+        matches[*edited_index] = Some(*shadow_index);
+        used_shadow.insert(*shadow_index);
+    }
+}
+
+fn has_heading_anchor(
+    shadow: &ShadowDocument,
+    previous_anchor: Option<(usize, usize)>,
+    next_anchor: Option<(usize, usize)>,
+) -> bool {
+    previous_anchor
+        .into_iter()
+        .chain(next_anchor)
+        .any(|(_, shadow_index)| shadow.blocks[shadow_index].kind == MarkdownBlockKind::Heading)
 }
 
 fn align_residual_by_order(

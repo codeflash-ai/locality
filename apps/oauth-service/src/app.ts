@@ -44,7 +44,7 @@ app.get("/healthz", (c) => c.json({ ok: true }));
 
 app.get("/.well-known/loc-auth-broker", (c) =>
   c.json({
-    issuer: "loc-oauth-broker",
+    issuer: "afs-oauth-broker",
     version: 1,
     connectors: {
       notion: {

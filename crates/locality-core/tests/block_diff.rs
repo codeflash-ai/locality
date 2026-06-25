@@ -428,6 +428,78 @@ fn ambiguous_residual_alignment_is_explicitly_degraded() {
 }
 
 #[test]
+fn bounded_section_rewrite_aligns_by_order_instead_of_append_archive() {
+    let shadow = shadow(
+        "## Framer Copy Draft\n\n### Hero\n\nBadge: Old badge\n\n- Product\n\n- How it works\n\n### Workflow Strip",
+        [
+            "draft",
+            "hero",
+            "badge",
+            "product",
+            "how-it-works",
+            "workflow",
+        ],
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "## Framer Copy Draft\n\n### Hero\n\nBadge: Local workspace layer for AI agents\n\nProduct: Download for Mac\n\nHow it works: See how it works\n\n### Workflow Strip",
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("badge"),
+                content: "Badge: Local workspace layer for AI agents".to_string(),
+            },
+            PushOperation::ReplaceBlock {
+                block_id: RemoteId::new("product"),
+                content: "Product: Download for Mac".to_string(),
+            },
+            PushOperation::ReplaceBlock {
+                block_id: RemoteId::new("how-it-works"),
+                content: "How it works: See how it works".to_string(),
+            },
+        ]
+    );
+    assert_eq!(plan.summary.blocks_updated, 1);
+    assert_eq!(plan.summary.blocks_replaced, 2);
+    assert_eq!(plan.summary.blocks_created, 0);
+    assert_eq!(plan.summary.blocks_archived, 0);
+    assert!(plan.degradations.is_empty());
+}
+
+#[test]
+fn heading_bounded_rewrite_with_count_change_stays_degraded() {
+    let shadow = shadow(
+        "## Framer Copy Draft\n\n### Hero\n\nBadge: Old badge\n\n- Product\n\n### Workflow Strip",
+        ["draft", "hero", "badge", "product", "workflow"],
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        "## Framer Copy Draft\n\n### Hero\n\nBadge: New badge\n\nProduct: Download for Mac\n\nHow it works: See how it works\n\n### Workflow Strip",
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(plan.summary.blocks_updated, 0);
+    assert_eq!(plan.summary.blocks_replaced, 0);
+    assert_eq!(plan.summary.blocks_created, 3);
+    assert_eq!(plan.summary.blocks_archived, 2);
+    assert_eq!(plan.degradations.len(), 1);
+    assert_eq!(
+        plan.degradations[0].kind,
+        PlanDegradationKind::AmbiguousBlockAlignment
+    );
+}
+
+#[test]
 fn residual_alignment_updates_same_kind_sequence_without_archive_recreate() {
     let shadow = shadow(
         "# Heading\n\nParagraph.\n\n- Item\n\n```rust\nfn old() {}\n```",

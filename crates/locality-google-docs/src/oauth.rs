@@ -11,8 +11,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub const GOOGLE_DOCS_CONNECTOR_ID: &str = "google-docs";
+// Cloudflare worker name is still `afs-oauth-broker`; the workers.dev hostname
+// predates the Locality product rename until auth.locality.dev is deployed.
 pub const DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL: &str =
-    "https://loc-oauth-broker.saurabh-b07.workers.dev";
+    "https://afs-oauth-broker.saurabh-b07.workers.dev";
 pub const DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI: &str =
     "http://localhost:8757/oauth/google-docs/callback";
 pub const GOOGLE_DOCS_OAUTH_SCOPES: &[&str] = &[

@@ -13,8 +13,10 @@ use serde_json::json;
 use crate::client::{DEFAULT_NOTION_API_BASE_URL, DEFAULT_NOTION_VERSION, notion_http_client};
 
 pub const DEFAULT_NOTION_OAUTH_AUTHORIZE_URL: &str = "https://api.notion.com/v1/oauth/authorize";
+// Cloudflare worker name is still `afs-oauth-broker`; the workers.dev hostname
+// predates the Locality product rename until auth.locality.dev is deployed.
 pub const DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL: &str =
-    "https://loc-oauth-broker.saurabh-b07.workers.dev";
+    "https://afs-oauth-broker.saurabh-b07.workers.dev";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotionOAuthCodeExchange {

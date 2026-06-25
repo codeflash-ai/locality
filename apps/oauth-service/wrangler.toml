@@ -1,4 +1,4 @@
-name = "loc-oauth-broker"
+name = "afs-oauth-broker"
 main = "src/index.ts"
 compatibility_date = "2026-06-11"
 workers_dev = true
