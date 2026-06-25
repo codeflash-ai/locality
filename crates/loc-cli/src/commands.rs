@@ -18,8 +18,8 @@ use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
 };
 use locality_notion::oauth::{
-    DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, HttpNotionOAuthClient,
-    NotionOAuthBrokerStart,
+    DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, DEFAULT_NOTION_OAUTH_AUTHORIZE_URL,
+    HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
 };
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileRepository,
@@ -59,7 +59,7 @@ use crate::history::{
 use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
 use crate::inspect::{InspectError, InspectOptions, InspectReport, run_inspect};
 use crate::local_oauth::{
-    LocalOAuthAuthorization, LocalOAuthError, local_redirect, notion_authorize_url, random_state,
+    LocalOAuthAuthorization, LocalOAuthError, local_redirect, random_state,
     run_local_oauth_authorization,
 };
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
@@ -4119,6 +4119,28 @@ fn run_local_notion_oauth(
     .map_err(local_oauth_command_error)
 }
 
+fn notion_authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
+    format!(
+        "{DEFAULT_NOTION_OAUTH_AUTHORIZE_URL}?client_id={}&response_type=code&owner=user&redirect_uri={}&state={}",
+        url_encode(client_id),
+        url_encode(redirect_uri),
+        url_encode(state)
+    )
+}
+
+fn url_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 fn env_first(keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| std::env::var(key).ok())
@@ -5153,18 +5175,19 @@ mod tests {
     use locality_store::{MountConfig, ProjectionMode};
 
     use crate::diff::{DiffReport, GuardrailOutput};
-    use crate::local_oauth::{local_redirect, notion_authorize_url, parse_oauth_callback};
+    use crate::local_oauth::{local_redirect, parse_oauth_callback};
     use crate::push::PushReport;
     use crate::search::{SearchOptions, SearchReport};
 
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
         absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
-        google_docs_oauth_broker_config, legacy_args_for_command, notion_oauth_broker_config,
-        projection_mode_for_target, projection_usage_options_for_target,
-        prompt_for_push_confirmation, pull_direct_fallback_error,
-        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
+        google_docs_oauth_broker_config, legacy_args_for_command, notion_authorize_url,
+        notion_oauth_broker_config, projection_mode_for_target,
+        projection_usage_options_for_target, prompt_for_push_confirmation,
+        pull_direct_fallback_error, should_prompt_for_push_confirmation,
+        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
+        validate_virtual_projection_registration,
     };
 
     #[test]

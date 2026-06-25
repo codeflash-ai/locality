@@ -10,8 +10,6 @@ use std::net::TcpListener;
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use locality_notion::oauth::DEFAULT_NOTION_OAUTH_AUTHORIZE_URL;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalOAuthAuthorization {
     pub code: String,
@@ -73,10 +71,16 @@ pub fn run_local_oauth_authorization(
         eprintln!("open the authorization URL manually");
     }
 
-    wait_for_oauth_callback(&listener, &redirect.callback_path, expected_state)
+    wait_for_oauth_callback(
+        provider_name,
+        &listener,
+        &redirect.callback_path,
+        expected_state,
+    )
 }
 
 fn wait_for_oauth_callback(
+    provider_name: &str,
     listener: &TcpListener,
     callback_path: &str,
     expected_state: &str,
@@ -93,8 +97,10 @@ fn wait_for_oauth_callback(
                 let result = parse_oauth_callback(&request, callback_path, expected_state);
                 let response = match &result {
                     Ok(_) => oauth_http_response(
-                        "Notion connected",
-                        "Notion authorization is complete. You can close this window.",
+                        &format!("{provider_name} connected"),
+                        &format!(
+                            "{provider_name} authorization is complete. You can close this window."
+                        ),
                     ),
                     Err(error) => oauth_http_response("Locality OAuth failed", &error.message),
                 };
@@ -109,7 +115,7 @@ fn wait_for_oauth_callback(
                 if Instant::now() >= deadline {
                     return Err(LocalOAuthError::new(
                         "oauth_timeout",
-                        "timed out waiting for Notion OAuth callback",
+                        format!("timed out waiting for {provider_name} OAuth callback"),
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -160,13 +166,13 @@ pub fn parse_oauth_callback(
             params
                 .get("error_description")
                 .cloned()
-                .unwrap_or_else(|| format!("Notion returned OAuth error `{error}`")),
+                .unwrap_or_else(|| format!("OAuth provider returned OAuth error `{error}`")),
         ));
     }
     if params.get("state").map(String::as_str) != Some(expected_state) {
         return Err(LocalOAuthError::new(
             "oauth_state_mismatch",
-            "Notion OAuth callback state did not match",
+            "OAuth callback state did not match",
         ));
     }
     let code = params
@@ -176,7 +182,7 @@ pub fn parse_oauth_callback(
         .ok_or_else(|| {
             LocalOAuthError::new(
                 "oauth_missing_code",
-                "Notion OAuth callback did not include a code",
+                "OAuth callback did not include a code",
             )
         })?;
     Ok(LocalOAuthAuthorization { code })
@@ -196,20 +202,11 @@ fn oauth_http_response(title: &str, message: &str) -> String {
     )
 }
 
-pub fn notion_authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
-    format!(
-        "{DEFAULT_NOTION_OAUTH_AUTHORIZE_URL}?client_id={}&response_type=code&owner=user&redirect_uri={}&state={}",
-        url_encode(client_id),
-        url_encode(redirect_uri),
-        url_encode(state)
-    )
-}
-
 pub fn local_redirect(uri: &str) -> Result<LocalRedirect, LocalOAuthError> {
     let rest = uri.strip_prefix("http://").ok_or_else(|| {
         LocalOAuthError::new(
             "invalid_redirect_uri",
-            "Notion OAuth redirect URI must start with http://",
+            "OAuth redirect URI must start with http://",
         )
     })?;
     let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
@@ -217,25 +214,25 @@ pub fn local_redirect(uri: &str) -> Result<LocalRedirect, LocalOAuthError> {
     if callback_path == "/" {
         return Err(LocalOAuthError::new(
             "invalid_redirect_uri",
-            "Notion OAuth redirect URI must include a callback path",
+            "OAuth redirect URI must include a callback path",
         ));
     }
     let (host, port) = host_port.rsplit_once(':').ok_or_else(|| {
         LocalOAuthError::new(
             "invalid_redirect_uri",
-            "Notion OAuth redirect URI must include a localhost port",
+            "OAuth redirect URI must include a localhost port",
         )
     })?;
     if host != "127.0.0.1" && host != "localhost" {
         return Err(LocalOAuthError::new(
             "invalid_redirect_uri",
-            "Notion OAuth redirect URI must use 127.0.0.1 or localhost",
+            "OAuth redirect URI must use 127.0.0.1 or localhost",
         ));
     }
     let port = port.parse::<u16>().map_err(|_| {
         LocalOAuthError::new(
             "invalid_redirect_uri",
-            "Notion OAuth redirect URI has an invalid port",
+            "OAuth redirect URI has an invalid port",
         )
     })?;
     Ok(LocalRedirect {
@@ -325,19 +322,6 @@ fn browser_command(url: &str) -> BrowserCommandSpec {
     }
 }
 
-fn url_encode(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
 fn url_decode(value: &str) -> Result<String, ()> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -379,12 +363,16 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     use super::browser_command;
-    use super::{LocalOAuthAuthorization, retryable_callback_error, wait_for_oauth_callback};
+    use super::{
+        LocalOAuthAuthorization, local_redirect, parse_oauth_callback, retryable_callback_error,
+        wait_for_oauth_callback,
+    };
 
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_browser_command_does_not_route_oauth_url_through_cmd() {
-        let url = "https://api.notion.com/v1/oauth/authorize?client_id=client&response_type=code&owner=user";
+        let url =
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=client&response_type=code";
         let command = browser_command(url);
 
         assert_eq!(command.program, "rundll32.exe");
@@ -402,17 +390,21 @@ mod tests {
             .expect("nonblocking listener");
         let addr = listener.local_addr().expect("listener addr");
 
-        thread::spawn(move || {
-            send_request(addr, "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let handle = thread::spawn(move || {
+            let _ = send_request(addr, "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n");
             send_request(
                 addr,
-                "GET /oauth/notion/callback?state=expected&code=abc123 HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            );
+                "GET /oauth/google-docs/callback?state=expected&code=abc123 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
         });
 
-        let authorization =
-            wait_for_oauth_callback(&listener, "/oauth/notion/callback", "expected")
-                .expect("eventual valid callback");
+        let authorization = wait_for_oauth_callback(
+            "Google Docs",
+            &listener,
+            "/oauth/google-docs/callback",
+            "expected",
+        )
+        .expect("eventual valid callback");
 
         assert_eq!(
             authorization,
@@ -420,6 +412,8 @@ mod tests {
                 code: "abc123".to_string()
             }
         );
+        let response = handle.join().expect("callback response");
+        assert!(response.contains("Google Docs connected"));
     }
 
     #[test]
@@ -432,11 +426,34 @@ mod tests {
         assert!(!retryable_callback_error(&error));
     }
 
-    fn send_request(addr: SocketAddr, request: &str) {
+    #[test]
+    fn oauth_callback_error_message_is_provider_neutral() {
+        let request = "GET /oauth/google-docs/callback?error=access_denied&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        let error = parse_oauth_callback(request, "/oauth/google-docs/callback", "expected")
+            .expect_err("provider denied callback");
+
+        assert_eq!(error.code, "oauth_denied");
+        assert_eq!(
+            error.message,
+            "OAuth provider returned OAuth error `access_denied`"
+        );
+    }
+
+    #[test]
+    fn local_redirect_errors_are_provider_neutral() {
+        let error = local_redirect("https://localhost:8757/oauth/google-docs/callback")
+            .expect_err("https callback rejected");
+
+        assert_eq!(error.code, "invalid_redirect_uri");
+    }
+
+    fn send_request(addr: SocketAddr, request: &str) -> String {
         let mut stream = TcpStream::connect(addr).expect("connect callback listener");
         stream.write_all(request.as_bytes()).expect("write request");
         let _ = stream.shutdown(std::net::Shutdown::Write);
         let mut response = String::new();
         let _ = stream.read_to_string(&mut response);
+        response
     }
 }
