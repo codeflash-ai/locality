@@ -21,6 +21,7 @@ use locality_core::planner::PushOperationKind;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
+use locality_google_docs::GOOGLE_DOCS_CONNECTOR_ID;
 use locality_notion::NotionConnector;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use locality_store::{
@@ -61,13 +62,22 @@ struct SourceRegistration {
     validate_create_frontmatter: SourceValidationFn,
 }
 
-const SOURCE_REGISTRY: &[SourceRegistration] = &[SourceRegistration {
-    id: "notion",
-    descriptor: notion_source_descriptor,
-    resolve: resolve_notion_source,
-    validate_changed_frontmatter: crate::notion::validate_notion_changed_frontmatter,
-    validate_create_frontmatter: crate::notion::validate_notion_create_frontmatter,
-}];
+const SOURCE_REGISTRY: &[SourceRegistration] = &[
+    SourceRegistration {
+        id: "notion",
+        descriptor: notion_source_descriptor,
+        resolve: resolve_notion_source,
+        validate_changed_frontmatter: crate::notion::validate_notion_changed_frontmatter,
+        validate_create_frontmatter: crate::notion::validate_notion_create_frontmatter,
+    },
+    SourceRegistration {
+        id: GOOGLE_DOCS_CONNECTOR_ID,
+        descriptor: google_docs_source_descriptor,
+        resolve: resolve_google_docs_source,
+        validate_changed_frontmatter: clean_frontmatter_validation,
+        validate_create_frontmatter: clean_frontmatter_validation,
+    },
+];
 
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedSourceSet {
@@ -150,12 +160,40 @@ fn notion_source_descriptor() -> SourceDescriptor {
     }
 }
 
+fn google_docs_source_descriptor() -> SourceDescriptor {
+    SourceDescriptor {
+        id: Cow::Borrowed(GOOGLE_DOCS_CONNECTOR_ID),
+        display_name: Cow::Borrowed("Google Docs"),
+        default_mount_id: Cow::Borrowed("google-docs-main"),
+        connect_command: Some(Cow::Borrowed("loc connect google-docs")),
+        auth_env_var: None,
+        supports_oauth: true,
+        mount_guidance: Cow::Owned(generic_mount_guidance("Google Docs")),
+    }
+}
+
 fn resolve_notion_source(
     store: &dyn SourceResolverStore,
     credentials: &dyn CredentialStore,
     mount: &MountConfig,
 ) -> Result<ResolvedSource, ConnectorResolveError> {
     resolve_notion_connector_for_mount(store, credentials, mount).map(ResolvedSource::Notion)
+}
+
+fn resolve_google_docs_source(
+    _store: &dyn SourceResolverStore,
+    _credentials: &dyn CredentialStore,
+    _mount: &MountConfig,
+) -> Result<ResolvedSource, ConnectorResolveError> {
+    Err(ConnectorResolveError::UnsupportedConnector(
+        GOOGLE_DOCS_CONNECTOR_ID.to_string(),
+    ))
+}
+
+fn clean_frontmatter_validation(
+    _context: SourceValidationContext<'_>,
+) -> LocalityResult<ValidationReport> {
+    Ok(ValidationReport::clean())
 }
 
 fn generic_source_descriptor(connector: &str) -> SourceDescriptor {

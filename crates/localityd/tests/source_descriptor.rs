@@ -19,6 +19,23 @@ fn notion_descriptor_exposes_cli_and_mount_metadata() {
 }
 
 #[test]
+fn google_docs_descriptor_comes_from_registry() {
+    let descriptor = source_descriptor("google-docs");
+
+    assert_eq!(descriptor.id(), "google-docs");
+    assert_eq!(descriptor.display_name(), "Google Docs");
+    assert_eq!(descriptor.default_mount_id(), "google-docs-main");
+    assert_eq!(descriptor.connect_command(), Some("loc connect google-docs"));
+    assert_eq!(descriptor.auth_env_var(), None);
+    assert!(descriptor.supports_oauth());
+    assert!(
+        descriptor
+            .mount_guidance()
+            .contains("# Locality Google Docs Mount")
+    );
+}
+
+#[test]
 fn generic_descriptor_preserves_source_id_in_guidance() {
     let descriptor = source_descriptor("linear");
 
@@ -39,13 +56,14 @@ fn generic_descriptor_preserves_source_id_in_guidance() {
 #[test]
 fn source_display_name_uses_descriptor_registry() {
     assert_eq!(source_display_name("notion"), "Notion");
+    assert_eq!(source_display_name("google-docs"), "Google Docs");
     assert_eq!(source_display_name("linear"), "Linear");
     assert_eq!(source_display_name("custom"), "custom");
 }
 
 #[test]
 fn supported_source_connectors_lists_runtime_registered_connectors() {
-    assert_eq!(supported_source_connectors(), vec!["notion"]);
+    assert_eq!(supported_source_connectors(), vec!["notion", "google-docs"]);
 }
 
 #[test]
