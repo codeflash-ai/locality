@@ -641,18 +641,24 @@ fn macos_provider_status(mount: &MountConfig, findings: &mut Vec<DoctorFinding>)
         );
         match file_provider::run_macos_file_provider_helper("list", Vec::new()) {
             Ok(report) => {
-                let registered = report
+                let registered_domain_id = report
                     .helper_report
                     .get("domains")
                     .and_then(Value::as_array)
-                    .map(|domains| {
-                        domains.iter().any(|domain| {
-                            domain
-                                .get("identifier")
-                                .and_then(Value::as_str)
-                                .is_some_and(|identifier| identifier == mount.mount_id.0)
+                    .and_then(|domains| {
+                        domains.iter().find_map(|domain| {
+                            let identifier = domain.get("identifier").and_then(Value::as_str)?;
+                            if identifier == mount.mount_id.0
+                                || identifier
+                                    == localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID
+                            {
+                                Some(identifier.to_string())
+                            } else {
+                                None
+                            }
                         })
                     });
+                let registered = Some(registered_domain_id.is_some());
                 provider.registered = registered;
                 provider.state = if registered == Some(true) {
                     "registered".to_string()
@@ -666,6 +672,9 @@ fn macos_provider_status(mount: &MountConfig, findings: &mut Vec<DoctorFinding>)
                     .unwrap_or("macOS File Provider status inspected.")
                     .to_string();
                 provider.details = report.helper_report;
+                if let Some(identifier) = registered_domain_id {
+                    provider.details["registered_domain_id"] = Value::String(identifier);
+                }
             }
             Err(error) => {
                 provider.state = "error".to_string();
