@@ -77,7 +77,7 @@ mod tests {
             "account_label": "user@example.com",
             "workspace_id": "google-drive",
             "workspace_name": "Google Drive",
-            "scopes": ["openid", "https://www.googleapis.com/auth/drive"]
+            "scopes": ["openid", "https://www.googleapis.com/auth/documents"]
         });
 
         let token: OAuthBrokerToken = serde_json::from_value(payload).expect("decode token");

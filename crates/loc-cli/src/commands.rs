@@ -176,7 +176,7 @@ enum LocalityCommand {
 enum ConnectCommand {
     #[command(about = "Connect a Notion workspace")]
     Notion(ConnectNotionArgs),
-    #[command(name = "google-docs", about = "Connect Google Docs and Drive")]
+    #[command(name = "google-docs", about = "Connect Google Docs")]
     GoogleDocs(ConnectGoogleDocsArgs),
 }
 
@@ -5197,7 +5197,7 @@ mod tests {
                 vec!["connect", "google-docs", "--help"],
                 vec![
                     "Usage: loc connect google-docs",
-                    "Connect Google Docs and Drive",
+                    "Connect Google Docs",
                     "--broker-url",
                     "--redirect-uri",
                 ],

@@ -134,8 +134,7 @@ The broker returns a token payload:
     "openid",
     "email",
     "profile",
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/documents"
   ]
 }
 ```
@@ -164,18 +163,18 @@ openid
 email
 profile
 https://www.googleapis.com/auth/documents
-https://www.googleapis.com/auth/drive
 ```
 
-`documents` is needed for Google Docs body read/write. Full `drive` is needed
-because v1 is expected to be a complete Locality mount, including Drive
-discovery and file management: list folders/docs, create Docs, rename, move,
-trash/delete, and inspect file metadata. Narrower Drive scopes are not enough
-for this product contract.
+`documents` is needed for Google Docs body read/write. Drive access is omitted
+from the initial OAuth request to keep local development consent narrow. A later
+Drive-backed mount implementation must add an explicit consent upgrade before it
+lists folders/docs, creates Docs, renames, moves, trashes/deletes, or inspects
+file metadata through Drive APIs.
 
-The broker project must enable Google Docs API and Google Drive API. The OAuth
-consent screen must list exactly the scopes Locality requests, and the product
-must be prepared for Google's sensitive/restricted-scope review requirements.
+The broker project must enable Google Docs API. A later Drive-backed mount
+implementation must also enable Google Drive API. The OAuth consent screen must
+list exactly the scopes Locality requests, and the product must be prepared for
+Google's sensitive/restricted-scope review requirements.
 
 ## Credential Shape
 

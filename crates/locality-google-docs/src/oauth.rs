@@ -20,7 +20,6 @@ pub const GOOGLE_DOCS_OAUTH_SCOPES: &[&str] = &[
     "email",
     "profile",
     "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive",
 ];
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
@@ -193,7 +192,14 @@ fn ensure_reqwest_crypto_provider() {
 mod tests {
     use locality_connector::oauth_broker::OAuthBrokerToken;
 
-    use super::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
+    use super::{GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential};
+
+    #[test]
+    fn oauth_scopes_do_not_request_google_drive_access() {
+        assert!(GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/documents"));
+        assert!(!GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive"));
+        assert!(!GOOGLE_DOCS_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/drive.file"));
+    }
 
     #[test]
     fn broker_credential_stores_refresh_handle_without_refresh_token_or_secret() {
