@@ -264,6 +264,24 @@ struct ActionReport {
     message: String,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MountIdRequest {
+    mount_id: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateDesktopMountRequest {
+    connector: String,
+    path: String,
+    mount_id: String,
+    connection_id: Option<String>,
+    read_only: bool,
+    notion_root_page: Option<String>,
+    google_docs_workspace_folder: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LiveModeRemoteTarget {
     mount_id: MountId,
@@ -628,20 +646,43 @@ async fn ensure_terminal_cli_available() -> ActionReport {
 
 #[tauri::command]
 async fn create_workspace_mount(app: AppHandle, path: String) -> ActionReport {
-    match tauri::async_runtime::spawn_blocking(move || create_notion_workspace_mount(&path))
-        .await
-        .map_err(|error| format!("Mount worker failed: {error}"))
-        .and_then(|result| result)
-    {
-        Ok(report) => {
-            refresh_desktop_surfaces(&app);
-            ActionReport {
-                ok: true,
-                message: report,
-            }
-        }
-        Err(message) => ActionReport { ok: false, message },
+    create_desktop_mount_command(
+        app,
+        CreateDesktopMountRequest {
+            connector: "notion".to_string(),
+            path,
+            mount_id: "notion-main".to_string(),
+            connection_id: None,
+            read_only: false,
+            notion_root_page: None,
+            google_docs_workspace_folder: None,
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+async fn create_desktop_mount(app: AppHandle, request: CreateDesktopMountRequest) -> ActionReport {
+    create_desktop_mount_command(app, request).await
+}
+
+async fn create_desktop_mount_command(
+    app: AppHandle,
+    request: CreateDesktopMountRequest,
+) -> ActionReport {
+    let report =
+        match tauri::async_runtime::spawn_blocking(move || create_desktop_mount_blocking(request))
+            .await
+            .map_err(|error| format!("Mount worker failed: {error}"))
+            .and_then(|result| result)
+        {
+            Ok(message) => ActionReport { ok: true, message },
+            Err(message) => ActionReport { ok: false, message },
+        };
+    if report.ok {
+        refresh_desktop_surfaces(&app);
     }
+    report
 }
 
 #[tauri::command]
@@ -1304,6 +1345,50 @@ async fn open_in_vs_code(path: String) -> ActionReport {
         Ok(expanded) => ActionReport {
             ok: true,
             message: format!("Opened {} in VS Code", expanded.display()),
+        },
+        Err(message) => ActionReport { ok: false, message },
+    }
+}
+
+#[tauri::command]
+async fn open_mount_folder(request: MountIdRequest) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let state_root = default_state_root();
+        let store = SqliteStateStore::open(state_root)
+            .map_err(|error| format!("Could not open Locality state: {error}"))?;
+        let mount = desktop_mount_by_id(&store, &request.mount_id)?;
+        let path = mount_access_root(&mount);
+        open_virtual_mount_or_path(&path).map(|()| mount)
+    })
+    .await
+    .map_err(|error| format!("Open mount worker failed: {error}"))
+    .and_then(|result| result)
+    {
+        Ok(mount) => ActionReport {
+            ok: true,
+            message: format!("Opened mount `{}`.", mount.mount_id.0),
+        },
+        Err(message) => ActionReport { ok: false, message },
+    }
+}
+
+#[tauri::command]
+async fn open_mount_in_vs_code(request: MountIdRequest) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(move || {
+        let state_root = default_state_root();
+        let store = SqliteStateStore::open(state_root)
+            .map_err(|error| format!("Could not open Locality state: {error}"))?;
+        let mount = desktop_mount_by_id(&store, &request.mount_id)?;
+        let path = mount_access_root(&mount);
+        open_path_in_vs_code(&path).map(|()| mount)
+    })
+    .await
+    .map_err(|error| format!("VS Code mount worker failed: {error}"))
+    .and_then(|result| result)
+    {
+        Ok(mount) => ActionReport {
+            ok: true,
+            message: format!("Opened mount `{}` in VS Code.", mount.mount_id.0),
         },
         Err(message) => ActionReport { ok: false, message },
     }
@@ -3920,24 +4005,68 @@ fn choose_folder_with_dialog(
         .transpose()
 }
 
-fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
+fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<String, String> {
     let state_root = default_state_root();
     let projection = desktop_projection_mode();
-    let root = resolve_desktop_mount_root(path)?;
+    let connector = request.connector.trim().to_string();
+    let mount_id = request.mount_id.trim().to_string();
+    if mount_id.is_empty() {
+        return Err("Mount id is required.".to_string());
+    }
+    let root = resolve_desktop_mount_root(&request.path)?;
     validate_desktop_mount_root(&root, &state_root, &projection)?;
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
-    let connection_id = preferred_notion_connection_id(&store)?;
+    if store
+        .get_mount(&MountId::new(mount_id.clone()))
+        .map_err(|error| format!("Could not inspect existing mounts: {error}"))?
+        .is_some()
+    {
+        return Err(format!("Mount id `{mount_id}` already exists."));
+    }
+    let connection_id = match request
+        .connection_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(connection_id) => Some(ConnectionId::new(connection_id.to_string())),
+        None => preferred_connection_id_for_connector(&store, &connector)?,
+    };
+    let remote_root_id = match connector.as_str() {
+        "notion" => request
+            .notion_root_page
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| RemoteId::new(value.to_string())),
+        "google-docs" => {
+            let workspace = request
+                .google_docs_workspace_folder
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "Google Docs mounts need a workspace folder name or ID.".to_string()
+                })?;
+            Some(RemoteId::new(workspace.to_string()))
+        }
+        other => {
+            return Err(format!(
+                "Desktop mount creation does not support connector `{other}`."
+            ));
+        }
+    };
 
     let mount_report = run_mount(
         &mut store,
         MountOptions {
-            mount_id: MountId::new("notion-main"),
-            connector: "notion".to_string(),
+            mount_id: MountId::new(mount_id),
+            connector,
             root,
-            remote_root_id: None,
+            remote_root_id,
             connection_id,
-            read_only: false,
+            read_only: request.read_only,
             projection: projection.clone(),
         },
     )
@@ -3956,10 +4085,50 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
     }
 
     Ok(format!(
-        "Mounted Notion workspace at {} with {}.",
+        "Mounted {} at {} with {}.",
+        connector_label(&mount.connector),
         absolute_display_path(&mount_access_root(&mount)),
         projection_label(&mount.projection)
     ))
+}
+
+fn desktop_mount_by_id(store: &SqliteStateStore, mount_id: &str) -> Result<MountConfig, String> {
+    store
+        .get_mount(&MountId::new(mount_id.to_string()))
+        .map_err(|error| format!("Could not load mount `{mount_id}`: {error}"))?
+        .ok_or_else(|| format!("No Locality mount has id `{mount_id}`."))
+}
+
+fn preferred_connection_id_for_connector(
+    store: &SqliteStateStore,
+    connector: &str,
+) -> Result<Option<ConnectionId>, String> {
+    if connector == "notion" {
+        return preferred_notion_connection_id(store);
+    }
+
+    if let Some(connection_id) = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts: {error}"))?
+        .into_iter()
+        .find(|mount| mount.connector == connector)
+        .and_then(|mount| mount.connection_id)
+    {
+        return Ok(Some(connection_id));
+    }
+
+    let connections = store
+        .list_connections()
+        .map_err(|error| format!("Could not load connections: {error}"))?;
+    Ok(connections
+        .iter()
+        .find(|connection| connection.connector == connector && connection.status == "active")
+        .or_else(|| {
+            connections
+                .iter()
+                .find(|connection| connection.connector == connector)
+        })
+        .map(|connection| connection.connection_id.clone()))
 }
 
 fn preferred_notion_connection_id(
@@ -6444,6 +6613,30 @@ mod tests {
     }
 
     #[test]
+    fn desktop_mount_by_id_returns_selected_mount_not_preferred_mount() {
+        let temp = TestTempDir::new("desktop-selected-mount-by-id");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let notion = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("notion"),
+        );
+        let google = MountConfig::new(
+            MountId::new("google-docs-main"),
+            "google-docs",
+            temp.path().join("google-docs"),
+        );
+        store.save_mount(notion).expect("save notion mount");
+        store.save_mount(google.clone()).expect("save google mount");
+
+        let selected =
+            super::desktop_mount_by_id(&store, "google-docs-main").expect("selected mount");
+
+        assert_eq!(selected.mount_id, google.mount_id);
+        assert_eq!(selected.connector, "google-docs");
+    }
+
+    #[test]
     fn desktop_onboarding_is_required_until_active_connection_and_mount_exist() {
         let active_connection = test_connection("workspace-1", "Synergy Labs");
         let mut inactive_connection = active_connection.clone();
@@ -8601,6 +8794,7 @@ fn main() {
             ensure_runtime_ready,
             ensure_terminal_cli_available,
             create_workspace_mount,
+            create_desktop_mount,
             install_agent_guidance,
             locate_notion_page,
             search_notion_pages,
@@ -8617,6 +8811,8 @@ fn main() {
             open_path,
             open_logs_folder,
             open_in_vs_code,
+            open_mount_folder,
+            open_mount_in_vs_code,
             reveal_path,
             show_main_window,
             set_desktop_setting,

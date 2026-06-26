@@ -193,6 +193,39 @@ fn mount_can_persist_google_docs_workspace_folder() {
     assert!(read_to_string(fixture.agents_file()).contains("Google Docs"));
 }
 
+#[test]
+fn mount_options_preserve_google_docs_workspace_folder_id_from_resolver() {
+    let fixture = MountFixture::new("loc-cli-mount-google-docs-reusable");
+    let mut store = InMemoryStateStore::new();
+    let report = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("google-docs-secondary"),
+            connector: "google-docs".to_string(),
+            root: fixture.root.join("google-docs-secondary"),
+            remote_root_id: Some(RemoteId::new("drive-folder-secondary")),
+            connection_id: Some(ConnectionId::new("google-docs-default")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect("mount google docs");
+
+    assert_eq!(report.mount_id, "google-docs-secondary");
+    assert_eq!(
+        report.remote_root_id.as_deref(),
+        Some("drive-folder-secondary")
+    );
+    assert_eq!(
+        store
+            .get_mount(&MountId::new("google-docs-secondary"))
+            .expect("read mount")
+            .expect("mount saved")
+            .remote_root_id,
+        Some(RemoteId::new("drive-folder-secondary"))
+    );
+}
+
 struct MountFixture {
     root: PathBuf,
 }
