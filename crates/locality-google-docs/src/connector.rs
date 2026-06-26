@@ -1407,8 +1407,7 @@ fn parse_delimited_style(
 
 fn parse_link_style(content: &str, index: usize, parsed: &mut DocsText) -> Option<usize> {
     let label_start = index + '['.len_utf8();
-    let label_close_offset = content[label_start..].find("](")?;
-    let label_end = label_start + label_close_offset;
+    let label_end = find_unescaped_link_label_end(content, label_start)?;
     let url_start = label_end + "](".len();
     let url_end = find_unescaped_char(content, url_start, ')')?;
     let start = docs_text_len(&parsed.text);
@@ -1427,6 +1426,25 @@ fn parse_link_style(content: &str, index: usize, parsed: &mut DocsText) -> Optio
         },
     );
     Some(url_end + ')'.len_utf8())
+}
+
+fn find_unescaped_link_label_end(content: &str, start: usize) -> Option<usize> {
+    let mut index = start;
+    while index < content.len() {
+        let ch = content[index..].chars().next()?;
+        if ch == '\\' {
+            index += ch.len_utf8();
+            if let Some(escaped) = content[index..].chars().next() {
+                index += escaped.len_utf8();
+            }
+            continue;
+        }
+        if ch == ']' && content[index + ch.len_utf8()..].starts_with('(') {
+            return Some(index);
+        }
+        index += ch.len_utf8();
+    }
+    None
 }
 
 fn find_unescaped_char(content: &str, start: usize, needle: char) -> Option<usize> {
@@ -2097,6 +2115,30 @@ mod tests {
                     && range.style.underline
             }),
             "expected nested underline to remain scoped to the linked label: {:#?}",
+            parsed.style_ranges
+        );
+    }
+
+    #[test]
+    fn apply_ignores_escaped_link_label_delimiters() {
+        let parsed =
+            docs_block_text(r#"[<u>A2\](B</u>](https://example.test/label-delimiter) link target"#);
+
+        assert_eq!(parsed.text, "A2](B link target\n");
+        assert!(
+            parsed.style_ranges.iter().any(|range| {
+                range.start == 0
+                    && range.end == docs_text_len("A2](B")
+                    && range.style.link.as_deref() == Some("https://example.test/label-delimiter")
+            }),
+            "expected escaped Markdown label delimiter to stay inside one link label: {:#?}",
+            parsed.style_ranges
+        );
+        assert!(
+            parsed.style_ranges.iter().any(|range| {
+                range.start == 0 && range.end == docs_text_len("A2](B") && range.style.underline
+            }),
+            "expected nested underline to remain scoped to the complete linked label: {:#?}",
             parsed.style_ranges
         );
     }
