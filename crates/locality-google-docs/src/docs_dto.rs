@@ -115,6 +115,8 @@ pub struct TextStyle {
     #[serde(default)]
     pub strikethrough: bool,
     #[serde(default)]
+    pub small_caps: bool,
+    #[serde(default)]
     pub link: Option<Link>,
     #[serde(default)]
     pub foreground_color: Option<serde_json::Value>,
@@ -322,6 +324,8 @@ pub struct TextStylePatch {
     pub underline: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strikethrough: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub small_caps: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_color: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
