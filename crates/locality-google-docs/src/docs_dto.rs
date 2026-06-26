@@ -60,6 +60,10 @@ pub struct ParagraphStyle {
     pub named_style_type: Option<String>,
     #[serde(default)]
     pub alignment: Option<String>,
+    #[serde(default)]
+    pub indent_start: Option<serde_json::Value>,
+    #[serde(default)]
+    pub indent_first_line: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +293,10 @@ pub struct ParagraphStylePatch {
     pub named_style_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indent_start: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indent_first_line: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

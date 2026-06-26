@@ -824,6 +824,14 @@ struct DocsParagraphAlignmentRange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsParagraphIndentRange {
+    start: usize,
+    end: usize,
+    indent_start: Option<serde_json::Value>,
+    indent_first_line: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DocsBulletRange {
     start: usize,
     end: usize,
@@ -852,6 +860,9 @@ fn docs_text_requests_from_parsed(
         .unwrap_or_default();
     let preserved_paragraph_alignments = style_source
         .map(|source| preserved_paragraph_alignments(&inserted_text, source))
+        .unwrap_or_default();
+    let preserved_paragraph_indents = style_source
+        .map(|source| preserved_paragraph_indents(&inserted_text, source))
         .unwrap_or_default();
     let mut requests = vec![DocsRequest::InsertText {
         insert_text: InsertTextRequest {
@@ -883,6 +894,11 @@ fn docs_text_requests_from_parsed(
         preserved_paragraph_alignments
             .into_iter()
             .map(|range| paragraph_alignment_request(location_index, range)),
+    );
+    requests.extend(
+        preserved_paragraph_indents
+            .into_iter()
+            .map(|range| paragraph_indent_request(location_index, range)),
     );
     requests.extend(
         preserved_color_ranges
@@ -1000,7 +1016,7 @@ fn paragraph_style_request(location_index: usize, range: DocsParagraphStyleRange
             },
             paragraph_style: ParagraphStylePatch {
                 named_style_type: Some(range.named_style_type),
-                alignment: None,
+                ..ParagraphStylePatch::default()
             },
             fields: "namedStyleType".to_string(),
         },
@@ -1018,10 +1034,34 @@ fn paragraph_alignment_request(
                 end_index: location_index + range.end,
             },
             paragraph_style: ParagraphStylePatch {
-                named_style_type: None,
                 alignment: Some(range.alignment),
+                ..ParagraphStylePatch::default()
             },
             fields: "alignment".to_string(),
+        },
+    }
+}
+
+fn paragraph_indent_request(location_index: usize, range: DocsParagraphIndentRange) -> DocsRequest {
+    let mut fields = Vec::new();
+    if range.indent_start.is_some() {
+        fields.push("indentStart");
+    }
+    if range.indent_first_line.is_some() {
+        fields.push("indentFirstLine");
+    }
+    DocsRequest::UpdateParagraphStyle {
+        update_paragraph_style: UpdateParagraphStyleRequest {
+            range: Range {
+                start_index: location_index + range.start,
+                end_index: location_index + range.end,
+            },
+            paragraph_style: ParagraphStylePatch {
+                indent_start: range.indent_start,
+                indent_first_line: range.indent_first_line,
+                ..ParagraphStylePatch::default()
+            },
+            fields: fields.join(","),
         },
     }
 }
@@ -1254,11 +1294,31 @@ fn preserved_paragraph_alignments(
         .into_iter()
         .filter_map(|range| {
             let (start, end) =
-                map_source_range_by_context(&source_text, range.start, range.end, new_text)?;
+                map_paragraph_range_by_context(&source_text, range.start, range.end, new_text)?;
             Some(DocsParagraphAlignmentRange {
                 start,
                 end,
                 alignment: range.alignment,
+            })
+        })
+        .collect()
+}
+
+fn preserved_paragraph_indents(
+    new_text: &str,
+    source: DocsTextStyleSource<'_>,
+) -> Vec<DocsParagraphIndentRange> {
+    let (source_text, source_ranges) = source_text_paragraph_indent_ranges(source);
+    source_ranges
+        .into_iter()
+        .filter_map(|range| {
+            let (start, end) =
+                map_paragraph_range_by_context(&source_text, range.start, range.end, new_text)?;
+            Some(DocsParagraphIndentRange {
+                start,
+                end,
+                indent_start: range.indent_start,
+                indent_first_line: range.indent_first_line,
             })
         })
         .collect()
@@ -1319,6 +1379,61 @@ fn source_text_paragraph_alignment_ranges(
 ) -> (String, Vec<DocsParagraphAlignmentRange>) {
     let mut source_text = String::new();
     let mut ranges = Vec::new();
+    for (paragraph, range_start, range_end) in
+        source_paragraph_text_ranges(source, &mut source_text)
+    {
+        if range_end <= range_start {
+            continue;
+        }
+        let Some(alignment) = paragraph
+            .paragraph_style
+            .as_ref()
+            .and_then(|style| style.alignment.clone())
+            .filter(|alignment| alignment != "START")
+        else {
+            continue;
+        };
+        ranges.push(DocsParagraphAlignmentRange {
+            start: range_start,
+            end: range_end,
+            alignment,
+        });
+    }
+    (source_text, ranges)
+}
+
+fn source_text_paragraph_indent_ranges(
+    source: DocsTextStyleSource<'_>,
+) -> (String, Vec<DocsParagraphIndentRange>) {
+    let mut source_text = String::new();
+    let mut ranges = Vec::new();
+    for (paragraph, range_start, range_end) in
+        source_paragraph_text_ranges(source, &mut source_text)
+    {
+        if range_end <= range_start {
+            continue;
+        }
+        let Some(style) = paragraph.paragraph_style.as_ref() else {
+            continue;
+        };
+        if style.indent_start.is_none() && style.indent_first_line.is_none() {
+            continue;
+        }
+        ranges.push(DocsParagraphIndentRange {
+            start: range_start,
+            end: range_end,
+            indent_start: style.indent_start.clone(),
+            indent_first_line: style.indent_first_line.clone(),
+        });
+    }
+    (source_text, ranges)
+}
+
+fn source_paragraph_text_ranges<'a>(
+    source: DocsTextStyleSource<'a>,
+    source_text: &mut String,
+) -> Vec<(&'a crate::docs_dto::Paragraph, usize, usize)> {
+    let mut ranges = Vec::new();
     for paragraph in source
         .document
         .body
@@ -1326,7 +1441,7 @@ fn source_text_paragraph_alignment_ranges(
         .iter()
         .filter_map(|element| element.paragraph.as_ref())
     {
-        let range_start = docs_text_len(&source_text);
+        let range_start = docs_text_len(source_text);
         for element in &paragraph.elements {
             let (Some(element_start), Some(element_end), Some(text_run)) = (
                 element.start_index,
@@ -1346,25 +1461,10 @@ fn source_text_paragraph_alignment_ranges(
                 overlap_end - element_start,
             ));
         }
-        let range_end = docs_text_len(&source_text);
-        if range_end <= range_start {
-            continue;
-        }
-        let Some(alignment) = paragraph
-            .paragraph_style
-            .as_ref()
-            .and_then(|style| style.alignment.clone())
-            .filter(|alignment| alignment != "START")
-        else {
-            continue;
-        };
-        ranges.push(DocsParagraphAlignmentRange {
-            start: range_start,
-            end: range_end,
-            alignment,
-        });
+        let range_end = docs_text_len(source_text);
+        ranges.push((paragraph, range_start, range_end));
     }
-    (source_text, ranges)
+    ranges
 }
 
 fn source_text_background_ranges(
@@ -1543,6 +1643,60 @@ fn map_source_range_by_context(
             && old_change_start == old_change_end
             && should_extend_color_boundary_insertion(new_text, new_change_start, new_change_end)
         {
+            end = new_change_end;
+        }
+        (source_start, end)
+    } else if source_start >= old_change_end {
+        (
+            shift_utf16_index(source_start, old_change_end, new_change_end)?,
+            shift_utf16_index(source_end, old_change_end, new_change_end)?,
+        )
+    } else {
+        let start = if source_start < old_change_start {
+            source_start
+        } else {
+            new_change_start
+        };
+        let end = if source_end > old_change_end {
+            shift_utf16_index(source_end, old_change_end, new_change_end)?
+        } else {
+            new_change_end
+        };
+        (start, end)
+    };
+    (end > start).then_some((start, end))
+}
+
+fn map_paragraph_range_by_context(
+    source_text: &str,
+    source_start: usize,
+    source_end: usize,
+    new_text: &str,
+) -> Option<(usize, usize)> {
+    let source_len = docs_text_len(source_text);
+    let new_len = docs_text_len(new_text);
+    if source_start > source_end || source_end > source_len {
+        return None;
+    }
+    if source_len == new_len {
+        return (source_end > source_start).then_some((source_start, source_end));
+    }
+
+    let common_prefix = common_prefix_utf16(source_text, new_text);
+    let common_suffix = common_suffix_utf16(
+        source_text,
+        new_text,
+        source_len.saturating_sub(common_prefix),
+        new_len.saturating_sub(common_prefix),
+    );
+    let old_change_start = common_prefix;
+    let old_change_end = source_len.saturating_sub(common_suffix);
+    let new_change_start = common_prefix;
+    let new_change_end = new_len.saturating_sub(common_suffix);
+
+    let (start, end) = if source_end <= old_change_start {
+        let mut end = source_end;
+        if source_end == old_change_start && old_change_start == old_change_end {
             end = new_change_end;
         }
         (source_start, end)
@@ -3714,6 +3868,95 @@ mod tests {
                     && value["updateParagraphStyle"]["fields"] == "alignment"
             }),
             "source paragraph alignment should be restored after editing the block: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_paragraph_indentation_for_edited_block() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Indented", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Indented",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 20,
+                            "paragraph": {
+                                "paragraphStyle": {
+                                    "namedStyleType": "NORMAL_TEXT",
+                                    "indentStart": {
+                                        "magnitude": 36,
+                                        "unit": "PT"
+                                    },
+                                    "indentFirstLine": {
+                                        "magnitude": 18,
+                                        "unit": "PT"
+                                    }
+                                },
+                                "elements": [{
+                                    "startIndex": 1,
+                                    "endIndex": 20,
+                                    "textRun": {
+                                        "content": "Indented paragraph\n",
+                                        "textStyle": {}
+                                    }
+                                }]
+                            }
+                        }]
+                    }
+                }))
+                .expect("indented document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:20"),
+                content: "Indented paragraph updated".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateParagraphStyle"]["range"]["startIndex"] == 1
+                    && value["updateParagraphStyle"]["range"]["endIndex"] == 27
+                    && value["updateParagraphStyle"]["paragraphStyle"]["indentStart"]["magnitude"]
+                        == 36
+                    && value["updateParagraphStyle"]["paragraphStyle"]["indentFirstLine"]
+                        ["magnitude"]
+                        == 18
+                    && value["updateParagraphStyle"]["fields"] == "indentStart,indentFirstLine"
+            }),
+            "source paragraph indentation should be restored after editing the block: {serialized:#?}"
         );
     }
 
