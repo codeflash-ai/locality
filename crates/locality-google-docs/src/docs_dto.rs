@@ -124,6 +124,8 @@ pub struct TextStyle {
     pub baseline_offset: Option<String>,
     #[serde(default)]
     pub font_size: Option<serde_json::Value>,
+    #[serde(default)]
+    pub weighted_font_family: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,6 +330,8 @@ pub struct TextStylePatch {
     pub baseline_offset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weighted_font_family: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<Link>,
 }

@@ -861,6 +861,9 @@ fn docs_text_requests_from_parsed(
     let preserved_font_size_ranges = style_source
         .map(|source| preserved_font_size_ranges(&inserted_text, source, &docs_text.style_ranges))
         .unwrap_or_default();
+    let preserved_font_family_ranges = style_source
+        .map(|source| preserved_font_family_ranges(&inserted_text, source, &docs_text.style_ranges))
+        .unwrap_or_default();
     let preserved_paragraph_alignments = style_source
         .map(|source| preserved_paragraph_alignments(&inserted_text, source))
         .unwrap_or_default();
@@ -922,6 +925,11 @@ fn docs_text_requests_from_parsed(
         preserved_font_size_ranges
             .into_iter()
             .map(|range| font_size_request(location_index, range)),
+    );
+    requests.extend(
+        preserved_font_family_ranges
+            .into_iter()
+            .map(|range| font_family_request(location_index, range)),
     );
     requests.extend(
         docs_text
@@ -987,6 +995,13 @@ struct DocsFontSizeRange {
     font_size: serde_json::Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsFontFamilyRange {
+    start: usize,
+    end: usize,
+    weighted_font_family: serde_json::Value,
+}
+
 fn reset_text_style_request(start_index: usize, end_index: usize) -> DocsRequest {
     DocsRequest::UpdateTextStyle {
         update_text_style: UpdateTextStyleRequest {
@@ -1003,10 +1018,11 @@ fn reset_text_style_request(start_index: usize, end_index: usize) -> DocsRequest
                 background_color: None,
                 baseline_offset: Some("NONE".to_string()),
                 font_size: None,
+                weighted_font_family: None,
                 link: None,
             },
             fields:
-                "bold,italic,underline,strikethrough,foregroundColor,backgroundColor,baselineOffset,fontSize,link"
+                "bold,italic,underline,strikethrough,foregroundColor,backgroundColor,baselineOffset,fontSize,weightedFontFamily,link"
                     .to_string(),
         },
     }
@@ -1158,6 +1174,22 @@ fn font_size_request(location_index: usize, range: DocsFontSizeRange) -> DocsReq
     }
 }
 
+fn font_family_request(location_index: usize, range: DocsFontFamilyRange) -> DocsRequest {
+    DocsRequest::UpdateTextStyle {
+        update_text_style: UpdateTextStyleRequest {
+            range: Range {
+                start_index: location_index + range.start,
+                end_index: location_index + range.end,
+            },
+            text_style: TextStylePatch {
+                weighted_font_family: Some(range.weighted_font_family),
+                ..TextStylePatch::default()
+            },
+            fields: "weightedFontFamily".to_string(),
+        },
+    }
+}
+
 fn text_style_request(
     location_index: usize,
     range: DocsTextStyleRange,
@@ -1202,6 +1234,15 @@ fn text_style_request(
                 || range.style.link.is_some()
         })
         .and_then(|style| style.font_size.clone());
+    let weighted_font_family = existing_style
+        .filter(|_| {
+            range.style.bold
+                || range.style.italic
+                || range.style.underline
+                || range.style.strikethrough
+                || range.style.link.is_some()
+        })
+        .and_then(|style| style.weighted_font_family.clone());
     let mut fields = Vec::new();
     if range.style.bold {
         fields.push("bold");
@@ -1230,6 +1271,9 @@ fn text_style_request(
     if font_size.is_some() {
         fields.push("fontSize");
     }
+    if weighted_font_family.is_some() {
+        fields.push("weightedFontFamily");
+    }
     DocsRequest::UpdateTextStyle {
         update_text_style: UpdateTextStyleRequest {
             range: Range {
@@ -1245,6 +1289,7 @@ fn text_style_request(
                 background_color,
                 baseline_offset,
                 font_size,
+                weighted_font_family,
                 link: range.style.link.map(|url| Link { url: Some(url) }),
             },
             fields: fields.join(","),
@@ -1351,6 +1396,32 @@ fn preserved_font_size_ranges(
                 start,
                 end,
                 font_size: range.font_size,
+            })
+        })
+        .collect()
+}
+
+fn preserved_font_family_ranges(
+    new_text: &str,
+    source: DocsTextStyleSource<'_>,
+    explicit_style_ranges: &[DocsTextStyleRange],
+) -> Vec<DocsFontFamilyRange> {
+    let (source_text, source_ranges) = source_text_font_family_ranges(source);
+    source_ranges
+        .into_iter()
+        .filter_map(|range| {
+            let (start, end) =
+                map_source_range_by_context(&source_text, range.start, range.end, new_text)?;
+            if explicit_style_ranges
+                .iter()
+                .any(|explicit| ranges_overlap(start, end, explicit.start, explicit.end))
+            {
+                return None;
+            }
+            Some(DocsFontFamilyRange {
+                start,
+                end,
+                weighted_font_family: range.weighted_font_family,
             })
         })
         .collect()
@@ -1689,6 +1760,56 @@ fn source_text_font_size_ranges(
     (source_text, ranges)
 }
 
+fn source_text_font_family_ranges(
+    source: DocsTextStyleSource<'_>,
+) -> (String, Vec<DocsFontFamilyRange>) {
+    let mut source_text = String::new();
+    let mut ranges = Vec::new();
+    for element in source
+        .document
+        .body
+        .content
+        .iter()
+        .filter_map(|element| element.paragraph.as_ref())
+        .flat_map(|paragraph| paragraph.elements.iter())
+    {
+        let (Some(element_start), Some(element_end), Some(text_run)) = (
+            element.start_index,
+            element.end_index,
+            element.text_run.as_ref(),
+        ) else {
+            continue;
+        };
+        let overlap_start = element_start.max(source.start_index);
+        let overlap_end = element_end.min(source.end_index);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+
+        let content = utf16_slice(
+            &text_run.content,
+            overlap_start - element_start,
+            overlap_end - element_start,
+        );
+        let range_start = docs_text_len(&source_text);
+        source_text.push_str(&content);
+        let range_end = docs_text_len(&source_text);
+        if let Some(weighted_font_family) = text_run.text_style.weighted_font_family.clone()
+            && range_end > range_start
+        {
+            push_merged_font_family_range(
+                &mut ranges,
+                DocsFontFamilyRange {
+                    start: range_start,
+                    end: range_end,
+                    weighted_font_family,
+                },
+            );
+        }
+    }
+    (source_text, ranges)
+}
+
 fn push_merged_foreground_color_range(
     ranges: &mut Vec<DocsForegroundColorRange>,
     range: DocsForegroundColorRange,
@@ -1735,6 +1856,20 @@ fn push_merged_font_size_range(ranges: &mut Vec<DocsFontSizeRange>, range: DocsF
     if let Some(previous) = ranges.last_mut()
         && previous.end == range.start
         && previous.font_size == range.font_size
+    {
+        previous.end = range.end;
+        return;
+    }
+    ranges.push(range);
+}
+
+fn push_merged_font_family_range(
+    ranges: &mut Vec<DocsFontFamilyRange>,
+    range: DocsFontFamilyRange,
+) {
+    if let Some(previous) = ranges.last_mut()
+        && previous.end == range.start
+        && previous.weighted_font_family == range.weighted_font_family
     {
         previous.end = range.end;
         return;
@@ -3372,7 +3507,7 @@ mod tests {
                         "strikethrough": false,
                         "baselineOffset": "NONE"
                     },
-                    "fields": "bold,italic,underline,strikethrough,foregroundColor,backgroundColor,baselineOffset,fontSize,link"
+                    "fields": "bold,italic,underline,strikethrough,foregroundColor,backgroundColor,baselineOffset,fontSize,weightedFontFamily,link"
                 }
             })
         );
@@ -4019,6 +4154,97 @@ mod tests {
                     && value["updateTextStyle"]["fields"] == "fontSize"
             }),
             "font-size-only source style should be restored onto the edited span: {serialized:#?}"
+        );
+    }
+
+    #[test]
+    fn apply_preserves_font_family_only_text_style_for_edited_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Mono", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Mono",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 13,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 7,
+                                        "textRun": {
+                                            "content": "Font: ",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 7,
+                                        "endIndex": 12,
+                                        "textRun": {
+                                            "content": "Mono\n",
+                                            "textStyle": {
+                                                "weightedFontFamily": {
+                                                    "fontFamily": "Courier New",
+                                                    "weight": 400
+                                                }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("font family document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:13"),
+                content: "Font: Code".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let serialized: Vec<_> = batch
+            .requests
+            .iter()
+            .map(|request| serde_json::to_value(request).expect("request json"))
+            .collect();
+        assert!(
+            serialized.iter().any(|value| {
+                value["updateTextStyle"]["range"]["startIndex"] == 7
+                    && value["updateTextStyle"]["range"]["endIndex"] == 11
+                    && value["updateTextStyle"]["textStyle"]["weightedFontFamily"]["fontFamily"]
+                        == "Courier New"
+                    && value["updateTextStyle"]["textStyle"]["weightedFontFamily"]["weight"] == 400
+                    && value["updateTextStyle"]["fields"] == "weightedFontFamily"
+            }),
+            "font-family-only source style should be restored onto the edited span: {serialized:#?}"
         );
     }
 
