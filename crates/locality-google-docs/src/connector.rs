@@ -865,12 +865,26 @@ fn docs_text_requests_from_parsed(
             .map(|range| paragraph_style_request(location_index, range)),
     );
     requests.extend(
-        docs_text
-            .bullet_ranges
+        merge_adjacent_bullet_ranges(docs_text.bullet_ranges)
             .into_iter()
             .map(|range| create_paragraph_bullets_request(location_index, range)),
     );
     requests
+}
+
+fn merge_adjacent_bullet_ranges(ranges: Vec<DocsBulletRange>) -> Vec<DocsBulletRange> {
+    let mut merged: Vec<DocsBulletRange> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && previous.preset == range.preset
+            && previous.end == range.start
+        {
+            previous.end = range.end;
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
 }
 
 #[derive(Clone, Copy)]
@@ -1060,7 +1074,7 @@ fn docs_block_text(content: &str) -> DocsText {
     }
 
     let mut parsed = DocsText::default();
-    append_markdown_block(&mut parsed, trimmed);
+    append_markdown_block(&mut parsed, content);
     if matches!(
         block_kind,
         MarkdownBlockKind::UnorderedList | MarkdownBlockKind::OrderedList
@@ -1129,6 +1143,14 @@ fn append_markdown_block(parsed: &mut DocsText, block: &str) {
     let trimmed = block.trim_start();
     let (content, block_kind) = markdown_block_content(trimmed);
     let block_inline = parse_docs_markdown_inline(content);
+    if matches!(
+        block_kind,
+        MarkdownBlockKind::UnorderedList | MarkdownBlockKind::OrderedList
+    ) {
+        parsed
+            .text
+            .push_str(&"\t".repeat(markdown_list_nesting_level(block)));
+    }
     append_parsed_inline(parsed, &block_inline);
     if !parsed.text.ends_with('\n') {
         parsed.text.push('\n');
@@ -1211,6 +1233,33 @@ fn markdown_ordered_list_content(block: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((digits, content))
+}
+
+fn markdown_list_nesting_level(block: &str) -> usize {
+    let leading = block
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, ' ' | '\t'))
+        .map(|(index, _)| &block[..index])
+        .unwrap_or(block);
+    let mut nesting = 0;
+    let mut spaces = 0;
+    for ch in leading.chars() {
+        match ch {
+            '\t' => {
+                nesting += 1;
+                spaces = 0;
+            }
+            ' ' => {
+                spaces += 1;
+                if spaces == 2 {
+                    nesting += 1;
+                    spaces = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+    nesting
 }
 
 fn parse_docs_markdown_inline(content: &str) -> DocsText {
@@ -1607,7 +1656,10 @@ mod tests {
     use locality_core::planner::{PushOperation, PushPlan};
     use locality_core::push::RemotePrecondition;
 
-    use super::{GoogleDocsConfig, GoogleDocsConnector, docs_block_text};
+    use super::{
+        GoogleDocsConfig, GoogleDocsConnector, docs_block_text, docs_document_text_requests,
+        docs_text_len,
+    };
     use crate::client::{GoogleDocsApi, GoogleDriveApi};
     use crate::docs_dto::{BatchUpdateDocumentRequest, DocsRequest, GoogleDocument, Range};
     use crate::drive_dto::{
@@ -1988,6 +2040,70 @@ mod tests {
                 "escaped block marker must remain a normal paragraph: {escaped:?}"
             );
         }
+    }
+
+    #[test]
+    fn apply_converts_nested_markdown_list_indent_to_docs_tabs() {
+        let nested_bullet = docs_block_text("  - Nested bullet");
+        assert_eq!(nested_bullet.text, "\tNested bullet\n");
+        assert_eq!(nested_bullet.bullet_ranges.len(), 1);
+        assert_eq!(nested_bullet.bullet_ranges[0].start, 0);
+        assert_eq!(
+            nested_bullet.bullet_ranges[0].end,
+            docs_text_len("\tNested bullet\n")
+        );
+        assert_eq!(
+            nested_bullet.bullet_ranges[0].preset,
+            "BULLET_DISC_CIRCLE_SQUARE"
+        );
+
+        let double_nested_number = docs_block_text("    1. Nested number");
+        assert_eq!(double_nested_number.text, "\t\tNested number\n");
+        assert_eq!(double_nested_number.bullet_ranges.len(), 1);
+        assert_eq!(
+            double_nested_number.bullet_ranges[0].end,
+            docs_text_len("\t\tNested number\n")
+        );
+        assert_eq!(
+            double_nested_number.bullet_ranges[0].preset,
+            "NUMBERED_DECIMAL_ALPHA_ROMAN"
+        );
+    }
+
+    #[test]
+    fn document_text_groups_adjacent_nested_bullets_in_one_create_request() {
+        let requests = docs_document_text_requests(
+            1,
+            "- Parent bullet\n\n  - Child bullet\n\n    1. Grandchild number",
+        );
+        let bullet_requests = requests
+            .iter()
+            .filter_map(|request| match request {
+                DocsRequest::CreateParagraphBullets {
+                    create_paragraph_bullets,
+                } => Some(create_paragraph_bullets),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(bullet_requests.len(), 2);
+        assert_eq!(
+            bullet_requests[0].bullet_preset,
+            "BULLET_DISC_CIRCLE_SQUARE"
+        );
+        assert_eq!(bullet_requests[0].range.start_index, 1);
+        assert_eq!(
+            bullet_requests[0].range.end_index,
+            1 + docs_text_len("Parent bullet\n\tChild bullet\n")
+        );
+        assert_eq!(
+            bullet_requests[1].bullet_preset,
+            "NUMBERED_DECIMAL_ALPHA_ROMAN"
+        );
+        assert_eq!(
+            bullet_requests[1].range.start_index,
+            1 + docs_text_len("Parent bullet\n\tChild bullet\n")
+        );
     }
 
     #[test]

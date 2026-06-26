@@ -415,7 +415,14 @@ fn heading_level(style: &str) -> Option<usize> {
 }
 
 fn list_marker(glyph_type: &str) -> &'static str {
-    if glyph_type.contains("DECIMAL") || glyph_type.contains("NUMBER") {
+    if glyph_type.contains("DECIMAL")
+        || glyph_type.contains("NUMBER")
+        || glyph_type.contains("ALPHA")
+        || glyph_type.contains("ROMAN")
+        || glyph_type.contains("ORDERED")
+        || glyph_type.contains("ZERO")
+        || glyph_type.contains("DIGIT")
+    {
         "1."
     } else {
         "-"
@@ -665,6 +672,46 @@ mod tests {
             "\\# Literal heading\n\n\\- Literal bullet\n\n\\1. Literal number\n\n\\> Literal quote\n\n\\---\n\n\\::loc{id=literal type=paragraph}\n"
         );
         assert!(!rendered.push_blocking_directives);
+    }
+
+    #[test]
+    fn render_uses_ordered_markers_for_nested_alpha_and_roman_lists() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Nested Ordered"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Nested Ordered",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 9, "paragraph": {
+                            "bullet": { "listId": "ordered", "nestingLevel": 1 },
+                            "elements": [{ "textRun": { "content": "Alpha\n" } }]
+                        }},
+                        { "startIndex": 9, "endIndex": 17, "paragraph": {
+                            "bullet": { "listId": "ordered", "nestingLevel": 2 },
+                            "elements": [{ "textRun": { "content": "Roman\n" } }]
+                        }}
+                    ]
+                },
+                "lists": {
+                    "ordered": {
+                        "listProperties": {
+                            "nestingLevels": [
+                                { "glyphType": "DECIMAL" },
+                                { "glyphType": "ALPHA" },
+                                { "glyphType": "ROMAN" }
+                            ]
+                        }
+                    }
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(rendered.document.body, "  1. Alpha\n\n    1. Roman\n");
     }
 
     #[test]
