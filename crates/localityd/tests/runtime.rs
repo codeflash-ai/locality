@@ -757,6 +757,136 @@ fn default_runner_virtual_fs_children_rejects_plain_files_mount() {
 }
 
 #[test]
+fn virtual_projection_root_children_lists_mount_points_for_shared_root() {
+    use locality_core::model::MountId;
+    use locality_store::{InMemoryStateStore, MountConfig, MountRepository, ProjectionMode};
+    use localityd::virtual_projection::virtual_projection_root_children;
+
+    let mut store = InMemoryStateStore::new();
+    let root = std::env::temp_dir().join("locality-shared-root-test");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                root.join("notion-main"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save notion");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-my-company"),
+                "notion",
+                root.join("notion-my-company"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save notion company");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("google-docs-main"),
+                "google-docs",
+                root.join("google-docs-main"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save google docs");
+
+    let report = virtual_projection_root_children(&store, &root, ProjectionMode::LinuxFuse)
+        .expect("root children");
+
+    let filenames = report
+        .children
+        .iter()
+        .map(|child| child.filename.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        filenames,
+        vec!["google-docs-main", "notion-main", "notion-my-company"]
+    );
+    assert!(
+        report
+            .children
+            .iter()
+            .all(|child| child.identifier.starts_with("m:"))
+    );
+}
+
+#[test]
+fn runtime_virtual_projection_root_children_lists_mount_points_for_shared_root() {
+    let config = relay_config("shared-root-runtime-children");
+    let root = temp_root("shared-root-runtime-projection");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                root.join("notion-main"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save notion");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-my-company"),
+                "notion",
+                root.join("notion-my-company"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save notion company");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("google-docs-main"),
+                "google-docs",
+                root.join("google-docs-main"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save google docs");
+    drop(store);
+
+    let runtime = DaemonRuntime::spawn(config).expect("spawn runtime");
+    let response = runtime
+        .handle()
+        .request(DaemonRequest::VirtualProjectionRootChildren {
+            projection_root: root,
+            projection: ProjectionMode::LinuxFuse,
+        });
+    runtime.shutdown();
+
+    assert!(
+        response.ok,
+        "shared projection root children request failed: {:?}",
+        response.error
+    );
+    let payload = response.payload.expect("children payload");
+    let report: VirtualFsChildrenReport =
+        serde_json::from_value(payload).expect("decode children report");
+    let filenames = report
+        .children
+        .iter()
+        .map(|child| child.filename.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        filenames,
+        vec!["google-docs-main", "notion-main", "notion-my-company"]
+    );
+    assert!(
+        report
+            .children
+            .iter()
+            .all(|child| child.identifier.starts_with("m:"))
+    );
+}
+
+#[test]
 fn default_runner_marks_hydrated_write_dirty() {
     let fixture = EventFixture::new("dirty-write");
     fixture.write_hydrated_page("Original body.");

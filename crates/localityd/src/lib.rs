@@ -18,6 +18,7 @@ mod shadow_match;
 pub mod source;
 pub mod supervisor;
 pub mod virtual_fs;
+pub mod virtual_projection;
 pub mod watcher;
 
 use std::net::SocketAddr;

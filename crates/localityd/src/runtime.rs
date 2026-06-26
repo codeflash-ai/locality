@@ -25,8 +25,8 @@ use locality_core::shadow::ShadowDocument;
 use locality_store::{
     AutoSaveRepository, AutoSaveState, EntityRecord, EntityRepository, FreshnessStateRecord,
     FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
-    MountRepository, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
-    SqliteStateStore, open_credential_store,
+    MountRepository, ProjectionMode, RemoteObservationRecord, RemoteObservationRepository,
+    ShadowRepository, SqliteStateStore, open_credential_store,
 };
 use serde_json::{Value, json};
 
@@ -236,6 +236,18 @@ pub trait RuntimeJobRunner: Send + Sync + 'static {
         DaemonResponse::error(
             "unsupported",
             "runtime runner does not handle virtual filesystem child enumeration",
+        )
+    }
+
+    fn run_virtual_projection_root_children(
+        &self,
+        _state_root: PathBuf,
+        _projection_root: PathBuf,
+        _projection: ProjectionMode,
+    ) -> DaemonResponse {
+        DaemonResponse::error(
+            "unsupported",
+            "runtime runner does not handle shared projection root child enumeration",
         )
     }
 
@@ -574,6 +586,26 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
             &content_root,
             &mount_id,
             &container_identifier,
+        ) {
+            Ok(report) => DaemonResponse::ok(report),
+            Err(error) => DaemonResponse::error(locality_error_code(&error), error.to_string()),
+        }
+    }
+
+    fn run_virtual_projection_root_children(
+        &self,
+        state_root: PathBuf,
+        projection_root: PathBuf,
+        projection: ProjectionMode,
+    ) -> DaemonResponse {
+        let store = match SqliteStateStore::open(state_root) {
+            Ok(store) => store,
+            Err(error) => return DaemonResponse::error("store_open_failed", error.to_string()),
+        };
+        match crate::virtual_projection::virtual_projection_root_children(
+            &store,
+            &projection_root,
+            projection,
         ) {
             Ok(report) => DaemonResponse::ok(report),
             Err(error) => DaemonResponse::error(locality_error_code(&error), error.to_string()),
@@ -1215,6 +1247,17 @@ impl RuntimeState {
                         0,
                     );
                 }
+            }
+            DaemonRequest::VirtualProjectionRootChildren {
+                projection_root,
+                projection,
+            } => {
+                let response = self.runner.run_virtual_projection_root_children(
+                    self.config.state_root.clone(),
+                    projection_root,
+                    projection,
+                );
+                let _ = respond_to.send(response);
             }
             DaemonRequest::FileProviderChildren {
                 mount_id,
