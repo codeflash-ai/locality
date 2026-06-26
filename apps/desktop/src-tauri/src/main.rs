@@ -40,10 +40,7 @@ use loc_cli::push::{
 use loc_cli::search::{
     SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
 };
-#[cfg(test)]
-use loc_cli::status::StatusState;
-#[cfg(test)]
-use loc_cli::status::StatusSyncState;
+use loc_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::conflict::has_unresolved_conflict_markers;
 use locality_core::hydration::{HydrationReason, HydrationRequest};
@@ -1385,7 +1382,10 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let provider = mount
         .as_ref()
         .and_then(|mount| provider_runtime_summary(&state_root, mount));
-    let pending_changes = pending_changes_from_store(&store, &mounts, &journals);
+    let pending_changes = match mount.as_ref() {
+        Some(mount) => pending_changes_for_mount(&store, &state_root, &mount.mount_id)?,
+        None => Vec::new(),
+    };
     let daemon_ready = send_request(&state_root, &DaemonRequest::Ping)
         .map(|response| response.ok)
         .unwrap_or(false);
@@ -1652,7 +1652,24 @@ fn windows_cloud_files_provider_status(
     }
 }
 
-#[cfg(test)]
+fn pending_changes_for_mount(
+    store: &SqliteStateStore,
+    state_root: &Path,
+    mount_id: &MountId,
+) -> Result<Vec<PendingChange>, String> {
+    let status = run_status(
+        store,
+        StatusOptions {
+            state_root: Some(state_root.to_path_buf()),
+            mount_id: Some(mount_id.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .map_err(|error| error.message())?;
+
+    Ok(pending_changes_from_status(store, &status))
+}
+
 fn pending_changes_from_status<S>(
     store: &S,
     status: &loc_cli::status::StatusReport,
@@ -1683,108 +1700,6 @@ where
         .collect()
 }
 
-fn pending_changes_from_store(
-    store: &SqliteStateStore,
-    mounts: &[MountConfig],
-    journals: &[JournalEntry],
-) -> Vec<PendingChange> {
-    let mut changes = Vec::new();
-
-    for mount in mounts {
-        let mount_id = &mount.mount_id;
-        if let Ok(mutations) = store.list_virtual_mutations(mount_id) {
-            for mutation in mutations {
-                let summary = match mutation.mutation_kind {
-                    VirtualMutationKind::Create => "file is pending remote creation",
-                    VirtualMutationKind::Rename => "file rename is pending remote update",
-                    VirtualMutationKind::Delete => "file is pending remote archive",
-                };
-                changes.push(PendingChange {
-                    title: mutation.title,
-                    local_path: locality_platform::logical_path_display(&mutation.projected_path),
-                    summary: summary.to_string(),
-                    state: "safe".to_string(),
-                    auto_save: auto_save_status_for_path(store, mount_id, &mutation.projected_path),
-                });
-            }
-        }
-
-        let Ok(entities) = store.list_entities(mount_id) else {
-            continue;
-        };
-        for entity in entities {
-            let (pending_journal_count, failed_journal_count) =
-                desktop_journal_counts(journals, mount_id, &entity.remote_id);
-            let locally_pending = matches!(
-                entity.hydration,
-                HydrationState::Dirty | HydrationState::Conflicted
-            );
-            if !locally_pending && pending_journal_count == 0 {
-                continue;
-            }
-
-            let state = if matches!(entity.hydration, HydrationState::Conflicted) {
-                "conflict"
-            } else if failed_journal_count > 0 && locally_pending {
-                "blocked"
-            } else {
-                "safe"
-            };
-            let summary = if failed_journal_count > 0 && locally_pending {
-                store
-                    .latest_failed_journal_for_entity(mount_id, &entity.remote_id)
-                    .ok()
-                    .flatten()
-                    .map(|message| failed_push_summary(&message))
-                    .unwrap_or_else(|| {
-                        "previous push failed; review this file before trying again".to_string()
-                    })
-            } else if pending_journal_count > 0 {
-                "push in progress".to_string()
-            } else if matches!(entity.hydration, HydrationState::Conflicted) {
-                "conflict".to_string()
-            } else {
-                "local edits pending review".to_string()
-            };
-
-            changes.push(PendingChange {
-                title: entity.title,
-                local_path: locality_platform::logical_path_display(&entity.path),
-                summary,
-                state: state.to_string(),
-                auto_save: auto_save_status_for_path(store, mount_id, &entity.path),
-            });
-        }
-    }
-
-    changes
-}
-
-fn desktop_journal_counts(
-    journals: &[JournalEntry],
-    mount_id: &MountId,
-    remote_id: &RemoteId,
-) -> (usize, usize) {
-    let mut pending = 0;
-    let mut failed = 0;
-
-    for journal in journals {
-        if journal.mount_id != *mount_id || !journal.remote_ids.iter().any(|id| id == remote_id) {
-            continue;
-        }
-        match journal.status {
-            JournalStatus::Prepared | JournalStatus::Applying | JournalStatus::Applied => {
-                pending += 1;
-            }
-            JournalStatus::Failed(_) => failed += 1,
-            JournalStatus::Reconciled | JournalStatus::Reverted => {}
-        }
-    }
-
-    (pending, failed)
-}
-
-#[cfg(test)]
 fn auto_save_status_for_entry(
     store: &impl AutoSaveRepository,
     mount_id: &MountId,
@@ -1834,7 +1749,6 @@ fn auto_save_status_for_path(
     }
 }
 
-#[cfg(test)]
 fn pending_state_for_entry(entry: &loc_cli::status::StatusEntry) -> &'static str {
     if matches!(entry.sync_state, StatusSyncState::Conflicted) {
         "conflict"
@@ -1856,7 +1770,6 @@ fn pending_state_for_entry(entry: &loc_cli::status::StatusEntry) -> &'static str
     }
 }
 
-#[cfg(test)]
 fn status_summary_for_entry(entry: &loc_cli::status::StatusEntry) -> String {
     if entry.failed_journal_count > 0 {
         if let Some(last_failure) = status_issue_message(entry, "last_failure") {
@@ -1887,7 +1800,6 @@ fn status_summary_for_entry(entry: &loc_cli::status::StatusEntry) -> String {
     "local edits pending review".to_string()
 }
 
-#[cfg(test)]
 fn status_entry_needs_desktop_attention(entry: &loc_cli::status::StatusEntry) -> bool {
     if matches!(
         entry.state,
@@ -1912,7 +1824,6 @@ fn status_entry_needs_desktop_attention(entry: &loc_cli::status::StatusEntry) ->
     false
 }
 
-#[cfg(test)]
 fn failed_journal_only(entry: &loc_cli::status::StatusEntry) -> bool {
     entry.failed_journal_count > 0
         && matches!(entry.state, StatusState::Clean)
@@ -1923,7 +1834,6 @@ fn failed_journal_only(entry: &loc_cli::status::StatusEntry) -> bool {
             .all(|issue| matches!(issue.code.as_str(), "failed_journal" | "last_failure"))
 }
 
-#[cfg(test)]
 fn status_issue_message<'a>(
     entry: &'a loc_cli::status::StatusEntry,
     code: &str,
@@ -7254,6 +7164,70 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].state, "blocked");
         assert!(changes[0].summary.contains("Previous push failed"));
+    }
+
+    #[test]
+    fn desktop_pending_changes_ignore_other_mount_failed_dirty_entries() {
+        let temp = TestTempDir::new("desktop-pending-selected-mount");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let selected_mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("notion"),
+        );
+        let other_mount = MountConfig::new(
+            MountId::new("google-docs-main"),
+            "google-docs",
+            temp.path().join("google-docs"),
+        );
+        let remote_id = RemoteId::new("google-docs-page");
+
+        store
+            .save_mount(selected_mount.clone())
+            .expect("save selected mount");
+        store
+            .save_mount(other_mount.clone())
+            .expect("save other mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    other_mount.mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "table-move-guard",
+                    "table-move-guard/page.md",
+                )
+                .with_hydration(HydrationState::Dirty),
+            )
+            .expect("save dirty other entity");
+        store
+            .append_journal(JournalEntry::new(
+                PushId("push-google-docs-failed".to_string()),
+                other_mount.mount_id.clone(),
+                vec![remote_id.clone()],
+                PushPlan::new(vec![remote_id], Vec::new()),
+                JournalStatus::Failed("google docs failed deletion".to_string()),
+            ))
+            .expect("append failed other journal");
+
+        let changes =
+            super::pending_changes_for_mount(&store, temp.path(), &selected_mount.mount_id)
+                .expect("selected mount pending changes");
+
+        let titles = changes
+            .iter()
+            .map(|change| change.title.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            changes.is_empty(),
+            "Live Mode pending changes for the selected mount must not include another mount: {titles:?}"
+        );
+
+        let other_changes =
+            super::pending_changes_for_mount(&store, temp.path(), &other_mount.mount_id)
+                .expect("other mount pending changes");
+        assert_eq!(other_changes.len(), 1);
+        assert_eq!(other_changes[0].title, "table-move-guard");
     }
 
     #[test]

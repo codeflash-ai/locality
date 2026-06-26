@@ -29,6 +29,7 @@ use serde::Serialize;
 pub struct StatusOptions {
     pub path: Option<PathBuf>,
     pub state_root: Option<PathBuf>,
+    pub mount_id: Option<MountId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -164,7 +165,7 @@ where
     let mounts = store.load_mounts().map_err(StatusError::Store)?;
     let target = options.path.as_deref().map(absolute_path).transpose()?;
     let state_root = options.state_root.unwrap_or_else(default_state_root);
-    let scopes = resolve_scopes(store, &mounts, target.as_deref())?;
+    let scopes = resolve_scopes(store, &mounts, options.mount_id.as_ref(), target.as_deref())?;
     let journals = store.list_journal().map_err(StatusError::Store)?;
     let mut summary = StatusSummary::default();
     let mut mount_reports = Vec::new();
@@ -257,6 +258,7 @@ impl StatusSummary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatusError {
     CurrentDir(String),
+    MountIdNotFound(MountId),
     MountNotFound(PathBuf),
     Store(StoreError),
 }
@@ -265,6 +267,7 @@ impl StatusError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::CurrentDir(_) => "current_dir_failed",
+            Self::MountIdNotFound(_) => "mount_id_not_found",
             Self::MountNotFound(_) => "mount_not_found",
             Self::Store(StoreError::EntityPathMissing { .. }) => "entity_path_missing",
             Self::Store(_) => "store_error",
@@ -274,6 +277,9 @@ impl StatusError {
     pub fn message(&self) -> String {
         match self {
             Self::CurrentDir(message) => format!("failed to resolve current directory: {message}"),
+            Self::MountIdNotFound(mount_id) => {
+                format!("no Locality mount has id `{}`", mount_id.0)
+            }
             Self::MountNotFound(path) => {
                 format!("no Locality mount contains `{}`", path.display())
             }
@@ -298,11 +304,16 @@ enum ScopeFilter {
 fn resolve_scopes<S>(
     store: &S,
     mounts: &[MountConfig],
+    mount_id: Option<&MountId>,
     target: Option<&Path>,
 ) -> Result<Vec<StatusScope>, StatusError>
 where
     S: EntityRepository + VirtualMutationRepository,
 {
+    if let Some(mount_id) = mount_id {
+        return resolve_mount_id_scope(store, mounts, mount_id, target).map(|scope| vec![scope]);
+    }
+
     match target {
         Some(target) => resolve_target_scope(store, mounts, target).map(|scope| vec![scope]),
         None => resolve_default_scopes(store, mounts),
@@ -340,6 +351,30 @@ where
             filter: ScopeFilter::All,
         })
         .collect())
+}
+
+fn resolve_mount_id_scope<S>(
+    store: &S,
+    mounts: &[MountConfig],
+    mount_id: &MountId,
+    target: Option<&Path>,
+) -> Result<StatusScope, StatusError>
+where
+    S: EntityRepository + VirtualMutationRepository,
+{
+    let mount = mounts
+        .iter()
+        .find(|mount| mount.mount_id == *mount_id)
+        .cloned()
+        .ok_or_else(|| StatusError::MountIdNotFound(mount_id.clone()))?;
+    let filter = if let Some(target) = target {
+        let relative_path = relative_entity_path(&mount, target)?;
+        scope_filter_for_relative_path(store, &mount, &relative_path)?
+    } else {
+        ScopeFilter::All
+    };
+
+    Ok(StatusScope { mount, filter })
 }
 
 fn resolve_target_scope<S>(

@@ -2034,6 +2034,7 @@ fn status(args: &[String], json: bool) -> i32 {
     let options = StatusOptions {
         path: first_positional(args).map(PathBuf::from),
         state_root: Some(state_root.clone()),
+        ..StatusOptions::default()
     };
     if let Some(target) = options.path.as_deref() {
         reconcile_projection_changes_best_effort("status", &mut store, &state_root, Some(target));
@@ -2927,6 +2928,7 @@ fn push_reports_exit_code(reports: &[PushReport]) -> i32 {
 fn push_target_error(json: bool, error: StatusError) -> i32 {
     let exit_code = match &error {
         StatusError::MountNotFound(_)
+        | StatusError::MountIdNotFound(_)
         | StatusError::Store(locality_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
         StatusError::CurrentDir(_) | StatusError::Store(_) => EXIT_INTERNAL,
     };
@@ -4721,11 +4723,12 @@ fn pull_command_error(json: bool, error: PullError) -> i32 {
 fn status_command_error(json: bool, error: StatusError, state_root: PathBuf) -> i32 {
     let exit_code = match &error {
         StatusError::MountNotFound(_)
+        | StatusError::MountIdNotFound(_)
         | StatusError::Store(locality_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
         StatusError::CurrentDir(_) | StatusError::Store(_) => EXIT_INTERNAL,
     };
     let message = match &error {
-        StatusError::MountNotFound(_) => {
+        StatusError::MountNotFound(_) | StatusError::MountIdNotFound(_) => {
             format!(
                 "{} in state dir `{}`",
                 error.message(),

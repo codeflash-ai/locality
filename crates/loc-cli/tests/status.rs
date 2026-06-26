@@ -249,6 +249,52 @@ fn status_without_path_outside_mount_reports_all_mounts() {
 }
 
 #[test]
+fn status_scopes_to_explicit_mount_id_without_path() {
+    let fixture = StatusFixture::new();
+    let second_root = TempRoot::new("loc-cli-status-explicit-mount-second");
+    let outside = TempRoot::new("loc-cli-status-explicit-mount-outside");
+    let mut store = fixture.store();
+    fixture.stub_page(&mut store, "page-1", "Selected.md");
+    fixture.write_stub("Selected.md", "page-1");
+    store
+        .save_mount(MountConfig::new(
+            MountId::new("google-docs-main"),
+            "google-docs",
+            second_root.path.clone(),
+        ))
+        .expect("save second mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                MountId::new("google-docs-main"),
+                RemoteId::new("google-docs-page"),
+                EntityKind::Page,
+                "table-move-guard",
+                "table-move-guard/page.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save other mount entity");
+
+    let _lock = cwd_lock().lock().expect("cwd lock");
+    let _cwd = CurrentDirGuard::enter(&outside.path);
+    let report = run_status(
+        &store,
+        StatusOptions {
+            mount_id: Some(fixture.mount_id.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert_eq!(report.target, None);
+    assert_eq!(report.mounts.len(), 1);
+    assert_eq!(report.mounts[0].mount_id, "notion-main");
+    assert_eq!(report.summary.total, 1);
+    assert_eq!(report.mounts[0].entries[0].path, "Selected.md");
+}
+
+#[test]
 fn status_reports_missing_and_conflicted_entities() {
     let fixture = StatusFixture::new();
     let mut store = fixture.store();
@@ -434,6 +480,7 @@ fn status_reads_virtual_projection_from_content_cache() {
         StatusOptions {
             path: Some(fixture.root.clone()),
             state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("status report");
@@ -473,6 +520,7 @@ fn status_reports_stub_virtual_cache_edits_as_dirty() {
         StatusOptions {
             path: Some(fixture.root.clone()),
             state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("status report");
@@ -505,6 +553,7 @@ fn status_reports_stub_virtual_cache_conflicts_as_conflicted() {
         StatusOptions {
             path: Some(fixture.root.clone()),
             state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("status report");
@@ -559,6 +608,7 @@ fn status_reports_pending_virtual_creates_and_deletes() {
         StatusOptions {
             path: Some(fixture.root.clone()),
             state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("status report");

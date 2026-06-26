@@ -282,6 +282,7 @@ fn unknown_local_path_reports_no_matching_mount() {
         StatusOptions {
             path: Some(missing_path),
             state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect_err("unknown path should not silently pick a mount");
@@ -526,6 +527,7 @@ fn status_for(
         StatusOptions {
             path: Some(path.to_path_buf()),
             state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("status report")

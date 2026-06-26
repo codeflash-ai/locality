@@ -139,6 +139,7 @@ where
         StatusOptions {
             path: Some(requested_path.clone()),
             state_root,
+            ..StatusOptions::default()
         },
     ) {
         Ok(status) => status,

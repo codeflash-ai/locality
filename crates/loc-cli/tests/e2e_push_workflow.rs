@@ -2674,6 +2674,7 @@ fn live_virtual_page_directory_delete_archives_remote_child_page() {
         StatusOptions {
             path: Some(fixture.root.clone()),
             state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("pending delete status");
@@ -2832,6 +2833,7 @@ fn live_virtual_database_row_directory_delete_archives_remote_row() {
         StatusOptions {
             path: Some(fixture.root.clone()),
             state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("pending database row delete status");
@@ -3007,6 +3009,7 @@ fn live_virtual_page_directory_rename_updates_remote_title_and_reconciles() {
         StatusOptions {
             path: Some(renamed_page_path.clone()),
             state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
         },
     )
     .expect("clean rename status");
