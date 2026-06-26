@@ -1396,7 +1396,7 @@ mod tests {
         );
         assert_eq!(
             super::macos_file_provider_display_name(
-                std::path::Path::new("/Users/example/Library/CloudStorage/Locality/notion"),
+                std::path::Path::new("/Users/example/Library/CloudStorage/Locality/notion-main"),
                 "fallback",
             ),
             ""

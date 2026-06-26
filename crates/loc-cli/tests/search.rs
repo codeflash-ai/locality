@@ -10,6 +10,7 @@ use locality_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
     ProjectionMode, RemoteObservationRecord, RemoteObservationRepository, SqliteStateStore,
 };
+use localityd::virtual_fs::virtual_projection_mount_point;
 
 #[test]
 fn search_ranks_title_path_and_remote_id_matches() {
@@ -269,22 +270,19 @@ fn notion_url_locate_keeps_workspace_fallback_when_root_entity_is_unknown() {
 }
 
 #[test]
-fn search_reports_linux_fuse_absolute_path_under_source_root() {
+fn search_reports_linux_fuse_absolute_path_under_mount_point_root() {
     let fixture = SearchFixture::new();
     let mut store = InMemoryStateStore::new();
+    let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+        .projection(ProjectionMode::LinuxFuse);
     store
-        .save_mount(
-            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
-                .projection(ProjectionMode::LinuxFuse),
-        )
+        .save_mount(mount.clone())
         .expect("save linux fuse mount");
     fixture.seed_entities(&mut store);
 
     let report = run_search(&store, SearchOptions::new("initial")).expect("search");
 
-    let expected = fixture
-        .root
-        .join("notion")
+    let expected = virtual_projection_mount_point(&mount)
         .join("Product")
         .join("Initial Idea")
         .join("page.md")

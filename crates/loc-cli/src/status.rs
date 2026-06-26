@@ -22,7 +22,7 @@ use locality_store::{
     VirtualMutationRecord, VirtualMutationRepository,
 };
 use localityd::file_provider as daemon_file_provider;
-use localityd::virtual_fs::{source_root_directory_name, virtual_fs_content_path};
+use localityd::virtual_fs::{virtual_fs_content_path, virtual_projection_mount_point};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -605,9 +605,7 @@ fn projected_absolute_path(mount: &MountConfig, relative_path: &Path) -> PathBuf
         ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
     ) {
         return locality_platform::join_logical_path(
-            &mount
-                .root
-                .join(source_root_directory_name(&mount.connector)),
+            &virtual_projection_mount_point(mount),
             relative_path,
         );
     }

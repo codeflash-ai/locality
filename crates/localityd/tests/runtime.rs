@@ -27,9 +27,9 @@ use localityd::runtime::{
     FreshnessRuntimeReport, RuntimeJobRunner, ScheduledPullRuntimeReport,
 };
 use localityd::scheduler::PullSchedulerTick;
-use localityd::virtual_fs::{
-    ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport, virtual_fs_content_root,
-};
+#[cfg(target_os = "macos")]
+use localityd::virtual_fs::virtual_fs_content_root;
+use localityd::virtual_fs::{ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport};
 use localityd::watcher::{FileEvent, FileEventKind};
 use serde_json::json;
 
@@ -258,7 +258,7 @@ fn runtime_file_provider_children_bypasses_active_background_refreshes() {
     let response_thread = thread::spawn(move || {
         foreground_handle.request(DaemonRequest::FileProviderChildren {
             mount_id: "notion-main".to_string(),
-            container_identifier: "source:notion".to_string(),
+            container_identifier: "mount:notion-main".to_string(),
         })
     });
 
@@ -266,7 +266,7 @@ fn runtime_file_provider_children_bypasses_active_background_refreshes() {
         foreground_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("foreground children request"),
-        ("notion-main".to_string(), "source:notion".to_string())
+        ("notion-main".to_string(), "mount:notion-main".to_string())
     );
     assert!(response_thread.join().expect("foreground response").ok);
     release_blocked_runner(&release);
@@ -439,7 +439,7 @@ fn runtime_routes_push_request_through_runner() {
 }
 
 #[test]
-fn runtime_prime_virtual_mounts_queues_root_and_source_refreshes() {
+fn runtime_prime_virtual_mounts_queues_root_and_mount_point_refreshes() {
     let config = relay_config("prime-virtual-mount");
     let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
     store
@@ -476,11 +476,11 @@ fn runtime_prime_virtual_mounts_queues_root_and_source_refreshes() {
     assert_eq!(
         refreshes,
         vec![
+            ("notion-main".to_string(), "mount:notion-main".to_string()),
             (
                 "notion-main".to_string(),
                 ROOT_CONTAINER_IDENTIFIER.to_string()
             ),
-            ("notion-main".to_string(), "source:notion".to_string()),
         ]
     );
     runtime.shutdown();
@@ -531,7 +531,7 @@ fn runtime_background_virtual_refreshes_walk_breadth_first() {
         "notion-main".to_string(),
         ROOT_CONTAINER_IDENTIFIER.to_string(),
     );
-    let source = ("notion-main".to_string(), "source:notion".to_string());
+    let source = ("notion-main".to_string(), "mount:notion-main".to_string());
     let page_a = ("notion-main".to_string(), "children:page-a".to_string());
     let page_b = ("notion-main".to_string(), "children:page-b".to_string());
     let page_a1 = ("notion-main".to_string(), "children:page-a1".to_string());
@@ -565,9 +565,9 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
 
     simulation.advance_to(0, SchedulerInputAction::InitialEnumeration);
     simulation.prime_virtual_mounts();
-    let [root_refresh, source_refresh] = simulation.expect_started_set([
+    let [mount_point_refresh, root_refresh] = simulation.expect_started_set([
         SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, ROOT_CONTAINER_IDENTIFIER),
-        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "source:notion"),
+        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "mount:notion-main"),
     ]);
 
     simulation.advance_to(
@@ -631,9 +631,9 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
 
     simulation.advance_to(
         70,
-        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "source:notion"),
+        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "mount:notion-main"),
     );
-    simulation.release(source_refresh);
+    simulation.release(mount_point_refresh);
     simulation.expect_no_start();
 
     simulation.advance_to(
@@ -669,12 +669,12 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
     simulation.expect_no_start();
 
     simulation.assert_timeline([
+        SchedulerTimelineEntry::new(0, SchedulerOpKind::RefreshChildren, "mount:notion-main"),
         SchedulerTimelineEntry::new(
             0,
             SchedulerOpKind::RefreshChildren,
             ROOT_CONTAINER_IDENTIFIER,
         ),
-        SchedulerTimelineEntry::new(0, SchedulerOpKind::RefreshChildren, "source:notion"),
         SchedulerTimelineEntry::new(10, SchedulerOpKind::RefreshChildren, "children:page-a"),
         SchedulerTimelineEntry::new(20, SchedulerOpKind::FileProviderRead, "page-open"),
         SchedulerTimelineEntry::new(50, SchedulerOpKind::Pull, "ManualSync.md"),
@@ -711,7 +711,7 @@ fn default_runner_virtual_fs_children_is_cache_only() {
     let response = DefaultRuntimeJobRunner.run_virtual_fs_children(
         state_root,
         mount_id.0.clone(),
-        "source:notion".to_string(),
+        "mount:notion-main".to_string(),
     );
 
     assert!(
@@ -1220,6 +1220,7 @@ fn assert_hydration_jobs_drained(state_root: PathBuf) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn wait_for_file_contains(path: &Path, needle: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1558,7 +1559,7 @@ impl ScriptedSchedulerState {
         container_identifier: &str,
     ) -> LocalityResult<usize> {
         let entries = match container_identifier {
-            "source:notion" => vec![
+            "mount:notion-main" => vec![
                 EntityRecord::new(
                     self.mount_id.clone(),
                     RemoteId::new("page-a"),
@@ -2139,7 +2140,7 @@ impl RuntimeJobRunner for BreadthFirstRefreshRunner {
 
         let mut store = SqliteStateStore::open(state_root).map_err(LocalityError::from)?;
         let entries = match container_identifier.as_str() {
-            "source:notion" => vec![
+            "mount:notion-main" => vec![
                 EntityRecord::new(
                     self.mount_id.clone(),
                     RemoteId::new("page-a"),

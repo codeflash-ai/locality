@@ -22,7 +22,7 @@ use crate::hydration::HydrationSource;
 use crate::shadow_match::parsed_matches_shadow;
 use crate::virtual_fs;
 use crate::virtual_fs::{
-    mount_point_directory_name, source_root_identifier, virtual_projection_mount_point,
+    mount_point_directory_name, mount_point_identifier, virtual_projection_mount_point,
 };
 
 pub use crate::virtual_fs::{
@@ -83,7 +83,7 @@ where
         .into_iter()
         .map(|mount| FileProviderDomainChild {
             mount_id: mount.mount_id.0.clone(),
-            item: shared_domain_source_root_item(&mount),
+            item: shared_domain_mount_point_item(&mount),
         })
         .collect();
 
@@ -104,10 +104,10 @@ where
     virtual_fs::virtual_fs_item(store, mount_id, identifier)
 }
 
-fn shared_domain_source_root_item(mount: &MountConfig) -> FileProviderItem {
+fn shared_domain_mount_point_item(mount: &MountConfig) -> FileProviderItem {
     let filename = mount_point_directory_name(mount);
     FileProviderItem {
-        identifier: source_root_identifier(&mount.connector),
+        identifier: mount_point_identifier(mount),
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: filename.clone(),
         kind: FileProviderItemKind::Folder,
@@ -117,7 +117,7 @@ fn shared_domain_source_root_item(mount: &MountConfig) -> FileProviderItem {
         hydration: None,
         content_type: "public.folder".to_string(),
         remote_edited_at: None,
-        materialized_path: Some(mount.root.display().to_string()),
+        materialized_path: Some(virtual_projection_mount_point(mount).display().to_string()),
         byte_size: None,
     }
 }
@@ -1178,6 +1178,31 @@ mod tests {
     }
 
     #[test]
+    fn new_virtual_mount_keeps_connector_named_child_in_relative_path() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        let matched = match_mount_path(
+            &mount,
+            Path::new("/tmp/Locality/notion-main/notion/roadmap/page.md"),
+        )
+        .expect("path matches mount point");
+
+        assert_eq!(
+            matched.access_root,
+            PathBuf::from("/tmp/Locality/notion-main")
+        );
+        assert_eq!(
+            matched.relative_path,
+            PathBuf::from("notion/roadmap/page.md")
+        );
+    }
+
+    #[test]
     fn shared_macos_file_provider_domain_children_lists_virtual_mount_roots() {
         let mut store = InMemoryStateStore::new();
         store
@@ -1215,14 +1240,14 @@ mod tests {
         assert_eq!(report.children.len(), 2);
         assert_eq!(report.children[0].mount_id, "linear-main");
         assert_eq!(report.children[0].item.filename, "linear-main");
-        assert_eq!(report.children[0].item.identifier, "source:linear");
+        assert_eq!(report.children[0].item.identifier, "mount:linear-main");
         assert_eq!(
             report.children[0].item.parent_identifier.as_deref(),
             Some(ROOT_CONTAINER_IDENTIFIER)
         );
         assert_eq!(report.children[1].mount_id, "notion-main");
         assert_eq!(report.children[1].item.filename, "notion-main");
-        assert_eq!(report.children[1].item.identifier, "source:notion");
+        assert_eq!(report.children[1].item.identifier, "mount:notion-main");
     }
 
     #[test]

@@ -516,8 +516,8 @@ mod tests {
         assert_eq!(
             refreshes,
             vec![
+                ("notion-main".to_string(), "mount:notion-main".to_string()),
                 ("notion-main".to_string(), "root".to_string()),
-                ("notion-main".to_string(), "source:notion".to_string()),
             ]
         );
         runtime.shutdown();

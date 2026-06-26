@@ -50,10 +50,10 @@ use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::shadow_match::parsed_matches_shadow;
 use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
-    ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, commit_virtual_fs_write,
+    MOUNT_POINT_PREFIX, ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind, commit_virtual_fs_write,
     create_virtual_fs_directory, create_virtual_fs_file,
-    materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
-    rename_virtual_fs_item, source_root_identifier, trash_virtual_fs_item,
+    materialize_virtual_fs_item_with_content_root, mount_point_identifier,
+    refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
     virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
     virtual_fs_content_root, virtual_fs_item_with_content_root,
 };
@@ -1691,8 +1691,8 @@ impl RuntimeState {
                 0,
             );
             self.queue_child_refresh(
-                mount.mount_id.0,
-                source_root_identifier(&mount.connector),
+                mount.mount_id.0.clone(),
+                mount_point_identifier(&mount),
                 ChildRefreshPriority::Background,
                 0,
             );
@@ -2355,6 +2355,7 @@ fn observable_remote_identifier(identifier: &str) -> bool {
         && !identifier.starts_with("children:")
         && !identifier.starts_with("guidance:")
         && !identifier.starts_with("path:")
+        && !identifier.starts_with(MOUNT_POINT_PREFIX)
         && !identifier.starts_with("source:")
         && identifier != ROOT_CONTAINER_IDENTIFIER
 }
@@ -3049,6 +3050,7 @@ mod tests {
         ));
         assert!(!observable_remote_identifier("guidance:AGENTS.md"));
         assert!(!observable_remote_identifier("children:page-1"));
+        assert!(!observable_remote_identifier("mount:notion-main"));
         assert!(!observable_remote_identifier("source:notion"));
     }
 

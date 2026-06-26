@@ -19,7 +19,9 @@ use locality_store::{
     RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
     VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
-use localityd::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
+use localityd::virtual_fs::{
+    virtual_fs_content_path, virtual_fs_content_root, virtual_projection_mount_point,
+};
 
 #[test]
 fn status_reports_clean_and_dirty_hydrated_files() {
@@ -450,12 +452,9 @@ fn status_runner_works_with_sqlite_state_store() {
 fn status_reads_virtual_projection_from_content_cache() {
     let fixture = StatusFixture::new();
     let mut store = InMemoryStateStore::new();
-    store
-        .save_mount(
-            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
-                .projection(ProjectionMode::LinuxFuse),
-        )
-        .expect("save virtual mount");
+    let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+        .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save virtual mount");
     fixture.hydrated_page(
         &mut store,
         "page-1",
@@ -490,9 +489,7 @@ fn status_reads_virtual_projection_from_content_cache() {
     assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
     assert_eq!(
         status_entry(&report, "Roadmap.md").absolute_path,
-        fixture
-            .root
-            .join("notion")
+        virtual_projection_mount_point(&mount)
             .join("Roadmap.md")
             .display()
             .to_string()
@@ -570,12 +567,9 @@ fn status_reports_stub_virtual_cache_conflicts_as_conflicted() {
 fn status_reports_pending_virtual_creates_and_deletes() {
     let fixture = StatusFixture::new();
     let mut store = InMemoryStateStore::new();
-    store
-        .save_mount(
-            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
-                .projection(ProjectionMode::LinuxFuse),
-        )
-        .expect("save virtual mount");
+    let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+        .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save virtual mount");
     fixture.hydrated_page(
         &mut store,
         "page-1",
@@ -620,9 +614,7 @@ fn status_reports_pending_virtual_creates_and_deletes() {
     assert_eq!(entry_issue(&report, "Roadmap.md"), "pending_virtual_delete");
     assert_eq!(
         status_entry(&report, "Draft.md").absolute_path,
-        fixture
-            .root
-            .join("notion")
+        virtual_projection_mount_point(&mount)
             .join("Draft.md")
             .display()
             .to_string()

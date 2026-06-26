@@ -77,9 +77,12 @@ use localityd::push::execute_auto_save_push_job_with_content_root;
 use localityd::source::{
     resolve_source_for_mount_id, resolve_source_for_path, source_display_name,
 };
+#[cfg(target_os = "macos")]
+use localityd::virtual_fs::materialize_virtual_fs_item_with_content_root;
+#[cfg(target_os = "macos")]
+use localityd::virtual_fs::mount_point_directory_name;
 use localityd::virtual_fs::{
-    commit_virtual_fs_write, materialize_virtual_fs_item_with_content_root,
-    source_root_directory_name, source_root_identifier, virtual_fs_content_base,
+    commit_virtual_fs_write, mount_point_identifier, virtual_fs_content_base,
     virtual_fs_content_path, virtual_fs_content_root,
 };
 use notify::{RecursiveMode, Watcher};
@@ -107,6 +110,7 @@ const TERMINAL_CLI_PATH_MANAGED_END: &str = "# <<< LOCALITY_TERMINAL_CLI_PATH <<
 const WINDOWS_TERMINAL_CLI_SHIM_MARKER: &str = "LOCALITY_TERMINAL_CLI_SHIM";
 #[cfg(windows)]
 const WINDOWS_RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const DEFAULT_NOTION_MOUNT_POINT_DIRECTORY: &str = "notion-main";
 #[cfg(windows)]
 const WINDOWS_RUN_VALUE_NAME: &str = "Locality";
 #[cfg(windows)]
@@ -3354,14 +3358,8 @@ fn mount_access_root(mount: &MountConfig) -> PathBuf {
                 localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
             )
         {
-            return url.join(source_root_directory_name(&mount.connector));
+            return url.join(mount_point_directory_name(mount));
         }
-    }
-
-    if mount.projection == ProjectionMode::LinuxFuse {
-        return mount
-            .root
-            .join(source_root_directory_name(&mount.connector));
     }
 
     mount.root.clone()
@@ -3417,15 +3415,19 @@ fn absolute_display_path(path: &Path) -> String {
 }
 
 fn default_notion_mount_root() -> PathBuf {
+    default_notion_shared_root().join(DEFAULT_NOTION_MOUNT_POINT_DIRECTORY)
+}
+
+fn default_notion_shared_root() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        macos_locality_cloud_storage_root().join(source_root_directory_name("notion"))
+        macos_locality_cloud_storage_root()
     }
 
     #[cfg(target_os = "linux")]
     {
         if let Ok(home) = home_dir() {
-            return home.join("Documents").join("Locality");
+            return home.join("Locality");
         }
         PathBuf::from("Locality")
     }
@@ -3433,18 +3435,14 @@ fn default_notion_mount_root() -> PathBuf {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         if let Ok(home) = home_dir() {
-            return home.join("Documents").join("Locality").join("Notion");
+            return home.join("Locality");
         }
-        PathBuf::from("Locality").join("Notion")
+        PathBuf::from("Locality")
     }
 }
 
 fn default_notion_access_root() -> PathBuf {
-    let root = default_notion_mount_root();
-    if desktop_projection_mode() == ProjectionMode::LinuxFuse {
-        return root.join(source_root_directory_name("notion"));
-    }
-    root
+    default_notion_mount_root()
 }
 
 #[cfg(target_os = "macos")]
@@ -3517,7 +3515,7 @@ fn resolve_desktop_mount_root(path: &str) -> Result<PathBuf, String> {
             return Err("Choose a CloudStorage folder for the Notion mount.".to_string());
         }
         if !path.contains('/') && !path.starts_with('~') {
-            return Ok(macos_locality_cloud_storage_root().join(source_root_directory_name(path)));
+            return Ok(macos_locality_cloud_storage_root().join(path));
         }
     }
 
@@ -3528,6 +3526,10 @@ fn resolve_desktop_mount_root(path: &str) -> Result<PathBuf, String> {
 fn normalize_desktop_mount_root(root: &Path) -> Result<PathBuf, String> {
     let root = absolute_path(root)?;
 
+    if root == default_notion_shared_root() {
+        return Ok(default_notion_mount_root());
+    }
+
     #[cfg(target_os = "macos")]
     {
         if root == macos_cloud_storage_dir() || root == macos_locality_cloud_storage_root() {
@@ -3537,19 +3539,7 @@ fn normalize_desktop_mount_root(root: &Path) -> Result<PathBuf, String> {
             .into_iter()
             .any(|provider_root| root == provider_root)
         {
-            return Ok(root.join(source_root_directory_name("notion")));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case(&source_root_directory_name("notion")))
-            && let Some(parent) = root.parent()
-        {
-            return Ok(parent.to_path_buf());
+            return Ok(root.join(DEFAULT_NOTION_MOUNT_POINT_DIRECTORY));
         }
     }
 
@@ -4994,16 +4984,17 @@ fn activate_virtual_projection_mount(
 }
 
 fn prefetch_virtual_projection_root(state_root: &Path, mount: &MountConfig) -> Result<(), String> {
-    prefetch_virtual_projection_container(
-        state_root,
-        &mount.mount_id.0,
-        ROOT_CONTAINER_IDENTIFIER,
-    )?;
-    prefetch_virtual_projection_container(
-        state_root,
-        &mount.mount_id.0,
-        &source_root_identifier(&mount.connector),
-    )
+    for identifier in virtual_projection_prefetch_container_identifiers(mount) {
+        prefetch_virtual_projection_container(state_root, &mount.mount_id.0, &identifier)?;
+    }
+    Ok(())
+}
+
+fn virtual_projection_prefetch_container_identifiers(mount: &MountConfig) -> Vec<String> {
+    vec![
+        ROOT_CONTAINER_IDENTIFIER.to_string(),
+        mount_point_identifier(mount),
+    ]
 }
 
 fn prefetch_virtual_projection_container(
@@ -5245,7 +5236,7 @@ fn signal_virtual_projection_refresh(mount: &MountConfig) {
 fn virtual_projection_refresh_signal_identifiers(mount: &MountConfig) -> Vec<String> {
     vec![
         ROOT_CONTAINER_IDENTIFIER.to_string(),
-        source_root_identifier(&mount.connector),
+        mount_point_identifier(mount),
     ]
 }
 
@@ -5436,9 +5427,9 @@ fn open_virtual_projection(mount: &MountConfig) -> Result<(), String> {
 fn open_macos_virtual_projection(mount: &MountConfig) -> Result<(), String> {
     match macos_file_provider_domain_url(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID) {
         Ok(provider_root) => {
-            let source_root = provider_root.join(source_root_directory_name(&mount.connector));
-            if source_root.exists() {
-                return open_in_file_manager(&source_root);
+            let mount_point_root = provider_root.join(mount_point_directory_name(mount));
+            if mount_point_root.exists() {
+                return open_in_file_manager(&mount_point_root);
             }
             open_in_file_manager(&provider_root)
         }
@@ -6510,8 +6501,8 @@ mod tests {
         sample_snapshot, shell_single_quote, should_hide_tray_popover,
         should_prioritize_located_result, state_event_path_requires_refresh,
         terminal_cli_link_state, tray_icon_image, tray_popover_position, unique_suffix,
-        validate_mount_root, virtual_projection_refresh_signal_identifiers,
-        write_terminal_cli_path_section,
+        validate_mount_root, virtual_projection_prefetch_container_identifiers,
+        virtual_projection_refresh_signal_identifiers, write_terminal_cli_path_section,
     };
 
     #[test]
@@ -7007,13 +6998,17 @@ mod tests {
     }
 
     #[test]
-    fn linux_fuse_mount_access_root_points_at_connector_directory() {
-        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/Locality")
-            .projection(ProjectionMode::LinuxFuse);
+    fn mount_access_root_returns_mount_point_for_virtual_projection() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
 
         assert_eq!(
             super::mount_access_root(&mount),
-            std::path::PathBuf::from("/tmp/Locality/notion")
+            std::path::PathBuf::from("/tmp/Locality/notion-main")
         );
     }
 
@@ -7100,23 +7095,21 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_default_notion_mount_root_is_shared_loc_root() {
+    fn linux_default_notion_mount_root_is_mount_point_under_shared_root() {
         let home = super::home_dir().expect("home dir");
 
         assert_eq!(
             super::default_notion_mount_root(),
-            home.join("Documents").join("Locality")
+            home.join("Locality").join("notion-main")
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_default_notion_access_root_is_connector_directory() {
-        let home = super::home_dir().expect("home dir");
-
+    fn linux_default_notion_access_root_is_mount_point() {
         assert_eq!(
             super::default_notion_access_root(),
-            home.join("Documents").join("Locality").join("notion")
+            super::default_notion_mount_root()
         );
     }
 
@@ -7131,14 +7124,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_desktop_mount_normalizes_selected_connector_directory_to_shared_root() {
+    fn linux_desktop_mount_normalizes_selected_shared_root_to_mount_point() {
         let home = super::home_dir().expect("home dir");
-        let selected = home.join("Documents").join("Locality").join("notion");
+        let selected = home.join("Locality");
 
         assert_eq!(
             super::resolve_desktop_mount_root(&selected.display().to_string())
                 .expect("resolve mount root"),
-            home.join("Documents").join("Locality")
+            home.join("Locality").join("notion-main")
         );
     }
 
@@ -7149,7 +7142,7 @@ mod tests {
 
         assert_eq!(
             root,
-            super::macos_locality_cloud_storage_root().join("notion")
+            super::macos_locality_cloud_storage_root().join("Notion")
         );
     }
 
@@ -7301,7 +7294,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_projection_refresh_signals_shared_and_connector_roots() {
+    fn virtual_projection_refresh_signal_identifiers_use_mount_point_root() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
@@ -7311,7 +7304,22 @@ mod tests {
 
         assert_eq!(
             virtual_projection_refresh_signal_identifiers(&mount),
-            vec!["root".to_string(), "source:notion".to_string()]
+            vec!["root".to_string(), "mount:notion-main".to_string()]
+        );
+    }
+
+    #[test]
+    fn virtual_projection_prefetch_container_identifiers_use_mount_point_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/CloudStorage/Locality/notion",
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+
+        assert_eq!(
+            virtual_projection_prefetch_container_identifiers(&mount),
+            vec!["root".to_string(), "mount:notion-main".to_string()]
         );
     }
 

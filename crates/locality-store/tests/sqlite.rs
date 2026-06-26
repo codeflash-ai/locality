@@ -110,7 +110,7 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "projection:linux_fuse".to_string(),
                 "projection_layout".to_string(),
-                1,
+                2,
                 1,
                 1,
                 0,
@@ -258,6 +258,496 @@ fn sqlite_store_reports_newer_schema_as_needing_update() {
             found: 999,
             supported: 14,
         }]
+    );
+}
+
+#[test]
+fn sqlite_store_migrates_linux_fuse_projection_layout_v1_mount_roots() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &old_shared_root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save linux fuse mount");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+        )
+        .expect("downgrade linux fuse component");
+    drop(connection);
+    drop(store);
+
+    let reopened = fixture.open();
+    let mounts = reopened.load_mounts().expect("load mounts");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].root, old_shared_root.join("notion"));
+
+    let connection = Connection::open(&reopened.db_path).expect("raw connection");
+    let version: i64 = connection
+        .query_row(
+            "SELECT version
+             FROM state_components
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("linux fuse component version");
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn sqlite_store_does_not_rewrite_v2_linux_fuse_mount_point_roots() {
+    let fixture = SqliteFixture::new();
+    let mount_point_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality")
+        .join("notion-main");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &mount_point_root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save linux fuse mount");
+    drop(store);
+
+    let reopened = fixture.open();
+    let mounts = reopened.load_mounts().expect("load mounts");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].root, mount_point_root);
+}
+
+#[test]
+fn sqlite_store_v13_missing_linux_fuse_component_is_not_seeded_or_rewritten() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    create_minimal_v13_linux_fuse_state(&fixture, &old_shared_root);
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    insert_current_state_components_for_v13(&connection, None);
+    drop(connection);
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+
+    let connection = Connection::open(db_path).expect("raw connection");
+    let root: String = connection
+        .query_row(
+            "SELECT root
+             FROM mounts
+             WHERE mount_id = ?1",
+            params![fixture.mount_id.0],
+            |row| row.get(0),
+        )
+        .expect("mount root");
+    let component_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM state_components
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("linux fuse component count");
+    let migration_count = query_state_migration_count(&connection);
+    assert_eq!(PathBuf::from(root), old_shared_root);
+    assert_eq!(component_count, 0);
+    assert_eq!(migration_count, 0);
+}
+
+#[test]
+fn sqlite_store_v13_newer_linux_fuse_reader_is_not_seeded_or_rewritten() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    create_minimal_v13_linux_fuse_state(&fixture, &old_shared_root);
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    insert_current_state_components_for_v13(&connection, Some((1, 999)));
+    drop(connection);
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+
+    let connection = Connection::open(db_path).expect("raw connection");
+    let (root, min_reader_version): (String, i64) = connection
+        .query_row(
+            "SELECT mounts.root, state_components.min_reader_version
+             FROM mounts
+             JOIN state_components ON state_components.component_id = 'projection:linux_fuse'
+             WHERE mounts.mount_id = ?1",
+            params![fixture.mount_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("mount root and component reader");
+    let migration_count = query_state_migration_count(&connection);
+    assert_eq!(PathBuf::from(root), old_shared_root);
+    assert_eq!(min_reader_version, 999);
+    assert_eq!(migration_count, 0);
+}
+
+#[test]
+fn sqlite_store_v13_non_linux_newer_reader_is_not_seeded_or_rewritten() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    create_minimal_v13_linux_fuse_state(&fixture, &old_shared_root);
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    insert_current_state_components_for_v13(&connection, Some((1, 1)));
+    connection
+        .execute(
+            "UPDATE state_components
+             SET min_reader_version = 999
+             WHERE component_id = 'durable:journals'",
+            [],
+        )
+        .expect("bump journals reader");
+    drop(connection);
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+
+    let connection = Connection::open(db_path).expect("raw connection");
+    let (root, min_reader_version): (String, i64) = connection
+        .query_row(
+            "SELECT mounts.root, state_components.min_reader_version
+             FROM mounts
+             JOIN state_components ON state_components.component_id = 'durable:journals'
+             WHERE mounts.mount_id = ?1",
+            params![fixture.mount_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("mount root and component reader");
+    let migration_count = query_state_migration_count(&connection);
+    assert_eq!(PathBuf::from(root), old_shared_root);
+    assert_eq!(min_reader_version, 999);
+    assert_eq!(migration_count, 0);
+}
+
+#[test]
+fn sqlite_store_v13_unknown_required_component_leaves_no_schema_side_effects() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    create_minimal_v13_linux_fuse_state(&fixture, &old_shared_root);
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    insert_current_state_components_for_v13(&connection, Some((1, 1)));
+    insert_state_component(
+        &connection,
+        "durable:future",
+        "durable_json",
+        1,
+        1,
+        true,
+        false,
+        "{}",
+    );
+    drop(connection);
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+
+    let connection = Connection::open(db_path).expect("raw connection");
+    let root: String = connection
+        .query_row(
+            "SELECT root
+             FROM mounts
+             WHERE mount_id = ?1",
+            params![fixture.mount_id.0],
+            |row| row.get(0),
+        )
+        .expect("mount root");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    assert_eq!(PathBuf::from(root), old_shared_root);
+    assert_eq!(user_version, 13);
+    assert_eq!(query_state_migration_count(&connection), 0);
+    assert!(!sqlite_table_exists(&connection, "auto_save_enrollments"));
+}
+
+#[test]
+fn sqlite_store_v13_valid_linux_fuse_v1_component_migrates_to_v2() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    create_minimal_v13_linux_fuse_state(&fixture, &old_shared_root);
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    insert_current_state_components_for_v13(&connection, Some((1, 1)));
+    drop(connection);
+
+    let store = fixture.open();
+    let mounts = store.load_mounts().expect("load mounts");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].root, old_shared_root.join("notion"));
+
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    let version: i64 = connection
+        .query_row(
+            "SELECT version
+             FROM state_components
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("linux fuse component version");
+    assert_eq!(version, 2);
+    assert_eq!(query_state_migration_count(&connection), 1);
+}
+
+#[test]
+fn sqlite_store_pre_component_linux_fuse_mounts_migrate_from_v1_layout() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    create_minimal_v12_linux_fuse_state(&fixture, &old_shared_root);
+
+    let store = fixture.open();
+    let mounts = store.load_mounts().expect("load mounts");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].root, old_shared_root.join("notion"));
+
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    let version: i64 = connection
+        .query_row(
+            "SELECT version
+             FROM state_components
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("linux fuse component version");
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn sqlite_store_missing_linux_fuse_component_does_not_rewrite_mount_root() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &old_shared_root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save linux fuse mount");
+    let db_path = store.db_path.clone();
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute(
+            "DELETE FROM state_components
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+        )
+        .expect("delete linux fuse component");
+    drop(connection);
+    drop(store);
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+
+    let connection = Connection::open(db_path).expect("raw connection");
+    let root: String = connection
+        .query_row(
+            "SELECT root
+             FROM mounts
+             WHERE mount_id = ?1",
+            params![fixture.mount_id.0],
+            |row| row.get(0),
+        )
+        .expect("mount root");
+    assert_eq!(PathBuf::from(root), old_shared_root);
+}
+
+#[test]
+fn sqlite_store_newer_linux_fuse_reader_requirement_does_not_rewrite_mount_root() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &old_shared_root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save linux fuse mount");
+    let db_path = store.db_path.clone();
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1, min_reader_version = 999
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+        )
+        .expect("bump linux fuse minimum reader");
+    drop(connection);
+    drop(store);
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+
+    let connection = Connection::open(db_path).expect("raw connection");
+    let root: String = connection
+        .query_row(
+            "SELECT root
+             FROM mounts
+             WHERE mount_id = ?1",
+            params![fixture.mount_id.0],
+            |row| row.get(0),
+        )
+        .expect("mount root");
+    assert_eq!(PathBuf::from(root), old_shared_root);
+}
+
+#[test]
+fn sqlite_store_linux_fuse_layout_migration_does_not_double_append_connector_directory() {
+    let fixture = SqliteFixture::new();
+    let already_migrated_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality")
+        .join("notion");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &already_migrated_root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save linux fuse mount");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+        )
+        .expect("downgrade linux fuse component");
+    drop(connection);
+    drop(store);
+
+    let reopened = fixture.open();
+    let mounts = reopened.load_mounts().expect("load mounts");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].root, already_migrated_root);
+
+    let connection = Connection::open(&reopened.db_path).expect("raw connection");
+    let version: i64 = connection
+        .query_row(
+            "SELECT version
+             FROM state_components
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("linux fuse component version");
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn sqlite_store_linux_fuse_layout_migration_uses_frozen_connector_directory_names() {
+    let fixture = SqliteFixture::new();
+    let root = fixture.state_root.parent().expect("fixture root");
+    let google_docs_root = root.join("Locality");
+    let google_docs_alt_root = root.join("LocalityAlt");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("google-docs-main"),
+                "Google Docs",
+                &google_docs_root,
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save google docs mount");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("google-docs-alt"),
+                "google_docs",
+                &google_docs_alt_root,
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save google docs alt mount");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+        )
+        .expect("downgrade linux fuse component");
+    drop(connection);
+    drop(store);
+
+    let reopened = fixture.open();
+    let mut roots = reopened
+        .load_mounts()
+        .expect("load mounts")
+        .into_iter()
+        .map(|mount| (mount.mount_id.0, mount.root))
+        .collect::<Vec<_>>();
+    roots.sort_by(|left, right| left.0.cmp(&right.0));
+
+    assert_eq!(
+        roots,
+        vec![
+            (
+                "google-docs-alt".to_string(),
+                google_docs_alt_root.join("google-docs")
+            ),
+            (
+                "google-docs-main".to_string(),
+                google_docs_root.join("googledocs")
+            ),
+        ]
     );
 }
 
@@ -1895,6 +2385,170 @@ fn create_minimal_v12_state(fixture: &SqliteFixture) {
             ],
         )
         .expect("insert entity");
+}
+
+fn create_minimal_v12_linux_fuse_state(fixture: &SqliteFixture, mount_root: &PathBuf) {
+    fs::create_dir_all(&fixture.state_root).expect("state root");
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "
+            PRAGMA user_version = 12;
+            CREATE TABLE mounts (
+                mount_id TEXT PRIMARY KEY,
+                connector TEXT NOT NULL,
+                root TEXT NOT NULL,
+                remote_root_id TEXT,
+                read_only INTEGER NOT NULL CHECK (read_only IN (0, 1)),
+                projection_json TEXT NOT NULL DEFAULT '\"plain_files\"',
+                connection_id TEXT
+            );
+            ",
+        )
+        .expect("create v12 schema");
+    connection
+        .execute(
+            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id)
+             VALUES (?1, 'notion', ?2, 'root-page', 0, ?3, NULL)",
+            params![
+                fixture.mount_id.0.as_str(),
+                mount_root.to_string_lossy(),
+                serde_json::to_string(&ProjectionMode::LinuxFuse).expect("projection json"),
+            ],
+        )
+        .expect("insert mount");
+}
+
+fn create_minimal_v13_linux_fuse_state(fixture: &SqliteFixture, mount_root: &PathBuf) {
+    fs::create_dir_all(&fixture.state_root).expect("state root");
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            "
+            PRAGMA user_version = 13;
+            CREATE TABLE mounts (
+                mount_id TEXT PRIMARY KEY,
+                connector TEXT NOT NULL,
+                root TEXT NOT NULL,
+                remote_root_id TEXT,
+                read_only INTEGER NOT NULL CHECK (read_only IN (0, 1)),
+                projection_json TEXT NOT NULL DEFAULT '\"plain_files\"',
+                connection_id TEXT
+            );
+            CREATE TABLE state_components (
+                component_id TEXT PRIMARY KEY,
+                component_kind TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                min_reader_version INTEGER NOT NULL DEFAULT 1,
+                required INTEGER NOT NULL CHECK (required IN (0, 1)),
+                rebuildable INTEGER NOT NULL CHECK (rebuildable IN (0, 1)),
+                data_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL
+            );
+            ",
+        )
+        .expect("create v13 schema");
+    connection
+        .execute(
+            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id)
+             VALUES (?1, 'notion', ?2, 'root-page', 0, ?3, NULL)",
+            params![
+                fixture.mount_id.0.as_str(),
+                mount_root.to_string_lossy(),
+                serde_json::to_string(&ProjectionMode::LinuxFuse).expect("projection json"),
+            ],
+        )
+        .expect("insert mount");
+}
+
+fn insert_current_state_components_for_v13(
+    connection: &Connection,
+    linux_fuse_component: Option<(i64, i64)>,
+) {
+    for definition in SqliteStateStore::current_component_definitions() {
+        if definition.component_id == "projection:linux_fuse" {
+            if let Some((version, min_reader_version)) = linux_fuse_component {
+                insert_state_component(
+                    connection,
+                    definition.component_id,
+                    definition.component_kind,
+                    version,
+                    min_reader_version,
+                    definition.required,
+                    definition.rebuildable,
+                    definition.data_json,
+                );
+            }
+        } else {
+            insert_state_component(
+                connection,
+                definition.component_id,
+                definition.component_kind,
+                definition.current_version,
+                definition.min_reader_version,
+                definition.required,
+                definition.rebuildable,
+                definition.data_json,
+            );
+        }
+    }
+}
+
+fn insert_state_component(
+    connection: &Connection,
+    component_id: &str,
+    component_kind: &str,
+    version: i64,
+    min_reader_version: i64,
+    required: bool,
+    rebuildable: bool,
+    data_json: &str,
+) {
+    connection
+        .execute(
+            "INSERT INTO state_components (
+                component_id, component_kind, version, min_reader_version,
+                required, rebuildable, data_json, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '0')",
+            params![
+                component_id,
+                component_kind,
+                version,
+                min_reader_version,
+                if required { 1 } else { 0 },
+                if rebuildable { 1 } else { 0 },
+                data_json,
+            ],
+        )
+        .expect("insert state component");
+}
+
+fn query_state_migration_count(connection: &Connection) -> i64 {
+    if !sqlite_table_exists(connection, "state_migrations") {
+        return 0;
+    }
+
+    connection
+        .query_row("SELECT COUNT(*) FROM state_migrations", [], |row| {
+            row.get(0)
+        })
+        .expect("state migration count")
+}
+
+fn sqlite_table_exists(connection: &Connection, table_name: &str) -> bool {
+    let table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_master
+             WHERE type = 'table' AND name = ?1",
+            params![table_name],
+            |row| row.get(0),
+        )
+        .expect("sqlite table count");
+    table_count > 0
 }
 
 struct SqliteFixture {

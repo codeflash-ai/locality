@@ -41,6 +41,7 @@ use crate::repository::{
 
 const DB_FILE: &str = "state.sqlite3";
 const SCHEMA_VERSION: i64 = 14;
+const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
 const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
 const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
@@ -83,7 +84,7 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "projection:linux_fuse",
         component_kind: "projection_layout",
-        current_version: 1,
+        current_version: LINUX_FUSE_PROJECTION_LAYOUT_VERSION,
         min_reader_version: 1,
         required: true,
         rebuildable: false,
@@ -1426,7 +1427,13 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         });
     }
     if user_version == SCHEMA_VERSION {
+        ensure_state_components_allow_schema_migration(connection)?;
+        migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         return Ok(());
+    }
+
+    if user_version >= 13 {
+        ensure_state_components_allow_schema_migration(connection)?;
     }
 
     connection.execute_batch(
@@ -1750,7 +1757,6 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
 
     if user_version < 13 {
         create_state_management_tables(connection)?;
-        seed_current_state_components(connection)?;
         record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
     }
 
@@ -1778,11 +1784,36 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
 
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
+        migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
         seed_current_state_components(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
 
     Ok(())
+}
+
+fn ensure_state_components_allow_schema_migration(connection: &Connection) -> StoreResult<()> {
+    let blocking_issues = inspect_state_component_issues(connection)?
+        .into_iter()
+        .filter(|issue| {
+            !matches!(
+                issue,
+                StateCompatibilityIssue::OlderComponent {
+                    component_id,
+                    found: 1,
+                    current: LINUX_FUSE_PROJECTION_LAYOUT_VERSION,
+                } if component_id == "projection:linux_fuse"
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if blocking_issues.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::StateCompatibility(format!(
+            "state components are not safe to migrate: {blocking_issues:?}",
+        )))
+    }
 }
 
 fn mount_from_row(row: MountRow) -> StoreResult<MountConfig> {
@@ -2386,6 +2417,138 @@ fn create_state_management_tables(connection: &Connection) -> StoreResult<()> {
         ",
     )?;
     Ok(())
+}
+
+fn migrate_linux_fuse_projection_layout_to_v2(
+    connection: &Connection,
+    pre_state_components_schema: bool,
+) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let component = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = 'projection:linux_fuse'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if let Some((component_version, min_reader_version)) = component {
+        if component_version > LINUX_FUSE_PROJECTION_LAYOUT_VERSION {
+            return Err(StoreError::StateCompatibility(format!(
+                "state component projection:linux_fuse version {component_version} is newer than supported version {LINUX_FUSE_PROJECTION_LAYOUT_VERSION}",
+            )));
+        }
+        if min_reader_version > LINUX_FUSE_PROJECTION_LAYOUT_VERSION {
+            return Err(StoreError::StateCompatibility(format!(
+                "state component projection:linux_fuse requires reader version {min_reader_version}, but supported version is {LINUX_FUSE_PROJECTION_LAYOUT_VERSION}",
+            )));
+        }
+        if component_version >= LINUX_FUSE_PROJECTION_LAYOUT_VERSION {
+            return Ok(());
+        }
+    } else if !pre_state_components_schema {
+        return Err(StoreError::StateCompatibility(
+            "missing required state component projection:linux_fuse".to_string(),
+        ));
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    let linux_fuse_projection = to_json(&ProjectionMode::LinuxFuse)?;
+    let mounts = {
+        let mut statement = transaction.prepare(
+            "SELECT mount_id, connector, root
+         FROM mounts
+         WHERE projection_json = ?1
+         ORDER BY mount_id",
+        )?;
+        let rows = statement.query_map(params![linux_fuse_projection], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for (mount_id, connector, root) in mounts {
+        let connector_root = connector_root_directory_name(&connector);
+        let root = PathBuf::from(root);
+        let migrated_root =
+            if root.file_name().and_then(|name| name.to_str()) == Some(connector_root.as_str()) {
+                root
+            } else {
+                root.join(connector_root)
+            };
+        transaction.execute(
+            "UPDATE mounts
+             SET root = ?1
+             WHERE mount_id = ?2",
+            params![path_to_text(&migrated_root), mount_id],
+        )?;
+    }
+
+    let definition = CURRENT_COMPONENT_DEFINITIONS
+        .iter()
+        .find(|definition| definition.component_id == "projection:linux_fuse")
+        .expect("known state component definition");
+    let updated_at = unix_timestamp_string();
+    transaction.execute(
+        "INSERT INTO state_components (
+            component_id,
+            component_kind,
+            version,
+            min_reader_version,
+            required,
+            rebuildable,
+            data_json,
+            updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(component_id) DO UPDATE SET
+            component_kind = excluded.component_kind,
+            version = excluded.version,
+            min_reader_version = excluded.min_reader_version,
+            required = excluded.required,
+            rebuildable = excluded.rebuildable,
+            data_json = excluded.data_json,
+            updated_at = excluded.updated_at",
+        params![
+            definition.component_id,
+            definition.component_kind,
+            LINUX_FUSE_PROJECTION_LAYOUT_VERSION,
+            definition.min_reader_version,
+            bool_to_int(definition.required),
+            bool_to_int(definition.rebuildable),
+            definition.data_json,
+            &updated_at,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn connector_root_directory_name(connector: &str) -> String {
+    let normalized = connector
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() {
+                Some(character.to_ascii_lowercase())
+            } else if matches!(character, '-' | '_') {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if normalized.is_empty() {
+        "source".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn seed_current_state_components(connection: &Connection) -> StoreResult<()> {

@@ -86,18 +86,18 @@ Default mount base:
 Suggested concrete folder:
 
 ```text
-~/Library/CloudStorage/Locality/notion
+~/Library/CloudStorage/Locality/notion-main
 ```
 
 On macOS, the real Locality root is assigned by File Provider and must be read from
 `NSFileProviderManager.getUserVisibleURL`. Packaged builds and the local
 development bundle identify the host app as `Locality`, so new installs should
 resolve to `~/Library/CloudStorage/Locality`. Older roots such as `Locality` and
-`Locality-Locality` are repair aliases only. Each connector gets a stable child folder
-such as `notion`, `linear`, or `gmail`. Locality should not create a Documents alias
-or symlink; the app should show the actual CloudStorage folder directly. This
-step should be framed as "Where should your Notion files appear?" rather than
-"configure mount root."
+`Locality-Locality` are repair aliases only. Each mount gets a stable mount-point
+folder such as `notion-main`, rather than a connector-derived child folder such as
+`notion`. Locality should not create a Documents alias or symlink; the app should
+show the actual CloudStorage folder directly. This step should be framed as
+"Where should your Notion files appear?" rather than "configure mount root."
 
 Local diagnostics live under the Locality state root in `logs/`. Desktop actions and
 File Provider repair failures are mirrored to `desktop.log` with event markers

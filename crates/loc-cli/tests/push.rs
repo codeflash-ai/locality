@@ -29,7 +29,7 @@ use locality_store::{
     VirtualMutationRecord, VirtualMutationRepository,
 };
 use localityd::hydration::{HydratedEntity, HydrationSource};
-use localityd::virtual_fs::virtual_fs_content_path;
+use localityd::virtual_fs::{virtual_fs_content_path, virtual_projection_mount_point};
 
 #[test]
 fn push_noop_succeeds_without_apply() {
@@ -276,8 +276,9 @@ fn push_virtual_projection_direct_fallback_reconciles_content_cache() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join("state");
     let mount_root = fixture.root.join("loc");
-    let source_root = mount_root.join("notion");
-    let target_path = source_root.join("Roadmap.md");
+    let mount = MountConfig::new(fixture.mount_id.clone(), "notion", &mount_root)
+        .projection(ProjectionMode::LinuxFuse);
+    let target_path = virtual_projection_mount_point(&mount).join("Roadmap.md");
     let content_path =
         virtual_fs_content_path(&state_root, &fixture.mount_id, Path::new("Roadmap.md"))
             .expect("content path");
@@ -291,12 +292,7 @@ fn push_virtual_projection_direct_fallback_reconciles_content_cache() {
     .expect("content cache");
 
     let mut store = InMemoryStateStore::new();
-    store
-        .save_mount(
-            MountConfig::new(fixture.mount_id.clone(), "notion", &mount_root)
-                .projection(ProjectionMode::LinuxFuse),
-        )
-        .expect("save mount");
+    store.save_mount(mount).expect("save mount");
     store
         .save_entity(
             EntityRecord::new(

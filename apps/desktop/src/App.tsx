@@ -185,7 +185,7 @@ const sampleSnapshot: DesktopSnapshot = {
   mount: {
     connector: "notion",
     workspaceName: "CodeFlash",
-    localPath: "~/Library/CloudStorage/Locality/notion",
+    localPath: "~/Library/CloudStorage/Locality/notion-main",
     notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
     accessScope: "Initial Idea",
     projection: "macOS File Provider",
@@ -314,13 +314,13 @@ const sampleSearchResults: LocatedItem[] = [
   {
     title: "Roadmap 2026",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
     state: "ready",
   },
   {
     title: "Launch Plan",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/Locality/notion/Marketing/Launch Plan/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion-main/Marketing/Launch Plan/page.md",
     state: "online_only",
   },
 ];
@@ -1026,7 +1026,7 @@ function Onboarding({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1614,7 +1614,7 @@ function HomeView({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -2480,7 +2480,7 @@ function SettingsView({
         <div className="panel">
           <PanelTitle title="Agent Instructions" />
           <SettingRow title="Local agents" value="Claude, Codex, Warp, Cursor, Gemini, Cline/Roo" />
-          <SettingRow title="Notion guidance" value="Installed under /Locality/notion" />
+          <SettingRow title="Notion guidance" value="Installed under /Locality/notion-main" />
           <SecondaryButton
             compact
             icon={installingAgents ? <Loader2 className="spin-icon" /> : <Bot />}
@@ -2596,7 +2596,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );

@@ -13,7 +13,7 @@ use locality_store::{
     MountRepository, ProjectionMode, RemoteObservationRecord, RemoteObservationRepository,
     StoreError,
 };
-use localityd::virtual_fs::source_root_directory_name;
+use localityd::virtual_fs::virtual_projection_mount_point;
 use serde::Serialize;
 
 const DEFAULT_LIMIT: usize = 10;
@@ -544,9 +544,9 @@ fn source_display_name(connector: &str) -> String {
 
 fn default_access_root(mount: &MountConfig) -> PathBuf {
     match mount.projection {
-        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles => mount
-            .root
-            .join(source_root_directory_name(&mount.connector)),
+        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles => {
+            virtual_projection_mount_point(mount)
+        }
         ProjectionMode::PlainFiles | ProjectionMode::MacosFileProvider => mount.root.clone(),
     }
 }

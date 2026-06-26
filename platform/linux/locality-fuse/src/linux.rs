@@ -180,6 +180,10 @@ fn staging_root(state_root: &Path, mount_id: &str) -> PathBuf {
     state_root.join("fuse-staging").join(mount_id)
 }
 
+fn projection_root_identifier(mount_id: &str) -> String {
+    format!("mount:{mount_id}")
+}
+
 #[derive(Clone, Debug)]
 struct DaemonClient {
     state_root: PathBuf,
@@ -441,7 +445,7 @@ where
 {
     fn new(client: C) -> Self {
         let mut cache = BTreeMap::new();
-        if let Ok(report) = client.item(ROOT_CONTAINER_IDENTIFIER) {
+        if let Ok(report) = client.item(&projection_root_identifier(client.mount_id())) {
             cache.insert(PathBuf::from(ROOT_PATH), report.item);
         }
         Self {
@@ -463,7 +467,9 @@ where
             return Ok(item);
         }
 
-        let report = self.client.item(ROOT_CONTAINER_IDENTIFIER)?;
+        let report = self
+            .client
+            .item(&projection_root_identifier(self.client.mount_id()))?;
         self.cache_item_at(PathBuf::from(ROOT_PATH), report.item.clone());
         Ok(report.item)
     }
@@ -568,6 +574,20 @@ where
         self.remove_cached_path(old_path);
         self.cache_item_at(child_path(new_parent_path, filename), report.item);
         Ok(())
+    }
+
+    fn create_file_at_parent_path(
+        &self,
+        parent: &Path,
+        filename: &str,
+    ) -> Result<VirtualFsMutationReport, FuseError> {
+        let parent_item = self.resolve_path(parent)?;
+        if parent_item.kind != VirtualFsItemKind::Folder {
+            return Err(FuseError::NotDirectory);
+        }
+        let report = self.client.create_file(&parent_item.identifier, filename)?;
+        self.cache_item_at(child_path(parent, filename), report.item.clone());
+        Ok(report)
     }
 
     fn update_cached_materialized_path(&self, identifier: &str, materialized_path: &str) {
@@ -927,14 +947,10 @@ where
         _mode: u32,
         _flags: u32,
     ) -> FuseResult<ReplyCreated> {
-        let parent_item = self.resolve_path(Path::new(parent))?;
-        if parent_item.kind != VirtualFsItemKind::Folder {
-            return Err(FuseError::NotDirectory.into());
-        }
         let filename = name.to_str().ok_or(FuseError::Invalid)?;
-        let report = self.client.create_file(&parent_item.identifier, filename)?;
-        let path = child_path(Path::new(parent), filename);
-        self.cache_item_at(path.clone(), report.item.clone());
+        let report = self
+            .create_file_at_parent_path(Path::new(parent), filename)
+            .map_err(fuse3::Errno::from)?;
 
         let fh = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let temp_path = staging_root(self.client.state_root(), self.client.mount_id())
@@ -1363,6 +1379,8 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
+                created_files: RefCell::new(Vec::new()),
+                created_item: None,
                 renamed: RefCell::new(Vec::new()),
                 trashed: RefCell::new(Vec::new()),
             },
@@ -1374,12 +1392,44 @@ mod tests {
         let item = fs.resolve_path(Path::new(ROOT_PATH)).expect("resolve root");
 
         assert_eq!(item, root);
+        assert_eq!(item.identifier, "mount:notion-main");
         assert_eq!(
             fs.cache
                 .lock()
                 .expect("fuse item cache")
                 .get(Path::new(ROOT_PATH)),
             Some(&root)
+        );
+    }
+
+    #[test]
+    fn root_level_create_uses_mount_point_identifier_as_parent() {
+        let root = test_root_item();
+        let created = test_named_item("local:draft", "Draft.md", VirtualFsItemKind::File);
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::new(),
+                created_files: RefCell::new(Vec::new()),
+                created_item: Some(created.clone()),
+                renamed: RefCell::new(Vec::new()),
+                trashed: RefCell::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([(PathBuf::from(ROOT_PATH), root)])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let report = fs
+            .create_file_at_parent_path(Path::new(ROOT_PATH), "Draft.md")
+            .expect("create root file");
+
+        assert_eq!(report.item, created);
+        assert_eq!(
+            fs.client.created_files.borrow().as_slice(),
+            &[("mount:notion-main".to_string(), "Draft.md".to_string())]
         );
     }
 
@@ -1412,6 +1462,8 @@ mod tests {
                         )],
                     ),
                 ]),
+                created_files: RefCell::new(Vec::new()),
+                created_item: None,
                 renamed: RefCell::new(Vec::new()),
                 trashed: RefCell::new(Vec::new()),
             },
@@ -1451,6 +1503,8 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
+                created_files: RefCell::new(Vec::new()),
+                created_item: None,
                 renamed: RefCell::new(Vec::new()),
                 trashed: RefCell::new(Vec::new()),
             },
@@ -1487,6 +1541,8 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
+                created_files: RefCell::new(Vec::new()),
+                created_item: None,
                 renamed: RefCell::new(Vec::new()),
                 trashed: RefCell::new(Vec::new()),
             },
@@ -1531,6 +1587,8 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
+                created_files: RefCell::new(Vec::new()),
+                created_item: None,
                 renamed: RefCell::new(Vec::new()),
                 trashed: RefCell::new(Vec::new()),
             },
@@ -1550,7 +1608,7 @@ mod tests {
             fs.client.renamed.borrow().as_slice(),
             &[(
                 "children:page-draft".to_string(),
-                ROOT_CONTAINER_IDENTIFIER.to_string(),
+                "mount:notion-main".to_string(),
                 "Published".to_string()
             )]
         );
@@ -1614,7 +1672,7 @@ mod tests {
 
     fn test_root_item() -> VirtualFsItem {
         VirtualFsItem {
-            identifier: ROOT_CONTAINER_IDENTIFIER.to_string(),
+            identifier: "mount:notion-main".to_string(),
             parent_identifier: None,
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,
@@ -1634,6 +1692,8 @@ mod tests {
         mount_id: String,
         root: VirtualFsItem,
         children: BTreeMap<String, Vec<VirtualFsItem>>,
+        created_files: RefCell<Vec<(String, String)>>,
+        created_item: Option<VirtualFsItem>,
         renamed: RefCell<Vec<(String, String, String)>>,
         trashed: RefCell<Vec<String>>,
     }
@@ -1648,7 +1708,7 @@ mod tests {
         }
 
         fn item(&self, identifier: &str) -> Result<VirtualFsItemReport, FuseError> {
-            if identifier != ROOT_CONTAINER_IDENTIFIER {
+            if identifier != projection_root_identifier(&self.mount_id) {
                 return Err(FuseError::Daemon(format!("missing item {identifier}")));
             }
             Ok(VirtualFsItemReport {
@@ -1689,10 +1749,21 @@ mod tests {
 
         fn create_file(
             &self,
-            _parent_identifier: &str,
-            _filename: &str,
+            parent_identifier: &str,
+            filename: &str,
         ) -> Result<VirtualFsMutationReport, FuseError> {
-            Err(FuseError::Daemon("unexpected create request".to_string()))
+            self.created_files
+                .borrow_mut()
+                .push((parent_identifier.to_string(), filename.to_string()));
+            let item = self.created_item.clone().unwrap_or_else(|| {
+                test_named_item("local:created", filename, VirtualFsItemKind::File)
+            });
+            Ok(VirtualFsMutationReport {
+                mount_id: self.mount_id.clone(),
+                identifier: item.identifier.clone(),
+                path: filename.to_string(),
+                item,
+            })
         }
 
         fn create_directory(

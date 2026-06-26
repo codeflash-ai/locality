@@ -210,7 +210,12 @@ fn register(args: RegisterArgs) -> Result<CommandReport, HelperError> {
     let sync_root = prepare_directory(&args.sync_root, "create sync root")?;
     let state_dir = prepare_directory(&args.state_dir, "create state dir")?;
 
-    register_cloud_filter_sync_root(&sync_root_id, &args.display_name, &sync_root)?;
+    register_cloud_filter_sync_root(
+        &args.mount_id,
+        &sync_root_id,
+        &args.display_name,
+        &sync_root,
+    )?;
     let shell_registration =
         register_shell_sync_root(&sync_root_id, &args.display_name, &sync_root);
     let (shell_registered, shell_registration_error) = match shell_registration {
@@ -539,6 +544,10 @@ fn sync_root_id_for_mount(mount_id: &str) -> String {
     )
 }
 
+fn projection_root_identifier(mount_id: &str) -> String {
+    format!("mount:{mount_id}")
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn mount_id_from_sync_root_id(sync_root_id: &str) -> Option<String> {
     sync_root_id
@@ -669,6 +678,7 @@ struct RegistrationMarker {
 
 #[cfg(target_os = "windows")]
 fn register_cloud_filter_sync_root(
+    mount_id: &str,
     sync_root_id: &str,
     display_name: &str,
     sync_root: &Path,
@@ -690,7 +700,8 @@ fn register_cloud_filter_sync_root(
     let provider_name = wide_str("Locality");
     let provider_version = wide_str(env!("CARGO_PKG_VERSION"));
     let identity = sync_root_id.as_bytes();
-    let root_identity = localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.as_bytes();
+    let root_identity = projection_root_identifier(mount_id);
+    let root_identity = root_identity.as_bytes();
     let registration = CF_SYNC_REGISTRATION {
         StructSize: std::mem::size_of::<CF_SYNC_REGISTRATION>() as u32,
         ProviderName: PCWSTR::from_raw(provider_name.as_ptr()),
@@ -734,6 +745,7 @@ fn register_cloud_filter_sync_root(
 
 #[cfg(not(target_os = "windows"))]
 fn register_cloud_filter_sync_root(
+    _mount_id: &str,
     _sync_root_id: &str,
     _display_name: &str,
     _sync_root: &Path,
@@ -925,6 +937,10 @@ impl ProviderLocalFileIndex {
 
 #[cfg(target_os = "windows")]
 impl ProviderContext {
+    fn projection_root_identifier(&self) -> String {
+        projection_root_identifier(&self.mount_id)
+    }
+
     fn children(
         &self,
         container_identifier: &str,
@@ -1502,12 +1518,10 @@ fn daemon_identity_for_path(
         None => return Ok(None),
     };
     if relative_path.as_os_str().is_empty() {
-        return Ok(Some(
-            localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string(),
-        ));
+        return Ok(Some(context.projection_root_identifier()));
     }
 
-    let mut current_identifier = localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string();
+    let mut current_identifier = context.projection_root_identifier();
     let mut current_path = context.sync_root.clone();
     for component in relative_path.components() {
         let std::path::Component::Normal(component) = component else {
@@ -1757,7 +1771,7 @@ fn connect_cloud_filter_sync_root(
 
 #[cfg(target_os = "windows")]
 fn seed_root_placeholders(context: &ProviderContext) -> Result<usize, HelperError> {
-    let children = context.children(localityd::file_provider::ROOT_CONTAINER_IDENTIFIER)?;
+    let children = context.children(&context.projection_root_identifier())?;
     create_placeholders_in_directory(&context.sync_root, &children.children)?;
     remember_placeholder_children(context, &context.sync_root, &children.children);
     Ok(children.children.len())
@@ -1909,8 +1923,8 @@ unsafe fn handle_fetch_placeholders(
         )
     })?;
     let context = unsafe { provider_context(info) }?;
-    let container_identifier = callback_identifier(info)
-        .unwrap_or_else(|| localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string());
+    let container_identifier =
+        callback_identifier(info).unwrap_or_else(|| context.projection_root_identifier());
     trace_cloud_files(format!(
         "fetch placeholders start container=`{container_identifier}`"
     ));
@@ -2218,7 +2232,7 @@ fn parent_identifier_for_path(
 ) -> Result<String, HelperError> {
     let parent = absolute_cloud_path(context, parent);
     if same_cloud_path(&parent, &context.sync_root) {
-        return Ok(localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string());
+        return Ok(context.projection_root_identifier());
     }
     if let Some(identifier) = identity_for_path(context, &parent)? {
         return Ok(identifier);
@@ -3117,6 +3131,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn projection_root_identifiers_namespace_mount_roots() {
+        assert_eq!(
+            projection_root_identifier("notion-main"),
+            "mount:notion-main"
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn placeholders_without_known_sizes_stay_online_only() {
@@ -3310,6 +3332,24 @@ mod tests {
         assert_eq!(
             parent_identifier_for_path(&context, directory).expect("parent identifier"),
             "children:local:123"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parent_identifier_for_sync_root_uses_projection_root_identifier() {
+        let context = ProviderContext {
+            mount_id: "notion-main".to_string(),
+            sync_root: PathBuf::from(r"C:\Users\Ada\Locality\notion-main"),
+            state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\Locality"),
+            identity_index: Default::default(),
+            local_file_index: Default::default(),
+        };
+
+        assert_eq!(
+            parent_identifier_for_path(&context, Path::new(r"C:\Users\Ada\Locality\notion-main"))
+                .expect("parent identifier"),
+            "mount:notion-main"
         );
     }
 

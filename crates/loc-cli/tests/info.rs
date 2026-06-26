@@ -12,6 +12,7 @@ use locality_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
     MountRepository, ProjectionMode, SqliteStateStore,
 };
+use localityd::virtual_fs::virtual_projection_mount_point;
 
 #[test]
 fn info_for_page_file_reports_source_children_and_journals() {
@@ -198,9 +199,11 @@ fn info_runner_works_with_sqlite_state_store() {
 }
 
 #[test]
-fn info_for_linux_fuse_reports_entity_absolute_path_under_source_root() {
+fn info_for_linux_fuse_reports_entity_absolute_path_under_mount_point_root() {
     let fixture = InfoFixture::new();
-    let visible_root = fixture.root.join("notion");
+    let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+        .projection(ProjectionMode::LinuxFuse);
+    let visible_root = virtual_projection_mount_point(&mount);
     let visible_file = visible_root.join("roadmap").join("page.md");
     if let Some(parent) = visible_file.parent() {
         fs::create_dir_all(parent).expect("visible parent");
@@ -208,12 +211,7 @@ fn info_for_linux_fuse_reports_entity_absolute_path_under_source_root() {
     fs::write(&visible_file, "").expect("visible page");
 
     let mut store = InMemoryStateStore::new();
-    store
-        .save_mount(
-            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
-                .projection(ProjectionMode::LinuxFuse),
-        )
-        .expect("save linux fuse mount");
+    store.save_mount(mount).expect("save linux fuse mount");
     store
         .save_entity(
             entity_record(

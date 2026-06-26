@@ -120,7 +120,7 @@ where
 
     let mut identifiers = vec![
         ROOT_CONTAINER_IDENTIFIER.to_string(),
-        source_root_identifier(&mount.connector),
+        mount_point_identifier(&mount),
     ];
     let mut path = PathBuf::new();
     for component in target_container.components() {
@@ -264,7 +264,7 @@ where
 
     let container_path = container_path(&mount, &entities, &mutations, container_identifier)?;
     let mut children = Vec::new();
-    if container_identifier == source_root_identifier(&mount.connector) {
+    if container_identifier == mount_point_identifier(&mount) {
         children.extend(source_root_guidance_items(&mount));
     }
     let deleted_remote_ids = pending_deleted_remote_ids(&mutations);
@@ -1285,7 +1285,7 @@ fn schema_item_for_container(
     container_identifier: &str,
 ) -> LocalityResult<Option<VirtualFsItem>> {
     if container_identifier == ROOT_CONTAINER_IDENTIFIER
-        || container_identifier == source_root_identifier(&mount.connector)
+        || container_identifier == mount_point_identifier(mount)
         || container_identifier.starts_with(CHILDREN_PREFIX)
         || container_identifier.starts_with(PATH_PREFIX)
     {
@@ -1317,7 +1317,7 @@ fn create_parent_remote_id(
         }
         return Ok(RemoteId::new(remote_id));
     }
-    if parent_identifier == source_root_identifier(&mount.connector) {
+    if parent_identifier == mount_point_identifier(mount) {
         if source_descriptor(&mount.connector)
             .source_root_create_parent_kind()
             .is_some()
@@ -1650,7 +1650,7 @@ fn resolve_item(
     if identifier == ROOT_CONTAINER_IDENTIFIER {
         return Ok(root_item(mount));
     }
-    if identifier == source_root_identifier(&mount.connector) {
+    if identifier == mount_point_identifier(mount) {
         return Ok(source_root_item(mount));
     }
     if let Some(item) = guidance_item_for_identifier(mount, identifier) {
@@ -1762,7 +1762,7 @@ fn guidance_item(mount: &MountConfig, filename: &str, identifier: &str) -> Virtu
     let contents = guidance_contents_for_connector(&mount.connector);
     VirtualFsItem {
         identifier: identifier.to_string(),
-        parent_identifier: Some(source_root_identifier(&mount.connector)),
+        parent_identifier: Some(mount_point_identifier(mount)),
         filename: filename.to_string(),
         kind: VirtualFsItemKind::File,
         entity_kind: None,
@@ -1777,9 +1777,9 @@ fn guidance_item(mount: &MountConfig, filename: &str, identifier: &str) -> Virtu
 }
 
 fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
-    let filename = source_root_directory_name(&mount.connector);
+    let filename = mount_point_directory_name(mount);
     VirtualFsItem {
-        identifier: source_root_identifier(&mount.connector),
+        identifier: mount_point_identifier(mount),
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: filename.clone(),
         kind: VirtualFsItemKind::Folder,
@@ -1789,7 +1789,7 @@ fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
         hydration: None,
         content_type: "public.folder".to_string(),
         remote_edited_at: None,
-        materialized_path: Some(mount.root.display().to_string()),
+        materialized_path: Some(virtual_projection_mount_point(mount).display().to_string()),
         byte_size: None,
     }
 }
@@ -2155,7 +2155,7 @@ fn container_path(
     if identifier == ROOT_CONTAINER_IDENTIFIER {
         return Ok(PathBuf::new());
     }
-    if identifier == source_root_identifier(&mount.connector) {
+    if identifier == mount_point_identifier(mount) {
         return Ok(PathBuf::new());
     }
 
@@ -2202,7 +2202,7 @@ fn child_container_for_identifier(
         return Ok(None);
     }
 
-    if identifier == source_root_identifier(&mount.connector) {
+    if identifier == mount_point_identifier(mount) {
         return Ok(Some(ChildContainer::Root));
     }
 
@@ -2264,6 +2264,7 @@ fn entity_identifier(identifier: &str) -> LocalityResult<String> {
     if identifier == ROOT_CONTAINER_IDENTIFIER
         || identifier.starts_with(CHILDREN_PREFIX)
         || identifier.starts_with(PATH_PREFIX)
+        || identifier.starts_with(MOUNT_POINT_PREFIX)
         || identifier.starts_with(SOURCE_ROOT_PREFIX)
         || identifier.starts_with(GUIDANCE_PREFIX)
     {
@@ -2430,7 +2431,7 @@ fn container_identifier_for_path(
     index: &ProviderIndex,
 ) -> String {
     if path.as_os_str().is_empty() {
-        return source_root_identifier(&mount.connector);
+        return mount_point_identifier(mount);
     }
 
     if let Some(entity) = index.entities_by_path.get(path)
@@ -2495,12 +2496,74 @@ mod tests {
         AGENTS_GUIDANCE_IDENTIFIER, CLAUDE_GUIDANCE_IDENTIFIER, ROOT_CONTAINER_IDENTIFIER,
         VirtualFsItemKind, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
         create_virtual_fs_directory, create_virtual_fs_file,
-        materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
-        rename_virtual_fs_item, source_root_identifier, trash_virtual_fs_item,
+        materialize_virtual_fs_item_with_content_root, mount_point_identifier,
+        refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
         virtual_fs_ancestor_container_identifiers, virtual_fs_children,
         virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_item,
         virtual_fs_item_with_content_root,
     };
+
+    #[test]
+    fn virtual_fs_root_child_uses_mount_point_name_and_identifier() {
+        let mut store = InMemoryStateStore::new();
+        let mount_id = MountId::new("notion-main");
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", "/tmp/Locality/notion-main")
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+
+        let report = virtual_fs_children(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER)
+            .expect("root children");
+
+        assert_eq!(report.children.len(), 1);
+        assert_eq!(report.children[0].filename, "notion-main");
+        assert_eq!(report.children[0].identifier, "mount:notion-main");
+        assert_eq!(
+            report.children[0].parent_identifier.as_deref(),
+            Some(ROOT_CONTAINER_IDENTIFIER)
+        );
+    }
+
+    #[test]
+    fn mount_point_root_lists_guidance_files() {
+        let mut store = InMemoryStateStore::new();
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(mount_id.clone(), "notion", "/tmp/Locality/notion-main")
+            .projection(ProjectionMode::LinuxFuse);
+        store.save_mount(mount.clone()).expect("save mount");
+
+        let report = virtual_fs_children(&store, &mount_id, &mount_point_identifier(&mount))
+            .expect("mount point children");
+
+        assert!(
+            report
+                .children
+                .iter()
+                .any(|item| item.filename == "AGENTS.md")
+        );
+        assert!(
+            report
+                .children
+                .iter()
+                .any(|item| item.filename == "CLAUDE.md")
+        );
+        assert!(
+            report
+                .children
+                .iter()
+                .all(|item| item.parent_identifier.as_deref() == Some("mount:notion-main"))
+        );
+    }
+
+    #[test]
+    fn mount_point_identifier_is_not_a_materializable_entity_identifier() {
+        assert!(matches!(
+            super::entity_identifier("mount:notion-main"),
+            Err(LocalityError::InvalidState(_))
+        ));
+    }
 
     #[test]
     fn children_include_page_directories_with_page_body_files_inside() {
@@ -2539,10 +2602,10 @@ mod tests {
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].filename, "notion");
         assert_eq!(root.children[0].kind, VirtualFsItemKind::Folder);
-        assert_eq!(root.children[0].identifier, "source:notion");
+        assert_eq!(root.children[0].identifier, "mount:notion-main");
 
-        let report =
-            virtual_fs_children(&store, &mount_id, "source:notion").expect("source children");
+        let report = virtual_fs_children(&store, &mount_id, "mount:notion-main")
+            .expect("mount point children");
 
         assert_eq!(report.children.len(), 3);
         assert_eq!(report.children[0].filename, "AGENTS.md");
@@ -2550,14 +2613,14 @@ mod tests {
         assert_eq!(report.children[0].identifier, AGENTS_GUIDANCE_IDENTIFIER);
         assert_eq!(
             report.children[0].parent_identifier.as_deref(),
-            Some("source:notion")
+            Some("mount:notion-main")
         );
         assert_eq!(report.children[1].filename, "CLAUDE.md");
         assert_eq!(report.children[1].kind, VirtualFsItemKind::File);
         assert_eq!(report.children[1].identifier, CLAUDE_GUIDANCE_IDENTIFIER);
         assert_eq!(
             report.children[1].parent_identifier.as_deref(),
-            Some("source:notion")
+            Some("mount:notion-main")
         );
         assert_eq!(report.children[2].filename, "Home");
         assert_eq!(report.children[2].kind, VirtualFsItemKind::Folder);
@@ -2565,29 +2628,31 @@ mod tests {
     }
 
     #[test]
-    fn source_root_guidance_files_materialize_read_only_agent_instructions() {
+    fn mount_point_guidance_files_materialize_read_only_agent_instructions() {
         let mount_id = MountId::new("notion-main");
         let state_root = temp_root("loc-virtual-fs-guidance");
         let content_root = state_root.join("content/notion-main/files");
         let mut store = InMemoryStateStore::new();
-        store
-            .save_mount(virtual_mount(&mount_id))
-            .expect("save mount");
+        let mount = virtual_mount(&mount_id);
+        store.save_mount(mount.clone()).expect("save mount");
 
         let listed = virtual_fs_children_with_content_root(
             &store,
             &content_root,
             &mount_id,
-            &source_root_identifier("notion"),
+            &mount_point_identifier(&mount),
         )
-        .expect("list source root");
+        .expect("list mount point root");
         let agents = listed
             .children
             .iter()
             .find(|child| child.identifier == AGENTS_GUIDANCE_IDENTIFIER)
             .expect("agents guidance");
         assert_eq!(agents.filename, "AGENTS.md");
-        assert_eq!(agents.parent_identifier.as_deref(), Some("source:notion"));
+        assert_eq!(
+            agents.parent_identifier.as_deref(),
+            Some("mount:notion-main")
+        );
         assert_eq!(agents.kind, VirtualFsItemKind::File);
         assert_eq!(agents.entity_kind, None);
         assert_eq!(agents.hydration, Some(HydrationState::Stub));
@@ -2720,7 +2785,7 @@ mod tests {
             identifiers,
             vec![
                 "root".to_string(),
-                "source:notion".to_string(),
+                "mount:notion-main".to_string(),
                 "children:page-root".to_string(),
                 "children:page-child".to_string(),
             ]
@@ -2749,12 +2814,13 @@ mod tests {
             expected_parent_path: PathBuf::new(),
         };
 
-        let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "source:notion")
-            .expect("refresh children");
+        let saved =
+            refresh_virtual_fs_children(&mut store, &connector, &mount_id, "mount:notion-main")
+                .expect("refresh children");
         assert_eq!(saved, 1);
 
-        let report =
-            virtual_fs_children(&store, &mount_id, "source:notion").expect("source children");
+        let report = virtual_fs_children(&store, &mount_id, "mount:notion-main")
+            .expect("mount point children");
         assert_eq!(report.children.len(), 3);
         assert_eq!(report.children[0].identifier, AGENTS_GUIDANCE_IDENTIFIER);
         assert_eq!(report.children[0].kind, VirtualFsItemKind::File);
@@ -2763,8 +2829,9 @@ mod tests {
         assert_eq!(report.children[2].identifier, "children:page-root");
         assert_eq!(report.children[2].kind, VirtualFsItemKind::Folder);
 
-        let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "source:notion")
-            .expect("refresh cached children");
+        let saved =
+            refresh_virtual_fs_children(&mut store, &connector, &mount_id, "mount:notion-main")
+                .expect("refresh cached children");
         assert_eq!(saved, 0);
     }
 
@@ -3442,10 +3509,10 @@ mod tests {
             &mut store,
             &content_root,
             &mount_id,
-            &source_root_identifier("google-docs"),
+            "mount:google-docs-main",
             "Scratch Hydration",
         )
-        .expect("create google docs directory under source root");
+        .expect("create google docs directory under mount point root");
 
         assert!(created.identifier.starts_with("children:local:"));
         assert_eq!(created.item.filename, "Scratch Hydration");
