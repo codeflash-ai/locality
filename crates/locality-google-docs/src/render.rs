@@ -215,7 +215,7 @@ fn paragraph_text(
 }
 
 fn render_text_run(content: &str, style: &TextStyle) -> String {
-    let mut rendered = normalize_docs_text(trim_docs_newline(content));
+    let mut rendered = escape_markdown_text(&normalize_docs_text(trim_docs_newline(content)));
     if rendered.is_empty() {
         return rendered;
     }
@@ -232,13 +232,64 @@ fn render_text_run(content: &str, style: &TextStyle) -> String {
         rendered = format!("~~{rendered}~~");
     }
     if let Some(url) = style.link.as_ref().and_then(|link| link.url.as_deref()) {
-        rendered = format!("[{rendered}]({url})");
+        rendered = format!(
+            "[{}]({})",
+            escape_markdown_link_label(&rendered),
+            escape_markdown_link_href(url)
+        );
     }
     rendered
 }
 
 fn normalize_docs_text(value: &str) -> String {
     value.replace('\u{000b}', "\n")
+}
+
+fn escape_markdown_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while !rest.is_empty() {
+        if let Some(marker) = literal_inline_marker_prefix(rest) {
+            escaped.push('\\');
+            escaped.push_str(marker);
+            rest = &rest[marker.len()..];
+            continue;
+        }
+
+        let ch = rest.chars().next().expect("non-empty rest");
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            _ => escaped.push(ch),
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+
+    escaped
+}
+
+fn escape_markdown_link_label(text: &str) -> String {
+    text.replace(']', "\\]")
+}
+
+fn escape_markdown_link_href(href: &str) -> String {
+    href.replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
+}
+
+fn literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
+    literal_inline_tag_prefix(value).or_else(|| {
+        ["**", "~~", "`", "[", "_"]
+            .into_iter()
+            .find(|marker| value.starts_with(marker))
+    })
+}
+
+fn literal_inline_tag_prefix(value: &str) -> Option<&'static str> {
+    ["<br />", "<br/>", "<br>", "</u>", "<u>"]
+        .into_iter()
+        .find(|tag| value.starts_with(tag))
 }
 
 fn render_table(document: &GoogleDocument, table: &Table) -> String {
@@ -488,6 +539,36 @@ mod tests {
             Some("google_docs_table")
         );
         assert_eq!(rendered.shadow.entity_id.as_str(), "doc-1");
+    }
+
+    #[test]
+    fn render_escapes_literal_markdown_inline_markers() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: drive_file("doc-1", "Literal Markers"),
+            document: serde_json::from_value(serde_json::json!({
+                "documentId": "doc-1",
+                "title": "Literal Markers",
+                "revisionId": "rev-1",
+                "body": {
+                    "content": [
+                        { "startIndex": 1, "endIndex": 81, "paragraph": {
+                            "elements": [{ "textRun": {
+                                "content": "Literal **bold** _italic_ ~~strike~~ `code` [link](https://example.com) <u>underline</u>\n"
+                            }}]
+                        }}
+                    ]
+                }
+            }))
+            .expect("document"),
+        };
+
+        let rendered = render_google_document(&bundle).expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "Literal \\**bold\\** \\_italic\\_ \\~~strike\\~~ \\`code\\` \\[link](https://example.com) \\<u>underline\\</u>\n"
+        );
+        assert_eq!(rendered.shadow.blocks.len(), 1);
     }
 
     #[test]

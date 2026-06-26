@@ -1137,6 +1137,16 @@ fn parse_docs_markdown_inline(content: &str) -> DocsText {
     };
     let mut index = 0;
     while index < content.len() {
+        if let Some(marker) = escaped_literal_inline_marker_prefix(&content[index..]) {
+            parsed.text.push_str(marker);
+            index += '\\'.len_utf8() + marker.len();
+            continue;
+        }
+        if content[index..].starts_with("\\\\") {
+            parsed.text.push('\\');
+            index += 2;
+            continue;
+        }
         if let Some(next) = parse_markdown_span(content, index, &mut parsed) {
             index = next;
             continue;
@@ -1220,6 +1230,26 @@ fn parse_markdown_span(content: &str, index: usize, parsed: &mut DocsText) -> Op
         );
     }
     None
+}
+
+fn escaped_literal_inline_marker_prefix(value: &str) -> Option<&'static str> {
+    literal_inline_tag_prefix(value).or_else(|| {
+        ["**", "~~", "`", "[", "]", "_"].into_iter().find(|marker| {
+            value
+                .strip_prefix('\\')
+                .is_some_and(|rest| rest.starts_with(marker))
+        })
+    })
+}
+
+fn literal_inline_tag_prefix(value: &str) -> Option<&'static str> {
+    ["<br />", "<br/>", "<br>", "</u>", "<u>"]
+        .into_iter()
+        .find(|tag| {
+            value
+                .strip_prefix('\\')
+                .is_some_and(|rest| rest.starts_with(tag))
+        })
 }
 
 fn parse_delimited_style(
@@ -1762,6 +1792,61 @@ mod tests {
         assert_eq!(update_text_style.range.start_index, 14);
         assert_eq!(update_text_style.range.end_index, 21);
         assert_eq!(update_text_style.text_style.bold, Some(true));
+    }
+
+    #[test]
+    fn apply_decodes_escaped_literal_markdown_inline_markers() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Literal Doc", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Literal Doc",
+            "rev-1",
+            "Original\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let literal = "Literal **bold** _italic_ ~~strike~~ `code` [link](https://example.com) <u>underline</u>";
+        let escaped = "Literal \\**bold\\** \\_italic\\_ \\~~strike\\~~ \\`code\\` \\[link](https://example.com) \\<u>underline\\</u>";
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:10"),
+                content: escaped.to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[1] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(insert_text.text, format!("{literal}\n"));
+        assert_eq!(
+            batch
+                .requests
+                .iter()
+                .filter(|request| matches!(request, DocsRequest::UpdateTextStyle { .. }))
+                .count(),
+            1,
+            "escaped literal markers should not emit inline style requests beyond the reset"
+        );
     }
 
     #[test]
