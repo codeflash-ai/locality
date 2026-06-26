@@ -83,9 +83,10 @@ use localityd::source::{
     ResolvedSource, resolve_source_for_mount_id, resolve_source_for_path, source_display_name,
 };
 use localityd::virtual_fs::{
-    commit_virtual_fs_write, materialize_virtual_fs_item_with_content_root,
-    source_root_directory_name, source_root_identifier, virtual_fs_content_base,
-    virtual_fs_content_path, virtual_fs_content_root,
+    VirtualFsChildrenReport, commit_virtual_fs_write,
+    materialize_virtual_fs_item_with_content_root, source_root_directory_name,
+    source_root_identifier, virtual_fs_content_base, virtual_fs_content_path,
+    virtual_fs_content_root,
 };
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,9 @@ const WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX: &str =
 const WINDOWS_DESKTOP_ACTIVATION_EVENT: &str = r"Local\CodeFlash.Locality.Desktop.Activate";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250);
+const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4223,7 +4227,7 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
         .ok_or_else(|| "Created mount was not found in Locality state.".to_string())?;
 
     if mount.projection.uses_virtual_filesystem() {
-        activate_virtual_projection_mount(&state_root, &mount, false)?;
+        activate_virtual_projection_mount(&state_root, &mount, true)?;
     }
 
     Ok(format!(
@@ -5130,13 +5134,32 @@ fn activate_virtual_projection_mount(
     mount: &MountConfig,
     wait_for_entities: bool,
 ) -> Result<(), String> {
+    desktop_log(
+        "info",
+        "file_provider.activate_started",
+        format!(
+            "activating virtual projection for mount `{}` using {:?}; wait_for_entities={wait_for_entities}",
+            mount.mount_id.0, mount.projection
+        ),
+    );
+    if wait_for_entities && mount.projection == ProjectionMode::MacosFileProvider {
+        wait_for_virtual_projection_source_children(state_root, mount)?;
+    }
     register_virtual_projection(state_root, mount)?;
     prefetch_virtual_projection_root(state_root, mount)?;
-    if wait_for_entities {
+    if wait_for_entities && mount.projection != ProjectionMode::MacosFileProvider {
         wait_for_mount_entities(state_root, &mount.mount_id)?;
     }
     ensure_virtual_projection_runtime(state_root, mount)?;
     signal_virtual_projection_refresh(mount);
+    desktop_log(
+        "info",
+        "file_provider.activate_finished",
+        format!(
+            "activated virtual projection for mount `{}` using {:?}",
+            mount.mount_id.0, mount.projection
+        ),
+    );
     Ok(())
 }
 
@@ -5158,6 +5181,32 @@ fn prefetch_virtual_projection_container(
     mount_id: &str,
     container_identifier: &str,
 ) -> Result<(), String> {
+    let report =
+        load_virtual_projection_children_report(state_root, mount_id, container_identifier)?;
+    let summary = summarize_virtual_projection_children(&report);
+    desktop_log(
+        "debug",
+        "file_provider.prefetch_children",
+        format!(
+            "prefetched `{mount_id}:{container_identifier}` with {} child{} ({} content; preview: {})",
+            summary.total_children,
+            if summary.total_children == 1 {
+                ""
+            } else {
+                "ren"
+            },
+            summary.content_children,
+            summary.preview()
+        ),
+    );
+    Ok(())
+}
+
+fn load_virtual_projection_children_report(
+    state_root: &Path,
+    mount_id: &str,
+    container_identifier: &str,
+) -> Result<VirtualFsChildrenReport, String> {
     match send_request(
         state_root,
         &DaemonRequest::FileProviderChildren {
@@ -5165,7 +5214,18 @@ fn prefetch_virtual_projection_container(
             container_identifier: container_identifier.to_string(),
         },
     ) {
-        Ok(response) if response.ok => Ok(()),
+        Ok(response) if response.ok => {
+            let payload = response.payload.ok_or_else(|| {
+                format!(
+                    "Could not load `{mount_id}:{container_identifier}`: daemon returned no payload."
+                )
+            })?;
+            serde_json::from_value::<VirtualFsChildrenReport>(payload).map_err(|error| {
+                format!(
+                    "Could not decode `{mount_id}:{container_identifier}` children from localityd: {error}"
+                )
+            })
+        }
         Ok(response) => Err(response
             .error
             .map(|error| {
@@ -5179,6 +5239,178 @@ fn prefetch_virtual_projection_container(
             "Could not ask localityd to load the top-level Notion folder: {}",
             error.message()
         )),
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct VirtualProjectionChildrenSummary {
+    total_children: usize,
+    content_children: usize,
+    content_names: Vec<String>,
+}
+
+impl VirtualProjectionChildrenSummary {
+    fn preview(&self) -> String {
+        if self.content_names.is_empty() {
+            return "none".to_string();
+        }
+
+        let visible = self
+            .content_names
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>();
+        let remaining = self.content_names.len().saturating_sub(visible.len());
+        if remaining == 0 {
+            visible.join(", ")
+        } else {
+            format!("{}, +{} more", visible.join(", "), remaining)
+        }
+    }
+}
+
+fn summarize_virtual_projection_children(
+    report: &VirtualFsChildrenReport,
+) -> VirtualProjectionChildrenSummary {
+    let content_names = report
+        .children
+        .iter()
+        .filter(|child| !is_virtual_projection_guidance_child(&child.identifier))
+        .map(|child| child.filename.clone())
+        .collect::<Vec<_>>();
+
+    VirtualProjectionChildrenSummary {
+        total_children: report.children.len(),
+        content_children: content_names.len(),
+        content_names,
+    }
+}
+
+fn is_virtual_projection_guidance_child(identifier: &str) -> bool {
+    identifier.starts_with("guidance:")
+}
+
+fn wait_for_virtual_projection_source_children(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    let mount_id = mount.mount_id.0.as_str();
+    let source_identifier = source_root_identifier(&mount.connector);
+    let started = Instant::now();
+    let deadline = started + VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT;
+    let mut attempts = 0_u32;
+    let mut next_progress_log = started + VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY;
+    let mut last_summary = VirtualProjectionChildrenSummary::default();
+    let mut last_error: Option<String>;
+
+    desktop_log(
+        "info",
+        "file_provider.source_ready.wait_started",
+        format!(
+            "waiting up to {}s for `{mount_id}:{source_identifier}` to expose Notion children before registering macOS File Provider",
+            VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT.as_secs()
+        ),
+    );
+
+    loop {
+        attempts = attempts.saturating_add(1);
+        match load_virtual_projection_children_report(state_root, mount_id, &source_identifier) {
+            Ok(report) => {
+                let summary = summarize_virtual_projection_children(&report);
+                last_error = None;
+                if summary.content_children > 0 {
+                    desktop_log(
+                        "info",
+                        "file_provider.source_ready.ready",
+                        format!(
+                            "`{mount_id}:{source_identifier}` exposed {} content child{} after {}ms across {attempts} attempt{} ({} total; preview: {})",
+                            summary.content_children,
+                            if summary.content_children == 1 {
+                                ""
+                            } else {
+                                "ren"
+                            },
+                            started.elapsed().as_millis(),
+                            if attempts == 1 { "" } else { "s" },
+                            summary.total_children,
+                            summary.preview()
+                        ),
+                    );
+                    return Ok(());
+                }
+                last_summary = summary;
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            let diagnostic = last_error
+                .as_ref()
+                .map(|error| format!("last daemon error: {error}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "last daemon response had {} child{} but no content children (preview: {})",
+                        last_summary.total_children,
+                        if last_summary.total_children == 1 {
+                            ""
+                        } else {
+                            "ren"
+                        },
+                        last_summary.preview()
+                    )
+                });
+            desktop_log(
+                "error",
+                "file_provider.source_ready.timeout",
+                format!(
+                    "`{mount_id}:{source_identifier}` did not expose Notion children after {}ms across {attempts} attempt{}; {diagnostic}",
+                    started.elapsed().as_millis(),
+                    if attempts == 1 { "" } else { "s" }
+                ),
+            );
+            return Err(format!(
+                "Notion connected, but Locality could not load any Notion files before mounting. Make sure at least one page is selected for Locality access, then try again. {diagnostic}"
+            ));
+        }
+
+        if now >= next_progress_log {
+            let diagnostic = last_error
+                .as_ref()
+                .map(|error| format!("last daemon error: {error}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} total child{} and {} content child{}",
+                        last_summary.total_children,
+                        if last_summary.total_children == 1 {
+                            ""
+                        } else {
+                            "ren"
+                        },
+                        last_summary.content_children,
+                        if last_summary.content_children == 1 {
+                            ""
+                        } else {
+                            "ren"
+                        }
+                    )
+                });
+            desktop_log(
+                "debug",
+                "file_provider.source_ready.waiting",
+                format!(
+                    "still waiting for `{mount_id}:{source_identifier}` after {}ms across {attempts} attempt{}; {diagnostic}",
+                    started.elapsed().as_millis(),
+                    if attempts == 1 { "" } else { "s" }
+                ),
+            );
+            next_progress_log = now + VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY;
+        }
+
+        std::thread::sleep(VIRTUAL_PROJECTION_SOURCE_READY_POLL);
     }
 }
 
@@ -6659,9 +6891,9 @@ mod tests {
         push_action_message, record_current_install_marker, record_desktop_activity,
         sample_live_mode_status, sample_snapshot, shell_single_quote, should_hide_tray_popover,
         should_prioritize_located_result, state_event_path_requires_refresh,
-        terminal_cli_link_state, tray_icon_image, tray_popover_position, unique_suffix,
-        validate_mount_root, virtual_projection_refresh_signal_identifiers,
-        write_terminal_cli_path_section,
+        summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
+        tray_popover_position, unique_suffix, validate_mount_root,
+        virtual_projection_refresh_signal_identifiers, write_terminal_cli_path_section,
     };
 
     #[test]
@@ -7499,6 +7731,69 @@ mod tests {
             virtual_projection_refresh_signal_identifiers(&mount),
             vec!["root".to_string(), "source:notion".to_string()]
         );
+    }
+
+    #[test]
+    fn virtual_projection_children_summary_ignores_guidance_files() {
+        let report = localityd::virtual_fs::VirtualFsChildrenReport {
+            mount_id: "notion-main".to_string(),
+            container_identifier: "source:notion".to_string(),
+            children: vec![
+                virtual_projection_test_item("guidance:AGENTS.md", "AGENTS.md", None),
+                virtual_projection_test_item("guidance:CLAUDE.md", "CLAUDE.md", None),
+                virtual_projection_test_item("remote-page-1", "product", Some("remote-page-1")),
+                virtual_projection_test_item("remote-page-2", "engineering", Some("remote-page-2")),
+            ],
+        };
+
+        let summary = summarize_virtual_projection_children(&report);
+
+        assert_eq!(summary.total_children, 4);
+        assert_eq!(summary.content_children, 2);
+        assert_eq!(summary.preview(), "product, engineering");
+    }
+
+    #[test]
+    fn virtual_projection_children_summary_preview_limits_long_lists() {
+        let report = localityd::virtual_fs::VirtualFsChildrenReport {
+            mount_id: "notion-main".to_string(),
+            container_identifier: "source:notion".to_string(),
+            children: (0..8)
+                .map(|index| {
+                    let name = format!("teamspace-{index}");
+                    virtual_projection_test_item(&format!("remote-{index}"), &name, Some("remote"))
+                })
+                .collect(),
+        };
+
+        let summary = summarize_virtual_projection_children(&report);
+
+        assert_eq!(summary.content_children, 8);
+        assert_eq!(
+            summary.preview(),
+            "teamspace-0, teamspace-1, teamspace-2, teamspace-3, teamspace-4, teamspace-5, +2 more"
+        );
+    }
+
+    fn virtual_projection_test_item(
+        identifier: &str,
+        filename: &str,
+        remote_id: Option<&str>,
+    ) -> localityd::virtual_fs::VirtualFsItem {
+        localityd::virtual_fs::VirtualFsItem {
+            identifier: identifier.to_string(),
+            parent_identifier: Some("source:notion".to_string()),
+            filename: filename.to_string(),
+            kind: localityd::virtual_fs::VirtualFsItemKind::Folder,
+            entity_kind: None,
+            remote_id: remote_id.map(str::to_string),
+            path: filename.to_string(),
+            hydration: None,
+            content_type: "public.folder".to_string(),
+            remote_edited_at: None,
+            materialized_path: None,
+            byte_size: None,
+        }
     }
 
     #[test]
