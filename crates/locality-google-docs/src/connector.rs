@@ -17,7 +17,7 @@ use locality_core::{LocalityError, LocalityResult};
 use crate::client::{GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient};
 use crate::docs_dto::{
     BatchUpdateDocumentRequest, DeleteContentRangeRequest, DocsRequest, GoogleDocument,
-    InsertTextRequest, Location, Range, TextStyle, TextStylePatch, UpdateTextStyleRequest,
+    InsertTextRequest, Link, Location, Range, TextStyle, TextStylePatch, UpdateTextStyleRequest,
     WriteControl,
 };
 use crate::drive_dto::{
@@ -677,13 +677,23 @@ fn write_control(document: &GoogleDocument) -> Option<WriteControl> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DocsText {
     text: String,
-    bold_ranges: Vec<DocsTextRange>,
+    style_ranges: Vec<DocsTextStyleRange>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DocsTextRange {
+struct DocsTextStyleRange {
     start: usize,
     end: usize,
+    style: DocsInlineStyle,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DocsInlineStyle {
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    link: Option<String>,
 }
 
 fn docs_text_requests(location_index: usize, content: &str) -> Vec<DocsRequest> {
@@ -720,9 +730,9 @@ fn docs_text_requests_from_parsed(
     }
     requests.extend(
         docs_text
-            .bold_ranges
+            .style_ranges
             .into_iter()
-            .map(|range| bold_text_style_request(location_index, range, style_source)),
+            .map(|range| text_style_request(location_index, range, style_source)),
     );
     requests
 }
@@ -746,23 +756,47 @@ fn reset_text_style_request(start_index: usize, end_index: usize) -> DocsRequest
                 underline: Some(false),
                 strikethrough: Some(false),
                 foreground_color: None,
+                link: None,
             },
             fields: "bold,italic,underline,strikethrough,foregroundColor,link".to_string(),
         },
     }
 }
 
-fn bold_text_style_request(
+fn text_style_request(
     location_index: usize,
-    range: DocsTextRange,
+    range: DocsTextStyleRange,
     style_source: Option<DocsTextStyleSource<'_>>,
 ) -> DocsRequest {
     let existing_style = style_source
         .and_then(|source| text_style_at(source.document, source.start_index + range.start));
-    let foreground_color = existing_style.and_then(|style| style.foreground_color.clone());
-    let mut fields = "bold".to_string();
+    let foreground_color = existing_style
+        .filter(|_| {
+            range.style.bold
+                || range.style.italic
+                || range.style.underline
+                || range.style.strikethrough
+                || range.style.link.is_some()
+        })
+        .and_then(|style| style.foreground_color.clone());
+    let mut fields = Vec::new();
+    if range.style.bold {
+        fields.push("bold");
+    }
+    if range.style.italic {
+        fields.push("italic");
+    }
+    if range.style.underline {
+        fields.push("underline");
+    }
+    if range.style.strikethrough {
+        fields.push("strikethrough");
+    }
+    if range.style.link.is_some() {
+        fields.push("link");
+    }
     if foreground_color.is_some() {
-        fields.push_str(",foregroundColor");
+        fields.push("foregroundColor");
     }
     DocsRequest::UpdateTextStyle {
         update_text_style: UpdateTextStyleRequest {
@@ -771,13 +805,14 @@ fn bold_text_style_request(
                 end_index: location_index + range.end,
             },
             text_style: TextStylePatch {
-                bold: Some(true),
-                italic: None,
-                underline: None,
-                strikethrough: None,
+                bold: range.style.bold.then_some(true),
+                italic: range.style.italic.then_some(true),
+                underline: range.style.underline.then_some(true),
+                strikethrough: range.style.strikethrough.then_some(true),
                 foreground_color,
+                link: range.style.link.map(|url| Link { url: Some(url) }),
             },
-            fields,
+            fields: fields.join(","),
         },
     }
 }
@@ -826,20 +861,9 @@ fn parse_docs_markdown_inline(content: &str) -> DocsText {
     let mut parsed = DocsText::default();
     let mut index = 0;
     while index < content.len() {
-        if content[index..].starts_with("**") {
-            let inner_start = index + 2;
-            if let Some(close_offset) = content[inner_start..].find("**") {
-                let inner_end = inner_start + close_offset;
-                let inner = &content[inner_start..inner_end];
-                let start = docs_text_len(&parsed.text);
-                parsed.text.push_str(inner);
-                let end = docs_text_len(&parsed.text);
-                if end > start {
-                    parsed.bold_ranges.push(DocsTextRange { start, end });
-                }
-                index = inner_end + 2;
-                continue;
-            }
+        if let Some(next) = parse_markdown_span(content, index, &mut parsed) {
+            index = next;
+            continue;
         }
 
         let ch = content[index..]
@@ -850,6 +874,131 @@ fn parse_docs_markdown_inline(content: &str) -> DocsText {
         index += ch.len_utf8();
     }
     parsed
+}
+
+fn parse_markdown_span(content: &str, index: usize, parsed: &mut DocsText) -> Option<usize> {
+    if content[index..].starts_with("**") {
+        return parse_delimited_style(
+            content,
+            index,
+            "**",
+            "**",
+            DocsInlineStyle {
+                bold: true,
+                ..DocsInlineStyle::default()
+            },
+            parsed,
+        );
+    }
+    if content[index..].starts_with("~~") {
+        return parse_delimited_style(
+            content,
+            index,
+            "~~",
+            "~~",
+            DocsInlineStyle {
+                strikethrough: true,
+                ..DocsInlineStyle::default()
+            },
+            parsed,
+        );
+    }
+    if content[index..].starts_with("<u>") {
+        return parse_delimited_style(
+            content,
+            index,
+            "<u>",
+            "</u>",
+            DocsInlineStyle {
+                underline: true,
+                ..DocsInlineStyle::default()
+            },
+            parsed,
+        );
+    }
+    if content[index..].starts_with('[') {
+        return parse_link_style(content, index, parsed);
+    }
+    if content[index..].starts_with('*') && !content[index..].starts_with("**") {
+        return parse_delimited_style(
+            content,
+            index,
+            "*",
+            "*",
+            DocsInlineStyle {
+                italic: true,
+                ..DocsInlineStyle::default()
+            },
+            parsed,
+        );
+    }
+    None
+}
+
+fn parse_delimited_style(
+    content: &str,
+    index: usize,
+    open: &str,
+    close: &str,
+    style: DocsInlineStyle,
+    parsed: &mut DocsText,
+) -> Option<usize> {
+    let inner_start = index + open.len();
+    let close_offset = content[inner_start..].find(close)?;
+    let inner_end = inner_start + close_offset;
+    let start = docs_text_len(&parsed.text);
+    append_parsed_inline(
+        parsed,
+        &parse_docs_markdown_inline(&content[inner_start..inner_end]),
+    );
+    let end = docs_text_len(&parsed.text);
+    push_style_range(parsed, start, end, style);
+    Some(inner_end + close.len())
+}
+
+fn parse_link_style(content: &str, index: usize, parsed: &mut DocsText) -> Option<usize> {
+    let label_start = index + '['.len_utf8();
+    let label_close_offset = content[label_start..].find("](")?;
+    let label_end = label_start + label_close_offset;
+    let url_start = label_end + "](".len();
+    let url_close_offset = content[url_start..].find(')')?;
+    let url_end = url_start + url_close_offset;
+    let start = docs_text_len(&parsed.text);
+    append_parsed_inline(
+        parsed,
+        &parse_docs_markdown_inline(&content[label_start..label_end]),
+    );
+    let end = docs_text_len(&parsed.text);
+    push_style_range(
+        parsed,
+        start,
+        end,
+        DocsInlineStyle {
+            link: Some(content[url_start..url_end].to_string()),
+            ..DocsInlineStyle::default()
+        },
+    );
+    Some(url_end + ')'.len_utf8())
+}
+
+fn append_parsed_inline(parsed: &mut DocsText, inline: &DocsText) {
+    let offset = docs_text_len(&parsed.text);
+    parsed.text.push_str(&inline.text);
+    parsed
+        .style_ranges
+        .extend(inline.style_ranges.iter().cloned().map(|mut range| {
+            range.start += offset;
+            range.end += offset;
+            range
+        }));
+}
+
+fn push_style_range(parsed: &mut DocsText, start: usize, end: usize, style: DocsInlineStyle) {
+    if end > start {
+        parsed
+            .style_ranges
+            .push(DocsTextStyleRange { start, end, style });
+    }
 }
 
 fn docs_text_len(value: &str) -> usize {
@@ -1288,6 +1437,113 @@ mod tests {
         assert_eq!(update_text_style.range.start_index, 14);
         assert_eq!(update_text_style.range.end_index, 21);
         assert_eq!(update_text_style.text_style.bold, Some(true));
+    }
+
+    #[test]
+    fn apply_converts_markdown_inline_styles_beyond_bold_to_docs_text() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Pet Resume", "workspace")));
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Pet Resume",
+            "rev-1",
+            "Styled: Bold Italic Under Strike Link Plain\n",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:45"),
+                content: "Styled: **Bold** *Italic* <u>Under</u> ~~Strike~~ [<u>Link</u>](https://example.test/live-inline) Plain edited".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[1] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(
+            insert_text.text,
+            "Styled: Bold Italic Under Strike Link Plain edited\n"
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[3]).expect("bold style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 9, "endIndex": 13 },
+                    "textStyle": { "bold": true },
+                    "fields": "bold"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[4]).expect("italic style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 14, "endIndex": 20 },
+                    "textStyle": { "italic": true },
+                    "fields": "italic"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[5]).expect("underline style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 21, "endIndex": 26 },
+                    "textStyle": { "underline": true },
+                    "fields": "underline"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[6]).expect("strike style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 27, "endIndex": 33 },
+                    "textStyle": { "strikethrough": true },
+                    "fields": "strikethrough"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[7]).expect("link underline style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 34, "endIndex": 38 },
+                    "textStyle": { "underline": true },
+                    "fields": "underline"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&batch.requests[8]).expect("link style json"),
+            serde_json::json!({
+                "updateTextStyle": {
+                    "range": { "startIndex": 34, "endIndex": 38 },
+                    "textStyle": { "link": { "url": "https://example.test/live-inline" } },
+                    "fields": "link"
+                }
+            })
+        );
     }
 
     #[test]
