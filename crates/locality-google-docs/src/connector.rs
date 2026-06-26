@@ -837,6 +837,9 @@ fn docs_text_requests_from_parsed(
     let preserved_color_ranges = style_source
         .map(|source| preserved_color_ranges(&inserted_text, source, &docs_text.style_ranges))
         .unwrap_or_default();
+    let preserved_background_ranges = style_source
+        .map(|source| preserved_background_ranges(&inserted_text, source, &docs_text.style_ranges))
+        .unwrap_or_default();
     let mut requests = vec![DocsRequest::InsertText {
         insert_text: InsertTextRequest {
             location: Location {
@@ -867,6 +870,11 @@ fn docs_text_requests_from_parsed(
         preserved_color_ranges
             .into_iter()
             .map(|range| foreground_color_request(location_index, range)),
+    );
+    requests.extend(
+        preserved_background_ranges
+            .into_iter()
+            .map(|range| background_color_request(location_index, range)),
     );
     requests.extend(
         docs_text
@@ -911,6 +919,13 @@ struct DocsForegroundColorRange {
     foreground_color: serde_json::Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsBackgroundColorRange {
+    start: usize,
+    end: usize,
+    background_color: serde_json::Value,
+}
+
 fn reset_text_style_request(start_index: usize, end_index: usize) -> DocsRequest {
     DocsRequest::UpdateTextStyle {
         update_text_style: UpdateTextStyleRequest {
@@ -924,9 +939,11 @@ fn reset_text_style_request(start_index: usize, end_index: usize) -> DocsRequest
                 underline: Some(false),
                 strikethrough: Some(false),
                 foreground_color: None,
+                background_color: None,
                 link: None,
             },
-            fields: "bold,italic,underline,strikethrough,foregroundColor,link".to_string(),
+            fields: "bold,italic,underline,strikethrough,foregroundColor,backgroundColor,link"
+                .to_string(),
         },
     }
 }
@@ -985,6 +1002,22 @@ fn foreground_color_request(location_index: usize, range: DocsForegroundColorRan
     }
 }
 
+fn background_color_request(location_index: usize, range: DocsBackgroundColorRange) -> DocsRequest {
+    DocsRequest::UpdateTextStyle {
+        update_text_style: UpdateTextStyleRequest {
+            range: Range {
+                start_index: location_index + range.start,
+                end_index: location_index + range.end,
+            },
+            text_style: TextStylePatch {
+                background_color: Some(range.background_color),
+                ..TextStylePatch::default()
+            },
+            fields: "backgroundColor".to_string(),
+        },
+    }
+}
+
 fn text_style_request(
     location_index: usize,
     range: DocsTextStyleRange,
@@ -1001,6 +1034,15 @@ fn text_style_request(
                 || range.style.link.is_some()
         })
         .and_then(|style| style.foreground_color.clone());
+    let background_color = existing_style
+        .filter(|_| {
+            range.style.bold
+                || range.style.italic
+                || range.style.underline
+                || range.style.strikethrough
+                || range.style.link.is_some()
+        })
+        .and_then(|style| style.background_color.clone());
     let mut fields = Vec::new();
     if range.style.bold {
         fields.push("bold");
@@ -1020,6 +1062,9 @@ fn text_style_request(
     if foreground_color.is_some() {
         fields.push("foregroundColor");
     }
+    if background_color.is_some() {
+        fields.push("backgroundColor");
+    }
     DocsRequest::UpdateTextStyle {
         update_text_style: UpdateTextStyleRequest {
             range: Range {
@@ -1032,6 +1077,7 @@ fn text_style_request(
                 underline: range.style.underline.then_some(true),
                 strikethrough: range.style.strikethrough.then_some(true),
                 foreground_color,
+                background_color,
                 link: range.style.link.map(|url| Link { url: Some(url) }),
             },
             fields: fields.join(","),
@@ -1060,6 +1106,32 @@ fn preserved_color_ranges(
                 start,
                 end,
                 foreground_color: range.foreground_color,
+            })
+        })
+        .collect()
+}
+
+fn preserved_background_ranges(
+    new_text: &str,
+    source: DocsTextStyleSource<'_>,
+    explicit_style_ranges: &[DocsTextStyleRange],
+) -> Vec<DocsBackgroundColorRange> {
+    let (source_text, source_ranges) = source_text_background_ranges(source);
+    source_ranges
+        .into_iter()
+        .filter_map(|range| {
+            let (start, end) =
+                map_source_range_by_context(&source_text, range.start, range.end, new_text)?;
+            if explicit_style_ranges
+                .iter()
+                .any(|explicit| ranges_overlap(start, end, explicit.start, explicit.end))
+            {
+                return None;
+            }
+            Some(DocsBackgroundColorRange {
+                start,
+                end,
+                background_color: range.background_color,
             })
         })
         .collect()
@@ -1115,6 +1187,56 @@ fn source_text_color_ranges(
     (source_text, ranges)
 }
 
+fn source_text_background_ranges(
+    source: DocsTextStyleSource<'_>,
+) -> (String, Vec<DocsBackgroundColorRange>) {
+    let mut source_text = String::new();
+    let mut ranges = Vec::new();
+    for element in source
+        .document
+        .body
+        .content
+        .iter()
+        .filter_map(|element| element.paragraph.as_ref())
+        .flat_map(|paragraph| paragraph.elements.iter())
+    {
+        let (Some(element_start), Some(element_end), Some(text_run)) = (
+            element.start_index,
+            element.end_index,
+            element.text_run.as_ref(),
+        ) else {
+            continue;
+        };
+        let overlap_start = element_start.max(source.start_index);
+        let overlap_end = element_end.min(source.end_index);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+
+        let content = utf16_slice(
+            &text_run.content,
+            overlap_start - element_start,
+            overlap_end - element_start,
+        );
+        let range_start = docs_text_len(&source_text);
+        source_text.push_str(&content);
+        let range_end = docs_text_len(&source_text);
+        if let Some(background_color) = text_run.text_style.background_color.clone()
+            && range_end > range_start
+        {
+            push_merged_background_color_range(
+                &mut ranges,
+                DocsBackgroundColorRange {
+                    start: range_start,
+                    end: range_end,
+                    background_color,
+                },
+            );
+        }
+    }
+    (source_text, ranges)
+}
+
 fn push_merged_foreground_color_range(
     ranges: &mut Vec<DocsForegroundColorRange>,
     range: DocsForegroundColorRange,
@@ -1122,6 +1244,20 @@ fn push_merged_foreground_color_range(
     if let Some(previous) = ranges.last_mut()
         && previous.end == range.start
         && previous.foreground_color == range.foreground_color
+    {
+        previous.end = range.end;
+        return;
+    }
+    ranges.push(range);
+}
+
+fn push_merged_background_color_range(
+    ranges: &mut Vec<DocsBackgroundColorRange>,
+    range: DocsBackgroundColorRange,
+) {
+    if let Some(previous) = ranges.last_mut()
+        && previous.end == range.start
+        && previous.background_color == range.background_color
     {
         previous.end = range.end;
         return;
@@ -2701,7 +2837,7 @@ mod tests {
                         "underline": false,
                         "strikethrough": false
                     },
-                    "fields": "bold,italic,underline,strikethrough,foregroundColor,link"
+                    "fields": "bold,italic,underline,strikethrough,foregroundColor,backgroundColor,link"
                 }
             })
         );
@@ -3030,6 +3166,105 @@ mod tests {
                 )
             }),
             "appended plain text after a colored span must remain uncolored: {:#?}",
+            batch.requests
+        );
+    }
+
+    #[test]
+    fn apply_preserves_background_color_only_text_style_for_edited_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Highlight", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Highlight",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 19,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 12,
+                                        "textRun": {
+                                            "content": "Highlight: ",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 12,
+                                        "endIndex": 18,
+                                        "textRun": {
+                                            "content": "Yellow",
+                                            "textStyle": {
+                                                "backgroundColor": {
+                                                    "color": {
+                                                        "rgbColor": {
+                                                            "red": 1.0,
+                                                            "green": 0.9019608,
+                                                            "blue": 0.2
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 18,
+                                        "endIndex": 19,
+                                        "textRun": {
+                                            "content": "\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("highlighted document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:19"),
+                content: "Highlight: Amber".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            batch.requests.iter().any(|request| {
+                let value = serde_json::to_value(request).expect("request json");
+                value["updateTextStyle"]["range"]["startIndex"] == 12
+                    && value["updateTextStyle"]["range"]["endIndex"] == 17
+                    && value["updateTextStyle"]["textStyle"]["backgroundColor"].is_object()
+                    && value["updateTextStyle"]["fields"] == "backgroundColor"
+            }),
+            "background-only source style should be restored onto the edited span: {:#?}",
             batch.requests
         );
     }

@@ -112,6 +112,8 @@ pub struct TextStyle {
     pub link: Option<Link>,
     #[serde(default)]
     pub foreground_color: Option<serde_json::Value>,
+    #[serde(default)]
+    pub background_color: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +306,8 @@ pub struct TextStylePatch {
     pub strikethrough: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_color: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_color: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<Link>,
 }
