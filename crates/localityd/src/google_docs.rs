@@ -9,7 +9,7 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConfig, GoogleDocsConnector,
     HttpGoogleDocsOAuthBrokerClient, StoredGoogleDocsCredential,
-    render::GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND,
+    render::{GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND},
 };
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
@@ -341,7 +341,7 @@ pub(crate) fn validate_google_docs_frontmatter(
     }
     if let Some(shadow) = context.shadow {
         for block in shadow.blocks.iter().filter(|block| {
-            block.native_kind.as_deref() == Some("google_docs_table")
+            block.native_kind.as_deref() == Some(GOOGLE_DOCS_TABLE_NATIVE_KIND)
                 && !context.parsed.document.body.contains(&block.text)
         }) {
             report.push(locality_core::validation::ValidationIssue::new(

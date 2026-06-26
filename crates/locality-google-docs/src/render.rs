@@ -11,6 +11,7 @@ use crate::drive_dto::DriveFile;
 use crate::oauth::GOOGLE_DOCS_CONNECTOR_ID;
 
 pub const GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND: &str = "google_docs_inline_object";
+pub const GOOGLE_DOCS_TABLE_NATIVE_KIND: &str = "google_docs_table";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoogleDocsNativeBundle {
@@ -58,7 +59,7 @@ pub fn render_google_document(
             if !table.trim().is_empty() {
                 rendered_blocks.push(table);
                 native_block_ids.push(RemoteId::new(block_id));
-                native_block_kinds.push(Some("google_docs_table".to_string()));
+                native_block_kinds.push(Some(GOOGLE_DOCS_TABLE_NATIVE_KIND.to_string()));
             }
         } else if unsupported_structural_element(element) {
             if implicit_document_boundary_section_break(element) {

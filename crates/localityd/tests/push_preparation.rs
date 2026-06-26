@@ -600,6 +600,35 @@ fn prepare_push_blocks_google_docs_inline_image_move_before_apply() {
 }
 
 #[test]
+fn prepare_push_blocks_google_docs_table_move_before_apply() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("google-docs");
+    let table = "| Pet | Age |\n| --- | --- |\n| Luna | 4 |";
+    let mut shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        format!("Intro.\n\n{table}"),
+        8,
+        [RemoteId::new("page-1:1:8"), RemoteId::new("page-1:8:40")],
+    )
+    .expect("shadow");
+    shadow.blocks[1].native_kind = Some("google_docs_table".to_string());
+    store
+        .save_shadow(&fixture.mount_id, shadow)
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", &format!("{table}\n\nIntro."));
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::FixValidation);
+    assert!(prepared.pipeline.plan.is_none());
+    assert_eq!(
+        prepared.pipeline.validation.issues[0].code,
+        "google_docs_table_move_unsupported"
+    );
+}
+
+#[test]
 fn prepare_push_blocks_notion_table_width_change_before_apply() {
     let fixture = PrepareFixture::new();
     let mut store = fixture.store("notion");
