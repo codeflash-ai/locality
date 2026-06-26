@@ -60,6 +60,7 @@ pub enum GuidanceFileAction {
     Preserved,
     Symlinked,
     Copied,
+    Virtual,
 }
 
 impl GuidanceFileAction {
@@ -69,6 +70,7 @@ impl GuidanceFileAction {
             Self::Preserved => "preserved",
             Self::Symlinked => "symlinked",
             Self::Copied => "copied",
+            Self::Virtual => "virtual",
         }
     }
 }
@@ -78,12 +80,16 @@ where
     S: MountRepository,
 {
     let root = absolute_path(&options.root)?;
-    std::fs::create_dir_all(&root).map_err(|error| MountError::CreateRoot {
-        path: root.clone(),
-        message: error.to_string(),
-    })?;
 
-    let guidance = install_mount_guidance(&root, &options.connector)?;
+    let guidance = if options.projection == ProjectionMode::MacosFileProvider {
+        virtual_mount_guidance(&root)
+    } else {
+        std::fs::create_dir_all(&root).map_err(|error| MountError::CreateRoot {
+            path: root.clone(),
+            message: error.to_string(),
+        })?;
+        install_mount_guidance(&root, &options.connector)?
+    };
 
     let mut mount = MountConfig::new(options.mount_id.clone(), options.connector.clone(), &root)
         .read_only(options.read_only)
@@ -174,6 +180,19 @@ fn install_mount_guidance(root: &Path, connector: &str) -> Result<MountGuidanceR
             action: claude_action,
         },
     })
+}
+
+fn virtual_mount_guidance(root: &Path) -> MountGuidanceReport {
+    MountGuidanceReport {
+        agents_md: GuidanceFileReport {
+            path: root.join(AGENTS_FILE).display().to_string(),
+            action: GuidanceFileAction::Virtual,
+        },
+        claude_md: GuidanceFileReport {
+            path: root.join(CLAUDE_FILE).display().to_string(),
+            action: GuidanceFileAction::Virtual,
+        },
+    }
 }
 
 fn write_guidance_if_absent(path: &Path, contents: &str) -> Result<GuidanceFileAction, MountError> {
