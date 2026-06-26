@@ -43,9 +43,10 @@ use loc_cli::search::{
 use loc_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::conflict::has_unresolved_conflict_markers;
+use locality_core::freshness::RemoteVersion;
 use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::journal::{JournalEntry, JournalStatus};
-use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 #[cfg(test)]
 use locality_notion::NotionConfig;
 #[cfg(test)]
@@ -66,8 +67,8 @@ use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, HydrationJobRecord,
     HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository, open_credential_store,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository, open_credential_store,
 };
 use localityd::autosave::auto_save_timestamp;
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
@@ -75,7 +76,7 @@ use localityd::hydration::{HydrationExecutor, HydrationOutcome, HydrationSource}
 use localityd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
 use localityd::push::execute_auto_save_push_job_with_content_root;
 use localityd::source::{
-    resolve_source_for_mount_id, resolve_source_for_path, source_display_name,
+    ResolvedSource, resolve_source_for_mount_id, resolve_source_for_path, source_display_name,
 };
 use localityd::virtual_fs::{
     commit_virtual_fs_write, materialize_virtual_fs_item_with_content_root,
@@ -2213,6 +2214,10 @@ fn blend_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4],
 }
 
 fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
+    if notion_id_from_url(query).is_some() {
+        prepare_exact_notion_url_path(query)?;
+    }
+
     let results = search_notion_results(query, 1)?;
     let result = results.into_iter().next().ok_or_else(|| {
         if notion_id_from_url(query).is_some() {
@@ -2224,6 +2229,122 @@ fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
     })?;
     prioritize_located_notion_result(&result);
     Ok(located_item_for_search_result(result))
+}
+
+fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
+    let Some(notion_id) = notion_id_from_url(query) else {
+        return Ok(());
+    };
+    let remote_id = RemoteId::new(notion_id.clone());
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load Locality mounts: {error}"))?
+        .into_iter()
+        .filter(|mount| mount.connector == "notion")
+        .collect::<Vec<_>>();
+    if mounts.is_empty() {
+        return Err("Create a Notion folder before locating pages.".to_string());
+    }
+
+    let credentials = open_credential_store(&state_root);
+    let mut last_error = None;
+    for mount in mounts {
+        let source =
+            match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount.mount_id) {
+                Ok(source) => source,
+                Err(error) => {
+                    last_error = Some(error.message());
+                    continue;
+                }
+            };
+        let ResolvedSource::Notion(connector) = source else {
+            continue;
+        };
+        match connector.resolve_page_path_entries(mount.mount_id.clone(), &remote_id) {
+            Ok(entries) if entries.iter().any(|entry| entry.remote_id == remote_id) => {
+                save_exact_notion_entries(&mut store, entries)?;
+                return Ok(());
+            }
+            Ok(_) => {
+                last_error = Some(format!(
+                    "Notion page `{}` was not returned while resolving its parent hierarchy.",
+                    remote_id.0
+                ));
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(notion_access_miss_message))
+}
+
+fn save_exact_notion_entries(
+    store: &mut SqliteStateStore,
+    entries: Vec<TreeEntry>,
+) -> Result<(), String> {
+    let observed_at = activity_timestamp();
+    for entry in entries {
+        let existing = store
+            .get_entity(&entry.mount_id, &entry.remote_id)
+            .map_err(|error| format!("Could not inspect local Notion metadata: {error}"))?;
+        let record = exact_located_entity_record(&entry, existing.as_ref())?;
+        store
+            .save_entity(record)
+            .map_err(|error| format!("Could not update local Notion metadata: {error}"))?;
+
+        let mut observation = RemoteObservationRecord::new(
+            entry.mount_id.clone(),
+            entry.remote_id.clone(),
+            entry.kind.clone(),
+            entry.title.clone(),
+            entry.path.clone(),
+            observed_at.clone(),
+        );
+        if let Some(remote_version) = entry.remote_edited_at.clone() {
+            observation = observation.with_remote_version(RemoteVersion::new(remote_version));
+        }
+        store
+            .save_remote_observation(observation)
+            .map_err(|error| format!("Could not update local Notion metadata: {error}"))?;
+    }
+
+    Ok(())
+}
+
+fn exact_located_entity_record(
+    entry: &TreeEntry,
+    existing: Option<&EntityRecord>,
+) -> Result<EntityRecord, String> {
+    let mut record = EntityRecord::from(entry.clone());
+    if let Some(existing) = existing {
+        if existing.path != entry.path
+            && matches!(
+                existing.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        {
+            return Err(format!(
+                "Notion page `{}` moved from `{}` to `{}`, but the old local file has pending changes. Review or push the old file before opening the new path.",
+                existing.title,
+                display_path(&existing.path),
+                display_path(&entry.path)
+            ));
+        }
+        record.hydration = existing.hydration.clone();
+        record.content_hash = existing.content_hash.clone();
+        if matches!(
+            existing.hydration,
+            HydrationState::Hydrated | HydrationState::Dirty | HydrationState::Conflicted
+        ) {
+            record.remote_edited_at = existing.remote_edited_at.clone();
+        }
+    }
+    Ok(record)
 }
 
 fn notion_access_miss_message() -> String {
@@ -6213,7 +6334,9 @@ mod tests {
     use loc_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
     use locality_core::canonical::render_canonical_markdown;
     use locality_core::journal::{JournalEntry, JournalStatus, PushId};
-    use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+    use locality_core::model::{
+        CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
+    };
     use locality_core::planner::PushPlan;
     use locality_core::shadow::ShadowDocument;
     use locality_store::{
@@ -6228,19 +6351,19 @@ mod tests {
         ScreenBounds, TerminalCliLinkState, TrayVisualState, clear_mount_cached_projection,
         clear_state_root_contents, conflict_preview, connection_metadata_changed,
         current_daemon_build_id, current_desktop_build_id, diff_report_message,
-        failed_push_summary, hydration_after_editor_write, inspect_install_state,
-        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
-        is_notion_access_lost_message, is_unsupported_schema_version_message,
-        live_mode_content_hash_changed, live_mode_e2e_append_local_marker,
-        live_mode_e2e_append_remote_marker, live_mode_e2e_notion_api, live_mode_e2e_page_id,
-        live_mode_e2e_page_path, live_mode_e2e_remote_text, live_mode_e2e_wait_until,
-        live_mode_remote_pull_candidates, live_mode_should_reconcile_local_target_for_key,
-        live_mode_target, live_mode_tick_blocking, live_mode_tick_from_snapshot,
-        load_desktop_activity, mount_has_pending_local_changes, mount_has_unfinished_journals,
-        notion_id_from_url, pending_changes_from_status, preserve_mount_pending_local_changes,
-        pull_error_message, pull_report_message, push_action_message,
-        record_current_install_marker, record_desktop_activity, sample_auto_save_status,
-        sample_snapshot, shell_single_quote, should_hide_tray_popover,
+        exact_located_entity_record, failed_push_summary, hydration_after_editor_write,
+        inspect_install_state, install_terminal_cli_link_at,
+        install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
+        is_unsupported_schema_version_message, live_mode_content_hash_changed,
+        live_mode_e2e_append_local_marker, live_mode_e2e_append_remote_marker,
+        live_mode_e2e_notion_api, live_mode_e2e_page_id, live_mode_e2e_page_path,
+        live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_remote_pull_candidates,
+        live_mode_should_reconcile_local_target_for_key, live_mode_target, live_mode_tick_blocking,
+        live_mode_tick_from_snapshot, load_desktop_activity, mount_has_pending_local_changes,
+        mount_has_unfinished_journals, notion_id_from_url, pending_changes_from_status,
+        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
+        push_action_message, record_current_install_marker, record_desktop_activity,
+        sample_auto_save_status, sample_snapshot, shell_single_quote, should_hide_tray_popover,
         should_prioritize_located_result, state_event_path_requires_refresh,
         terminal_cli_link_state, tray_icon_image, tray_popover_position, unique_suffix,
         validate_mount_root, virtual_projection_refresh_signal_identifiers,
@@ -6264,6 +6387,53 @@ mod tests {
         assert!(message.contains("Current mount access: `Product Teamspace`"));
         assert!(message.contains("select this page or the correct teamspace"));
         assert!(message.contains("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972"));
+    }
+
+    #[test]
+    fn exact_located_entity_updates_clean_stub_path() {
+        let existing = EntityRecord::new(
+            MountId::new("notion-main"),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Daily Standup",
+            "engineering-wiki/daily-standup/page.md",
+        )
+        .with_hydration(HydrationState::Stub);
+        let entry = tree_entry(
+            "page-1",
+            "Daily Standup",
+            "engineering-wiki/standups-with-locality/daily-standup/page.md",
+        );
+
+        let record =
+            exact_located_entity_record(&entry, Some(&existing)).expect("clean stub can move");
+
+        assert_eq!(record.path, entry.path);
+        assert_eq!(record.hydration, HydrationState::Stub);
+    }
+
+    #[test]
+    fn exact_located_entity_blocks_dirty_path_move() {
+        let existing = EntityRecord::new(
+            MountId::new("notion-main"),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Daily Standup",
+            "engineering-wiki/daily-standup/page.md",
+        )
+        .with_hydration(HydrationState::Dirty);
+        let entry = tree_entry(
+            "page-1",
+            "Daily Standup",
+            "engineering-wiki/standups-with-locality/daily-standup/page.md",
+        );
+
+        let error = exact_located_entity_record(&entry, Some(&existing))
+            .expect_err("dirty old path must not move silently");
+
+        assert!(error.contains("pending changes"));
+        assert!(error.contains("engineering-wiki/daily-standup/page.md"));
+        assert!(error.contains("engineering-wiki/standups-with-locality/daily-standup/page.md"));
     }
 
     #[test]
@@ -7931,6 +8101,20 @@ mod tests {
             },
             remote: SearchRemoteState::default(),
             score: 0,
+        }
+    }
+
+    fn tree_entry(remote_id: &str, title: &str, path: &str) -> TreeEntry {
+        TreeEntry {
+            mount_id: MountId::new("notion-main"),
+            remote_id: RemoteId::new(remote_id),
+            kind: EntityKind::Page,
+            title: title.to_string(),
+            path: PathBuf::from(path),
+            hydration: HydrationState::Stub,
+            content_hash: None,
+            remote_edited_at: None,
+            stub_frontmatter: None,
         }
     }
 }
