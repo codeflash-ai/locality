@@ -16,9 +16,10 @@ use locality_core::{LocalityError, LocalityResult};
 
 use crate::client::{GoogleDocsApi, GoogleDriveApi, HttpGoogleApiClient};
 use crate::docs_dto::{
-    BatchUpdateDocumentRequest, DeleteContentRangeRequest, DeleteParagraphBulletsRequest,
-    DocsRequest, GoogleDocument, InsertTextRequest, Link, Location, Range, TextStyle,
-    TextStylePatch, UpdateTextStyleRequest, WriteControl,
+    BatchUpdateDocumentRequest, CreateParagraphBulletsRequest, DeleteContentRangeRequest,
+    DeleteParagraphBulletsRequest, DocsRequest, GoogleDocument, InsertTextRequest, Link, Location,
+    ParagraphStylePatch, Range, TextStyle, TextStylePatch, UpdateParagraphStyleRequest,
+    UpdateTextStyleRequest, WriteControl,
 };
 use crate::drive_dto::{
     DRIVE_FOLDER_MIME_TYPE, DRIVE_GOOGLE_DOC_MIME_TYPE, DriveCreateFileRequest, DriveFile,
@@ -678,6 +679,8 @@ fn write_control(document: &GoogleDocument) -> Option<WriteControl> {
 struct DocsText {
     text: String,
     style_ranges: Vec<DocsTextStyleRange>,
+    paragraph_styles: Vec<DocsParagraphStyleRange>,
+    bullet_ranges: Vec<DocsBulletRange>,
     list_block: bool,
 }
 
@@ -695,6 +698,20 @@ struct DocsInlineStyle {
     underline: bool,
     strikethrough: bool,
     link: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsParagraphStyleRange {
+    start: usize,
+    end: usize,
+    named_style_type: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsBulletRange {
+    start: usize,
+    end: usize,
+    preset: String,
 }
 
 fn docs_document_text_requests(location_index: usize, content: &str) -> Vec<DocsRequest> {
@@ -741,6 +758,18 @@ fn docs_text_requests_from_parsed(
             .into_iter()
             .map(|range| text_style_request(location_index, range, style_source)),
     );
+    requests.extend(
+        docs_text
+            .paragraph_styles
+            .into_iter()
+            .map(|range| paragraph_style_request(location_index, range)),
+    );
+    requests.extend(
+        docs_text
+            .bullet_ranges
+            .into_iter()
+            .map(|range| create_paragraph_bullets_request(location_index, range)),
+    );
     requests
 }
 
@@ -777,6 +806,33 @@ fn delete_paragraph_bullets_request(start_index: usize, end_index: usize) -> Doc
                 start_index,
                 end_index,
             },
+        },
+    }
+}
+
+fn paragraph_style_request(location_index: usize, range: DocsParagraphStyleRange) -> DocsRequest {
+    DocsRequest::UpdateParagraphStyle {
+        update_paragraph_style: UpdateParagraphStyleRequest {
+            range: Range {
+                start_index: location_index + range.start,
+                end_index: location_index + range.end,
+            },
+            paragraph_style: ParagraphStylePatch {
+                named_style_type: Some(range.named_style_type),
+            },
+            fields: "namedStyleType".to_string(),
+        },
+    }
+}
+
+fn create_paragraph_bullets_request(location_index: usize, range: DocsBulletRange) -> DocsRequest {
+    DocsRequest::CreateParagraphBullets {
+        create_paragraph_bullets: CreateParagraphBulletsRequest {
+            range: Range {
+                start_index: location_index + range.start,
+                end_index: location_index + range.end,
+            },
+            bullet_preset: range.preset,
         },
     }
 }
@@ -876,11 +932,99 @@ fn docs_text(content: &str) -> DocsText {
 }
 
 fn docs_document_text(content: &str) -> DocsText {
-    let mut parsed = parse_docs_markdown_inline(content);
+    let mut parsed = parse_docs_markdown_blocks(content);
     if !parsed.text.ends_with('\n') {
         parsed.text.push('\n');
     }
     parsed
+}
+
+fn parse_docs_markdown_blocks(content: &str) -> DocsText {
+    let mut parsed = DocsText::default();
+    let mut current = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            append_markdown_block(&mut parsed, &current.join("\n"));
+            current.clear();
+        } else {
+            current.push(line);
+        }
+    }
+    append_markdown_block(&mut parsed, &current.join("\n"));
+    parsed
+}
+
+fn append_markdown_block(parsed: &mut DocsText, block: &str) {
+    if block.trim().is_empty() {
+        return;
+    }
+    let block_start = docs_text_len(&parsed.text);
+    let trimmed = block.trim_start();
+    let (content, block_kind) = markdown_block_content(trimmed);
+    let block_inline = parse_docs_markdown_inline(content);
+    append_parsed_inline(parsed, &block_inline);
+    if !parsed.text.ends_with('\n') {
+        parsed.text.push('\n');
+    }
+    let block_end = docs_text_len(&parsed.text);
+    match block_kind {
+        MarkdownBlockKind::Heading(level) => {
+            parsed.paragraph_styles.push(DocsParagraphStyleRange {
+                start: block_start,
+                end: block_end,
+                named_style_type: format!("HEADING_{level}"),
+            })
+        }
+        MarkdownBlockKind::UnorderedList => parsed.bullet_ranges.push(DocsBulletRange {
+            start: block_start,
+            end: block_end,
+            preset: "BULLET_DISC_CIRCLE_SQUARE".to_string(),
+        }),
+        MarkdownBlockKind::OrderedList => parsed.bullet_ranges.push(DocsBulletRange {
+            start: block_start,
+            end: block_end,
+            preset: "NUMBERED_DECIMAL_ALPHA_ROMAN".to_string(),
+        }),
+        MarkdownBlockKind::Paragraph => {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkdownBlockKind {
+    Paragraph,
+    Heading(usize),
+    UnorderedList,
+    OrderedList,
+}
+
+fn markdown_block_content(block: &str) -> (&str, MarkdownBlockKind) {
+    if let Some((level, content)) = markdown_heading_content(block) {
+        return (content, MarkdownBlockKind::Heading(level));
+    }
+    if block.starts_with("- ") || block.starts_with("* ") || block.starts_with("+ ") {
+        return (&block[2..], MarkdownBlockKind::UnorderedList);
+    }
+    if let Some((_, content)) = markdown_ordered_list_content(block) {
+        return (content, MarkdownBlockKind::OrderedList);
+    }
+    (block, MarkdownBlockKind::Paragraph)
+}
+
+fn markdown_heading_content(block: &str) -> Option<(usize, &str)> {
+    let level = block.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let rest = &block[level..];
+    rest.strip_prefix(' ').map(|content| (level, content))
+}
+
+fn markdown_ordered_list_content(block: &str) -> Option<(&str, &str)> {
+    let (digits, content) = block.split_once(". ")?;
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some((digits, content))
 }
 
 fn parse_docs_markdown_inline(content: &str) -> DocsText {
@@ -1835,13 +1979,102 @@ mod tests {
         let DocsRequest::InsertText { insert_text } = &batch.requests[0] else {
             panic!("expected insert text request");
         };
-        assert_eq!(
-            insert_text.text,
-            "# Local Shape Create\n\nIntro paragraph\n"
-        );
+        assert_eq!(insert_text.text, "Local Shape Create\nIntro paragraph\n");
         assert!(
             !insert_text.text.contains('\u{000b}'),
             "full-document creates must not collapse Markdown blocks into soft breaks"
+        );
+    }
+
+    #[test]
+    fn create_entity_converts_markdown_blocks_to_docs_paragraph_styles_and_lists() {
+        let drive = Arc::new(FakeDrive::default());
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "created-doc",
+            "Local Shape Create",
+            "rev-1",
+            "",
+        )));
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("workspace")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("workspace"),
+                parent_kind: Some(EntityKind::Directory),
+                title: "Local Shape Create".to_string(),
+                properties: BTreeMap::new(),
+                body: "# Local Shape Create\n\nIntro with **Bold** and *Italic*.\n\n## Section Two\n\n- Bullet alpha\n\n1. Number alpha\n".to_string(),
+                source_path: PathBuf::from("local-shape-create/page.md"),
+            }],
+        );
+        let op_ids = vec![PushOperationId(
+            "push-1:0:create_entity:workspace".to_string(),
+        )];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        let DocsRequest::InsertText { insert_text } = &batch.requests[0] else {
+            panic!("expected insert text request");
+        };
+        assert_eq!(
+            insert_text.text,
+            "Local Shape Create\nIntro with Bold and Italic.\nSection Two\nBullet alpha\nNumber alpha\n"
+        );
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
+                    == Some(&serde_json::Value::String("HEADING_1".to_string()))
+            }),
+            "expected heading 1 paragraph style update"
+        );
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/updateParagraphStyle/paragraphStyle/namedStyleType")
+                    == Some(&serde_json::Value::String("HEADING_2".to_string()))
+            }),
+            "expected heading 2 paragraph style update"
+        );
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/createParagraphBullets/bulletPreset")
+                    == Some(&serde_json::Value::String(
+                        "BULLET_DISC_CIRCLE_SQUARE".to_string(),
+                    ))
+            }),
+            "expected unordered list bullet creation"
+        );
+        assert!(
+            batch.requests.iter().any(|request| {
+                serde_json::to_value(request)
+                    .expect("request json")
+                    .pointer("/createParagraphBullets/bulletPreset")
+                    == Some(&serde_json::Value::String(
+                        "NUMBERED_DECIMAL_ALPHA_ROMAN".to_string(),
+                    ))
+            }),
+            "expected ordered list bullet creation"
         );
     }
 

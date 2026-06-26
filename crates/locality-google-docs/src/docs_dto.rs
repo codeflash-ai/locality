@@ -227,9 +227,17 @@ pub enum DocsRequest {
         #[serde(rename = "deleteParagraphBullets")]
         delete_paragraph_bullets: DeleteParagraphBulletsRequest,
     },
+    CreateParagraphBullets {
+        #[serde(rename = "createParagraphBullets")]
+        create_paragraph_bullets: CreateParagraphBulletsRequest,
+    },
     InsertText {
         #[serde(rename = "insertText")]
         insert_text: InsertTextRequest,
+    },
+    UpdateParagraphStyle {
+        #[serde(rename = "updateParagraphStyle")]
+        update_paragraph_style: UpdateParagraphStyleRequest,
     },
     UpdateTextStyle {
         #[serde(rename = "updateTextStyle")]
@@ -248,9 +256,31 @@ pub struct DeleteParagraphBulletsRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateParagraphBulletsRequest {
+    pub range: Range,
+    pub bullet_preset: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InsertTextRequest {
     pub location: Location,
     pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateParagraphStyleRequest {
+    pub range: Range,
+    pub paragraph_style: ParagraphStylePatch,
+    pub fields: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParagraphStylePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_style_type: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
