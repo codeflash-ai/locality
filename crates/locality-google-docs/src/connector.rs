@@ -568,6 +568,7 @@ fn apply_plan(
                     Some(DocsTextStyleSource {
                         document: &document,
                         start_index: range.start_index,
+                        end_index: delete_end_index,
                     }),
                 ));
                 docs.batch_update_document(
@@ -832,6 +833,10 @@ fn docs_text_requests_from_parsed(
     style_source: Option<DocsTextStyleSource<'_>>,
 ) -> Vec<DocsRequest> {
     let inserted_len = docs_text_len(&docs_text.text);
+    let inserted_text = docs_text.text.clone();
+    let preserved_color_ranges = style_source
+        .map(|source| preserved_color_ranges(&inserted_text, source, &docs_text.style_ranges))
+        .unwrap_or_default();
     let mut requests = vec![DocsRequest::InsertText {
         insert_text: InsertTextRequest {
             location: Location {
@@ -857,6 +862,11 @@ fn docs_text_requests_from_parsed(
             .paragraph_styles
             .into_iter()
             .map(|range| paragraph_style_request(location_index, range)),
+    );
+    requests.extend(
+        preserved_color_ranges
+            .into_iter()
+            .map(|range| foreground_color_request(location_index, range)),
     );
     requests.extend(
         docs_text
@@ -891,6 +901,14 @@ fn merge_adjacent_bullet_ranges(ranges: Vec<DocsBulletRange>) -> Vec<DocsBulletR
 struct DocsTextStyleSource<'a> {
     document: &'a GoogleDocument,
     start_index: usize,
+    end_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DocsForegroundColorRange {
+    start: usize,
+    end: usize,
+    foreground_color: serde_json::Value,
 }
 
 fn reset_text_style_request(start_index: usize, end_index: usize) -> DocsRequest {
@@ -951,6 +969,22 @@ fn create_paragraph_bullets_request(location_index: usize, range: DocsBulletRang
     }
 }
 
+fn foreground_color_request(location_index: usize, range: DocsForegroundColorRange) -> DocsRequest {
+    DocsRequest::UpdateTextStyle {
+        update_text_style: UpdateTextStyleRequest {
+            range: Range {
+                start_index: location_index + range.start,
+                end_index: location_index + range.end,
+            },
+            text_style: TextStylePatch {
+                foreground_color: Some(range.foreground_color),
+                ..TextStylePatch::default()
+            },
+            fields: "foregroundColor".to_string(),
+        },
+    }
+}
+
 fn text_style_request(
     location_index: usize,
     range: DocsTextStyleRange,
@@ -1003,6 +1037,138 @@ fn text_style_request(
             fields: fields.join(","),
         },
     }
+}
+
+fn preserved_color_ranges(
+    new_text: &str,
+    source: DocsTextStyleSource<'_>,
+    explicit_style_ranges: &[DocsTextStyleRange],
+) -> Vec<DocsForegroundColorRange> {
+    let (source_text, source_ranges) = source_text_color_ranges(source);
+    source_ranges
+        .into_iter()
+        .filter_map(|range| {
+            let (start, end) =
+                map_source_range_by_context(&source_text, range.start, range.end, new_text)?;
+            if explicit_style_ranges
+                .iter()
+                .any(|explicit| ranges_overlap(start, end, explicit.start, explicit.end))
+            {
+                return None;
+            }
+            Some(DocsForegroundColorRange {
+                start,
+                end,
+                foreground_color: range.foreground_color,
+            })
+        })
+        .collect()
+}
+
+fn source_text_color_ranges(
+    source: DocsTextStyleSource<'_>,
+) -> (String, Vec<DocsForegroundColorRange>) {
+    let mut source_text = String::new();
+    let mut ranges = Vec::new();
+    for element in source
+        .document
+        .body
+        .content
+        .iter()
+        .filter_map(|element| element.paragraph.as_ref())
+        .flat_map(|paragraph| paragraph.elements.iter())
+    {
+        let (Some(element_start), Some(element_end), Some(text_run)) = (
+            element.start_index,
+            element.end_index,
+            element.text_run.as_ref(),
+        ) else {
+            continue;
+        };
+        let overlap_start = element_start.max(source.start_index);
+        let overlap_end = element_end.min(source.end_index);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+
+        let content = utf16_slice(
+            &text_run.content,
+            overlap_start - element_start,
+            overlap_end - element_start,
+        );
+        let range_start = docs_text_len(&source_text);
+        source_text.push_str(&content);
+        let range_end = docs_text_len(&source_text);
+        if let Some(foreground_color) = text_run.text_style.foreground_color.clone()
+            && range_end > range_start
+        {
+            push_merged_foreground_color_range(
+                &mut ranges,
+                DocsForegroundColorRange {
+                    start: range_start,
+                    end: range_end,
+                    foreground_color,
+                },
+            );
+        }
+    }
+    (source_text, ranges)
+}
+
+fn push_merged_foreground_color_range(
+    ranges: &mut Vec<DocsForegroundColorRange>,
+    range: DocsForegroundColorRange,
+) {
+    if let Some(previous) = ranges.last_mut()
+        && previous.end == range.start
+        && previous.foreground_color == range.foreground_color
+    {
+        previous.end = range.end;
+        return;
+    }
+    ranges.push(range);
+}
+
+fn map_source_range_by_context(
+    source_text: &str,
+    source_start: usize,
+    source_end: usize,
+    new_text: &str,
+) -> Option<(usize, usize)> {
+    let source_len = docs_text_len(source_text);
+    let prefix = utf16_slice(source_text, 0, source_start);
+    let suffix = utf16_slice(source_text, source_end, source_len);
+    if !new_text.starts_with(&prefix) || !new_text.ends_with(&suffix) {
+        return None;
+    }
+    let start = docs_text_len(&prefix);
+    let end = docs_text_len(new_text).checked_sub(docs_text_len(&suffix))?;
+    (end > start).then_some((start, end))
+}
+
+fn ranges_overlap(
+    left_start: usize,
+    left_end: usize,
+    right_start: usize,
+    right_end: usize,
+) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
+fn utf16_slice(value: &str, start: usize, end: usize) -> String {
+    let mut sliced = String::new();
+    let mut offset = 0;
+    for ch in value.chars() {
+        let next = offset + ch.len_utf16();
+        if offset >= end {
+            break;
+        }
+        if offset >= start && next <= end {
+            sliced.push(ch);
+        }
+        offset = next;
+    }
+    sliced
 }
 
 fn text_style_at(document: &GoogleDocument, index: usize) -> Option<&TextStyle> {
@@ -2572,6 +2738,107 @@ mod tests {
                         && update_text_style.fields == "bold,foregroundColor"
             ),
             "the inline style restore must be the final style-affecting request: {:#?}",
+            batch.requests
+        );
+    }
+
+    #[test]
+    fn apply_preserves_color_only_text_style_for_edited_span() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Status", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Status",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 15,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 9,
+                                        "textRun": {
+                                            "content": "Status: ",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 9,
+                                        "endIndex": 14,
+                                        "textRun": {
+                                            "content": "Green",
+                                            "textStyle": {
+                                                "foregroundColor": {
+                                                    "color": {
+                                                        "rgbColor": {
+                                                            "green": 0.6,
+                                                            "blue": 0.2
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 14,
+                                        "endIndex": 15,
+                                        "textRun": {
+                                            "content": "\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("styled document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:15"),
+                content: "Status: Emerald".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            batch.requests.iter().any(|request| {
+                matches!(
+                    request,
+                    DocsRequest::UpdateTextStyle { update_text_style }
+                        if update_text_style.range.start_index == 9
+                            && update_text_style.range.end_index == 16
+                            && update_text_style.text_style.foreground_color.is_some()
+                            && update_text_style.fields == "foregroundColor"
+                )
+            }),
+            "color-only source style should be restored onto the edited span: {:#?}",
             batch.requests
         );
     }
