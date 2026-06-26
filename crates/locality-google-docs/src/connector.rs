@@ -1136,14 +1136,104 @@ fn map_source_range_by_context(
     new_text: &str,
 ) -> Option<(usize, usize)> {
     let source_len = docs_text_len(source_text);
-    let prefix = utf16_slice(source_text, 0, source_start);
-    let suffix = utf16_slice(source_text, source_end, source_len);
-    if !new_text.starts_with(&prefix) || !new_text.ends_with(&suffix) {
+    let new_len = docs_text_len(new_text);
+    if source_start > source_end || source_end > source_len {
         return None;
     }
-    let start = docs_text_len(&prefix);
-    let end = docs_text_len(new_text).checked_sub(docs_text_len(&suffix))?;
+
+    let common_prefix = common_prefix_utf16(source_text, new_text);
+    let common_suffix = common_suffix_utf16(
+        source_text,
+        new_text,
+        source_len.saturating_sub(common_prefix),
+        new_len.saturating_sub(common_prefix),
+    );
+    let old_change_start = common_prefix;
+    let old_change_end = source_len.saturating_sub(common_suffix);
+    let new_change_start = common_prefix;
+    let new_change_end = new_len.saturating_sub(common_suffix);
+
+    let (start, end) = if source_end <= old_change_start {
+        let mut end = source_end;
+        if source_end == old_change_start
+            && old_change_start == old_change_end
+            && should_extend_color_boundary_insertion(new_text, new_change_start, new_change_end)
+        {
+            end = new_change_end;
+        }
+        (source_start, end)
+    } else if source_start >= old_change_end {
+        (
+            shift_utf16_index(source_start, old_change_end, new_change_end)?,
+            shift_utf16_index(source_end, old_change_end, new_change_end)?,
+        )
+    } else {
+        let start = if source_start < old_change_start {
+            source_start
+        } else {
+            new_change_start
+        };
+        let end = if source_end > old_change_end {
+            shift_utf16_index(source_end, old_change_end, new_change_end)?
+        } else {
+            new_change_end
+        };
+        (start, end)
+    };
     (end > start).then_some((start, end))
+}
+
+fn common_prefix_utf16(left: &str, right: &str) -> usize {
+    let mut units = 0;
+    for (left_ch, right_ch) in left.chars().zip(right.chars()) {
+        if left_ch != right_ch {
+            break;
+        }
+        units += left_ch.len_utf16();
+    }
+    units
+}
+
+fn common_suffix_utf16(
+    left: &str,
+    right: &str,
+    max_left_units: usize,
+    max_right_units: usize,
+) -> usize {
+    let mut units = 0;
+    for (left_ch, right_ch) in left.chars().rev().zip(right.chars().rev()) {
+        if left_ch != right_ch {
+            break;
+        }
+        let ch_units = left_ch.len_utf16();
+        if units + ch_units > max_left_units || units + ch_units > max_right_units {
+            break;
+        }
+        units += ch_units;
+    }
+    units
+}
+
+fn shift_utf16_index(index: usize, old_change_end: usize, new_change_end: usize) -> Option<usize> {
+    if new_change_end >= old_change_end {
+        index.checked_add(new_change_end - old_change_end)
+    } else {
+        index.checked_sub(old_change_end - new_change_end)
+    }
+}
+
+fn should_extend_color_boundary_insertion(
+    new_text: &str,
+    insertion_start: usize,
+    insertion_end: usize,
+) -> bool {
+    if insertion_start >= insertion_end {
+        return false;
+    }
+    utf16_slice(new_text, insertion_start, insertion_end)
+        .chars()
+        .next()
+        .is_some_and(|ch| !ch.is_whitespace())
 }
 
 fn ranges_overlap(
@@ -2839,6 +2929,107 @@ mod tests {
                 )
             }),
             "color-only source style should be restored onto the edited span: {:#?}",
+            batch.requests
+        );
+    }
+
+    #[test]
+    fn apply_does_not_extend_color_only_style_to_appended_plain_text() {
+        let drive =
+            Arc::new(FakeDrive::default().with_file(doc_file("doc-1", "Status", "workspace")));
+        let docs = Arc::new(
+            FakeDocs::default().with_document(
+                serde_json::from_value(serde_json::json!({
+                    "documentId": "doc-1",
+                    "title": "Status",
+                    "revisionId": "rev-1",
+                    "body": {
+                        "content": [{
+                            "startIndex": 1,
+                            "endIndex": 15,
+                            "paragraph": {
+                                "elements": [
+                                    {
+                                        "startIndex": 1,
+                                        "endIndex": 9,
+                                        "textRun": {
+                                            "content": "Status: ",
+                                            "textStyle": {}
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 9,
+                                        "endIndex": 14,
+                                        "textRun": {
+                                            "content": "Green",
+                                            "textStyle": {
+                                                "foregroundColor": {
+                                                    "color": {
+                                                        "rgbColor": {
+                                                            "green": 0.6,
+                                                            "blue": 0.2
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "startIndex": 14,
+                                        "endIndex": 15,
+                                        "textRun": {
+                                            "content": "\n",
+                                            "textStyle": {}
+                                        }
+                                    }
+                                ]
+                            }
+                        }]
+                    }
+                }))
+                .expect("styled document"),
+            ),
+        );
+        let connector =
+            GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::UpdateBlock {
+                block_id: RemoteId::new("doc-1:1:15"),
+                content: "Status: Green today".to_string(),
+            }],
+        );
+        let op_ids = vec![PushOperationId("push-1:0:update_block:doc-1".to_string())];
+
+        connector
+            .apply(ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply");
+
+        let batch = docs
+            .last_batch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("batch update");
+        assert!(
+            batch.requests.iter().any(|request| {
+                matches!(
+                    request,
+                    DocsRequest::UpdateTextStyle { update_text_style }
+                        if update_text_style.range.start_index == 9
+                            && update_text_style.range.end_index == 14
+                            && update_text_style.text_style.foreground_color.is_some()
+                            && update_text_style.fields == "foregroundColor"
+                )
+            }),
+            "appended plain text after a colored span must remain uncolored: {:#?}",
             batch.requests
         );
     }
