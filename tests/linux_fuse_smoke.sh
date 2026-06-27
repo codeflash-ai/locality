@@ -34,11 +34,13 @@ fi
 loc_bin="${LOCALITY_BIN:-./target/debug/loc}"
 localityd_bin="${LOCALITYD_BIN:-./target/debug/localityd}"
 fuse_bin="${LOCALITY_FUSE_BIN:-./target/debug/locality-fuse}"
-mount_id="${LOCALITY_FUSE_SMOKE_MOUNT_ID:-notion-fuse-smoke}"
+mount_id="notion-main"
+google_mount_id="google-docs-main"
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/locality-fuse-smoke.XXXXXX")"
 state_root="${LOCALITY_FUSE_SMOKE_STATE:-$tmp_root/state}"
-loc_root="${LOCALITY_FUSE_SMOKE_ROOT:-$tmp_root/loc}"
-mount_root="${LOCALITY_FUSE_SMOKE_MOUNT:-$loc_root/notion}"
+LOCALITY_ROOT="${LOCALITY_FUSE_SMOKE_ROOT:-$tmp_root/Locality}"
+NOTION_MOUNT="${LOCALITY_FUSE_SMOKE_NOTION_MOUNT:-$LOCALITY_ROOT/notion-main}"
+GOOGLE_MOUNT="${LOCALITY_FUSE_SMOKE_GOOGLE_MOUNT:-$LOCALITY_ROOT/google-docs-main}"
 daemon_log="$tmp_root/localityd.log"
 fuse_log="$tmp_root/locality-fuse.log"
 localityd_pid=""
@@ -55,8 +57,8 @@ on_error() {
 
 cleanup() {
   set +e
-  if mountpoint -q "$loc_root"; then
-    fusermount3 -uz "$loc_root" >/dev/null 2>&1
+  if mountpoint -q "$LOCALITY_ROOT"; then
+    fusermount3 -uz "$LOCALITY_ROOT" >/dev/null 2>&1
   fi
   if [[ -n "$fuse_pid" ]] && kill -0 "$fuse_pid" >/dev/null 2>&1; then
     kill "$fuse_pid" >/dev/null 2>&1
@@ -79,10 +81,20 @@ if [[ ! -x "$loc_bin" || ! -x "$localityd_bin" || ! -x "$fuse_bin" ]]; then
   cargo build -p localityd -p loc-cli -p locality-fuse
 fi
 
+sql_text_literal() {
+  local hex
+  hex="$(printf '%s' "$1" | od -An -tx1 -v | tr -d ' \n')"
+  if [[ -z "$hex" ]]; then
+    printf "''"
+  else
+    printf "CAST(X'%s' AS TEXT)" "$hex"
+  fi
+}
+
 seed_fixture() {
-  mkdir -p "$state_root" "$loc_root" "$mount_root"
+  mkdir -p "$state_root" "$LOCALITY_ROOT" "$GOOGLE_MOUNT"
   LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 NOTION_TOKEN="ci-fuse-smoke-token" \
-    "$loc_bin" mount notion "$mount_root" \
+    "$loc_bin" mount notion "$NOTION_MOUNT" \
       --workspace \
       --mount-id "$mount_id" \
       --projection linux-fuse \
@@ -91,6 +103,30 @@ seed_fixture() {
   local db="$state_root/state.sqlite3"
   local content_root="$state_root/content/$mount_id/files"
   mkdir -p "$content_root/Teamspace Home/Launch Plan"
+
+  local google_mount_id_sql
+  local google_mount_root_sql
+  local google_connector_sql
+  local linux_fuse_projection_sql
+  google_mount_id_sql="$(sql_text_literal "$google_mount_id")"
+  google_mount_root_sql="$(sql_text_literal "$GOOGLE_MOUNT")"
+  google_connector_sql="$(sql_text_literal "google-docs")"
+  linux_fuse_projection_sql="$(sql_text_literal '"linux_fuse"')"
+
+  sqlite3 "$db" <<SQL
+INSERT INTO mounts (
+  mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
+) VALUES (
+  $google_mount_id_sql, $google_connector_sql, $google_mount_root_sql, NULL, 0, $linux_fuse_projection_sql, NULL
+)
+ON CONFLICT(mount_id) DO UPDATE SET
+  connector = excluded.connector,
+  root = excluded.root,
+  remote_root_id = excluded.remote_root_id,
+  read_only = excluded.read_only,
+  projection_json = excluded.projection_json,
+  connection_id = excluded.connection_id;
+SQL
 
   local home_frontmatter
   local home_body
@@ -106,12 +142,47 @@ seed_fixture() {
   printf -- '---\n%s---\n%s' "$child_frontmatter" "$child_body" \
     > "$content_root/Teamspace Home/Launch Plan/page.md"
 
+  local mount_id_sql
+  local page_home_sql
+  local page_launch_sql
+  local page_kind_sql
+  local title_home_sql
+  local title_launch_sql
+  local path_home_sql
+  local path_launch_sql
+  local hydration_sql
+  local remote_edited_sql
+  local home_frontmatter_sql
+  local child_frontmatter_sql
+  local home_body_hash_sql
+  local child_body_hash_sql
+  local home_body_sql
+  local child_body_sql
+  local blocks_sql
+  mount_id_sql="$(sql_text_literal "$mount_id")"
+  page_home_sql="$(sql_text_literal "page-home")"
+  page_launch_sql="$(sql_text_literal "page-launch")"
+  page_kind_sql="$(sql_text_literal '"page"')"
+  title_home_sql="$(sql_text_literal "Teamspace Home")"
+  title_launch_sql="$(sql_text_literal "Launch Plan")"
+  path_home_sql="$(sql_text_literal "Teamspace Home/page.md")"
+  path_launch_sql="$(sql_text_literal "Teamspace Home/Launch Plan/page.md")"
+  hydration_sql="$(sql_text_literal '"hydrated"')"
+  remote_edited_sql="$(sql_text_literal "2026-06-13T00:00:00Z")"
+  home_frontmatter_sql="$(sql_text_literal "$home_frontmatter")"
+  child_frontmatter_sql="$(sql_text_literal "$child_frontmatter")"
+  home_body_hash_sql="$(sql_text_literal "ci-home-body")"
+  child_body_hash_sql="$(sql_text_literal "ci-launch-body")"
+  home_body_sql="$(sql_text_literal "$home_body")"
+  child_body_sql="$(sql_text_literal "$child_body")"
+  blocks_sql="$(sql_text_literal "[]")"
+
   sqlite3 "$db" <<SQL
 INSERT INTO entities (
   mount_id, remote_id, kind_json, title, path, hydration_json, content_hash, remote_edited_at
 ) VALUES
-  ('$mount_id', 'page-home', '"page"', 'Teamspace Home', 'Teamspace Home/page.md', '"hydrated"', NULL, '2026-06-13T00:00:00Z'),
-  ('$mount_id', 'page-launch', '"page"', 'Launch Plan', 'Teamspace Home/Launch Plan/page.md', '"hydrated"', NULL, '2026-06-13T00:00:00Z')
+  ($mount_id_sql, $page_home_sql, $page_kind_sql, $title_home_sql, $path_home_sql, $hydration_sql, NULL, $remote_edited_sql),
+  ($mount_id_sql, $page_launch_sql, $page_kind_sql, $title_launch_sql, $path_launch_sql, $hydration_sql, NULL, $remote_edited_sql)
 ON CONFLICT(mount_id, remote_id) DO UPDATE SET
   kind_json = excluded.kind_json,
   title = excluded.title,
@@ -123,8 +194,8 @@ ON CONFLICT(mount_id, remote_id) DO UPDATE SET
 INSERT INTO shadows (
   mount_id, entity_id, frontmatter, body_hash, rendered_body, blocks_json
 ) VALUES
-  ('$mount_id', 'page-home', '$home_frontmatter', 'ci-home-body', '$home_body', '[]'),
-  ('$mount_id', 'page-launch', '$child_frontmatter', 'ci-launch-body', '$child_body', '[]')
+  ($mount_id_sql, $page_home_sql, $home_frontmatter_sql, $home_body_hash_sql, $home_body_sql, $blocks_sql),
+  ($mount_id_sql, $page_launch_sql, $child_frontmatter_sql, $child_body_hash_sql, $child_body_sql, $blocks_sql)
 ON CONFLICT(mount_id, entity_id) DO UPDATE SET
   frontmatter = excluded.frontmatter,
   body_hash = excluded.body_hash,
@@ -148,7 +219,7 @@ wait_for_daemon() {
 
 wait_for_mount() {
   for _ in {1..80}; do
-    if mountpoint -q "$loc_root"; then
+    if mountpoint -q "$LOCALITY_ROOT"; then
       return 0
     fi
     if [[ -n "$fuse_pid" ]] && ! kill -0 "$fuse_pid" >/dev/null 2>&1; then
@@ -176,6 +247,8 @@ assert_status_contains() {
 }
 
 seed_fixture
+test -d "$NOTION_MOUNT"
+test -d "$GOOGLE_MOUNT"
 
 LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_TCP_ADDR=off LOCALITY_DAEMON_PULL_MODE=disabled NOTION_TOKEN="ci-fuse-smoke-token" \
   "$localityd_bin" >"$daemon_log" 2>&1 &
@@ -184,16 +257,18 @@ wait_for_daemon
 
 LOCALITY_STATE_DIR="$state_root" "$fuse_bin" \
   --state-dir "$state_root" \
-  --mountpoint "$loc_root" >"$fuse_log" 2>&1 &
+  --mountpoint "$LOCALITY_ROOT" >"$fuse_log" 2>&1 &
 fuse_pid="$!"
 wait_for_mount
 
-findmnt -R "$loc_root" >/dev/null
-ls -la "$loc_root" >/dev/null
+findmnt -R "$LOCALITY_ROOT" >/dev/null
+ls -la "$LOCALITY_ROOT" >/dev/null
+test -d "$NOTION_MOUNT"
+test -d "$GOOGLE_MOUNT"
 
-home_dir="$mount_root/Teamspace Home"
+home_dir="$NOTION_MOUNT/Teamspace Home"
 home_file="$home_dir/page.md"
-child_dir="$mount_root/Teamspace Home/Launch Plan"
+child_dir="$NOTION_MOUNT/Teamspace Home/Launch Plan"
 child_file="$child_dir/page.md"
 
 test -d "$home_dir"
@@ -202,6 +277,7 @@ test -d "$child_dir"
 test -f "$child_file"
 head -n 20 "$home_file" >/dev/null
 grep -q "Original launch plan" "$child_file"
+assert_status_contains "$child_file" '"mount_id": "notion-main"'
 assert_status_contains "$child_file" '"state": "clean"'
 
 backup="$(mktemp "$tmp_root/original.XXXXXX")"
