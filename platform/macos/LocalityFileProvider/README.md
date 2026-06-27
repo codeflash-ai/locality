@@ -32,11 +32,11 @@ identifier: loc
 display:    Locality
 ```
 
-Each connected source is exposed as a top-level folder inside that domain, for
-example `Locality/notion`. The extension namespaces File Provider item identifiers
-with the internal Locality `mount_id`, then sends the unwrapped mount id and item
-identifier to `localityd`. This keeps Finder paths stable as more connectors are
-added without exposing mount ids in user-visible folder names.
+Each mount is exposed as a top-level mount-point folder inside that domain, for
+example `Locality/notion-main`. The extension namespaces File Provider item
+identifiers with the internal Locality `mount_id`, then sends the unwrapped mount
+id and item identifier to `localityd`. This keeps Finder paths stable as multiple
+mounts and connectors are added under one shared Locality root.
 
 The extension talks to `localityd` over `127.0.0.1:38567` by default because
 sandboxed app extensions should not depend on a Unix socket in `~/.loc`.

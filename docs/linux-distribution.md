@@ -75,7 +75,7 @@ target/release/bundle/updater/Locality-release-linux-<arch>.AppImage.sig
 
 The package metadata declares `fuse3` and `systemd` dependencies. Locality needs
 `fusermount3` and `/dev/fuse` for Linux FUSE mounts, and it uses `systemctl
---user` to manage one per-mount FUSE service.
+--user` to manage one shared-root FUSE service per Locality root.
 
 The desktop tray requires either `libayatana-appindicator3` or
 `libappindicator3`. Tauri detects that library through pkg-config during

@@ -178,7 +178,7 @@ Goal: choose where the workspace appears locally.
 Default value:
 
 ```text
-~/Library/CloudStorage/Locality/notion
+~/Library/CloudStorage/Locality/notion-main
 ```
 
 Primary action: `Continue`
@@ -194,7 +194,7 @@ Layout:
 │ Where should your Notion files appear?                       │
 │                                                              │
 │ ┌──────────────────────────────────────────────────────────┐ │
-│ │ ~/Library/CloudStorage/Locality/notion                              [... ]│ │
+│ │ ~/Library/CloudStorage/Locality/notion-main                              [... ]│ │
 │ └──────────────────────────────────────────────────────────┘ │
 │                                                              │
 │ [ Continue ]                                                 │
@@ -235,7 +235,7 @@ Layout:
 │                                                              │
 │ ┌──────────────────────────────────────────────────────────┐ │
 │ │ Notion folder                         [ Copy ]           │ │
-│ │ ~/Library/CloudStorage/Locality/notion                                  │ │
+│ │ ~/Library/CloudStorage/Locality/notion-main                                  │ │
 │ └──────────────────────────────────────────────────────────┘ │
 │                                                              │
 │ [ Open Notion Folder ]                                      │
@@ -328,7 +328,7 @@ Layout:
 │                                      │
 │ Notion                               │
 │ CodeFlash                            │
-│ ~/Library/CloudStorage/Locality/notion               │
+│ ~/Library/CloudStorage/Locality/notion-main               │
 │                                      │
 │ [ Open Notion Folder ]               │
 │                                      │
@@ -430,7 +430,7 @@ Home
 
 Notion workspace
 CodeFlash
-~/Library/CloudStorage/Locality/notion
+~/Library/CloudStorage/Locality/notion-main
 
 Open a Notion page
 ┌──────────────────────────────────────────────────────────────┐
@@ -476,7 +476,7 @@ Preparing this page
 Locality is making the local file available now.
 
 Roadmap 2026
-~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md
+~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md
 
 [ Copy Path ]    Reveal in Finder
 ```
@@ -488,7 +488,7 @@ Roadmap 2026
 Page
 
 ┌──────────────────────────────────────────────────────────────┐
-│ ~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md      │
+│ ~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md      │
 └──────────────────────────────────────────────────────────────┘
 
 [ Copy Path ]    Reveal in Finder
@@ -631,10 +631,10 @@ Layout:
 Notion
 
 CodeFlash
-~/Library/CloudStorage/Locality/notion
+~/Library/CloudStorage/Locality/notion-main
 
 Location
-~/Library/CloudStorage/Locality/notion        [ Move... ]
+~/Library/CloudStorage/Locality/notion-main        [ Move... ]
 
 [ Open Folder ]
 
