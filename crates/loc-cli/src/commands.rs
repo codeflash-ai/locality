@@ -1708,6 +1708,56 @@ fn file_provider_unregister(args: &[String], json: bool) -> i32 {
         .ok()
         .and_then(|store| resolve_mount_target(&store, target).ok());
     if target_os == "windows" {
+        if let Ok(store) = SqliteStateStore::open(default_state_root()) {
+            match resolve_mount_target(&store, target) {
+                Ok(mount) => {
+                    if let Err(error) = validate_virtual_projection_registration(&mount, "windows")
+                    {
+                        return command_error(json, error, EXIT_USAGE);
+                    }
+                    let mounts = match store.load_mounts() {
+                        Ok(mounts) => mounts,
+                        Err(error) => {
+                            return command_error(
+                                json,
+                                CommandError::new(
+                                    "file-provider",
+                                    "store_load_failed",
+                                    error.to_string(),
+                                ),
+                                EXIT_INTERNAL,
+                            );
+                        }
+                    };
+                    if let Err(error) =
+                        guard_windows_cloud_files_shared_root_unregister(&mounts, &mount)
+                    {
+                        return command_error(json, error, EXIT_USAGE);
+                    }
+                }
+                Err(_) => {
+                    let mounts = match store.load_mounts() {
+                        Ok(mounts) => mounts,
+                        Err(error) => {
+                            return command_error(
+                                json,
+                                CommandError::new(
+                                    "file-provider",
+                                    "store_load_failed",
+                                    error.to_string(),
+                                ),
+                                EXIT_INTERNAL,
+                            );
+                        }
+                    };
+                    if let Err(error) =
+                        guard_unresolved_windows_cloud_files_unregister(&mounts, target)
+                    {
+                        return command_error(json, error, EXIT_USAGE);
+                    }
+                }
+            }
+        }
         let mount_id = resolved_mount
             .map(|mount| mount.mount_id.0)
             .unwrap_or_else(|| target.to_string());
@@ -3901,7 +3951,60 @@ fn guard_linux_fuse_shared_root_unregister(
     mounts: &[MountConfig],
     target: &MountConfig,
 ) -> Result<(), CommandError> {
-    if target.projection != ProjectionMode::LinuxFuse {
+    guard_shared_virtual_projection_root_unregister(
+        mounts,
+        target,
+        ProjectionMode::LinuxFuse,
+        "linux_fuse_shared_root_in_use",
+        "Linux FUSE",
+    )
+}
+
+fn guard_windows_cloud_files_shared_root_unregister(
+    mounts: &[MountConfig],
+    target: &MountConfig,
+) -> Result<(), CommandError> {
+    guard_shared_virtual_projection_root_unregister(
+        mounts,
+        target,
+        ProjectionMode::WindowsCloudFiles,
+        "windows_cloud_files_shared_root_in_use",
+        "Windows Cloud Files",
+    )
+}
+
+fn guard_unresolved_windows_cloud_files_unregister(
+    mounts: &[MountConfig],
+    target: &str,
+) -> Result<(), CommandError> {
+    let mut mount_ids = mounts
+        .iter()
+        .filter(|mount| mount.projection == ProjectionMode::WindowsCloudFiles)
+        .map(|mount| mount.mount_id.0.clone())
+        .collect::<Vec<_>>();
+    mount_ids.sort();
+    if mount_ids.is_empty() {
+        return Ok(());
+    }
+
+    Err(CommandError::new(
+        "file-provider",
+        "windows_cloud_files_unresolved_shared_root",
+        format!(
+            "Windows Cloud Files unregister target `{target}` does not match a known mount; refusing raw unregister while shared Windows Cloud Files mounts exist: {}",
+            mount_ids.join(", ")
+        ),
+    ))
+}
+
+fn guard_shared_virtual_projection_root_unregister(
+    mounts: &[MountConfig],
+    target: &MountConfig,
+    projection: ProjectionMode,
+    code: &'static str,
+    label: &'static str,
+) -> Result<(), CommandError> {
+    if target.projection != projection {
         return Ok(());
     }
     let target_root = virtual_projection_root(target);
@@ -3909,7 +4012,7 @@ fn guard_linux_fuse_shared_root_unregister(
         .iter()
         .filter(|mount| {
             mount.mount_id != target.mount_id
-                && mount.projection == ProjectionMode::LinuxFuse
+                && mount.projection == projection
                 && virtual_projection_root(mount) == target_root
         })
         .map(|mount| mount.mount_id.0.clone())
@@ -3921,9 +4024,9 @@ fn guard_linux_fuse_shared_root_unregister(
 
     Err(CommandError::new(
         "file-provider",
-        "linux_fuse_shared_root_in_use",
+        code,
         format!(
-            "Linux FUSE root `{}` is shared by sibling mount ids {}; unregistering `{}` would stop their provider too",
+            "{label} root `{}` is shared by sibling mount ids {}; unregistering `{}` would stop their provider too",
             target_root.display(),
             sibling_ids.join(", "),
             target.mount_id.0
@@ -5407,11 +5510,13 @@ mod tests {
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, VirtualProjectionRegistration,
         absolute_command_path, auto_registration_for_mounted_projection, diff_report_exit_code,
         google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
-        legacy_args_for_command, notion_authorize_url, notion_oauth_broker_config,
-        projection_mode_for_target, projection_usage_options_for_target,
-        prompt_for_push_confirmation, pull_direct_fallback_error,
-        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
+        guard_unresolved_windows_cloud_files_unregister,
+        guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
+        notion_authorize_url, notion_oauth_broker_config, projection_mode_for_target,
+        projection_usage_options_for_target, prompt_for_push_confirmation,
+        pull_direct_fallback_error, should_prompt_for_push_confirmation,
+        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
+        validate_virtual_projection_registration,
     };
 
     #[test]
@@ -6148,6 +6253,56 @@ mod tests {
 
         guard_linux_fuse_shared_root_unregister(&mounts, &target)
             .expect("non-siblings should not block unregister");
+    }
+
+    #[test]
+    fn windows_cloud_files_unregister_guard_blocks_shared_root_siblings() {
+        let target = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let sibling = MountConfig::new(
+            MountId::new("docs-main"),
+            "google-docs",
+            "/tmp/Locality/docs",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let mounts = vec![target.clone(), sibling];
+
+        let error = guard_windows_cloud_files_shared_root_unregister(&mounts, &target)
+            .expect_err("shared root sibling should block unregister");
+
+        assert_eq!(error.code, "windows_cloud_files_shared_root_in_use");
+        assert!(error.message.contains("/tmp/Locality"));
+        assert!(error.message.contains("docs-main"));
+    }
+
+    #[test]
+    fn unresolved_windows_cloud_files_unregister_is_blocked_when_shared_mounts_exist() {
+        let mounts = vec![
+            MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                "/tmp/Locality/notion",
+            )
+            .projection(ProjectionMode::WindowsCloudFiles),
+            MountConfig::new(
+                MountId::new("docs-main"),
+                "google-docs",
+                "/tmp/Locality/docs",
+            )
+            .projection(ProjectionMode::WindowsCloudFiles),
+        ];
+
+        let error = guard_unresolved_windows_cloud_files_unregister(&mounts, "notoin-main")
+            .expect_err("unresolved raw target should not unregister shared roots");
+
+        assert_eq!(error.code, "windows_cloud_files_unresolved_shared_root");
+        assert!(error.message.contains("notoin-main"));
+        assert!(error.message.contains("notion-main"));
+        assert!(error.message.contains("docs-main"));
     }
 
     #[test]

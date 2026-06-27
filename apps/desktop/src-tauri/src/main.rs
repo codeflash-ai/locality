@@ -5142,7 +5142,13 @@ fn ensure_windows_cloud_files_providers_for_state(state_root: &Path) -> Result<(
 
     ensure_daemon_running(state_root)?;
     reload_daemon_mounts(state_root)?;
-    for mount in &cloud_mounts {
+    let mut mounts_by_root = BTreeMap::new();
+    for mount in cloud_mounts {
+        mounts_by_root
+            .entry(localityd::virtual_fs::virtual_projection_root(&mount))
+            .or_insert(mount);
+    }
+    for mount in mounts_by_root.values() {
         ensure_windows_cloud_files_provider_running(state_root, mount)?;
     }
     Ok(())

@@ -38,6 +38,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(target_os = "windows")]
 const HIDDEN_WINDOWS_PROCESS_FLAGS: u32 =
     CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW;
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_CLOUD_FILES_SYNC_ROOT_ID_PREFIX: &str = "codeflash.ai.loc!default!";
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_CLOUD_FILES_SHARED_SYNC_ROOT_COMPONENT: &str = "locality";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileProviderHelperReport {
@@ -190,7 +194,8 @@ enum WindowsCloudFilesProviderState {
 #[cfg(target_os = "windows")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct WindowsCloudFilesProcessMetadata {
-    mount_id: String,
+    #[serde(alias = "mount_id")]
+    root_id: String,
     pid: u32,
     helper: PathBuf,
     sync_root: PathBuf,
@@ -205,6 +210,7 @@ struct WindowsCloudFilesLifecycleReport {
     message: String,
     state: WindowsCloudFilesProviderState,
     mount_id: String,
+    root_id: String,
     sync_root: String,
     state_dir: String,
     helper: String,
@@ -443,12 +449,12 @@ fn start_windows_cloud_files_lifecycle(
     }
 
     let helper = windows_cloud_files_helper_path().ok_or(WindowsCloudFilesHelperError::Missing)?;
-    let existing = read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)?;
+    let root_id = windows_cloud_files_lifecycle_root_id(mount);
+    let existing = read_windows_cloud_files_lifecycle_metadata_for_mount(state_root, mount)?;
     if let Some(metadata) = existing
         && windows_process_is_running(metadata.pid, &metadata.helper)
     {
-        let registered =
-            windows_cloud_files_registration_marker_exists(state_root, &mount.mount_id.0);
+        let registered = windows_cloud_files_registration_marker_exists(state_root, mount);
         if !registered {
             register_windows_cloud_files_sync_root(state_root, mount, display_name)?;
         }
@@ -471,8 +477,8 @@ fn start_windows_cloud_files_lifecycle(
     let log_dir = windows_cloud_files_log_dir(state_root);
     std::fs::create_dir_all(&log_dir)
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
-    let stdout_log = windows_cloud_files_stdout_log_path(state_root, &mount.mount_id.0);
-    let stderr_log = windows_cloud_files_stderr_log_path(state_root, &mount.mount_id.0);
+    let stdout_log = windows_cloud_files_stdout_log_path(state_root, &root_id);
+    let stderr_log = windows_cloud_files_stderr_log_path(state_root, &root_id);
     let stdout = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -495,10 +501,10 @@ fn start_windows_cloud_files_lifecycle(
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
     let pid = child.id();
     let metadata = WindowsCloudFilesProcessMetadata {
-        mount_id: mount.mount_id.0.clone(),
+        root_id: root_id.clone(),
         pid,
         helper: helper.clone(),
-        sync_root: mount.root.clone(),
+        sync_root: windows_cloud_files_projection_root(mount),
         state_dir: state_root.to_path_buf(),
         stdout_log,
         stderr_log,
@@ -519,7 +525,7 @@ fn start_windows_cloud_files_lifecycle(
             WindowsCloudFilesProviderState::Running,
         )),
         Ok(Some(status)) => {
-            let _ = remove_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0);
+            let _ = remove_windows_cloud_files_lifecycle_metadata(state_root, &root_id);
             Err(WindowsCloudFilesHelperError::Failed(format!(
                 "locality-cloud-files exited immediately with {status}; see {}",
                 metadata.stderr_log.display()
@@ -534,14 +540,29 @@ fn stop_windows_cloud_files_lifecycle(
     state_root: &Path,
     mount: &MountConfig,
 ) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    let root_id = windows_cloud_files_lifecycle_root_id(mount);
     let helper = windows_cloud_files_helper_path().unwrap_or_else(|| {
-        read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)
+        read_windows_cloud_files_lifecycle_metadata(state_root, &root_id)
             .ok()
             .flatten()
+            .filter(|metadata| {
+                windows_cloud_files_lifecycle_metadata_matches_mount(&metadata.sync_root, mount)
+            })
+            .or_else(|| {
+                read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)
+                    .ok()
+                    .flatten()
+                    .filter(|metadata| {
+                        windows_cloud_files_lifecycle_metadata_matches_mount(
+                            &metadata.sync_root,
+                            mount,
+                        )
+                    })
+            })
             .map(|metadata| metadata.helper)
             .unwrap_or_else(|| PathBuf::from("locality-cloud-files"))
     });
-    let metadata = read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)?;
+    let metadata = read_windows_cloud_files_lifecycle_metadata_for_mount(state_root, mount)?;
     let mut stopped_pid = None;
     if let Some(metadata) = &metadata
         && windows_process_is_running(metadata.pid, &metadata.helper)
@@ -549,6 +570,7 @@ fn stop_windows_cloud_files_lifecycle(
         stop_windows_process(metadata.pid)?;
         stopped_pid = Some(metadata.pid);
     }
+    let _ = remove_windows_cloud_files_lifecycle_metadata(state_root, &root_id);
     let _ = remove_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0);
     Ok(windows_cloud_files_lifecycle_report(
         WindowsCloudFilesLifecycleAction::Stop,
@@ -556,7 +578,7 @@ fn stop_windows_cloud_files_lifecycle(
         state_root,
         helper,
         daemon_is_running(state_root),
-        windows_cloud_files_registration_status(state_root, &mount.mount_id.0),
+        windows_cloud_files_registration_status(state_root, mount),
         stopped_pid,
         false,
         WindowsCloudFilesProviderState::Stopped,
@@ -568,7 +590,7 @@ fn status_windows_cloud_files_lifecycle(
     state_root: &Path,
     mount: &MountConfig,
 ) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
-    let metadata = read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)?;
+    let metadata = read_windows_cloud_files_lifecycle_metadata_for_mount(state_root, mount)?;
     let helper = windows_cloud_files_helper_path()
         .or_else(|| metadata.as_ref().map(|metadata| metadata.helper.clone()))
         .unwrap_or_else(|| PathBuf::from("locality-cloud-files"));
@@ -589,7 +611,7 @@ fn status_windows_cloud_files_lifecycle(
         state_root,
         helper,
         daemon_is_running(state_root),
-        windows_cloud_files_registration_status(state_root, &mount.mount_id.0),
+        windows_cloud_files_registration_status(state_root, mount),
         pid,
         stale_pid_file,
         state,
@@ -610,11 +632,15 @@ fn windows_cloud_files_lifecycle_report(
 ) -> FileProviderHelperReport {
     let helper_present = helper.exists();
     let message = windows_cloud_files_lifecycle_message(action, &mount.mount_id.0, state, pid);
+    let root_id = windows_cloud_files_lifecycle_root_id(mount);
     let report = WindowsCloudFilesLifecycleReport {
         message,
         state,
         mount_id: mount.mount_id.0.clone(),
-        sync_root: mount.root.display().to_string(),
+        root_id: root_id.clone(),
+        sync_root: windows_cloud_files_projection_root(mount)
+            .display()
+            .to_string(),
         state_dir: state_root.display().to_string(),
         helper: helper.display().to_string(),
         helper_present,
@@ -622,13 +648,13 @@ fn windows_cloud_files_lifecycle_report(
         registered,
         pid,
         stale_pid_file,
-        pid_file: windows_cloud_files_lifecycle_file(state_root, &mount.mount_id.0)
+        pid_file: windows_cloud_files_lifecycle_file(state_root, &root_id)
             .display()
             .to_string(),
-        stdout_log: windows_cloud_files_stdout_log_path(state_root, &mount.mount_id.0)
+        stdout_log: windows_cloud_files_stdout_log_path(state_root, &root_id)
             .display()
             .to_string(),
-        stderr_log: windows_cloud_files_stderr_log_path(state_root, &mount.mount_id.0)
+        stderr_log: windows_cloud_files_stderr_log_path(state_root, &root_id)
             .display()
             .to_string(),
     };
@@ -690,7 +716,7 @@ fn windows_cloud_files_lifecycle_message(
 }
 
 #[cfg(target_os = "windows")]
-fn windows_cloud_files_registration_status(state_root: &Path, mount_id: &str) -> Option<bool> {
+fn windows_cloud_files_registration_status(state_root: &Path, mount: &MountConfig) -> Option<bool> {
     let report = run_windows_cloud_files_helper(
         "list",
         vec!["--state-dir".to_string(), helper_path_arg(state_root)],
@@ -700,18 +726,91 @@ fn windows_cloud_files_registration_status(state_root: &Path, mount_id: &str) ->
         .helper_report
         .get("roots")
         .and_then(Value::as_array)?;
-    Some(roots.iter().any(|root| {
-        root.get("mount_id")
+    Some(windows_cloud_files_roots_contain_registration(roots, mount))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_roots_contain_registration(roots: &[Value], mount: &MountConfig) -> bool {
+    let expected_sync_root_id = windows_cloud_files_shared_sync_root_id(mount);
+    let expected_sync_root_key =
+        windows_cloud_files_path_key(&windows_cloud_files_projection_root(mount));
+    roots.iter().any(|root| {
+        let sync_root_id_matches = root
+            .get("sync_root_id")
+            .or_else(|| root.get("id"))
             .and_then(Value::as_str)
-            .is_some_and(|registered_mount_id| registered_mount_id == mount_id)
-    }))
+            .is_some_and(|sync_root_id| sync_root_id == expected_sync_root_id);
+        let legacy_mount_matches = root
+            .get("mount_id")
+            .and_then(Value::as_str)
+            .is_some_and(|registered_mount_id| registered_mount_id == mount.mount_id.0);
+        let legacy_shared_path_matches = root
+            .get("sync_root_id")
+            .or_else(|| root.get("id"))
+            .and_then(Value::as_str)
+            .is_some_and(|sync_root_id| sync_root_id == "codeflash.ai.loc!default!locality")
+            && root
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| {
+                    windows_cloud_files_path_key(Path::new(path)) == expected_sync_root_key
+                });
+
+        sync_root_id_matches || legacy_mount_matches || legacy_shared_path_matches
+    })
 }
 
 #[cfg(target_os = "windows")]
-fn windows_cloud_files_registration_marker_exists(state_root: &Path, mount_id: &str) -> bool {
-    locality_platform::windows_cloud_files_registration_marker_dir(state_root, mount_id)
-        .join("registration.json")
-        .exists()
+fn windows_cloud_files_registration_marker_exists(state_root: &Path, mount: &MountConfig) -> bool {
+    let expected_sync_root_id = windows_cloud_files_shared_sync_root_id(mount);
+    let expected_sync_root_key =
+        windows_cloud_files_path_key(&windows_cloud_files_projection_root(mount));
+    windows_cloud_files_marker_matches(
+        state_root,
+        &expected_sync_root_id,
+        &expected_sync_root_id,
+        &expected_sync_root_key,
+    ) || windows_cloud_files_marker_matches(
+        state_root,
+        &mount.mount_id.0,
+        &expected_sync_root_id,
+        &expected_sync_root_key,
+    ) || windows_cloud_files_marker_matches(
+        state_root,
+        WINDOWS_CLOUD_FILES_SHARED_SYNC_ROOT_COMPONENT,
+        &expected_sync_root_id,
+        &expected_sync_root_key,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_marker_matches(
+    state_root: &Path,
+    marker_key: &str,
+    expected_sync_root_id: &str,
+    expected_sync_root_key: &str,
+) -> bool {
+    let marker_path =
+        locality_platform::windows_cloud_files_registration_marker_dir(state_root, marker_key)
+            .join("registration.json");
+    let Ok(json) = std::fs::read_to_string(marker_path) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_str::<Value>(&json) else {
+        return false;
+    };
+    marker
+        .get("sync_root_id")
+        .or_else(|| marker.get("id"))
+        .and_then(Value::as_str)
+        .is_some_and(|sync_root_id| sync_root_id == expected_sync_root_id)
+        || marker
+            .get("path")
+            .or_else(|| marker.get("sync_root"))
+            .and_then(Value::as_str)
+            .is_some_and(|path| {
+                windows_cloud_files_path_key(Path::new(path)) == expected_sync_root_key
+            })
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -768,6 +867,31 @@ fn windows_cloud_files_lifecycle_fragment(value: &str) -> String {
     format!("{sanitized}-{:016x}", stable_lifecycle_hash(value))
 }
 
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_lifecycle_root_id(mount: &MountConfig) -> String {
+    let root = windows_cloud_files_projection_root(mount);
+    let root = root.display().to_string();
+    format!("root-{}", windows_cloud_files_lifecycle_fragment(&root))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_lifecycle_metadata_matches_mount(
+    metadata_sync_root: &Path,
+    mount: &MountConfig,
+) -> bool {
+    windows_cloud_files_path_key(metadata_sync_root)
+        == windows_cloud_files_path_key(&windows_cloud_files_projection_root(mount))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_path_key(path: &Path) -> String {
+    let mut value = path.display().to_string().replace('/', "\\");
+    while value.ends_with('\\') && value.len() > 3 {
+        value.pop();
+    }
+    value.to_ascii_lowercase()
+}
+
 #[cfg(any(test, target_os = "windows"))]
 fn stable_lifecycle_hash(value: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
@@ -776,6 +900,29 @@ fn stable_lifecycle_hash(value: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_cloud_files_lifecycle_metadata_for_mount(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<Option<WindowsCloudFilesProcessMetadata>, WindowsCloudFilesHelperError> {
+    let root_id = windows_cloud_files_lifecycle_root_id(mount);
+    let shared =
+        read_windows_cloud_files_lifecycle_metadata(state_root, &root_id)?.filter(|metadata| {
+            windows_cloud_files_lifecycle_metadata_matches_mount(&metadata.sync_root, mount)
+        });
+    if shared.is_some() {
+        return Ok(shared);
+    }
+
+    Ok(
+        read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)?.filter(
+            |metadata| {
+                windows_cloud_files_lifecycle_metadata_matches_mount(&metadata.sync_root, mount)
+            },
+        ),
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -804,7 +951,7 @@ fn write_windows_cloud_files_lifecycle_metadata(
     let json = serde_json::to_string_pretty(metadata)
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
     std::fs::write(
-        windows_cloud_files_lifecycle_file(state_root, &metadata.mount_id),
+        windows_cloud_files_lifecycle_file(state_root, &metadata.root_id),
         json,
     )
     .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))
@@ -907,15 +1054,13 @@ fn configure_hidden_windows_command(command: &mut Command) {
 fn windows_cloud_files_register_args(
     state_root: &Path,
     mount: &MountConfig,
-    display_name: &str,
+    _display_name: &str,
 ) -> Vec<String> {
     vec![
-        "--mount-id".to_string(),
-        mount.mount_id.0.clone(),
         "--display-name".to_string(),
-        display_name.to_string(),
+        "Locality".to_string(),
         "--sync-root".to_string(),
-        helper_path_arg(&mount.root),
+        helper_path_arg(&windows_cloud_files_projection_root(mount)),
         "--state-dir".to_string(),
         helper_path_arg(state_root),
     ]
@@ -924,19 +1069,15 @@ fn windows_cloud_files_register_args(
 #[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_open_args(mount: &MountConfig) -> Vec<String> {
     vec![
-        "--mount-id".to_string(),
-        mount.mount_id.0.clone(),
         "--sync-root".to_string(),
-        helper_path_arg(&mount.root),
+        helper_path_arg(&windows_cloud_files_projection_root(mount)),
     ]
 }
 
 fn windows_cloud_files_run_args(state_root: &Path, mount: &MountConfig) -> Vec<String> {
     vec![
-        "--mount-id".to_string(),
-        mount.mount_id.0.clone(),
         "--sync-root".to_string(),
-        helper_path_arg(&mount.root),
+        helper_path_arg(&windows_cloud_files_projection_root(mount)),
         "--state-dir".to_string(),
         helper_path_arg(state_root),
     ]
@@ -956,6 +1097,40 @@ fn windows_cloud_files_unregister_args(state_root: &Path, mount_id: &str) -> Vec
         "--state-dir".to_string(),
         helper_path_arg(state_root),
     ]
+}
+
+fn windows_cloud_files_projection_root(mount: &MountConfig) -> PathBuf {
+    let root = localityd::virtual_fs::virtual_projection_root(mount);
+    if !root.as_os_str().is_empty() {
+        return root;
+    }
+
+    windows_style_parent(&mount.root).unwrap_or(root)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_shared_sync_root_id(mount: &MountConfig) -> String {
+    windows_cloud_files_shared_sync_root_id_for_projection_root(
+        &windows_cloud_files_projection_root(mount),
+    )
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_shared_sync_root_id_for_projection_root(sync_root: &Path) -> String {
+    format!(
+        "{WINDOWS_CLOUD_FILES_SYNC_ROOT_ID_PREFIX}{WINDOWS_CLOUD_FILES_SHARED_SYNC_ROOT_COMPONENT}-{:016x}",
+        stable_lifecycle_hash(&windows_cloud_files_path_key(sync_root))
+    )
+}
+
+fn windows_style_parent(path: &Path) -> Option<PathBuf> {
+    let value = path.to_str()?;
+    let (parent, _) = value.rsplit_once(['\\', '/'])?;
+    if parent.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(parent))
+    }
 }
 
 fn helper_path_arg(path: &Path) -> String {
@@ -1542,7 +1717,7 @@ mod tests {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            r"C:\Users\Ada\Locality",
+            r"C:\Users\Ada\Locality\notion-main",
         )
         .projection(ProjectionMode::WindowsCloudFiles);
 
@@ -1553,10 +1728,8 @@ mod tests {
                 "Notion"
             ),
             vec![
-                "--mount-id",
-                "notion-main",
                 "--display-name",
-                "Notion",
+                "Locality",
                 "--sync-root",
                 r"C:\Users\Ada\Locality",
                 "--state-dir",
@@ -1571,7 +1744,7 @@ mod tests {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            r"C:\Users\Ada\Locality",
+            r"C:\Users\Ada\Locality\notion-main",
         )
         .projection(ProjectionMode::WindowsCloudFiles);
         let current_dir = std::env::current_dir().expect("current dir");
@@ -1584,10 +1757,8 @@ mod tests {
                 "Notion"
             ),
             vec![
-                "--mount-id",
-                "notion-main",
                 "--display-name",
-                "Notion",
+                "Locality",
                 "--sync-root",
                 r"C:\Users\Ada\Locality",
                 "--state-dir",
@@ -1601,18 +1772,13 @@ mod tests {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            r"C:\Users\Ada\Locality",
+            r"C:\Users\Ada\Locality\notion-main",
         )
         .projection(ProjectionMode::WindowsCloudFiles);
 
         assert_eq!(
             super::windows_cloud_files_open_args(&mount),
-            vec![
-                "--mount-id",
-                "notion-main",
-                "--sync-root",
-                r"C:\Users\Ada\Locality"
-            ]
+            vec!["--sync-root", r"C:\Users\Ada\Locality"]
         );
         assert_eq!(
             super::windows_cloud_files_run_args(
@@ -1620,8 +1786,6 @@ mod tests {
                 &mount,
             ),
             vec![
-                "--mount-id",
-                "notion-main",
                 "--sync-root",
                 r"C:\Users\Ada\Locality",
                 "--state-dir",
@@ -1635,8 +1799,6 @@ mod tests {
             ),
             vec![
                 "run",
-                "--mount-id",
-                "notion-main",
                 "--sync-root",
                 r"C:\Users\Ada\Locality",
                 "--state-dir",
@@ -1654,6 +1816,86 @@ mod tests {
                 "--state-dir",
                 r"C:\Users\Ada\AppData\Local\Locality",
             ]
+        );
+    }
+
+    #[test]
+    fn windows_cloud_files_run_args_use_shared_projection_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            r"C:\Users\Ada\Locality\notion-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+
+        let args = super::windows_cloud_files_run_command_args(
+            std::path::Path::new(r"C:\Users\Ada\.loc"),
+            &mount,
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair[0] == "--sync-root" && pair[1] == r"C:\Users\Ada\Locality" })
+        );
+        assert!(!args.windows(2).any(|pair| pair[0] == "--mount-id"));
+    }
+
+    #[test]
+    fn windows_cloud_files_registration_status_accepts_shared_root_id_field() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            r"C:\Users\Ada\Locality\notion-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let roots = serde_json::json!([
+            {
+                "id": super::windows_cloud_files_shared_sync_root_id(&mount),
+                "mount_id": null,
+                "display_name": "Locality",
+                "path": r"C:\Users\Ada\Locality"
+            }
+        ]);
+
+        assert!(super::windows_cloud_files_roots_contain_registration(
+            roots.as_array().expect("roots array"),
+            &mount
+        ));
+    }
+
+    #[test]
+    fn windows_cloud_files_registration_status_rejects_other_shared_root_id() {
+        let mount_a = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            r"C:\Users\Ada\Locality\notion-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let mount_b = MountConfig::new(
+            MountId::new("linear-main"),
+            "linear",
+            r"D:\Teams\Grace\Locality\linear-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let roots = serde_json::json!([
+            {
+                "id": super::windows_cloud_files_shared_sync_root_id(&mount_b),
+                "mount_id": null,
+                "display_name": "Locality",
+                "path": r"D:\Teams\Grace\Locality"
+            }
+        ]);
+        let roots = roots.as_array().expect("roots array");
+
+        assert!(!super::windows_cloud_files_roots_contain_registration(
+            roots, &mount_a
+        ));
+        assert!(super::windows_cloud_files_roots_contain_registration(
+            roots, &mount_b
+        ));
+        assert_ne!(
+            super::windows_cloud_files_shared_sync_root_id(&mount_a),
+            super::windows_cloud_files_shared_sync_root_id(&mount_b)
         );
     }
 
@@ -1682,6 +1924,27 @@ mod tests {
                 .join("logs")
                 .join(format!("locality-cloud-files.{fragment}.err.log"))
         );
+    }
+
+    #[test]
+    fn windows_cloud_files_lifecycle_metadata_rejects_old_mount_point_sync_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            r"C:\Users\Ada\Locality\notion-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+
+        assert!(
+            !super::windows_cloud_files_lifecycle_metadata_matches_mount(
+                std::path::Path::new(r"C:\Users\Ada\Locality\notion-main"),
+                &mount
+            )
+        );
+        assert!(super::windows_cloud_files_lifecycle_metadata_matches_mount(
+            std::path::Path::new(r"C:\Users\Ada\Locality"),
+            &mount
+        ));
     }
 
     #[test]

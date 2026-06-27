@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 locality-core = { path = "../../../crates/locality-core" }
 locality-platform.workspace = true
+locality-store = { path = "../../../crates/locality-store" }
 localityd = { path = "../../../crates/localityd" }
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }

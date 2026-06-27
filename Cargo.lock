@@ -2066,6 +2066,7 @@ dependencies = [
  "ctrlc",
  "locality-core",
  "locality-platform",
+ "locality-store",
  "localityd",
  "notify",
  "serde",
