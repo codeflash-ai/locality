@@ -15,9 +15,9 @@ behavior as `macos_file_provider`.
   jobs through the runtime queue.
 - `locality-fuse` mounts a virtual tree and translates kernel filesystem callbacks
   into daemon IPC.
-- `loc mount ... --projection linux-fuse` creates and starts a per-mount systemd
-  user service for `locality-fuse`; `loc file-provider register <mount>` can repair
-  or restart that registration.
+- `loc mount ... --projection linux-fuse` records a mount-point folder under the
+  shared FUSE root; `loc file-provider register <mount>` can repair or restart
+  the shared-root registration.
 - Hydrated and edited contents for virtual projections live under
   `~/.loc/content/<mount-id>/files/`; the mounted root remains virtual.
 - Plain-directory projection remains the fallback for tests, unsupported systems,
@@ -70,30 +70,31 @@ Create or reuse a Linux FUSE mount:
 
 ```bash
 ./target/debug/loc daemon start --session --localityd-bin "$PWD/target/debug/localityd"
-./target/debug/loc mount notion /path/to/mount --root-page <notion-page-id> --mount-id notion-test --projection linux-fuse
-./target/debug/loc pull /path/to/mount
+./target/debug/loc mount notion "$HOME/Locality/notion-main" --root-page <notion-page-id> --mount-id notion-main --projection linux-fuse
+./target/debug/loc pull "$HOME/Locality/notion-main"
 ```
 
 Verify the mount and directory listing:
 
 ```bash
-systemctl --user status ai.codeflash.locality.fuse.notion-test.service --no-pager
-findmnt -R /path/to/mount
-ls -la /path/to/mount
+./target/debug/loc file-provider status "$HOME/Locality/notion-main"
+findmnt -R "$HOME/Locality"
+ls -la "$HOME/Locality"
+ls -la "$HOME/Locality/notion-main"
 ```
 
 Read a projected Markdown file to force hydration:
 
 ```bash
-head -n 40 "/path/to/mount/<projected-page>/page.md"
-./target/debug/loc status /path/to/mount --json
+head -n 40 "$HOME/Locality/notion-main/<projected-page>/page.md"
+./target/debug/loc status "$HOME/Locality/notion-main" --json
 ```
 
 Exercise local writes without pushing to Notion by saving the current content,
 appending a smoke-test line, then writing the original bytes back:
 
 ```bash
-file="/path/to/mount/<projected-page>/page.md"
+file="$HOME/Locality/notion-main/<projected-page>/page.md"
 backup="$(mktemp)"
 cat "$file" > "$backup"
 printf '\nFUSE smoke edit %s\n' "$(date -Is)" >> "$file"
@@ -108,7 +109,7 @@ creating a draft inside a page child directory or database directory, renaming
 it, and removing it before pushing:
 
 ```bash
-parent="/path/to/mount/<page-or-database-directory>"
+parent="$HOME/Locality/notion-main/<page-or-database-directory>"
 draft="$parent/locality-fuse-smoke.md"
 renamed="$parent/locality-fuse-smoke-renamed.md"
 printf '# FUSE smoke\n' > "$draft"
@@ -127,12 +128,12 @@ LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_KEEP_TMP=1 tests/linux_fuse_smoke.sh
 ```
 
 If `ls` reports `Function not implemented`, rebuild the helper and restart the
-per-mount service so the running process has the latest FUSE operation support:
+shared-root registration so the running process has the latest FUSE operation
+support:
 
 ```bash
 cargo build -p loc-cli -p locality-fuse
-./target/debug/loc file-provider register /path/to/mount
-systemctl --user restart ai.codeflash.locality.fuse.notion-test.service
+./target/debug/loc file-provider register "$HOME/Locality/notion-main"
 ```
 
 ## Why Not Watchers

@@ -267,7 +267,7 @@ selection.
 
 Responsibilities:
 
-- Mount one `linux_fuse` root.
+- Mount one shared `linux_fuse` root containing mount-point folders.
 - Serve `lookup`, `getattr`, and `readdir` from daemon metadata.
 - Serve `open/read` through `materialize`.
 - Stage `write/flush` bytes and call `commit_write`.
@@ -276,7 +276,7 @@ Responsibilities:
 Packaging:
 
 - systemd user service remains the product-grade lifecycle manager.
-- `loc file-provider register` repairs/restarts the per-mount unit.
+- `loc file-provider register` repairs/restarts the shared-root unit.
 
 ### Windows: Cloud Files
 
@@ -294,7 +294,7 @@ Responsibilities:
 - On local modification/close, call daemon `commit_write` and mark the local
   item dirty in daemon state.
 - Map local create/rename/delete notifications to daemon virtual mutations.
-- Start and supervise the per-mount provider runtime from the desktop app.
+- Start and supervise the shared-root provider runtime from the desktop app.
 - Surface sync/provider status in a Windows-native way where possible.
 
 Implementation note: Cloud Files native callbacks cover close, rename, delete,
@@ -308,7 +308,7 @@ helper. The CLI exposes `loc file-provider start|stop|status|restart` as the
 shared lifecycle surface for the provider runtime; the desktop app should call
 the same platform layer when a mount is activated/opened or when the app
 launches with existing Cloud Files mounts, and can build restart supervision on
-top of the same per-mount PID/log metadata.
+top of the same provider PID/log metadata.
 
 Open design questions:
 

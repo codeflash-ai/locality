@@ -10,7 +10,6 @@ use locality_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
     ProjectionMode, RemoteObservationRecord, RemoteObservationRepository, SqliteStateStore,
 };
-use localityd::virtual_fs::virtual_projection_mount_point;
 
 #[test]
 fn search_ranks_title_path_and_remote_id_matches() {
@@ -282,13 +281,53 @@ fn search_reports_linux_fuse_absolute_path_under_mount_point_root() {
 
     let report = run_search(&store, SearchOptions::new("initial")).expect("search");
 
-    let expected = virtual_projection_mount_point(&mount)
+    let expected = mount
+        .root
         .join("Product")
         .join("Initial Idea")
         .join("page.md")
         .display()
         .to_string();
     assert_eq!(report.results[0].absolute_path, expected);
+}
+
+#[test]
+fn search_absolute_path_uses_mount_point_root() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    store
+        .save_mount(
+            MountConfig::new(mount_id.clone(), "notion", "/tmp/Locality/notion-main")
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord {
+            mount_id: mount_id.clone(),
+            remote_id: RemoteId::new("page-1"),
+            kind: EntityKind::Page,
+            title: "Roadmap".to_string(),
+            path: PathBuf::from("Roadmap/page.md"),
+            hydration: HydrationState::Hydrated,
+            content_hash: None,
+            remote_edited_at: None,
+        })
+        .expect("save entity");
+
+    let report = run_search(
+        &store,
+        SearchOptions {
+            query: "Roadmap".to_string(),
+            connector: None,
+            limit: 10,
+        },
+    )
+    .expect("search");
+
+    assert_eq!(
+        report.results[0].absolute_path,
+        "/tmp/Locality/notion-main/Roadmap/page.md"
+    );
 }
 
 struct SearchFixture {

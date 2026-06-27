@@ -83,10 +83,13 @@ Default mount base:
 ~/Library/CloudStorage/Locality
 ```
 
-Suggested concrete folder:
+Suggested concrete folders:
 
 ```text
-~/Library/CloudStorage/Locality/notion-main
+~/Library/CloudStorage/Locality/
+  notion-main/
+  notion-my-company/
+  google-docs-main/
 ```
 
 On macOS, the real Locality root is assigned by File Provider and must be read from

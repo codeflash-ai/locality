@@ -17,12 +17,12 @@ use locality_core::planner::PushOperation;
 use locality_core::shadow::rendered_bodies_equivalent;
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
+    JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
 };
 use localityd::file_provider as daemon_file_provider;
-use localityd::virtual_fs::{virtual_fs_content_path, virtual_projection_mount_point};
+use localityd::virtual_fs::virtual_fs_content_path;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -600,16 +600,6 @@ where
 }
 
 fn projected_absolute_path(mount: &MountConfig, relative_path: &Path) -> PathBuf {
-    if matches!(
-        mount.projection,
-        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
-    ) {
-        return locality_platform::join_logical_path(
-            &virtual_projection_mount_point(mount),
-            relative_path,
-        );
-    }
-
     locality_platform::join_logical_path(&mount.root, relative_path)
 }
 
