@@ -131,6 +131,14 @@ fn sqlite_store_seeds_state_compatibility_components() {
                 1,
                 0,
             ),
+            (
+                "projection:windows_cloud_files".to_string(),
+                "projection_layout".to_string(),
+                2,
+                1,
+                1,
+                0,
+            ),
         ]
     );
 
@@ -749,6 +757,165 @@ fn sqlite_store_linux_fuse_layout_migration_uses_frozen_connector_directory_name
             ),
         ]
     );
+}
+
+#[test]
+fn sqlite_store_migrates_windows_cloud_files_projection_layout_v1_mount_roots() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &old_shared_root)
+                .projection(ProjectionMode::WindowsCloudFiles),
+        )
+        .expect("save windows cloud files mount");
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1
+             WHERE component_id = 'projection:windows_cloud_files'",
+            [],
+        )
+        .expect("downgrade windows cloud files component");
+    drop(connection);
+    drop(store);
+
+    let reopened = fixture.open();
+    let mounts = reopened.load_mounts().expect("load mounts");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].root, old_shared_root.join("notion"));
+
+    let connection = Connection::open(&reopened.db_path).expect("raw connection");
+    let version: i64 = connection
+        .query_row(
+            "SELECT version
+             FROM state_components
+             WHERE component_id = 'projection:windows_cloud_files'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("windows cloud files component version");
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn sqlite_store_does_not_rewrite_v2_windows_cloud_files_mount_point_roots() {
+    let fixture = SqliteFixture::new();
+    let mount_point_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality")
+        .join("notion-main");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &mount_point_root)
+                .projection(ProjectionMode::WindowsCloudFiles),
+        )
+        .expect("save windows cloud files mount");
+    drop(store);
+
+    let reopened = fixture.open();
+    let mounts = reopened.load_mounts().expect("load mounts");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].root, mount_point_root);
+}
+
+#[test]
+fn sqlite_store_missing_windows_cloud_files_component_does_not_rewrite_mount_point_roots() {
+    let fixture = SqliteFixture::new();
+    let mount_point_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality")
+        .join("notion-main");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &mount_point_root)
+                .projection(ProjectionMode::WindowsCloudFiles),
+        )
+        .expect("save windows cloud files mount");
+    let db_path = store.db_path.clone();
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute(
+            "DELETE FROM state_components
+             WHERE component_id = 'projection:windows_cloud_files'",
+            [],
+        )
+        .expect("delete windows cloud files component");
+    drop(connection);
+    drop(store);
+
+    let reopened = fixture.open();
+    let mounts = reopened.load_mounts().expect("load mounts");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].root, mount_point_root);
+
+    let connection = Connection::open(&reopened.db_path).expect("raw connection");
+    let version: i64 = connection
+        .query_row(
+            "SELECT version
+             FROM state_components
+             WHERE component_id = 'projection:windows_cloud_files'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("windows cloud files component version");
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn sqlite_store_newer_windows_cloud_files_reader_requirement_does_not_rewrite_mount_root() {
+    let fixture = SqliteFixture::new();
+    let old_shared_root = fixture
+        .state_root
+        .parent()
+        .expect("fixture root")
+        .join("Locality");
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &old_shared_root)
+                .projection(ProjectionMode::WindowsCloudFiles),
+        )
+        .expect("save windows cloud files mount");
+    let db_path = store.db_path.clone();
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1, min_reader_version = 999
+             WHERE component_id = 'projection:windows_cloud_files'",
+            [],
+        )
+        .expect("bump windows cloud files minimum reader");
+    drop(connection);
+    drop(store);
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+
+    let connection = Connection::open(db_path).expect("raw connection");
+    let root: String = connection
+        .query_row(
+            "SELECT root
+             FROM mounts
+             WHERE mount_id = ?1",
+            params![fixture.mount_id.0],
+            |row| row.get(0),
+        )
+        .expect("mount root");
+    assert_eq!(PathBuf::from(root), old_shared_root);
 }
 
 #[test]

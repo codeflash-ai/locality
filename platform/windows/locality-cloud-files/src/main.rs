@@ -6,7 +6,6 @@ use locality_platform::{
     cloud_files_mount_id_component, decode_cloud_files_mount_id_component,
     windows_cloud_files_registration_marker_dir,
 };
-#[cfg(target_os = "windows")]
 use locality_store::MountConfig;
 use locality_store::{MountRepository, ProjectionMode, SqliteStateStore};
 use serde::{Deserialize, Serialize};
@@ -1452,6 +1451,19 @@ impl ProviderContext {
                 format!("mount `{}` is not a Windows Cloud Files mount", mount_id.0),
             ));
         }
+        if self.legacy_mount_id.is_none()
+            && !shared_provider_mount_matches_projection_root(&mount, &self.projection_root)
+        {
+            return Err(HelperError::new(
+                "mount_outside_sync_root",
+                format!(
+                    "mount `{}` belongs to Windows Cloud Files sync root `{}`, not provider sync root `{}`",
+                    mount_id.0,
+                    localityd::virtual_fs::virtual_projection_root(&mount).display(),
+                    self.projection_root.display()
+                ),
+            ));
+        }
         Ok(mount)
     }
 
@@ -1876,9 +1888,9 @@ fn local_path_disappeared(error: &HelperError) -> bool {
         || error.message.contains("cannot find the file")
 }
 
-#[cfg(target_os = "windows")]
 fn stale_pending_file_delete(identifier: &str, error: &HelperError) -> bool {
-    identifier.starts_with("local:") && error.message.contains("was not found in mount")
+    daemon_identifier_for_identity_check(identifier).starts_with("local:")
+        && error.message.contains("was not found in mount")
 }
 
 #[cfg(target_os = "windows")]
@@ -1913,9 +1925,15 @@ fn identity_for_path(
     daemon_identity_for_path(context, &path)
 }
 
-#[cfg(target_os = "windows")]
 fn is_local_identity(identifier: &str) -> bool {
+    let identifier = daemon_identifier_for_identity_check(identifier);
     identifier.starts_with("local:") || identifier.starts_with("children:local:")
+}
+
+fn daemon_identifier_for_identity_check(identifier: &str) -> std::borrow::Cow<'_, str> {
+    localityd::virtual_projection::unwrap_identifier(identifier)
+        .map(|unwrapped| std::borrow::Cow::Owned(unwrapped.daemon_identifier))
+        .unwrap_or_else(|_| std::borrow::Cow::Borrowed(identifier))
 }
 
 #[cfg(target_os = "windows")]
@@ -2559,9 +2577,8 @@ unsafe fn handle_delete(
     }
 }
 
-#[cfg(target_os = "windows")]
 fn stale_pending_page_directory_delete(identifier: &str, error: &HelperError) -> bool {
-    identifier.starts_with("children:local:")
+    daemon_identifier_for_identity_check(identifier).starts_with("children:local:")
         && error.message.contains("not present in daemon state")
 }
 
@@ -3297,12 +3314,20 @@ fn path_is_under_sync_root(context: &ProviderContext, path: &Path) -> bool {
     path == root || path.starts_with(&(root + r"\"))
 }
 
-#[cfg(target_os = "windows")]
 fn same_cloud_path(left: &Path, right: &Path) -> bool {
     normalized_cloud_path_string(left) == normalized_cloud_path_string(right)
 }
 
-#[cfg(target_os = "windows")]
+fn shared_provider_mount_matches_projection_root(
+    mount: &MountConfig,
+    projection_root: &Path,
+) -> bool {
+    same_cloud_path(
+        &localityd::virtual_fs::virtual_projection_root(mount),
+        projection_root,
+    )
+}
+
 fn normalized_cloud_path_string(path: &Path) -> String {
     let path = platform_display_path(path.to_path_buf());
     path.to_string_lossy()
@@ -3684,6 +3709,102 @@ mod tests {
             projection_root_identifier("notion-main"),
             "mount:notion-main"
         );
+    }
+
+    #[test]
+    fn shared_provider_mount_scope_uses_projection_root_path_key() {
+        let mount = locality_store::MountConfig::new(
+            locality_core::model::MountId::new("notion-main"),
+            "notion",
+            Path::new("/Users/Ada/Locality/notion"),
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+
+        assert!(shared_provider_mount_matches_projection_root(
+            &mount,
+            Path::new("/users/ada/locality/")
+        ));
+        assert!(!shared_provider_mount_matches_projection_root(
+            &mount,
+            Path::new("/users/ada/other-locality")
+        ));
+    }
+
+    #[test]
+    fn wrapped_local_identities_are_recognized_for_refresh_and_stale_deletes() {
+        let local = localityd::virtual_projection::wrap_identifier(
+            &locality_core::model::MountId::new("notion-main"),
+            "local:123",
+        );
+        let child_local = localityd::virtual_projection::wrap_identifier(
+            &locality_core::model::MountId::new("notion-main"),
+            "children:local:123",
+        );
+        let missing_file = HelperError::new(
+            "daemon_error",
+            "invalid_state: virtual filesystem item `local:123` was not found in mount",
+        );
+        let missing_directory = HelperError::new(
+            "daemon_error",
+            "invalid_state: invalid state: virtual filesystem item `children:local:123` is not present in daemon state",
+        );
+
+        assert!(is_local_identity(&local));
+        assert!(is_local_identity(&child_local));
+        assert!(stale_pending_file_delete(&local, &missing_file));
+        assert!(stale_pending_page_directory_delete(
+            &child_local,
+            &missing_directory
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn shared_provider_rejects_wrapped_identifier_for_mount_under_other_projection_root() {
+        use locality_store::MountRepository;
+
+        let state_dir = unique_test_state_dir("shared-provider-cross-root");
+        let mut store = SqliteStateStore::open(state_dir.clone()).expect("open store");
+        store
+            .save_mount(
+                locality_store::MountConfig::new(
+                    locality_core::model::MountId::new("notion-main"),
+                    "notion",
+                    Path::new(r"C:\Users\Ada\Locality\notion"),
+                )
+                .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save first mount");
+        store
+            .save_mount(
+                locality_store::MountConfig::new(
+                    locality_core::model::MountId::new("notion-other"),
+                    "notion",
+                    Path::new(r"D:\Teams\Grace\Locality\notion"),
+                )
+                .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save second mount");
+        drop(store);
+        let context = ProviderContext {
+            legacy_mount_id: None,
+            sync_root: PathBuf::from(r"C:\Users\Ada\Locality"),
+            projection_root: PathBuf::from(r"C:\Users\Ada\Locality"),
+            state_dir: state_dir.clone(),
+            identity_index: Default::default(),
+            local_file_index: Default::default(),
+        };
+        let identifier = localityd::virtual_projection::wrap_identifier(
+            &locality_core::model::MountId::new("notion-other"),
+            "page-1",
+        );
+
+        let error = context
+            .resolve_identifier(&identifier)
+            .expect_err("cross-root identifier rejected");
+
+        assert_eq!(error.code, "mount_outside_sync_root");
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[cfg(target_os = "windows")]
