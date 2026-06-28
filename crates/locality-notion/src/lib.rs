@@ -36,6 +36,7 @@ use crate::fetch::fetch_page_bundle;
 use crate::media::{MediaDownloadReport, download_media_assets};
 use crate::projection::{
     enumerate_root_page_tree, enumerate_shared_pages, list_container_children, observe_entity,
+    resolve_page_path_entries,
 };
 use crate::render::{
     NotionRenderedEntity, RenderOptions, render_native_entity, render_native_entity_with_options,
@@ -162,6 +163,19 @@ impl NotionConnector {
 
     pub fn database_schema_yaml(&self, database_id: &RemoteId) -> LocalityResult<String> {
         database::database_schema_yaml(self.api.as_ref(), database_id.as_str())
+    }
+
+    pub fn resolve_page_path_entries(
+        &self,
+        mount_id: locality_core::model::MountId,
+        page_id: &RemoteId,
+    ) -> LocalityResult<Vec<TreeEntry>> {
+        resolve_page_path_entries(
+            self.api.as_ref(),
+            mount_id,
+            self.config.root_page_id.as_ref(),
+            page_id,
+        )
     }
 }
 

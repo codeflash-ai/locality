@@ -42,10 +42,13 @@ use loc_cli::search::{
 };
 use loc_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
 use locality_core::canonical::parse_canonical_markdown;
-use locality_core::conflict::has_unresolved_conflict_markers;
+use locality_core::conflict::{
+    has_unresolved_conflict_markers, render_inline_conflict_markdown_with_base,
+};
+use locality_core::freshness::RemoteVersion;
 use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::journal::{JournalEntry, JournalStatus};
-use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 #[cfg(test)]
 use locality_notion::NotionConfig;
 #[cfg(test)]
@@ -64,8 +67,9 @@ use locality_platform::{
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-    ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, HydrationJobRecord,
-    HydrationJobRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
+    FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, JournalRepository,
+    MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository, open_credential_store,
 };
@@ -73,17 +77,18 @@ use localityd::autosave::auto_save_timestamp;
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use localityd::hydration::{HydrationExecutor, HydrationOutcome, HydrationSource};
 use localityd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
+use localityd::media::{document_with_absolute_media_hrefs, update_hydrated_media_manifest};
 use localityd::push::execute_auto_save_push_job_with_content_root;
 use localityd::source::{
-    resolve_source_for_mount_id, resolve_source_for_path, source_display_name,
+    ResolvedSource, resolve_source_for_mount_id, resolve_source_for_path, source_display_name,
 };
 #[cfg(target_os = "macos")]
 use localityd::virtual_fs::materialize_virtual_fs_item_with_content_root;
 #[cfg(target_os = "macos")]
 use localityd::virtual_fs::mount_point_directory_name;
 use localityd::virtual_fs::{
-    commit_virtual_fs_write, mount_point_identifier, virtual_fs_content_base,
-    virtual_fs_content_path, virtual_fs_content_root,
+    VirtualFsChildrenReport, commit_virtual_fs_write, mount_point_identifier,
+    virtual_fs_content_base, virtual_fs_content_path, virtual_fs_content_root,
 };
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -120,6 +125,9 @@ const WINDOWS_DESKTOP_SINGLE_INSTANCE_MUTEX: &str =
 const WINDOWS_DESKTOP_ACTIVATION_EVENT: &str = r"Local\CodeFlash.Locality.Desktop.Activate";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250);
+const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -207,12 +215,13 @@ struct PendingChange {
     local_path: String,
     summary: String,
     state: String,
-    auto_save: AutoSaveFileStatus,
+    issue_codes: Vec<String>,
+    live_mode: LiveModeFileStatus,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AutoSaveFileStatus {
+struct LiveModeFileStatus {
     enabled: bool,
     state: String,
     label: String,
@@ -343,7 +352,7 @@ struct DesktopSettingChange {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AutoSaveFileChange {
+struct LiveModeFileChange {
     path: String,
     enabled: bool,
 }
@@ -992,6 +1001,7 @@ fn live_mode_tick_blocking() -> ActionReport {
                 }
             },
             live_mode_pull_remote_target_if_changed,
+            live_mode_merge_remote_drift_target,
         ),
         Err(message) => ActionReport {
             ok: false,
@@ -1000,15 +1010,17 @@ fn live_mode_tick_blocking() -> ActionReport {
     }
 }
 
-fn live_mode_tick_from_snapshot<Sync, Pull>(
+fn live_mode_tick_from_snapshot<Sync, Pull, Merge>(
     snapshot: &DesktopSnapshot,
     remote_pull_target: Option<&LiveModeRemoteTarget>,
     mut sync_target: Sync,
     mut pull_remote_target: Pull,
+    mut merge_remote_drift: Merge,
 ) -> ActionReport
 where
     Sync: FnMut(&PendingChange, &Path) -> Result<(), String>,
     Pull: FnMut(&LiveModeRemoteTarget) -> Result<bool, String>,
+    Merge: FnMut(&PendingChange, &Path) -> Result<bool, String>,
 {
     if !live_mode_has_mounted_folder(snapshot) {
         return ActionReport {
@@ -1041,7 +1053,29 @@ where
             message: "Live Mode checked for changes.".to_string(),
         };
     };
+    let target = expand_tilde(&join_mount_path(
+        &snapshot.mount.local_path,
+        &change.local_path,
+    ))
+    .unwrap_or_else(|_| PathBuf::from(&change.local_path));
+
     if change.state != "safe" {
+        if live_mode_change_may_merge_remote_drift(change) {
+            match merge_remote_drift(change, &target) {
+                Ok(true) => {
+                    if let Err(message) = sync_target(change, &target) {
+                        return ActionReport { ok: false, message };
+                    }
+                    return ActionReport {
+                        ok: true,
+                        message: "Live Mode merged remote updates and synced 1 pending change."
+                            .to_string(),
+                    };
+                }
+                Ok(false) => {}
+                Err(message) => return ActionReport { ok: false, message },
+            }
+        }
         return ActionReport {
             ok: false,
             message: format!(
@@ -1051,11 +1085,6 @@ where
         };
     }
 
-    let target = expand_tilde(&join_mount_path(
-        &snapshot.mount.local_path,
-        &change.local_path,
-    ))
-    .unwrap_or_else(|_| PathBuf::from(&change.local_path));
     if let Err(message) = sync_target(change, &target) {
         return ActionReport { ok: false, message };
     }
@@ -1064,6 +1093,20 @@ where
         ok: true,
         message: "Live Mode synced 1 pending change.".to_string(),
     }
+}
+
+fn live_mode_change_may_merge_remote_drift(change: &PendingChange) -> bool {
+    if change.state != "needs_review" {
+        return false;
+    }
+    change
+        .issue_codes
+        .iter()
+        .any(|code| code == "remote_changed_with_local_pending")
+        || change
+            .summary
+            .to_ascii_lowercase()
+            .contains("remote changed while local edits are pending")
 }
 
 fn live_mode_has_mounted_folder(snapshot: &DesktopSnapshot) -> bool {
@@ -1276,6 +1319,206 @@ fn live_mode_pull_remote_target_if_changed(target: &LiveModeRemoteTarget) -> Res
     Ok(true)
 }
 
+fn live_mode_merge_remote_drift_target(
+    _change: &PendingChange,
+    target: &Path,
+) -> Result<bool, String> {
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
+    reconcile_desktop_projection_changes(&mut store, &state_root, Some(target))?;
+    let target = absolute_path(target)?;
+    let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
+    let Some(mut entity) = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(|error| format!("Live Mode could not inspect local metadata: {error}"))?
+    else {
+        return Ok(false);
+    };
+    if entity.kind != EntityKind::Page {
+        return Ok(false);
+    }
+    let previous_shadow = match store.load_shadow(&mount.mount_id, &entity.remote_id) {
+        Ok(shadow) => shadow,
+        Err(locality_store::StoreError::ShadowMissing { .. }) => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "Live Mode could not inspect the current page shadow: {error}"
+            ));
+        }
+    };
+
+    let credentials = open_credential_store(&state_root);
+    let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &mount.mount_id)
+        .map_err(|error| error.message())?;
+    let rendered = connector
+        .fetch_render(&HydrationRequest::new(
+            mount.mount_id.clone(),
+            entity.remote_id.clone(),
+            entity.path.clone(),
+            HydrationState::Hydrated,
+            HydrationReason::RemoteFastForward,
+        ))
+        .map_err(|error| format!("Live Mode could not inspect Notion changes: {error}"))?;
+    if rendered.shadow == previous_shadow {
+        return Ok(false);
+    }
+
+    let output_root = live_mode_projection_output_root(&state_root, &mount);
+    for asset in &rendered.assets {
+        let path = safe_join_relative(&output_root, &asset.path)?;
+        write_file_atomic(&path, &asset.bytes).map_err(|error| {
+            format!(
+                "Live Mode could not write media asset `{}`: {error}",
+                path.display()
+            )
+        })?;
+    }
+    update_hydrated_media_manifest(&output_root, &rendered.assets)
+        .map_err(|error| format!("Live Mode could not update media metadata: {error}"))?;
+
+    let read_path = live_mode_projection_read_path(&state_root, &mount, &relative_path, &target)?;
+    let local_contents = fs::read_to_string(&read_path).map_err(|error| {
+        format!(
+            "Live Mode could not read `{}`: {error}",
+            read_path.display()
+        )
+    })?;
+    let remote_document =
+        document_with_absolute_media_hrefs(&rendered.document, &entity.path, &output_root);
+    let Some(merged) = live_mode_merge_remote_drift_markdown(
+        &local_contents,
+        previous_shadow.rendered_body.as_str(),
+        &remote_document,
+    ) else {
+        return Ok(false);
+    };
+
+    write_file_atomic(&read_path, merged.as_bytes()).map_err(|error| {
+        format!(
+            "Live Mode could not write `{}`: {error}",
+            read_path.display()
+        )
+    })?;
+    if read_path != target && target.exists() {
+        write_file_atomic(&target, merged.as_bytes()).map_err(|error| {
+            format!(
+                "Live Mode could not refresh visible file `{}`: {error}",
+                target.display()
+            )
+        })?;
+    }
+
+    store
+        .save_shadow(&mount.mount_id, rendered.shadow.clone())
+        .map_err(|error| format!("Live Mode could not update local shadow: {error}"))?;
+    if entity.hydration.can_transition_to(&HydrationState::Dirty) {
+        entity.hydration = HydrationState::Dirty;
+    }
+    entity.content_hash = Some(rendered.shadow.body_hash.clone());
+    if rendered.remote_edited_at.is_some() {
+        entity.remote_edited_at = rendered.remote_edited_at.clone();
+    }
+    store
+        .save_entity(entity.clone())
+        .map_err(|error| format!("Live Mode could not update local metadata: {error}"))?;
+    save_live_mode_remote_observation(&mut store, &mount, &entity, rendered.remote_edited_at)?;
+    clear_live_mode_remote_hint(&mut store, &mount.mount_id, &entity.remote_id)?;
+
+    Ok(true)
+}
+
+fn live_mode_merge_remote_drift_markdown(
+    local_contents: &str,
+    base_body: &str,
+    remote_document: &locality_core::model::CanonicalDocument,
+) -> Option<String> {
+    let merged =
+        render_inline_conflict_markdown_with_base(local_contents, Some(base_body), remote_document);
+    if has_unresolved_conflict_markers(&merged) {
+        return None;
+    }
+    Some(merged)
+}
+
+fn live_mode_projection_output_root(state_root: &Path, mount: &MountConfig) -> PathBuf {
+    if mount.projection.uses_virtual_filesystem() {
+        virtual_fs_content_root(state_root, &mount.mount_id)
+    } else {
+        mount.root.clone()
+    }
+}
+
+fn live_mode_projection_read_path(
+    state_root: &Path,
+    mount: &MountConfig,
+    relative_path: &Path,
+    target: &Path,
+) -> Result<PathBuf, String> {
+    if mount.projection.uses_virtual_filesystem() {
+        virtual_fs_content_path(state_root, &mount.mount_id, relative_path)
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(target.to_path_buf())
+    }
+}
+
+fn safe_join_relative(root: &Path, relative_path: &Path) -> Result<PathBuf, String> {
+    if relative_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(format!(
+            "Live Mode received an unsafe media path `{}`.",
+            relative_path.display()
+        ));
+    }
+    Ok(root.join(relative_path))
+}
+
+fn save_live_mode_remote_observation(
+    store: &mut SqliteStateStore,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    remote_edited_at: Option<String>,
+) -> Result<(), String> {
+    let mut observation = RemoteObservationRecord::new(
+        mount.mount_id.clone(),
+        entity.remote_id.clone(),
+        entity.kind.clone(),
+        entity.title.clone(),
+        entity.path.clone(),
+        activity_timestamp(),
+    );
+    if let Some(remote_edited_at) = remote_edited_at {
+        observation = observation.with_remote_version(RemoteVersion::new(remote_edited_at));
+    }
+    store
+        .save_remote_observation(observation)
+        .map_err(|error| format!("Live Mode could not update remote metadata: {error}"))
+}
+
+fn clear_live_mode_remote_hint(
+    store: &mut SqliteStateStore,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+) -> Result<(), String> {
+    let Some(mut freshness) = store
+        .get_freshness_state(mount_id, remote_id)
+        .map_err(|error| format!("Live Mode could not update freshness metadata: {error}"))?
+    else {
+        return Ok(());
+    };
+    freshness.remote_hint_pending = false;
+    store
+        .save_freshness_state(freshness)
+        .map_err(|error| format!("Live Mode could not update freshness metadata: {error}"))
+}
+
 fn live_mode_load_shadow(
     store: &SqliteStateStore,
     target: &LiveModeRemoteTarget,
@@ -1452,8 +1695,13 @@ async fn set_desktop_setting(app: AppHandle, change: DesktopSettingChange) -> Ac
 }
 
 #[tauri::command]
-fn set_auto_save_for_file(change: AutoSaveFileChange) -> ActionReport {
-    set_auto_save_for_file_blocking(change).unwrap_or_else(action_error)
+fn set_live_mode_for_file(change: LiveModeFileChange) -> ActionReport {
+    set_live_mode_for_file_blocking(change).unwrap_or_else(action_error)
+}
+
+#[tauri::command]
+fn set_auto_save_for_file(change: LiveModeFileChange) -> ActionReport {
+    set_live_mode_for_file(change)
 }
 
 #[tauri::command]
@@ -1855,34 +2103,39 @@ where
                 (
                     MountId::new(mount.mount_id.clone()),
                     entry,
-                    auto_save_status_for_entry(store, &MountId::new(mount.mount_id.clone()), entry),
+                    live_mode_status_for_entry(store, &MountId::new(mount.mount_id.clone()), entry),
                 )
             })
         })
         .filter(|(_, entry, _)| status_entry_needs_desktop_attention(entry))
-        .map(|(_, entry, auto_save)| PendingChange {
+        .map(|(_, entry, live_mode)| PendingChange {
             title: entry.title.clone(),
             local_path: entry.path.clone(),
             summary: status_summary_for_entry(entry),
             state: pending_state_for_entry(entry).to_string(),
-            auto_save,
+            issue_codes: entry
+                .issues
+                .iter()
+                .map(|issue| issue.code.clone())
+                .collect(),
+            live_mode,
         })
         .collect()
 }
 
-fn auto_save_status_for_entry(
+fn live_mode_status_for_entry(
     store: &impl AutoSaveRepository,
     mount_id: &MountId,
     entry: &loc_cli::status::StatusEntry,
-) -> AutoSaveFileStatus {
-    auto_save_status_for_path(store, mount_id, Path::new(&entry.path))
+) -> LiveModeFileStatus {
+    live_mode_status_for_path(store, mount_id, Path::new(&entry.path))
 }
 
-fn auto_save_status_for_path(
+fn live_mode_status_for_path(
     store: &impl AutoSaveRepository,
     mount_id: &MountId,
     path: &Path,
-) -> AutoSaveFileStatus {
+) -> LiveModeFileStatus {
     let enrollment = store
         .get_auto_save_enrollment(mount_id, path)
         .ok()
@@ -1890,30 +2143,28 @@ fn auto_save_status_for_path(
     match enrollment {
         Some(enrollment) if enrollment.enabled => {
             let (state, label) = match enrollment.state {
-                AutoSaveState::Active => ("active", "Auto-save on"),
-                AutoSaveState::Blocked => ("blocked", "Auto-save blocked"),
-                AutoSaveState::PausedRemoteChanged => {
-                    ("paused_remote_changed", "Paused: remote changed")
-                }
-                AutoSaveState::PausedFailure => ("paused_failure", "Paused: failed"),
+                AutoSaveState::Active => ("active", "Live Mode on"),
+                AutoSaveState::Blocked => ("blocked", "Live Mode blocked"),
+                AutoSaveState::PausedRemoteChanged => ("paused_remote_changed", "Live Mode paused"),
+                AutoSaveState::PausedFailure => ("paused_failure", "Live Mode paused"),
             };
-            AutoSaveFileStatus {
+            LiveModeFileStatus {
                 enabled: true,
                 state: state.to_string(),
                 label: label.to_string(),
                 reason: enrollment.last_reason,
             }
         }
-        Some(enrollment) => AutoSaveFileStatus {
+        Some(enrollment) => LiveModeFileStatus {
             enabled: false,
             state: "off".to_string(),
-            label: "Auto-save off".to_string(),
+            label: "Live Mode off".to_string(),
             reason: enrollment.last_reason,
         },
-        None => AutoSaveFileStatus {
+        None => LiveModeFileStatus {
             enabled: false,
             state: "off".to_string(),
-            label: "Auto-save off".to_string(),
+            label: "Live Mode off".to_string(),
             reason: None,
         },
     }
@@ -2020,7 +2271,7 @@ fn failed_push_summary(message: &str) -> String {
         return notion_access_lost_recovery_message();
     }
     if is_remote_changed_push_message(message) || message.contains("changed since last sync") {
-        return "Notion changed since last sync. Resolve pulls the latest version and may create conflict markers.".to_string();
+        return "Notion changed since last sync. Pull latest may create conflict markers if the remote and local edits overlap.".to_string();
     }
     if message.contains("unsupported feature") {
         return format!("Previous push hit an unsupported Notion feature: {message}");
@@ -2383,6 +2634,10 @@ fn blend_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4],
 }
 
 fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
+    if notion_id_from_url(query).is_some() {
+        prepare_exact_notion_url_path(query)?;
+    }
+
     let results = search_notion_results(query, 1)?;
     let result = results.into_iter().next().ok_or_else(|| {
         if notion_id_from_url(query).is_some() {
@@ -2394,6 +2649,122 @@ fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
     })?;
     prioritize_located_notion_result(&result);
     Ok(located_item_for_search_result(result))
+}
+
+fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
+    let Some(notion_id) = notion_id_from_url(query) else {
+        return Ok(());
+    };
+    let remote_id = RemoteId::new(notion_id.clone());
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load Locality mounts: {error}"))?
+        .into_iter()
+        .filter(|mount| mount.connector == "notion")
+        .collect::<Vec<_>>();
+    if mounts.is_empty() {
+        return Err("Create a Notion folder before locating pages.".to_string());
+    }
+
+    let credentials = open_credential_store(&state_root);
+    let mut last_error = None;
+    for mount in mounts {
+        let source =
+            match resolve_source_for_mount_id(&store, credentials.as_ref(), &mount.mount_id) {
+                Ok(source) => source,
+                Err(error) => {
+                    last_error = Some(error.message());
+                    continue;
+                }
+            };
+        let ResolvedSource::Notion(connector) = source else {
+            continue;
+        };
+        match connector.resolve_page_path_entries(mount.mount_id.clone(), &remote_id) {
+            Ok(entries) if entries.iter().any(|entry| entry.remote_id == remote_id) => {
+                save_exact_notion_entries(&mut store, entries)?;
+                return Ok(());
+            }
+            Ok(_) => {
+                last_error = Some(format!(
+                    "Notion page `{}` was not returned while resolving its parent hierarchy.",
+                    remote_id.0
+                ));
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(notion_access_miss_message))
+}
+
+fn save_exact_notion_entries(
+    store: &mut SqliteStateStore,
+    entries: Vec<TreeEntry>,
+) -> Result<(), String> {
+    let observed_at = activity_timestamp();
+    for entry in entries {
+        let existing = store
+            .get_entity(&entry.mount_id, &entry.remote_id)
+            .map_err(|error| format!("Could not inspect local Notion metadata: {error}"))?;
+        let record = exact_located_entity_record(&entry, existing.as_ref())?;
+        store
+            .save_entity(record)
+            .map_err(|error| format!("Could not update local Notion metadata: {error}"))?;
+
+        let mut observation = RemoteObservationRecord::new(
+            entry.mount_id.clone(),
+            entry.remote_id.clone(),
+            entry.kind.clone(),
+            entry.title.clone(),
+            entry.path.clone(),
+            observed_at.clone(),
+        );
+        if let Some(remote_version) = entry.remote_edited_at.clone() {
+            observation = observation.with_remote_version(RemoteVersion::new(remote_version));
+        }
+        store
+            .save_remote_observation(observation)
+            .map_err(|error| format!("Could not update local Notion metadata: {error}"))?;
+    }
+
+    Ok(())
+}
+
+fn exact_located_entity_record(
+    entry: &TreeEntry,
+    existing: Option<&EntityRecord>,
+) -> Result<EntityRecord, String> {
+    let mut record = EntityRecord::from(entry.clone());
+    if let Some(existing) = existing {
+        if existing.path != entry.path
+            && matches!(
+                existing.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        {
+            return Err(format!(
+                "Notion page `{}` moved from `{}` to `{}`, but the old local file has pending changes. Review or push the old file before opening the new path.",
+                existing.title,
+                display_path(&existing.path),
+                display_path(&entry.path)
+            ));
+        }
+        record.hydration = existing.hydration.clone();
+        record.content_hash = existing.content_hash.clone();
+        if matches!(
+            existing.hydration,
+            HydrationState::Hydrated | HydrationState::Dirty | HydrationState::Conflicted
+        ) {
+            record.remote_edited_at = existing.remote_edited_at.clone();
+        }
+    }
+    Ok(record)
 }
 
 fn notion_access_miss_message() -> String {
@@ -2763,7 +3134,7 @@ fn current_desktop_build_id() -> String {
 }
 
 fn current_daemon_build_id() -> String {
-    DaemonBuildInfo::current().build_id
+    expected_daemon_build_info().build_id
 }
 
 fn install_marker_path(state_root: &Path) -> PathBuf {
@@ -4071,7 +4442,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
         .ok_or_else(|| "Created mount was not found in Locality state.".to_string())?;
 
     if mount.projection.uses_virtual_filesystem() {
-        activate_virtual_projection_mount(&state_root, &mount, false)?;
+        activate_virtual_projection_mount(&state_root, &mount, true)?;
     }
 
     Ok(format!(
@@ -4174,7 +4545,7 @@ fn desktop_projection_mode() -> ProjectionMode {
 }
 
 fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
-    let current_build = DaemonBuildInfo::current();
+    let current_build = expected_daemon_build_info();
     match running_daemon_build(state_root) {
         Some(build) if build == current_build => return Ok(()),
         Some(build) => {
@@ -4186,7 +4557,7 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
                     build.build_id, current_build.build_id
                 ),
             );
-            return restart_daemon_for_current_binary(state_root);
+            return restart_daemon_for_current_binary(state_root, &current_build);
         }
         None if daemon_is_ready(state_root) => {
             desktop_log(
@@ -4194,7 +4565,7 @@ fn ensure_daemon_running(state_root: &Path) -> Result<(), String> {
                 "daemon.missing_build_metadata",
                 "detected an older localityd without build metadata; restarting localityd",
             );
-            return restart_daemon_for_current_binary(state_root);
+            return restart_daemon_for_current_binary(state_root, &current_build);
         }
         None => {}
     }
@@ -4212,18 +4583,62 @@ fn start_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
     }
 }
 
-fn restart_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
+fn restart_daemon_for_current_binary(
+    state_root: &Path,
+    expected_build: &DaemonBuildInfo,
+) -> Result<(), String> {
     let _ = run_daemon_control(&daemon_control_args_any_manager("stop", state_root));
     start_daemon_for_current_binary(state_root)?;
     match running_daemon_build(state_root) {
-        Some(build) if build == DaemonBuildInfo::current() => Ok(()),
+        Some(build) if &build == expected_build => Ok(()),
         Some(build) => Err(format!(
             "localityd restarted, but reported build {} instead of {}.",
-            build.build_id,
-            DaemonBuildInfo::current().build_id
+            build.build_id, expected_build.build_id
         )),
         None => Err("localityd restarted, but did not report build metadata.".to_string()),
     }
+}
+
+fn expected_daemon_build_info() -> DaemonBuildInfo {
+    let Some(binary) = bundled_localityd_binary() else {
+        return DaemonBuildInfo::current();
+    };
+    match daemon_build_info_from_binary(&binary) {
+        Ok(build) => build,
+        Err(message) => {
+            desktop_log(
+                "warn",
+                "daemon.bundled_build_probe_failed",
+                format!(
+                    "could not read bundled localityd build metadata from {}: {}; falling back to linked daemon build metadata",
+                    binary.display(),
+                    message
+                ),
+            );
+            DaemonBuildInfo::current()
+        }
+    }
+}
+
+fn daemon_build_info_from_binary(binary: &Path) -> Result<DaemonBuildInfo, String> {
+    let mut command = Command::new(binary);
+    command.arg("--build-info");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command.output().map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("process exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    parse_daemon_build_info_json(&output.stdout)
+}
+
+fn parse_daemon_build_info_json(output: &[u8]) -> Result<DaemonBuildInfo, String> {
+    serde_json::from_slice(output).map_err(|error| error.to_string())
 }
 
 fn daemon_control_args(action: &str, state_root: &Path) -> Vec<String> {
@@ -4918,7 +5333,8 @@ fn reload_daemon_mounts(state_root: &Path) -> Result<(), String> {
                     error.message
                 ),
             );
-            restart_daemon_for_current_binary(state_root)?;
+            let current_build = expected_daemon_build_info();
+            restart_daemon_for_current_binary(state_root, &current_build)?;
             reload_daemon_mounts_once(state_root).map_err(|retry_error| {
                 format!(
                     "Could not reload localityd mounts after restarting localityd for the current state schema: {}",
@@ -4973,13 +5389,32 @@ fn activate_virtual_projection_mount(
     mount: &MountConfig,
     wait_for_entities: bool,
 ) -> Result<(), String> {
+    desktop_log(
+        "info",
+        "file_provider.activate_started",
+        format!(
+            "activating virtual projection for mount `{}` using {:?}; wait_for_entities={wait_for_entities}",
+            mount.mount_id.0, mount.projection
+        ),
+    );
+    if wait_for_entities && mount.projection == ProjectionMode::MacosFileProvider {
+        wait_for_virtual_projection_mount_point_children(state_root, mount)?;
+    }
     register_virtual_projection(state_root, mount)?;
     prefetch_virtual_projection_root(state_root, mount)?;
-    if wait_for_entities {
+    if wait_for_entities && mount.projection != ProjectionMode::MacosFileProvider {
         wait_for_mount_entities(state_root, &mount.mount_id)?;
     }
     ensure_virtual_projection_runtime(state_root, mount)?;
     signal_virtual_projection_refresh(mount);
+    desktop_log(
+        "info",
+        "file_provider.activate_finished",
+        format!(
+            "activated virtual projection for mount `{}` using {:?}",
+            mount.mount_id.0, mount.projection
+        ),
+    );
     Ok(())
 }
 
@@ -5002,6 +5437,32 @@ fn prefetch_virtual_projection_container(
     mount_id: &str,
     container_identifier: &str,
 ) -> Result<(), String> {
+    let report =
+        load_virtual_projection_children_report(state_root, mount_id, container_identifier)?;
+    let summary = summarize_virtual_projection_children(&report);
+    desktop_log(
+        "debug",
+        "file_provider.prefetch_children",
+        format!(
+            "prefetched `{mount_id}:{container_identifier}` with {} child{} ({} content; preview: {})",
+            summary.total_children,
+            if summary.total_children == 1 {
+                ""
+            } else {
+                "ren"
+            },
+            summary.content_children,
+            summary.preview()
+        ),
+    );
+    Ok(())
+}
+
+fn load_virtual_projection_children_report(
+    state_root: &Path,
+    mount_id: &str,
+    container_identifier: &str,
+) -> Result<VirtualFsChildrenReport, String> {
     match send_request(
         state_root,
         &DaemonRequest::FileProviderChildren {
@@ -5009,7 +5470,18 @@ fn prefetch_virtual_projection_container(
             container_identifier: container_identifier.to_string(),
         },
     ) {
-        Ok(response) if response.ok => Ok(()),
+        Ok(response) if response.ok => {
+            let payload = response.payload.ok_or_else(|| {
+                format!(
+                    "Could not load `{mount_id}:{container_identifier}`: daemon returned no payload."
+                )
+            })?;
+            serde_json::from_value::<VirtualFsChildrenReport>(payload).map_err(|error| {
+                format!(
+                    "Could not decode `{mount_id}:{container_identifier}` children from localityd: {error}"
+                )
+            })
+        }
         Ok(response) => Err(response
             .error
             .map(|error| {
@@ -5023,6 +5495,182 @@ fn prefetch_virtual_projection_container(
             "Could not ask localityd to load the top-level Notion folder: {}",
             error.message()
         )),
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct VirtualProjectionChildrenSummary {
+    total_children: usize,
+    content_children: usize,
+    content_names: Vec<String>,
+}
+
+impl VirtualProjectionChildrenSummary {
+    fn preview(&self) -> String {
+        if self.content_names.is_empty() {
+            return "none".to_string();
+        }
+
+        let visible = self
+            .content_names
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>();
+        let remaining = self.content_names.len().saturating_sub(visible.len());
+        if remaining == 0 {
+            visible.join(", ")
+        } else {
+            format!("{}, +{} more", visible.join(", "), remaining)
+        }
+    }
+}
+
+fn summarize_virtual_projection_children(
+    report: &VirtualFsChildrenReport,
+) -> VirtualProjectionChildrenSummary {
+    let content_names = report
+        .children
+        .iter()
+        .filter(|child| !is_virtual_projection_guidance_child(&child.identifier))
+        .map(|child| child.filename.clone())
+        .collect::<Vec<_>>();
+
+    VirtualProjectionChildrenSummary {
+        total_children: report.children.len(),
+        content_children: content_names.len(),
+        content_names,
+    }
+}
+
+fn is_virtual_projection_guidance_child(identifier: &str) -> bool {
+    identifier.starts_with("guidance:")
+}
+
+fn wait_for_virtual_projection_mount_point_children(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    let mount_id = mount.mount_id.0.as_str();
+    let mount_point_container_identifier = mount_point_identifier(mount);
+    let started = Instant::now();
+    let deadline = started + VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT;
+    let mut attempts = 0_u32;
+    let mut next_progress_log = started + VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY;
+    let mut last_summary = VirtualProjectionChildrenSummary::default();
+    let mut last_error: Option<String>;
+
+    desktop_log(
+        "info",
+        "file_provider.source_ready.wait_started",
+        format!(
+            "waiting up to {}s for `{mount_id}:{mount_point_container_identifier}` to expose mount-point children before registering macOS File Provider",
+            VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT.as_secs()
+        ),
+    );
+
+    loop {
+        attempts = attempts.saturating_add(1);
+        match load_virtual_projection_children_report(
+            state_root,
+            mount_id,
+            &mount_point_container_identifier,
+        ) {
+            Ok(report) => {
+                let summary = summarize_virtual_projection_children(&report);
+                last_error = None;
+                if summary.content_children > 0 {
+                    desktop_log(
+                        "info",
+                        "file_provider.source_ready.ready",
+                        format!(
+                            "`{mount_id}:{mount_point_container_identifier}` exposed {} content child{} after {}ms across {attempts} attempt{} ({} total; preview: {})",
+                            summary.content_children,
+                            if summary.content_children == 1 {
+                                ""
+                            } else {
+                                "ren"
+                            },
+                            started.elapsed().as_millis(),
+                            if attempts == 1 { "" } else { "s" },
+                            summary.total_children,
+                            summary.preview()
+                        ),
+                    );
+                    return Ok(());
+                }
+                last_summary = summary;
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            let diagnostic = last_error
+                .as_ref()
+                .map(|error| format!("last daemon error: {error}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "last daemon response had {} child{} but no content children (preview: {})",
+                        last_summary.total_children,
+                        if last_summary.total_children == 1 {
+                            ""
+                        } else {
+                            "ren"
+                        },
+                        last_summary.preview()
+                    )
+                });
+            desktop_log(
+                "error",
+                "file_provider.source_ready.timeout",
+                format!(
+                    "`{mount_id}:{mount_point_container_identifier}` did not expose mount-point children after {}ms across {attempts} attempt{}; {diagnostic}",
+                    started.elapsed().as_millis(),
+                    if attempts == 1 { "" } else { "s" }
+                ),
+            );
+            return Err(format!(
+                "Notion connected, but Locality could not load any files for the mount point before mounting. Make sure at least one page is selected for Locality access, then try again. {diagnostic}"
+            ));
+        }
+
+        if now >= next_progress_log {
+            let diagnostic = last_error
+                .as_ref()
+                .map(|error| format!("last daemon error: {error}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} total child{} and {} content child{}",
+                        last_summary.total_children,
+                        if last_summary.total_children == 1 {
+                            ""
+                        } else {
+                            "ren"
+                        },
+                        last_summary.content_children,
+                        if last_summary.content_children == 1 {
+                            ""
+                        } else {
+                            "ren"
+                        }
+                    )
+                });
+            desktop_log(
+                "debug",
+                "file_provider.source_ready.waiting",
+                format!(
+                    "still waiting for `{mount_id}:{mount_point_container_identifier}` after {}ms across {attempts} attempt{}; {diagnostic}",
+                    started.elapsed().as_millis(),
+                    if attempts == 1 { "" } else { "s" }
+                ),
+            );
+            next_progress_log = now + VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY;
+        }
+
+        std::thread::sleep(VIRTUAL_PROJECTION_SOURCE_READY_POLL);
     }
 }
 
@@ -6022,7 +6670,7 @@ fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushRepo
     .map_err(|error| error.to_string())
 }
 
-fn set_auto_save_for_file_blocking(change: AutoSaveFileChange) -> Result<ActionReport, String> {
+fn set_live_mode_for_file_blocking(change: LiveModeFileChange) -> Result<ActionReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
@@ -6062,9 +6710,9 @@ fn set_auto_save_for_file_blocking(change: AutoSaveFileChange) -> Result<ActionR
     Ok(ActionReport {
         ok: true,
         message: if change.enabled {
-            "Auto-save is on for this file.".to_string()
+            "Live Mode is on for this file.".to_string()
         } else {
-            "Auto-save is off for this file.".to_string()
+            "Live Mode is off for this file.".to_string()
         },
     })
 }
@@ -6343,7 +6991,7 @@ fn push_action_message(action: &str, ok: bool, message: Option<&str>) -> String 
             notion_access_lost_recovery_message()
         }
         Some(message) if is_remote_changed_push_message(message) => {
-            "Notion has newer changes than your last sync. Click Resolve on this file to pull the latest version, resolve any conflict markers if Locality writes them, then push again.".to_string()
+            "Notion has newer changes than your last sync. Pull latest on this file, resolve any conflict markers if Locality writes them, then push again.".to_string()
         }
         Some(message) if !message.is_empty() => message.to_string(),
         _ if ok => "Pushed changes to Notion.".to_string(),
@@ -6474,7 +7122,9 @@ mod tests {
     use loc_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
     use locality_core::canonical::render_canonical_markdown;
     use locality_core::journal::{JournalEntry, JournalStatus, PushId};
-    use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+    use locality_core::model::{
+        CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
+    };
     use locality_core::planner::PushPlan;
     use locality_core::shadow::ShadowDocument;
     use locality_store::{
@@ -6483,6 +7133,7 @@ mod tests {
         InMemoryStateStore, JournalRepository, MountConfig, MountRepository, ProjectionMode,
         ShadowRepository, SqliteStateStore,
     };
+    use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize};
 
     use super::{
@@ -6490,22 +7141,24 @@ mod tests {
         ScreenBounds, TerminalCliLinkState, TrayVisualState, clear_mount_cached_projection,
         clear_state_root_contents, conflict_preview, connection_metadata_changed,
         current_daemon_build_id, current_desktop_build_id, diff_report_message,
-        failed_push_summary, hydration_after_editor_write, inspect_install_state,
-        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
-        is_notion_access_lost_message, is_unsupported_schema_version_message,
-        live_mode_content_hash_changed, live_mode_e2e_append_local_marker,
-        live_mode_e2e_append_remote_marker, live_mode_e2e_notion_api, live_mode_e2e_page_id,
-        live_mode_e2e_page_path, live_mode_e2e_remote_text, live_mode_e2e_wait_until,
+        exact_located_entity_record, failed_push_summary, has_unresolved_conflict_markers,
+        hydration_after_editor_write, inspect_install_state, install_terminal_cli_link_at,
+        install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
+        is_unsupported_schema_version_message, live_mode_content_hash_changed,
+        live_mode_e2e_append_local_marker, live_mode_e2e_append_remote_marker,
+        live_mode_e2e_notion_api, live_mode_e2e_page_id, live_mode_e2e_page_path,
+        live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_merge_remote_drift_markdown,
         live_mode_remote_pull_candidates, live_mode_should_reconcile_local_target_for_key,
         live_mode_target, live_mode_tick_blocking, live_mode_tick_from_snapshot,
         load_desktop_activity, mount_has_pending_local_changes, mount_has_unfinished_journals,
-        notion_id_from_url, pending_changes_from_status, preserve_mount_pending_local_changes,
-        pull_error_message, pull_report_message, push_action_message,
-        record_current_install_marker, record_desktop_activity, sample_auto_save_status,
-        sample_snapshot, shell_single_quote, should_hide_tray_popover,
+        notion_id_from_url, parse_daemon_build_info_json, pending_changes_from_status,
+        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
+        push_action_message, record_current_install_marker, record_desktop_activity,
+        sample_live_mode_status, sample_snapshot, shell_single_quote, should_hide_tray_popover,
         should_prioritize_located_result, state_event_path_requires_refresh,
-        terminal_cli_link_state, tray_icon_image, tray_popover_position, unique_suffix,
-        validate_mount_root, virtual_projection_prefetch_container_identifiers,
+        summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
+        tray_popover_position, unique_suffix, validate_mount_root,
+        virtual_projection_prefetch_container_identifiers,
         virtual_projection_refresh_signal_identifiers, write_terminal_cli_path_section,
     };
 
@@ -6526,6 +7179,67 @@ mod tests {
         assert!(message.contains("Current mount access: `Product Teamspace`"));
         assert!(message.contains("select this page or the correct teamspace"));
         assert!(message.contains("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972"));
+    }
+
+    #[test]
+    fn exact_located_entity_updates_clean_stub_path() {
+        let existing = EntityRecord::new(
+            MountId::new("notion-main"),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Daily Standup",
+            "engineering-wiki/daily-standup/page.md",
+        )
+        .with_hydration(HydrationState::Stub);
+        let entry = tree_entry(
+            "page-1",
+            "Daily Standup",
+            "engineering-wiki/standups-with-locality/daily-standup/page.md",
+        );
+
+        let record =
+            exact_located_entity_record(&entry, Some(&existing)).expect("clean stub can move");
+
+        assert_eq!(record.path, entry.path);
+        assert_eq!(record.hydration, HydrationState::Stub);
+    }
+
+    #[test]
+    fn exact_located_entity_blocks_dirty_path_move() {
+        let existing = EntityRecord::new(
+            MountId::new("notion-main"),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Daily Standup",
+            "engineering-wiki/daily-standup/page.md",
+        )
+        .with_hydration(HydrationState::Dirty);
+        let entry = tree_entry(
+            "page-1",
+            "Daily Standup",
+            "engineering-wiki/standups-with-locality/daily-standup/page.md",
+        );
+
+        let error = exact_located_entity_record(&entry, Some(&existing))
+            .expect_err("dirty old path must not move silently");
+
+        assert!(error.contains("pending changes"));
+        assert!(error.contains("engineering-wiki/daily-standup/page.md"));
+        assert!(error.contains("engineering-wiki/standups-with-locality/daily-standup/page.md"));
+    }
+
+    #[test]
+    fn daemon_build_info_parser_reads_sidecar_metadata() {
+        let parsed = parse_daemon_build_info_json(br#"{"version":"0.1.3","build_id":"build-123"}"#)
+            .expect("parse build info");
+
+        assert_eq!(
+            parsed,
+            DaemonBuildInfo {
+                version: "0.1.3".to_string(),
+                build_id: "build-123".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -6675,6 +7389,7 @@ mod tests {
                 pull_calls += 1;
                 Ok(false)
             },
+            |_, _| panic!("no pending changes should not merge remote drift"),
         );
 
         assert!(report.ok);
@@ -6702,6 +7417,7 @@ mod tests {
                 pulled.push(target.path.clone());
                 Ok(false)
             },
+            |_, _| panic!("remote-only tick should not merge local drift"),
         );
 
         assert!(report.ok);
@@ -6724,6 +7440,7 @@ mod tests {
             Some(&target),
             |_, _| panic!("remote pull should not sync local changes"),
             |_| Ok(true),
+            |_, _| panic!("remote-only tick should not merge local drift"),
         );
 
         assert!(report.ok);
@@ -6736,6 +7453,30 @@ mod tests {
         assert!(!live_mode_content_hash_changed(Some("same"), Some("same")));
         assert!(live_mode_content_hash_changed(None, Some("hydrated")));
         assert!(!live_mode_content_hash_changed(None, None));
+    }
+
+    #[test]
+    fn live_mode_merge_remote_drift_keeps_non_overlapping_local_and_remote_changes() {
+        let frontmatter = "title: Roadmap\n".to_string();
+        let local = render_canonical_markdown(&CanonicalDocument::new(
+            frontmatter.clone(),
+            "Intro.\n\nLocal middle.\n\nFooter.\n".to_string(),
+        ));
+        let remote = CanonicalDocument::new(
+            frontmatter,
+            "Remote intro.\n\nOld middle.\n\nFooter.\n".to_string(),
+        );
+
+        let merged = live_mode_merge_remote_drift_markdown(
+            &local,
+            "Intro.\n\nOld middle.\n\nFooter.\n",
+            &remote,
+        )
+        .expect("non-overlapping changes merge cleanly");
+
+        assert!(!has_unresolved_conflict_markers(&merged));
+        assert!(merged.contains("Remote intro."));
+        assert!(merged.contains("Local middle."));
     }
 
     #[test]
@@ -6843,7 +7584,8 @@ mod tests {
             local_path: "Engineering/Roadmap/page.md".to_string(),
             summary: "local edits pending review".to_string(),
             state: "safe".to_string(),
-            auto_save: sample_auto_save_status(false),
+            issue_codes: Vec::new(),
+            live_mode: sample_live_mode_status(false),
         }];
         let mut synced = Vec::new();
 
@@ -6855,6 +7597,7 @@ mod tests {
                 Ok(())
             },
             |_| panic!("pending changes should take the live mode tick"),
+            |_, _| panic!("safe pending changes should not merge remote drift"),
         );
 
         assert!(report.ok);
@@ -6865,6 +7608,46 @@ mod tests {
     }
 
     #[test]
+    fn live_mode_tick_merges_remote_drift_before_syncing_obvious_case() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes = vec![PendingChange {
+            title: "Roadmap".to_string(),
+            local_path: "Engineering/Roadmap/page.md".to_string(),
+            summary: "remote changed while local edits are pending".to_string(),
+            state: "needs_review".to_string(),
+            issue_codes: vec!["remote_changed_with_local_pending".to_string()],
+            live_mode: sample_live_mode_status(true),
+        }];
+        let mut merged = Vec::new();
+        let mut synced = Vec::new();
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            Some(&live_mode_target("/tmp/Locality/notion/Other/page.md")),
+            |change, target| {
+                synced.push((change.title.clone(), target.to_path_buf()));
+                Ok(())
+            },
+            |_| panic!("mergeable local+remote drift should not block on remote pull cursor"),
+            |change, target| {
+                merged.push((change.title.clone(), target.to_path_buf()));
+                Ok(true)
+            },
+        );
+
+        assert!(report.ok);
+        assert_eq!(
+            report.message,
+            "Live Mode merged remote updates and synced 1 pending change."
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(synced.len(), 1);
+        assert_eq!(merged[0].0, "Roadmap");
+        assert!(merged[0].1.ends_with("Engineering/Roadmap/page.md"));
+        assert_eq!(synced[0].1, merged[0].1);
+    }
+
+    #[test]
     fn live_mode_tick_pauses_for_review_required_changes() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes = vec![PendingChange {
@@ -6872,7 +7655,8 @@ mod tests {
             local_path: "Marketing/Launch Plan/page.md".to_string(),
             summary: "needs review: large deletion".to_string(),
             state: "needs_review".to_string(),
-            auto_save: sample_auto_save_status(false),
+            issue_codes: vec!["large_deletion".to_string()],
+            live_mode: sample_live_mode_status(false),
         }];
         let mut calls = 0usize;
 
@@ -6884,6 +7668,7 @@ mod tests {
                 Ok(())
             },
             |_| panic!("review-required changes should pause before remote pulls"),
+            |_, _| panic!("large review-required changes should not merge remote drift"),
         );
 
         assert!(!report.ok);
@@ -7328,6 +8113,69 @@ mod tests {
     }
 
     #[test]
+    fn virtual_projection_children_summary_ignores_guidance_files() {
+        let report = localityd::virtual_fs::VirtualFsChildrenReport {
+            mount_id: "notion-main".to_string(),
+            container_identifier: "source:notion".to_string(),
+            children: vec![
+                virtual_projection_test_item("guidance:AGENTS.md", "AGENTS.md", None),
+                virtual_projection_test_item("guidance:CLAUDE.md", "CLAUDE.md", None),
+                virtual_projection_test_item("remote-page-1", "product", Some("remote-page-1")),
+                virtual_projection_test_item("remote-page-2", "engineering", Some("remote-page-2")),
+            ],
+        };
+
+        let summary = summarize_virtual_projection_children(&report);
+
+        assert_eq!(summary.total_children, 4);
+        assert_eq!(summary.content_children, 2);
+        assert_eq!(summary.preview(), "product, engineering");
+    }
+
+    #[test]
+    fn virtual_projection_children_summary_preview_limits_long_lists() {
+        let report = localityd::virtual_fs::VirtualFsChildrenReport {
+            mount_id: "notion-main".to_string(),
+            container_identifier: "source:notion".to_string(),
+            children: (0..8)
+                .map(|index| {
+                    let name = format!("teamspace-{index}");
+                    virtual_projection_test_item(&format!("remote-{index}"), &name, Some("remote"))
+                })
+                .collect(),
+        };
+
+        let summary = summarize_virtual_projection_children(&report);
+
+        assert_eq!(summary.content_children, 8);
+        assert_eq!(
+            summary.preview(),
+            "teamspace-0, teamspace-1, teamspace-2, teamspace-3, teamspace-4, teamspace-5, +2 more"
+        );
+    }
+
+    fn virtual_projection_test_item(
+        identifier: &str,
+        filename: &str,
+        remote_id: Option<&str>,
+    ) -> localityd::virtual_fs::VirtualFsItem {
+        localityd::virtual_fs::VirtualFsItem {
+            identifier: identifier.to_string(),
+            parent_identifier: Some("source:notion".to_string()),
+            filename: filename.to_string(),
+            kind: localityd::virtual_fs::VirtualFsItemKind::Folder,
+            entity_kind: None,
+            remote_id: remote_id.map(str::to_string),
+            path: filename.to_string(),
+            hydration: None,
+            content_type: "public.folder".to_string(),
+            remote_edited_at: None,
+            materialized_path: None,
+            byte_size: None,
+        }
+    }
+
+    #[test]
     fn push_action_message_explains_dangerous_confirmation() {
         assert_eq!(
             push_action_message("confirm_dangerous_plan", false, None),
@@ -7349,8 +8197,8 @@ mod tests {
             ),
         );
 
-        assert!(message.contains("Click Resolve"));
-        assert!(message.contains("pull the latest version"));
+        assert!(message.contains("Pull latest"));
+        assert!(message.contains("resolve any conflict markers"));
     }
 
     #[test]
@@ -7360,7 +8208,7 @@ mod tests {
         );
 
         assert!(message.contains("Notion changed since last sync"));
-        assert!(message.contains("Resolve pulls"));
+        assert!(message.contains("Pull latest"));
     }
 
     #[test]
@@ -7629,11 +8477,11 @@ mod tests {
         let changes = pending_changes_from_status(&store, &status);
 
         assert_eq!(changes.len(), 1);
-        assert!(changes[0].auto_save.enabled);
-        assert_eq!(changes[0].auto_save.state, "blocked");
-        assert_eq!(changes[0].auto_save.label, "Auto-save blocked");
+        assert!(changes[0].live_mode.enabled);
+        assert_eq!(changes[0].live_mode.state, "blocked");
+        assert_eq!(changes[0].live_mode.label, "Live Mode blocked");
         assert_eq!(
-            changes[0].auto_save.reason.as_deref(),
+            changes[0].live_mode.reason.as_deref(),
             Some("deletions require review")
         );
     }
@@ -8308,6 +9156,20 @@ mod tests {
             score: 0,
         }
     }
+
+    fn tree_entry(remote_id: &str, title: &str, path: &str) -> TreeEntry {
+        TreeEntry {
+            mount_id: MountId::new("notion-main"),
+            remote_id: RemoteId::new(remote_id),
+            kind: EntityKind::Page,
+            title: title.to_string(),
+            path: PathBuf::from(path),
+            hydration: HydrationState::Stub,
+            content_hash: None,
+            remote_edited_at: None,
+            stub_frontmatter: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8620,34 +9482,37 @@ fn sample_pending_changes() -> Vec<PendingChange> {
             local_path: "Engineering/Roadmap 2026/page.md".to_string(),
             summary: "2 text edits".to_string(),
             state: "safe".to_string(),
-            auto_save: sample_auto_save_status(false),
+            issue_codes: Vec::new(),
+            live_mode: sample_live_mode_status(false),
         },
         PendingChange {
             title: "Launch Plan".to_string(),
             local_path: "Marketing/Launch Plan/page.md".to_string(),
             summary: "needs review: large deletion".to_string(),
             state: "needs_review".to_string(),
-            auto_save: sample_auto_save_status(false),
+            issue_codes: vec!["large_deletion".to_string()],
+            live_mode: sample_live_mode_status(false),
         },
         PendingChange {
             title: "Customer Notes".to_string(),
             local_path: "Sales/Customer Notes/page.md".to_string(),
             summary: "1 property edit".to_string(),
             state: "safe".to_string(),
-            auto_save: sample_auto_save_status(true),
+            issue_codes: Vec::new(),
+            live_mode: sample_live_mode_status(true),
         },
     ]
 }
 
 #[cfg(test)]
-fn sample_auto_save_status(enabled: bool) -> AutoSaveFileStatus {
-    AutoSaveFileStatus {
+fn sample_live_mode_status(enabled: bool) -> LiveModeFileStatus {
+    LiveModeFileStatus {
         enabled,
         state: if enabled { "active" } else { "off" }.to_string(),
         label: if enabled {
-            "Auto-save on"
+            "Live Mode on"
         } else {
-            "Auto-save off"
+            "Live Mode off"
         }
         .to_string(),
         reason: None,
@@ -8819,6 +9684,7 @@ fn main() {
             inspect_notion_file,
             read_notion_file,
             save_notion_file,
+            set_live_mode_for_file,
             set_auto_save_for_file,
             open_path,
             open_logs_folder,

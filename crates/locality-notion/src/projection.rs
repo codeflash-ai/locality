@@ -143,6 +143,184 @@ pub fn observe_entity(
     }
 }
 
+pub fn resolve_page_path_entries(
+    api: &dyn NotionApi,
+    mount_id: MountId,
+    root_page_id: Option<&RemoteId>,
+    page_id: &RemoteId,
+) -> LocalityResult<Vec<TreeEntry>> {
+    let mut resolver = ExactPathResolver {
+        api,
+        mount_id,
+        root_page_id,
+        resolved: BTreeMap::new(),
+        resolving: BTreeSet::new(),
+        entries: Vec::new(),
+    };
+    resolver.resolve_page(page_id.as_str())?;
+    Ok(resolver.entries)
+}
+
+struct ExactPathResolver<'a> {
+    api: &'a dyn NotionApi,
+    mount_id: MountId,
+    root_page_id: Option<&'a RemoteId>,
+    resolved: BTreeMap<String, TreeEntry>,
+    resolving: BTreeSet<String>,
+    entries: Vec<TreeEntry>,
+}
+
+#[derive(Clone, Debug)]
+enum ParentListing {
+    Root(PathBuf),
+    PageChildren {
+        page_id: RemoteId,
+        parent_path: PathBuf,
+    },
+    DatabaseRows {
+        database_id: RemoteId,
+        parent_path: PathBuf,
+    },
+}
+
+impl ExactPathResolver<'_> {
+    fn resolve_page(&mut self, page_id: &str) -> LocalityResult<TreeEntry> {
+        if let Some(entry) = self.resolved.get(page_id) {
+            return Ok(entry.clone());
+        }
+        if !self.resolving.insert(page_id.to_string()) {
+            return Err(LocalityError::InvalidState(format!(
+                "notion hierarchy for page `{page_id}` contains a parent cycle"
+            )));
+        }
+
+        let page = self.api.retrieve_page(page_id)?;
+        let entry = if self
+            .root_page_id
+            .is_some_and(|root_page_id| root_page_id.as_str() == page_id)
+        {
+            let title = page_title(&page);
+            let mut used_paths = BTreeSet::new();
+            let path = allocate_page_path(Path::new(""), &title, &page.id, &mut used_paths);
+            page_entry(self.mount_id.clone(), &page, title, path)
+        } else {
+            let parent = self.parent_listing(page.parent.as_ref())?;
+            self.find_projected_child(parent, page_id, EntityKind::Page)?
+        };
+
+        self.resolving.remove(page_id);
+        Ok(self.remember(entry))
+    }
+
+    fn resolve_database(&mut self, database_id: &str) -> LocalityResult<TreeEntry> {
+        if let Some(entry) = self.resolved.get(database_id) {
+            return Ok(entry.clone());
+        }
+        if !self.resolving.insert(database_id.to_string()) {
+            return Err(LocalityError::InvalidState(format!(
+                "notion hierarchy for database `{database_id}` contains a parent cycle"
+            )));
+        }
+
+        let database = self.api.retrieve_database(database_id)?;
+        let parent = self.parent_listing(database.parent.as_ref())?;
+        let entry = self.find_projected_child(parent, database_id, EntityKind::Database)?;
+
+        self.resolving.remove(database_id);
+        Ok(self.remember(entry))
+    }
+
+    fn parent_listing(&mut self, parent: Option<&ParentDto>) -> LocalityResult<ParentListing> {
+        let Some(parent) = parent else {
+            return Ok(ParentListing::Root(PathBuf::new()));
+        };
+        if parent.workspace == Some(true) || parent.kind == "workspace" {
+            return Ok(ParentListing::Root(PathBuf::new()));
+        }
+        if let Some(page_id) = parent.page_id.as_deref() {
+            let parent_entry = self.resolve_page(page_id)?;
+            return Ok(ParentListing::PageChildren {
+                page_id: RemoteId::new(page_id.to_string()),
+                parent_path: page_child_dir(&parent_entry.path),
+            });
+        }
+        if let Some(database_id) = parent.database_id.as_deref() {
+            let parent_entry = self.resolve_database(database_id)?;
+            return Ok(ParentListing::DatabaseRows {
+                database_id: RemoteId::new(database_id.to_string()),
+                parent_path: parent_entry.path,
+            });
+        }
+        if let Some(data_source_id) = parent.data_source_id.as_deref() {
+            let data_source = self.api.retrieve_data_source(data_source_id)?;
+            let database_id = data_source
+                .parent
+                .as_ref()
+                .and_then(|parent| parent.database_id.as_deref())
+                .ok_or_else(|| {
+                    LocalityError::InvalidState(format!(
+                        "notion data source `{data_source_id}` did not expose a parent database"
+                    ))
+                })?;
+            let parent_entry = self.resolve_database(database_id)?;
+            return Ok(ParentListing::DatabaseRows {
+                database_id: RemoteId::new(database_id.to_string()),
+                parent_path: parent_entry.path,
+            });
+        }
+
+        Err(LocalityError::InvalidState(format!(
+            "cannot resolve a stable local path for Notion parent `{}`",
+            parent.kind
+        )))
+    }
+
+    fn find_projected_child(
+        &mut self,
+        parent: ParentListing,
+        remote_id: &str,
+        kind: EntityKind,
+    ) -> LocalityResult<TreeEntry> {
+        let entries = match parent {
+            ParentListing::Root(parent_path) => list_root_children(
+                self.api,
+                self.mount_id.clone(),
+                self.root_page_id,
+                &parent_path,
+            )?,
+            ParentListing::PageChildren {
+                page_id,
+                parent_path,
+            } => list_page_children(self.api, &self.mount_id, page_id.as_str(), &parent_path)?,
+            ParentListing::DatabaseRows {
+                database_id,
+                parent_path,
+            } => {
+                let database = self.api.retrieve_database(database_id.as_str())?;
+                list_database_rows(self.api, &self.mount_id, &database, &parent_path)?
+            }
+        };
+
+        entries
+            .into_iter()
+            .find(|entry| entry.remote_id.as_str() == remote_id && entry.kind == kind)
+            .ok_or_else(|| {
+                LocalityError::RemoteNotFound(format!(
+                    "notion object `{remote_id}` was not found in its resolved parent"
+                ))
+            })
+    }
+
+    fn remember(&mut self, entry: TreeEntry) -> TreeEntry {
+        if !self.resolved.contains_key(entry.remote_id.as_str()) {
+            self.entries.push(entry.clone());
+        }
+        self.resolved
+            .insert(entry.remote_id.0.clone(), entry.clone());
+        entry
+    }
+}
+
 fn push_projected_listing_entry(
     mount_id: &MountId,
     projected: ProjectedChildWithPath,
@@ -910,10 +1088,19 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
-    use super::{ProjectedChild, allocate_child_paths, allocate_page_path, slugify_title};
+    use super::{
+        ProjectedChild, allocate_child_paths, allocate_page_path, resolve_page_path_entries,
+        slugify_title,
+    };
+    use locality_core::model::{MountId, RemoteId};
     use locality_core::path_projection::PAGE_DOCUMENT_FILENAME;
+    use locality_core::{LocalityError, LocalityResult};
 
-    use crate::dto::{DatabaseDto, PageDto};
+    use crate::client::NotionApi;
+    use crate::dto::{
+        BlockDto, BlockListDto, DataSourceDto, DataSourceSummaryDto, DatabaseDto, DatabaseListDto,
+        PageDto, PageListDto, PagePropertyDto, ParentDto, RichTextDto,
+    };
 
     #[test]
     fn slugifies_titles_for_stable_paths() {
@@ -1065,6 +1252,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exact_page_resolution_uses_real_parent_hierarchy_before_hydration() {
+        let api = FakeNotionApi::new()
+            .with_database(database_with_title(
+                "engineering-db",
+                "Engineering Wiki",
+                workspace_parent(),
+                vec![DataSourceSummaryDto {
+                    id: "engineering-ds".to_string(),
+                    name: Some("Engineering Wiki".to_string()),
+                }],
+            ))
+            .with_data_source(data_source(
+                "engineering-ds",
+                database_parent("engineering-db"),
+            ))
+            .with_page(page_with_title(
+                "standups",
+                "Standups with Locality",
+                data_source_parent("engineering-ds"),
+            ))
+            .with_page(page_with_title(
+                "standup-2026-06-26",
+                "2026-06-26",
+                page_parent("standups"),
+            ))
+            .with_database_rows("engineering-ds", vec!["standups"])
+            .with_page_children(
+                "standups",
+                vec![child_page("standup-2026-06-26", "2026-06-26")],
+            );
+
+        let entries = resolve_page_path_entries(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            &RemoteId::new("standup-2026-06-26"),
+        )
+        .expect("resolve exact page hierarchy");
+
+        let resolved = entries
+            .iter()
+            .find(|entry| entry.remote_id.as_str() == "standup-2026-06-26")
+            .expect("resolved target entry");
+
+        assert_eq!(
+            resolved.path,
+            Path::new("engineering-wiki")
+                .join("standups-with-locality")
+                .join("2026-06-26")
+                .join(PAGE_DOCUMENT_FILENAME)
+        );
+        assert_ne!(
+            resolved.path,
+            Path::new("engineering-wiki")
+                .join("2026-06-26")
+                .join(PAGE_DOCUMENT_FILENAME)
+        );
+    }
+
     fn page(id: &str) -> PageDto {
         PageDto {
             id: id.to_string(),
@@ -1081,6 +1328,235 @@ mod tests {
         DatabaseDto {
             id: id.to_string(),
             ..Default::default()
+        }
+    }
+
+    fn page_with_title(id: &str, title: &str, parent: ParentDto) -> PageDto {
+        let mut page = page(id);
+        page.parent = Some(parent);
+        page.properties
+            .insert("Name".to_string(), title_property(title));
+        page
+    }
+
+    fn database_with_title(
+        id: &str,
+        title: &str,
+        parent: ParentDto,
+        data_sources: Vec<DataSourceSummaryDto>,
+    ) -> DatabaseDto {
+        DatabaseDto {
+            id: id.to_string(),
+            parent: Some(parent),
+            title: vec![plain_text(title)],
+            data_sources,
+            ..Default::default()
+        }
+    }
+
+    fn data_source(id: &str, parent: ParentDto) -> DataSourceDto {
+        DataSourceDto {
+            id: id.to_string(),
+            parent: Some(parent),
+            ..Default::default()
+        }
+    }
+
+    fn child_page(id: &str, title: &str) -> BlockDto {
+        BlockDto {
+            id: id.to_string(),
+            kind: "child_page".to_string(),
+            child_page: Some(crate::dto::TitleBlockDto {
+                title: title.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn title_property(title: &str) -> PagePropertyDto {
+        PagePropertyDto {
+            kind: "title".to_string(),
+            title: vec![plain_text(title)],
+            ..Default::default()
+        }
+    }
+
+    fn plain_text(value: &str) -> RichTextDto {
+        RichTextDto {
+            kind: "text".to_string(),
+            plain_text: value.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn workspace_parent() -> ParentDto {
+        ParentDto {
+            kind: "workspace".to_string(),
+            workspace: Some(true),
+            ..Default::default()
+        }
+    }
+
+    fn page_parent(page_id: &str) -> ParentDto {
+        ParentDto {
+            kind: "page_id".to_string(),
+            page_id: Some(page_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn database_parent(database_id: &str) -> ParentDto {
+        ParentDto {
+            kind: "database_id".to_string(),
+            database_id: Some(database_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn data_source_parent(data_source_id: &str) -> ParentDto {
+        ParentDto {
+            kind: "data_source_id".to_string(),
+            data_source_id: Some(data_source_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeNotionApi {
+        pages: BTreeMap<String, PageDto>,
+        databases: BTreeMap<String, DatabaseDto>,
+        data_sources: BTreeMap<String, DataSourceDto>,
+        database_rows: BTreeMap<String, Vec<String>>,
+        page_children: BTreeMap<String, Vec<BlockDto>>,
+    }
+
+    impl FakeNotionApi {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_page(mut self, page: PageDto) -> Self {
+            self.pages.insert(page.id.clone(), page);
+            self
+        }
+
+        fn with_database(mut self, database: DatabaseDto) -> Self {
+            self.databases.insert(database.id.clone(), database);
+            self
+        }
+
+        fn with_data_source(mut self, data_source: DataSourceDto) -> Self {
+            self.data_sources
+                .insert(data_source.id.clone(), data_source);
+            self
+        }
+
+        fn with_database_rows(mut self, data_source_id: &str, rows: Vec<&str>) -> Self {
+            self.database_rows.insert(
+                data_source_id.to_string(),
+                rows.into_iter().map(str::to_string).collect(),
+            );
+            self
+        }
+
+        fn with_page_children(mut self, page_id: &str, children: Vec<BlockDto>) -> Self {
+            self.page_children.insert(page_id.to_string(), children);
+            self
+        }
+    }
+
+    impl std::fmt::Debug for FakeNotionApi {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FakeNotionApi").finish_non_exhaustive()
+        }
+    }
+
+    impl NotionApi for FakeNotionApi {
+        fn retrieve_page(&self, page_id: &str) -> LocalityResult<PageDto> {
+            self.pages
+                .get(page_id)
+                .cloned()
+                .ok_or_else(|| LocalityError::RemoteNotFound(page_id.to_string()))
+        }
+
+        fn retrieve_database(&self, database_id: &str) -> LocalityResult<DatabaseDto> {
+            self.databases
+                .get(database_id)
+                .cloned()
+                .ok_or_else(|| LocalityError::RemoteNotFound(database_id.to_string()))
+        }
+
+        fn retrieve_data_source(&self, data_source_id: &str) -> LocalityResult<DataSourceDto> {
+            self.data_sources
+                .get(data_source_id)
+                .cloned()
+                .ok_or_else(|| LocalityError::RemoteNotFound(data_source_id.to_string()))
+        }
+
+        fn query_data_source(
+            &self,
+            data_source_id: &str,
+            _start_cursor: Option<&str>,
+        ) -> LocalityResult<PageListDto> {
+            Ok(PageListDto {
+                results: self
+                    .database_rows
+                    .get(data_source_id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|page_id| self.pages.get(page_id).cloned())
+                    .collect(),
+                next_cursor: None,
+                has_more: false,
+            })
+        }
+
+        fn retrieve_block_children(
+            &self,
+            block_id: &str,
+            _start_cursor: Option<&str>,
+        ) -> LocalityResult<BlockListDto> {
+            Ok(BlockListDto {
+                results: self
+                    .page_children
+                    .get(block_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                next_cursor: None,
+                has_more: false,
+            })
+        }
+
+        fn search_pages(&self, _start_cursor: Option<&str>) -> LocalityResult<PageListDto> {
+            Ok(PageListDto::default())
+        }
+
+        fn search_databases(&self, _start_cursor: Option<&str>) -> LocalityResult<DatabaseListDto> {
+            Ok(DatabaseListDto {
+                results: self.databases.values().cloned().collect(),
+                next_cursor: None,
+                has_more: false,
+            })
+        }
+
+        fn update_block(
+            &self,
+            _block_id: &str,
+            _body: serde_json::Value,
+        ) -> LocalityResult<BlockDto> {
+            Err(LocalityError::NotImplemented("update fake block"))
+        }
+
+        fn append_block_children(
+            &self,
+            _block_id: &str,
+            _body: serde_json::Value,
+        ) -> LocalityResult<BlockListDto> {
+            Err(LocalityError::NotImplemented("append fake block children"))
+        }
+
+        fn delete_block(&self, _block_id: &str) -> LocalityResult<BlockDto> {
+            Err(LocalityError::NotImplemented("delete fake block"))
         }
     }
 }

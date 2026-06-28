@@ -1,3 +1,6 @@
 LocalityFileProvider/
+AgentFSFileProvider/
 loc
 localityd
+afs
+afsd

@@ -77,7 +77,8 @@ type PendingChange = {
   localPath: string;
   summary: string;
   state: "safe" | "needs_review" | "conflict" | "blocked";
-  autoSave: {
+  issueCodes: string[];
+  liveMode: {
     enabled: boolean;
     state: "off" | "active" | "blocked" | "paused_remote_changed" | "paused_failure";
     label: string;
@@ -204,21 +205,24 @@ const sampleSnapshot: DesktopSnapshot = {
       localPath: "Engineering/Roadmap 2026/page.md",
       summary: "2 text edits",
       state: "safe",
-      autoSave: { enabled: false, state: "off", label: "Auto-save off" },
+      issueCodes: [],
+      liveMode: { enabled: false, state: "off", label: "Live Mode off" },
     },
     {
       title: "Launch Plan",
       localPath: "Marketing/Launch Plan/page.md",
       summary: "needs review: large deletion",
       state: "needs_review",
-      autoSave: { enabled: false, state: "off", label: "Auto-save off" },
+      issueCodes: ["large_deletion"],
+      liveMode: { enabled: false, state: "off", label: "Live Mode off" },
     },
     {
       title: "Customer Notes",
       localPath: "Sales/Customer Notes/page.md",
       summary: "1 property edit",
       state: "safe",
-      autoSave: { enabled: true, state: "active", label: "Auto-save on" },
+      issueCodes: [],
+      liveMode: { enabled: true, state: "active", label: "Live Mode on" },
     },
   ],
   activity: [
@@ -808,6 +812,7 @@ function Onboarding({
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
   const [mountError, setMountError] = useState("");
+  const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
 
@@ -938,29 +943,40 @@ function Onboarding({
   }
 
   async function startMount() {
+    if (mounting) {
+      return;
+    }
+
     setMountError("");
-    const report = await callCommand<ActionReport>(
-      "create_workspace_mount",
-      { path: mountPath },
-      { ok: true, message: "Created demo mount." },
-    );
-    if (!report.ok) {
-      setMountError(report.message);
-      return;
+    setMounting(true);
+    try {
+      const report = await callCommand<ActionReport>(
+        "create_workspace_mount",
+        { path: mountPath },
+        { ok: true, message: "Created demo mount." },
+      );
+      if (!report.ok) {
+        setMountError(report.message);
+        return;
+      }
+      const cliReady = await ensureCliAvailable();
+      if (!cliReady) {
+        return;
+      }
+      const nextSnapshot = await callCommand<DesktopSnapshot>(
+        "desktop_snapshot",
+        undefined,
+        sampleSnapshot,
+      );
+      setMountPathDirty(false);
+      setMountPath(nextSnapshot.mount.localPath);
+      await installAgentGuidance(nextSnapshot.mount.localPath);
+      setStep(4);
+    } catch (error) {
+      setMountError(errorMessage(error));
+    } finally {
+      setMounting(false);
     }
-    const cliReady = await ensureCliAvailable();
-    if (!cliReady) {
-      return;
-    }
-    const nextSnapshot = await callCommand<DesktopSnapshot>(
-      "desktop_snapshot",
-      undefined,
-      sampleSnapshot,
-    );
-    setMountPathDirty(false);
-    setMountPath(nextSnapshot.mount.localPath);
-    await installAgentGuidance(nextSnapshot.mount.localPath);
-    setStep(4);
   }
 
   async function ensureCliAvailable() {
@@ -1099,7 +1115,7 @@ function Onboarding({
         )}
 
         {step === 3 && (
-          <SetupContent mark={<BrandTile variant="folder" />}>
+          <SetupContent mark={<BrandTile variant={mounting ? "progress" : "folder"} />}>
             <div>
               <h1>Where should your Notion files appear?</h1>
               <p>
@@ -1110,17 +1126,18 @@ function Onboarding({
             <div className="path-field">
               <input
                 value={mountPath}
+                disabled={mounting}
                 onChange={(event) => {
                   setMountPathDirty(true);
                   setMountPath(event.target.value);
                 }}
               />
-              <SecondaryButton compact onClick={chooseFolder}>
+              <SecondaryButton compact disabled={mounting} onClick={chooseFolder}>
                 Choose
               </SecondaryButton>
             </div>
-            <PrimaryButton disabled={!mountPath.trim()} onClick={startMount}>
-              Continue
+            <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
+              {mounting ? "Mounting Notion" : "Continue"}
             </PrimaryButton>
             {mountError && <p className="field-error">{mountError}</p>}
             <p className="quiet-note">
@@ -2788,10 +2805,10 @@ function FileChangeList({
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [details, setDetails] = useState<Record<string, FileDetailStatus>>({});
   const [editors, setEditors] = useState<Record<string, FileEditorStatus>>({});
-  const [autoSaveOverrides, setAutoSaveOverrides] = useState<Record<string, PendingChange["autoSave"]>>({});
+  const [liveModeOverrides, setLiveModeOverrides] = useState<Record<string, PendingChange["liveMode"]>>({});
 
   useEffect(() => {
-    setAutoSaveOverrides((current) => {
+    setLiveModeOverrides((current) => {
       let changed = false;
       const next = { ...current };
       const activePaths = new Set(changes.map((change) => change.localPath));
@@ -2805,9 +2822,9 @@ function FileChangeList({
         const override = next[change.localPath];
         if (
           override &&
-          override.enabled === change.autoSave.enabled &&
-          override.state === change.autoSave.state &&
-          override.label === change.autoSave.label
+          override.enabled === change.liveMode.enabled &&
+          override.state === change.liveMode.state &&
+          override.label === change.liveMode.label
         ) {
           delete next[change.localPath];
           changed = true;
@@ -2961,26 +2978,26 @@ function FileChangeList({
     }
   }
 
-  async function toggleAutoSave(change: PendingChange, enabled: boolean) {
+  async function toggleFileLiveMode(change: PendingChange, enabled: boolean) {
     const path = joinMountPath(mountPath, change.localPath);
-    const optimisticState: PendingChange["autoSave"] = {
-      ...change.autoSave,
+    const optimisticState: PendingChange["liveMode"] = {
+      ...change.liveMode,
       enabled,
       state: enabled ? "active" : "off",
-      label: enabled ? "Auto-save on" : "Auto-save off",
+      label: enabled ? "Live Mode on" : "Live Mode off",
       reason: null,
     };
-    setAutoSaveOverrides((current) => ({
+    setLiveModeOverrides((current) => ({
       ...current,
       [change.localPath]: optimisticState,
     }));
     setActions((current) => ({
       ...current,
-      [change.localPath]: { state: "working", message: enabled ? "Turning on auto-save..." : "Turning off auto-save..." },
+      [change.localPath]: { state: "working", message: enabled ? "Turning on Live Mode..." : "Turning off Live Mode..." },
     }));
 
     try {
-      const report = await callCommand<ActionReport>("set_auto_save_for_file", {
+      const report = await callCommand<ActionReport>("set_live_mode_for_file", {
         change: { path, enabled },
       });
       setActions((current) => ({
@@ -2991,16 +3008,16 @@ function FileChangeList({
         },
       }));
       if (!report.ok) {
-        setAutoSaveOverrides((current) => ({
+        setLiveModeOverrides((current) => ({
           ...current,
-          [change.localPath]: change.autoSave,
+          [change.localPath]: change.liveMode,
         }));
       }
       await onRefresh?.().catch(() => undefined);
     } catch (error) {
-      setAutoSaveOverrides((current) => ({
+      setLiveModeOverrides((current) => ({
         ...current,
-        [change.localPath]: change.autoSave,
+        [change.localPath]: change.liveMode,
       }));
       setActions((current) => ({
         ...current,
@@ -3021,7 +3038,7 @@ function FileChangeList({
         const shouldReviewBeforePush = Boolean(!confirmDangerous && change.state === "needs_review" && onReview);
         const actionNeedsReview = Boolean(action?.state === "error" && pushNeedsReview(action.message) && onReview);
         const isSelected = selectedPath === change.localPath;
-        const autoSave = autoSaveOverrides[change.localPath] ?? change.autoSave;
+        const liveMode = liveModeOverrides[change.localPath] ?? change.liveMode;
         return (
           <article className={`file-row ${change.state} ${isSelected ? "expanded" : ""}`} key={change.localPath}>
             <div className="file-state">
@@ -3066,24 +3083,43 @@ function FileChangeList({
               )}
             </div>
             <div className="file-row-actions">
-              <div className={`auto-save-control ${autoSave.state}`}>
-                <span title={autoSave.reason || autoSave.label}>{autoSave.label}</span>
+              <div className={`file-live-mode ${liveMode.state}`}>
+                <span title={liveMode.reason || liveMode.label}>
+                  <Zap />
+                  {liveMode.label}
+                </span>
                 <button
-                  className={`toggle ${autoSave.enabled ? "enabled" : ""}`}
+                  className={`toggle ${liveMode.enabled ? "enabled" : ""}`}
                   type="button"
                   disabled={isWorking}
-                  aria-label={`${autoSave.enabled ? "Turn off" : "Turn on"} auto-save for ${change.title}`}
-                  onClick={() => void toggleAutoSave(change, !autoSave.enabled)}
+                  aria-label={`${liveMode.enabled ? "Turn off" : "Turn on"} Live Mode for ${change.title}`}
+                  onClick={() => void toggleFileLiveMode(change, !liveMode.enabled)}
                 >
                   <i />
                 </button>
               </div>
-              <SecondaryButton compact disabled={isWorking} icon={<Search />} onClick={() => void runFileAction(change, "diff")}>
-                Diff
-              </SecondaryButton>
-              <SecondaryButton compact disabled={isWorking} icon={<RefreshCw />} onClick={() => void runFileAction(change, "resolve")}>
-                Resolve
-              </SecondaryButton>
+              <div className="file-utility-actions">
+                <IconButton
+                  label="Show diff"
+                  disabled={isWorking}
+                  icon={<Search />}
+                  onClick={() => void runFileAction(change, "diff")}
+                />
+                <IconButton
+                  label="Pull latest"
+                  disabled={isWorking}
+                  icon={<RefreshCw />}
+                  onClick={() => void runFileAction(change, "resolve")}
+                />
+                <IconButton
+                  label="Open file"
+                  disabled={isWorking}
+                  icon={<FolderOpen />}
+                  onClick={() =>
+                    void callCommand("open_path", { path: joinMountPath(mountPath, change.localPath) }, { ok: true })
+                  }
+                />
+              </div>
               <PrimaryButton
                 compact
                 icon={shouldReviewBeforePush ? <ListChecks /> : <ShieldCheck />}
@@ -3098,16 +3134,6 @@ function FileChangeList({
               >
                 {shouldReviewBeforePush ? "Review" : "Push"}
               </PrimaryButton>
-              <SecondaryButton
-                compact
-                disabled={isWorking}
-                icon={<FolderOpen />}
-                onClick={() =>
-                  void callCommand("open_path", { path: joinMountPath(mountPath, change.localPath) }, { ok: true })
-                }
-              >
-                Open
-              </SecondaryButton>
             </div>
             {isSelected && (
               <div className="file-detail-panel">
@@ -3671,6 +3697,24 @@ function SecondaryButton({
   );
 }
 
+function IconButton({
+  label,
+  icon,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  icon: React.ReactNode;
+  disabled?: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <button className="icon-button has-tooltip" type="button" disabled={disabled} onClick={onClick} aria-label={label} title={label} data-tooltip={label}>
+      {icon}
+    </button>
+  );
+}
+
 function TextButton({
   children,
   disabled,
@@ -3862,7 +3906,7 @@ function healthDescription(state: string, attentionCount: number) {
     return "Notion needs to be reconnected before Locality can sync this workspace.";
   }
   if (state === "stopped") {
-    return "The Locality daemon is stopped. Background sync, hydration, and auto-save are paused; direct actions can still run from the app.";
+    return "The Locality daemon is stopped. Background sync, hydration, and Live Mode are paused; direct actions can still run from the app.";
   }
   if (state === "runtime_stopped") {
     return "The filesystem provider is stopped or unregistered. Use Repair Locality in Settings to restore online-only file access.";

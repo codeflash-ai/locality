@@ -73,6 +73,12 @@ pub enum HydrationOutcome {
     RemoteDeleted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirtyRemoteDriftOutcome {
+    Merged,
+    Conflicted,
+}
+
 pub struct HydrationExecutor<'a, S, Source: ?Sized> {
     store: &'a mut S,
     source: &'a Source,
@@ -274,7 +280,7 @@ where
         mut entity: EntityRecord,
         path: &Path,
         rendered: HydratedEntity,
-    ) -> LocalityResult<()> {
+    ) -> LocalityResult<DirtyRemoteDriftOutcome> {
         for asset in &rendered.assets {
             let path = mount_relative_path(output_root, &asset.path)?;
             write_binary_atomic(&path, &asset.bytes)?;
@@ -295,6 +301,7 @@ where
                 .map(|shadow| shadow.rendered_body.as_str()),
             &remote_document,
         );
+        let has_conflict_markers = has_unresolved_conflict_markers(&conflict_markdown);
         write_atomic(path, conflict_markdown)?;
         self.store
             .save_shadow(&mount.mount_id, rendered.shadow.clone())
@@ -303,9 +310,10 @@ where
         if entity.hydration.can_transition_to(&HydrationState::Dirty) {
             entity.hydration = HydrationState::Dirty;
         }
-        if entity
-            .hydration
-            .can_transition_to(&HydrationState::Conflicted)
+        if has_conflict_markers
+            && entity
+                .hydration
+                .can_transition_to(&HydrationState::Conflicted)
         {
             entity.hydration = HydrationState::Conflicted;
         }
@@ -316,8 +324,15 @@ where
         self.store
             .save_entity(entity)
             .map_err(LocalityError::from)?;
+        if !has_conflict_markers {
+            self.clear_remote_hint(&mount.mount_id, &rendered.shadow.entity_id)?;
+        }
 
-        Ok(())
+        Ok(if has_conflict_markers {
+            DirtyRemoteDriftOutcome::Conflicted
+        } else {
+            DirtyRemoteDriftOutcome::Merged
+        })
     }
 
     fn remote_matches_shadow(

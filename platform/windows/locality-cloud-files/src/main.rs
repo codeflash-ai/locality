@@ -3778,7 +3778,10 @@ mod tests {
             .expect("legacy identifier resolved")
             .expect("legacy provider handled identifier");
 
-        assert_eq!(resolved.mount_id, locality_core::model::MountId::new("notion-main"));
+        assert_eq!(
+            resolved.mount_id,
+            locality_core::model::MountId::new("notion-main")
+        );
         assert_eq!(resolved.daemon_identifier, "page-1");
     }
 
@@ -3793,7 +3796,10 @@ mod tests {
             .expect("legacy identifier resolved")
             .expect("legacy provider handled identifier");
 
-        assert_eq!(resolved.mount_id, locality_core::model::MountId::new("notion-main"));
+        assert_eq!(
+            resolved.mount_id,
+            locality_core::model::MountId::new("notion-main")
+        );
         assert_eq!(resolved.daemon_identifier, "page-1");
     }
 

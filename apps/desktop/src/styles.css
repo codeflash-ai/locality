@@ -1468,28 +1468,96 @@ p {
 
 .file-row-actions {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr) 104px;
   align-items: center;
-  gap: 7px;
-  min-width: 312px;
+  gap: 8px;
+  min-width: 286px;
 }
 
-.auto-save-control {
+.file-live-mode {
   grid-column: 1 / -1;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 28px;
+  min-height: 32px;
+  padding: 0 0 2px;
   gap: 10px;
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
 }
 
-.auto-save-control.blocked,
-.auto-save-control.paused_remote_changed,
-.auto-save-control.paused_failure {
+.file-live-mode > span {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 6px;
+  margin-top: 0;
+  overflow: hidden;
+  color: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-live-mode svg {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+}
+
+.file-live-mode.active {
+  color: var(--green);
+}
+
+.file-live-mode.blocked,
+.file-live-mode.paused_remote_changed,
+.file-live-mode.paused_failure {
   color: var(--amber);
+}
+
+.file-utility-actions {
+  display: flex;
+  min-width: 0;
+  gap: 7px;
+}
+
+.icon-button {
+  display: grid;
+  place-items: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.82);
+  color: var(--ink);
+  transition:
+    background-color 170ms ease,
+    border-color 170ms ease,
+    box-shadow 170ms ease,
+    color 170ms ease,
+    opacity 170ms ease,
+    transform 90ms ease;
+}
+
+.icon-button:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  background: #fff;
+  box-shadow: 0 8px 18px rgba(20, 30, 43, 0.08);
+}
+
+.icon-button:active:not(:disabled) {
+  transform: translateY(1px) scale(0.99);
+}
+
+.icon-button:disabled {
+  color: var(--subtle);
+  opacity: 0.7;
+}
+
+.icon-button svg {
+  width: 14px;
+  height: 14px;
 }
 
 .file-row-actions .primary-button,
@@ -1503,6 +1571,10 @@ p {
   font-weight: 750;
   line-height: 1;
   white-space: nowrap;
+}
+
+.file-row-actions .primary-button {
+  min-width: 104px;
 }
 
 .file-row-actions .primary-button svg,

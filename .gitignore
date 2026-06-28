@@ -9,3 +9,4 @@ dist/
 *.db-shm
 *.db-wal
 .DS_Store
+/platform/macos/AgentFSFileProvider/.build/

@@ -132,6 +132,129 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
 }
 
 #[test]
+fn pull_dirty_page_merges_non_overlapping_blocks_and_conflicts_same_block() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_blocks(vec![
+        paragraph_block("block-1", "Base intro paragraph."),
+        paragraph_block("block-2", "Base detail paragraph."),
+    ]));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount non-overlapping pull fixture");
+    run_pull(&mut store, &connector, &fixture.root).expect("initial pull");
+
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read pulled page");
+    let local_marker = format!("Local intro edit {}", unique_suffix());
+    let remote_marker = format!("Remote detail edit {}", unique_suffix());
+    fs::write(
+        &page_path,
+        original.replace("Base intro paragraph.", &local_marker),
+    )
+    .expect("write local non-overlapping edit");
+    replace_mutable_paragraph(&api, "block-2", &remote_marker);
+
+    let pull = run_pull(&mut store, &connector, &page_path).expect("pull non-overlapping drift");
+    assert!(pull.ok, "{pull:#?}");
+    assert_eq!(pull.hydrated, 1, "{pull:#?}");
+    assert_eq!(pull.skipped_dirty, 0, "{pull:#?}");
+    assert!(pull.conflicts.is_empty(), "{pull:#?}");
+    let merged = fs::read_to_string(&page_path).expect("read merged page");
+    assert!(merged.contains(&local_marker), "{merged}");
+    assert!(merged.contains(&remote_marker), "{merged}");
+    assert!(
+        !has_unresolved_conflict_markers(&merged),
+        "non-overlapping block edits should merge without conflict markers:\n{merged}"
+    );
+    let merged_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status after non-overlapping merge");
+    assert_eq!(merged_status.summary.conflicted, 0, "{merged_status:#?}");
+    assert_eq!(merged_status.summary.dirty, 1, "{merged_status:#?}");
+    assert_eq!(merged_status.summary.review_needed, 0, "{merged_status:#?}");
+
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_blocks(vec![
+        paragraph_block("block-1", "Shared base paragraph."),
+        paragraph_block("block-2", "Unchanged detail paragraph."),
+    ]));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount same-block pull fixture");
+    run_pull(&mut store, &connector, &fixture.root).expect("initial same-block pull");
+
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read same-block page");
+    let local_marker = format!("Local same-block edit {}", unique_suffix());
+    let remote_marker = format!("Remote same-block edit {}", unique_suffix());
+    fs::write(
+        &page_path,
+        original.replace("Shared base paragraph.", &local_marker),
+    )
+    .expect("write local same-block edit");
+    replace_mutable_paragraph(&api, "block-1", &remote_marker);
+
+    let pull = run_pull(&mut store, &connector, &page_path).expect("pull same-block drift");
+    assert!(!pull.ok, "{pull:#?}");
+    assert_eq!(pull.hydrated, 0, "{pull:#?}");
+    assert_eq!(pull.skipped_dirty, 1, "{pull:#?}");
+    assert_eq!(pull.conflicts.len(), 1, "{pull:#?}");
+    let conflicted = fs::read_to_string(&page_path).expect("read conflicted page");
+    assert!(conflicted.contains(&local_marker), "{conflicted}");
+    assert!(conflicted.contains(&remote_marker), "{conflicted}");
+    assert!(conflicted.contains(CONFLICT_LOCAL_MARKER), "{conflicted}");
+    assert!(
+        conflicted.contains(CONFLICT_SEPARATOR_MARKER),
+        "{conflicted}"
+    );
+    assert!(conflicted.contains(CONFLICT_REMOTE_MARKER), "{conflicted}");
+    assert!(has_unresolved_conflict_markers(&conflicted), "{conflicted}");
+    let conflicted_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(page_path),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status after same-block conflict");
+    assert_eq!(
+        conflicted_status.summary.conflicted, 1,
+        "{conflicted_status:#?}"
+    );
+}
+
+#[test]
 fn mount_pull_directive_move_pushes_copy_archive_and_status_clean() {
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -5495,6 +5618,15 @@ impl NotionApi for MutableNotionApi {
         }
         Ok(paragraph_block(block_id, ""))
     }
+}
+
+fn replace_mutable_paragraph(api: &Arc<MutableNotionApi>, block_id: &str, text: &str) {
+    let mut blocks = api.blocks.lock().expect("blocks");
+    let block = blocks
+        .iter_mut()
+        .find(|block| block.id == block_id)
+        .expect("mutable paragraph block");
+    *block = paragraph_block(block_id, text);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -11,7 +11,7 @@ use locality_core::conflict::{
 };
 use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
-use locality_core::shadow::ShadowDocument;
+use locality_core::shadow::{ShadowDocument, segment_markdown_body};
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
@@ -341,6 +341,57 @@ fn executor_remote_fast_forward_skips_dirty_file_without_materializing_conflict(
         .expect("get entity")
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Dirty);
+}
+
+#[test]
+fn executor_merges_non_overlapping_dirty_and_remote_changes_without_conflict_markers() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Hydrated);
+    let old = rendered_entity("Intro.\n\nOld middle.\n\nFooter.");
+    store
+        .save_shadow(&fixture.mount_id, old.shadow.clone())
+        .expect("save old shadow");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                locality_core::freshness::FreshnessTier::Hot,
+            )
+            .remote_hint_pending(true),
+        )
+        .expect("save freshness");
+    let local_document = CanonicalDocument::new(
+        old.document.frontmatter.clone(),
+        old.document.body.replace("Old middle.", "Local middle."),
+    );
+    fixture.write_markdown(&local_document);
+    let new = rendered_entity("Remote intro.\n\nOld middle.\n\nFooter.");
+    let source = FakeHydrationSource::with_entity("page-1", new.clone());
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("merge non-overlapping drift");
+
+    assert_eq!(outcome, HydrationOutcome::SkippedDirty);
+    let contents = fs::read_to_string(fixture.page_path()).expect("merged file");
+    assert!(contents.contains("Remote intro."), "{contents}");
+    assert!(contents.contains("Local middle."), "{contents}");
+    assert!(!has_unresolved_conflict_markers(&contents), "{contents}");
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Dirty);
+    assert_eq!(entity.remote_edited_at, new.remote_edited_at);
+    assert!(
+        !store
+            .get_freshness_state(&fixture.mount_id, &fixture.remote_id)
+            .expect("get freshness")
+            .expect("freshness")
+            .remote_hint_pending
+    );
 }
 
 #[test]
@@ -686,18 +737,16 @@ fn rendered_entity_with_sync(
 
 fn rendered_entity_for(remote_id: &str, body: &str) -> HydratedEntity {
     let body = format!("# Roadmap\n\n{body}\n");
+    let native_block_count = segment_markdown_body(&body, 7).len();
     let document = CanonicalDocument::new(
         format!("loc:\n  id: {remote_id}\n  type: page\ntitle: Roadmap\n"),
         body.clone(),
     );
     let shadow = ShadowDocument::from_synced_body(
         RemoteId::new(remote_id),
-        body,
+        body.clone(),
         7,
-        [
-            RemoteId::new(format!("{remote_id}-heading")),
-            RemoteId::new(format!("{remote_id}-body")),
-        ],
+        (0..native_block_count).map(|index| RemoteId::new(format!("{remote_id}-{index}"))),
     )
     .expect("shadow")
     .with_frontmatter(document.frontmatter.clone());

@@ -243,7 +243,7 @@ where
                 })
             })?;
         match hydrate_entity(store, source, mount, root_entity, state_root)? {
-            HydrationOutcome::Hydrated => hydrated += 1,
+            HydrationOutcome::Hydrated | HydrationOutcome::MergedDirty => hydrated += 1,
             HydrationOutcome::RemoteDeleted => {}
             HydrationOutcome::SkippedDirty => skipped_dirty += 1,
             HydrationOutcome::Conflicted(conflict) => {
@@ -317,7 +317,7 @@ where
         }
 
         match hydrate_entity(store, source, mount, entity, state_root)? {
-            HydrationOutcome::Hydrated => report.hydrated += 1,
+            HydrationOutcome::Hydrated | HydrationOutcome::MergedDirty => report.hydrated += 1,
             HydrationOutcome::RemoteDeleted => {}
             HydrationOutcome::SkippedDirty => report.skipped_dirty += 1,
             HydrationOutcome::Conflicted(conflict) => {
@@ -436,7 +436,7 @@ where
             continue;
         }
         match hydrate_entity(store, source, mount, row, state_root)? {
-            HydrationOutcome::Hydrated => hydrated += 1,
+            HydrationOutcome::Hydrated | HydrationOutcome::MergedDirty => hydrated += 1,
             HydrationOutcome::RemoteDeleted => {}
             HydrationOutcome::SkippedDirty => skipped_dirty += 1,
             HydrationOutcome::Conflicted(conflict) => {
@@ -565,7 +565,7 @@ where
 
     let outcome = hydrate_entity(store, source, mount, entity, state_root)?;
     let (hydrated, skipped_dirty, conflicts) = match outcome {
-        HydrationOutcome::Hydrated => (1, 0, Vec::new()),
+        HydrationOutcome::Hydrated | HydrationOutcome::MergedDirty => (1, 0, Vec::new()),
         HydrationOutcome::RemoteDeleted => (0, 0, Vec::new()),
         HydrationOutcome::SkippedDirty => (0, 1, Vec::new()),
         HydrationOutcome::Conflicted(conflict) => (0, 1, vec![conflict]),
@@ -783,8 +783,10 @@ where
         return Ok(HydrationOutcome::Conflicted(conflict));
     } else if !remote_matches_shadow(store, mount, &entity, &rendered.shadow)? {
         let conflict = pull_conflict(mount, &entity);
-        materialize_conflict(store, mount, entity, &path, &media_root, rendered)?;
-        return Ok(HydrationOutcome::Conflicted(conflict));
+        return match materialize_conflict(store, mount, entity, &path, &media_root, rendered)? {
+            DirtyRemoteDriftOutcome::Merged => Ok(HydrationOutcome::MergedDirty),
+            DirtyRemoteDriftOutcome::Conflicted => Ok(HydrationOutcome::Conflicted(conflict)),
+        };
     } else {
         store
             .save_entity(mark_dirty_if_allowed(entity))
@@ -1062,9 +1064,12 @@ fn materialize_conflict<S>(
     path: &Path,
     output_root: &Path,
     rendered: HydratedEntity,
-) -> Result<(), PullError>
+) -> Result<DirtyRemoteDriftOutcome, PullError>
 where
-    S: EntityRepository + ShadowRepository,
+    S: EntityRepository
+        + ShadowRepository
+        + locality_store::FreshnessStateRepository
+        + locality_store::RemoteObservationRepository,
 {
     let local_contents = std::fs::read_to_string(path).map_err(|error| PullError::ReadFile {
         path: path.to_path_buf(),
@@ -1084,19 +1089,29 @@ where
             .map(|shadow| shadow.rendered_body.as_str()),
         &remote_document,
     );
+    let has_conflict_markers = has_unresolved_conflict_markers(&conflict_markdown);
     write_atomic(path, conflict_markdown)?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
         .map_err(PullError::Store)?;
+    let remote_edited_at = rendered.remote_edited_at.clone();
+    let entity = if has_conflict_markers {
+        conflicted_record(entity, &rendered.shadow, remote_edited_at.clone())
+    } else {
+        dirty_record(entity, &rendered.shadow, remote_edited_at.clone())
+    };
     store
-        .save_entity(conflicted_record(
-            entity,
-            &rendered.shadow,
-            rendered.remote_edited_at,
-        ))
+        .save_entity(entity.clone())
         .map_err(PullError::Store)?;
+    if !has_conflict_markers {
+        record_synced_remote_observation(store, mount, &entity, remote_edited_at)?;
+    }
 
-    Ok(())
+    Ok(if has_conflict_markers {
+        DirtyRemoteDriftOutcome::Conflicted
+    } else {
+        DirtyRemoteDriftOutcome::Merged
+    })
 }
 
 fn pull_conflict(mount: &MountConfig, entity: &EntityRecord) -> PullConflict {
@@ -1145,6 +1160,23 @@ fn conflicted_record(
         .can_transition_to(&HydrationState::Conflicted)
     {
         entity.hydration = HydrationState::Conflicted;
+    }
+    entity.content_hash = Some(shadow.body_hash.clone());
+    if remote_edited_at.is_some() {
+        entity.remote_edited_at = remote_edited_at;
+    }
+    entity
+}
+
+fn dirty_record(
+    mut entity: EntityRecord,
+    shadow: &ShadowDocument,
+    remote_edited_at: Option<String>,
+) -> EntityRecord {
+    if entity.hydration != HydrationState::Conflicted
+        && entity.hydration.can_transition_to(&HydrationState::Dirty)
+    {
+        entity.hydration = HydrationState::Dirty;
     }
     entity.content_hash = Some(shadow.body_hash.clone());
     if remote_edited_at.is_some() {
@@ -1400,9 +1432,16 @@ fn remote_precondition_belongs_to_shadow(existing: &EntityRecord) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HydrationOutcome {
     Hydrated,
+    MergedDirty,
     RemoteDeleted,
     SkippedDirty,
     Conflicted(PullConflict),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirtyRemoteDriftOutcome {
+    Merged,
+    Conflicted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
