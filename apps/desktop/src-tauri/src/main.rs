@@ -4767,6 +4767,7 @@ fn ensure_daemon_running_locked(state_root: &Path) -> Result<(), String> {
         None => {}
     }
 
+    clear_stale_daemon_manager(state_root);
     start_daemon_for_current_binary(state_root)
 }
 
@@ -4777,6 +4778,32 @@ fn start_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err("localityd did not start.".to_string())
+    }
+}
+
+fn clear_stale_daemon_manager(state_root: &Path) {
+    match run_daemon_control(&daemon_control_args_any_manager("stop", state_root)) {
+        Ok(report) if report.state == DaemonRunState::Stopped => {
+            if report.message != "daemon was not running" {
+                desktop_log(
+                    "info",
+                    "daemon.stale_manager_removed",
+                    format!(
+                        "cleared existing {} daemon manager before starting bundled localityd",
+                        report.manager.as_str()
+                    ),
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(error) => desktop_log(
+            "warn",
+            "daemon.stale_manager_remove_failed",
+            format!(
+                "could not clear stale daemon manager before starting bundled localityd: {}",
+                error.message()
+            ),
+        ),
     }
 }
 

@@ -12,7 +12,9 @@ use locality_connector::oauth_broker::OAuthBrokerStart;
 use locality_core::LocalityError;
 use locality_core::journal::PushId;
 use locality_core::model::{EntityKind, MountId, RemoteId};
-use locality_core::path_projection::{page_document_path, page_listing_parent_path};
+use locality_core::path_projection::{
+    page_container_path, page_document_path, page_listing_parent_path,
+};
 use locality_google_docs::{
     DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
     GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
@@ -32,7 +34,8 @@ use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::hydration::write_parent_database_schema_cache;
 use localityd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
 use localityd::virtual_fs::{
-    VirtualFsChildrenReport, virtual_fs_ancestor_container_identifiers, virtual_fs_content_root,
+    VirtualFsChildrenReport, source_root_identifier, virtual_fs_ancestor_container_identifiers,
+    virtual_fs_content_root,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1953,11 +1956,13 @@ fn pull(args: &[String], json: bool) -> i32 {
     });
     let fallback_reason = match daemon_report {
         DaemonReport::Report(report) if json => {
+            signal_pull_virtual_projection_refresh(&state_root, &report);
             let exit_code = pull_report_exit_code(&report);
             print_json(&report);
             return exit_code;
         }
         DaemonReport::Report(report) => {
+            signal_pull_virtual_projection_refresh(&state_root, &report);
             let exit_code = pull_report_exit_code(&report);
             print_pull_report(&report);
             return exit_code;
@@ -2006,11 +2011,13 @@ fn pull(args: &[String], json: bool) -> i32 {
         )
     }) {
         Ok(report) if json => {
+            signal_pull_virtual_projection_refresh_with_store(&store, &report);
             let exit_code = pull_report_exit_code(&report);
             print_json(&report);
             exit_code
         }
         Ok(report) => {
+            signal_pull_virtual_projection_refresh_with_store(&store, &report);
             let exit_code = pull_report_exit_code(&report);
             print_pull_report(&report);
             exit_code
@@ -4368,6 +4375,81 @@ fn pull_direct_fallback_error(
         }
         DaemonUnavailableReason::Disabled | DaemonUnavailableReason::NotAvailable => None,
     }
+}
+
+fn signal_pull_virtual_projection_refresh(state_root: &Path, report: &PullReport) {
+    if report.enumerated == 0 && report.stubbed == 0 {
+        return;
+    }
+    let Ok(store) = SqliteStateStore::open(state_root.to_path_buf()) else {
+        return;
+    };
+    signal_pull_virtual_projection_refresh_with_store(&store, report);
+}
+
+fn signal_pull_virtual_projection_refresh_with_store(
+    store: &SqliteStateStore,
+    report: &PullReport,
+) {
+    if report.enumerated == 0 && report.stubbed == 0 {
+        return;
+    }
+    let Ok(Some((mount, container_identifier))) =
+        pull_virtual_projection_signal_target(store, report)
+    else {
+        return;
+    };
+    let _ = file_provider_helper::signal_macos_file_provider_container(
+        &mount.mount_id.0,
+        &container_identifier,
+    );
+}
+
+fn pull_virtual_projection_signal_target(
+    store: &SqliteStateStore,
+    report: &PullReport,
+) -> Result<Option<(MountConfig, String)>, locality_store::StoreError> {
+    let mount_id = MountId::new(report.mount_id.clone());
+    let Some(mount) = store.get_mount(&mount_id)? else {
+        return Ok(None);
+    };
+    if mount.projection != ProjectionMode::MacosFileProvider {
+        return Ok(None);
+    }
+
+    let target = absolute_command_path(Path::new(&report.target));
+    let Some(matched) = daemon_file_provider::match_mount_path(&mount, &target) else {
+        return Ok(None);
+    };
+    let relative_path = matched.relative_path;
+    if relative_path.as_os_str().is_empty() {
+        return Ok(Some((
+            mount,
+            daemon_file_provider::ROOT_CONTAINER_IDENTIFIER.to_string(),
+        )));
+    }
+
+    if let Some(entity) = store.find_entity_by_path(&mount.mount_id, &relative_path)? {
+        return Ok(match entity.kind {
+            EntityKind::Database | EntityKind::Page => Some((mount, entity.remote_id.0)),
+            EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => {
+                Some((mount, format!("path:{}", entity.path.display())))
+            }
+        });
+    }
+
+    if let Some(entity) = store
+        .list_entities(&mount.mount_id)?
+        .into_iter()
+        .find(|entity| {
+            entity.kind == EntityKind::Page && page_container_path(&entity.path) == relative_path
+        })
+    {
+        return Ok(Some((mount, format!("children:{}", entity.remote_id.0))));
+    }
+
+    let source_identifier = source_root_identifier(&mount.connector);
+    Ok(Some((mount, source_identifier)))
 }
 
 fn resolve_mount_connection(

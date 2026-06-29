@@ -11,7 +11,7 @@ use loc_cli::inspect::{InspectOptions, run_inspect};
 use loc_cli::mount::{MountOptions, run_mount};
 use loc_cli::pull::{run_pull, run_pull_with_state_root};
 use loc_cli::push::{PushOptions, run_push_with_daemon, run_push_with_daemon_at_state_root};
-use loc_cli::search::{SearchOptions, run_search};
+use loc_cli::search::{SearchOptions, notion_id_from_url, run_search};
 use loc_cli::status::{StatusOptions, run_status};
 use locality_connector::{Connector, ConnectorUndoApplier, FetchRequest};
 use locality_core::canonical::render_canonical_markdown;
@@ -31,8 +31,8 @@ use locality_notion::dto::{
 use locality_notion::media::resolve_media_href_with_content_root;
 use locality_notion::{NotionConfig, NotionConnector};
 use locality_store::{
-    ConnectionId, EntityRepository, InMemoryStateStore, JournalRepository, MountRepository,
-    ProjectionMode, VirtualMutationRepository,
+    ConnectionId, EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository,
+    MountRepository, ProjectionMode, VirtualMutationRepository,
 };
 use localityd::hydration::{HydrationExecutor, HydrationOutcome, HydrationQueue};
 use localityd::reconcile::{DefaultFetchScheduleStrategy, reconcile_scheduled_pull};
@@ -3531,6 +3531,128 @@ fn live_locate_notion_url_returns_markdown_path_and_can_prioritize_hydration() {
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(NotionConfig::default());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live child locate root {}", unique_suffix()),
+        vec![paragraph_child(
+            "Root page body before creating a fresh child page.",
+        )],
+    );
+    let existing_child = cleanup.create_page(
+        &scratch.id,
+        &format!("Locality live existing child {}", unique_suffix()),
+        vec![paragraph_child(
+            "Existing child primes the cached parent listing.",
+        )],
+    );
+    let connector = NotionConnector::new(
+        NotionConfig::default().with_root_page_id(RemoteId::new(scratch.id.clone())),
+    );
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    mount_virtual_workspace(&fixture, &mut store, &scratch.id);
+    let content_root = fixture.content_root();
+
+    let source_root = source_root_identifier("notion");
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
+        .expect("refresh source root");
+    let source_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &source_root,
+    )
+    .expect("list source root");
+    let scratch_folder = find_virtual_folder(&source_children.children, &scratch.id).clone();
+    refresh_virtual_children_until_remote_folder(
+        &mut store,
+        &connector,
+        &content_root,
+        &fixture.mount_id,
+        &scratch_folder.identifier,
+        &existing_child.id,
+    );
+
+    let child = cleanup.create_page(
+        &scratch.id,
+        &format!("Locality live located child {}", unique_suffix()),
+        vec![paragraph_child(
+            "Fresh child should appear after the parent directory is refreshed.",
+        )],
+    );
+    let child_url = notion_object_url(&child.id);
+    let mut locate_store = store.clone();
+    let located_child_path = desktop_style_locate_notion_url_path(
+        &mut locate_store,
+        &connector,
+        &fixture.mount_id,
+        &child_url,
+    );
+    let parent_directory = located_child_path
+        .parent()
+        .and_then(Path::parent)
+        .expect("located child parent directory");
+
+    refresh_virtual_children_until_remote_folder(
+        &mut store,
+        &connector,
+        &content_root,
+        &fixture.mount_id,
+        &scratch_folder.identifier,
+        &child.id,
+    );
+
+    let pull = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        parent_directory,
+        Some(&fixture.state_root),
+    )
+    .expect("pull parent directory after locating child URL");
+    assert!(pull.ok, "{pull:#?}");
+    assert!(
+        pull.enumerated >= 2,
+        "parent directory pull should enumerate existing and fresh child pages: {pull:#?}"
+    );
+
+    let parent_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &scratch_folder.identifier,
+    )
+    .expect("list refreshed parent children");
+    let child_folder = find_virtual_folder(&parent_children.children, &child.id);
+    let located_relative_path = located_child_path
+        .strip_prefix(fixture.root.join("notion"))
+        .expect("located path under source root");
+    assert_eq!(
+        Path::new(&child_folder.path).join("page.md"),
+        located_relative_path,
+        "desktop-style locate and virtual directory projection should agree"
+    );
+
+    let child_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &child_folder.identifier,
+    )
+    .expect("list new child page directory");
+    assert!(
+        child_children.children.iter().any(|item| {
+            item.filename == "page.md" && item.remote_id.as_deref() == Some(child.id.as_str())
+        }),
+        "new child directory should expose page.md after parent pull: {child_children:#?}"
+    );
+}
+
+#[test]
+#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_cyclic_diverse_page_read_noop_preserves_notion() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(NotionConfig::default());
@@ -4688,6 +4810,104 @@ fn find_virtual_folder<'a>(
                 && item.kind == localityd::virtual_fs::VirtualFsItemKind::Folder
         })
         .unwrap_or_else(|| panic!("missing virtual folder for {remote_id}: {items:#?}"))
+}
+
+fn refresh_virtual_children_until_remote_folder(
+    store: &mut InMemoryStateStore,
+    connector: &NotionConnector,
+    content_root: &Path,
+    mount_id: &MountId,
+    container_identifier: &str,
+    remote_id: &str,
+) -> localityd::virtual_fs::VirtualFsItem {
+    let mut last_children = None;
+    for _ in 0..8 {
+        refresh_virtual_fs_children(store, connector, mount_id, container_identifier)
+            .expect("refresh virtual children");
+        let report = virtual_fs_children_with_content_root(
+            store,
+            content_root,
+            mount_id,
+            container_identifier,
+        )
+        .expect("list virtual children after refresh");
+        if let Some(child) = report
+            .children
+            .iter()
+            .find(|item| {
+                item.remote_id.as_deref() == Some(remote_id)
+                    && item.kind == localityd::virtual_fs::VirtualFsItemKind::Folder
+            })
+            .cloned()
+        {
+            return child;
+        }
+        last_children = Some(report.children);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    panic!(
+        "missing virtual folder for {remote_id} after refreshed parent `{container_identifier}`: {:#?}",
+        last_children.unwrap_or_default()
+    );
+}
+
+fn desktop_style_locate_notion_url_path(
+    store: &mut InMemoryStateStore,
+    connector: &NotionConnector,
+    mount_id: &MountId,
+    url: &str,
+) -> PathBuf {
+    let notion_id = notion_id_from_url(url).expect("Notion URL id");
+    let remote_id = RemoteId::new(notion_id.clone());
+    let mut last_error = "unknown error".to_string();
+    let mut resolved_entries = None;
+    for _ in 0..8 {
+        match connector.resolve_page_path_entries(mount_id.clone(), &remote_id) {
+            Ok(entries) => {
+                resolved_entries = Some(entries);
+                break;
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+    let entries = resolved_entries
+        .unwrap_or_else(|| panic!("resolve exact Notion URL path entries: {last_error}"));
+    assert!(
+        entries
+            .iter()
+            .any(|entry| compact_notion_id(entry.remote_id.as_str()) == notion_id),
+        "exact Notion URL resolver did not return target {remote_id:?}: {entries:#?}"
+    );
+    for entry in entries {
+        store
+            .save_entity(EntityRecord::from(entry))
+            .expect("save exact located Notion metadata");
+    }
+
+    let search = run_search(
+        store,
+        SearchOptions {
+            query: url.to_string(),
+            connector: Some("notion".to_string()),
+            limit: 8,
+        },
+    )
+    .expect("search exact located Notion URL");
+    let located = search
+        .results
+        .iter()
+        .find(|result| compact_notion_id(&result.remote_id) == notion_id)
+        .unwrap_or_else(|| panic!("missing exact located Notion result: {search:#?}"));
+    assert_eq!(located.kind, "page", "{located:#?}");
+    assert!(
+        located.path.ends_with("/page.md"),
+        "desktop locate should resolve a page URL to page.md: {located:#?}"
+    );
+    PathBuf::from(&located.absolute_path)
 }
 
 #[derive(Debug)]

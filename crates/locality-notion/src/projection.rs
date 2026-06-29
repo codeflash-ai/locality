@@ -197,7 +197,7 @@ impl ExactPathResolver<'_> {
         let page = self.api.retrieve_page(page_id)?;
         let entry = if self
             .root_page_id
-            .is_some_and(|root_page_id| root_page_id.as_str() == page_id)
+            .is_some_and(|root_page_id| notion_ids_equal(root_page_id.as_str(), page_id))
         {
             let title = page_title(&page);
             let mut used_paths = BTreeSet::new();
@@ -303,7 +303,9 @@ impl ExactPathResolver<'_> {
 
         entries
             .into_iter()
-            .find(|entry| entry.remote_id.as_str() == remote_id && entry.kind == kind)
+            .find(|entry| {
+                notion_ids_equal(entry.remote_id.as_str(), remote_id) && entry.kind == kind
+            })
             .ok_or_else(|| {
                 LocalityError::RemoteNotFound(format!(
                     "notion object `{remote_id}` was not found in its resolved parent"
@@ -319,6 +321,18 @@ impl ExactPathResolver<'_> {
             .insert(entry.remote_id.0.clone(), entry.clone());
         entry
     }
+}
+
+fn notion_ids_equal(left: &str, right: &str) -> bool {
+    compact_notion_id(left) == compact_notion_id(right)
+}
+
+fn compact_notion_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
 
 fn push_projected_listing_entry(
@@ -1310,6 +1324,14 @@ mod tests {
                 .join("2026-06-26")
                 .join(PAGE_DOCUMENT_FILENAME)
         );
+    }
+
+    #[test]
+    fn notion_id_matching_ignores_hyphen_formatting_for_exact_url_resolution() {
+        assert!(super::notion_ids_equal(
+            "38e3ac0e-bb88-8140-94e2-d9ff17e60faa",
+            "38e3ac0ebb88814094e2d9ff17e60faa"
+        ));
     }
 
     fn page(id: &str) -> PageDto {

@@ -227,6 +227,71 @@ pub fn register_macos_file_provider_domain(
     )
 }
 
+#[cfg(target_os = "macos")]
+pub fn signal_macos_file_provider_container(
+    mount_id: &str,
+    container_identifier: &str,
+) -> Result<FileProviderHelperReport, FileProviderHelperError> {
+    run_macos_file_provider_helper(
+        "signal",
+        vec![
+            "--mount-id".to_string(),
+            localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
+            "--identifier".to_string(),
+            macos_file_provider_item_identifier(mount_id, container_identifier),
+        ],
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn signal_macos_file_provider_container(
+    _mount_id: &str,
+    _container_identifier: &str,
+) -> Result<FileProviderHelperReport, FileProviderHelperError> {
+    Err(FileProviderHelperError::Missing)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_item_identifier(mount_id: &str, identifier: &str) -> String {
+    if identifier == localityd::file_provider::ROOT_CONTAINER_IDENTIFIER {
+        return localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string();
+    }
+    format!(
+        "m:{}:{}",
+        macos_file_provider_encode_identifier_component(mount_id),
+        macos_file_provider_encode_identifier_component(identifier)
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_encode_identifier_component(value: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let bytes = value.as_bytes();
+    let mut output = String::with_capacity((bytes.len() * 4).div_ceil(3));
+    let mut index = 0;
+    while index < bytes.len() {
+        let first = bytes[index];
+        let second = bytes.get(index + 1).copied();
+        let third = bytes.get(index + 2).copied();
+
+        output.push(TABLE[(first >> 2) as usize] as char);
+        output.push(
+            TABLE[(((first & 0b0000_0011) << 4) | second.unwrap_or(0) >> 4) as usize] as char,
+        );
+        if let Some(second) = second {
+            output.push(
+                TABLE[(((second & 0b0000_1111) << 2) | third.unwrap_or(0) >> 6) as usize] as char,
+            );
+        }
+        if let Some(third) = third {
+            output.push(TABLE[(third & 0b0011_1111) as usize] as char);
+        }
+
+        index += 3;
+    }
+    output
+}
+
 #[cfg(target_os = "linux")]
 pub fn register_linux_fuse_mount(
     state_root: &Path,
@@ -1431,6 +1496,22 @@ mod tests {
         assert!(message.contains("make install-macos-file-provider"));
         assert!(message.contains("enable the File Provider"));
         assert!(!message.contains("right now.."));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_signal_identifier_matches_shared_domain_contract() {
+        assert_eq!(
+            super::macos_file_provider_item_identifier("notion-main", "root"),
+            "root"
+        );
+        assert_eq!(
+            super::macos_file_provider_item_identifier(
+                "notion-main",
+                "children:38e3ac0e-bb88-80f9-96d6-fb1cfcc66574",
+            ),
+            "m:bm90aW9uLW1haW4:Y2hpbGRyZW46MzhlM2FjMGUtYmI4OC04MGY5LTk2ZDYtZmIxY2ZjYzY2NTc0"
+        );
     }
 
     #[test]

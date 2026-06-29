@@ -659,6 +659,12 @@ fn find_localityd_binary(explicit: Option<&Path>) -> Result<PathBuf, DaemonContr
         return Ok(path);
     }
 
+    for candidate in installed_app_localityd_candidates() {
+        if let Some(path) = existing_file(&candidate) {
+            return Ok(path);
+        }
+    }
+
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest_dir.join("../..");
     for candidate in [
@@ -682,6 +688,29 @@ fn find_localityd_binary(explicit: Option<&Path>) -> Result<PathBuf, DaemonContr
         "binary_missing",
         "localityd binary was not found; build/install localityd or pass --localityd-bin <path>",
     ))
+}
+
+fn installed_app_localityd_candidates() -> Vec<PathBuf> {
+    installed_app_localityd_candidates_for_target(std::env::consts::OS, env::var_os("HOME"))
+}
+
+fn installed_app_localityd_candidates_for_target(
+    target_os: &str,
+    home: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    if target_os != "macos" {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push(PathBuf::from(
+        "/Applications/Locality.app/Contents/MacOS/localityd",
+    ));
+    if let Some(home) = home {
+        candidates
+            .push(PathBuf::from(home).join("Applications/Locality.app/Contents/MacOS/localityd"));
+    }
+    candidates
 }
 
 fn existing_file(path: &Path) -> Option<PathBuf> {
@@ -825,6 +854,33 @@ mod tests {
             false,
             "macos"
         ));
+    }
+
+    #[test]
+    fn macos_installed_app_daemon_candidates_prefer_system_then_user_app() {
+        let candidates = installed_app_localityd_candidates_for_target(
+            "macos",
+            Some(std::ffi::OsString::from("/Users/ada")),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/Applications/Locality.app/Contents/MacOS/localityd"),
+                PathBuf::from("/Users/ada/Applications/Locality.app/Contents/MacOS/localityd"),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_macos_installed_app_daemon_candidates_are_empty() {
+        assert!(
+            installed_app_localityd_candidates_for_target(
+                "linux",
+                Some(std::ffi::OsString::from("/home/ada")),
+            )
+            .is_empty()
+        );
     }
 
     #[cfg(unix)]

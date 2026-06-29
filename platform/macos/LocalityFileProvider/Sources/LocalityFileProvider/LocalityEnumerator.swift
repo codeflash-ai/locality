@@ -88,8 +88,18 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         for observer: NSFileProviderChangeObserver,
         from syncAnchor: NSFileProviderSyncAnchor
     ) {
-        observer.finishEnumeratingChanges(upTo: syncAnchor, moreComing: false)
+        observer.finishEnumeratingWithError(syncAnchorExpiredError())
     }
+}
+
+private func syncAnchorExpiredError() -> NSError {
+    NSError(
+        domain: NSFileProviderErrorDomain,
+        code: NSFileProviderError.syncAnchorExpired.rawValue,
+        userInfo: [
+            NSLocalizedDescriptionKey: "Locality refreshes this folder by re-enumerating it."
+        ]
+    )
 }
 
 func agentFSFileProviderError(_ error: Error) -> NSError {
