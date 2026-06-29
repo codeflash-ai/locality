@@ -624,9 +624,21 @@ fn shared_virtual_root_mounts<'a>(
     mounts
         .iter()
         .filter(|mount| {
-            mount.projection.uses_virtual_filesystem() && virtual_projection_root(mount) == target
+            mount.projection.uses_virtual_filesystem()
+                && paths_match_existing_root(&virtual_projection_root(mount), target)
         })
         .collect()
+}
+
+fn paths_match_existing_root(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn scope_filter_for_relative_path<S>(

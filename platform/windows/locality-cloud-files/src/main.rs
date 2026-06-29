@@ -1179,6 +1179,7 @@ struct ProviderLocalFileIndex {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Debug)]
 struct ResolvedIdentifier {
     mount: MountConfig,
     daemon_identifier: String,

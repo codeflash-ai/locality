@@ -347,6 +347,68 @@ fn status_without_path_from_shared_linux_fuse_root_reports_only_that_root() {
     assert_eq!(report.summary.stub, 2);
 }
 
+#[cfg(unix)]
+#[test]
+fn status_shared_linux_fuse_root_matches_canonical_path_alias() {
+    let real_shared_root = TempRoot::new("loc-cli-status-real-shared-root");
+    let alias_parent = TempRoot::new("loc-cli-status-shared-root-alias-parent");
+    let alias_shared_root = alias_parent.path.join("Locality");
+    std::os::unix::fs::symlink(&real_shared_root.path, &alias_shared_root)
+        .expect("create shared root alias");
+    let other_root = TempRoot::new("loc-cli-status-alias-other-root");
+    let mut store = InMemoryStateStore::new();
+    let notion = MountConfig::new(
+        MountId::new("notion-main"),
+        "notion",
+        alias_shared_root.join("notion-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    let google = MountConfig::new(
+        MountId::new("google-docs-main"),
+        "google-docs",
+        alias_shared_root.join("google-docs-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    let other = MountConfig::new(
+        MountId::new("notion-other"),
+        "notion",
+        other_root.path.join("notion-other"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(notion.clone()).expect("save notion mount");
+    store.save_mount(google.clone()).expect("save google mount");
+    store.save_mount(other.clone()).expect("save other mount");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(real_shared_root.path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("shared root alias status report");
+    let mount_ids = report
+        .mounts
+        .iter()
+        .map(|mount| mount.mount_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(mount_ids, vec!["google-docs-main", "notion-main"]);
+
+    let _lock = cwd_lock().lock().expect("cwd lock");
+    let _cwd = CurrentDirGuard::enter(&real_shared_root.path);
+    let report =
+        run_status(&store, StatusOptions::default()).expect("shared root alias cwd status report");
+    let mount_ids = report
+        .mounts
+        .iter()
+        .map(|mount| mount.mount_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(report.target, None);
+    assert_eq!(mount_ids, vec!["google-docs-main", "notion-main"]);
+}
+
 #[test]
 fn status_for_shared_linux_fuse_root_reports_all_mount_points() {
     let shared_root = TempRoot::new("loc-cli-status-shared-root");
