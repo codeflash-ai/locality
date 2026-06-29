@@ -20,7 +20,7 @@ jobs:
     environment: notion-live-e2e
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE }}
+      LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE || secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
       LOCALITY_NOTION_LIVE_DIR: /tmp/locality-notion-live
     steps:
       - uses: actions/checkout@v4
@@ -49,7 +49,7 @@ jobs:
     environment: notion-live-e2e
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE }}
+      LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE || secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
       LOCALITY_WINDOWS_CLOUD_FILES_LIVE: "1"
       LOCALITY_WINDOWS_CLOUD_FILES_LIVE_REQUIRED: "1"
     steps:
