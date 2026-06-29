@@ -249,6 +249,64 @@ fn status_without_path_outside_mount_reports_all_mounts() {
 }
 
 #[test]
+fn status_for_shared_linux_fuse_root_reports_all_mount_points() {
+    let shared_root = TempRoot::new("loc-cli-status-shared-root");
+    let mut store = InMemoryStateStore::new();
+    let notion = MountConfig::new(
+        MountId::new("notion-main"),
+        "notion",
+        shared_root.path.join("notion-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    let google = MountConfig::new(
+        MountId::new("google-docs-main"),
+        "google-docs",
+        shared_root.path.join("google-docs-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(notion.clone()).expect("save notion mount");
+    store.save_mount(google.clone()).expect("save google mount");
+    store
+        .save_entity(entity_record(
+            &notion.mount_id,
+            "notion-page",
+            "Roadmap/page.md",
+            HydrationState::Stub,
+        ))
+        .expect("save notion entity");
+    store
+        .save_entity(entity_record(
+            &google.mount_id,
+            "google-page",
+            "Docs/page.md",
+            HydrationState::Stub,
+        ))
+        .expect("save google entity");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(shared_root.path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("shared root status report");
+    let mount_ids = report
+        .mounts
+        .iter()
+        .map(|mount| mount.mount_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        report.target.as_deref(),
+        Some(shared_root.path.to_str().expect("utf8 root"))
+    );
+    assert_eq!(mount_ids, vec!["google-docs-main", "notion-main"]);
+    assert_eq!(report.summary.total, 2);
+    assert_eq!(report.summary.stub, 2);
+}
+
+#[test]
 fn status_scopes_to_explicit_mount_id_without_path() {
     let fixture = StatusFixture::new();
     let second_root = TempRoot::new("loc-cli-status-explicit-mount-second");

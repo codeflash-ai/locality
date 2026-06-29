@@ -22,7 +22,7 @@ use locality_store::{
     VirtualMutationRecord, VirtualMutationRepository,
 };
 use localityd::file_provider as daemon_file_provider;
-use localityd::virtual_fs::virtual_fs_content_path;
+use localityd::virtual_fs::{virtual_fs_content_path, virtual_projection_root};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -315,7 +315,7 @@ where
     }
 
     match target {
-        Some(target) => resolve_target_scope(store, mounts, target).map(|scope| vec![scope]),
+        Some(target) => resolve_target_scopes(store, mounts, target),
         None => resolve_default_scopes(store, mounts),
     }
 }
@@ -377,21 +377,44 @@ where
     Ok(StatusScope { mount, filter })
 }
 
-fn resolve_target_scope<S>(
+fn resolve_target_scopes<S>(
     store: &S,
     mounts: &[MountConfig],
     target: &Path,
-) -> Result<StatusScope, StatusError>
+) -> Result<Vec<StatusScope>, StatusError>
 where
     S: EntityRepository + VirtualMutationRepository,
 {
-    let mount = find_mount_for_path(mounts, target)
-        .cloned()
-        .ok_or_else(|| StatusError::MountNotFound(target.to_path_buf()))?;
-    let relative_path = relative_entity_path(&mount, target)?;
-    let filter = scope_filter_for_relative_path(store, &mount, &relative_path)?;
+    if let Some(mount) = find_mount_for_path(mounts, target).cloned() {
+        let relative_path = relative_entity_path(&mount, target)?;
+        let filter = scope_filter_for_relative_path(store, &mount, &relative_path)?;
+        return Ok(vec![StatusScope { mount, filter }]);
+    }
 
-    Ok(StatusScope { mount, filter })
+    let shared_root_mounts = shared_virtual_root_mounts(mounts, target);
+    if !shared_root_mounts.is_empty() {
+        return Ok(shared_root_mounts
+            .into_iter()
+            .map(|mount| StatusScope {
+                mount: mount.clone(),
+                filter: ScopeFilter::All,
+            })
+            .collect());
+    }
+
+    Err(StatusError::MountNotFound(target.to_path_buf()))
+}
+
+fn shared_virtual_root_mounts<'a>(
+    mounts: &'a [MountConfig],
+    target: &Path,
+) -> Vec<&'a MountConfig> {
+    mounts
+        .iter()
+        .filter(|mount| {
+            mount.projection.uses_virtual_filesystem() && virtual_projection_root(mount) == target
+        })
+        .collect()
 }
 
 fn scope_filter_for_relative_path<S>(
