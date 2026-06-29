@@ -110,6 +110,89 @@ impl MountConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MountLiveModeState {
+    Off,
+    Active,
+    Syncing,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountLiveModeRecord {
+    pub mount_id: MountId,
+    pub enabled: bool,
+    pub state: MountLiveModeState,
+    pub last_reason: Option<String>,
+    pub last_run_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl MountLiveModeRecord {
+    pub fn new(mount_id: MountId, enabled: bool, created_at: impl Into<String>) -> Self {
+        let created_at = created_at.into();
+        Self {
+            mount_id,
+            enabled,
+            state: if enabled {
+                MountLiveModeState::Active
+            } else {
+                MountLiveModeState::Off
+            },
+            last_reason: None,
+            last_run_at: None,
+            created_at: created_at.clone(),
+            updated_at: created_at,
+        }
+    }
+
+    pub fn off(mut self, updated_at: impl Into<String>) -> Self {
+        self.enabled = false;
+        self.state = MountLiveModeState::Off;
+        self.last_reason = None;
+        self.updated_at = updated_at.into();
+        self
+    }
+
+    pub fn active(
+        mut self,
+        reason: Option<String>,
+        last_run_at: impl Into<String>,
+        updated_at: impl Into<String>,
+    ) -> Self {
+        self.enabled = true;
+        self.state = MountLiveModeState::Active;
+        self.last_reason = reason;
+        self.last_run_at = Some(last_run_at.into());
+        self.updated_at = updated_at.into();
+        self
+    }
+
+    pub fn syncing(mut self, updated_at: impl Into<String>) -> Self {
+        self.enabled = true;
+        self.state = MountLiveModeState::Syncing;
+        self.last_reason = None;
+        self.updated_at = updated_at.into();
+        self
+    }
+
+    pub fn error(
+        mut self,
+        reason: impl Into<String>,
+        last_run_at: impl Into<String>,
+        updated_at: impl Into<String>,
+    ) -> Self {
+        self.enabled = false;
+        self.state = MountLiveModeState::Error;
+        self.last_reason = Some(reason.into());
+        self.last_run_at = Some(last_run_at.into());
+        self.updated_at = updated_at.into();
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionRecord {
     pub connection_id: ConnectionId,
     pub profile_id: Option<ConnectorProfileId>,

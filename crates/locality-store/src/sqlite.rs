@@ -29,18 +29,18 @@ use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord, MountConfig,
-    ProjectionMode, RemoteObservationRecord, ShadowBlockRecord, ShadowSnapshotRecord,
-    VirtualMutationKind, VirtualMutationRecord,
+    MountLiveModeRecord, MountLiveModeState, ProjectionMode, RemoteObservationRecord,
+    ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
 };
 use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
     EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
-    HydrationJobRepository, JournalRepository, MountRepository, RemoteObservationRepository,
-    ShadowRepository, VirtualMutationRepository,
+    HydrationJobRepository, JournalRepository, MountLiveModeRepository, MountRepository,
+    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
@@ -120,6 +120,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     },
     StateComponentDefinition {
         component_id: "durable:auto_save",
+        component_kind: "durable_json",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "durable:live_mode",
         component_kind: "durable_json",
         current_version: 1,
         min_reader_version: 1,
@@ -295,6 +304,68 @@ impl MountRepository for SqliteStateStore {
         })?;
 
         rows.map(|row| mount_from_row(row?)).collect()
+    }
+}
+
+impl MountLiveModeRepository for SqliteStateStore {
+    fn save_mount_live_mode(&mut self, live_mode: MountLiveModeRecord) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO mount_live_modes (
+                mount_id,
+                enabled,
+                state_json,
+                last_reason,
+                last_run_at,
+                created_at,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(mount_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                state_json = excluded.state_json,
+                last_reason = excluded.last_reason,
+                last_run_at = excluded.last_run_at,
+                updated_at = excluded.updated_at",
+            params![
+                live_mode.mount_id.0,
+                bool_to_int(live_mode.enabled),
+                to_json(&live_mode.state)?,
+                live_mode.last_reason,
+                live_mode.last_run_at,
+                live_mode.created_at,
+                live_mode.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_mount_live_mode(&self, mount_id: &MountId) -> StoreResult<Option<MountLiveModeRecord>> {
+        let connection = self.connection()?;
+        let sql = MOUNT_LIVE_MODE_SELECT_WITH_WHERE.to_owned() + "WHERE mount_id = ?1";
+        connection
+            .query_row(&sql, params![mount_id.0], mount_live_mode_row)
+            .optional()?
+            .map(mount_live_mode_from_row)
+            .transpose()
+    }
+
+    fn list_mount_live_modes(&self) -> StoreResult<Vec<MountLiveModeRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(&(MOUNT_LIVE_MODE_SELECT_WITH_WHERE.to_owned() + "ORDER BY mount_id"))?;
+        let rows = statement.query_map([], mount_live_mode_row)?;
+
+        rows.map(|row| mount_live_mode_from_row(row?)).collect()
+    }
+
+    fn delete_mount_live_mode(&mut self, mount_id: &MountId) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM mount_live_modes WHERE mount_id = ?1",
+            params![mount_id.0],
+        )?;
+        Ok(())
     }
 }
 
@@ -1278,6 +1349,7 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
         "shadows",
         "hydration_jobs",
         "virtual_mutations",
+        "mount_live_modes",
         "auto_save_enrollments",
         "remote_observations",
         "freshness_states",
@@ -1316,6 +1388,10 @@ const AUTO_SAVE_SELECT_WITH_WHERE: &str = "
     SELECT mount_id, path, remote_id, enabled, origin_json, state_json, last_reason,
            last_push_id, created_at, updated_at
     FROM auto_save_enrollments
+    ";
+const MOUNT_LIVE_MODE_SELECT_WITH_WHERE: &str = "
+    SELECT mount_id, enabled, state_json, last_reason, last_run_at, created_at, updated_at
+    FROM mount_live_modes
     ";
 const REMOTE_OBSERVATION_SELECT_WITH_WHERE: &str = "
     SELECT mount_id, remote_id, kind_json, title, parent_remote_id, projected_path,
@@ -1405,6 +1481,15 @@ type AutoSaveEnrollmentRow = (
     String,
     String,
 );
+type MountLiveModeRow = (
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
 type RemoteObservationRow = (
     String,
     String,
@@ -1437,14 +1522,14 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         });
     }
     if user_version == SCHEMA_VERSION {
-        ensure_state_components_allow_schema_migration(connection)?;
+        ensure_state_components_allow_schema_migration(connection, user_version)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
         return Ok(());
     }
 
     if user_version >= 13 {
-        ensure_state_components_allow_schema_migration(connection)?;
+        ensure_state_components_allow_schema_migration(connection, user_version)?;
     }
 
     connection.execute_batch(
@@ -1561,6 +1646,17 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (mount_id, path),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS mount_live_modes (
+            mount_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+            state_json TEXT NOT NULL,
+            last_reason TEXT,
+            last_run_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
 
@@ -1793,6 +1889,24 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         }
     }
 
+    if user_version < 15 {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS mount_live_modes (
+                mount_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                state_json TEXT NOT NULL,
+                last_reason TEXT,
+                last_run_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+            );",
+        )?;
+        if user_version >= 13 {
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
@@ -1804,10 +1918,13 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
-fn ensure_state_components_allow_schema_migration(connection: &Connection) -> StoreResult<()> {
+fn ensure_state_components_allow_schema_migration(
+    connection: &Connection,
+    user_version: i64,
+) -> StoreResult<()> {
     let blocking_issues = inspect_state_component_issues(connection)?
         .into_iter()
-        .filter(|issue| !state_component_issue_allows_schema_migration(issue))
+        .filter(|issue| !state_component_issue_allows_schema_migration(issue, user_version))
         .collect::<Vec<_>>();
 
     if blocking_issues.is_empty() {
@@ -1819,7 +1936,10 @@ fn ensure_state_components_allow_schema_migration(connection: &Connection) -> St
     }
 }
 
-fn state_component_issue_allows_schema_migration(issue: &StateCompatibilityIssue) -> bool {
+fn state_component_issue_allows_schema_migration(
+    issue: &StateCompatibilityIssue,
+    user_version: i64,
+) -> bool {
     matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -1838,6 +1958,14 @@ fn state_component_issue_allows_schema_migration(issue: &StateCompatibilityIssue
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
             if component_id == "projection:windows_cloud_files"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < 14 && component_id == "durable:auto_save"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < 15 && component_id == "durable:live_mode"
     )
 }
 
@@ -2039,6 +2167,30 @@ fn auto_save_enrollment_from_row(
         last_push_id: row.7,
         created_at: row.8,
         updated_at: row.9,
+    })
+}
+
+fn mount_live_mode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MountLiveModeRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn mount_live_mode_from_row(row: MountLiveModeRow) -> StoreResult<MountLiveModeRecord> {
+    Ok(MountLiveModeRecord {
+        mount_id: MountId(row.0),
+        enabled: row.1 != 0,
+        state: from_json::<MountLiveModeState>(&row.2)?,
+        last_reason: row.3,
+        last_run_at: row.4,
+        created_at: row.5,
+        updated_at: row.6,
     })
 }
 

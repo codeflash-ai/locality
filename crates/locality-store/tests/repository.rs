@@ -10,7 +10,8 @@ use locality_core::shadow::ShadowDocument;
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    InMemoryStateStore, JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
+    InMemoryStateStore, JournalRepository, MountConfig, MountLiveModeRecord,
+    MountLiveModeRepository, MountLiveModeState, MountRepository, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
 };
@@ -277,6 +278,31 @@ fn auto_save_enrollments_round_trip_by_path_and_remote_id() {
             .find_auto_save_enrollment_by_remote_id(&mount_id(), &RemoteId::new("page-2"))
             .expect("find enrollment"),
         Some(enrollment)
+    );
+}
+
+#[test]
+fn mount_live_mode_round_trips_by_mount_id() {
+    let mut store = InMemoryStateStore::new();
+    let mut live_mode = MountLiveModeRecord::new(mount_id(), true, "1");
+    live_mode.state = MountLiveModeState::Syncing;
+    live_mode.last_reason = Some("checking for changes".to_string());
+    live_mode.last_run_at = Some("2".to_string());
+    live_mode.updated_at = "2".to_string();
+
+    store
+        .save_mount_live_mode(live_mode.clone())
+        .expect("save live mode");
+
+    assert_eq!(
+        store
+            .get_mount_live_mode(&mount_id())
+            .expect("get live mode"),
+        Some(live_mode.clone())
+    );
+    assert_eq!(
+        store.list_mount_live_modes().expect("list live modes"),
+        vec![live_mode]
     );
 }
 

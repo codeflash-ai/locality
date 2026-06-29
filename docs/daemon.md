@@ -345,7 +345,12 @@ already-hydrated page so the app does not poll the user-visible file every tick.
 Remote checks fetch one already-hydrated page into the daemon content cache and
 compare the rendered shadow before refreshing the visible projection. This avoids
 relying on Notion page metadata that can miss some body edits, while leaving
-unchanged CloudStorage replicas untouched.
+unchanged CloudStorage replicas untouched. The desktop runner must not poll the
+SQLite state store while Live Mode is off. Live Mode state changes publish an
+explicit local signal under the state root through the shared store boundary;
+the app's watcher wakes the runner from that signal, while ordinary SQLite
+WAL/SHM churn remains ignored. The runner keeps a low-frequency recovery recheck
+only as a missed-event fallback, not as the normal state-change path.
 
 ## Scheduled Pull Reconciliation
 
@@ -367,6 +372,13 @@ usable, small eager-sync workspaces can hydrate through `HydrationPolicy`, and
 already hydrated pages with changed Remote Tree versions are queued for refresh.
 Project- or mount-specific strategies can dispatch on `MountConfig` without
 changing the reconciliation mechanics.
+
+Workspace-level virtual mounts, such as desktop File Provider or FUSE mounts
+without a `remote_root_id`, continue to skip full scheduled enumeration. After a
+scheduled tick reconciles normal mounts, the runtime separately queues at most
+100 cheap `observe_entity` freshness jobs for active or already-hydrated pages
+known in SQLite under those workspace mounts. Stub and virtual pages are left to
+hydrate or observe through open, locate, or browse activity.
 
 For hydrated, dirty, or conflicted entities, enumeration preserves the Synced
 Tree remote version until hydration writes a new shadow. That version is the

@@ -9,10 +9,10 @@ use std::io;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
 use std::sync::{
-    Mutex, OnceLock,
+    Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 #[cfg(target_os = "macos")]
 use std::thread;
@@ -69,9 +69,11 @@ use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
     FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, JournalRepository,
-    MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
+    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState,
+    MountLiveModeStateChangeError, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository, open_credential_store,
+    VirtualMutationRecord, VirtualMutationRepository, is_live_mode_state_change_signal_path,
+    open_credential_store, save_mount_live_mode_and_publish_signal,
 };
 use localityd::autosave::auto_save_timestamp;
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
@@ -93,7 +95,8 @@ use localityd::virtual_fs::{
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::{
-    AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, WebviewUrl, WebviewWindowBuilder,
+    AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, Rect, WebviewUrl,
+    WebviewWindowBuilder,
     image::Image,
     menu::{Menu, MenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -128,6 +131,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250);
 const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
+const LIVE_MODE_RUNNER_ACTIVE_INTERVAL: Duration = Duration::from_millis(500);
+const LIVE_MODE_RUNNER_IDLE_RECHECK: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -137,6 +142,7 @@ struct DesktopSnapshot {
     mount: MountSummary,
     mounts: Vec<MountSummary>,
     active_mount_id: Option<String>,
+    live_mode: MountLiveModeSummary,
     needs_onboarding: bool,
     settings: DesktopSettings,
     pending_changes: Vec<PendingChange>,
@@ -226,6 +232,19 @@ struct LiveModeFileStatus {
     state: String,
     label: String,
     reason: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MountLiveModeSummary {
+    enabled: bool,
+    state: String,
+    label: String,
+    reason: Option<String>,
+    last_run_at: Option<String>,
+    pending_count: usize,
+    review_count: usize,
+    covered_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +376,12 @@ struct LiveModeFileChange {
     enabled: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MountLiveModeChange {
+    enabled: bool,
+}
+
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SURFACE_REFRESH_STATE: OnceLock<Mutex<SurfaceRefreshState>> = OnceLock::new();
@@ -364,6 +389,7 @@ static LAUNCH_AT_LOGIN_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
 static LIVE_MODE_REMOTE_PULL_CURSOR: OnceLock<Mutex<usize>> = OnceLock::new();
 static LIVE_MODE_LOCAL_RECONCILE_TIMES: OnceLock<Mutex<BTreeMap<PathBuf, Instant>>> =
     OnceLock::new();
+static LIVE_MODE_TICK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR: OnceLock<
     Mutex<WindowsCloudFilesProviderSupervisor>,
@@ -445,6 +471,39 @@ struct ScreenBounds {
     top: f64,
     right: f64,
     bottom: f64,
+}
+
+impl ScreenBounds {
+    fn contains(&self, point: PhysicalPosition<f64>) -> bool {
+        point.x >= self.left
+            && point.x <= self.right
+            && point.y >= self.top
+            && point.y <= self.bottom
+    }
+
+    fn distance_squared_to(&self, point: PhysicalPosition<f64>) -> f64 {
+        let dx = if point.x < self.left {
+            self.left - point.x
+        } else if point.x > self.right {
+            point.x - self.right
+        } else {
+            0.0
+        };
+        let dy = if point.y < self.top {
+            self.top - point.y
+        } else if point.y > self.bottom {
+            point.y - self.bottom
+        } else {
+            0.0
+        };
+        (dx * dx) + (dy * dy)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MonitorScreenBounds {
+    screen: ScreenBounds,
+    work_area: ScreenBounds,
 }
 
 #[tauri::command]
@@ -847,6 +906,24 @@ async fn live_mode_tick(app: AppHandle) -> ActionReport {
 }
 
 #[tauri::command]
+async fn set_mount_live_mode(app: AppHandle, change: MountLiveModeChange) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        set_mount_live_mode_blocking(change).unwrap_or_else(action_error)
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Live Mode worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
 async fn diff_notion_file(path: String) -> ActionReport {
     match tauri::async_runtime::spawn_blocking(move || {
         let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
@@ -975,7 +1052,51 @@ fn push_to_notion_blocking(confirm_dangerous: bool) -> ActionReport {
 }
 
 fn live_mode_tick_blocking() -> ActionReport {
-    let remote_target = match live_mode_next_remote_pull_target() {
+    if LIVE_MODE_TICK_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return ActionReport {
+            ok: true,
+            message: "Live Mode is already syncing.".to_string(),
+        };
+    }
+
+    let report = live_mode_tick_blocking_inner();
+    LIVE_MODE_TICK_IN_PROGRESS.store(false, Ordering::Release);
+    report
+}
+
+fn live_mode_tick_blocking_inner() -> ActionReport {
+    let state_root = default_state_root();
+    let mount = match live_mode_enabled_mount(&state_root) {
+        Ok(Some(mount)) => mount,
+        Ok(None) => {
+            return ActionReport {
+                ok: true,
+                message: "Live Mode is off.".to_string(),
+            };
+        }
+        Err(message) => {
+            return ActionReport { ok: false, message };
+        }
+    };
+
+    if let Err(message) = mark_mount_live_mode_syncing(&state_root, &mount.mount_id) {
+        return ActionReport { ok: false, message };
+    }
+
+    let report = live_mode_tick_for_enabled_mount(&state_root, &mount);
+    if let Err(message) = record_mount_live_mode_tick_result(&state_root, &mount.mount_id, &report)
+    {
+        return ActionReport { ok: false, message };
+    }
+
+    report
+}
+
+fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> ActionReport {
+    let remote_target = match live_mode_next_remote_pull_target_for_state_root(state_root, mount) {
         Ok(target) => target,
         Err(message) => {
             return ActionReport { ok: false, message };
@@ -1113,9 +1234,8 @@ fn live_mode_has_mounted_folder(snapshot: &DesktopSnapshot) -> bool {
     snapshot.mount.status != "not_mounted" && !snapshot.mount.local_path.trim().is_empty()
 }
 
-fn live_mode_next_remote_pull_target() -> Result<Option<LiveModeRemoteTarget>, String> {
-    let state_root = default_state_root();
-    let store = SqliteStateStore::open(state_root)
+fn live_mode_enabled_mount(state_root: &Path) -> Result<Option<MountConfig>, String> {
+    let store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
     let mounts = store
         .load_mounts()
@@ -1123,8 +1243,159 @@ fn live_mode_next_remote_pull_target() -> Result<Option<LiveModeRemoteTarget>, S
     let Some(mount) = choose_mount(&mounts) else {
         return Ok(None);
     };
+    let enabled = store
+        .get_mount_live_mode(&mount.mount_id)
+        .map_err(|error| format!("Live Mode could not inspect its state: {error}"))?
+        .is_some_and(|record| record.enabled);
+    Ok(enabled.then_some(mount))
+}
 
-    live_mode_next_remote_pull_target_for_mount(&store, &mount)
+#[derive(Debug, Default)]
+struct LiveModeWakeState {
+    generation: u64,
+}
+
+fn live_mode_wake_state() -> &'static (Mutex<LiveModeWakeState>, Condvar) {
+    static STATE: OnceLock<(Mutex<LiveModeWakeState>, Condvar)> = OnceLock::new();
+    STATE.get_or_init(|| (Mutex::new(LiveModeWakeState::default()), Condvar::new()))
+}
+
+fn live_mode_wake_generation() -> u64 {
+    let (state, _) = live_mode_wake_state();
+    state
+        .lock()
+        .expect("live mode wake lock poisoned")
+        .generation
+}
+
+fn wake_live_mode_runner() {
+    let (state, cvar) = live_mode_wake_state();
+    {
+        let mut state = state.lock().expect("live mode wake lock poisoned");
+        state.generation = state.generation.wrapping_add(1);
+    }
+    cvar.notify_all();
+}
+
+fn log_live_mode_state_signal_error(error: impl std::fmt::Display) {
+    desktop_log(
+        "warn",
+        "live_mode.signal_failed",
+        format!("could not publish Live Mode state-change signal: {error}"),
+    );
+}
+
+fn wait_for_live_mode_state_change(last_seen: &mut u64, timeout: Duration) -> bool {
+    let (state, cvar) = live_mode_wake_state();
+    let guard = state.lock().expect("live mode wake lock poisoned");
+    let (guard, timeout) = cvar
+        .wait_timeout_while(guard, timeout, |state| state.generation == *last_seen)
+        .expect("live mode wake lock poisoned");
+    let changed = guard.generation != *last_seen;
+    *last_seen = guard.generation;
+    changed && !timeout.timed_out()
+}
+
+fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionReport, String> {
+    let state_root = default_state_root();
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not inspect mounted folders: {error}"))?;
+    let mount = choose_mount(&mounts)
+        .ok_or_else(|| "Create a Notion folder before turning on Live Mode.".to_string())?;
+    let now = live_mode_timestamp();
+    let existing = store
+        .get_mount_live_mode(&mount.mount_id)
+        .map_err(|error| format!("Could not inspect Live Mode state: {error}"))?;
+    let record = existing.unwrap_or_else(|| {
+        MountLiveModeRecord::new(mount.mount_id.clone(), change.enabled, now.clone())
+    });
+    let record = if change.enabled {
+        record.active(None, now.clone(), now)
+    } else {
+        record.off(now)
+    };
+    match save_mount_live_mode_and_publish_signal(&mut store, &state_root, record) {
+        Ok(_) => wake_live_mode_runner(),
+        Err(MountLiveModeStateChangeError::Save(error)) => {
+            return Err(format!("Could not update Live Mode state: {error}"));
+        }
+        Err(MountLiveModeStateChangeError::PublishSignal(error)) => {
+            wake_live_mode_runner();
+            log_live_mode_state_signal_error(&error);
+            return Err(format!(
+                "Live Mode state changed, but Locality could not publish its wake signal: {error}"
+            ));
+        }
+    }
+
+    Ok(ActionReport {
+        ok: true,
+        message: if change.enabled {
+            "Live Mode is on for this folder.".to_string()
+        } else {
+            "Live Mode is off for this folder.".to_string()
+        },
+    })
+}
+
+fn mark_mount_live_mode_syncing(state_root: &Path, mount_id: &MountId) -> Result<(), String> {
+    let mut store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
+    let now = live_mode_timestamp();
+    let record = store
+        .get_mount_live_mode(mount_id)
+        .map_err(|error| format!("Live Mode could not inspect its state: {error}"))?
+        .unwrap_or_else(|| MountLiveModeRecord::new(mount_id.clone(), true, now.clone()))
+        .syncing(now);
+    store
+        .save_mount_live_mode(record)
+        .map_err(|error| format!("Live Mode could not update its state: {error}"))
+}
+
+fn record_mount_live_mode_tick_result(
+    state_root: &Path,
+    mount_id: &MountId,
+    report: &ActionReport,
+) -> Result<(), String> {
+    let mut store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
+    let now = live_mode_timestamp();
+    let record = store
+        .get_mount_live_mode(mount_id)
+        .map_err(|error| format!("Live Mode could not inspect its state: {error}"))?
+        .unwrap_or_else(|| MountLiveModeRecord::new(mount_id.clone(), true, now.clone()));
+    let record = if report.ok {
+        record.active(non_empty_string(report.message.clone()), now.clone(), now)
+    } else {
+        record.error(report.message.clone(), now.clone(), now)
+    };
+    store
+        .save_mount_live_mode(record)
+        .map_err(|error| format!("Live Mode could not update its state: {error}"))
+}
+
+fn live_mode_timestamp() -> String {
+    auto_save_timestamp()
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn live_mode_next_remote_pull_target_for_state_root(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<Option<LiveModeRemoteTarget>, String> {
+    let store = SqliteStateStore::open(state_root.to_path_buf())
+        .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
+    live_mode_next_remote_pull_target_for_mount(&store, mount)
 }
 
 fn live_mode_next_remote_pull_target_for_mount<S>(
@@ -1737,7 +2008,13 @@ fn load_desktop_snapshot_from_store(
         .map(|mount| {
             let connection = choose_connection_for_mount(&connections, mount);
             let provider = provider_runtime_summary(state_root, mount);
-            mount_summary(Some(store), Some(mount), connection.as_ref(), provider)
+            mount_summary(
+                Some(store),
+                state_root,
+                Some(mount),
+                connection.as_ref(),
+                provider,
+            )
         })
         .collect::<Vec<_>>();
     let provider = mount
@@ -1747,6 +2024,7 @@ fn load_desktop_snapshot_from_store(
         Some(mount) => pending_changes_for_mount(store, state_root, &mount.mount_id)?,
         None => Vec::new(),
     };
+    let live_mode = mount_live_mode_summary(store, mount.as_ref(), &pending_changes);
     let daemon_ready = send_request(state_root, &DaemonRequest::Ping)
         .map(|response| response.ok)
         .unwrap_or(false);
@@ -1763,9 +2041,16 @@ fn load_desktop_snapshot_from_store(
             attention_count: pending_changes.len(),
         },
         connection: connection_summary(connection.as_ref()),
-        mount: mount_summary(Some(store), mount.as_ref(), connection.as_ref(), provider),
+        mount: mount_summary(
+            Some(store),
+            state_root,
+            mount.as_ref(),
+            connection.as_ref(),
+            provider,
+        ),
         mounts: mount_summaries,
         active_mount_id: mount.as_ref().map(|mount| mount.mount_id.0.clone()),
+        live_mode,
         needs_onboarding,
         settings: desktop_settings(),
         pending_changes,
@@ -1779,6 +2064,7 @@ fn load_desktop_snapshot_from_store(
 }
 
 fn degraded_snapshot(message: String) -> DesktopSnapshot {
+    let state_root = default_state_root();
     DesktopSnapshot {
         health: AppHealth {
             state: "runtime_stopped".to_string(),
@@ -1808,8 +2094,9 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
             pending_change_count: 0,
             provider: None,
         },
-        mounts: vec![mount_summary(None, None, None, None)],
+        mounts: vec![mount_summary(None, &state_root, None, None, None)],
         active_mount_id: None,
+        live_mode: MountLiveModeSummary::off(),
         needs_onboarding: false,
         settings: desktop_settings(),
         pending_changes: Vec::new(),
@@ -1904,6 +2191,7 @@ fn connection_summary(connection: Option<&ConnectionRecord>) -> ConnectionSummar
 
 fn mount_summary(
     store: Option<&SqliteStateStore>,
+    state_root: &Path,
     mount: Option<&MountConfig>,
     connection: Option<&ConnectionRecord>,
     provider: Option<ProviderRuntimeSummary>,
@@ -1967,11 +2255,86 @@ fn mount_summary(
             .map(|entities| entities.len())
             .unwrap_or(0),
         pending_change_count: store
-            .map(|store| pending_changes_for_mount(store, &default_state_root(), &mount.mount_id))
+            .map(|store| pending_changes_for_mount(store, state_root, &mount.mount_id))
             .and_then(Result::ok)
             .map(|changes| changes.len())
             .unwrap_or(0),
         provider,
+    }
+}
+
+fn mount_live_mode_summary(
+    store: &SqliteStateStore,
+    mount: Option<&MountConfig>,
+    pending_changes: &[PendingChange],
+) -> MountLiveModeSummary {
+    let Some(mount) = mount else {
+        return MountLiveModeSummary::off();
+    };
+    let record = store.get_mount_live_mode(&mount.mount_id).ok().flatten();
+    MountLiveModeSummary::from_record(record.as_ref(), pending_changes)
+}
+
+impl MountLiveModeSummary {
+    fn off() -> Self {
+        Self {
+            enabled: false,
+            state: "off".to_string(),
+            label: "Live Mode off".to_string(),
+            reason: None,
+            last_run_at: None,
+            pending_count: 0,
+            review_count: 0,
+            covered_count: 0,
+        }
+    }
+
+    fn from_record(
+        record: Option<&MountLiveModeRecord>,
+        pending_changes: &[PendingChange],
+    ) -> Self {
+        let pending_count = pending_changes.len();
+        let review_count = pending_changes
+            .iter()
+            .filter(|change| change.state != "safe")
+            .count();
+        let covered_count = pending_changes
+            .iter()
+            .filter(|change| change.state == "safe")
+            .count();
+        let Some(record) = record else {
+            return Self {
+                pending_count,
+                review_count,
+                covered_count,
+                ..Self::off()
+            };
+        };
+        let state = mount_live_mode_state_label(record);
+
+        Self {
+            enabled: record.enabled,
+            state: state.0.to_string(),
+            label: state.1.to_string(),
+            reason: record.last_reason.clone(),
+            last_run_at: record.last_run_at.clone(),
+            pending_count,
+            review_count,
+            covered_count,
+        }
+    }
+}
+
+fn mount_live_mode_state_label(record: &MountLiveModeRecord) -> (&'static str, &'static str) {
+    if !record.enabled && record.state != MountLiveModeState::Error {
+        return ("off", "Live Mode off");
+    }
+
+    match record.state {
+        MountLiveModeState::Off => ("off", "Live Mode off"),
+        MountLiveModeState::Active => ("active", "Live Mode on"),
+        MountLiveModeState::Syncing => ("syncing", "Live Mode syncing"),
+        MountLiveModeState::Error => ("error", "Live Mode paused"),
     }
 }
 
@@ -3078,9 +3441,10 @@ fn inspect_install_state(state_root: &Path) -> InstallStateReview {
     let state_exists = state_root.exists();
     let current_build_id = current_desktop_build_id();
     let previous_build_id = marker.as_ref().map(install_marker_display_build_id);
+    let should_prompt = marker.is_none() && !sqlite_exists;
 
     InstallStateReview {
-        should_prompt: false,
+        should_prompt,
         state_exists,
         sqlite_exists,
         previous_build_id,
@@ -3310,15 +3674,13 @@ fn start_state_change_watcher(app: AppHandle) {
         loop {
             match rx.recv() {
                 Ok(Ok(event)) => {
-                    if !debounce_state_events_require_refresh(
-                        &rx,
-                        &state_root,
-                        &content_roots,
-                        event,
-                    ) {
-                        continue;
+                    let actions = debounce_state_events(&rx, &state_root, &content_roots, event);
+                    if actions.wake_live_mode {
+                        wake_live_mode_runner();
                     }
-                    refresh_desktop_surfaces(&app);
+                    if actions.refresh_surfaces {
+                        refresh_desktop_surfaces(&app);
+                    }
                 }
                 Ok(Err(error)) => desktop_log(
                     "warn",
@@ -3363,34 +3725,54 @@ fn watch_virtual_content_roots(
     vec![content_root]
 }
 
-fn debounce_state_events_require_refresh(
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StateEventActions {
+    refresh_surfaces: bool,
+    wake_live_mode: bool,
+}
+
+impl StateEventActions {
+    fn include(&mut self, other: Self) {
+        self.refresh_surfaces |= other.refresh_surfaces;
+        self.wake_live_mode |= other.wake_live_mode;
+    }
+}
+
+fn debounce_state_events(
     rx: &mpsc::Receiver<notify::Result<notify::Event>>,
     state_root: &Path,
     content_roots: &[PathBuf],
     first_event: notify::Event,
-) -> bool {
-    let mut should_refresh = state_event_requires_refresh(&first_event, state_root, content_roots);
+) -> StateEventActions {
+    let mut actions = state_event_actions(&first_event, state_root, content_roots);
     std::thread::sleep(std::time::Duration::from_millis(150));
     while let Ok(event) = rx.try_recv() {
         match event {
             Ok(event) => {
-                should_refresh |= state_event_requires_refresh(&event, state_root, content_roots);
+                actions.include(state_event_actions(&event, state_root, content_roots));
             }
             Err(error) => eprintln!("loc desktop state watcher event failed: {error}"),
         }
     }
-    should_refresh
+    actions
 }
 
-fn state_event_requires_refresh(
+fn state_event_actions(
     event: &notify::Event,
     state_root: &Path,
     content_roots: &[PathBuf],
-) -> bool {
-    event
-        .paths
-        .iter()
-        .any(|path| state_event_path_requires_refresh(path, state_root, content_roots))
+) -> StateEventActions {
+    let mut actions = StateEventActions::default();
+    for path in &event.paths {
+        actions.refresh_surfaces |=
+            state_event_path_requires_refresh(path, state_root, content_roots);
+        actions.wake_live_mode |= state_event_path_wakes_live_mode(path, state_root);
+    }
+    actions
+}
+
+fn state_event_path_wakes_live_mode(path: &Path, state_root: &Path) -> bool {
+    is_live_mode_state_change_signal_path(path, state_root)
 }
 
 fn state_event_path_requires_refresh(
@@ -3412,6 +3794,9 @@ fn state_event_path_requires_refresh(
     let file_name = relative.file_name().and_then(|name| name.to_str());
     if file_name.is_some_and(|name| name.starts_with("state.sqlite3")) {
         return false;
+    }
+    if is_live_mode_state_change_signal_path(path, state_root) {
+        return true;
     }
 
     match relative.components().next() {
@@ -6755,9 +7140,9 @@ fn reconcile_desktop_projection_changes(
     state_root: &Path,
     target: Option<&Path>,
 ) -> Result<(), String> {
-    daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+    daemon_file_provider::reconcile_visible_projection(store, state_root, target)
         .map(|_| ())
-        .map_err(|error| format!("Could not reconcile macOS File Provider changes: {error}"))
+        .map_err(|error| format!("Could not reconcile visible projection changes: {error}"))
 }
 
 fn auto_save_target_direct(target: &Path) -> Result<PushReport, String> {
@@ -7130,36 +7515,39 @@ mod tests {
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
-        InMemoryStateStore, JournalRepository, MountConfig, MountRepository, ProjectionMode,
-        ShadowRepository, SqliteStateStore,
+        InMemoryStateStore, JournalRepository, LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig,
+        MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
     };
     use localityd::ipc::DaemonBuildInfo;
-    use tauri::{PhysicalPosition, PhysicalSize};
+    use tauri::{PhysicalPosition, PhysicalSize, Rect};
 
     use super::{
-        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup, PendingChange,
-        ScreenBounds, TerminalCliLinkState, TrayVisualState, clear_mount_cached_projection,
-        clear_state_root_contents, conflict_preview, connection_metadata_changed,
-        current_daemon_build_id, current_desktop_build_id, diff_report_message,
-        exact_located_entity_record, failed_push_summary, has_unresolved_conflict_markers,
-        hydration_after_editor_write, inspect_install_state, install_terminal_cli_link_at,
-        install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
-        is_unsupported_schema_version_message, live_mode_content_hash_changed,
-        live_mode_e2e_append_local_marker, live_mode_e2e_append_remote_marker,
-        live_mode_e2e_notion_api, live_mode_e2e_page_id, live_mode_e2e_page_path,
-        live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_merge_remote_drift_markdown,
-        live_mode_remote_pull_candidates, live_mode_should_reconcile_local_target_for_key,
-        live_mode_target, live_mode_tick_blocking, live_mode_tick_from_snapshot,
-        load_desktop_activity, mount_has_pending_local_changes, mount_has_unfinished_journals,
-        notion_id_from_url, parse_daemon_build_info_json, pending_changes_from_status,
+        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup,
+        MonitorScreenBounds, PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
+        clear_mount_cached_projection, clear_state_root_contents, conflict_preview,
+        connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
+        diff_report_message, exact_located_entity_record, failed_push_summary,
+        has_unresolved_conflict_markers, hydration_after_editor_write, inspect_install_state,
+        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
+        is_notion_access_lost_message, is_unsupported_schema_version_message,
+        live_mode_content_hash_changed, live_mode_e2e_append_local_marker,
+        live_mode_e2e_append_remote_marker, live_mode_e2e_notion_api, live_mode_e2e_page_id,
+        live_mode_e2e_page_path, live_mode_e2e_remote_text, live_mode_e2e_wait_until,
+        live_mode_merge_remote_drift_markdown, live_mode_remote_pull_candidates,
+        live_mode_should_reconcile_local_target_for_key, live_mode_target, live_mode_tick_blocking,
+        live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
+        mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
+        parse_daemon_build_info_json, pending_changes_from_status,
         preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
         push_action_message, record_current_install_marker, record_desktop_activity,
-        sample_live_mode_status, sample_snapshot, shell_single_quote, should_hide_tray_popover,
-        should_prioritize_located_result, state_event_path_requires_refresh,
+        sample_live_mode_status, sample_snapshot, screen_bounds_for_anchor_from_monitors,
+        shell_single_quote, should_hide_tray_popover, should_prioritize_located_result,
+        state_event_path_requires_refresh, state_event_path_wakes_live_mode,
         summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
-        tray_popover_position, unique_suffix, validate_mount_root,
+        tray_popover_anchor, tray_popover_position, unique_suffix, validate_mount_root,
         virtual_projection_prefetch_container_identifiers,
-        virtual_projection_refresh_signal_identifiers, write_terminal_cli_path_section,
+        virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
+        wake_live_mode_runner, write_terminal_cli_path_section,
     };
 
     #[test]
@@ -7244,7 +7632,7 @@ mod tests {
 
     #[test]
     fn mount_summary_default_path_is_absolute() {
-        let summary = super::mount_summary(None, None, None, None);
+        let summary = super::mount_summary(None, Path::new("."), None, None, None);
 
         assert!(Path::new(&summary.local_path).is_absolute());
     }
@@ -7295,6 +7683,28 @@ mod tests {
             .expect("save google connection");
         store.save_mount(google_mount).expect("save google mount");
         store.save_mount(notion_mount).expect("save notion mount");
+        let google_remote_id = RemoteId::new("doc-1");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    MountId::new("google-docs-main"),
+                    google_remote_id.clone(),
+                    EntityKind::Page,
+                    "Planning Doc",
+                    "planning-doc/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save google entity");
+        store
+            .append_journal(JournalEntry::new(
+                PushId("push-google-1".to_string()),
+                MountId::new("google-docs-main"),
+                vec![google_remote_id.clone()],
+                PushPlan::new(vec![google_remote_id], Vec::new()),
+                JournalStatus::Prepared,
+            ))
+            .expect("append google journal");
 
         let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
             .expect("load snapshot from test store");
@@ -7318,6 +7728,15 @@ mod tests {
                 .expect("google mount")
                 .connector_name,
             "Google Docs"
+        );
+        assert_eq!(
+            snapshot
+                .mounts
+                .iter()
+                .find(|mount| mount.mount_id == "google-docs-main")
+                .expect("google mount")
+                .pending_change_count,
+            1
         );
     }
 
@@ -7873,7 +8292,7 @@ mod tests {
     #[test]
     fn windows_mount_summary_without_mount_reports_cloud_files_projection() {
         assert_eq!(
-            super::mount_summary(None, None, None, None).projection,
+            super::mount_summary(None, Path::new("."), None, None, None).projection,
             "Windows Cloud Files"
         );
         assert_eq!(
@@ -7906,7 +8325,7 @@ mod tests {
     #[test]
     fn linux_mount_summary_without_mount_reports_linux_fuse_projection() {
         assert_eq!(
-            super::mount_summary(None, None, None, None).projection,
+            super::mount_summary(None, Path::new("."), None, None, None).projection,
             "Linux FUSE"
         );
     }
@@ -7975,6 +8394,74 @@ mod tests {
             "main",
             &tauri::WindowEvent::Focused(false)
         ));
+    }
+
+    #[test]
+    fn tray_popover_anchor_uses_tray_icon_rect() {
+        let anchor = tray_popover_anchor(
+            PhysicalPosition::new(42.0, 12.0),
+            Rect {
+                position: PhysicalPosition::new(1600_i32, 4_i32).into(),
+                size: PhysicalSize::new(24_u32, 22_u32).into(),
+            },
+        );
+
+        assert_eq!(anchor, PhysicalPosition::new(1612.0, 26.0));
+    }
+
+    #[test]
+    fn tray_popover_anchor_falls_back_to_click_position_without_rect_size() {
+        let click_position = PhysicalPosition::new(42.0, 12.0);
+        let anchor = tray_popover_anchor(
+            click_position,
+            Rect {
+                position: PhysicalPosition::new(1600_i32, 4_i32).into(),
+                size: PhysicalSize::new(0_u32, 0_u32).into(),
+            },
+        );
+
+        assert_eq!(anchor, click_position);
+    }
+
+    #[test]
+    fn tray_monitor_selection_uses_monitor_containing_anchor() {
+        let left_work_area = ScreenBounds {
+            left: -1440.0,
+            top: 24.0,
+            right: 0.0,
+            bottom: 900.0,
+        };
+        let right_work_area = ScreenBounds {
+            left: 0.0,
+            top: 24.0,
+            right: 1440.0,
+            bottom: 900.0,
+        };
+        let monitors = [
+            MonitorScreenBounds {
+                screen: ScreenBounds {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 1440.0,
+                    bottom: 900.0,
+                },
+                work_area: right_work_area,
+            },
+            MonitorScreenBounds {
+                screen: ScreenBounds {
+                    left: -1440.0,
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 900.0,
+                },
+                work_area: left_work_area,
+            },
+        ];
+
+        assert_eq!(
+            screen_bounds_for_anchor_from_monitors(PhysicalPosition::new(-32.0, 12.0), &monitors),
+            Some(left_work_area)
+        );
     }
 
     #[test]
@@ -8521,6 +9008,13 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 connector: "notion".to_string(),
                 root: "/tmp/notion".to_string(),
+                live_mode: loc_cli::status::StatusLiveMode {
+                    enabled: false,
+                    state: "off".to_string(),
+                    label: "Live Mode off".to_string(),
+                    reason: None,
+                    last_run_at: None,
+                },
                 entries: vec![entry],
             }],
         }
@@ -8693,6 +9187,18 @@ mod tests {
         assert!(!review.should_prompt);
         assert!(review.state_exists);
         assert!(review.sqlite_exists);
+        assert_eq!(review.previous_build_id, None);
+    }
+
+    #[test]
+    fn install_state_prompts_for_fresh_install_without_state() {
+        let temp = TestTempDir::new("install-state-fresh");
+
+        let review = inspect_install_state(temp.path());
+
+        assert!(review.should_prompt);
+        assert!(review.state_exists);
+        assert!(!review.sqlite_exists);
         assert_eq!(review.previous_build_id, None);
     }
 
@@ -9032,6 +9538,40 @@ mod tests {
     }
 
     #[test]
+    fn state_watcher_uses_explicit_live_mode_signal_without_refreshing_on_sqlite() {
+        let temp = TestTempDir::new("state-watch-live-mode");
+        let state_root = temp.path().join(".loc");
+        let content_roots = vec![temp.path().join("group-content")];
+
+        for path in [
+            state_root.join("state.sqlite3"),
+            state_root.join("state.sqlite3-wal"),
+            state_root.join("state.sqlite3-shm"),
+        ] {
+            assert!(
+                !state_event_path_wakes_live_mode(&path, &state_root),
+                "{} should not wake Live Mode",
+                path.display()
+            );
+            assert!(
+                !state_event_path_requires_refresh(&path, &state_root, &content_roots),
+                "{} should not refresh desktop surfaces",
+                path.display()
+            );
+        }
+
+        assert!(state_event_path_wakes_live_mode(
+            &state_root.join(LIVE_MODE_STATE_CHANGE_SIGNAL_FILE),
+            &state_root
+        ));
+        assert!(state_event_path_requires_refresh(
+            &state_root.join(LIVE_MODE_STATE_CHANGE_SIGNAL_FILE),
+            &state_root,
+            &content_roots
+        ));
+    }
+
+    #[test]
     fn state_watcher_refreshes_for_user_visible_state_changes() {
         let temp = TestTempDir::new("state-watch-refresh");
         let state_root = temp.path().join(".loc");
@@ -9053,6 +9593,27 @@ mod tests {
             &state_root,
             &content_roots
         ));
+    }
+
+    #[test]
+    fn live_mode_wake_signal_unblocks_wait_without_polling_state() {
+        let mut generation = live_mode_wake_generation();
+
+        wake_live_mode_runner();
+
+        let started = Instant::now();
+        assert!(wait_for_live_mode_state_change(
+            &mut generation,
+            Duration::from_secs(1)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        let started = Instant::now();
+        assert!(!wait_for_live_mode_state_change(
+            &mut generation,
+            Duration::from_millis(10)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(5));
     }
 
     #[test]
@@ -9206,6 +9767,7 @@ fn sample_snapshot() -> DesktopSnapshot {
         mount: mount.clone(),
         mounts: vec![mount],
         active_mount_id: Some("notion-main".to_string()),
+        live_mode: MountLiveModeSummary::from_record(None, &sample_pending_changes()),
         needs_onboarding: false,
         settings: DesktopSettings {
             launch_at_login: true,
@@ -9655,6 +10217,7 @@ fn main() {
             start_desktop_activation_listener(app.app_handle().clone(), activation_event_handle);
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());
+            start_live_mode_runner(app.app_handle().clone());
             start_windows_cloud_files_provider_supervisor();
             start_agent_guidance_refresher();
             Ok(())
@@ -9680,6 +10243,7 @@ fn main() {
             push_notion_file,
             pull_notion_file,
             live_mode_tick,
+            set_mount_live_mode,
             diff_notion_file,
             inspect_notion_file,
             read_notion_file,
@@ -9713,6 +10277,42 @@ fn start_agent_guidance_refresher() {
             std::thread::sleep(std::time::Duration::from_secs(10 * 60));
         }
     });
+}
+
+fn start_live_mode_runner(app: AppHandle) {
+    std::thread::spawn(move || {
+        let mut wake_generation = live_mode_wake_generation();
+        loop {
+            if !mount_live_mode_enabled() {
+                wait_for_live_mode_state_change(
+                    &mut wake_generation,
+                    LIVE_MODE_RUNNER_IDLE_RECHECK,
+                );
+                continue;
+            }
+            let report = live_mode_tick_blocking();
+            if live_mode_tick_should_refresh_surfaces(&report) {
+                refresh_desktop_surfaces(&app);
+            }
+            wake_generation = live_mode_wake_generation();
+            wait_for_live_mode_state_change(&mut wake_generation, LIVE_MODE_RUNNER_ACTIVE_INTERVAL);
+        }
+    });
+}
+
+fn mount_live_mode_enabled() -> bool {
+    live_mode_enabled_mount(&default_state_root())
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+fn live_mode_tick_should_refresh_surfaces(report: &ActionReport) -> bool {
+    !report.ok
+        || report.message.contains("synced")
+        || report.message.contains("pulled")
+        || report.message.contains("paused")
+        || report.message.contains("off")
 }
 
 fn configure_main_window_chrome(app: &mut tauri::App) {
@@ -9793,12 +10393,13 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
                 position,
+                rect,
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
             } = event
             {
-                toggle_tray_popover(tray.app_handle(), position);
+                toggle_tray_popover(tray.app_handle(), tray_popover_anchor(position, rect));
             }
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -9829,6 +10430,22 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     refresh_tray_icon(app.app_handle());
 
     Ok(())
+}
+
+fn tray_popover_anchor(
+    click_position: PhysicalPosition<f64>,
+    icon_rect: Rect,
+) -> PhysicalPosition<f64> {
+    let rect_position = icon_rect.position.to_physical::<f64>(1.0);
+    let rect_size = icon_rect.size.to_physical::<f64>(1.0);
+    if rect_size.width <= 0.0 || rect_size.height <= 0.0 {
+        return click_position;
+    }
+
+    PhysicalPosition::new(
+        rect_position.x + (rect_size.width / 2.0),
+        rect_position.y + rect_size.height,
+    )
 }
 
 fn build_tray_popover(app: &mut tauri::App) -> tauri::Result<()> {
@@ -9880,14 +10497,51 @@ fn screen_bounds_for_tray_anchor(
     app: &AppHandle,
     position: PhysicalPosition<f64>,
 ) -> Option<ScreenBounds> {
-    if let Ok(Some(monitor)) = app.monitor_from_point(position.x, position.y) {
-        return Some(monitor_work_area_bounds(&monitor));
+    if let Ok(monitors) = app.available_monitors() {
+        let monitor_bounds = monitors
+            .iter()
+            .map(monitor_screen_bounds)
+            .collect::<Vec<_>>();
+        if let Some(bounds) = screen_bounds_for_anchor_from_monitors(position, &monitor_bounds) {
+            return Some(bounds);
+        }
     }
 
     app.primary_monitor()
         .ok()
         .flatten()
         .map(|monitor| monitor_work_area_bounds(&monitor))
+}
+
+fn screen_bounds_for_anchor_from_monitors(
+    anchor: PhysicalPosition<f64>,
+    monitors: &[MonitorScreenBounds],
+) -> Option<ScreenBounds> {
+    monitors
+        .iter()
+        .find(|bounds| bounds.screen.contains(anchor))
+        .or_else(|| {
+            monitors.iter().min_by(|left, right| {
+                left.screen
+                    .distance_squared_to(anchor)
+                    .total_cmp(&right.screen.distance_squared_to(anchor))
+            })
+        })
+        .map(|bounds| bounds.work_area)
+}
+
+fn monitor_screen_bounds(monitor: &tauri::Monitor) -> MonitorScreenBounds {
+    let position = monitor.position();
+    let size = monitor.size();
+    MonitorScreenBounds {
+        screen: ScreenBounds {
+            left: f64::from(position.x),
+            top: f64::from(position.y),
+            right: f64::from(position.x) + f64::from(size.width),
+            bottom: f64::from(position.y) + f64::from(size.height),
+        },
+        work_area: monitor_work_area_bounds(monitor),
+    }
 }
 
 fn monitor_work_area_bounds(monitor: &tauri::Monitor) -> ScreenBounds {

@@ -90,10 +90,33 @@ run_quiet() {
   fi
 }
 
+prepare_path_for_removal() {
+  local path="$1"
+  [[ "${DRY_RUN}" -eq 0 ]] || return 0
+  [[ "$(uname -s)" == "Darwin" ]] || return 0
+
+  command -v chflags >/dev/null 2>&1 && chflags -R nouchg "${path}" >/dev/null 2>&1 || true
+  command -v chmod >/dev/null 2>&1 && chmod -RN "${path}" >/dev/null 2>&1 || true
+}
+
 remove_path() {
   local path="$1"
   [[ -e "${path}" || -L "${path}" ]] || return 0
+  prepare_path_for_removal "${path}"
   run rm -rf "${path}"
+}
+
+remove_cli_link_if_locality_app_link() {
+  local path="$1"
+  [[ -L "${path}" ]] || return 0
+
+  local target
+  target="$(readlink "${path}" 2>/dev/null || true)"
+  case "${target}" in
+    "${APP_PATH}/Contents/MacOS/loc"|*/Locality.app/Contents/MacOS/loc)
+      run rm -f "${path}"
+      ;;
+  esac
 }
 
 append_unique() {
@@ -191,7 +214,9 @@ reset_file_provider_domains() {
 stop_processes() {
   if [[ "$(uname -s)" == "Darwin" ]]; then
     run_quiet osascript -e 'tell application id "ai.codeflash.locality" to quit'
+    run_quiet launchctl bootout "gui/${UID}/ai.codeflash.locality.desktop"
     run_quiet launchctl bootout "gui/${UID}/ai.codeflash.locality.localityd"
+    run_quiet launchctl bootout "gui/${UID}" "${HOME}/Library/LaunchAgents/ai.codeflash.locality.desktop.plist"
     run_quiet launchctl bootout "gui/${UID}" "${HOME}/Library/LaunchAgents/ai.codeflash.locality.localityd.plist"
   fi
 
@@ -264,14 +289,26 @@ remove_credentials() {
 
 remove_support_files() {
   if [[ "$(uname -s)" == "Darwin" ]]; then
+    remove_path "${HOME}/Library/LaunchAgents/ai.codeflash.locality.desktop.plist"
     remove_path "${HOME}/Library/LaunchAgents/ai.codeflash.locality.localityd.plist"
     remove_path "${HOME}/Library/Group Containers/C484HB7Q6S.group.ai.codeflash.locality"
     remove_path "${HOME}/Library/Group Containers/group.ai.codeflash.locality"
+    remove_path "${HOME}/Library/Application Scripts/C484HB7Q6S.group.ai.codeflash.locality"
+    remove_path "${HOME}/Library/Application Scripts/group.ai.codeflash.locality"
+    remove_path "${HOME}/Library/Application Scripts/ai.codeflash.locality.Locality.FileProvider"
+    remove_path "${HOME}/Library/Application Scripts/ai.codeflash.locality.Locality.file-providerctl"
     remove_path "${HOME}/Library/Application Support/ai.codeflash.locality"
     remove_path "${HOME}/Library/Caches/ai.codeflash.locality"
+    remove_path "${HOME}/Library/Containers/ai.codeflash.locality.Locality.FileProvider"
+    remove_path "${HOME}/Library/Containers/ai.codeflash.locality.Locality.file-providerctl"
     remove_path "${HOME}/Library/HTTPStorages/ai.codeflash.locality"
     remove_path "${HOME}/Library/Preferences/ai.codeflash.locality.plist"
     remove_path "${HOME}/Library/Saved Application State/ai.codeflash.locality.savedState"
+    remove_path "${HOME}/Library/WebKit/ai.codeflash.locality"
+    remove_cli_link_if_locality_app_link "${HOME}/.local/bin/loc"
+    remove_cli_link_if_locality_app_link "${HOME}/bin/loc"
+    remove_cli_link_if_locality_app_link "/opt/homebrew/bin/loc"
+    remove_cli_link_if_locality_app_link "/usr/local/bin/loc"
   fi
   remove_path "${STATE_DIR}"
 }
@@ -302,8 +339,8 @@ stop_processes
 reset_file_provider_domains
 remove_mount_roots
 remove_credentials
-remove_support_files
 remove_app
+remove_support_files
 
 log ""
 if [[ "${DRY_RUN}" -eq 1 ]]; then

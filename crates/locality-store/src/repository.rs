@@ -14,13 +14,20 @@ use crate::error::StoreResult;
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord, MountConfig,
-    RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
+    MountLiveModeRecord, RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
 
 pub trait MountRepository {
     fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()>;
     fn get_mount(&self, mount_id: &MountId) -> StoreResult<Option<MountConfig>>;
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>>;
+}
+
+pub trait MountLiveModeRepository {
+    fn save_mount_live_mode(&mut self, live_mode: MountLiveModeRecord) -> StoreResult<()>;
+    fn get_mount_live_mode(&self, mount_id: &MountId) -> StoreResult<Option<MountLiveModeRecord>>;
+    fn list_mount_live_modes(&self) -> StoreResult<Vec<MountLiveModeRecord>>;
+    fn delete_mount_live_mode(&mut self, mount_id: &MountId) -> StoreResult<()>;
 }
 
 pub trait ConnectionRepository {

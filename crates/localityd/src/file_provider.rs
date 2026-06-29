@@ -223,13 +223,13 @@ pub struct ProjectionRefreshBase {
     pub previous_shadow: ShadowDocument,
 }
 
-/// Imports macOS File Provider replica edits that did not arrive through
-/// `modifyItem`.
+/// Imports visible virtual-provider replica edits that did not arrive through
+/// the provider callback path.
 ///
 /// This is intentionally a narrow command-boundary fallback, not a background
 /// scanner: it reads only an explicit target. The daemon cache remains the
 /// durable source used by diff and push after this reconciliation step.
-pub fn reconcile_macos_file_provider_projection<S>(
+pub fn reconcile_visible_projection<S>(
     store: &mut S,
     state_root: &Path,
     target: Option<&Path>,
@@ -241,13 +241,13 @@ where
         + VirtualMutationRepository
         + FreshnessStateRepository,
 {
-    reconcile_macos_file_provider_projection_with_mode(store, state_root, target, true)
+    reconcile_visible_projection_with_mode(store, state_root, target, true)
 }
 
-/// Imports only visible macOS File Provider replicas newer than daemon content.
+/// Imports only visible virtual-provider replicas newer than daemon content.
 ///
 /// This is used before explicit pull so a missed local edit is preserved, while
-/// an older stale CloudStorage replica does not get mistaken for a local edit.
+/// an older stale visible replica does not get mistaken for a local edit.
 pub fn reconcile_newer_macos_file_provider_projection<S>(
     store: &mut S,
     state_root: &Path,
@@ -260,10 +260,10 @@ where
         + VirtualMutationRepository
         + FreshnessStateRepository,
 {
-    reconcile_macos_file_provider_projection_with_mode(store, state_root, target, false)
+    reconcile_visible_projection_with_mode(store, state_root, target, false)
 }
 
-fn reconcile_macos_file_provider_projection_with_mode<S>(
+fn reconcile_visible_projection_with_mode<S>(
     store: &mut S,
     state_root: &Path,
     target: Option<&Path>,
@@ -283,7 +283,7 @@ where
     let mut report = ProjectionReconcileReport::default();
 
     for mount in mounts {
-        if mount.projection != ProjectionMode::MacosFileProvider {
+        if !supports_visible_projection_refresh(&mount.projection) {
             continue;
         }
 
@@ -322,18 +322,188 @@ where
     Ok(report)
 }
 
-/// Copies daemon-materialized content back into the visible macOS File Provider
+/// Copies daemon-materialized content back into a visible virtual-provider
 /// replica after an explicit remote refresh.
 ///
-/// File Provider may keep an already-materialized CloudStorage file stale even
-/// after the daemon content cache has accepted newer remote content. This repair
-/// is deliberately target-scoped and only writes visible files that already
-/// exist.
+/// Some virtual providers may keep an already-materialized visible file stale
+/// even after the daemon content cache has accepted newer remote content. This
+/// repair is deliberately target-scoped and only writes visible files that
+/// already exist.
+pub fn refresh_visible_projection<S>(
+    store: &S,
+    state_root: &Path,
+    target: Option<&Path>,
+    refresh_bases: &[ProjectionRefreshBase],
+) -> LocalityResult<ProjectionRefreshReport>
+where
+    S: MountRepository + EntityRepository,
+{
+    refresh_projection_for(
+        store,
+        state_root,
+        target,
+        refresh_bases,
+        supports_visible_projection_refresh,
+    )
+}
+
+pub fn visible_projection_refresh_bases<S>(
+    store: &S,
+    target: Option<&Path>,
+) -> LocalityResult<Vec<ProjectionRefreshBase>>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+{
+    projection_refresh_bases_for(store, target, supports_visible_projection_refresh)
+}
+
+/// Repairs already-materialized visible virtual-provider replicas after a
+/// background remote fast-forward.
+///
+/// Unlike explicit `loc pull <path>`, this path runs without direct user intent,
+/// so it only replaces visible replica contents that are still equal to the
+/// previous synced shadow. If the visible file diverged, the repair is skipped
+/// so a missed provider write is not silently overwritten.
+pub fn refresh_visible_entity_projection_if_clean<S>(
+    store: &S,
+    state_root: &Path,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+    previous_shadow: &ShadowDocument,
+) -> LocalityResult<ProjectionRefreshReport>
+where
+    S: MountRepository + EntityRepository,
+{
+    let Some(mount) = store.get_mount(mount_id).map_err(LocalityError::from)? else {
+        return Ok(ProjectionRefreshReport::default());
+    };
+    if !supports_visible_projection_refresh(&mount.projection) {
+        return Ok(ProjectionRefreshReport::default());
+    }
+
+    refresh_entity_projection_if_clean(store, state_root, &mount, remote_id, previous_shadow)
+}
+
+/// Repairs already-materialized macOS File Provider replicas after a background
+/// remote fast-forward.
+///
+/// Unlike explicit `loc pull <path>`, this path runs without direct user intent,
+/// so it only replaces visible replica contents that are still equal to the
+/// previous synced shadow. If the visible file diverged, the repair is skipped
+/// so a missed File Provider write is not silently overwritten.
+pub fn refresh_macos_file_provider_entity_projection_if_clean<S>(
+    store: &S,
+    state_root: &Path,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+    previous_shadow: &ShadowDocument,
+) -> LocalityResult<ProjectionRefreshReport>
+where
+    S: MountRepository + EntityRepository,
+{
+    let Some(mount) = store.get_mount(mount_id).map_err(LocalityError::from)? else {
+        return Ok(ProjectionRefreshReport::default());
+    };
+    if mount.projection != ProjectionMode::MacosFileProvider {
+        return Ok(ProjectionRefreshReport::default());
+    }
+
+    refresh_entity_projection_if_clean(store, state_root, &mount, remote_id, previous_shadow)
+}
+
+fn refresh_entity_projection_if_clean<S>(
+    store: &S,
+    state_root: &Path,
+    mount: &MountConfig,
+    remote_id: &RemoteId,
+    previous_shadow: &ShadowDocument,
+) -> LocalityResult<ProjectionRefreshReport>
+where
+    S: EntityRepository,
+{
+    let Some(entity) = store
+        .get_entity(&mount.mount_id, remote_id)
+        .map_err(LocalityError::from)?
+    else {
+        return Ok(ProjectionRefreshReport::default());
+    };
+    if entity.kind != EntityKind::Page {
+        return Ok(ProjectionRefreshReport::default());
+    }
+
+    let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
+    let mut report = ProjectionRefreshReport::default();
+    let candidates = existing_projection_paths(&mount, &entity.path);
+    if candidates.is_empty() {
+        report.skipped_missing_projection += 1;
+        return Ok(report);
+    }
+
+    for candidate in candidates {
+        match refresh_projection_candidate_if_clean(
+            &entity,
+            &content_root,
+            candidate,
+            Some(previous_shadow),
+        )? {
+            ProjectionRefreshOutcome::MissingCache => {
+                report.checked += 1;
+                report.skipped_missing_cache += 1;
+            }
+            ProjectionRefreshOutcome::MissingProjection => {
+                report.checked += 1;
+                report.skipped_missing_projection += 1;
+            }
+            ProjectionRefreshOutcome::Unchanged => {
+                report.checked += 1;
+                report.skipped_unchanged += 1;
+            }
+            ProjectionRefreshOutcome::SkippedLocalChanges => {
+                report.checked += 1;
+                report.skipped_local_changes += 1;
+            }
+            ProjectionRefreshOutcome::Refreshed => {
+                report.checked += 1;
+                report.refreshed += 1;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 pub fn refresh_macos_file_provider_projection<S>(
     store: &S,
     state_root: &Path,
     target: Option<&Path>,
     refresh_bases: &[ProjectionRefreshBase],
+) -> LocalityResult<ProjectionRefreshReport>
+where
+    S: MountRepository + EntityRepository,
+{
+    refresh_projection_for(store, state_root, target, refresh_bases, |projection| {
+        matches!(projection, ProjectionMode::MacosFileProvider)
+    })
+}
+
+pub fn macos_file_provider_projection_refresh_bases<S>(
+    store: &S,
+    target: Option<&Path>,
+) -> LocalityResult<Vec<ProjectionRefreshBase>>
+where
+    S: MountRepository + EntityRepository + ShadowRepository,
+{
+    projection_refresh_bases_for(store, target, |projection| {
+        matches!(projection, ProjectionMode::MacosFileProvider)
+    })
+}
+
+fn refresh_projection_for<S>(
+    store: &S,
+    state_root: &Path,
+    target: Option<&Path>,
+    refresh_bases: &[ProjectionRefreshBase],
+    include_projection: impl Fn(&ProjectionMode) -> bool,
 ) -> LocalityResult<ProjectionRefreshReport>
 where
     S: MountRepository + EntityRepository,
@@ -345,7 +515,7 @@ where
     let mut report = ProjectionRefreshReport::default();
 
     for mount in mounts {
-        if mount.projection != ProjectionMode::MacosFileProvider {
+        if !include_projection(&mount.projection) {
             continue;
         }
 
@@ -396,9 +566,10 @@ where
     Ok(report)
 }
 
-pub fn macos_file_provider_projection_refresh_bases<S>(
+fn projection_refresh_bases_for<S>(
     store: &S,
     target: Option<&Path>,
+    include_projection: impl Fn(&ProjectionMode) -> bool,
 ) -> LocalityResult<Vec<ProjectionRefreshBase>>
 where
     S: MountRepository + EntityRepository + ShadowRepository,
@@ -410,7 +581,7 @@ where
     let mut bases = Vec::new();
 
     for mount in mounts {
-        if mount.projection != ProjectionMode::MacosFileProvider {
+        if !include_projection(&mount.projection) {
             continue;
         }
 
@@ -440,79 +611,11 @@ where
     Ok(bases)
 }
 
-/// Repairs already-materialized macOS File Provider replicas after a background
-/// remote fast-forward.
-///
-/// Unlike explicit `loc pull <path>`, this path runs without direct user intent,
-/// so it only replaces visible replica contents that are still equal to the
-/// previous synced shadow. If the visible file diverged, the repair is skipped
-/// so a missed File Provider write is not silently overwritten.
-pub fn refresh_macos_file_provider_entity_projection_if_clean<S>(
-    store: &S,
-    state_root: &Path,
-    mount_id: &MountId,
-    remote_id: &RemoteId,
-    previous_shadow: &ShadowDocument,
-) -> LocalityResult<ProjectionRefreshReport>
-where
-    S: MountRepository + EntityRepository,
-{
-    let Some(mount) = store.get_mount(mount_id).map_err(LocalityError::from)? else {
-        return Ok(ProjectionRefreshReport::default());
-    };
-    if mount.projection != ProjectionMode::MacosFileProvider {
-        return Ok(ProjectionRefreshReport::default());
-    }
-
-    let Some(entity) = store
-        .get_entity(mount_id, remote_id)
-        .map_err(LocalityError::from)?
-    else {
-        return Ok(ProjectionRefreshReport::default());
-    };
-    if entity.kind != EntityKind::Page {
-        return Ok(ProjectionRefreshReport::default());
-    }
-
-    let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
-    let mut report = ProjectionRefreshReport::default();
-    let candidates = existing_projection_paths(&mount, &entity.path);
-    if candidates.is_empty() {
-        report.skipped_missing_projection += 1;
-        return Ok(report);
-    }
-
-    for candidate in candidates {
-        match refresh_projection_candidate_if_clean(
-            &entity,
-            &content_root,
-            candidate,
-            Some(previous_shadow),
-        )? {
-            ProjectionRefreshOutcome::MissingCache => {
-                report.checked += 1;
-                report.skipped_missing_cache += 1;
-            }
-            ProjectionRefreshOutcome::MissingProjection => {
-                report.checked += 1;
-                report.skipped_missing_projection += 1;
-            }
-            ProjectionRefreshOutcome::Unchanged => {
-                report.checked += 1;
-                report.skipped_unchanged += 1;
-            }
-            ProjectionRefreshOutcome::SkippedLocalChanges => {
-                report.checked += 1;
-                report.skipped_local_changes += 1;
-            }
-            ProjectionRefreshOutcome::Refreshed => {
-                report.checked += 1;
-                report.refreshed += 1;
-            }
-        }
-    }
-
-    Ok(report)
+fn supports_visible_projection_refresh(projection: &ProjectionMode) -> bool {
+    matches!(
+        projection,
+        ProjectionMode::MacosFileProvider | ProjectionMode::WindowsCloudFiles
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1389,9 +1492,8 @@ mod tests {
         fixture.write_projection_without_identity("Original body.\n\nLocal edit.\n");
 
         let mut store = fixture.store();
-        let report =
-            reconcile_macos_file_provider_projection(&mut store, &fixture.state_root, None)
-                .expect("reconcile projection");
+        let report = reconcile_visible_projection(&mut store, &fixture.state_root, None)
+            .expect("reconcile projection");
 
         assert_eq!(report, ProjectionReconcileReport::default());
         let cached = fs::read_to_string(fixture.content_path()).expect("read cache");
@@ -1407,7 +1509,7 @@ mod tests {
         fixture.write_projection_without_identity("Original body.\n\nLocal edit.\n");
 
         let mut store = fixture.store();
-        let report = reconcile_macos_file_provider_projection(
+        let report = reconcile_visible_projection(
             &mut store,
             &fixture.state_root,
             Some(&fixture.projection_path()),
@@ -1436,7 +1538,7 @@ mod tests {
         fixture.write_cache("Original body.\n");
 
         let mut store = fixture.store();
-        let report = reconcile_macos_file_provider_projection(
+        let report = reconcile_visible_projection(
             &mut store,
             &fixture.state_root,
             Some(&fixture.projection_path()),

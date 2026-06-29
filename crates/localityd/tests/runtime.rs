@@ -15,7 +15,8 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, EntityRecord, EntityRepository,
     FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
-    MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+    InMemoryStateStore, MountConfig, MountRepository, ProjectionMode, ShadowRepository,
+    SqliteStateStore,
 };
 use localityd::DaemonConfig;
 use localityd::execution::{DaemonEventReport, PushJob};
@@ -25,6 +26,7 @@ use localityd::ipc::{DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use localityd::runtime::{
     DaemonRuntime, DaemonRuntimeHandle, DefaultRuntimeJobRunner, FileEventRuntimeReport,
     FreshnessRuntimeReport, RuntimeJobRunner, ScheduledPullRuntimeReport,
+    workspace_virtual_freshness_jobs,
 };
 use localityd::scheduler::PullSchedulerTick;
 #[cfg(target_os = "macos")]
@@ -336,6 +338,404 @@ fn runtime_scheduler_queues_and_drains_hydration() {
     assert_eq!(request.remote_id, RemoteId::new("page-1"));
     assert_eq!(request.reason, HydrationReason::Policy);
     runtime.shutdown();
+}
+
+#[test]
+fn runtime_drains_freshness_queued_by_scheduled_pull() {
+    let (scheduled_tx, scheduled_rx) = mpsc::channel();
+    let (freshness_tx, freshness_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        polling_config("scheduled-freshness"),
+        ScheduledFreshnessRunner {
+            scheduled: scheduled_tx,
+            freshness: freshness_tx,
+            scheduled_count: AtomicUsize::new(0),
+        },
+    )
+    .expect("spawn runtime");
+
+    scheduled_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("scheduled pull ran");
+    let job = freshness_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("freshness drained");
+
+    assert_eq!(job.mount_id, MountId::new("notion-main"));
+    assert_eq!(job.remote_id, Some(RemoteId::new("page-1")));
+    assert_eq!(job.kind, SyncJobKind::ObserveEntity);
+    assert_eq!(job.reason, ChangeHintKind::BackgroundPoll);
+    runtime.shutdown();
+}
+
+#[test]
+fn workspace_virtual_mount_queues_hydrated_page_on_cold_tick() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-cold");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "page-1",
+        "Roadmap",
+        "Roadmap.md",
+        HydrationState::Hydrated,
+    );
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: false,
+            poll_cold: true,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].mount_id, mount_id);
+    assert_eq!(jobs[0].remote_id, Some(RemoteId::new("page-1")));
+    assert_eq!(jobs[0].kind, SyncJobKind::ObserveEntity);
+    assert_eq!(jobs[0].reason, ChangeHintKind::BackgroundPoll);
+    assert_eq!(jobs[0].tier, FreshnessTier::Warm);
+}
+
+#[test]
+fn workspace_virtual_mount_queues_hot_dirty_and_conflicted_pages_on_active_tick() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-active");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "hot-page",
+        "Hot",
+        "Hot.md",
+        HydrationState::Hydrated,
+    );
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "dirty-page",
+        "Dirty",
+        "Dirty.md",
+        HydrationState::Dirty,
+    );
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "conflicted-page",
+        "Conflicted",
+        "Conflicted.md",
+        HydrationState::Conflicted,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("hot-page"),
+                FreshnessTier::Hot,
+            )
+            .opened_at(freshness_timestamp())
+            .checked_at("unix_ms:100"),
+        )
+        .expect("save hot freshness");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: false,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert_eq!(jobs.len(), 3);
+    let job_facts = jobs
+        .iter()
+        .map(|job| {
+            (
+                job.remote_id
+                    .as_ref()
+                    .expect("remote id")
+                    .as_str()
+                    .to_string(),
+                format!("{:?}", job.reason),
+                job.tier.as_str().to_string(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        job_facts,
+        BTreeSet::from([
+            (
+                "conflicted-page".to_string(),
+                "LocalEdited".to_string(),
+                "hot".to_string(),
+            ),
+            (
+                "dirty-page".to_string(),
+                "LocalEdited".to_string(),
+                "hot".to_string(),
+            ),
+            (
+                "hot-page".to_string(),
+                "FileOpened".to_string(),
+                "hot".to_string(),
+            ),
+        ])
+    );
+}
+
+#[test]
+fn workspace_virtual_mount_does_not_queue_stale_hot_page_on_active_tick() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-stale-hot");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "stale-hot-page",
+        "Stale Hot",
+        "Stale Hot.md",
+        HydrationState::Hydrated,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("stale-hot-page"),
+                FreshnessTier::Hot,
+            )
+            .opened_at("unix_ms:1")
+            .checked_at("unix_ms:2"),
+        )
+        .expect("save stale hot freshness");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: false,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert!(jobs.is_empty());
+}
+
+#[test]
+fn workspace_virtual_mount_skips_pages_deferred_until_future_check() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-future-check");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "deferred-page",
+        "Deferred",
+        "Deferred.md",
+        HydrationState::Hydrated,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("deferred-page"),
+                FreshnessTier::Warm,
+            )
+            .next_check_at("unix_ms:18446744073709551615"),
+        )
+        .expect("save deferred freshness");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: false,
+            poll_cold: true,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert!(jobs.is_empty());
+}
+
+#[test]
+fn workspace_virtual_mount_does_not_queue_stub_or_virtual_pages() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-skip-stub");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "stub-page",
+        "Stub",
+        "Stub.md",
+        HydrationState::Stub,
+    );
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "virtual-page",
+        "Virtual",
+        "Virtual.md",
+        HydrationState::Virtual,
+    );
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Tasks",
+                "Tasks",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save database");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: true,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert!(jobs.is_empty());
+}
+
+#[test]
+fn root_page_virtual_mount_is_not_queued_by_workspace_freshness_path() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "root-page-virtual")
+        .with_remote_root_id(RemoteId::new("root-page"));
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "root-page",
+        "Root",
+        "Root/page.md",
+        HydrationState::Hydrated,
+    );
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: false,
+            poll_cold: true,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert!(jobs.is_empty());
+}
+
+#[test]
+fn workspace_freshness_cap_and_order_prefers_hot_then_oldest_checks() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-cap");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "hot-recent",
+        "Hot Recent",
+        "z-hot-recent.md",
+        HydrationState::Hydrated,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("hot-recent"),
+                FreshnessTier::Hot,
+            )
+            .opened_at(freshness_timestamp())
+            .checked_at("unix_ms:999999"),
+        )
+        .expect("save hot freshness");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "warm-never",
+        "Warm Never",
+        "a-warm-never.md",
+        HydrationState::Hydrated,
+    );
+    for index in 0..98 {
+        let remote_id = format!("warm-old-{index:03}");
+        save_workspace_page(
+            &mut store,
+            &mount_id,
+            &remote_id,
+            format!("Warm Old {index:03}"),
+            format!("b-warm-old-{index:03}.md"),
+            HydrationState::Hydrated,
+        );
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new(remote_id),
+                    FreshnessTier::Warm,
+                )
+                .checked_at(format!("unix_ms:{}", index + 1)),
+            )
+            .expect("save old freshness");
+    }
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "warm-newest",
+        "Warm Newest",
+        "c-warm-newest.md",
+        HydrationState::Hydrated,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("warm-newest"),
+                FreshnessTier::Warm,
+            )
+            .checked_at("unix_ms:9999999"),
+        )
+        .expect("save newest freshness");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: true,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert_eq!(jobs.len(), 100);
+    assert_eq!(jobs[0].remote_id, Some(RemoteId::new("hot-recent")));
+    assert_eq!(jobs[1].remote_id, Some(RemoteId::new("warm-never")));
+    assert_eq!(jobs[2].remote_id, Some(RemoteId::new("warm-old-000")));
+    assert!(
+        !jobs
+            .iter()
+            .any(|job| job.remote_id == Some(RemoteId::new("warm-newest")))
+    );
 }
 
 #[test]
@@ -2115,6 +2515,12 @@ struct SchedulingRunner {
     scheduled_count: AtomicUsize,
 }
 
+struct ScheduledFreshnessRunner {
+    scheduled: mpsc::Sender<()>,
+    freshness: mpsc::Sender<SyncJob>,
+    scheduled_count: AtomicUsize,
+}
+
 struct EventRunner {
     event_tx: mpsc::Sender<FileEvent>,
 }
@@ -2745,6 +3151,7 @@ impl RuntimeJobRunner for SchedulingRunner {
         Ok(ScheduledPullRuntimeReport {
             report: Default::default(),
             queued_hydrations,
+            freshness_jobs: Vec::new(),
         })
     }
 
@@ -2755,6 +3162,65 @@ impl RuntimeJobRunner for SchedulingRunner {
     ) -> locality_core::LocalityResult<HydrationOutcome> {
         self.hydrated.send(request).expect("notify hydrated");
         Ok(HydrationOutcome::Hydrated)
+    }
+}
+
+impl RuntimeJobRunner for ScheduledFreshnessRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        self.scheduled.send(()).expect("notify scheduled");
+        let freshness_jobs = if self.scheduled_count.fetch_add(1, Ordering::SeqCst) == 0 {
+            vec![SyncJob::new(
+                MountId::new("notion-main"),
+                Some(RemoteId::new("page-1")),
+                SyncJobKind::ObserveEntity,
+                ChangeHintKind::BackgroundPoll,
+            )]
+        } else {
+            Vec::new()
+        };
+
+        Ok(ScheduledPullRuntimeReport {
+            report: Default::default(),
+            queued_hydrations: Vec::new(),
+            freshness_jobs,
+        })
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        _request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        Err(LocalityError::InvalidState(
+            "hydration should not run".to_string(),
+        ))
+    }
+
+    fn run_freshness_job(
+        &self,
+        _state_root: PathBuf,
+        job: SyncJob,
+    ) -> locality_core::LocalityResult<FreshnessRuntimeReport> {
+        self.freshness.send(job.clone()).expect("notify freshness");
+        Ok(FreshnessRuntimeReport {
+            job,
+            remote_hint_pending: false,
+            queued_hydrations: Vec::new(),
+            follow_up_jobs: Vec::new(),
+        })
     }
 }
 
@@ -2833,6 +3299,33 @@ fn temp_root(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
     root
+}
+
+fn workspace_virtual_mount(mount_id: &MountId, name: &str) -> MountConfig {
+    MountConfig::new(mount_id.clone(), "notion", temp_root(name))
+        .projection(ProjectionMode::MacosFileProvider)
+}
+
+fn save_workspace_page(
+    store: &mut InMemoryStateStore,
+    mount_id: &MountId,
+    remote_id: &str,
+    title: impl Into<String>,
+    path: impl Into<PathBuf>,
+    hydration: HydrationState,
+) {
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new(remote_id),
+                EntityKind::Page,
+                title,
+                path,
+            )
+            .with_hydration(hydration),
+        )
+        .expect("save workspace page");
 }
 
 fn seed_clean_remote_changed_page(state_root: &Path, mount_root: &Path) {

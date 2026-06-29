@@ -11,8 +11,8 @@ use locality_core::journal::{JournalStatus, JournalStore};
 use locality_core::model::{EntityKind, RemoteId};
 use locality_core::push::{PushApproval, PushExecutionAction, PushExecutionResult};
 use locality_store::{
-    EntityRepository, FreshnessStateRepository, JournalRepository, MountRepository,
-    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
+    EntityRepository, FreshnessStateRepository, JournalRepository, MountLiveModeRepository,
+    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 use localityd::execution::{PushJob, PushJobError, PushJobReport};
 use localityd::file_provider;
@@ -123,7 +123,8 @@ where
         + JournalRepository
         + RemoteObservationRepository
         + FreshnessStateRepository
-        + VirtualMutationRepository,
+        + VirtualMutationRepository
+        + MountLiveModeRepository,
 {
     let requested_path = absolute_push_target_path(target_path.as_ref())?;
     if !push_target_is_scope(store, &requested_path)? {

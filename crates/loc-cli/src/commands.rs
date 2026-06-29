@@ -3370,6 +3370,12 @@ fn print_status_report(report: &StatusReport) {
 
     let mut printed_entries = 0;
     for mount in &report.mounts {
+        if mount.live_mode.enabled || mount.live_mode.state != "off" {
+            println!("{}  live_mode: {}", mount.mount_id, mount.live_mode.state);
+            if let Some(reason) = mount.live_mode.reason.as_deref() {
+                println!("  live_mode_reason: {reason}");
+            }
+        }
         for entry in &mount.entries {
             if matches!(
                 entry.sync_state,
@@ -5592,13 +5598,13 @@ fn reconcile_projection_changes(
     state_root: &Path,
     target: Option<&Path>,
 ) -> Result<(), CommandError> {
-    daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+    daemon_file_provider::reconcile_visible_projection(store, state_root, target)
         .map(|_| ())
         .map_err(|error| {
             CommandError::new(
                 command,
                 "projection_reconcile_failed",
-                format!("failed to reconcile macOS File Provider changes: {error}"),
+                format!("failed to reconcile visible projection changes: {error}"),
             )
         })
 }
@@ -5685,9 +5691,9 @@ fn reconcile_projection_changes_best_effort(
     target: Option<&Path>,
 ) {
     if let Err(error) =
-        daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+        daemon_file_provider::reconcile_visible_projection(store, state_root, target)
     {
-        eprintln!("loc {command}: skipped macOS File Provider reconciliation: {error}");
+        eprintln!("loc {command}: skipped visible projection reconciliation: {error}");
     }
 }
 

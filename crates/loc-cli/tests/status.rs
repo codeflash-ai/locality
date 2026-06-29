@@ -9,15 +9,17 @@ use locality_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
 };
 use locality_core::freshness::{FreshnessTier, RemoteVersion};
-use locality_core::journal::{JournalEntry, JournalStatus, PushId};
+use locality_core::journal::{JournalApplyEffect, JournalEntry, JournalStatus, PushId};
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::{PushOperation, PushPlan};
 use locality_core::shadow::ShadowDocument;
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    InMemoryStateStore, JournalRepository, MountConfig, MountRepository, ProjectionMode,
-    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    InMemoryStateStore, JournalRepository, MountConfig, MountLiveModeRecord,
+    MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, ShadowSnapshotRecord,
+    SqliteStateStore, StoreResult, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository,
 };
 use localityd::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
@@ -57,6 +59,37 @@ fn status_reports_clean_and_dirty_hydrated_files() {
     assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
     assert_eq!(entry_state(&report, "Notes.md"), StatusState::Dirty);
     assert_eq!(entry_issue(&report, "Notes.md"), "local_body_changed");
+}
+
+#[test]
+fn status_reports_mount_live_mode_state() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    let mut live_mode = MountLiveModeRecord::new(fixture.mount_id.clone(), true, "1");
+    live_mode.state = MountLiveModeState::Syncing;
+    live_mode.last_reason = Some("checking for changes".to_string());
+    live_mode.last_run_at = Some("2".to_string());
+    store
+        .save_mount_live_mode(live_mode)
+        .expect("save live mode");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert_eq!(report.mounts[0].live_mode.enabled, true);
+    assert_eq!(report.mounts[0].live_mode.state, "syncing");
+    assert_eq!(report.mounts[0].live_mode.label, "Live Mode syncing");
+    assert_eq!(
+        report.mounts[0].live_mode.reason.as_deref(),
+        Some("checking for changes")
+    );
+    assert_eq!(report.mounts[0].live_mode.last_run_at.as_deref(), Some("2"));
 }
 
 #[test]
@@ -683,6 +716,39 @@ fn status_reports_stub_virtual_cache_conflicts_as_conflicted() {
 }
 
 #[test]
+fn status_reports_missing_virtual_content_cache_stubs_without_materializing_each_path() {
+    let fixture = StatusFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::MacosFileProvider),
+        )
+        .expect("save virtual mount");
+    for index in 0..1000 {
+        fixture.stub_page(
+            &mut store,
+            &format!("page-{index}"),
+            &format!("Pages/Page {index}/page.md"),
+        );
+    }
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.clean);
+    assert_eq!(report.summary.total, 1000);
+    assert_eq!(report.summary.stub, 1000);
+}
+
+#[test]
 fn status_reports_pending_virtual_creates_and_deletes() {
     let fixture = StatusFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -927,6 +993,244 @@ fn status_reports_checking_freshness_without_attention() {
         StatusSyncState::CheckingFreshness
     );
     assert_eq!(entry_issue(&report, "Roadmap.md"), "checking_freshness");
+}
+
+#[test]
+fn status_bulk_loads_remote_facts_instead_of_per_entity_point_lookups() {
+    let fixture = StatusFixture::new();
+    let mut inner = fixture.store();
+    fixture.hydrated_page(
+        &mut inner,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nSame paragraph.");
+    fixture.remote_observation(&mut inner, "page-1", "remote-v2", true);
+    let store = BulkOnlyStatusStore::new(inner);
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert_eq!(report.summary.remote_update_available, 1);
+    assert_eq!(
+        entry_sync_state(&report, "Roadmap.md"),
+        StatusSyncState::RemoteUpdateAvailable
+    );
+}
+
+struct BulkOnlyStatusStore {
+    inner: InMemoryStateStore,
+}
+
+impl BulkOnlyStatusStore {
+    fn new(inner: InMemoryStateStore) -> Self {
+        Self { inner }
+    }
+}
+
+impl MountRepository for BulkOnlyStatusStore {
+    fn save_mount(&mut self, mount: MountConfig) -> StoreResult<()> {
+        self.inner.save_mount(mount)
+    }
+
+    fn get_mount(&self, mount_id: &MountId) -> StoreResult<Option<MountConfig>> {
+        self.inner.get_mount(mount_id)
+    }
+
+    fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
+        self.inner.load_mounts()
+    }
+}
+
+impl MountLiveModeRepository for BulkOnlyStatusStore {
+    fn save_mount_live_mode(&mut self, live_mode: MountLiveModeRecord) -> StoreResult<()> {
+        self.inner.save_mount_live_mode(live_mode)
+    }
+
+    fn get_mount_live_mode(&self, mount_id: &MountId) -> StoreResult<Option<MountLiveModeRecord>> {
+        self.inner.get_mount_live_mode(mount_id)
+    }
+
+    fn list_mount_live_modes(&self) -> StoreResult<Vec<MountLiveModeRecord>> {
+        self.inner.list_mount_live_modes()
+    }
+
+    fn delete_mount_live_mode(&mut self, mount_id: &MountId) -> StoreResult<()> {
+        self.inner.delete_mount_live_mode(mount_id)
+    }
+}
+
+impl EntityRepository for BulkOnlyStatusStore {
+    fn save_entity(&mut self, entity: EntityRecord) -> StoreResult<()> {
+        self.inner.save_entity(entity)
+    }
+
+    fn get_entity(
+        &self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<Option<EntityRecord>> {
+        self.inner.get_entity(mount_id, remote_id)
+    }
+
+    fn find_entity_by_path(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> StoreResult<Option<EntityRecord>> {
+        self.inner.find_entity_by_path(mount_id, path)
+    }
+
+    fn list_entities(&self, mount_id: &MountId) -> StoreResult<Vec<EntityRecord>> {
+        self.inner.list_entities(mount_id)
+    }
+
+    fn delete_entity(&mut self, mount_id: &MountId, remote_id: &RemoteId) -> StoreResult<()> {
+        self.inner.delete_entity(mount_id, remote_id)
+    }
+}
+
+impl ShadowRepository for BulkOnlyStatusStore {
+    fn save_shadow(&mut self, mount_id: &MountId, shadow: ShadowDocument) -> StoreResult<()> {
+        self.inner.save_shadow(mount_id, shadow)
+    }
+
+    fn load_shadow(&self, mount_id: &MountId, entity_id: &RemoteId) -> StoreResult<ShadowDocument> {
+        self.inner.load_shadow(mount_id, entity_id)
+    }
+
+    fn get_shadow_record(
+        &self,
+        mount_id: &MountId,
+        entity_id: &RemoteId,
+    ) -> StoreResult<Option<ShadowSnapshotRecord>> {
+        self.inner.get_shadow_record(mount_id, entity_id)
+    }
+}
+
+impl JournalRepository for BulkOnlyStatusStore {
+    fn append_journal(&mut self, entry: JournalEntry) -> StoreResult<()> {
+        self.inner.append_journal(entry)
+    }
+
+    fn record_journal_apply_effects(
+        &mut self,
+        push_id: &PushId,
+        effects: Vec<JournalApplyEffect>,
+    ) -> StoreResult<()> {
+        self.inner.record_journal_apply_effects(push_id, effects)
+    }
+
+    fn update_journal_status(
+        &mut self,
+        push_id: &PushId,
+        status: JournalStatus,
+    ) -> StoreResult<()> {
+        self.inner.update_journal_status(push_id, status)
+    }
+
+    fn get_journal(&self, push_id: &PushId) -> StoreResult<Option<JournalEntry>> {
+        self.inner.get_journal(push_id)
+    }
+
+    fn list_journal(&self) -> StoreResult<Vec<JournalEntry>> {
+        self.inner.list_journal()
+    }
+}
+
+impl RemoteObservationRepository for BulkOnlyStatusStore {
+    fn save_remote_observation(&mut self, observation: RemoteObservationRecord) -> StoreResult<()> {
+        self.inner.save_remote_observation(observation)
+    }
+
+    fn get_remote_observation(
+        &self,
+        _mount_id: &MountId,
+        _remote_id: &RemoteId,
+    ) -> StoreResult<Option<RemoteObservationRecord>> {
+        panic!("status should bulk-load remote observations")
+    }
+
+    fn list_remote_observations(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<RemoteObservationRecord>> {
+        self.inner.list_remote_observations(mount_id)
+    }
+
+    fn delete_remote_observation(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<()> {
+        self.inner.delete_remote_observation(mount_id, remote_id)
+    }
+}
+
+impl FreshnessStateRepository for BulkOnlyStatusStore {
+    fn save_freshness_state(&mut self, state: FreshnessStateRecord) -> StoreResult<()> {
+        self.inner.save_freshness_state(state)
+    }
+
+    fn get_freshness_state(
+        &self,
+        _mount_id: &MountId,
+        _remote_id: &RemoteId,
+    ) -> StoreResult<Option<FreshnessStateRecord>> {
+        panic!("status should bulk-load freshness states")
+    }
+
+    fn list_freshness_states(&self, mount_id: &MountId) -> StoreResult<Vec<FreshnessStateRecord>> {
+        self.inner.list_freshness_states(mount_id)
+    }
+
+    fn delete_freshness_state(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> StoreResult<()> {
+        self.inner.delete_freshness_state(mount_id, remote_id)
+    }
+}
+
+impl VirtualMutationRepository for BulkOnlyStatusStore {
+    fn save_virtual_mutation(&mut self, mutation: VirtualMutationRecord) -> StoreResult<()> {
+        self.inner.save_virtual_mutation(mutation)
+    }
+
+    fn get_virtual_mutation(
+        &self,
+        mount_id: &MountId,
+        local_id: &str,
+    ) -> StoreResult<Option<VirtualMutationRecord>> {
+        self.inner.get_virtual_mutation(mount_id, local_id)
+    }
+
+    fn find_virtual_mutation_by_path(
+        &self,
+        mount_id: &MountId,
+        path: &Path,
+    ) -> StoreResult<Option<VirtualMutationRecord>> {
+        self.inner.find_virtual_mutation_by_path(mount_id, path)
+    }
+
+    fn list_virtual_mutations(
+        &self,
+        mount_id: &MountId,
+    ) -> StoreResult<Vec<VirtualMutationRecord>> {
+        self.inner.list_virtual_mutations(mount_id)
+    }
+
+    fn delete_virtual_mutation(&mut self, mount_id: &MountId, local_id: &str) -> StoreResult<()> {
+        self.inner.delete_virtual_mutation(mount_id, local_id)
+    }
 }
 
 struct StatusFixture {

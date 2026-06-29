@@ -50,6 +50,10 @@ setup flow.
 ## First-Run Onboarding
 
 The first-run flow should be a compact wizard with a single primary path.
+On a fresh local install with no AFS SQLite state yet, the packaged desktop app
+should open this flow automatically after runtime startup instead of dropping the
+user on the dashboard. Existing local state should continue to open normally
+without forcing setup again.
 
 ### 1. Welcome
 
@@ -342,7 +346,12 @@ Important language:
   Mode fetches one already-hydrated page into the daemon content cache and
   compares the rendered shadow before touching the visible CloudStorage
   projection, so stale Notion metadata does not hide body edits and unchanged
-  files are not repeatedly read or rewritten.
+  files are not repeatedly read or rewritten. When Live Mode is disabled, the
+  desktop runner must sleep on an explicit Live Mode state-change signal rather
+  than polling durable SQLite; writers that change the source-of-truth state
+  publish that signal so the app wakes on the state change. A low-frequency
+  recovery recheck is still allowed for missed filesystem events, but ordinary
+  SQLite WAL/SHM churn must not drive the runner.
 
 ## Main App Structure
 

@@ -38,7 +38,7 @@ const appStoreDistribution = distributionChannel === "mas";
 
 type AppView = "home" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
-type OnboardingStep = 1 | 2 | 3 | 4;
+type OnboardingStep = 1 | 2 | 3 | 4 | 5;
 
 type DesktopSnapshot = {
   health: {
@@ -51,17 +51,10 @@ type DesktopSnapshot = {
     accountLabel: string;
     status: string;
   };
-  mount: {
-    connector: string;
-    workspaceName: string;
-    localPath: string;
-    notionUrl?: string | null;
-    accessScope: string;
-    projection: string;
-    readOnly: boolean;
-    status: string;
-    provider?: ProviderRuntimeSummary | null;
-  };
+  mount: MountSummary;
+  mounts: MountSummary[];
+  activeMountId?: string | null;
+  liveMode: MountLiveMode;
   needsOnboarding: boolean;
   settings: {
     launchAtLogin: boolean;
@@ -70,6 +63,36 @@ type DesktopSnapshot = {
   pendingChanges: PendingChange[];
   activity: ActivityItem[];
   suggestions: ConnectorSuggestion[];
+};
+
+type MountSummary = {
+  mountId: string;
+  connector: string;
+  connectorName: string;
+  connectionId?: string | null;
+  workspaceName: string;
+  localPath: string;
+  notionUrl?: string | null;
+  accessScope: string;
+  remoteRootId?: string | null;
+  projection: string;
+  readOnly: boolean;
+  status: string;
+  rootExists: boolean;
+  entityCount: number;
+  pendingChangeCount: number;
+  provider?: ProviderRuntimeSummary | null;
+};
+
+type MountLiveMode = {
+  enabled: boolean;
+  state: "off" | "active" | "syncing" | "error";
+  label: string;
+  reason?: string | null;
+  lastRunAt?: string | null;
+  pendingCount: number;
+  reviewCount: number;
+  coveredCount: number;
 };
 
 type PendingChange = {
@@ -133,6 +156,14 @@ type ActionReport = {
   message: string;
 };
 
+type InstallStateReview = {
+  shouldPrompt: boolean;
+  stateExists: boolean;
+  sqliteExists: boolean;
+  previousBuildId?: string | null;
+  currentBuildId: string;
+};
+
 type UpdateStatus = {
   state: "idle" | "checking" | "available" | "installing" | "current" | "error";
   message: string;
@@ -172,6 +203,25 @@ type AgentGuidanceInstallReport = {
   prompt: string;
 };
 
+const sampleMount: MountSummary = {
+  mountId: "notion-main",
+  connector: "notion",
+  connectorName: "Notion",
+  connectionId: "notion-main",
+  workspaceName: "CodeFlash",
+  localPath: "~/Library/CloudStorage/Locality/notion-main",
+  notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
+  accessScope: "Initial Idea",
+  remoteRootId: "37b3ac0ebb88802cbcf4d53c9cfc4972",
+  projection: "macOS File Provider",
+  readOnly: false,
+  status: "ready",
+  rootExists: true,
+  entityCount: 24,
+  pendingChangeCount: 3,
+  provider: null,
+};
+
 const sampleSnapshot: DesktopSnapshot = {
   health: {
     state: "ready",
@@ -183,16 +233,18 @@ const sampleSnapshot: DesktopSnapshot = {
     accountLabel: "saurabh@codeflash.ai",
     status: "ready",
   },
-  mount: {
-    connector: "notion",
-    workspaceName: "CodeFlash",
-    localPath: "~/Library/CloudStorage/Locality/notion-main",
-    notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
-    accessScope: "Initial Idea",
-    projection: "macOS File Provider",
-    readOnly: false,
-    status: "ready",
-    provider: null,
+  mount: sampleMount,
+  mounts: [sampleMount],
+  activeMountId: sampleMount.mountId,
+  liveMode: {
+    enabled: false,
+    state: "off",
+    label: "Live Mode off",
+    reason: null,
+    lastRunAt: null,
+    pendingCount: 3,
+    reviewCount: 1,
+    coveredCount: 2,
   },
   needsOnboarding: false,
   settings: {
@@ -281,6 +333,16 @@ const loadingSnapshot: DesktopSnapshot = {
     status: "loading",
     provider: null,
   },
+  liveMode: {
+    enabled: false,
+    state: "off",
+    label: "Live Mode off",
+    reason: null,
+    lastRunAt: null,
+    pendingCount: 0,
+    reviewCount: 0,
+    coveredCount: 0,
+  },
   needsOnboarding: false,
   pendingChanges: [],
   activity: [],
@@ -330,7 +392,7 @@ const sampleSearchResults: LocatedItem[] = [
 ];
 
 function suggestedAgentPrompt(mountPath: string) {
-  return `Use Locality to edit my Notion workspace. Open the Notion files under ${mountPath}, make the requested edits directly in Markdown, and leave the changes pending for Locality review.`;
+  return `Use Locality to edit my Notion workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review.`;
 }
 
 function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallReport {
@@ -403,14 +465,73 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function liveModeReportNeedsRefresh(message: string) {
-  return message.includes("synced") || message.includes("pulled") || message.includes("paused");
-}
-
 function liveModeTooltip(enabled: boolean) {
   return enabled
     ? "Live Mode is watching safe local edits, pushing them to Notion, and pulling remote Notion changes when no review is needed. It pauses when a change needs review."
     : "Turn on Live Mode to keep this Notion mount point in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
+}
+
+function trayLiveModeLabel(liveMode: MountLiveMode, busy: boolean) {
+  if (busy || liveMode.state === "syncing") {
+    return "Syncing";
+  }
+  if (liveMode.state === "error") {
+    return "Needs attention";
+  }
+  if (!liveMode.enabled) {
+    return "Off";
+  }
+  if (liveMode.reviewCount > 0) {
+    return `${liveMode.reviewCount} need review`;
+  }
+  if (liveMode.coveredCount > 0) {
+    return `${liveMode.coveredCount} safe pending`;
+  }
+  return "On";
+}
+
+function useMountLiveModeController(
+  snapshot: DesktopSnapshot,
+  onRefresh: () => Promise<void>,
+) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const refreshRef = useRef(onRefresh);
+  const enabled = snapshot.liveMode.enabled;
+  const state = snapshot.liveMode.state;
+
+  useEffect(() => {
+    refreshRef.current = onRefresh;
+  }, [onRefresh]);
+
+  async function toggle() {
+    setBusy(true);
+    setMessage("");
+    try {
+      const report = await callCommand<ActionReport>(
+        "set_mount_live_mode",
+        { change: { enabled: !enabled } },
+        {
+          ok: true,
+          message: enabled ? "Live Mode is off for this folder." : "Live Mode is on for this folder.",
+        },
+      );
+      setMessage(report.message);
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      await refreshRef.current().catch(() => undefined);
+      setBusy(false);
+    }
+  }
+
+  return {
+    liveModeEnabled: enabled,
+    liveModeBusy: busy || state === "syncing",
+    liveModeState: state,
+    liveModeMessage: message || snapshot.liveMode.reason || "",
+    toggleLiveMode: toggle,
+  };
 }
 
 function emptyUpdateStatus(): UpdateStatus {
@@ -486,12 +607,19 @@ export default function App() {
     routeForcesOnboarding(initialRoute) || previewRouteStartsOnboarding(initialRoute),
   );
   const [onboardingKey, setOnboardingKey] = useState(0);
-  const [onboardingInitialStep, setOnboardingInitialStep] = useState<1 | 4>(() =>
-    initialRoute === "#onboarding-ready" ? 4 : 1,
+  const [onboardingInitialStep, setOnboardingInitialStep] = useState<OnboardingStep>(() =>
+    initialRoute === "#onboarding-ready" ? 5 : 1,
   );
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
   const refreshSnapshotPromise = useRef<Promise<void> | null>(null);
   const refreshSnapshotQueued = useRef(false);
+
+  async function loadDesktopSnapshot() {
+    const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
+    setSnapshot(nextSnapshot);
+    setSnapshotLoaded(true);
+    return nextSnapshot;
+  }
 
   async function refreshSnapshot() {
     if (refreshSnapshotPromise.current) {
@@ -502,9 +630,7 @@ export default function App() {
     const run = async () => {
       do {
         refreshSnapshotQueued.current = false;
-        const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
-        setSnapshot(nextSnapshot);
-        setSnapshotLoaded(true);
+        await loadDesktopSnapshot();
       } while (refreshSnapshotQueued.current);
     };
 
@@ -609,19 +735,42 @@ export default function App() {
   }
 
   useEffect(() => {
+    let cancelled = false;
+
     void (async () => {
+      let installReview: InstallStateReview | null = null;
       if (isTauriRuntime()) {
+        installReview = await callCommand<InstallStateReview>(
+          "install_state_review",
+          undefined,
+          {
+            shouldPrompt: false,
+            stateExists: true,
+            sqliteExists: true,
+            previousBuildId: null,
+            currentBuildId: "unknown",
+          },
+        ).catch(() => null);
         await callCommand<ActionReport>("acknowledge_install_state").catch(() => undefined);
         if (!appStoreDistribution) {
           await callCommand<ActionReport>("ensure_terminal_cli_available").catch(() => undefined);
         }
         await callCommand<ActionReport>("ensure_runtime_ready").catch(() => undefined);
       }
-      await refreshSnapshot();
+      await loadDesktopSnapshot();
+      if (!cancelled && installReview?.shouldPrompt && window.location.hash !== "#tray") {
+        setOnboardingInitialStep(1);
+        setOnboardingKey((key) => key + 1);
+        setShowOnboarding(true);
+      }
     })().catch(() => {
       setSnapshot(isTauriRuntime() ? snapshotLoadFailed : sampleSnapshot);
       setSnapshotLoaded(true);
     });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -648,7 +797,7 @@ export default function App() {
     }
 
     if (route === "#onboarding-ready") {
-      setOnboardingInitialStep(4);
+      setOnboardingInitialStep(5);
       setShowOnboarding(true);
       return;
     }
@@ -656,6 +805,10 @@ export default function App() {
     if (routeShouldShowOnboarding(route, snapshot)) {
       setOnboardingInitialStep(1);
       setShowOnboarding(true);
+      return;
+    }
+
+    if (showOnboarding) {
       return;
     }
 
@@ -720,7 +873,7 @@ export default function App() {
   }, [route]);
 
   if (route === "#tray") {
-    return <TrayPopover snapshot={snapshot} />;
+    return <TrayPopover snapshot={snapshot} onRefresh={refreshSnapshot} />;
   }
 
   const shouldRenderOnboarding =
@@ -855,7 +1008,7 @@ function Onboarding({
   }, [mountPathDirty, snapshot.mount.localPath]);
 
   useEffect(() => {
-    if (step !== 2 || !oauthInFlight || oauthReady) {
+    if (step !== 3 || !oauthInFlight || oauthReady) {
       return;
     }
 
@@ -876,21 +1029,26 @@ function Onboarding({
   }, [oauthInFlight, oauthReady, step]);
 
   useEffect(() => {
-    if (!snapshotLoaded || window.location.hash === "#onboarding-ready" || connectionMissing(snapshot)) {
+    if (
+      !snapshotLoaded ||
+      window.location.hash === "#onboarding" ||
+      window.location.hash === "#onboarding-ready" ||
+      connectionMissing(snapshot)
+    ) {
       return;
     }
 
     setOauthReady(true);
     setStep((current) => {
       if (mountMissing(snapshot)) {
-        return current < 3 ? 3 : current;
+        return current < 4 ? 4 : current;
       }
-      return current < 4 ? 4 : current;
+      return current < 5 ? 5 : current;
     });
   }, [snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
 
   useEffect(() => {
-    if (step !== 4 || mountMissing(snapshot) || agentGuidanceState !== "idle") {
+    if (step !== 5 || mountMissing(snapshot) || agentGuidanceState !== "idle") {
       return;
     }
     void installAgentGuidance(mountPath);
@@ -902,7 +1060,7 @@ function Onboarding({
     setLoginCopyMessage("");
     setOauthReady(false);
     setOauthInFlight(true);
-    setStep(2);
+    setStep(3);
     try {
       const report = await callCommand<ActionReport>(
         "connect_notion",
@@ -971,7 +1129,7 @@ function Onboarding({
       setMountPathDirty(false);
       setMountPath(nextSnapshot.mount.localPath);
       await installAgentGuidance(nextSnapshot.mount.localPath);
-      setStep(4);
+      setStep(5);
     } catch (error) {
       setMountError(errorMessage(error));
     } finally {
@@ -1014,7 +1172,7 @@ function Onboarding({
     }
   }
 
-  async function openFolderAndFinish() {
+  async function openMountFolder() {
     setMountError("");
     const report = await callCommand<ActionReport>(
       "open_path",
@@ -1025,6 +1183,9 @@ function Onboarding({
       setMountError(report.message);
       return;
     }
+  }
+
+  function finishOnboarding() {
     onComplete();
   }
 
@@ -1055,75 +1216,117 @@ function Onboarding({
     }
   }
 
+  const connectionReady = oauthReady || !connectionMissing(snapshot);
+  const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
+  const finalPrompt = agentGuidanceReport?.prompt || suggestedAgentPrompt(mountPath);
+
   return (
     <main className="setup-shell">
       <section className="setup-window">
-        <WindowChrome title="Locality Setup" meta={`${step} of 4`} />
+        <WindowChrome title="Locality Setup" meta={`${step} of 5`} />
         {step === 1 && (
-          <SetupContent mark={<BrandTile>Locality</BrandTile>}>
+          <SetupContent side={<ProductLoopDemo />}>
             <div>
-              <h1>Let your agents edit Notion as local files.</h1>
+              <div className="eyebrow">Meet Locality</div>
+              <h1>Your work apps, as local files for agents.</h1>
               <p>
-                Mount your Notion workspace in CloudStorage. Agents edit local
-                files, then Locality syncs reviewed changes back to Notion.
+                Locality gives agents like Claude and Codex a safe local folder for tools like
+                Notion. Agents and humans can edit Markdown side by side, and you review what
+                changes before it updates the content in the connected app.
               </p>
             </div>
-            <PrimaryButton onClick={startConnect}>Connect Notion</PrimaryButton>
-            <p className="quiet-note">Local edits stay pending until you review and push.</p>
+            <PrimaryButton onClick={() => setStep(2)}>Set Up Locality</PrimaryButton>
+            <div className="onboarding-pill-row">
+              <span>Works in Finder</span>
+              <span>Agents edit Markdown</span>
+              <span>Review before sync</span>
+            </div>
           </SetupContent>
         )}
 
         {step === 2 && (
-          <SetupContent
-            mark={
-              <BrandTile variant={oauthReady ? "ready" : "notion"}>
-                {oauthReady ? undefined : "N"}
-              </BrandTile>
-            }
-          >
+          <SetupContent side={<AgentWorkspaceDemo />}>
             <div>
-              <div className={`sync-note ${oauthReady ? "connected" : ""}`}>
-                {oauthReady ? <Check /> : <Loader2 className={oauthInFlight ? "spin" : ""} />}
-                {oauthReady ? "Notion connected" : "Waiting for Notion"}
-              </div>
-              <h1>{oauthReady ? "Your Notion workspace is connected" : "Finish connecting in Notion"}</h1>
+              <div className="eyebrow">How agents use it</div>
+              <h1>Agents work in files you can see.</h1>
               <p>
-                {oauthReady
-                  ? `${
-                      connectedWorkspace || "Your workspace"
-                    } is ready. Next, choose the Notion mount point Locality should open.`
-                  : "A browser window is open. Choose your workspace, pick the pages Locality can use, then approve access."}
+                Each app appears as a folder. Pages and docs become page.md files that stay in sync
+                with the connected app. Locality adds AGENTS.md and CLAUDE.md so agents know how to
+                work in the folder safely.
               </p>
             </div>
-            <ProgressList
-              items={[
-                { label: "Browser opened", state: oauthError ? "idle" : "done" },
-                { label: "Select workspace and pages", state: oauthReady ? "done" : "active" },
-                { label: "Approve access", state: oauthReady ? "done" : "idle" },
-              ]}
-            />
-            <PrimaryButton disabled={!oauthReady} onClick={() => setStep(3)}>
-              {oauthReady ? "Continue to folder setup" : oauthInFlight ? "Waiting for Notion" : "Continue"}
-            </PrimaryButton>
-            <TextButton disabled={!oauthInFlight && !loginUrl} onClick={() => void copyLoginLink()}>
-              Copy login link
-            </TextButton>
-            {loginCopyMessage && <p className="quiet-note">{loginCopyMessage}</p>}
-            {oauthError && <p className="field-error">{oauthError}</p>}
-            <p className="quiet-note">Credentials are stored securely in the OS credential store.</p>
+            <PrimaryButton onClick={() => setStep(3)}>Continue</PrimaryButton>
           </SetupContent>
         )}
 
         {step === 3 && (
-          <SetupContent mark={<BrandTile variant={mounting ? "progress" : "folder"} />}>
+          <SetupContent
+            side={<ConnectorOptions connected={connectionReady} />}
+          >
             <div>
-              <h1>Where should your Notion files appear?</h1>
+              <div className="eyebrow">Connect app</div>
+              {(oauthInFlight || connectionReady) && (
+                <div className={`sync-note ${connectionReady ? "connected" : ""}`}>
+                  {connectionReady ? <Check /> : <Loader2 className="spin-icon" />}
+                  {connectionReady ? "Notion connected" : "Waiting for Notion"}
+                </div>
+              )}
+              <h1>
+                {connectionReady
+                  ? "Your Notion workspace is connected"
+                  : oauthInFlight
+                    ? "Finish connecting in Notion."
+                    : "Start with Notion."}
+              </h1>
               <p>
-                Locality keeps every source under one CloudStorage root. Notion will appear at the
-                notion-main mount point that Finder and agents open.
+                {connectionReady
+                  ? `${workspaceLabel} is ready. Next, choose where Locality should place the Notion mount point.`
+                  : oauthInFlight
+                    ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
+                    : "Connect the workspace you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
               </p>
             </div>
-            <div className="path-field">
+            {oauthInFlight && !connectionReady && (
+              <ProgressList
+                items={[
+                  { label: "Browser opened", state: oauthError ? "idle" : "done" },
+                  { label: "Select workspace and pages", state: "active" },
+                  { label: "Approve access", state: "idle" },
+                ]}
+              />
+            )}
+            <div className="button-row">
+              <PrimaryButton
+                busy={oauthInFlight && !connectionReady}
+                onClick={connectionReady ? () => setStep(4) : startConnect}
+              >
+                {connectionReady ? "Continue" : oauthInFlight ? "Waiting for Notion" : "Connect Notion"}
+              </PrimaryButton>
+              <SecondaryButton disabled={!oauthInFlight && !loginUrl} onClick={() => void copyLoginLink()}>
+                Copy login link
+              </SecondaryButton>
+            </div>
+            <div className="onboarding-pill-row">
+              <span>Scoped access</span>
+              <span>Credentials in Keychain</span>
+              <span>Direct app connection</span>
+            </div>
+            {loginCopyMessage && <p className="quiet-note inline-note">{loginCopyMessage}</p>}
+            {oauthError && <p className="field-error">{oauthError}</p>}
+          </SetupContent>
+        )}
+
+        {step === 4 && (
+          <SetupContent variant="wide">
+            <div>
+              <div className="eyebrow">Local folder</div>
+              <h1>Choose where your files appear.</h1>
+              <p>
+                Locality keeps your connected apps under one CloudStorage root. Agents and Finder
+                will use this folder.
+              </p>
+            </div>
+            <div className="path-field setup-path-field">
               <input
                 value={mountPath}
                 disabled={mounting}
@@ -1132,12 +1335,12 @@ function Onboarding({
                   setMountPath(event.target.value);
                 }}
               />
-              <SecondaryButton compact disabled={mounting} onClick={chooseFolder}>
+              <SecondaryButton disabled={mounting} onClick={chooseFolder}>
                 Choose
               </SecondaryButton>
             </div>
             <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
-              {mounting ? "Mounting Notion" : "Continue"}
+              {mounting ? "Mounting Notion" : "Create Local Folder"}
             </PrimaryButton>
             {mountError && <p className="field-error">{mountError}</p>}
             <p className="quiet-note">
@@ -1147,78 +1350,52 @@ function Onboarding({
           </SetupContent>
         )}
 
-        {step === 4 && (
+        {step === 5 && (
           <SetupContent mark={<BrandTile variant="ready" />} variant="final">
             <div>
-              <h1>Locality is ready</h1>
+              <h1>Locality is ready!</h1>
               <p>
-                Your Notion mount point is ready. Agents can edit local Markdown now, and Locality
-                will keep review controls close when those edits are ready.
+                Your Notion mount point is ready. Agents can open this folder, edit
+                Markdown, and leave changes for Locality review. Open the app to review changes,
+                manage sync, and turn on Live Mode when you want file saves to update Notion and
+                new Notion changes to appear locally.
               </p>
             </div>
-            <div className="live-mode-intro">
-              <Zap />
-              <span>Live Mode can watch this folder, sync safe edits, and pause when a change needs review.</span>
-            </div>
-            <div className="ready-folder">
-              <FolderOpen />
-              <div>
-                <span>Notion mount point</span>
-                <code>{mountPath}</code>
-              </div>
-              <SecondaryButton compact icon={<Copy />} onClick={() => copyText(mountPath)}>
-                Copy
-              </SecondaryButton>
-            </div>
+            {mountError && <p className="field-error">{mountError}</p>}
             <div className="final-actions">
-              <PrimaryButton icon={<FolderOpen />} onClick={openFolderAndFinish}>
-                Open Notion Mount Point
+              <PrimaryButton onClick={finishOnboarding}>
+                Open Locality
               </PrimaryButton>
             </div>
-            <LocateBox
-              label="Open a Notion page"
-              value={locateUrl}
-              onChange={(next) => {
-                setLocateUrl(next);
-                setLocateState("idle");
-                setLocatedItem(null);
-              }}
-              onSubmit={locatePage}
-              onSelect={(item) => {
-                setLocatedItem(item);
-                setLocateState("ready");
-                setLocateError("");
-                setLocateUrl(item.title);
-              }}
-              state={locateState}
-              error={locateError}
-            />
-            {locatedItem && <LocatedPath item={locatedItem} />}
-            <div className="agent-demo compact-agent-demo">
-              <div className="agent-demo-title">
-                <Clipboard />
-                <span>Try this with an agent</span>
+            <div className="folder-inline final-folder-card">
+              <div className="ready-head">
+                <div>
+                  <strong>Folder</strong>
+                  <p>Your Notion files are mounted here.</p>
+                </div>
+                <span className="onboarding-pill">Mounted</span>
               </div>
-              <div className="agent-prompt-row">
-                <div className="agent-demo-command">
-                  {agentGuidanceReport?.prompt ||
-                    `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for Locality review.`}
+              <div className="path-field ready-path-field">
+                <span>{mountPath}</span>
+                <SecondaryButton onClick={() => void openMountFolder()}>
+                  Open Folder
+                </SecondaryButton>
+              </div>
+            </div>
+            <div className="agent-demo compact-agent-demo">
+              <div className="agent-demo-header">
+                <div>
+                  <strong>Try this agent prompt</strong>
+                  <p>Claude, Codex are now setup to use Locality.</p>
                 </div>
                 <SecondaryButton
-                  compact
-                  icon={<Copy />}
-                  onClick={() =>
-                    copyText(
-                      agentGuidanceReport?.prompt ||
-                        `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for Locality review.`,
-                    )
-                  }
+                  onClick={() => copyText(finalPrompt)}
                 >
                   Copy
                 </SecondaryButton>
               </div>
+              <div className="agent-demo-command">{finalPrompt}</div>
             </div>
-            <AgentGuidanceSummary report={agentGuidanceReport} state={agentGuidanceState} />
           </SetupContent>
         )}
       </section>
@@ -1488,88 +1665,14 @@ function HomeView({
   const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [actionError, setActionError] = useState("");
-  const [liveModeEnabled, setLiveModeEnabled] = useState(false);
-  const [liveModeBusy, setLiveModeBusy] = useState(false);
-  const [liveModeState, setLiveModeState] = useState<"idle" | "active" | "error">("idle");
-  const [liveModeMessage, setLiveModeMessage] = useState("");
-  const liveModeInFlight = useRef(false);
-  const liveModeSnapshot = useRef(snapshot);
-  const refreshHomeSnapshot = useRef(onRefresh);
+  const {
+    liveModeEnabled,
+    liveModeBusy,
+    liveModeState,
+    liveModeMessage,
+    toggleLiveMode,
+  } = useMountLiveModeController(snapshot, onRefresh);
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
-
-  useEffect(() => {
-    liveModeSnapshot.current = snapshot;
-  }, [snapshot]);
-
-  useEffect(() => {
-    refreshHomeSnapshot.current = onRefresh;
-  }, [onRefresh]);
-
-  useEffect(() => {
-    if (!liveModeEnabled) {
-      setLiveModeBusy(false);
-      return undefined;
-    }
-
-    let cancelled = false;
-    const runTick = async () => {
-      if (cancelled || liveModeInFlight.current) {
-        return;
-      }
-
-      const currentSnapshot = liveModeSnapshot.current;
-      if (connectionMissing(currentSnapshot) || mountMissing(currentSnapshot)) {
-        setLiveModeEnabled(false);
-        setLiveModeState("error");
-        setLiveModeMessage("Live Mode needs a connected Notion mount point.");
-        return;
-      }
-
-      liveModeInFlight.current = true;
-      setLiveModeBusy(true);
-      try {
-        const report = await callCommand<ActionReport>(
-          "live_mode_tick",
-          undefined,
-          { ok: true, message: "Live Mode checked for changes." },
-        );
-        if (cancelled) {
-          return;
-        }
-        if (!report.ok) {
-          setLiveModeEnabled(false);
-          setLiveModeState("error");
-          setLiveModeMessage(report.message);
-          return;
-        }
-        setLiveModeState("active");
-        if (report.message) {
-          setLiveModeMessage((current) => (current === report.message ? current : report.message));
-        }
-        if (liveModeReportNeedsRefresh(report.message)) {
-          await refreshHomeSnapshot.current().catch(() => undefined);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setLiveModeEnabled(false);
-          setLiveModeState("error");
-          setLiveModeMessage(errorMessage(error));
-        }
-      } finally {
-        liveModeInFlight.current = false;
-        if (!cancelled) {
-          setLiveModeBusy(false);
-        }
-      }
-    };
-
-    void runTick();
-    const interval = window.setInterval(runTick, 500);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [liveModeEnabled]);
 
   async function connectNotion() {
     setActionError("");
@@ -1609,13 +1712,6 @@ function HomeView({
     if (!report.ok) {
       setActionError(report.message);
     }
-  }
-
-  function toggleLiveMode() {
-    setActionError("");
-    setLiveModeMessage("");
-    setLiveModeState(liveModeEnabled ? "idle" : "active");
-    setLiveModeEnabled((enabled) => !enabled);
   }
 
   async function locatePage() {
@@ -2564,12 +2660,25 @@ function SettingsView({
   );
 }
 
-function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
+function TrayPopover({
+  snapshot,
+  onRefresh,
+}: {
+  snapshot: DesktopSnapshot;
+  onRefresh: () => Promise<void>;
+}) {
   const [url, setUrl] = useState("");
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [quitOptionsOpen, setQuitOptionsOpen] = useState(false);
+  const {
+    liveModeEnabled,
+    liveModeBusy,
+    liveModeState,
+    liveModeMessage,
+    toggleLiveMode,
+  } = useMountLiveModeController(snapshot, onRefresh);
   const quitOptionsRef = useRef<HTMLDivElement | null>(null);
   const { results: searchResults, searching } = useNotionSearchResults(url);
   const visibleChanges = snapshot.pendingChanges.slice(0, 3);
@@ -2665,6 +2774,32 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
         >
           Open Notion Folder
         </PrimaryButton>
+      </section>
+
+      <section className="tray-section tray-live-mode">
+        <button
+          className={`tray-live-mode-control ${liveModeEnabled ? "active" : ""}`}
+          aria-pressed={liveModeEnabled}
+          aria-label={`${liveModeEnabled ? "Turn off" : "Turn on"} Live Mode`}
+          disabled={mountMissing(snapshot) || connectionMissing(snapshot)}
+          onClick={() => void toggleLiveMode()}
+        >
+          <span className="tray-live-mode-copy">
+            {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+            <span>
+              <strong>Live Mode</strong>
+              <small>{trayLiveModeLabel(snapshot.liveMode, liveModeBusy)}</small>
+            </span>
+          </span>
+          <span className={`toggle ${liveModeEnabled ? "enabled" : ""}`} aria-hidden="true">
+            <i />
+          </span>
+        </button>
+        {liveModeMessage && (
+          <p className={liveModeState === "error" ? "field-error" : "quiet-note inline-note"}>
+            {liveModeMessage}
+          </p>
+        )}
       </section>
 
       <section className="tray-section">
@@ -2766,6 +2901,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
 type FileActionStatus = {
   state: "working" | "success" | "error";
   message: string;
+  action?: "diff" | "push" | "resolve" | "autosave";
 };
 
 type FileDetailStatus = {
@@ -2944,7 +3080,7 @@ function FileChangeList({
       action === "diff" ? "Checking diff..." : action === "push" ? "Pushing this file..." : "Pulling latest...";
     setActions((current) => ({
       ...current,
-      [change.localPath]: { state: "working", message: workingMessage },
+      [change.localPath]: { state: "working", message: workingMessage, action },
     }));
 
     try {
@@ -2962,6 +3098,7 @@ function FileChangeList({
         [change.localPath]: {
           state: report.ok ? "success" : "error",
           message: report.message,
+          action,
         },
       }));
       if (report.ok && action === "resolve" && selectedPath === change.localPath) {
@@ -2973,7 +3110,7 @@ function FileChangeList({
     } catch (error) {
       setActions((current) => ({
         ...current,
-        [change.localPath]: { state: "error", message: errorMessage(error) },
+        [change.localPath]: { state: "error", message: errorMessage(error), action },
       }));
     }
   }
@@ -2993,7 +3130,11 @@ function FileChangeList({
     }));
     setActions((current) => ({
       ...current,
-      [change.localPath]: { state: "working", message: enabled ? "Turning on Live Mode..." : "Turning off Live Mode..." },
+      [change.localPath]: {
+        state: "working",
+        message: enabled ? "Turning on Live Mode..." : "Turning off Live Mode...",
+        action: "autosave",
+      },
     }));
 
     try {
@@ -3005,6 +3146,7 @@ function FileChangeList({
         [change.localPath]: {
           state: report.ok ? "success" : "error",
           message: report.message,
+          action: "autosave",
         },
       }));
       if (!report.ok) {
@@ -3021,7 +3163,7 @@ function FileChangeList({
       }));
       setActions((current) => ({
         ...current,
-        [change.localPath]: { state: "error", message: errorMessage(error) },
+        [change.localPath]: { state: "error", message: errorMessage(error), action: "autosave" },
       }));
     }
   }
@@ -3033,6 +3175,7 @@ function FileChangeList({
         const detail = details[change.localPath];
         const editor = editors[change.localPath];
         const isWorking = action?.state === "working";
+        const isPushingFile = isWorking && action?.action === "push";
         const isSaving = editor?.state === "saving";
         const hasUnsavedEditorChanges = editor !== undefined && editor.contents !== editor.savedContents;
         const shouldReviewBeforePush = Boolean(!confirmDangerous && change.state === "needs_review" && onReview);
@@ -3122,7 +3265,7 @@ function FileChangeList({
               </div>
               <PrimaryButton
                 compact
-                icon={shouldReviewBeforePush ? <ListChecks /> : <ShieldCheck />}
+                icon={isPushingFile ? <Loader2 className="spin-icon" /> : shouldReviewBeforePush ? <ListChecks /> : <ShieldCheck />}
                 disabled={isWorking}
                 onClick={() => {
                   if (shouldReviewBeforePush) {
@@ -3132,7 +3275,7 @@ function FileChangeList({
                   void runFileAction(change, "push");
                 }}
               >
-                {shouldReviewBeforePush ? "Review" : "Push"}
+                {isPushingFile ? "Pushing..." : shouldReviewBeforePush ? "Review" : "Push"}
               </PrimaryButton>
             </div>
             {isSelected && (
@@ -3188,6 +3331,7 @@ function FileChangeList({
                       <PrimaryButton
                         compact
                         disabled={isSaving || hasUnsavedEditorChanges || isWorking}
+                        icon={isPushingFile ? <Loader2 className="spin-icon" /> : undefined}
                         onClick={() => {
                           if (shouldReviewBeforePush) {
                             onReview?.();
@@ -3196,7 +3340,7 @@ function FileChangeList({
                           void runFileAction(change, "push");
                         }}
                       >
-                        {shouldReviewBeforePush ? "Review Saved" : "Push Saved"}
+                        {isPushingFile ? "Pushing..." : shouldReviewBeforePush ? "Review Saved" : "Push Saved"}
                       </PrimaryButton>
                     </div>
                   </>
@@ -3495,6 +3639,124 @@ function ViewHeader({
   );
 }
 
+function ProductLoopDemo() {
+  return (
+    <div className="onboarding-product-demo">
+      <div className="demo-card-header">
+        <span>Product demo</span>
+        <strong>Ready</strong>
+      </div>
+      <div className="demo-tile-grid">
+        <div className="demo-tile">
+          <div>
+            <strong>Notion</strong>
+            <span>Connected</span>
+          </div>
+          <p>Launch Plan</p>
+        </div>
+        <div className="demo-tile">
+          <div>
+            <strong>Local Markdown</strong>
+            <span>Editable</span>
+          </div>
+          <code>Locality/notion/Launch Plan/page.md</code>
+        </div>
+        <div className="demo-tile">
+          <div>
+            <strong>Pending review</strong>
+            <span>Safe</span>
+          </div>
+          <p>Edited intro paragraph</p>
+          <p>Updated launch checklist</p>
+        </div>
+        <div className="demo-tile">
+          <div>
+            <strong>Notion</strong>
+            <span>Updated</span>
+          </div>
+          <p>Launch Plan reflects the approved Markdown edits.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AgentWorkspaceDemo() {
+  return (
+    <div className="agent-workspace-demo">
+      <div className="demo-card-header">
+        <span>Locality folder</span>
+        <strong>Visible</strong>
+      </div>
+      <div className="agent-surface-demo">
+        <div className="folder-pane-demo">
+          <span className="active">Locality</span>
+          <span>notion</span>
+          <span>google-docs</span>
+          <span>linear</span>
+          <pre>{`notion/
+  AGENTS.md
+  CLAUDE.md
+  Engineering/
+    Roadmap/
+      page.md
+  Launch Plan/
+    page.md`}</pre>
+        </div>
+        <div className="markdown-pane-demo">
+          <div>
+            <strong>Launch Plan/page.md</strong>
+            <span>Edited</span>
+          </div>
+          <pre>{`# Launch Plan
+
+Owner: Growth
+Status: Ready
+
+## Launch checklist
+- Finalize onboarding
+- Review pricing page
+- Publish announcement
+
+loc: notion-page`}</pre>
+        </div>
+      </div>
+      <div className="review-strip">
+        <strong>3 local edits ready to sync</strong>
+        <span>Review before updating Notion</span>
+      </div>
+    </div>
+  );
+}
+
+function ConnectorOptions({ connected }: { connected: boolean }) {
+  return (
+    <div className="connector-options">
+      <div className="connector-option available">
+        <div>
+          <strong>Notion</strong>
+          <small>Pages, databases, properties, and Markdown edits.</small>
+        </div>
+        <span>{connected ? "Connected" : "Available"}</span>
+      </div>
+      <div className="connector-option">
+        <div>
+          <strong>Google Docs</strong>
+          <small>Docs and Drive folders through the same local model.</small>
+        </div>
+        <span>Next</span>
+      </div>
+      <div className="connector-option">
+        <div>
+          <strong>Linear</strong>
+          <small>Issues and projects as agent-editable files.</small>
+        </div>
+        <span>Planned</span>
+      </div>
+    </div>
+  );
+}
+
 function WindowChrome({
   title,
   meta,
@@ -3558,7 +3820,7 @@ function WindowsWindowControls() {
         type="button"
         aria-label="Close"
         title="Close"
-        onClick={() => void getCurrentWindow().close()}
+        onClick={() => void getCurrentWindow().hide()}
       >
         <X />
       </button>
@@ -3588,14 +3850,32 @@ function SetupContent({
   mark,
   children,
   variant,
+  side,
 }: {
-  mark: React.ReactNode;
+  mark?: React.ReactNode;
   children: React.ReactNode;
-  variant?: "final";
+  variant?: "final" | "wide";
+  side?: React.ReactNode;
 }) {
+  if (side) {
+    return (
+      <div className="setup-content split-setup">
+        <div className="setup-copy">
+          {mark ? mark : null}
+          {children}
+        </div>
+        <aside className="setup-side">{side}</aside>
+      </div>
+    );
+  }
+
   return (
-    <div className={`setup-content ${variant === "final" ? "final-setup" : ""}`}>
-      {mark}
+    <div
+      className={`setup-content ${variant === "final" ? "final-setup" : ""} ${
+        variant === "wide" ? "wide-setup" : ""
+      }`}
+    >
+      {mark ? mark : null}
       {children}
     </div>
   );

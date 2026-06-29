@@ -562,6 +562,51 @@ fn pull_macos_file_provider_preserves_older_visible_edit_after_cache_fast_forwar
 }
 
 #[test]
+fn pull_windows_cloud_files_refreshes_clean_visible_replica_after_pull() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-windows-visible-refresh-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::WindowsCloudFiles);
+    run_pull_with_state_root(
+        &mut store,
+        &fixture.connector("Roadmap"),
+        &fixture.root,
+        Some(&state_root),
+    )
+    .expect("initial pull");
+
+    let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
+        .join("roadmap")
+        .join("page.md");
+    let visible_path = fixture.mount_point_root().join("roadmap").join("page.md");
+    fs::create_dir_all(visible_path.parent().expect("visible parent"))
+        .expect("create visible parent");
+    fs::copy(&content_path, &visible_path).expect("seed clean visible replica");
+    let stale_visible = fs::read_to_string(&visible_path).expect("read stale visible replica");
+    assert!(stale_visible.contains("Root body."));
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Remote body.", "2026-06-11T00:00:00.000Z"),
+        &visible_path,
+        Some(&state_root),
+    )
+    .expect("pull visible Windows Cloud Files path");
+
+    assert!(report.ok);
+    assert_eq!(report.hydrated, 1);
+    assert_eq!(report.skipped_dirty, 0);
+    let cached = fs::read_to_string(&content_path).expect("read daemon cache");
+    assert!(cached.contains("Remote body."));
+    let visible = fs::read_to_string(&visible_path).expect("read visible replica");
+    assert_eq!(visible, cached);
+    assert!(visible.contains("Remote body."));
+    assert!(!visible.contains("Root body."));
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
 fn pull_virtual_mount_accepts_mount_point_directory_as_root_target() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("loc-cli-pull-state");

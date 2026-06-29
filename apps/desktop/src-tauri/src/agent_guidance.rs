@@ -360,15 +360,16 @@ Locality projects connected company sources, including Notion, into the local fi
 
 ## MCP fallback
 
-If your sandbox cannot run the host `loc` CLI, use the MCP tool named `loc`.
+If your sandbox cannot run the host `loc` CLI, such as in Claude Cowork or
+another isolated agent runtime, fall back to the Locality MCP tool named `loc`.
 Pass the same CLI arguments as JSON `argv`, for example:
 
 ```json
 {{"argv":["status","{mount_path}","--json"]}}
 ```
 
-Locality configures this fallback automatically for supported local agents. Prefer
-direct CLI execution whenever it is available.
+Locality configures this MCP fallback automatically for supported local agents.
+Prefer direct CLI execution whenever it is available.
 
 ## Suggested user prompt
 
@@ -792,7 +793,9 @@ mod tests {
         assert!(skill.contains("parent-page/new-page/page.md"));
         assert!(skill.contains("no `loc:` identity block"));
         assert!(skill.contains("remote changed since last sync"));
-        assert!(skill.contains("Locality configures this fallback automatically"));
+        assert!(skill.contains("fall back to the Locality MCP tool named `loc`"));
+        assert!(skill.contains("Claude Cowork"));
+        assert!(skill.contains("Locality configures this MCP fallback automatically"));
     }
 
     #[test]

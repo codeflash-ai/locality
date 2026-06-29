@@ -115,9 +115,9 @@
 !macro NSIS_HOOK_POSTINSTALL
   SetOutPath "$INSTDIR"
   !insertmacro PREPARE_LOCALITY_SIDECAR_FILES
-  File /oname=loc.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\loc.exe"
-  File /oname=localityd.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\localityd.exe"
-  File /oname=locality-cloud-files.exe "${__FILEDIR__}\..\..\..\..\apps\desktop\src-tauri\windows\locality-cloud-files.exe"
+  File /oname=loc.exe "${__FILEDIR__}\loc.exe"
+  File /oname=localityd.exe "${__FILEDIR__}\localityd.exe"
+  File /oname=locality-cloud-files.exe "${__FILEDIR__}\locality-cloud-files.exe"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL

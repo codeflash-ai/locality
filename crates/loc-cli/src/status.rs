@@ -5,6 +5,7 @@
 //! the daemon has recorded cheap remote observations, status folds those facts
 //! into a connector-neutral sync safety state.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use locality_core::canonical::parse_canonical_markdown;
@@ -17,12 +18,15 @@ use locality_core::planner::PushOperation;
 use locality_core::shadow::rendered_bodies_equivalent;
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository,
+    JournalRepository, MountConfig, MountLiveModeRecord, MountLiveModeRepository,
+    MountLiveModeState, MountRepository, RemoteObservationRecord, RemoteObservationRepository,
+    ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository,
 };
 use localityd::file_provider as daemon_file_provider;
-use localityd::virtual_fs::{virtual_fs_content_path, virtual_projection_root};
+use localityd::virtual_fs::{
+    virtual_fs_content_path, virtual_fs_content_root, virtual_projection_root,
+};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -66,7 +70,17 @@ pub struct StatusMountReport {
     pub mount_id: String,
     pub connector: String,
     pub root: String,
+    pub live_mode: StatusLiveMode,
     pub entries: Vec<StatusEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StatusLiveMode {
+    pub enabled: bool,
+    pub state: String,
+    pub label: String,
+    pub reason: Option<String>,
+    pub last_run_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -152,6 +166,143 @@ pub struct StatusIssue {
     pub message: String,
 }
 
+struct StatusContext {
+    state_root: PathBuf,
+    virtual_content: VirtualContentIndex,
+}
+
+impl StatusContext {
+    fn new(state_root: &Path, scopes: &[StatusScope]) -> Self {
+        Self {
+            state_root: state_root.to_path_buf(),
+            virtual_content: VirtualContentIndex::new(state_root, scopes),
+        }
+    }
+}
+
+struct MountStatusFacts {
+    remote_observations: BTreeMap<RemoteId, RemoteObservationRecord>,
+    remote_observations_error: Option<String>,
+    freshness_states: BTreeMap<RemoteId, FreshnessStateRecord>,
+    freshness_states_error: Option<String>,
+}
+
+impl MountStatusFacts {
+    fn load<S>(store: &S, mount_id: &MountId) -> Self
+    where
+        S: RemoteObservationRepository + FreshnessStateRepository,
+    {
+        let (remote_observations, remote_observations_error) =
+            match store.list_remote_observations(mount_id) {
+                Ok(observations) => (
+                    observations
+                        .into_iter()
+                        .map(|observation| (observation.remote_id.clone(), observation))
+                        .collect(),
+                    None,
+                ),
+                Err(error) => (BTreeMap::new(), Some(error.to_string())),
+            };
+        let (freshness_states, freshness_states_error) = match store.list_freshness_states(mount_id)
+        {
+            Ok(states) => (
+                states
+                    .into_iter()
+                    .map(|state| (state.remote_id.clone(), state))
+                    .collect(),
+                None,
+            ),
+            Err(error) => (BTreeMap::new(), Some(error.to_string())),
+        };
+
+        Self {
+            remote_observations,
+            remote_observations_error,
+            freshness_states,
+            freshness_states_error,
+        }
+    }
+
+    fn remote_observation(&self, remote_id: &RemoteId) -> Option<&RemoteObservationRecord> {
+        self.remote_observations.get(remote_id)
+    }
+
+    fn freshness_state(&self, remote_id: &RemoteId) -> Option<&FreshnessStateRecord> {
+        self.freshness_states.get(remote_id)
+    }
+}
+
+struct VirtualContentIndex {
+    roots: BTreeMap<MountId, VirtualContentRootIndex>,
+}
+
+impl VirtualContentIndex {
+    fn new(state_root: &Path, scopes: &[StatusScope]) -> Self {
+        let mut roots = BTreeMap::new();
+        for scope in scopes {
+            if !scope.mount.projection.uses_virtual_filesystem()
+                || roots.contains_key(&scope.mount.mount_id)
+            {
+                continue;
+            }
+            let root = virtual_fs_content_root(state_root, &scope.mount.mount_id);
+            roots.insert(
+                scope.mount.mount_id.clone(),
+                VirtualContentRootIndex::scan(root),
+            );
+        }
+        Self { roots }
+    }
+
+    fn contains_file(&self, mount_id: &MountId, path: &Path) -> Option<bool> {
+        self.roots
+            .get(mount_id)
+            .and_then(|root| root.contains_file(path))
+    }
+}
+
+struct VirtualContentRootIndex {
+    root: PathBuf,
+    files: Option<BTreeSet<PathBuf>>,
+}
+
+impl VirtualContentRootIndex {
+    fn scan(root: PathBuf) -> Self {
+        let files = scan_virtual_content_files(&root);
+        Self { root, files }
+    }
+
+    fn contains_file(&self, path: &Path) -> Option<bool> {
+        if !path.starts_with(&self.root) {
+            return None;
+        }
+        self.files.as_ref().map(|files| files.contains(path))
+    }
+}
+
+fn scan_virtual_content_files(root: &Path) -> Option<BTreeSet<PathBuf>> {
+    if !root.exists() {
+        return Some(BTreeSet::new());
+    }
+
+    let mut files = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let entries = std::fs::read_dir(&directory).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                files.insert(path);
+            }
+        }
+    }
+    Some(files)
+}
+
 pub fn run_status<S>(store: &S, options: StatusOptions) -> Result<StatusReport, StatusError>
 where
     S: MountRepository
@@ -160,17 +311,20 @@ where
         + JournalRepository
         + RemoteObservationRepository
         + FreshnessStateRepository
-        + VirtualMutationRepository,
+        + VirtualMutationRepository
+        + MountLiveModeRepository,
 {
     let mounts = store.load_mounts().map_err(StatusError::Store)?;
     let target = options.path.as_deref().map(absolute_path).transpose()?;
     let state_root = options.state_root.unwrap_or_else(default_state_root);
     let scopes = resolve_scopes(store, &mounts, options.mount_id.as_ref(), target.as_deref())?;
+    let context = StatusContext::new(&state_root, &scopes);
     let journals = store.list_journal().map_err(StatusError::Store)?;
     let mut summary = StatusSummary::default();
     let mut mount_reports = Vec::new();
 
     for scope in scopes {
+        let facts = MountStatusFacts::load(store, &scope.mount.mount_id);
         let mutations = scoped_virtual_mutations(store, &scope)?;
         let deleted = mutations
             .iter()
@@ -185,7 +339,7 @@ where
 
         let mut status_entries = entries
             .into_iter()
-            .map(|entity| classify_entity(store, &scope.mount, entity, &journals, &state_root))
+            .map(|entity| classify_entity(store, &scope.mount, entity, &journals, &context, &facts))
             .collect::<Vec<_>>();
         status_entries.extend(
             mutations
@@ -203,6 +357,7 @@ where
             mount_id: scope.mount.mount_id.0.clone(),
             connector: scope.mount.connector.clone(),
             root: scope.mount.root.display().to_string(),
+            live_mode: status_live_mode_for_mount(store, &scope.mount.mount_id),
             entries: status_entries,
         });
     }
@@ -227,6 +382,49 @@ where
         summary,
         mounts: mount_reports,
     })
+}
+
+fn status_live_mode_for_mount<S>(store: &S, mount_id: &MountId) -> StatusLiveMode
+where
+    S: MountLiveModeRepository,
+{
+    let record = store.get_mount_live_mode(mount_id).ok().flatten();
+    StatusLiveMode::from_record(record.as_ref())
+}
+
+impl StatusLiveMode {
+    fn from_record(record: Option<&MountLiveModeRecord>) -> Self {
+        let Some(record) = record else {
+            return Self::off();
+        };
+        let (state, label) = if !record.enabled && record.state != MountLiveModeState::Error {
+            ("off", "Live Mode off")
+        } else {
+            match record.state {
+                MountLiveModeState::Off => ("off", "Live Mode off"),
+                MountLiveModeState::Active => ("active", "Live Mode on"),
+                MountLiveModeState::Syncing => ("syncing", "Live Mode syncing"),
+                MountLiveModeState::Error => ("error", "Live Mode paused"),
+            }
+        };
+        Self {
+            enabled: record.enabled,
+            state: state.to_string(),
+            label: label.to_string(),
+            reason: record.last_reason.clone(),
+            last_run_at: record.last_run_at.clone(),
+        }
+    }
+
+    fn off() -> Self {
+        Self {
+            enabled: false,
+            state: "off".to_string(),
+            label: "Live Mode off".to_string(),
+            reason: None,
+            last_run_at: None,
+        }
+    }
 }
 
 impl StatusSummary {
@@ -576,21 +774,19 @@ fn classify_entity<S>(
     mount: &MountConfig,
     entity: EntityRecord,
     journals: &[JournalEntry],
-    state_root: &Path,
+    context: &StatusContext,
+    facts: &MountStatusFacts,
 ) -> StatusEntry
 where
-    S: ShadowRepository
-        + JournalRepository
-        + RemoteObservationRepository
-        + FreshnessStateRepository,
+    S: ShadowRepository + JournalRepository,
 {
     let absolute_path = projected_absolute_path(mount, &entity.path);
     let mut issues = Vec::new();
     let (state, mut state_issues) =
-        classify_local_state(store, mount, &entity, &absolute_path, state_root);
+        classify_local_state(store, mount, &entity, &absolute_path, context);
     issues.append(&mut state_issues);
 
-    let (remote, mut remote_issues) = classify_remote_state(store, &mount.mount_id, &entity, state);
+    let (remote, mut remote_issues) = classify_remote_state(facts, &entity, state);
     issues.append(&mut remote_issues);
 
     let (pending_journal_count, failed_journal_count) =
@@ -640,42 +836,32 @@ fn projected_absolute_path(mount: &MountConfig, relative_path: &Path) -> PathBuf
     locality_platform::join_logical_path(&mount.root, relative_path)
 }
 
-fn classify_remote_state<S>(
-    store: &S,
-    mount_id: &MountId,
+fn classify_remote_state(
+    facts: &MountStatusFacts,
     entity: &EntityRecord,
     local_state: StatusState,
-) -> (StatusRemoteState, Vec<StatusIssue>)
-where
-    S: RemoteObservationRepository + FreshnessStateRepository,
-{
+) -> (StatusRemoteState, Vec<StatusIssue>) {
     let mut issues = Vec::new();
-    let freshness = match store.get_freshness_state(mount_id, &entity.remote_id) {
-        Ok(freshness) => freshness,
-        Err(error) => {
-            issues.push(StatusIssue::new(
-                "freshness_state_read_failed",
-                format!("failed to read freshness state: {error}"),
-            ));
-            None
-        }
-    };
-    let observation = match store.get_remote_observation(mount_id, &entity.remote_id) {
-        Ok(observation) => observation,
-        Err(error) => {
-            issues.push(StatusIssue::new(
-                "remote_observation_read_failed",
-                format!("failed to read remote observation: {error}"),
-            ));
-            None
-        }
-    };
+    if let Some(error) = &facts.freshness_states_error {
+        issues.push(StatusIssue::new(
+            "freshness_state_read_failed",
+            format!("failed to read freshness state: {error}"),
+        ));
+    }
+    if let Some(error) = &facts.remote_observations_error {
+        issues.push(StatusIssue::new(
+            "remote_observation_read_failed",
+            format!("failed to read remote observation: {error}"),
+        ));
+    }
 
-    let mut remote = remote_state(entity, freshness.as_ref(), observation.as_ref());
+    let freshness = facts.freshness_state(&entity.remote_id);
+    let observation = facts.remote_observation(&entity.remote_id);
+    let mut remote = remote_state(entity, freshness, observation);
     remote.changed = remote.remote_hint_pending
         || remote.deleted
-        || remote_tree_version_differs(entity.synced_tree_remote_version(), observation.as_ref());
-    remote.checking = !remote.changed && freshness_check_pending(freshness.as_ref(), &remote);
+        || remote_tree_version_differs(entity.synced_tree_remote_version(), observation);
+    remote.checking = !remote.changed && freshness_check_pending(freshness, &remote);
 
     if remote.deleted {
         let (code, message) = if local_state == StatusState::Dirty {
@@ -790,13 +976,13 @@ fn classify_local_state<S>(
     mount: &MountConfig,
     entity: &EntityRecord,
     absolute_path: &Path,
-    state_root: &Path,
+    context: &StatusContext,
 ) -> (StatusState, Vec<StatusIssue>)
 where
     S: ShadowRepository,
 {
     if mount.projection.uses_virtual_filesystem() {
-        return classify_virtual_state(store, mount, entity, state_root);
+        return classify_virtual_state(store, mount, entity, context);
     }
 
     if !absolute_path.exists() {
@@ -850,17 +1036,17 @@ fn classify_virtual_state<S>(
     store: &S,
     mount: &MountConfig,
     entity: &EntityRecord,
-    state_root: &Path,
+    context: &StatusContext,
 ) -> (StatusState, Vec<StatusIssue>)
 where
     S: ShadowRepository,
 {
     match entity.hydration {
         HydrationState::Conflicted if entity.kind == EntityKind::Page => {
-            return classify_conflicted_virtual_page_state(store, mount, entity, state_root);
+            return classify_conflicted_virtual_page_state(store, mount, entity, context);
         }
         HydrationState::Dirty if entity.kind == EntityKind::Page => {
-            return classify_dirty_virtual_page_state(store, mount, entity, state_root);
+            return classify_dirty_virtual_page_state(store, mount, entity, context);
         }
         HydrationState::Dirty => {
             return (
@@ -872,7 +1058,7 @@ where
     }
 
     match entity.kind {
-        EntityKind::Page => classify_virtual_page_state(store, mount, entity, state_root),
+        EntityKind::Page => classify_virtual_page_state(store, mount, entity, context),
         EntityKind::Database
         | EntityKind::Directory
         | EntityKind::Asset
@@ -884,31 +1070,37 @@ fn classify_virtual_page_state<S>(
     store: &S,
     mount: &MountConfig,
     entity: &EntityRecord,
-    state_root: &Path,
+    context: &StatusContext,
 ) -> (StatusState, Vec<StatusIssue>)
 where
     S: ShadowRepository,
 {
-    let content_path = match virtual_fs_content_path(state_root, &mount.mount_id, &entity.path) {
-        Ok(path) => path,
-        Err(error) => {
-            return (
-                StatusState::Error,
-                vec![StatusIssue::new(
-                    "content_cache_path_invalid",
-                    format!("invalid virtual content path: {error}"),
-                )],
-            );
-        }
-    };
+    let content_path =
+        match virtual_fs_content_path(&context.state_root, &mount.mount_id, &entity.path) {
+            Ok(path) => path,
+            Err(error) => {
+                return (
+                    StatusState::Error,
+                    vec![StatusIssue::new(
+                        "content_cache_path_invalid",
+                        format!("invalid virtual content path: {error}"),
+                    )],
+                );
+            }
+        };
+    let cache_exists = context
+        .virtual_content
+        .contains_file(&mount.mount_id, &content_path)
+        .unwrap_or_else(|| content_path.exists());
+
     if matches!(
         entity.hydration,
         HydrationState::Virtual | HydrationState::Stub
-    ) && !content_path.exists()
+    ) && !cache_exists
     {
         return (StatusState::Stub, Vec::new());
     }
-    if !content_path.exists() {
+    if !cache_exists {
         return (
             StatusState::Missing,
             vec![StatusIssue::new(
@@ -989,12 +1181,12 @@ fn classify_dirty_virtual_page_state<S>(
     store: &S,
     mount: &MountConfig,
     entity: &EntityRecord,
-    state_root: &Path,
+    context: &StatusContext,
 ) -> (StatusState, Vec<StatusIssue>)
 where
     S: ShadowRepository,
 {
-    let (state, issues) = classify_virtual_page_state(store, mount, entity, state_root);
+    let (state, issues) = classify_virtual_page_state(store, mount, entity, context);
     dirty_state_with_entity_issue(state, issues)
 }
 
@@ -1002,12 +1194,12 @@ fn classify_conflicted_virtual_page_state<S>(
     store: &S,
     mount: &MountConfig,
     entity: &EntityRecord,
-    state_root: &Path,
+    context: &StatusContext,
 ) -> (StatusState, Vec<StatusIssue>)
 where
     S: ShadowRepository,
 {
-    let (state, issues) = classify_virtual_page_state(store, mount, entity, state_root);
+    let (state, issues) = classify_virtual_page_state(store, mount, entity, context);
     conflicted_state_with_entity_issue(state, issues)
 }
 

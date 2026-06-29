@@ -17,12 +17,13 @@ use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
     ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord, MountConfig,
-    RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
+    MountLiveModeRecord, RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
 };
 use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
     EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository, JournalRepository,
-    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
+    MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
+    VirtualMutationRepository,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -37,6 +38,7 @@ type FreshnessStateKey = (MountId, RemoteId);
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
     mounts: BTreeMap<MountId, MountConfig>,
+    mount_live_modes: BTreeMap<MountId, MountLiveModeRecord>,
     connections: BTreeMap<ConnectionId, ConnectionRecord>,
     connector_profiles: BTreeMap<ConnectorProfileId, ConnectorProfileRecord>,
     entities: BTreeMap<EntityKey, EntityRecord>,
@@ -98,6 +100,8 @@ impl InMemoryStateStore {
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
         self.virtual_mutations
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.mount_live_modes
+            .retain(|entry_mount_id, _| entry_mount_id != mount_id);
         self.auto_save_enrollments
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
         self.remote_observations
@@ -127,6 +131,27 @@ impl MountRepository for InMemoryStateStore {
 
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
         Ok(self.mounts.values().cloned().collect())
+    }
+}
+
+impl MountLiveModeRepository for InMemoryStateStore {
+    fn save_mount_live_mode(&mut self, live_mode: MountLiveModeRecord) -> StoreResult<()> {
+        self.mount_live_modes
+            .insert(live_mode.mount_id.clone(), live_mode);
+        Ok(())
+    }
+
+    fn get_mount_live_mode(&self, mount_id: &MountId) -> StoreResult<Option<MountLiveModeRecord>> {
+        Ok(self.mount_live_modes.get(mount_id).cloned())
+    }
+
+    fn list_mount_live_modes(&self) -> StoreResult<Vec<MountLiveModeRecord>> {
+        Ok(self.mount_live_modes.values().cloned().collect())
+    }
+
+    fn delete_mount_live_mode(&mut self, mount_id: &MountId) -> StoreResult<()> {
+        self.mount_live_modes.remove(mount_id);
+        Ok(())
     }
 }
 

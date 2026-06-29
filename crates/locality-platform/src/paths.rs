@@ -55,21 +55,58 @@ impl DefaultHostPaths {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     }
+
+    fn first_var_path(&self, keys: &[&str]) -> Option<PathBuf> {
+        keys.iter().find_map(|key| self.var_path(key))
+    }
+
+    fn first_existing_path(
+        &self,
+        candidates: impl IntoIterator<Item = PathBuf>,
+    ) -> Option<PathBuf> {
+        let _ = self;
+        candidates.into_iter().find(|candidate| candidate.exists())
+    }
 }
 
 impl HostPaths for DefaultHostPaths {
     fn state_root(&self) -> PathBuf {
-        if let Some(path) = self.var_path("LOCALITY_STATE_DIR") {
+        if let Some(path) = self.first_var_path(&["LOCALITY_STATE_DIR", "AFS_STATE_DIR"]) {
             return path;
         }
 
         if self.target_os == "windows" {
+            if let Some(path) = self.first_existing_path(
+                [
+                    self.var_path("LOCALAPPDATA")
+                        .map(|path| path.join("Locality")),
+                    self.var_path("LOCALAPPDATA")
+                        .map(|path| path.join("AgentFS")),
+                    self.var_path("LOCALAPPDATA").map(|path| path.join("AFS")),
+                    self.var_path("USERPROFILE")
+                        .map(|path| path.join("AppData").join("Local").join("Locality")),
+                    self.var_path("USERPROFILE")
+                        .map(|path| path.join("AppData").join("Local").join("AgentFS")),
+                ]
+                .into_iter()
+                .flatten(),
+            ) {
+                return path;
+            }
             if let Some(path) = self.var_path("LOCALAPPDATA") {
                 return path.join("Locality");
             }
             if let Some(path) = self.var_path("USERPROFILE") {
                 return path.join("AppData").join("Local").join("Locality");
             }
+        }
+
+        if let Some(path) = self.first_existing_path(
+            self.user_home()
+                .into_iter()
+                .flat_map(|home| [home.join(".loc"), home.join(".afs")]),
+        ) {
+            return path;
         }
 
         self.user_home()
@@ -159,7 +196,9 @@ mod tests {
         DefaultHostPaths, HostPaths, host_path_from_logical_path, join_logical_path,
         logical_path_display,
     };
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn windows_state_root_uses_local_app_data() {
@@ -192,6 +231,57 @@ mod tests {
         );
 
         assert_eq!(paths.state_root(), PathBuf::from(r"D:\loc-state"));
+    }
+
+    #[test]
+    fn afs_state_dir_alias_overrides_platform_default() {
+        let paths = DefaultHostPaths::for_target_with_env(
+            "windows",
+            [
+                ("AFS_STATE_DIR", r"D:\afs-state"),
+                ("LOCALAPPDATA", r"C:\Users\Ada\AppData\Local"),
+            ],
+        );
+
+        assert_eq!(paths.state_root(), PathBuf::from(r"D:\afs-state"));
+    }
+
+    #[test]
+    fn windows_state_root_prefers_existing_legacy_agentfs_directory() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let local_app_data =
+            std::env::temp_dir().join(format!("locality-platform-localappdata-{suffix}"));
+        let legacy_root = local_app_data.join("AgentFS");
+        fs::create_dir_all(&legacy_root).expect("legacy state root");
+
+        let paths = DefaultHostPaths::for_target_with_env(
+            "windows",
+            [("LOCALAPPDATA", local_app_data.as_os_str())],
+        );
+
+        assert_eq!(paths.state_root(), legacy_root);
+
+        let _ = fs::remove_dir_all(local_app_data);
+    }
+
+    #[test]
+    fn unix_state_root_prefers_existing_legacy_dot_afs_directory() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("locality-platform-home-{suffix}"));
+        let legacy_root = home.join(".afs");
+        fs::create_dir_all(&legacy_root).expect("legacy unix state root");
+
+        let paths = DefaultHostPaths::for_target_with_env("linux", [("HOME", home.as_os_str())]);
+
+        assert_eq!(paths.state_root(), legacy_root);
+
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]

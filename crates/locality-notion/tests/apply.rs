@@ -3540,6 +3540,64 @@ fn apply_creates_child_page_with_consecutive_markdown_list_items_as_separate_blo
 }
 
 #[test]
+fn apply_creates_child_page_with_emoji_shortcodes_and_new_tables() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-parent")],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new("page-parent"),
+            parent_kind: Some(EntityKind::Page),
+            title: "Fitness Log".to_string(),
+            properties: BTreeMap::new(),
+            body: "# Fitness Log\n\n## 😴 Sleep Data\n\n| \u{00a0} | \u{00a0} |\n| --- | --- |\n| :sleeping: Poor | :sparkles: Excellent |\n\n**Sleep Quality Scale:** :sleeping: Poor".to_string(),
+            source_path: "Fitness Log/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    let [WriteCall::CreatePage { body }] = writes.as_slice() else {
+        panic!("expected one page create");
+    };
+    let children = body["children"].as_array().expect("children");
+    assert_eq!(children.len(), 4);
+    assert_eq!(
+        children[0]["heading_1"]["rich_text"],
+        rich_text_json("Fitness Log")
+    );
+    assert_eq!(
+        children[1]["heading_2"]["rich_text"],
+        rich_text_json("😴 Sleep Data")
+    );
+    assert_eq!(children[2]["type"], "table");
+    assert_eq!(children[2]["table"]["table_width"], json!(2));
+    assert_eq!(children[2]["table"]["has_column_header"], json!(false));
+    assert_eq!(
+        children[2]["table"]["children"][0]["table_row"]["cells"][0],
+        rich_text_json(":sleeping: Poor")
+    );
+    assert_eq!(
+        children[2]["table"]["children"][0]["table_row"]["cells"][1],
+        rich_text_json(":sparkles: Excellent")
+    );
+    assert_eq!(children[3]["type"], "paragraph");
+}
+
+#[test]
 fn apply_creates_database_row_with_properties_and_children() {
     let api = Arc::new(RecordingNotionApi::with_data_source_properties(
         "2026-06-10T00:00:00.000Z",
