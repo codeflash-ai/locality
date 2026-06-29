@@ -346,8 +346,10 @@ compare the rendered shadow before refreshing the visible projection. This avoid
 relying on Notion page metadata that can miss some body edits, while leaving
 unchanged CloudStorage replicas untouched. The desktop runner must not poll the
 SQLite state store while Live Mode is off. Live Mode state changes publish an
-explicit local signal under the state root; the app's watcher wakes the runner
-from that signal, while ordinary SQLite WAL/SHM churn remains ignored.
+explicit local signal under the state root through the shared store boundary;
+the app's watcher wakes the runner from that signal, while ordinary SQLite
+WAL/SHM churn remains ignored. The runner keeps a low-frequency recovery recheck
+only as a missed-event fallback, not as the normal state-change path.
 
 ## Scheduled Pull Reconciliation
 

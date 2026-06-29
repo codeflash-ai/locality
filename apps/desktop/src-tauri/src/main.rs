@@ -69,10 +69,11 @@ use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
     FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, JournalRepository,
-    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState, MountRepository,
-    ProjectionMode, RemoteObservationRecord, RemoteObservationRepository, ShadowRepository,
-    SqliteStateStore, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
-    open_credential_store,
+    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState,
+    MountLiveModeStateChangeError, MountRepository, ProjectionMode, RemoteObservationRecord,
+    RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository, is_live_mode_state_change_signal_path,
+    open_credential_store, save_mount_live_mode_and_publish_signal,
 };
 use localityd::autosave::auto_save_timestamp;
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
@@ -129,7 +130,6 @@ const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250
 const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
 const LIVE_MODE_RUNNER_ACTIVE_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_MODE_RUNNER_IDLE_RECHECK: Duration = Duration::from_secs(5 * 60);
-const LIVE_MODE_STATE_CHANGED_FILE: &str = "live-mode.changed";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1215,7 +1215,7 @@ fn live_mode_wake_generation() -> u64 {
         .generation
 }
 
-fn notify_live_mode_state_changed() {
+fn wake_live_mode_runner() {
     let (state, cvar) = live_mode_wake_state();
     {
         let mut state = state.lock().expect("live mode wake lock poisoned");
@@ -1224,17 +1224,12 @@ fn notify_live_mode_state_changed() {
     cvar.notify_all();
 }
 
-fn publish_live_mode_state_changed(state_root: &Path) {
-    notify_live_mode_state_changed();
-    let path = live_mode_state_changed_path(state_root);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, live_mode_timestamp());
-}
-
-fn live_mode_state_changed_path(state_root: &Path) -> PathBuf {
-    state_root.join(LIVE_MODE_STATE_CHANGED_FILE)
+fn log_live_mode_state_signal_error(error: impl std::fmt::Display) {
+    desktop_log(
+        "warn",
+        "live_mode.signal_failed",
+        format!("could not publish Live Mode state-change signal: {error}"),
+    );
 }
 
 fn wait_for_live_mode_state_change(last_seen: &mut u64, timeout: Duration) -> bool {
@@ -1269,10 +1264,19 @@ fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionRep
     } else {
         record.off(now)
     };
-    store
-        .save_mount_live_mode(record)
-        .map_err(|error| format!("Could not update Live Mode state: {error}"))?;
-    publish_live_mode_state_changed(&state_root);
+    match save_mount_live_mode_and_publish_signal(&mut store, &state_root, record) {
+        Ok(_) => wake_live_mode_runner(),
+        Err(MountLiveModeStateChangeError::Save(error)) => {
+            return Err(format!("Could not update Live Mode state: {error}"));
+        }
+        Err(MountLiveModeStateChangeError::PublishSignal(error)) => {
+            wake_live_mode_runner();
+            log_live_mode_state_signal_error(&error);
+            return Err(format!(
+                "Live Mode state changed, but Locality could not publish its wake signal: {error}"
+            ));
+        }
+    }
 
     Ok(ActionReport {
         ok: true,
@@ -3473,7 +3477,7 @@ fn start_state_change_watcher(app: AppHandle) {
                 Ok(Ok(event)) => {
                     let actions = debounce_state_events(&rx, &state_root, &content_roots, event);
                     if actions.wake_live_mode {
-                        notify_live_mode_state_changed();
+                        wake_live_mode_runner();
                     }
                     if actions.refresh_surfaces {
                         refresh_desktop_surfaces(&app);
@@ -3569,10 +3573,7 @@ fn state_event_actions(
 }
 
 fn state_event_path_wakes_live_mode(path: &Path, state_root: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(state_root) else {
-        return false;
-    };
-    relative == Path::new(LIVE_MODE_STATE_CHANGED_FILE)
+    is_live_mode_state_change_signal_path(path, state_root)
 }
 
 fn state_event_path_requires_refresh(
@@ -3595,7 +3596,7 @@ fn state_event_path_requires_refresh(
     if file_name.is_some_and(|name| name.starts_with("state.sqlite3")) {
         return false;
     }
-    if relative == Path::new(LIVE_MODE_STATE_CHANGED_FILE) {
+    if is_live_mode_state_change_signal_path(path, state_root) {
         return true;
     }
 
@@ -7236,28 +7237,28 @@ mod tests {
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository,
-        MountConfig, MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore,
+        LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountRepository, ProjectionMode,
+        ShadowRepository, SqliteStateStore,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
 
     use super::{
-        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LIVE_MODE_STATE_CHANGED_FILE,
-        LiveModeE2eCleanup, MonitorScreenBounds, PendingChange, ScreenBounds, TerminalCliLinkState,
-        TrayVisualState, clear_mount_cached_projection, clear_state_root_contents,
-        conflict_preview, connection_metadata_changed, current_daemon_build_id,
-        current_desktop_build_id, diff_report_message, exact_located_entity_record,
-        failed_push_summary, has_unresolved_conflict_markers, hydration_after_editor_write,
-        inspect_install_state, install_terminal_cli_link_at,
-        install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
-        is_unsupported_schema_version_message, live_mode_content_hash_changed,
-        live_mode_e2e_append_local_marker, live_mode_e2e_append_remote_marker,
-        live_mode_e2e_notion_api, live_mode_e2e_page_id, live_mode_e2e_page_path,
-        live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_merge_remote_drift_markdown,
-        live_mode_remote_pull_candidates, live_mode_should_reconcile_local_target_for_key,
-        live_mode_target, live_mode_tick_blocking, live_mode_tick_from_snapshot,
-        live_mode_wake_generation, load_desktop_activity, mount_has_pending_local_changes,
-        mount_has_unfinished_journals, notify_live_mode_state_changed, notion_id_from_url,
+        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup,
+        MonitorScreenBounds, PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
+        clear_mount_cached_projection, clear_state_root_contents, conflict_preview,
+        connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
+        diff_report_message, exact_located_entity_record, failed_push_summary,
+        has_unresolved_conflict_markers, hydration_after_editor_write, inspect_install_state,
+        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
+        is_notion_access_lost_message, is_unsupported_schema_version_message,
+        live_mode_content_hash_changed, live_mode_e2e_append_local_marker,
+        live_mode_e2e_append_remote_marker, live_mode_e2e_notion_api, live_mode_e2e_page_id,
+        live_mode_e2e_page_path, live_mode_e2e_remote_text, live_mode_e2e_wait_until,
+        live_mode_merge_remote_drift_markdown, live_mode_remote_pull_candidates,
+        live_mode_should_reconcile_local_target_for_key, live_mode_target, live_mode_tick_blocking,
+        live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
+        mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
         parse_daemon_build_info_json, pending_changes_from_status,
         preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
         push_action_message, record_current_install_marker, record_desktop_activity,
@@ -7267,7 +7268,7 @@ mod tests {
         summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
         tray_popover_anchor, tray_popover_position, unique_suffix, validate_mount_root,
         virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
-        write_terminal_cli_path_section,
+        wake_live_mode_runner, write_terminal_cli_path_section,
     };
 
     #[test]
@@ -9137,11 +9138,11 @@ mod tests {
         }
 
         assert!(state_event_path_wakes_live_mode(
-            &state_root.join(LIVE_MODE_STATE_CHANGED_FILE),
+            &state_root.join(LIVE_MODE_STATE_CHANGE_SIGNAL_FILE),
             &state_root
         ));
         assert!(state_event_path_requires_refresh(
-            &state_root.join(LIVE_MODE_STATE_CHANGED_FILE),
+            &state_root.join(LIVE_MODE_STATE_CHANGE_SIGNAL_FILE),
             &state_root,
             &content_roots
         ));
@@ -9175,7 +9176,7 @@ mod tests {
     fn live_mode_wake_signal_unblocks_wait_without_polling_state() {
         let mut generation = live_mode_wake_generation();
 
-        notify_live_mode_state_changed();
+        wake_live_mode_runner();
 
         let started = Instant::now();
         assert!(wait_for_live_mode_state_change(

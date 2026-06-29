@@ -345,8 +345,10 @@ Important language:
   projection, so stale Notion metadata does not hide body edits and unchanged
   files are not repeatedly read or rewritten. When Live Mode is disabled, the
   desktop runner must sleep on an explicit Live Mode state-change signal rather
-  than polling durable SQLite; toggles write that signal so the app wakes only
-  when the source-of-truth state changes.
+  than polling durable SQLite; writers that change the source-of-truth state
+  publish that signal so the app wakes on the state change. A low-frequency
+  recovery recheck is still allowed for missed filesystem events, but ordinary
+  SQLite WAL/SHM churn must not drive the runner.
 
 ## Main App Structure
 

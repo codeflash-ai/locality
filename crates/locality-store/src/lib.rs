@@ -8,6 +8,7 @@
 pub mod compatibility;
 pub mod credentials;
 pub mod error;
+pub mod live_mode;
 pub mod memory;
 pub mod records;
 pub mod repository;
@@ -22,6 +23,11 @@ pub use credentials::{
     InMemoryCredentialStore, open_credential_store,
 };
 pub use error::{StoreError, StoreResult};
+pub use live_mode::{
+    LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountLiveModeStateChangeError,
+    is_live_mode_state_change_signal_path, live_mode_state_change_signal_path,
+    publish_live_mode_state_change_signal, save_mount_live_mode_and_publish_signal,
+};
 pub use memory::InMemoryStateStore;
 pub use records::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveState, ConnectionId, ConnectionRecord,
