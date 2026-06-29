@@ -147,14 +147,15 @@ function Invoke-Native {
         }
         throw "$Step timed out after $TimeoutSeconds seconds"
     }
+    [void] $process.WaitForExit()
     $stdoutText = ""
     $stderrText = ""
     if (-not $NoCapture) {
-        if (-not $stdout.Wait(5000)) {
-            throw "$Step exited, but stdout did not close within 5 seconds"
+        if (-not $stdout.Wait(30000)) {
+            throw "$Step exited, but stdout did not close within 30 seconds"
         }
-        if (-not $stderr.Wait(5000)) {
-            throw "$Step exited, but stderr did not close within 5 seconds"
+        if (-not $stderr.Wait(30000)) {
+            throw "$Step exited, but stderr did not close within 30 seconds"
         }
         $stdoutText = $stdout.Result
         $stderrText = $stderr.Result
