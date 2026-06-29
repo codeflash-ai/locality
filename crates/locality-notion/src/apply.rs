@@ -26,7 +26,9 @@ use crate::dto::{
     PagePropertyDto, RichTextAnnotationsDto, RichTextDto, TableBlockDto,
 };
 use crate::fetch::fetch_page_bundle;
-use crate::markdown_table::{parse_markdown_table_row, validate_markdown_table_separator};
+use crate::markdown_table::{
+    parse_markdown_table_row, parse_markdown_table_shape, validate_markdown_table_separator,
+};
 use crate::media::{resolve_media_href_with_content_root, unescape_markdown_href};
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
@@ -1100,6 +1102,9 @@ fn create_page_children(body: &str) -> LocalityResult<Vec<Value>> {
                     "creating Notion pages with Locality directive blocks",
                 ));
             }
+            if looks_like_markdown_table(&block.text) {
+                return parse_new_table_append_child(&block.text);
+            }
             parse_supported_block(&block.text, None, None).map(|patch| patch.append_child())
         })
         .collect()
@@ -1508,11 +1513,22 @@ impl NotionBlockPatch {
         Self { kind, payload }
     }
 
+    fn raw_child(child: Value) -> Self {
+        Self {
+            kind: "unsupported_raw_child",
+            payload: child,
+        }
+    }
+
     fn update_body(&self) -> Value {
         json!({ self.kind: self.payload.clone() })
     }
 
     fn append_child(&self) -> Value {
+        if self.kind == "unsupported_raw_child" {
+            return self.payload.clone();
+        }
+
         let mut object = Map::new();
         object.insert("object".to_string(), json!("block"));
         object.insert("type".to_string(), json!(self.kind));
@@ -1732,6 +1748,10 @@ fn parse_append_block(
     local_root: Option<&Path>,
 ) -> LocalityResult<NotionBlockPatch> {
     let trimmed = markdown.trim_end_matches('\n');
+    if looks_like_markdown_table(trimmed) {
+        return parse_new_table_append_child(trimmed).map(NotionBlockPatch::raw_child);
+    }
+
     if let Some((caption, href, image_syntax)) = parse_local_media_markdown(trimmed) {
         let Some(local_root) = local_root else {
             if image_syntax || looks_like_media_href(&href) {
@@ -1800,6 +1820,41 @@ fn table_row_append_child(cells: Vec<Value>) -> Value {
             "cells": cells,
         },
     })
+}
+
+fn parse_new_table_append_child(markdown: &str) -> LocalityResult<Value> {
+    let shape = parse_markdown_table_shape(markdown)?;
+    let has_column_header = shape.header.iter().any(|cell| !cell.trim().is_empty());
+    let mut rows = Vec::with_capacity(shape.data_rows.len() + usize::from(has_column_header));
+    if has_column_header {
+        rows.push(shape.header);
+    }
+    rows.extend(shape.data_rows);
+    if rows.is_empty() {
+        return Err(LocalityError::Unsupported("creating empty Notion tables"));
+    }
+
+    let children = rows
+        .iter()
+        .map(|row| {
+            let cells = row
+                .iter()
+                .map(|cell| rich_text_payload(cell, None))
+                .collect::<LocalityResult<Vec<_>>>()?;
+            Ok(table_row_append_child(cells))
+        })
+        .collect::<LocalityResult<Vec<_>>>()?;
+
+    Ok(json!({
+        "object": "block",
+        "type": "table",
+        "table": {
+            "table_width": shape.width,
+            "has_column_header": has_column_header,
+            "has_row_header": false,
+            "children": children,
+        },
+    }))
 }
 
 fn rich_text(content: &str) -> Value {
@@ -2120,7 +2175,13 @@ impl InlineParser<'_> {
                 continue;
             }
 
-            let next = self.next_special_or_preimage(index + 1, closing);
+            let next_scan_start = index
+                + self.input[index..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or(1);
+            let next = self.next_special_or_preimage(next_scan_start, closing);
             parts.push(RichTextWritePart::Text {
                 content: unescape_markdown_text(&self.input[index..next]),
                 link: None,

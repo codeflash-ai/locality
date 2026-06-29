@@ -248,18 +248,18 @@ helper rather than through inotify-triggered placeholder files. The daemon API f
 that path is platform-neutral `virtual_fs`; macOS File Provider commands are
 compatibility aliases over it.
 
-For macOS File Provider mounts, `loc status <path>`, `loc diff`, and `loc push`
-also reconcile visible CloudStorage edits into the daemon content cache before
-planning. This is a command-boundary fallback for rare File Provider callback
-misses: normal writes should still arrive through `modifyItem`, but targeted
-review and push commands should not ignore a newer visible `page.md` replica.
-After a targeted `loc pull <page.md>` updates the daemon content cache, the CLI
-also repairs an already-materialized visible CloudStorage replica for that file
-when the visible file still matches the synced shadow captured before the pull.
-If the visible file has diverged, Locality leaves it untouched for review instead of
-overwriting a possible File Provider callback miss. Background
-remote-fast-forward hydration applies the same clean-shadow guard for
-already-materialized macOS replicas.
+For visible virtual-provider projections, currently macOS File Provider and
+Windows Cloud Files, `loc status <path>`, `loc diff`, and `loc push` also
+reconcile visible replica edits into the daemon content cache before planning.
+This is a command-boundary fallback for rare provider callback misses: normal
+writes should still arrive through the provider, but targeted review and push
+commands should not ignore a newer visible `page.md` replica. After a targeted
+`loc pull <page.md>` updates the daemon content cache, the CLI also repairs an
+already-materialized visible replica for that file when the visible file still
+matches the synced shadow captured before the pull. If the visible file has
+diverged, Locality leaves it untouched for review instead of overwriting a
+possible provider callback miss. Background remote-fast-forward hydration
+applies the same clean-shadow guard for already-materialized visible replicas.
 
 `loc file-provider register <mount-id-or-path>` validates the mount against the
 current platform's virtual projection: `macos_file_provider` on macOS,

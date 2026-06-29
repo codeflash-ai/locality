@@ -2893,9 +2893,10 @@ fn inspect_install_state(state_root: &Path) -> InstallStateReview {
     let state_exists = state_root.exists();
     let current_build_id = current_desktop_build_id();
     let previous_build_id = marker.as_ref().map(install_marker_display_build_id);
+    let should_prompt = marker.is_none() && !sqlite_exists;
 
     InstallStateReview {
-        should_prompt: false,
+        should_prompt,
         state_exists,
         sqlite_exists,
         previous_build_id,
@@ -6491,9 +6492,9 @@ fn reconcile_desktop_projection_changes(
     state_root: &Path,
     target: Option<&Path>,
 ) -> Result<(), String> {
-    daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+    daemon_file_provider::reconcile_visible_projection(store, state_root, target)
         .map(|_| ())
-        .map_err(|error| format!("Could not reconcile macOS File Provider changes: {error}"))
+        .map_err(|error| format!("Could not reconcile visible projection changes: {error}"))
 }
 
 fn auto_save_target_direct(target: &Path) -> Result<PushReport, String> {
@@ -8314,6 +8315,18 @@ mod tests {
         assert!(!review.should_prompt);
         assert!(review.state_exists);
         assert!(review.sqlite_exists);
+        assert_eq!(review.previous_build_id, None);
+    }
+
+    #[test]
+    fn install_state_prompts_for_fresh_install_without_state() {
+        let temp = TestTempDir::new("install-state-fresh");
+
+        let review = inspect_install_state(temp.path());
+
+        assert!(review.should_prompt);
+        assert!(review.state_exists);
+        assert!(!review.sqlite_exists);
         assert_eq!(review.previous_build_id, None);
     }
 

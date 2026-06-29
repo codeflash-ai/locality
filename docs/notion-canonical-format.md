@@ -31,6 +31,8 @@ The first renderer supports common text blocks, richer inline text, display equa
 
 Media blocks with a Notion `file.url` or `external.url` render as ordinary Markdown. Images use image syntax, while other file-like blocks use links. When Locality writes a page into a local projection, downloadable file-like media links point at the absolute local media file under the projection output root instead of the remote Notion/S3 URL. For virtual projections this is the daemon content cache:
 
+Read-side compatibility also accepts legacy `afs:` identity frontmatter and `::afs{...}` directives from pre-rename projections. Normal Locality rewrites continue to emit `loc:` and `::loc{...}` spellings.
+
 ```markdown
 ![Architecture diagram](/home/user/.loc/content/notion-mount-1/files/.loc/media/roadmap/image-0123456789ab.png)
 [Design brief](/home/user/.loc/content/notion-mount-1/files/.loc/media/roadmap/pdf-abcdef1234567890.pdf)
@@ -83,3 +85,7 @@ title: "New task"
 ```
 
 On push, Locality creates the Notion row under the parent data source, reads back the assigned remote ID, and rewrites the file into the normal projected filename with generated `loc` metadata.
+New page and row creation supports the same common block shapes as appends, plus
+simple Markdown tables. Header text creates a Notion column-header row; an empty
+Markdown header row creates a headerless Notion table. Table cell rich text uses
+the same inline Markdown parser as paragraphs.

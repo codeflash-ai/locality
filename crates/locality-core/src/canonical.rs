@@ -16,6 +16,8 @@ use crate::model::{CanonicalBlock, CanonicalDocument, EntityKind, RemoteId, Sour
 
 pub type FrontmatterProperties = BTreeMap<String, Value>;
 
+const COMPAT_DIRECTIVE_PREFIXES: [&str; 2] = ["::loc", "::afs"];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedCanonicalDocument {
     pub document: CanonicalDocument,
@@ -152,15 +154,18 @@ pub fn parse_directive_line(line: &str, line_number: usize) -> Option<Directive>
     let raw = line.to_string();
     let trimmed = line.trim();
 
-    if !trimmed.starts_with("::loc") {
+    let prefix = directive_prefix(trimmed)?;
+    let brace_prefix = format!("{prefix}{{");
+
+    if !trimmed.starts_with(prefix) {
         return None;
     }
 
-    let malformed = !trimmed.starts_with("::loc{") || !trimmed.ends_with('}');
+    let malformed = !trimmed.starts_with(&brace_prefix) || !trimmed.ends_with('}');
     let attributes = if malformed {
         BTreeMap::new()
     } else {
-        parse_directive_attributes(&trimmed["::loc{".len()..trimmed.len() - 1])
+        parse_directive_attributes(&trimmed[brace_prefix.len()..trimmed.len() - 1])
     };
     let remote_id = attributes.get("id").filter(|id| !id.is_empty()).cloned();
     let directive_type = attributes
@@ -181,6 +186,13 @@ pub fn parse_directive_line(line: &str, line_number: usize) -> Option<Directive>
         line: line_number,
         malformed,
     })
+}
+
+fn directive_prefix(line: &str) -> Option<&'static str> {
+    COMPAT_DIRECTIVE_PREFIXES
+        .iter()
+        .find(|prefix| line.starts_with(**prefix))
+        .copied()
 }
 
 fn parse_frontmatter(frontmatter: &str) -> Result<Frontmatter, CanonicalParseError> {
@@ -374,6 +386,7 @@ struct FrontmatterSplit<'a> {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawFrontmatter {
+    #[serde(alias = "afs")]
     loc: Option<RawLocalityMetadata>,
     title: Option<String>,
     #[serde(flatten)]

@@ -15,7 +15,7 @@
         "customLanguageFiles": {
           "English": "windows/English.nsh"
         },
-        "installerHooks": "windows/loc-sidecars.nsh"
+        "installerHooks": "windows/locality-sidecars.nsh"
       }
     }
   }

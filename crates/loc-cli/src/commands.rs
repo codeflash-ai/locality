@@ -5171,13 +5171,13 @@ fn reconcile_projection_changes(
     state_root: &Path,
     target: Option<&Path>,
 ) -> Result<(), CommandError> {
-    daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+    daemon_file_provider::reconcile_visible_projection(store, state_root, target)
         .map(|_| ())
         .map_err(|error| {
             CommandError::new(
                 command,
                 "projection_reconcile_failed",
-                format!("failed to reconcile macOS File Provider changes: {error}"),
+                format!("failed to reconcile visible projection changes: {error}"),
             )
         })
 }
@@ -5264,9 +5264,9 @@ fn reconcile_projection_changes_best_effort(
     target: Option<&Path>,
 ) {
     if let Err(error) =
-        daemon_file_provider::reconcile_macos_file_provider_projection(store, state_root, target)
+        daemon_file_provider::reconcile_visible_projection(store, state_root, target)
     {
-        eprintln!("loc {command}: skipped macOS File Provider reconciliation: {error}");
+        eprintln!("loc {command}: skipped visible projection reconciliation: {error}");
     }
 }
 

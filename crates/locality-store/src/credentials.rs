@@ -145,6 +145,12 @@ impl CredentialStore for InMemoryCredentialStore {
 #[derive(Clone, Debug, Default)]
 pub struct KeychainCredentialStore;
 
+#[cfg(any(test, target_os = "macos"))]
+const PRIMARY_KEYCHAIN_SERVICE: &str = "loc";
+
+#[cfg(any(test, target_os = "macos"))]
+const COMPAT_KEYCHAIN_SERVICES: [&str; 2] = [PRIMARY_KEYCHAIN_SERVICE, "afs"];
+
 #[cfg(target_os = "macos")]
 impl CredentialStore for KeychainCredentialStore {
     fn put(&self, secret_ref: &str, secret: &str) -> CredentialResult<()> {
@@ -154,7 +160,7 @@ impl CredentialStore for KeychainCredentialStore {
                 "-a",
                 secret_ref,
                 "-s",
-                "loc",
+                PRIMARY_KEYCHAIN_SERVICE,
                 "-w",
                 secret,
                 "-U",
@@ -171,28 +177,54 @@ impl CredentialStore for KeychainCredentialStore {
     }
 
     fn get(&self, secret_ref: &str) -> CredentialResult<String> {
-        let output = std::process::Command::new("security")
-            .args(["find-generic-password", "-a", secret_ref, "-s", "loc", "-w"])
-            .output()
-            .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
-        if output.status.success() {
-            let password = keychain_output_password(&output.stdout);
-            if keychain_reports_hex_password(secret_ref, &password) {
-                return Ok(decode_hex_encoded_password(&password).unwrap_or(password));
+        for service in COMPAT_KEYCHAIN_SERVICES {
+            if let Some(password) = read_keychain_password(secret_ref, service)? {
+                if service != PRIMARY_KEYCHAIN_SERVICE {
+                    let _ = self.put(secret_ref, &password);
+                }
+                return Ok(password);
             }
-            Ok(password)
-        } else {
-            Err(CredentialError::NotFound(secret_ref.to_string()))
         }
+
+        Err(CredentialError::NotFound(secret_ref.to_string()))
     }
 
     fn delete(&self, secret_ref: &str) -> CredentialResult<()> {
-        let _ = std::process::Command::new("security")
-            .args(["delete-generic-password", "-a", secret_ref, "-s", "loc"])
-            .status()
-            .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
+        for service in COMPAT_KEYCHAIN_SERVICES {
+            let _ = std::process::Command::new("security")
+                .args(["delete-generic-password", "-a", secret_ref, "-s", service])
+                .status()
+                .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
+        }
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn read_keychain_password(secret_ref: &str, service: &str) -> CredentialResult<Option<String>> {
+    let output = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-a",
+            secret_ref,
+            "-s",
+            service,
+            "-w",
+        ])
+        .output()
+        .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let password = keychain_output_password(&output.stdout);
+    if keychain_reports_hex_password(secret_ref, service, &password) {
+        return Ok(Some(
+            decode_hex_encoded_password(&password).unwrap_or(password),
+        ));
+    }
+
+    Ok(Some(password))
 }
 
 #[cfg(windows)]
@@ -207,7 +239,7 @@ impl CredentialStore for WindowsCredentialStore {
             CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
         };
 
-        let mut target_name = wide_null(&windows_target_name(secret_ref));
+        let mut target_name = wide_null(&primary_windows_target_name(secret_ref));
         let mut blob = secret.as_bytes().to_vec();
         let blob_size = u32::try_from(blob.len()).map_err(|_| {
             CredentialError::Unavailable(
@@ -238,61 +270,90 @@ impl CredentialStore for WindowsCredentialStore {
     }
 
     fn get(&self, secret_ref: &str) -> CredentialResult<String> {
-        use std::ptr::null_mut;
-        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, GetLastError};
-        use windows_sys::Win32::Security::Credentials::{
-            CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
-        };
-
-        let target_name = wide_null(&windows_target_name(secret_ref));
-        let mut credential: *mut CREDENTIALW = null_mut();
-        let ok = unsafe { CredReadW(target_name.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
-        if ok == 0 {
-            let code = unsafe { GetLastError() };
-            if code == ERROR_NOT_FOUND || code == ERROR_FILE_NOT_FOUND {
-                return Err(CredentialError::NotFound(secret_ref.to_string()));
+        for target_name in windows_target_names(secret_ref) {
+            if let Some(secret) = read_windows_secret(&target_name)? {
+                if target_name != primary_windows_target_name(secret_ref) {
+                    let _ = self.put(secret_ref, &secret);
+                }
+                return Ok(secret);
             }
-            return Err(windows_credential_error("read", code));
         }
 
-        let credential_ref = unsafe { &*credential };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                credential_ref.CredentialBlob,
-                credential_ref.CredentialBlobSize as usize,
-            )
-        };
-        let secret = String::from_utf8(bytes.to_vec()).map_err(|error| {
-            CredentialError::Unavailable(format!("Windows credential is not valid UTF-8: {error}"))
-        });
-        unsafe {
-            CredFree(credential.cast());
-        }
-        secret
+        Err(CredentialError::NotFound(secret_ref.to_string()))
     }
 
     fn delete(&self, secret_ref: &str) -> CredentialResult<()> {
         use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, GetLastError};
         use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
 
-        let target_name = wide_null(&windows_target_name(secret_ref));
-        let ok = unsafe { CredDeleteW(target_name.as_ptr(), CRED_TYPE_GENERIC, 0) };
-        if ok != 0 {
-            return Ok(());
+        for target_name in windows_target_names(secret_ref) {
+            let wide_name = wide_null(&target_name);
+            let ok = unsafe { CredDeleteW(wide_name.as_ptr(), CRED_TYPE_GENERIC, 0) };
+            if ok != 0 {
+                continue;
+            }
+
+            let code = unsafe { GetLastError() };
+            if code != ERROR_NOT_FOUND && code != ERROR_FILE_NOT_FOUND {
+                return Err(windows_credential_error("delete", code));
+            }
         }
 
-        let code = unsafe { GetLastError() };
-        if code == ERROR_NOT_FOUND || code == ERROR_FILE_NOT_FOUND {
-            Ok(())
-        } else {
-            Err(windows_credential_error("delete", code))
-        }
+        Ok(())
     }
 }
 
 #[cfg(windows)]
-fn windows_target_name(secret_ref: &str) -> String {
-    format!("ai.codeflash.locality:{secret_ref}")
+fn read_windows_secret(target_name: &str) -> CredentialResult<Option<String>> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, GetLastError};
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+    };
+
+    let target_name = wide_null(target_name);
+    let mut credential: *mut CREDENTIALW = null_mut();
+    let ok = unsafe { CredReadW(target_name.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+    if ok == 0 {
+        let code = unsafe { GetLastError() };
+        if code == ERROR_NOT_FOUND || code == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        return Err(windows_credential_error("read", code));
+    }
+
+    let credential_ref = unsafe { &*credential };
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            credential_ref.CredentialBlob,
+            credential_ref.CredentialBlobSize as usize,
+        )
+    };
+    let secret = String::from_utf8(bytes.to_vec()).map_err(|error| {
+        CredentialError::Unavailable(format!("Windows credential is not valid UTF-8: {error}"))
+    });
+    unsafe {
+        CredFree(credential.cast());
+    }
+    secret.map(Some)
+}
+
+#[cfg(any(test, windows))]
+fn primary_windows_target_name(secret_ref: &str) -> String {
+    windows_target_name("ai.codeflash.locality:", secret_ref)
+}
+
+#[cfg(any(test, windows))]
+fn windows_target_names(secret_ref: &str) -> [String; 2] {
+    [
+        primary_windows_target_name(secret_ref),
+        windows_target_name("ai.codeflash.afs:", secret_ref),
+    ]
+}
+
+#[cfg(any(test, windows))]
+fn windows_target_name(prefix: &str, secret_ref: &str) -> String {
+    format!("{prefix}{secret_ref}")
 }
 
 #[cfg(windows)]
@@ -322,9 +383,16 @@ fn keychain_output_password(output: &[u8]) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_reports_hex_password(secret_ref: &str, encoded_password: &str) -> bool {
+fn keychain_reports_hex_password(secret_ref: &str, service: &str, encoded_password: &str) -> bool {
     let Ok(output) = std::process::Command::new("security")
-        .args(["find-generic-password", "-a", secret_ref, "-s", "loc", "-g"])
+        .args([
+            "find-generic-password",
+            "-a",
+            secret_ref,
+            "-s",
+            service,
+            "-g",
+        ])
         .output()
     else {
         return false;
@@ -415,8 +483,9 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_hex_encoded_password, keychain_hex_password_from_diagnostics,
-        keychain_output_password,
+        COMPAT_KEYCHAIN_SERVICES, PRIMARY_KEYCHAIN_SERVICE, decode_hex_encoded_password,
+        keychain_hex_password_from_diagnostics, keychain_output_password,
+        primary_windows_target_name, windows_target_names,
     };
 
     #[test]
@@ -462,6 +531,22 @@ mod tests {
         assert_eq!(
             keychain_hex_password_from_diagnostics(diagnostics).as_deref(),
             Some("7B2261223A317D")
+        );
+    }
+
+    #[test]
+    fn keychain_services_include_afs_compatibility_alias() {
+        assert_eq!(COMPAT_KEYCHAIN_SERVICES, [PRIMARY_KEYCHAIN_SERVICE, "afs"]);
+    }
+
+    #[test]
+    fn windows_target_names_include_afs_compatibility_alias() {
+        assert_eq!(
+            windows_target_names("workspace"),
+            [
+                primary_windows_target_name("workspace"),
+                "ai.codeflash.afs:workspace".to_string(),
+            ]
         );
     }
 }
