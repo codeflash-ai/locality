@@ -1,15 +1,16 @@
 [workspace]
 members = [
   "apps/desktop/src-tauri",
-  "crates/afs-cli",
-  "crates/afsd",
-  "crates/afs-core",
-  "crates/afs-connector",
-  "crates/afs-platform",
-  "crates/afs-store",
-  "crates/afs-notion",
-  "crates/afs-fuse",
-  "platform/windows/afs-cloud-files",
+  "crates/loc-cli",
+  "crates/localityd",
+  "crates/locality-core",
+  "crates/locality-connector",
+  "crates/locality-platform",
+  "crates/locality-store",
+  "crates/locality-notion",
+  "crates/locality-google-docs",
+  "platform/linux/locality-fuse",
+  "platform/windows/locality-cloud-files",
 ]
 resolver = "2"
 
@@ -20,8 +21,9 @@ repository = "TBD"
 rust-version = "1.96"
 
 [workspace.dependencies]
-afs-core = { path = "crates/afs-core" }
-afs-connector = { path = "crates/afs-connector" }
-afs-platform = { path = "crates/afs-platform" }
-afs-store = { path = "crates/afs-store" }
-afs-notion = { path = "crates/afs-notion" }
+locality-core = { path = "crates/locality-core" }
+locality-connector = { path = "crates/locality-connector" }
+locality-platform = { path = "crates/locality-platform" }
+locality-store = { path = "crates/locality-store" }
+locality-notion = { path = "crates/locality-notion" }
+locality-google-docs = { path = "crates/locality-google-docs" }

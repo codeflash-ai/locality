@@ -1,6 +1,6 @@
 # Platform Guides
 
-AFS keeps the sync model shared and lets each OS own only the native projection,
+Locality keeps the sync model shared and lets each OS own only the native projection,
 process, installer, and credential surfaces.
 
 Start with the shared model:
@@ -8,7 +8,7 @@ Start with the shared model:
 - [Multiplatform architecture](multiplatform-architecture.md): platform
   boundaries, projection contracts, daemon ownership, and phase plan.
 - [CLI surface](cli.md): shared user and agent commands, including
-  `afs doctor`.
+  `loc doctor`.
 - [Daemon](daemon.md): process and IPC behavior.
 
 Platform-specific guides:

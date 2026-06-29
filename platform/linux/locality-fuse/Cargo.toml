@@ -1,0 +1,23 @@
+[package]
+name = "locality-fuse"
+version = "0.1.3"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "locality-fuse"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+locality-core.workspace = true
+localityd = { path = "../../../crates/localityd" }
+base64 = "0.22"
+bytes = "1"
+fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
+futures-util = "0.3"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal"] }

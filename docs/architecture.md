@@ -1,16 +1,16 @@
 # Architecture
 
-AgentFS v1 is a local-first Rust system with seven implementation surfaces:
+Locality v1 is a local-first Rust system with seven implementation surfaces:
 
 For a clickable subsystem diagram grounded in code entry points, see
 [`architecture-diagram.html`](architecture-diagram.html).
 
-1. `afs` CLI: stable command and exit-code surface for humans and agents.
-2. `afsd` daemon: one per user, supervising many mounts.
+1. `loc` CLI: stable command and exit-code surface for humans and agents.
+2. `localityd` daemon: one per user, supervising many mounts.
 3. Sync core: connector-agnostic correctness layer.
 4. Connector SDK: trait boundary for source-specific APIs.
 5. Notion connector: first first-party connector.
-6. State store: SQLite-backed source of truth under `~/.afs/`.
+6. State store: SQLite-backed source of truth under `~/.loc/`.
 7. Platform projections: macOS File Provider now, Linux FUSE next, Windows Cloud
    Files later.
 
@@ -18,7 +18,7 @@ The optional cloud relay is deliberately not implemented in v1. The local remote
 
 ## Connector and Auth Model
 
-AgentFS keeps connector capability, authentication policy, account credentials,
+Locality keeps connector capability, authentication policy, account credentials,
 mount projection, and execution separate:
 
 ```text
@@ -57,12 +57,12 @@ action sets, health checks, and remote relay execution.
 
 | Crate | Responsibility |
 | --- | --- |
-| `afs-core` | Three-tree model, hydration ladder, validation, diff planning, guardrails, conflicts, journal abstractions. |
-| `afs-connector` | Connector trait and data transfer types for enumerate, fetch, render, parse, apply, and reverse apply. |
-| `afs-notion` | Notion API client, DTOs, block mapping, root-page projection, OAuth/API integration, Markdown/frontmatter conversion. |
-| `afs-store` | SQLite schema, snapshots, journal, mount config, hydration state, tree persistence. |
-| `afs-cli` | Commands: `connect`, `mount`, `status`, `pull`, `push`, `diff`, `undo`, `log`, `resolve`, `config`. |
-| `afsd` | Virtual filesystem boundary, file watcher fallback, hydration engine, pull scheduler, push queue, daemon lifecycle. |
+| `locality-core` | Three-tree model, hydration ladder, validation, diff planning, guardrails, conflicts, journal abstractions. |
+| `locality-connector` | Connector trait and data transfer types for enumerate, fetch, render, parse, apply, and reverse apply. |
+| `locality-notion` | Notion API client, DTOs, block mapping, root-page projection, OAuth/API integration, Markdown/frontmatter conversion. |
+| `locality-store` | SQLite schema, snapshots, journal, mount config, hydration state, tree persistence. |
+| `loc-cli` | Commands: `connect`, `mount`, `status`, `pull`, `push`, `diff`, `undo`, `log`, `resolve`, `config`. |
+| `localityd` | Virtual filesystem boundary, file watcher fallback, hydration engine, pull scheduler, push queue, daemon lifecycle. |
 
 ## Data-flow sketch
 
@@ -70,17 +70,48 @@ action sets, health checks, and remote relay execution.
 agent/editor/grep
       |
       v
-platform projection under ~/afs/<mount>
+platform projection under ~/loc/<mount>
       |
       v
-afsd virtual_fs boundary, watcher fallback, and hydration engine
+localityd virtual_fs boundary, watcher fallback, and hydration engine
       |
       v
-afs-core sync model <-> afs-store SQLite state
+locality-core sync model <-> locality-store SQLite state
       |
       v
-afs-connector trait
+locality-connector trait
       |
       v
-afs-notion direct API now, relay later
+locality-notion direct API now, relay later
 ```
+
+## Projection path model and safety
+
+Locality exposes one product-level shape across platforms:
+
+```text
+Locality/
+  notion/
+  linear/
+  github/
+```
+
+The physical root is platform-specific. On macOS, File Provider assigns the
+user-visible root and Locality reads it from `NSFileProviderManager`; packaged builds
+and the local development bundle identify the host app as `Locality`, so new roots
+should appear as `~/Library/CloudStorage/Locality`. Windows uses a Cloud Files root
+and Linux uses `~/Locality` or the configured FUSE mount. Command handling treats the
+connector child folder, such as `<root>/notion`, as the mount boundary and
+normalizes older macOS File Provider root names such as `Locality` and `Locality-Locality`
+only so existing local paths continue to resolve during upgrades.
+
+Every file operation resolves through this boundary:
+
+```text
+input path -> canonical connector root -> mount_id -> connection_id -> remote_id
+```
+
+Path normalization rejects traversal components and symlink escapes before a
+path can resolve to a mount. A local path alone is never enough to write remote
+content; push still validates the mounted entity, current connection, remote
+freshness, conflict markers, and connector guardrails before apply.

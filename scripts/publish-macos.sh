@@ -5,11 +5,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DESKTOP_DIR="${ROOT}/apps/desktop"
 DMG_DIR="${ROOT}/target/release/bundle/dmg"
 UPDATER_DIR="${ROOT}/target/release/bundle/updater"
-PRODUCT_NAME="${PUBLISH_PRODUCT_NAME:-AFS}"
+PRODUCT_NAME="${PUBLISH_PRODUCT_NAME:-Locality}"
 CHANNEL="${PUBLISH_CHANNEL:-beta}"
 DATE_STAMP="${PUBLISH_DATE:-$(date +%Y%m%d)}"
-NOTARY_PROFILE="${APPLE_NOTARY_KEYCHAIN_PROFILE:-${NOTARY_KEYCHAIN_PROFILE:-afs-notary}}"
-UPDATER_ENDPOINT="${TAURI_UPDATER_ENDPOINT:-https://github.com/codeflash-ai/afs/releases/latest/download/latest-macos.json}"
+NOTARY_PROFILE="${APPLE_NOTARY_KEYCHAIN_PROFILE:-${NOTARY_KEYCHAIN_PROFILE:-loc-notary}}"
+UPDATER_ENDPOINT="${TAURI_UPDATER_ENDPOINT:-https://github.com/codeflash-ai/locality/releases/latest/download/latest-macos.json}"
+HOST_ENTITLEMENTS="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityDeveloperId.entitlements"
+HOST_APP_GROUP="C484HB7Q6S.group.ai.codeflash.locality"
 
 log() {
   printf 'publish: %s\n' "$*"
@@ -91,6 +93,10 @@ notary_args() {
     return 0
   fi
 
+  return 1
+}
+
+notary_credentials_error() {
   fail "notary credentials unavailable; create keychain profile '${NOTARY_PROFILE}' or set APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID"
 }
 
@@ -123,20 +129,24 @@ updater_enabled() {
 
 build_config_json() {
   local signing_identity="$1"
-  local escaped_identity
+  local escaped_identity escaped_entitlements
   escaped_identity="$(json_escape "${signing_identity}")"
+  escaped_entitlements="$(json_escape "${HOST_ENTITLEMENTS}")"
 
   if updater_enabled; then
     [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]] \
       || fail "TAURI_UPDATER_PUBKEY is set but TAURI_SIGNING_PRIVATE_KEY is missing"
-    printf '{"bundle":{"createUpdaterArtifacts":true,"macOS":{"signingIdentity":"%s"}},"plugins":{"updater":{"pubkey":"%s","endpoints":["%s"]}}}' \
+    printf '{"bundle":{"createUpdaterArtifacts":true,"macOS":{"signingIdentity":"%s","entitlements":"%s"}},"plugins":{"updater":{"pubkey":"%s","endpoints":["%s"]}}}' \
       "${escaped_identity}" \
+      "${escaped_entitlements}" \
       "$(json_escape "${TAURI_UPDATER_PUBKEY}")" \
       "$(json_escape "${UPDATER_ENDPOINT}")"
     return 0
   fi
 
-  printf '{"bundle":{"macOS":{"signingIdentity":"%s"}}}' "${escaped_identity}"
+  printf '{"bundle":{"macOS":{"signingIdentity":"%s","entitlements":"%s"}}}' \
+    "${escaped_identity}" \
+    "${escaped_entitlements}"
 }
 
 latest_updater_archive() {
@@ -164,6 +174,16 @@ copy_updater_artifacts() {
   printf 'Published updater signature: %s.sig\n' "${final_archive}"
 }
 
+assert_app_group_entitlement() {
+  local path="$1"
+  local entitlements
+  entitlements="$(codesign -d --entitlements - "${path}" 2>/dev/null || true)"
+  [[ "${entitlements}" == *"com.apple.security.application-groups"* ]] \
+    || fail "${path} is missing com.apple.security.application-groups entitlement"
+  [[ "${entitlements}" == *"${HOST_APP_GROUP}"* ]] \
+    || fail "${path} is missing ${HOST_APP_GROUP} entitlement"
+}
+
 verify_signed_app_in_dmg() (
   local dmg="$1"
   local expected_build="$2"
@@ -184,20 +204,24 @@ verify_signed_app_in_dmg() (
   hdiutil attach "${dmg}" -readonly -noverify -noautoopen -mountpoint "${mountpoint}" -quiet
   app="${mountpoint}/${PRODUCT_NAME}.app"
   codesign --verify --deep --strict --verbose=2 "${app}"
-  [[ -x "${app}/Contents/MacOS/afs" ]] \
-    || fail "${PRODUCT_NAME}.app does not include an executable afs CLI"
-  [[ -x "${app}/Contents/MacOS/afsd" ]] \
-    || fail "${PRODUCT_NAME}.app does not include an executable afsd sidecar"
+  [[ -x "${app}/Contents/MacOS/loc" ]] \
+    || fail "${PRODUCT_NAME}.app does not include an executable loc CLI"
+  [[ -x "${app}/Contents/MacOS/localityd" ]] \
+    || fail "${PRODUCT_NAME}.app does not include an executable localityd sidecar"
   local app_signature appex_signature
   app_signature="$(codesign -dv --verbose=4 "${app}" 2>&1)"
-  appex_signature="$(codesign -dv --verbose=4 "${app}/Contents/PlugIns/AgentFSFileProvider.appex" 2>&1)"
+  appex_signature="$(codesign -dv --verbose=4 "${app}/Contents/PlugIns/LocalityFileProvider.appex" 2>&1)"
   if [[ "${require_developer_id}" == "1" ]]; then
     [[ "${app_signature}" == *"Developer ID Application"* ]] \
       || fail "${PRODUCT_NAME}.app is not signed with a Developer ID Application identity"
     [[ "${appex_signature}" == *"Developer ID Application"* ]] \
-      || fail "AgentFSFileProvider.appex is not signed with a Developer ID Application identity"
+      || fail "LocalityFileProvider.appex is not signed with a Developer ID Application identity"
+    assert_app_group_entitlement "${app}"
+    assert_app_group_entitlement "${app}/Contents/MacOS/loc"
+    assert_app_group_entitlement "${app}/Contents/MacOS/localityd"
+    assert_app_group_entitlement "${app}/Contents/MacOS/locality-file-providerctl"
   fi
-  grep -a -F -q "${expected_build}" "${app}/Contents/MacOS/afsd"
+  grep -a -F -q "${expected_build}" "${app}/Contents/MacOS/localityd"
   smoke_test_desktop_app "${app}"
 )
 
@@ -217,7 +241,7 @@ smoke_test_desktop_app() (
   }
   trap cleanup EXIT
 
-  AFS_DESKTOP_SMOKE_TEST=1 "${app}/Contents/MacOS/afs-desktop" >"${stdout}" 2>"${stderr}" &
+  LOCALITY_DESKTOP_SMOKE_TEST=1 "${app}/Contents/MacOS/locality-desktop" >"${stdout}" 2>"${stderr}" &
   pid="$!"
 
   for _ in {1..20}; do
@@ -261,10 +285,10 @@ validate_notarized_dmg() {
     hdiutil attach "${dmg}" -readonly -noverify -noautoopen -mountpoint "${mountpoint}" -quiet
     app="${mountpoint}/${PRODUCT_NAME}.app"
     codesign --verify --deep --strict --verbose=2 "${app}"
-    [[ -x "${app}/Contents/MacOS/afs" ]] \
-      || fail "${PRODUCT_NAME}.app does not include an executable afs CLI"
-    [[ -x "${app}/Contents/MacOS/afsd" ]] \
-      || fail "${PRODUCT_NAME}.app does not include an executable afsd sidecar"
+    [[ -x "${app}/Contents/MacOS/loc" ]] \
+      || fail "${PRODUCT_NAME}.app does not include an executable loc CLI"
+    [[ -x "${app}/Contents/MacOS/localityd" ]] \
+      || fail "${PRODUCT_NAME}.app does not include an executable localityd sidecar"
     spctl --assess --type execute --verbose "${app}"
   )
 }
@@ -303,6 +327,7 @@ main() {
     while IFS= read -r -d '' arg; do
       submit_args+=("${arg}")
     done < <(notary_args)
+    [[ "${#submit_args[@]}" -gt 0 ]] || notary_credentials_error
   fi
 
   log "commit ${commit_full}"

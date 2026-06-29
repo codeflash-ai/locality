@@ -1,0 +1,27 @@
+{
+  "name": "@codeflash-ai/locality-auth-broker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal OAuth broker for Locality connector auth.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260611.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.9",
+    "wrangler": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

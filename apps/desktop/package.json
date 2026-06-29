@@ -1,13 +1,14 @@
 {
-  "name": "@codeflash-ai/afs-desktop",
+  "name": "@codeflash-ai/locality-desktop",
   "private": true,
   "version": "0.1.3",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
+    "dev:prepare": "node ./scripts/prepare-dev-sidecars.mjs",
     "build": "tsc && vite build",
     "build:mac": "tauri build --bundles dmg && bash ./scripts/postprocess-dmg-volume-icon.sh",
-    "build:mas": "VITE_AFS_DISTRIBUTION_CHANNEL=mas AFS_DISTRIBUTION_CHANNEL=mas tauri build --bundles app",
+    "build:mas": "VITE_LOCALITY_DISTRIBUTION_CHANNEL=mas LOCALITY_DISTRIBUTION_CHANNEL=mas tauri build --bundles app",
     "build:linux": "tauri build --bundles deb,rpm",
     "build:windows": "tauri build --bundles nsis",
     "preview": "vite preview --host 127.0.0.1 --port 1421",

@@ -8,11 +8,11 @@ RUST_MAIN="${ROOT}/apps/desktop/src-tauri/src/main.rs"
 RUST_BUILD="${ROOT}/apps/desktop/src-tauri/build.rs"
 PUBLISH_SCRIPT="${ROOT}/scripts/publish-mas.sh"
 MAKEFILE="${ROOT}/Makefile"
-HOST_ENTITLEMENTS="${ROOT}/platform/macos/AgentFSFileProvider/App/AgentFS.entitlements"
-EXTENSION_ENTITLEMENTS="${ROOT}/platform/macos/AgentFSFileProvider/App/AgentFSFileProvider.entitlements"
-HOST_PLIST="${ROOT}/platform/macos/AgentFSFileProvider/App/AgentFS.Info.plist"
-EXTENSION_PLIST="${ROOT}/platform/macos/AgentFSFileProvider/App/AgentFSFileProvider.Info.plist"
-CTL_PLIST="${ROOT}/platform/macos/AgentFSFileProvider/App/AgentFSFileProviderCtl.Info.plist"
+HOST_ENTITLEMENTS="${ROOT}/platform/macos/LocalityFileProvider/App/Locality.entitlements"
+EXTENSION_ENTITLEMENTS="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityFileProvider.entitlements"
+HOST_PLIST="${ROOT}/platform/macos/LocalityFileProvider/App/Locality.Info.plist"
+EXTENSION_PLIST="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityFileProvider.Info.plist"
+CTL_PLIST="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityFileProviderCtl.Info.plist"
 
 fail() {
   printf 'mas-readiness: error: %s\n' "$*" >&2
@@ -52,15 +52,15 @@ grep -q '^publish-mas:' "${MAKEFILE}" || fail "Makefile is missing publish-mas t
   || fail "Tauri bundle targets must include app for Mac App Store packaging"
 [[ "$(json_value '.bundle.macOS.minimumSystemVersion' "${TAURI_CONF}")" == "14.0" ]] \
   || fail "Mac App Store packaging should match the current macOS 14.0 minimum"
-[[ "$(json_value '.identifier' "${TAURI_CONF}")" == "ai.codeflash.afs" ]] \
+[[ "$(json_value '.identifier' "${TAURI_CONF}")" == "ai.codeflash.locality" ]] \
   || fail "Tauri identifier must match the App Store app bundle ID"
 
-grep -q 'VITE_AFS_DISTRIBUTION_CHANNEL' "${FRONTEND_APP}" \
-  || fail "frontend must gate App Store update behavior on VITE_AFS_DISTRIBUTION_CHANNEL"
+grep -q 'VITE_LOCALITY_DISTRIBUTION_CHANNEL' "${FRONTEND_APP}" \
+  || fail "frontend must gate App Store update behavior on VITE_LOCALITY_DISTRIBUTION_CHANNEL"
 grep -q 'appStoreDistribution' "${FRONTEND_APP}" \
   || fail "frontend must disable self-update UI for App Store builds"
-grep -q 'AFS_DISTRIBUTION_CHANNEL' "${RUST_BUILD}" \
-  || fail "Rust build script must embed AFS_DISTRIBUTION_CHANNEL"
+grep -q 'LOCALITY_DISTRIBUTION_CHANNEL' "${RUST_BUILD}" \
+  || fail "Rust build script must embed LOCALITY_DISTRIBUTION_CHANNEL"
 grep -q 'app_store_distribution' "${RUST_MAIN}" \
   || fail "desktop backend must gate App Store-specific behavior"
 
@@ -72,7 +72,7 @@ done
 for entitlements in "${HOST_ENTITLEMENTS}" "${EXTENSION_ENTITLEMENTS}"; do
   require_plist_key "${entitlements}" "com.apple.security.app-sandbox"
   require_plist_key "${entitlements}" "com.apple.security.application-groups"
-  require_plist_string "${entitlements}" "group.ai.codeflash.afs"
+  require_plist_string "${entitlements}" "C484HB7Q6S.group.ai.codeflash.locality"
   require_plist_key "${entitlements}" "com.apple.security.network.client"
 done
 

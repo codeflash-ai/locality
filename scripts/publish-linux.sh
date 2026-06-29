@@ -8,10 +8,10 @@ RPM_DIR="${ROOT}/target/release/bundle/rpm"
 APPIMAGE_DIR="${ROOT}/target/release/bundle/appimage"
 LINUX_OUT_DIR="${ROOT}/target/release/bundle/linux"
 UPDATER_DIR="${ROOT}/target/release/bundle/updater"
-PRODUCT_NAME="${PUBLISH_PRODUCT_NAME:-AFS}"
+PRODUCT_NAME="${PUBLISH_PRODUCT_NAME:-Locality}"
 CHANNEL="${PUBLISH_CHANNEL:-beta}"
 DATE_STAMP="${PUBLISH_DATE:-$(date +%Y%m%d)}"
-UPDATER_ENDPOINT="${TAURI_UPDATER_ENDPOINT:-https://github.com/codeflash-ai/afs/releases/latest/download/latest-linux.json}"
+UPDATER_ENDPOINT="${TAURI_UPDATER_ENDPOINT:-https://github.com/codeflash-ai/locality/releases/latest/download/latest-linux.json}"
 APPINDICATOR_PKG_CONFIG_TMP=""
 
 log() {
@@ -155,20 +155,20 @@ validate_deb() {
   ar t "${deb}" | grep -qx 'debian-binary' || fail "${deb} is missing debian-binary"
   ar t "${deb}" | grep -Eq '^control\.tar\.(gz|xz|zst)$|^control\.tar$' \
     || fail "${deb} is missing control.tar"
-  assert_deb_contains "${deb}" "/usr/bin/afs"
-  assert_deb_contains "${deb}" "/usr/bin/afsd"
-  assert_deb_contains "${deb}" "/usr/bin/afs-fuse"
+  assert_deb_contains "${deb}" "/usr/bin/loc"
+  assert_deb_contains "${deb}" "/usr/bin/localityd"
+  assert_deb_contains "${deb}" "/usr/bin/locality-fuse"
 }
 
 validate_rpm() {
   local rpm="$1"
   rpm -qip "${rpm}" >/dev/null
-  rpm -qlp "${rpm}" | grep -qx '/usr/bin/afs' \
-    || fail "${rpm} does not contain /usr/bin/afs"
-  rpm -qlp "${rpm}" | grep -qx '/usr/bin/afsd' \
-    || fail "${rpm} does not contain /usr/bin/afsd"
-  rpm -qlp "${rpm}" | grep -qx '/usr/bin/afs-fuse' \
-    || fail "${rpm} does not contain /usr/bin/afs-fuse"
+  rpm -qlp "${rpm}" | grep -qx '/usr/bin/loc' \
+    || fail "${rpm} does not contain /usr/bin/loc"
+  rpm -qlp "${rpm}" | grep -qx '/usr/bin/localityd' \
+    || fail "${rpm} does not contain /usr/bin/localityd"
+  rpm -qlp "${rpm}" | grep -qx '/usr/bin/locality-fuse' \
+    || fail "${rpm} does not contain /usr/bin/locality-fuse"
 }
 
 copy_artifact() {

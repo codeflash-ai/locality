@@ -1,6 +1,6 @@
 # macOS Distribution
 
-AFS ships on macOS as a Tauri app bundle with the AgentFS File Provider
+Locality ships on macOS as a Tauri app bundle with the Locality File Provider
 extension embedded in `Contents/PlugIns`.
 
 ## Local Development
@@ -11,6 +11,10 @@ Start the desktop app from the repo root:
 make setup
 make dev-tauri
 ```
+
+The Tauri dev command runs `apps/desktop/scripts/prepare-dev-sidecars.mjs`
+before starting Vite. That script builds fresh debug `loc` and `localityd` binaries
+so the desktop app does not restart into a stale daemon from an earlier commit.
 
 Start the daemon manually when testing CLI or File Provider behavior outside the
 desktop app:
@@ -33,45 +37,45 @@ The Tauri pre-bundle hook runs:
 apps/desktop/scripts/prepare-macos-file-provider.sh
 ```
 
-That script builds `afs`, `afsd`, and the Swift File Provider extension, stages
-`AgentFSFileProvider.appex` and `agentfs-file-providerctl` under
-`apps/desktop/src-tauri/macos/AgentFSFileProvider/`, stages `afs` and `afsd`
+That script builds `loc`, `localityd`, and the Swift File Provider extension, stages
+`LocalityFileProvider.appex` and `locality-file-providerctl` under
+`apps/desktop/src-tauri/macos/LocalityFileProvider/`, stages `loc` and `localityd`
 under `apps/desktop/src-tauri/macos/`, and Tauri copies those files into the
 final app bundle. After the Tauri DMG is created, `build-tauri` runs
 `apps/desktop/scripts/postprocess-dmg-volume-icon.sh` so the mounted installer
-volume uses a disk-style AFS icon instead of the application icon.
+volume uses a disk-style Locality icon instead of the application icon.
 
 Expected local artifacts:
 
 ```text
-target/release/bundle/macos/AFS.app
+target/release/bundle/macos/Locality.app
 target/release/bundle/dmg/*.dmg
 ```
 
 ## Upgrade State
 
 The desktop app records the currently installed app and daemon build metadata,
-but an existing `~/.afs/state.sqlite3` from a different build no longer blocks
+but an existing `~/.loc/state.sqlite3` from a different build no longer blocks
 onboarding or asks the user to reset local state. Durable state compatibility is
-owned by SQLite schema and state-component migrations in `afs-store`; ordinary
+owned by SQLite schema and state-component migrations in `locality-store`; ordinary
 upgrades should continue without a user-visible state step.
 
 A destructive reset remains available in the app under **Settings > Developer >
-Reset Local State** for explicit repair/debugging. The reset stops `afsd`,
-unregisters File Provider domains, removes AFS metadata/cache/support state, and
+Reset Local State** for explicit repair/debugging. The reset stops `localityd`,
+unregisters File Provider domains, removes Locality metadata/cache/support state, and
 clears connector credentials. It does not delete user-visible local folders or
 documents.
 
-The desktop app also checks the running `afsd` build metadata before reusing a
+The desktop app also checks the running `localityd` build metadata before reusing a
 daemon. If the daemon does not report the same build ID as the app bundle, or if
 it is old enough not to report build metadata, the app stops it and starts the
-embedded `Contents/MacOS/afsd` from the current app bundle.
+embedded `Contents/MacOS/localityd` from the current app bundle.
 
 During onboarding, the desktop app also verifies the terminal command. For DMG
-installs it creates or refreshes `/usr/local/bin/afs` as a symlink to the
-embedded `Contents/MacOS/afs`, prompting for administrator permission only when
+installs it creates or refreshes `/usr/local/bin/loc` as a symlink to the
+embedded `Contents/MacOS/loc`, prompting for administrator permission only when
 that standard PATH location is not writable. If the app is launched from the
-mounted DMG volume, onboarding asks the user to move AFS to Applications before
+mounted DMG volume, onboarding asks the user to move Locality to Applications before
 installing the terminal command so the symlink does not point at a temporary
 volume.
 
@@ -85,9 +89,9 @@ macOS builds are Apple Silicon-only.
 Required Apple-side setup:
 
 - Developer ID Application certificate installed locally or available in CI.
-- App IDs and entitlements for `ai.codeflash.afs` and
-  `ai.codeflash.afs.AgentFS.FileProvider`.
-- Application group `group.ai.codeflash.afs`.
+- App IDs and entitlements for `ai.codeflash.locality` and
+  `ai.codeflash.locality.Locality.FileProvider`.
+- Application group `C484HB7Q6S.group.ai.codeflash.locality`.
 - Notary credentials, preferably an App Store Connect API key in CI.
 
 Find the local signing identity:
@@ -118,14 +122,14 @@ export APPLE_SIGNING_IDENTITY="Developer ID Application: Example, Inc. (TEAMID)"
 ```
 
 The File Provider staging script also reads
-`APPLE_SIGNING_IDENTITY`, so the nested File Provider extension, helper, `afs`
-CLI, and `afsd` sidecar are signed with the same release identity and hardened
+`APPLE_SIGNING_IDENTITY`, so the nested File Provider extension, helper, `loc`
+CLI, and `localityd` sidecar are signed with the same release identity and hardened
 runtime.
 
-Notarization uses a keychain profile named `afs-notary` by default:
+Notarization uses a keychain profile named `loc-notary` by default:
 
 ```sh
-xcrun notarytool store-credentials afs-notary \
+xcrun notarytool store-credentials loc-notary \
   --apple-id "$APPLE_ID" \
   --password "$APPLE_PASSWORD" \
   --team-id "$APPLE_TEAM_ID"
@@ -146,7 +150,7 @@ should come from Apple Silicon.
 The final artifact is copied to:
 
 ```text
-target/release/bundle/dmg/AFS-beta-YYYYMMDD-<commit>-notarized-<arch>.dmg
+target/release/bundle/dmg/Locality-beta-YYYYMMDD-<commit>-notarized-<arch>.dmg
 ```
 
 For local packaging tests that should sign the app but skip Apple notarization,
@@ -160,7 +164,7 @@ This sets `PUBLISH_SKIP_NOTARIZATION=1`, skips notary credential lookup,
 `notarytool submit`, stapling, and notarization validation, and writes:
 
 ```text
-target/release/bundle/dmg/AFS-beta-YYYYMMDD-<commit>-unnotarized-<arch>.dmg
+target/release/bundle/dmg/Locality-beta-YYYYMMDD-<commit>-unnotarized-<arch>.dmg
 ```
 
 If `APPLE_SIGNING_IDENTITY` is set, or exactly one Developer ID Application
@@ -173,40 +177,40 @@ Useful overrides:
 
 ```sh
 PUBLISH_CHANNEL=release make publish
-PUBLISH_DMG_NAME=AFS-beta-custom-notarized-aarch64.dmg make publish
+PUBLISH_DMG_NAME=Locality-beta-custom-notarized-aarch64.dmg make publish
 ```
 
 ## Auto-Update Artifacts
 
-AFS uses Tauri's updater plugin for signed in-app updates. The updater signing
+Locality uses Tauri's updater plugin for signed in-app updates. The updater signing
 key is separate from Apple code signing and notarization.
 
 Generate the updater key pair once:
 
 ```sh
-npm --prefix apps/desktop run tauri -- signer generate -w ~/.tauri/afs-updater.key
+npm --prefix apps/desktop run tauri -- signer generate -w ~/.tauri/loc-updater.key
 ```
 
 Store the private key content in CI as `TAURI_SIGNING_PRIVATE_KEY`. If the key
 has a password, store it as `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The public key
-from `~/.tauri/afs-updater.key.pub` is safe to share and must be supplied to
+from `~/.tauri/loc-updater.key.pub` is safe to share and must be supplied to
 release builds as `TAURI_UPDATER_PUBKEY`.
 
 Release builds enable updater artifacts when both `TAURI_UPDATER_PUBKEY` and
 `TAURI_SIGNING_PRIVATE_KEY` are set:
 
 ```sh
-export TAURI_UPDATER_PUBKEY="$(cat ~/.tauri/afs-updater.key.pub)"
-export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/afs-updater.key)"
-export TAURI_UPDATER_ENDPOINT="https://github.com/codeflash-ai/afs/releases/latest/download/latest-macos.json"
+export TAURI_UPDATER_PUBKEY="$(cat ~/.tauri/loc-updater.key.pub)"
+export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/loc-updater.key)"
+export TAURI_UPDATER_ENDPOINT="https://github.com/codeflash-ai/locality/releases/latest/download/latest-macos.json"
 make publish
 ```
 
 The publish script copies the signed updater archive and signature to:
 
 ```text
-target/release/bundle/updater/AFS-beta-YYYYMMDD-<commit>-macos-<arch>.app.tar.gz
-target/release/bundle/updater/AFS-beta-YYYYMMDD-<commit>-macos-<arch>.app.tar.gz.sig
+target/release/bundle/updater/Locality-beta-YYYYMMDD-<commit>-macos-<arch>.app.tar.gz
+target/release/bundle/updater/Locality-beta-YYYYMMDD-<commit>-macos-<arch>.app.tar.gz.sig
 ```
 
 After uploading the updater archive to the release, render the static updater
@@ -233,13 +237,13 @@ HOMEBREW_RELEASE_TAG=v0.1.0 make render-homebrew-cask
 The rendered cask is written to:
 
 ```text
-target/release/homebrew/Casks/afs.rb
+target/release/homebrew/Casks/loc.rb
 ```
 
 Copy that file into the CodeFlash tap, for example:
 
 ```text
-codeflash-ai/homebrew-tap/Casks/afs.rb
+codeflash-ai/homebrew-tap/Casks/loc.rb
 ```
 
 The generated cask declares `depends_on arch: :arm64`, so Intel Macs are not a
@@ -250,7 +254,7 @@ supported Homebrew installation target.
 The GitHub workflow in `.github/workflows/release-macos.yml` publishes the
 macOS channel from a `v*` tag or manual workflow dispatch. It runs on the
 GitHub-hosted `macos-15` arm64 runner, builds the notarized DMG, produces the
-signed updater archive, renders `latest-macos.json`, renders `afs.rb`, creates
+signed updater archive, renders `latest-macos.json`, renders `loc.rb`, creates
 or updates the GitHub Release, uploads all release assets, and optionally pushes
 the cask to the Homebrew tap. It shares a release concurrency group with the
 Linux workflow so both workflows can target the same tag without racing while
@@ -273,7 +277,7 @@ Optional repository secret:
 - `APPLE_SIGNING_IDENTITY`: exact Developer ID identity if the imported
   keychain has more than one Developer ID Application certificate.
 - `HOMEBREW_TAP_TOKEN`: fine-grained token with write access to the Homebrew tap
-  repo. If omitted, the workflow still uploads `afs.rb` to the GitHub Release,
+  repo. If omitted, the workflow still uploads `loc.rb` to the GitHub Release,
   but it does not push to the tap.
 
 Optional repository variable:
@@ -320,13 +324,13 @@ make build-mas
 This sets both build-time channel flags:
 
 ```sh
-VITE_AFS_DISTRIBUTION_CHANNEL=mas
-AFS_DISTRIBUTION_CHANNEL=mas
+VITE_LOCALITY_DISTRIBUTION_CHANNEL=mas
+LOCALITY_DISTRIBUTION_CHANNEL=mas
 ```
 
 The `mas` channel disables the in-app Tauri updater and skips automatic
 terminal-command symlink installation. The App Store build should get updates
-through the App Store, while users who need `afs` on their shell path should use
+through the App Store, while users who need `loc` on their shell path should use
 the Homebrew or direct DMG channel.
 
 Build a signed App Store package locally with:
@@ -342,8 +346,8 @@ Store installer identity. By default it only writes and validates the package
 locally:
 
 ```text
-target/release/bundle/mas/AFS-app-store-YYYYMMDD-<commit>-<arch>.pkg
-target/release/bundle/mas/AFS-app-store-YYYYMMDD-<commit>-<arch>.pkg.sha256
+target/release/bundle/mas/Locality-app-store-YYYYMMDD-<commit>-<arch>.pkg
+target/release/bundle/mas/Locality-app-store-YYYYMMDD-<commit>-<arch>.pkg.sha256
 ```
 
 Required local inputs:
@@ -393,10 +397,10 @@ Optional repository secrets:
 
 Remaining App Store work:
 
-- Create or confirm App Store App IDs for `ai.codeflash.afs` and
-  `ai.codeflash.afs.AgentFS.FileProvider`.
+- Create or confirm App Store App IDs for `ai.codeflash.locality` and
+  `ai.codeflash.locality.Locality.FileProvider`.
 - Create provisioning profiles for the containing app and File Provider
-  extension with `group.ai.codeflash.afs`.
+  extension with `C484HB7Q6S.group.ai.codeflash.locality`.
 - Run the manual workflow with validation enabled.
 - Run the manual workflow with upload enabled when validation passes.
 - Complete TestFlight/App Review metadata in App Store Connect.

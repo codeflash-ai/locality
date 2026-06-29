@@ -6,13 +6,13 @@ $DesktopDir = Join-Path $Root "apps\desktop"
 $NsisDir = Join-Path $Root "target\release\bundle\nsis"
 $WindowsOutDir = Join-Path $Root "target\release\bundle\windows"
 $UpdaterDir = Join-Path $Root "target\release\bundle\updater"
-$ProductName = if ($env:PUBLISH_PRODUCT_NAME) { $env:PUBLISH_PRODUCT_NAME } else { "AFS" }
+$ProductName = if ($env:PUBLISH_PRODUCT_NAME) { $env:PUBLISH_PRODUCT_NAME } else { "Locality" }
 $Channel = if ($env:PUBLISH_CHANNEL) { $env:PUBLISH_CHANNEL } else { "beta" }
 $DateStamp = if ($env:PUBLISH_DATE) { $env:PUBLISH_DATE } else { (Get-Date).ToUniversalTime().ToString("yyyyMMdd") }
 $UpdaterEndpoint = if ($env:TAURI_UPDATER_ENDPOINT) {
     $env:TAURI_UPDATER_ENDPOINT
 } else {
-    "https://github.com/codeflash-ai/afs/releases/latest/download/latest-windows.json"
+    "https://github.com/codeflash-ai/locality/releases/latest/download/latest-windows.json"
 }
 
 . (Join-Path $Root "scripts\windows-codesign.ps1")
@@ -109,8 +109,8 @@ function Copy-ReleaseArtifact {
 
 function Assert-SidecarsSigned {
     $sidecarDir = Join-Path $Root "apps\desktop\src-tauri\windows"
-    foreach ($name in @("afs.exe", "afsd.exe", "afs-cloud-files.exe")) {
-        Assert-AfsWindowsSigned -Path (Join-Path $sidecarDir $name)
+    foreach ($name in @("loc.exe", "localityd.exe", "locality-cloud-files.exe")) {
+        Assert-LocalityWindowsSigned -Path (Join-Path $sidecarDir $name)
     }
 }
 
@@ -155,8 +155,8 @@ Require-Command npm
 Require-Command cargo
 Assert-CleanTree
 
-if ($env:PUBLISH_REQUIRE_SIGNING -eq "1" -and -not (Test-AfsWindowsCodeSigningRequested) -and -not (Test-AfsWindowsExternalCodeSigningRequested)) {
-    Fail "PUBLISH_REQUIRE_SIGNING=1 requires either AFS_WINDOWS_CODESIGN=1 with a signing certificate selector or AFS_WINDOWS_EXTERNAL_CODESIGN=1"
+if ($env:PUBLISH_REQUIRE_SIGNING -eq "1" -and -not (Test-LocalityWindowsCodeSigningRequested) -and -not (Test-LocalityWindowsExternalCodeSigningRequested)) {
+    Fail "PUBLISH_REQUIRE_SIGNING=1 requires either LOCALITY_WINDOWS_CODESIGN=1 with a signing certificate selector or LOCALITY_WINDOWS_EXTERNAL_CODESIGN=1"
 }
 
 $commitShort = (& git -C $Root rev-parse --short=7 HEAD).Trim()
@@ -168,9 +168,9 @@ $configJson = Get-TauriBuildConfig
 
 Write-Log "commit $commitShort"
 Write-Log "architecture $arch"
-if (Test-AfsWindowsCodeSigningRequested) {
+if (Test-LocalityWindowsCodeSigningRequested) {
     Write-Log "Windows Authenticode signing enabled"
-} elseif (Test-AfsWindowsExternalCodeSigningRequested) {
+} elseif (Test-LocalityWindowsExternalCodeSigningRequested) {
     Write-Log "Windows Authenticode signing delegated to external workflow steps"
 } else {
     Write-Log "Windows Authenticode signing disabled"
@@ -198,21 +198,21 @@ try {
     Pop-Location
 }
 
-if (Test-AfsWindowsCodeSigningRequested -or Test-AfsWindowsExternalCodeSigningRequested) {
+if (Test-LocalityWindowsCodeSigningRequested -or Test-LocalityWindowsExternalCodeSigningRequested) {
     Assert-SidecarsSigned
 }
 
 $installer = Latest-Artifact -Directory $NsisDir -Predicate {
-    $_.Extension -ieq ".exe" -and $_.Name -match "setup|installer|AFS"
+    $_.Extension -ieq ".exe" -and $_.Name -match "setup|installer|Locality"
 }
 if (-not $installer) {
     Fail "Tauri did not produce a Windows NSIS installer"
 }
 
-if (Test-AfsWindowsCodeSigningRequested) {
-    [void] (Invoke-AfsWindowsCodeSign -Path $installer.FullName)
-    Assert-AfsWindowsSigned -Path $installer.FullName
-} elseif (Test-AfsWindowsExternalCodeSigningRequested) {
+if (Test-LocalityWindowsCodeSigningRequested) {
+    [void] (Invoke-LocalityWindowsCodeSign -Path $installer.FullName)
+    Assert-LocalityWindowsSigned -Path $installer.FullName
+} elseif (Test-LocalityWindowsExternalCodeSigningRequested) {
     Write-Log "Windows installer signing deferred to external workflow step"
 } elseif ($env:PUBLISH_REQUIRE_SIGNING -eq "1") {
     Fail "Windows installer is unsigned"

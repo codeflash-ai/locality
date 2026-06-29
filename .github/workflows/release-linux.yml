@@ -95,7 +95,7 @@ jobs:
         run: cargo test --workspace --all-targets --locked
 
       - name: Run real Linux FUSE smoke test
-        run: AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
+        run: LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
 
       - name: Install desktop dependencies
         run: npm ci
@@ -117,7 +117,7 @@ jobs:
       TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      LINUX_REPO_BASE_URL: ${{ vars.LINUX_REPO_BASE_URL || 'https://codeflash-ai.github.io/afs' }}
+      LINUX_REPO_BASE_URL: ${{ vars.LINUX_REPO_BASE_URL || 'https://codeflash-ai.github.io/locality' }}
       LINUX_REPO_GPG_PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
       LINUX_REPO_GPG_PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
     steps:
@@ -211,19 +211,19 @@ jobs:
         env:
           GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
           UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-linux.json
-          UPDATER_NOTES: AFS ${{ env.APP_VERSION }} Linux update.
+          UPDATER_NOTES: Locality ${{ env.APP_VERSION }} Linux update.
         run: |
-          export UPDATER_LINUX_X86_64_ARTIFACT="target/release/bundle/updater/AFS-release-linux-x86_64.AppImage"
+          export UPDATER_LINUX_X86_64_ARTIFACT="target/release/bundle/updater/Locality-release-linux-x86_64.AppImage"
           make render-updater-manifest
           make render-linux-repositories
 
       - name: Collect release assets
         run: |
           mkdir -p target/release/github-assets
-          cp target/release/bundle/linux/AFS-release-linux-x86_64.deb target/release/github-assets/
-          cp target/release/bundle/linux/AFS-release-linux-x86_64.rpm target/release/github-assets/
-          cp target/release/bundle/updater/AFS-release-linux-x86_64.AppImage target/release/github-assets/
-          cp target/release/bundle/updater/AFS-release-linux-x86_64.AppImage.sig target/release/github-assets/
+          cp target/release/bundle/linux/Locality-release-linux-x86_64.deb target/release/github-assets/
+          cp target/release/bundle/linux/Locality-release-linux-x86_64.rpm target/release/github-assets/
+          cp target/release/bundle/updater/Locality-release-linux-x86_64.AppImage target/release/github-assets/
+          cp target/release/bundle/updater/Locality-release-linux-x86_64.AppImage.sig target/release/github-assets/
           cp target/release/bundle/updater/latest-linux.json target/release/github-assets/
           sha256sum target/release/github-assets/* > target/release/github-assets/SHA256SUMS-linux
           ls -la target/release/github-assets
@@ -233,8 +233,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
         run: |
-          create_args=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "AFS ${APP_VERSION}" --generate-notes)
-          edit_args=(--repo "${GITHUB_REPOSITORY}" --title "AFS ${APP_VERSION}")
+          create_args=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "Locality ${APP_VERSION}" --generate-notes)
+          edit_args=(--repo "${GITHUB_REPOSITORY}" --title "Locality ${APP_VERSION}")
           if [[ "${PRERELEASE}" == "true" ]]; then
             create_args+=(--prerelease --latest=false)
             edit_args+=(--prerelease=true --latest=false)

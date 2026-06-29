@@ -1,6 +1,6 @@
 # Sync Freshness Model
 
-This document defines the connector-neutral model AFS uses to minimize remote
+This document defines the connector-neutral model Locality uses to minimize remote
 drift without repeatedly crawling large workspaces. Notion is the first
 implementation target, but the concepts must work for future sources such as
 Linear, Google Drive, GitHub, Slack, and custom internal systems.
@@ -17,7 +17,7 @@ Linear, Google Drive, GitHub, Slack, and custom internal systems.
 
 ## Core Concepts
 
-AFS uses the same high-level Nucleus vocabulary throughout the sync engine:
+Locality uses the same high-level Nucleus vocabulary throughout the sync engine:
 
 - **Remote Tree**: latest known source-side state.
 - **Local Tree**: latest known local filesystem or provider-cache state.
@@ -28,7 +28,7 @@ AFS uses the same high-level Nucleus vocabulary throughout the sync engine:
 
 ### Entity
 
-An `Entity` is any remote object AFS knows about. Examples include a Notion page,
+An `Entity` is any remote object Locality knows about. Examples include a Notion page,
 database, database row, directory-like container, asset, schema, or future
 connector object.
 
@@ -38,7 +38,7 @@ A `RemoteId` is a connector-owned stable identifier for an entity.
 
 ### RemoteVersion
 
-A `RemoteVersion` is an opaque connector-owned version token. AFS core compares
+A `RemoteVersion` is an opaque connector-owned version token. Locality core compares
 versions for equality, but does not assume their format or ordering.
 
 Examples:
@@ -69,7 +69,7 @@ Typical fields:
 
 A `Shadow` is the last accepted full rendered version of an entity. For a
 Markdown-backed page, this is the canonical Markdown render that local files are
-compared against. In Nucleus terminology, this shadow is AFS's Synced Tree entry
+compared against. In Nucleus terminology, this shadow is Locality's Synced Tree entry
 for that entity.
 
 ### Clean File
@@ -94,7 +94,7 @@ local tool:
 Local Tree != Synced Tree
 ```
 
-AFS must not overwrite pending Local Tree files with Remote Tree content.
+Locality must not overwrite pending Local Tree files with Remote Tree content.
 
 ### ChangeHint
 
@@ -106,7 +106,7 @@ Hints are not authoritative. They schedule observation or hydration work.
 
 ### FreshnessTier
 
-`FreshnessTier` controls how aggressively AFS spends sync budget on an entity or
+`FreshnessTier` controls how aggressively Locality spends sync budget on an entity or
 container:
 
 ```text
@@ -150,7 +150,7 @@ Each entity conceptually tracks:
 
 - Synced Tree remote version: the source version represented by the Synced Tree
   shadow
-- Remote Tree version: the newest cheap source version AFS has observed
+- Remote Tree version: the newest cheap source version Locality has observed
 - Local Tree file hash or local state
 - Synced Tree shadow
 - freshness tier
@@ -179,7 +179,7 @@ Diverged
 
 ## Freshness Scheduling
 
-AFS must not frequently scan an entire workspace. The daemon should use a
+Locality must not frequently scan an entire workspace. The daemon should use a
 bounded priority queue instead.
 
 Priority order:
@@ -232,12 +232,12 @@ Hydration
   Expensive. Fetch/render full content and media.
 ```
 
-AFS should do many cheap checks for hot entities, some enumeration for visible
+Locality should do many cheap checks for hot entities, some enumeration for visible
 navigation, and little background hydration.
 
 ## Auto-Fast-Forward Policy
 
-When remote changed and local has no pending edits, AFS may update the local
+When remote changed and local has no pending edits, Locality may update the local
 working copy.
 
 ```text
@@ -267,7 +267,7 @@ when file is opened/read/revealed:
   active_until = now + short duration
 ```
 
-While active, AFS can observe and hydrate remote content in the background, but
+While active, Locality can observe and hydrate remote content in the background, but
 should delay replacing the local file unless the user explicitly accepts it.
 
 ## Staged Implementation Plan
@@ -377,12 +377,12 @@ checking freshness
 push succeeded
 ```
 
-CLI commands such as `afs status --json`, `afs inspect <path> --json`, or
-`afs prepare <path>` are optional barriers for tests, scripts, and power users.
+CLI commands such as `loc status --json`, `loc inspect <path> --json`, or
+`loc prepare <path>` are optional barriers for tests, scripts, and power users.
 
 Current implementation:
 
-- `afs status --json` now exposes both Local Tree `state` and higher-level
+- `loc status --json` now exposes both Local Tree `state` and higher-level
   `sync_state` for each entry.
 - Entries include a `remote` object with Synced Tree version, Remote Tree
   version,
@@ -405,7 +405,7 @@ Current implementation:
 - Before queueing that hydration, the daemon verifies the Local Tree file/cache
   still matches the Synced Tree shadow and that the freshness state has an
   unresolved remote hint.
-- Recently opened or locally touched files get a short working-copy lease; AFS
+- Recently opened or locally touched files get a short working-copy lease; Locality
   re-observes after the lease instead of replacing the file immediately.
 - If a local file becomes pending before the auto hydration runs, the hydration
   executor skips without fetching remote content or inserting conflict markers.
@@ -433,18 +433,18 @@ both-changed, safe-to-fast-forward, and needs-review.
 
 Current implementation:
 
-- `afs-core::explain` compares the Synced Tree shadow against an available
+- `locality-core::explain` compares the Synced Tree shadow against an available
   Local Tree render and an available Remote Tree render, or records
   side-specific issues when a render is unavailable.
 - The output separates state from recommended action: for example,
   `remote_changed_only` maps to `safe_to_fast_forward`, while `both_changed`
   maps to `review_before_push`.
-- `afs inspect <path> --json` is the first command surface. It reads the local
+- `loc inspect <path> --json` is the first command surface. It reads the local
   plain file or virtual projection content cache, fetches the current remote
   render through the connector, and returns the full machine-readable
   explanation without mutating local or remote state.
 - The daemon push path also uses the same tree distinction as a final
-  pre-apply safety check: connector metadata checks run first, then AFS fetches
+  pre-apply safety check: connector metadata checks run first, then Locality fetches
   the affected Remote Tree render and verifies that it still matches the Synced
   Tree shadow before applying Local Tree edits.
 
@@ -463,7 +463,7 @@ Current local-only implementation:
 
 - Connector capabilities now include explicit flags for remote observation,
   lazy child enumeration, media download, undo, and future batch observation.
-- `afs-core::freshness` defines activity scoring and tier decay policy so
+- `locality-core::freshness` defines activity scoring and tier decay policy so
   recently opened/edited or hinted entities stay hot, hydrated files stay warm,
   and deep inactive virtual subtrees can cool to dormant.
 - The daemon freshness queue exposes bounded batch draining and queue metrics

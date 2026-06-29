@@ -4,12 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INPUT_DIR="${LINUX_REPO_INPUT_DIR:-${ROOT}/target/release/bundle/linux}"
 OUTPUT_DIR="${LINUX_REPO_OUTPUT_DIR:-${ROOT}/target/release/linux-repo}"
-BASE_URL="${LINUX_REPO_BASE_URL:-https://codeflash-ai.github.io/afs}"
+BASE_URL="${LINUX_REPO_BASE_URL:-https://codeflash-ai.github.io/locality}"
 APT_SUITE="${APT_SUITE:-stable}"
 APT_COMPONENT="${APT_COMPONENT:-main}"
 APT_ARCH="${APT_ARCH:-amd64}"
 RPM_ARCH="${RPM_ARCH:-x86_64}"
-PACKAGE_PATTERN="${LINUX_REPO_PACKAGE_PATTERN:-AFS-release-[0-9]*-*}"
+PACKAGE_PATTERN="${LINUX_REPO_PACKAGE_PATTERN:-Locality-release-[0-9]*-*}"
 GPG_HOME=""
 
 log() {
@@ -102,10 +102,10 @@ render_index() {
 <html lang="en">
   <head>
     <meta charset="utf-8">
-    <title>AFS Linux Packages</title>
+    <title>Locality Linux Packages</title>
   </head>
   <body>
-    <h1>AFS Linux Packages</h1>
+    <h1>Locality Linux Packages</h1>
     <ul>
       <li><a href="apt/">APT repository</a></li>
       <li><a href="rpm/">RPM repository</a></li>
@@ -121,7 +121,7 @@ render_apt_repo() {
   require_command gzip
 
   local apt_root="${OUTPUT_DIR}/apt"
-  local pool="${apt_root}/pool/main/a/afs"
+  local pool="${apt_root}/pool/main/a/loc"
   mkdir -p "${pool}" "${apt_root}/dists/${APT_SUITE}/${APT_COMPONENT}/binary-${APT_ARCH}"
   copy_unique "${PACKAGE_PATTERN}.deb" "${pool}"
 
@@ -131,7 +131,7 @@ render_apt_repo() {
     gzip -kf "dists/${APT_SUITE}/${APT_COMPONENT}/binary-${APT_ARCH}/Packages"
     apt-ftparchive \
       -o "APT::FTPArchive::Release::Origin=CodeFlash" \
-      -o "APT::FTPArchive::Release::Label=AFS" \
+      -o "APT::FTPArchive::Release::Label=Locality" \
       -o "APT::FTPArchive::Release::Suite=${APT_SUITE}" \
       -o "APT::FTPArchive::Release::Codename=${APT_SUITE}" \
       -o "APT::FTPArchive::Release::Architectures=${APT_ARCH}" \
@@ -156,14 +156,14 @@ write_rpm_repo_file() {
   if [[ "${signed}" == "1" ]]; then
     repo_gpgcheck=1
   fi
-  cat > "${rpm_root}/afs.repo" <<EOF
-[afs]
-name=AFS
+  cat > "${rpm_root}/loc.repo" <<EOF
+[loc]
+name=Locality
 baseurl=${BASE_URL%/}/rpm/${RPM_ARCH}
 enabled=1
 gpgcheck=0
 repo_gpgcheck=${repo_gpgcheck}
-gpgkey=${BASE_URL%/}/rpm/RPM-GPG-KEY-codeflash-afs
+gpgkey=${BASE_URL%/}/rpm/RPM-GPG-KEY-codeflash-loc
 EOF
 }
 
@@ -181,11 +181,11 @@ sign_repositories() {
   local apt_release="${OUTPUT_DIR}/apt/dists/${APT_SUITE}/Release"
   sign_file "${key_id}" clearsign "${apt_release}" "${OUTPUT_DIR}/apt/dists/${APT_SUITE}/InRelease"
   sign_file "${key_id}" detach "${apt_release}" "${OUTPUT_DIR}/apt/dists/${APT_SUITE}/Release.gpg"
-  gpg --batch --armor --export "${key_id}" > "${OUTPUT_DIR}/apt/codeflash-afs.asc"
+  gpg --batch --armor --export "${key_id}" > "${OUTPUT_DIR}/apt/codeflash-loc.asc"
 
   local repomd="${OUTPUT_DIR}/rpm/${RPM_ARCH}/repodata/repomd.xml"
   sign_file "${key_id}" detach "${repomd}" "${repomd}.asc"
-  gpg --batch --armor --export "${key_id}" > "${OUTPUT_DIR}/rpm/RPM-GPG-KEY-codeflash-afs"
+  gpg --batch --armor --export "${key_id}" > "${OUTPUT_DIR}/rpm/RPM-GPG-KEY-codeflash-loc"
   write_rpm_repo_file 1
 }
 

@@ -80,7 +80,7 @@ jobs:
         run: cargo test --workspace --all-targets --locked
 
       - name: Build macOS File Provider package
-        run: swift build --package-path platform/macos/AgentFSFileProvider
+        run: swift build --package-path platform/macos/LocalityFileProvider
 
       - name: Install desktop dependencies
         run: npm ci
@@ -173,7 +173,7 @@ jobs:
             exit 1
           fi
 
-          keychain_path="${RUNNER_TEMP}/afs-signing.keychain-db"
+          keychain_path="${RUNNER_TEMP}/loc-signing.keychain-db"
           certificate_path="${RUNNER_TEMP}/developer-id.p12"
           printf '%s' "${APPLE_CERTIFICATE_P12_BASE64}" | base64 --decode > "${certificate_path}" 2>/dev/null \
             || printf '%s' "${APPLE_CERTIFICATE_P12_BASE64}" | base64 -D > "${certificate_path}"
@@ -208,7 +208,7 @@ jobs:
         env:
           GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
           HOMEBREW_RELEASE_TAG: ${{ env.RELEASE_TAG }}
-          UPDATER_NOTES: "AFS ${{ env.APP_VERSION }} macOS update."
+          UPDATER_NOTES: "Locality ${{ env.APP_VERSION }} macOS update."
         run: |
           make render-updater-manifest
           make render-homebrew-cask
@@ -216,11 +216,11 @@ jobs:
       - name: Collect release assets
         run: |
           mkdir -p target/release/github-assets
-          cp target/release/bundle/dmg/AFS-release-*-notarized-*.dmg target/release/github-assets/
+          cp target/release/bundle/dmg/Locality-release-*-notarized-*.dmg target/release/github-assets/
           cp target/release/bundle/updater/*.app.tar.gz target/release/github-assets/
           cp target/release/bundle/updater/*.app.tar.gz.sig target/release/github-assets/
           cp target/release/bundle/updater/latest-macos.json target/release/github-assets/
-          cp target/release/homebrew/Casks/afs.rb target/release/github-assets/afs.rb
+          cp target/release/homebrew/Casks/loc.rb target/release/github-assets/loc.rb
           shasum -a 256 target/release/github-assets/* > target/release/github-assets/SHA256SUMS
           ls -la target/release/github-assets
 
@@ -229,8 +229,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
         run: |
-          create_args=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "AFS ${APP_VERSION}" --generate-notes)
-          edit_args=(--repo "${GITHUB_REPOSITORY}" --title "AFS ${APP_VERSION}")
+          create_args=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "Locality ${APP_VERSION}" --generate-notes)
+          edit_args=(--repo "${GITHUB_REPOSITORY}" --title "Locality ${APP_VERSION}")
           if [[ "${PRERELEASE}" == "true" ]]; then
             create_args+=(--prerelease --latest=false)
             edit_args+=(--prerelease=true --latest=false)
@@ -261,18 +261,18 @@ jobs:
           tap_dir="${RUNNER_TEMP}/homebrew-tap"
           git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${HOMEBREW_TAP_REPOSITORY}.git" "${tap_dir}"
           mkdir -p "${tap_dir}/Casks"
-          cp target/release/homebrew/Casks/afs.rb "${tap_dir}/Casks/afs.rb"
+          cp target/release/homebrew/Casks/loc.rb "${tap_dir}/Casks/loc.rb"
           cd "${tap_dir}"
-          git add Casks/afs.rb
+          git add Casks/loc.rb
           if git diff --cached --quiet; then
             echo "Homebrew cask already up to date."
             exit 0
           fi
-          git commit -m "Update AFS cask to ${RELEASE_TAG}"
+          git commit -m "Update Locality cask to ${RELEASE_TAG}"
           git push
 
       - name: Homebrew tap update instructions
         if: env.HOMEBREW_TAP_TOKEN == ''
         run: |
-          echo "::notice::Set HOMEBREW_TAP_TOKEN to let this workflow push Casks/afs.rb to ${HOMEBREW_TAP_REPOSITORY}."
-          echo "::notice::The generated cask was uploaded as a release asset named afs.rb."
+          echo "::notice::Set HOMEBREW_TAP_TOKEN to let this workflow push Casks/loc.rb to ${HOMEBREW_TAP_REPOSITORY}."
+          echo "::notice::The generated cask was uploaded as a release asset named loc.rb."

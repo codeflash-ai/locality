@@ -9,146 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "afs-cli"
-version = "0.1.3"
-dependencies = [
- "afs-connector",
- "afs-core",
- "afs-notion",
- "afs-platform",
- "afs-store",
- "afsd",
- "clap",
- "serde",
- "serde_json",
- "yaml_serde",
-]
-
-[[package]]
-name = "afs-cloud-files"
-version = "0.1.3"
-dependencies = [
- "afs-core",
- "afs-platform",
- "afsd",
- "base64 0.22.1",
- "clap",
- "ctrlc",
- "notify",
- "serde",
- "serde_json",
- "windows",
-]
-
-[[package]]
-name = "afs-connector"
-version = "0.1.3"
-dependencies = [
- "afs-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "afs-core"
-version = "0.1.3"
-dependencies = [
- "serde",
- "serde_json",
- "yaml_serde",
-]
-
-[[package]]
-name = "afs-desktop"
-version = "0.1.3"
-dependencies = [
- "afs-cli",
- "afs-core",
- "afs-notion",
- "afs-platform",
- "afs-store",
- "afsd",
- "notify",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-process",
- "tauri-plugin-updater",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "afs-fuse"
-version = "0.1.3"
-dependencies = [
- "afs-core",
- "afsd",
- "base64 0.22.1",
- "bytes",
- "fuse3",
- "futures-util",
- "libc",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "afs-notion"
-version = "0.1.3"
-dependencies = [
- "afs-connector",
- "afs-core",
- "mime_guess",
- "reqwest",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "yaml_serde",
-]
-
-[[package]]
-name = "afs-platform"
-version = "0.1.0"
-dependencies = [
- "afs-store",
- "libc",
- "serde",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "afs-store"
-version = "0.1.3"
-dependencies = [
- "afs-core",
- "rusqlite",
- "serde",
- "serde_json",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "afsd"
-version = "0.1.3"
-dependencies = [
- "afs-connector",
- "afs-core",
- "afs-notion",
- "afs-platform",
- "afs-store",
- "base64 0.22.1",
- "getrandom 0.3.4",
- "notify",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2179,6 +2039,160 @@ name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
+
+[[package]]
+name = "loc-cli"
+version = "0.1.3"
+dependencies = [
+ "clap",
+ "locality-connector",
+ "locality-core",
+ "locality-google-docs",
+ "locality-notion",
+ "locality-platform",
+ "locality-store",
+ "localityd",
+ "serde",
+ "serde_json",
+ "yaml_serde",
+]
+
+[[package]]
+name = "locality-cloud-files"
+version = "0.1.3"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "ctrlc",
+ "locality-core",
+ "locality-platform",
+ "localityd",
+ "notify",
+ "serde",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
+name = "locality-connector"
+version = "0.1.3"
+dependencies = [
+ "locality-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "locality-core"
+version = "0.1.3"
+dependencies = [
+ "serde",
+ "serde_json",
+ "yaml_serde",
+]
+
+[[package]]
+name = "locality-desktop"
+version = "0.1.3"
+dependencies = [
+ "loc-cli",
+ "locality-core",
+ "locality-notion",
+ "locality-platform",
+ "locality-store",
+ "localityd",
+ "notify",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-process",
+ "tauri-plugin-updater",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "locality-fuse"
+version = "0.1.3"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "fuse3",
+ "futures-util",
+ "libc",
+ "locality-core",
+ "localityd",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "locality-google-docs"
+version = "0.1.3"
+dependencies = [
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "locality-notion"
+version = "0.1.3"
+dependencies = [
+ "locality-connector",
+ "locality-core",
+ "mime_guess",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "yaml_serde",
+]
+
+[[package]]
+name = "locality-platform"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "locality-store",
+ "serde",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "locality-store"
+version = "0.1.3"
+dependencies = [
+ "locality-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "localityd"
+version = "0.1.3"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.3.4",
+ "locality-connector",
+ "locality-core",
+ "locality-google-docs",
+ "locality-notion",
+ "locality-platform",
+ "locality-store",
+ "notify",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "lock_api"

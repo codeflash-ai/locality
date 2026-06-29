@@ -10,12 +10,12 @@
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
         "installMode": "currentUser",
-        "startMenuFolder": "AFS",
+        "startMenuFolder": "Locality",
         "languages": ["English"],
         "customLanguageFiles": {
           "English": "windows/English.nsh"
         },
-        "installerHooks": "windows/afs-sidecars.nsh"
+        "installerHooks": "windows/loc-sidecars.nsh"
       }
     }
   }

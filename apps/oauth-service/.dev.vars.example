@@ -1,0 +1,10 @@
+# Local development only. Never commit .dev.vars.
+LOCALITY_BROKER_SESSION_SECRET=replace-with-at-least-32-random-bytes
+LOCALITY_REFRESH_HANDLE_KEY=replace-with-at-least-32-random-bytes
+LOCALITY_NOTION_CLIENT_ID=notion-oauth-client-id
+LOCALITY_NOTION_CLIENT_SECRET=notion-oauth-client-secret
+LOCALITY_GOOGLE_DOCS_CLIENT_ID=google-docs-oauth-client-id
+LOCALITY_GOOGLE_DOCS_CLIENT_SECRET=google-docs-oauth-client-secret
+LOCALITY_TOKEN_MODE=handle
+LOCALITY_NOTION_REDIRECT_URIS=http://localhost:8757/oauth/notion/callback,http://127.0.0.1:8757/oauth/notion/callback
+LOCALITY_GOOGLE_DOCS_REDIRECT_URIS=http://localhost:8757/oauth/google-docs/callback,http://127.0.0.1:8757/oauth/google-docs/callback

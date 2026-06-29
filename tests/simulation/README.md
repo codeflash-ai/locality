@@ -1,6 +1,6 @@
 # Simulation Harness Placeholder
 
-The randomized sync simulation should eventually drive the deterministic `afs-core` state machine with:
+The randomized sync simulation should eventually drive the deterministic `locality-core` state machine with:
 
 - local edits
 - remote edits

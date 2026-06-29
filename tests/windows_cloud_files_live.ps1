@@ -2,8 +2,8 @@ param()
 
 $ErrorActionPreference = "Stop"
 
-if ($env:AFS_WINDOWS_CLOUD_FILES_LIVE -ne "1") {
-    Write-Host "skip: set AFS_WINDOWS_CLOUD_FILES_LIVE=1 to run the live Windows Cloud Files Notion test"
+if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE -ne "1") {
+    Write-Host "skip: set LOCALITY_WINDOWS_CLOUD_FILES_LIVE=1 to run the live Windows Cloud Files Notion test"
     exit 0
 }
 
@@ -17,7 +17,7 @@ $runningOnWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPla
 )
 if (-not $runningOnWindows) {
     $message = "skip: Windows Cloud Files live test requires Windows"
-    if ($env:AFS_WINDOWS_CLOUD_FILES_LIVE_REQUIRED -eq "1") {
+    if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_REQUIRED -eq "1") {
         Write-Error $message
         exit 1
     }
@@ -26,7 +26,7 @@ if (-not $runningOnWindows) {
 }
 
 $notionToken = if ($env:NOTION_TOKEN) { $env:NOTION_TOKEN } else { $env:NOTION_AT }
-$parentPageId = if ($env:AFS_NOTION_LIVE_PARENT_PAGE) { $env:AFS_NOTION_LIVE_PARENT_PAGE } else { $env:AFS_NOTION_PAGE_ID }
+$parentPageId = if ($env:LOCALITY_NOTION_LIVE_PARENT_PAGE) { $env:LOCALITY_NOTION_LIVE_PARENT_PAGE } else { $env:LOCALITY_NOTION_PAGE_ID }
 
 if (-not $notionToken) {
     Write-Error "missing NOTION_TOKEN or NOTION_AT"
@@ -34,20 +34,20 @@ if (-not $notionToken) {
 }
 
 if (-not $parentPageId) {
-    Write-Error "missing AFS_NOTION_LIVE_PARENT_PAGE or AFS_NOTION_PAGE_ID"
+    Write-Error "missing LOCALITY_NOTION_LIVE_PARENT_PAGE or LOCALITY_NOTION_PAGE_ID"
     exit 1
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$afsBin = if ($env:AFS_BIN) { $env:AFS_BIN } else { Join-Path $repoRoot "target\debug\afs.exe" }
-$afsdBin = if ($env:AFSD_BIN) { $env:AFSD_BIN } else { Join-Path $repoRoot "target\debug\afsd.exe" }
-$cloudFilesBin = if ($env:AFS_CLOUD_FILES_BIN) { $env:AFS_CLOUD_FILES_BIN } else { Join-Path $repoRoot "target\debug\afs-cloud-files.exe" }
+$locBin = if ($env:LOCALITY_BIN) { $env:LOCALITY_BIN } else { Join-Path $repoRoot "target\debug\loc.exe" }
+$localitydBin = if ($env:LOCALITYD_BIN) { $env:LOCALITYD_BIN } else { Join-Path $repoRoot "target\debug\localityd.exe" }
+$cloudFilesBin = if ($env:LOCALITY_CLOUD_FILES_BIN) { $env:LOCALITY_CLOUD_FILES_BIN } else { Join-Path $repoRoot "target\debug\locality-cloud-files.exe" }
 
 $unique = "{0}-{1}" -f (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss"), ([Guid]::NewGuid().ToString("N").Substring(0, 8))
-$tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) "afs-windows-cloud-files-live-$unique"
-$stateRoot = if ($env:AFS_WINDOWS_CLOUD_FILES_LIVE_STATE) { $env:AFS_WINDOWS_CLOUD_FILES_LIVE_STATE } else { Join-Path $tmpRoot "state" }
-$syncRoot = if ($env:AFS_WINDOWS_CLOUD_FILES_LIVE_ROOT) { $env:AFS_WINDOWS_CLOUD_FILES_LIVE_ROOT } else { Join-Path $tmpRoot "AFS" }
-$mountId = if ($env:AFS_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID) { $env:AFS_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID } else { "notion-windows-cloud-live-$unique" }
+$tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) "loc-windows-cloud-files-live-$unique"
+$stateRoot = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_STATE) { $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_STATE } else { Join-Path $tmpRoot "state" }
+$syncRoot = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_ROOT) { $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_ROOT } else { Join-Path $tmpRoot "Locality" }
+$mountId = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID) { $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID } else { "notion-windows-cloud-live-$unique" }
 $scratchPageId = $null
 $createdChildPageId = $null
 $tcpAddr = $null
@@ -55,7 +55,7 @@ $failed = $false
 
 function Write-Step {
     param([string] $Message)
-    Write-Host "[afs-live] $Message"
+    Write-Host "[loc-live] $Message"
 }
 
 function Invoke-WithTimeout {
@@ -88,7 +88,7 @@ function Normalize-NotionId {
     return $candidate
 }
 
-function ConvertTo-AfsSlug {
+function ConvertTo-LocalitySlug {
     param([string] $Title)
     $builder = [System.Text.StringBuilder]::new()
     foreach ($char in $Title.ToCharArray()) {
@@ -338,7 +338,7 @@ function Wait-ForStatusContains {
         [string] $Needle
     )
     Wait-ForCondition -Name "status $Path contains $Needle" -Condition {
-        $output = Invoke-Native -FilePath $afsBin -Arguments @("status", $Path, "--json") -Step "afs status $Path"
+        $output = Invoke-Native -FilePath $locBin -Arguments @("status", $Path, "--json") -Step "loc status $Path"
         return $output.Contains($Needle)
     }
 }
@@ -347,21 +347,21 @@ try {
     Write-Step "preparing temp state and sync root"
     New-Item -ItemType Directory -Force -Path $stateRoot, $syncRoot | Out-Null
 
-    if (-not ((Test-Path -LiteralPath $afsBin) -and (Test-Path -LiteralPath $afsdBin) -and (Test-Path -LiteralPath $cloudFilesBin))) {
+    if (-not ((Test-Path -LiteralPath $locBin) -and (Test-Path -LiteralPath $localitydBin) -and (Test-Path -LiteralPath $cloudFilesBin))) {
         Push-Location $repoRoot
         try {
-            Invoke-Native -FilePath "cargo" -Arguments @("build", "-p", "afsd", "-p", "afs-cli", "-p", "afs-cloud-files") -Step "cargo build" -TimeoutSeconds 600
+            Invoke-Native -FilePath "cargo" -Arguments @("build", "-p", "localityd", "-p", "loc-cli", "-p", "locality-cloud-files") -Step "cargo build" -TimeoutSeconds 600
         } finally {
             Pop-Location
         }
     }
 
     $tcpAddr = Get-FreeTcpAddr
-    $env:AFS_STATE_DIR = $stateRoot
+    $env:LOCALITY_STATE_DIR = $stateRoot
     $env:NOTION_TOKEN = $notionToken
-    $env:AFS_CLOUD_FILES_BIN = $cloudFilesBin
+    $env:LOCALITY_CLOUD_FILES_BIN = $cloudFilesBin
     $parentPageId = Normalize-NotionId $parentPageId
-    $scratchTitle = "AFS Cloud Files live $unique"
+    $scratchTitle = "Locality Cloud Files live $unique"
     $initialBody = "Initial paragraph created by the Windows Cloud Files live e2e."
     Write-Step "creating scratch Notion page"
     $scratch = Invoke-Notion -Method POST -Path "pages" -Body @{
@@ -400,59 +400,59 @@ try {
     $scratchPageId = Normalize-NotionId $scratch.id
 
     Write-Step "mounting Windows Cloud Files projection"
-    $previousDisable = $env:AFS_DAEMON_DISABLE
-    $env:AFS_DAEMON_DISABLE = "1"
+    $previousDisable = $env:LOCALITY_DAEMON_DISABLE
+    $env:LOCALITY_DAEMON_DISABLE = "1"
     try {
-        Invoke-Native -FilePath $afsBin -Arguments @(
+        Invoke-Native -FilePath $locBin -Arguments @(
             "mount", "notion", $syncRoot,
             "--root-page", $scratchPageId,
             "--mount-id", $mountId,
             "--projection", "windows-cloud-files",
             "--json"
-        ) -Step "afs mount" | Out-Null
+        ) -Step "loc mount" | Out-Null
     } finally {
         if ($null -eq $previousDisable) {
-            Remove-Item Env:\AFS_DAEMON_DISABLE -ErrorAction SilentlyContinue
+            Remove-Item Env:\LOCALITY_DAEMON_DISABLE -ErrorAction SilentlyContinue
         } else {
-            $env:AFS_DAEMON_DISABLE = $previousDisable
+            $env:LOCALITY_DAEMON_DISABLE = $previousDisable
         }
     }
 
-    $env:AFS_DAEMON_TCP_ADDR = $tcpAddr
-    if (-not $env:AFS_CLOUD_FILES_TRACE) {
-        $env:AFS_CLOUD_FILES_TRACE = "1"
+    $env:LOCALITY_DAEMON_TCP_ADDR = $tcpAddr
+    if (-not $env:LOCALITY_CLOUD_FILES_TRACE) {
+        $env:LOCALITY_CLOUD_FILES_TRACE = "1"
     }
 
-    Write-Step "starting afsd"
-    Invoke-Native -FilePath $afsBin -Arguments @(
+    Write-Step "starting localityd"
+    Invoke-Native -FilePath $locBin -Arguments @(
         "daemon", "start",
         "--session",
         "--state-dir", $stateRoot,
         "--tcp-addr", $tcpAddr,
-        "--afsd-bin", $afsdBin,
+        "--localityd-bin", $localitydBin,
         "--include-env", "NOTION_TOKEN",
         "--json"
-    ) -Step "afs daemon start" -NoCapture | Out-Null
-    Wait-ForCondition -Name "afsd TCP endpoint" -Condition {
-        $output = Invoke-Native -FilePath $afsBin -Arguments @("daemon", "status", "--state-dir", $stateRoot, "--tcp-addr", $tcpAddr, "--json") -Step "afs daemon status"
+    ) -Step "loc daemon start" -NoCapture | Out-Null
+    Wait-ForCondition -Name "localityd TCP endpoint" -Condition {
+        $output = Invoke-Native -FilePath $locBin -Arguments @("daemon", "status", "--state-dir", $stateRoot, "--tcp-addr", $tcpAddr, "--json") -Step "loc daemon status"
         return $output.Contains('"state": "running"')
     }
 
     Write-Step "starting Cloud Files provider"
-    Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "start", $mountId, "--json") -Step "afs file-provider start" -NoCapture | Out-Null
+    Invoke-Native -FilePath $locBin -Arguments @("file-provider", "start", $mountId, "--json") -Step "loc file-provider start" -NoCapture | Out-Null
     Wait-ForCondition -Name "Cloud Files provider lifecycle" -Condition {
-        $output = Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "status", $mountId, "--json") -Step "afs file-provider status"
+        $output = Invoke-Native -FilePath $locBin -Arguments @("file-provider", "status", $mountId, "--json") -Step "loc file-provider status"
         return $output.Contains('"state": "running"')
     }
-    Write-Step "running afs doctor"
-    $doctorOutput = Invoke-Native -FilePath $afsBin -Arguments @("doctor", "--json") -Step "afs doctor"
+    Write-Step "running loc doctor"
+    $doctorOutput = Invoke-Native -FilePath $locBin -Arguments @("doctor", "--json") -Step "loc doctor"
     $doctor = $doctorOutput | ConvertFrom-Json
     if (-not $doctor.ok) {
-        throw "afs doctor reported $($doctor.status) during live Cloud Files e2e: $doctorOutput"
+        throw "loc doctor reported $($doctor.status) during live Cloud Files e2e: $doctorOutput"
     }
 
     $sourceRoot = Join-Path $syncRoot "notion"
-    $pageDir = Join-Path $sourceRoot (ConvertTo-AfsSlug $scratchTitle)
+    $pageDir = Join-Path $sourceRoot (ConvertTo-LocalitySlug $scratchTitle)
     $pageFile = Join-Path $pageDir "page.md"
     Write-Step "waiting for source root"
     Wait-ForCondition -Name "Cloud Files source root" -Condition {
@@ -480,7 +480,7 @@ try {
     Write-Utf8NoBom -Path $pageFile -Contents ($hydrated.TrimEnd() + "`n`n$editMarker`n")
     Wait-ForStatusContains -Path $pageFile -Needle '"local_body_changed"'
     Write-Step "pushing page edit"
-    Invoke-Native -FilePath $afsBin -Arguments @("push", $pageFile, "-y", "--json") -Step "push edited page" | Out-Null
+    Invoke-Native -FilePath $locBin -Arguments @("push", $pageFile, "-y", "--json") -Step "push edited page" | Out-Null
     Wait-ForStatusContains -Path $pageFile -Needle '"state": "clean"'
     Write-Step "verifying page edit in Notion"
     $remoteText = Get-NotionBlockText -PageId $scratchPageId
@@ -498,8 +498,8 @@ try {
     Remove-ItemWithTimeout -Path $renamedDraftFile
     Wait-ForStatusContains -Path $pageDir -Needle '"clean": true'
 
-    $childTitle = "AFS Cloud Files child $unique"
-    $childDir = Join-Path $pageDir (ConvertTo-AfsSlug $childTitle)
+    $childTitle = "Locality Cloud Files child $unique"
+    $childDir = Join-Path $pageDir (ConvertTo-LocalitySlug $childTitle)
     $childPage = Join-Path $childDir "page.md"
     $childMarker = "Windows Cloud Files created child $unique"
     Write-Step "creating child page directory"
@@ -507,7 +507,7 @@ try {
     Write-Utf8NoBom -Path $childPage -Contents "---`ntitle: `"$childTitle`"`n---`n# Created child`n`n$childMarker`n"
     Wait-ForStatusContains -Path $childPage -Needle '"pending_virtual_create"'
     Write-Step "pushing created child page"
-    $pushChildOutput = Invoke-Native -FilePath $afsBin -Arguments @("push", $childPage, "-y", "--json") -Step "push created child page"
+    $pushChildOutput = Invoke-Native -FilePath $locBin -Arguments @("push", $childPage, "-y", "--json") -Step "push created child page"
     $pushChild = $pushChildOutput | ConvertFrom-Json
     $createdChildPageId = @($pushChild.changed_remote_ids | Where-Object { (Normalize-NotionId $_) -ne $scratchPageId } | Select-Object -First 1)[0]
     if (-not $createdChildPageId) {
@@ -523,7 +523,7 @@ try {
     Remove-ItemWithTimeout -Path $childDir -Recurse
     Wait-ForStatusContains -Path $pageDir -Needle '"pending_virtual_delete"'
     Write-Step "pushing child page archive"
-    Invoke-Native -FilePath $afsBin -Arguments @("push", $pageDir, "-y", "--json") -Step "push deleted child page" | Out-Null
+    Invoke-Native -FilePath $locBin -Arguments @("push", $pageDir, "-y", "--json") -Step "push deleted child page" | Out-Null
     Assert-NotionPageArchived -PageId $createdChildPageId
 
     Write-Host "ok: Windows Cloud Files live Notion e2e completed"
@@ -531,22 +531,22 @@ try {
     $failed = $true
     Write-Error $_ -ErrorAction Continue
 } finally {
-    if (Test-Path -LiteralPath $afsBin) {
+    if (Test-Path -LiteralPath $locBin) {
         try {
-            Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "stop", $mountId, "--json") -Step "afs file-provider stop" | Out-Null
+            Invoke-Native -FilePath $locBin -Arguments @("file-provider", "stop", $mountId, "--json") -Step "loc file-provider stop" | Out-Null
         } catch {
             Write-Warning "Cloud Files provider stop failed: $($_.Exception.Message)"
         }
         try {
-            Invoke-Native -FilePath $afsBin -Arguments @("file-provider", "unregister", $mountId, "--json") -Step "afs file-provider unregister" | Out-Null
+            Invoke-Native -FilePath $locBin -Arguments @("file-provider", "unregister", $mountId, "--json") -Step "loc file-provider unregister" | Out-Null
         } catch {
             Write-Warning "Cloud Files unregister failed: $($_.Exception.Message)"
         }
         if ($tcpAddr) {
             try {
-                Invoke-Native -FilePath $afsBin -Arguments @("daemon", "stop", "--state-dir", $stateRoot, "--tcp-addr", $tcpAddr, "--json") -Step "afs daemon stop" | Out-Null
+                Invoke-Native -FilePath $locBin -Arguments @("daemon", "stop", "--state-dir", $stateRoot, "--tcp-addr", $tcpAddr, "--json") -Step "loc daemon stop" | Out-Null
             } catch {
-                Write-Warning "afsd stop failed: $($_.Exception.Message)"
+                Write-Warning "localityd stop failed: $($_.Exception.Message)"
             }
         }
     }
@@ -567,7 +567,7 @@ try {
         }
     }
 
-    if ($env:AFS_WINDOWS_CLOUD_FILES_LIVE_KEEP_TMP -eq "1") {
+    if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_KEEP_TMP -eq "1") {
         Write-Host "kept Windows Cloud Files live temp root: $tmpRoot"
     } elseif ((Test-Path -LiteralPath $tmpRoot) -and $tmpRoot.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase)) {
         Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue

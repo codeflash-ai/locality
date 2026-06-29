@@ -1,25 +1,25 @@
 # Multiplatform Architecture
 
-AgentFS should treat operating systems as presentation and host-integration
+Locality should treat operating systems as presentation and host-integration
 surfaces, not as sync-engine variants. The product promise is the same on every
 platform:
 
 - connected sources appear as normal local files and folders;
 - online-only content is browseable before it is hydrated;
 - first read can hydrate the file without exposing placeholder bytes;
-- local edits remain reviewable and explicit until `afs push`;
+- local edits remain reviewable and explicit until `loc push`;
 - the daemon remains the single owner of durable state, scheduling, connector
   calls, hydration, dirty-state transitions, journals, and push execution.
 
 The existing core split already points in the right direction. This plan keeps
-`afs-core`, connector crates, `afs-store`, and the daemon runtime mostly intact,
+`locality-core`, connector crates, `locality-store`, and the daemon runtime mostly intact,
 then adds explicit platform interfaces around the places where OS behavior is
 currently implicit.
 
 ## Design Goals
 
 1. Preserve the connector-agnostic sync model.
-   `afs-core` must not learn about File Provider, FUSE, Cloud Files, services,
+   `locality-core` must not learn about File Provider, FUSE, Cloud Files, services,
    named pipes, launchd, systemd, or Windows paths.
 
 2. Make platform adapters peers.
@@ -31,7 +31,7 @@ currently implicit.
    virtualization.
 
 4. Keep path semantics explicit.
-   AgentFS entity paths are logical slash-separated source paths. Host paths are
+   Locality entity paths are logical slash-separated source paths. Host paths are
    OS-native filesystem paths. Reports should deliberately choose one instead
    of leaking `Path::display()` everywhere.
 
@@ -47,23 +47,23 @@ currently implicit.
 ## Target Module Shape
 
 ```text
-afs-core
+locality-core
   Pure sync model, planning, validation, conflicts, journals, hydration policy.
 
-afs-connector
+locality-connector
   Connector trait and connector-neutral apply/fetch contracts.
 
-afs-notion
+locality-notion
   Notion fetch/render/apply implementation.
 
-afs-store
+locality-store
   SQLite state, credential-store trait, mount records, entity records.
 
-afsd
+localityd
   Daemon runtime, job queue, scheduler, hydration/push/pull execution,
   virtual filesystem service, daemon protocol handlers.
 
-afs-platform
+locality-platform
   Small cross-platform host abstraction crate:
     paths
     credentials
@@ -72,8 +72,8 @@ afs-platform
     opener
     projection registration
 
-afs-cli
-  User/agent command surface. Calls afs-platform and afsd protocol clients
+loc-cli
+  User/agent command surface. Calls locality-platform and localityd protocol clients
   instead of hard-coding OS behavior.
 
 platform/macos
@@ -86,10 +86,10 @@ platform/windows
   Cloud Files provider/helper, Windows service/login startup, installer helpers.
 
 apps/desktop
-  Tauri UI and platform packaging. Uses afs-platform for host integration.
+  Tauri UI and platform packaging. Uses locality-platform for host integration.
 ```
 
-`afs-platform` can begin as modules inside `afsd`/`afs-cli` if that keeps the
+`locality-platform` can begin as modules inside `localityd`/`loc-cli` if that keeps the
 first change smaller, but the product architecture should converge on a crate
 with narrow traits. The important constraint is that platform decisions are made
 in one layer, not scattered through CLI, daemon, desktop, and tests.
@@ -116,9 +116,9 @@ pub enum ReportPath<'a> {
 
 Rules:
 
-- `AFS_STATE_DIR` continues to override state root for tests/dev.
-- macOS/Linux can keep `~/.afs` for compatibility.
-- Windows should use `%LOCALAPPDATA%\AgentFS` or `%LOCALAPPDATA%\AFS` for
+- `LOCALITY_STATE_DIR` continues to override state root for tests/dev.
+- macOS/Linux can keep `~/.loc` for compatibility.
+- Windows should use `%LOCALAPPDATA%\Locality` or `%LOCALAPPDATA%\Locality` for
   durable app state, with `%USERPROFILE%` only as a fallback.
 - Entity paths and virtual mutation paths should be rendered with `/` for JSON
   and agent-facing reports.
@@ -186,7 +186,7 @@ and trash.
 
 ### Process Management
 
-Move `afs daemon start|stop|status|reload|restart` process details behind a
+Move `loc daemon start|stop|status|reload|restart` process details behind a
 manager interface.
 
 ```rust
@@ -211,7 +211,7 @@ The CLI should report the same logical state regardless of manager:
 ### Projection Adapters
 
 The daemon already has the correct platform-neutral boundary in
-`afsd::virtual_fs`. Formalize it as a service contract used by all virtual
+`localityd::virtual_fs`. Formalize it as a service contract used by all virtual
 filesystem adapters.
 
 ```rust
@@ -262,7 +262,8 @@ Non-responsibilities:
 
 ### Linux: FUSE
 
-Keep `afs-fuse`, but make the crate Linux-only in workspace/package selection.
+Keep `locality-fuse` under `platform/linux/locality-fuse`, with Linux-only dependency
+selection.
 
 Responsibilities:
 
@@ -275,7 +276,7 @@ Responsibilities:
 Packaging:
 
 - systemd user service remains the product-grade lifecycle manager.
-- `afs file-provider register` repairs/restarts the per-mount unit.
+- `loc file-provider register` repairs/restarts the per-mount unit.
 
 ### Windows: Cloud Files
 
@@ -286,7 +287,7 @@ Explorer integration.
 
 Responsibilities:
 
-- Register/unregister an AFS sync root.
+- Register/unregister an Locality sync root.
 - Create placeholder directories/files from daemon metadata.
 - On fetch/hydration callback, call daemon `materialize`, then supply bytes to
   Windows.
@@ -302,8 +303,8 @@ sync-root filesystem watcher, converted to placeholders after the daemon records
 the virtual mutation, and then tracked through the same placeholder identity path
 as existing cloud items.
 
-Current implementation direction: Windows uses the Rust `afs-cloud-files.exe`
-helper. The CLI exposes `afs file-provider start|stop|status|restart` as the
+Current implementation direction: Windows uses the Rust `locality-cloud-files.exe`
+helper. The CLI exposes `loc file-provider start|stop|status|restart` as the
 shared lifecycle surface for the provider runtime; the desktop app should call
 the same platform layer when a mount is activated/opened or when the app
 launches with existing Cloud Files mounts, and can build restart supervision on
@@ -311,7 +312,7 @@ top of the same per-mount PID/log metadata.
 
 Open design questions:
 
-- Whether the provider talks to `afsd` over named pipe or authenticated TCP.
+- Whether the provider talks to `localityd` over named pipe or authenticated TCP.
 - Whether the installed daemon is a per-user Windows Service, scheduled task, or
   desktop-managed background process.
 
@@ -369,7 +370,7 @@ This removes the need for scattered `cfg(target_os)` logic in command parsing.
 
 The desktop app should use the same platform layer as the CLI:
 
-- discover sidecar binaries through `afs-platform`;
+- discover sidecar binaries through `locality-platform`;
 - start/stop daemon through `DaemonProcessManager`;
 - register virtual projection through `ProjectionRegistrar`;
 - open mount roots through a platform `Opener`;
@@ -378,8 +379,8 @@ The desktop app should use the same platform layer as the CLI:
 Packaging targets:
 
 - macOS: signed/notarized DMG with File Provider extension.
-- Linux: deb/rpm with `afs`, `afsd`, `afs-fuse`, systemd integration.
-- Windows: signed MSIX/MSI/NSIS package with `afs.exe`, `afsd.exe`, Cloud Files
+- Linux: deb/rpm with `loc`, `localityd`, `locality-fuse`, systemd integration.
+- Windows: signed MSIX/MSI/NSIS package with `loc.exe`, `localityd.exe`, Cloud Files
   helper/provider, icon resources, and uninstall cleanup.
 
 The current desktop build needs Windows-specific assets and bundle config:
@@ -403,7 +404,7 @@ Run on every PR:
 Windows CI command after gating FUSE:
 
 ```text
-cargo test -p afs-core -p afs-connector -p afs-store -p afs-notion -p afsd -p afs-cli --all-targets
+cargo test -p locality-core -p locality-connector -p locality-store -p locality-notion -p localityd -p loc-cli --all-targets
 ```
 
 ### Platform Contract Tests
@@ -427,7 +428,7 @@ The same contract should run against:
 - Linux FUSE smoke;
 - Windows Cloud Files smoke.
 
-Implemented baseline: `crates/afs-cli/tests/projection_contract.rs` runs the
+Implemented baseline: `crates/loc-cli/tests/projection_contract.rs` runs the
 shared daemon virtual-filesystem contract for `macos-file-provider`,
 `linux-fuse`, and `windows-cloud-files` projection modes below the kernel
 adapters. It covers metadata-only browse, nested child refresh, hydration,
@@ -454,7 +455,7 @@ search, restore, and run tests without virtual projection.
 
 Work:
 
-- Gate or remove `afs-fuse` from Windows workspace builds.
+- Gate or remove `locality-fuse` from Windows workspace builds.
 - Add Windows host paths.
 - Add Windows credential store.
 - Add IPC transport abstraction and make daemon run on Windows over named pipe
@@ -464,13 +465,13 @@ Work:
 
 ### Phase 2: Desktop and Service
 
-Goal: Windows desktop app can install, start, stop, and manage AFS, using
+Goal: Windows desktop app can install, start, stop, and manage Locality, using
 plain-file mounts while Cloud Files is built.
 
 Work:
 
 - Add Windows Tauri bundle config and icon assets.
-- Stage `afs.exe` and `afsd.exe`.
+- Stage `loc.exe` and `localityd.exe`.
 - Implement Windows daemon process manager.
 - Implement terminal command install/update for Windows.
 - Implement installer reset/uninstall cleanup.
@@ -499,7 +500,7 @@ install and recovery paths.
 
 Work:
 
-- Unified diagnostics: implemented as top-level `afs doctor`, a read-only
+- Unified diagnostics: implemented as top-level `loc doctor`, a read-only
   command that inspects daemon state, SQLite compatibility, connections,
   credentials, mounts, and platform provider lifecycle without mutating local
   state.
@@ -516,7 +517,7 @@ Work:
 
 ## Non-Goals
 
-- Do not put platform-specific code in `afs-core`.
+- Do not put platform-specific code in `locality-core`.
 - Do not make connectors know which OS is running.
 - Do not let projection adapters bypass daemon state ownership.
 - Do not make Windows depend on Linux FUSE semantics.
@@ -527,9 +528,9 @@ Work:
 
 Current Windows research found these concrete issues:
 
-- `afsd` and `afs-cli` compile on Windows, but daemon IPC and foreground serving
+- `localityd` and `loc-cli` compile on Windows, but daemon IPC and foreground serving
   are Unix-gated.
-- `afs-fuse` fails on Windows through its `fuse3` dependency and should become
+- `locality-fuse` fails on Windows through its `fuse3` dependency and should become
   Linux-only.
 - Tauri Windows build needs `icon.ico` and Windows bundle configuration.
 - Tests expose inconsistent logical path rendering and CRLF parsing.

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AgentFS Architecture Map</title>
+    <title>Locality Architecture Map</title>
     <style>
       :root {
         color-scheme: light;
@@ -637,14 +637,14 @@
     <main class="page">
       <header class="hero">
         <div>
-          <p class="eyebrow">AgentFS architecture</p>
+          <p class="eyebrow">Locality architecture</p>
           <h1>How local files become safe source-of-record edits</h1>
           <p class="hero-copy">
-            AgentFS is a local-first Rust system. Editors, agents, the CLI, the desktop app, and
+            Locality is a local-first Rust system. Editors, agents, the CLI, the desktop app, and
             platform filesystem adapters all converge on one daemon-owned execution boundary. The
-            daemon serializes work, uses <code>afs-core</code> for sync decisions, persists facts in
-            <code>afs-store</code>, and calls source-specific connectors through
-            <code>afs-connector</code>. Notion is the first implemented source.
+            daemon serializes work, uses <code>locality-core</code> for sync decisions, persists facts in
+            <code>locality-store</code>, and calls source-specific connectors through
+            <code>locality-connector</code>. Notion is the first implemented source.
           </p>
         </div>
         <aside class="hero-aside">
@@ -678,7 +678,7 @@
           </p>
         </div>
 
-        <div class="overview" role="img" aria-label="Layered AgentFS architecture map">
+        <div class="overview" role="img" aria-label="Layered Locality architecture map">
           <div class="lane theme-control">
             <div class="lane-label">
               <span>Surface</span>
@@ -691,14 +691,14 @@
                 <p>Read and edit Markdown under a mount. Plain files use watchers; virtual mounts materialize on open.</p>
                 <div class="links">
                   <a class="code-link" href="../templates/mount/AGENTS.md">AGENTS.md</a>
-                  <a class="code-link" href="../crates/afs-cli/src/status.rs">status.rs:101</a>
+                  <a class="code-link" href="../crates/loc-cli/src/status.rs">status.rs:101</a>
                 </div>
               </article>
               <article class="node">
-                <div class="node-title"><strong><code>afs</code> CLI</strong><span class="tag">Control</span></div>
+                <div class="node-title"><strong><code>loc</code> CLI</strong><span class="tag">Control</span></div>
                 <p>Stable command surface for connect, mount, status, pull, push, diff, undo, daemon, and projection helpers.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-cli/src/commands.rs">commands.rs:80</a>
+                  <a class="code-link" href="../crates/loc-cli/src/commands.rs">commands.rs:80</a>
                   <a class="code-link" href="../docs/cli.md">docs/cli.md</a>
                 </div>
               </article>
@@ -712,10 +712,10 @@
               </article>
               <article class="node">
                 <div class="node-title"><strong>Platform projections</strong><span class="tag">VFS</span></div>
-                <p>macOS File Provider and Linux FUSE expose online-only trees while delegating state and network work to <code>afsd</code>.</p>
+                <p>macOS File Provider and Linux FUSE expose online-only trees while delegating state and network work to <code>localityd</code>.</p>
                 <div class="links">
-                  <a class="code-link" href="../platform/macos/AgentFSFileProvider/Sources/AgentFSFileProvider/AgentFSFileProviderExtension.swift">Extension.swift:6</a>
-                  <a class="code-link" href="../crates/afs-fuse/src/main.rs">afs-fuse:376</a>
+                  <a class="code-link" href="../platform/macos/LocalityFileProvider/Sources/LocalityFileProvider/LocalityFileProviderExtension.swift">Extension.swift:6</a>
+                  <a class="code-link" href="../platform/linux/locality-fuse/src/main.rs">locality-fuse:376</a>
                 </div>
               </article>
             </div>
@@ -729,7 +729,7 @@
           <div class="lane theme-daemon">
             <div class="lane-label">
               <span>Owner</span>
-              <strong><code>afsd</code> daemon</strong>
+              <strong><code>localityd</code> daemon</strong>
               <p>The daemon is the serialized execution owner for hydration, pulls, pushes, watches, virtual filesystem requests, and reconciliation.</p>
             </div>
             <div class="lane-grid">
@@ -737,33 +737,33 @@
                 <div class="node-title"><strong>IPC server</strong><span class="tag">Ingress</span></div>
                 <p>Accepts one JSON request, forwards work to the runtime, and keeps health/status responsive.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afsd/src/server.rs">server.rs:28</a>
-                  <a class="code-link" href="../crates/afsd/src/ipc.rs">ipc.rs:16</a>
+                  <a class="code-link" href="../crates/localityd/src/server.rs">server.rs:28</a>
+                  <a class="code-link" href="../crates/localityd/src/ipc.rs">ipc.rs:16</a>
                 </div>
               </article>
               <article class="node">
                 <div class="node-title"><strong>Runtime queue</strong><span class="tag">Serialize</span></div>
                 <p>Prioritizes user pull/push over background jobs and runs one mutating worker at a time.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afsd/src/runtime.rs">runtime.rs:101</a>
-                  <a class="code-link" href="../crates/afsd/src/runtime.rs">RuntimeJobRunner:155</a>
+                  <a class="code-link" href="../crates/localityd/src/runtime.rs">runtime.rs:101</a>
+                  <a class="code-link" href="../crates/localityd/src/runtime.rs">RuntimeJobRunner:155</a>
                 </div>
               </article>
               <article class="node">
                 <div class="node-title"><strong>Watchers and scheduler</strong><span class="tag">Observe</span></div>
                 <p>File changes, stub reads, and scheduled polling turn into daemon jobs instead of direct state mutation.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afsd/src/watcher.rs">watcher.rs</a>
-                  <a class="code-link" href="../crates/afsd/src/scheduler.rs">scheduler.rs</a>
+                  <a class="code-link" href="../crates/localityd/src/watcher.rs">watcher.rs</a>
+                  <a class="code-link" href="../crates/localityd/src/scheduler.rs">scheduler.rs</a>
                 </div>
               </article>
               <article class="node">
                 <div class="node-title"><strong>Hydrate, pull, push</strong><span class="tag">Execute</span></div>
                 <p>Fetch/render content, write local projection atomically, journal push preimages, apply remotely, then reconcile.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afsd/src/hydration.rs">hydration.rs:44</a>
-                  <a class="code-link" href="../crates/afsd/src/pull.rs">pull.rs:39</a>
-                  <a class="code-link" href="../crates/afsd/src/push.rs">push.rs:47</a>
+                  <a class="code-link" href="../crates/localityd/src/hydration.rs">hydration.rs:44</a>
+                  <a class="code-link" href="../crates/localityd/src/pull.rs">pull.rs:39</a>
+                  <a class="code-link" href="../crates/localityd/src/push.rs">push.rs:47</a>
                 </div>
               </article>
             </div>
@@ -777,7 +777,7 @@
           <div class="lane theme-core">
             <div class="lane-label">
               <span>Rules</span>
-              <strong><code>afs-core</code></strong>
+              <strong><code>locality-core</code></strong>
               <p>Connector-agnostic state machines, validation, diff planning, guardrails, journal contracts, undo, and conflict rules.</p>
             </div>
             <div class="lane-grid">
@@ -785,33 +785,33 @@
                 <div class="node-title"><strong>Model and sync</strong><span class="tag">State</span></div>
                 <p>Remote IDs are canonical. Three-tree classification decides pull, push, conflict, automerge, and local projection deletion.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-core/src/model.rs">model.rs:13</a>
-                  <a class="code-link" href="../crates/afs-core/src/sync.rs">sync.rs:10</a>
+                  <a class="code-link" href="../crates/locality-core/src/model.rs">model.rs:13</a>
+                  <a class="code-link" href="../crates/locality-core/src/sync.rs">sync.rs:10</a>
                 </div>
               </article>
               <article class="node">
                 <div class="node-title"><strong>Canonical and shadow</strong><span class="tag">Text</span></div>
                 <p>Markdown/frontmatter is parsed shallowly; shadows keep rendered body, block IDs, hashes, and spans.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-core/src/canonical.rs">canonical.rs</a>
-                  <a class="code-link" href="../crates/afs-core/src/shadow.rs">shadow.rs:21</a>
+                  <a class="code-link" href="../crates/locality-core/src/canonical.rs">canonical.rs</a>
+                  <a class="code-link" href="../crates/locality-core/src/shadow.rs">shadow.rs:21</a>
                 </div>
               </article>
               <article class="node">
                 <div class="node-title"><strong>Validation and diff</strong><span class="tag">Plan</span></div>
                 <p>Checks frontmatter identity, directive integrity, conflict markers, then aligns edited Markdown against shadow blocks.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-core/src/validation.rs">validation.rs:74</a>
-                  <a class="code-link" href="../crates/afs-core/src/diff.rs">diff.rs:234</a>
+                  <a class="code-link" href="../crates/locality-core/src/validation.rs">validation.rs:74</a>
+                  <a class="code-link" href="../crates/locality-core/src/diff.rs">diff.rs:234</a>
                 </div>
               </article>
               <article class="node">
                 <div class="node-title"><strong>Push and journal</strong><span class="tag">Safety</span></div>
                 <p>Builds connector-neutral plans, applies guardrails, creates deterministic operation IDs, and supports undo preimages.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-core/src/push.rs">push.rs:59</a>
-                  <a class="code-link" href="../crates/afs-core/src/planner.rs">planner.rs:14</a>
-                  <a class="code-link" href="../crates/afs-core/src/journal.rs">journal.rs:17</a>
+                  <a class="code-link" href="../crates/locality-core/src/push.rs">push.rs:59</a>
+                  <a class="code-link" href="../crates/locality-core/src/planner.rs">planner.rs:14</a>
+                  <a class="code-link" href="../crates/locality-core/src/journal.rs">journal.rs:17</a>
                 </div>
               </article>
             </div>
@@ -825,40 +825,40 @@
           <div class="lane theme-store">
             <div class="lane-label">
               <span>Durable</span>
-              <strong><code>afs-store</code></strong>
+              <strong><code>locality-store</code></strong>
               <p>Repository traits plus SQLite implementation for mount config, connections, entities, shadows, hydration jobs, virtual mutations, and journals.</p>
             </div>
             <div class="lane-grid">
               <article class="node">
                 <div class="node-title"><strong>SQLite state</strong><span class="tag">Facts</span></div>
-                <p>Opens <code>~/.afs/state.sqlite3</code>, initializes schema, and enables WAL-related durability settings.</p>
+                <p>Opens <code>~/.loc/state.sqlite3</code>, initializes schema, and enables WAL-related durability settings.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-store/src/sqlite.rs">sqlite.rs:36</a>
-                  <a class="code-link" href="../crates/afs-store/src/sqlite.rs">schema:866</a>
+                  <a class="code-link" href="../crates/locality-store/src/sqlite.rs">sqlite.rs:36</a>
+                  <a class="code-link" href="../crates/locality-store/src/sqlite.rs">schema:866</a>
                 </div>
               </article>
               <article class="node">
                 <div class="node-title"><strong>Repository traits</strong><span class="tag">Boundary</span></div>
                 <p>Mounts, connections, profiles, entities, shadows, hydration jobs, journals, and virtual mutations are split by trait.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-store/src/repository.rs">repository.rs:33</a>
-                  <a class="code-link" href="../crates/afs-store/src/records.rs">records.rs:41</a>
+                  <a class="code-link" href="../crates/locality-store/src/repository.rs">repository.rs:33</a>
+                  <a class="code-link" href="../crates/locality-store/src/records.rs">records.rs:41</a>
                 </div>
               </article>
               <article class="node">
                 <div class="node-title"><strong>Credentials</strong><span class="tag">Secrets</span></div>
                 <p>Connections persist metadata and a secret reference; bearer tokens live in the OS or fallback credential store.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-store/src/credentials.rs">credentials.rs</a>
-                  <a class="code-link" href="../crates/afs-cli/src/connect.rs">connect.rs:330</a>
+                  <a class="code-link" href="../crates/locality-store/src/credentials.rs">credentials.rs</a>
+                  <a class="code-link" href="../crates/loc-cli/src/connect.rs">connect.rs:330</a>
                 </div>
               </article>
               <article class="node">
                 <div class="node-title"><strong>Virtual content</strong><span class="tag">Cache</span></div>
                 <p>Materialized bytes for File Provider and FUSE live under daemon-owned content storage instead of the virtual mount root.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afsd/src/virtual_fs.rs">virtual_fs.rs:773</a>
-                  <a class="code-link" href="../crates/afsd/src/virtual_fs.rs">content path:812</a>
+                  <a class="code-link" href="../crates/localityd/src/virtual_fs.rs">virtual_fs.rs:773</a>
+                  <a class="code-link" href="../crates/localityd/src/virtual_fs.rs">content path:812</a>
                 </div>
               </article>
             </div>
@@ -880,7 +880,7 @@
                 <div class="node-title"><strong>Connector SDK</strong><span class="tag">Trait</span></div>
                 <p>Small Rust trait so the host owns caching, journaling, validation, conflicts, and rate limiting.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-connector/src/lib.rs">lib.rs:113</a>
+                  <a class="code-link" href="../crates/locality-connector/src/lib.rs">lib.rs:113</a>
                   <a class="code-link" href="../docs/connector-sdk.md">connector-sdk.md</a>
                 </div>
               </article>
@@ -888,17 +888,17 @@
                 <div class="node-title"><strong>Notion connector</strong><span class="tag">First</span></div>
                 <p>Notion transport, DTOs, projection, rendering, database schema, media, supported writes, and OAuth support.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-notion/src/lib.rs">lib.rs:87</a>
-                  <a class="code-link" href="../crates/afs-notion/src/lib.rs">Connector impl:150</a>
+                  <a class="code-link" href="../crates/locality-notion/src/lib.rs">lib.rs:87</a>
+                  <a class="code-link" href="../crates/locality-notion/src/lib.rs">Connector impl:150</a>
                 </div>
               </article>
               <article class="node">
                 <div class="node-title"><strong>Notion API and OAuth</strong><span class="tag">Remote</span></div>
                 <p>Live REST calls, broker-backed OAuth, PAT fallback, fetch/render, block apply, and read-back reconciliation.</p>
                 <div class="links">
-                  <a class="code-link" href="../crates/afs-notion/src/client.rs">client.rs</a>
-                  <a class="code-link" href="../crates/afs-notion/src/oauth.rs">oauth.rs</a>
-                  <a class="code-link" href="../crates/afs-notion/src/apply.rs">apply.rs:27</a>
+                  <a class="code-link" href="../crates/locality-notion/src/client.rs">client.rs</a>
+                  <a class="code-link" href="../crates/locality-notion/src/oauth.rs">oauth.rs</a>
+                  <a class="code-link" href="../crates/locality-notion/src/apply.rs">apply.rs:27</a>
                 </div>
               </article>
               <article class="node">
@@ -941,32 +941,32 @@
               <div class="step">
                 <strong>User starts connect</strong>
                 <p>CLI or desktop starts Notion OAuth broker or PAT fallback.</p>
-                <a class="code-link" href="../crates/afs-cli/src/connect.rs">connect.rs:186</a>
+                <a class="code-link" href="../crates/loc-cli/src/connect.rs">connect.rs:186</a>
               </div>
               <div class="step">
                 <strong>Credentials stored</strong>
                 <p>SQLite keeps metadata and <code>secret_ref</code>; token bytes stay in credential storage.</p>
-                <a class="code-link" href="../crates/afs-store/src/credentials.rs">credentials.rs</a>
+                <a class="code-link" href="../crates/locality-store/src/credentials.rs">credentials.rs</a>
               </div>
               <div class="step">
                 <strong>Mount recorded</strong>
-                <p><code>afs mount</code> writes guidance files and persists <code>MountConfig</code>.</p>
-                <a class="code-link" href="../crates/afs-cli/src/mount.rs">mount.rs:77</a>
+                <p><code>loc mount</code> writes guidance files and persists <code>MountConfig</code>.</p>
+                <a class="code-link" href="../crates/loc-cli/src/mount.rs">mount.rs:77</a>
               </div>
               <div class="step">
                 <strong>Projection chosen</strong>
                 <p>Plain files, macOS File Provider, or Linux FUSE are stored as projection mode.</p>
-                <a class="code-link" href="../crates/afs-store/src/records.rs">records.rs:41</a>
+                <a class="code-link" href="../crates/locality-store/src/records.rs">records.rs:41</a>
               </div>
               <div class="step">
                 <strong>Daemon reloads</strong>
                 <p>Running daemon reconciles watched roots after mount changes.</p>
-                <a class="code-link" href="../crates/afsd/src/server.rs">server.rs:123</a>
+                <a class="code-link" href="../crates/localityd/src/server.rs">server.rs:123</a>
               </div>
               <div class="step">
                 <strong>User sees files</strong>
                 <p>Root projection is enumerated through pull or lazy virtual filesystem listing.</p>
-                <a class="code-link" href="../crates/afsd/src/pull.rs">pull.rs:79</a>
+                <a class="code-link" href="../crates/localityd/src/pull.rs">pull.rs:79</a>
               </div>
             </div>
           </article>
@@ -977,32 +977,32 @@
               <div class="step">
                 <strong>Open/list file</strong>
                 <p>Plain mounts see file reads later; virtual mounts ask daemon for metadata and bytes.</p>
-                <a class="code-link" href="../crates/afsd/src/virtual_fs.rs">virtual_fs.rs:98</a>
+                <a class="code-link" href="../crates/localityd/src/virtual_fs.rs">virtual_fs.rs:98</a>
               </div>
               <div class="step">
                 <strong>Queue hydration</strong>
                 <p>Stub read, explicit pull, policy, or prefetch becomes a hydration request.</p>
-                <a class="code-link" href="../crates/afsd/src/hydration.rs">hydration.rs:13</a>
+                <a class="code-link" href="../crates/localityd/src/hydration.rs">hydration.rs:13</a>
               </div>
               <div class="step">
                 <strong>Fetch source</strong>
                 <p>Notion connector fetches page metadata and recursive block children.</p>
-                <a class="code-link" href="../crates/afs-notion/src/lib.rs">lib.rs:197</a>
+                <a class="code-link" href="../crates/locality-notion/src/lib.rs">lib.rs:197</a>
               </div>
               <div class="step">
                 <strong>Render canonical</strong>
                 <p>Native Notion JSON becomes Markdown/frontmatter plus a shadow document.</p>
-                <a class="code-link" href="../crates/afs-notion/src/render.rs">render.rs:40</a>
+                <a class="code-link" href="../crates/locality-notion/src/render.rs">render.rs:40</a>
               </div>
               <div class="step">
                 <strong>Write atomically</strong>
                 <p>Daemon writes Markdown or content cache only when the local file is safe to replace.</p>
-                <a class="code-link" href="../crates/afsd/src/hydration.rs">hydration.rs:76</a>
+                <a class="code-link" href="../crates/localityd/src/hydration.rs">hydration.rs:76</a>
               </div>
               <div class="step">
                 <strong>Persist shadow</strong>
                 <p>Entity hydration, content hash, remote timestamp, and shadow blocks are advanced together.</p>
-                <a class="code-link" href="../crates/afs-store/src/sqlite.rs">sqlite.rs:476</a>
+                <a class="code-link" href="../crates/locality-store/src/sqlite.rs">sqlite.rs:476</a>
               </div>
             </div>
           </article>
@@ -1013,32 +1013,32 @@
               <div class="step">
                 <strong>Local edit detected</strong>
                 <p>Status/watch compares the Local Tree body against the Synced Tree shadow and marks dirty.</p>
-                <a class="code-link" href="../crates/afs-cli/src/status.rs">status.rs:633</a>
+                <a class="code-link" href="../crates/loc-cli/src/status.rs">status.rs:633</a>
               </div>
               <div class="step">
                 <strong>Parse and validate</strong>
                 <p>Core checks identity, directive syntax, directive integrity, and conflict markers.</p>
-                <a class="code-link" href="../crates/afs-core/src/push.rs">push.rs:166</a>
+                <a class="code-link" href="../crates/locality-core/src/push.rs">push.rs:166</a>
               </div>
               <div class="step">
                 <strong>Diff and plan</strong>
                 <p>Edited canonical document and shadow produce connector-neutral operations.</p>
-                <a class="code-link" href="../crates/afs-core/src/planner.rs">planner.rs:52</a>
+                <a class="code-link" href="../crates/locality-core/src/planner.rs">planner.rs:52</a>
               </div>
               <div class="step">
                 <strong>Gate with guardrails</strong>
                 <p>Dangerous archives or broad mount touches require explicit confirmation.</p>
-                <a class="code-link" href="../crates/afs-core/src/push.rs">push.rs:145</a>
+                <a class="code-link" href="../crates/locality-core/src/push.rs">push.rs:145</a>
               </div>
               <div class="step">
                 <strong>Journal before apply</strong>
                 <p>Preimages and deterministic operation IDs are recorded before remote mutation.</p>
-                <a class="code-link" href="../crates/afs-core/src/push.rs">push.rs:465</a>
+                <a class="code-link" href="../crates/locality-core/src/push.rs">push.rs:465</a>
               </div>
               <div class="step">
                 <strong>Apply and read back</strong>
                 <p>Connector checks remote concurrency, applies Notion API operations, then daemon re-fetches and rewrites shadow.</p>
-                <a class="code-link" href="../crates/afsd/src/push.rs">push.rs:64</a>
+                <a class="code-link" href="../crates/localityd/src/push.rs">push.rs:64</a>
               </div>
             </div>
           </article>
@@ -1049,32 +1049,32 @@
               <div class="step">
                 <strong>OS asks for item</strong>
                 <p>File Provider or FUSE maps kernel/platform callbacks to daemon IPC requests.</p>
-                <a class="code-link" href="../platform/macos/AgentFSFileProvider/Sources/AgentFSFileProvider/AgentFSFileProviderExtension.swift">Extension.swift:22</a>
+                <a class="code-link" href="../platform/macos/LocalityFileProvider/Sources/LocalityFileProvider/LocalityFileProviderExtension.swift">Extension.swift:22</a>
               </div>
               <div class="step">
                 <strong>Daemon lists metadata</strong>
                 <p>Directory listings come from SQLite entity rows, not placeholder files.</p>
-                <a class="code-link" href="../crates/afsd/src/virtual_fs.rs">virtual_fs.rs:134</a>
+                <a class="code-link" href="../crates/localityd/src/virtual_fs.rs">virtual_fs.rs:134</a>
               </div>
               <div class="step">
                 <strong>Open materializes</strong>
                 <p>Read blocks until daemon fetches/renders content into daemon-owned storage.</p>
-                <a class="code-link" href="../crates/afsd/src/virtual_fs.rs">virtual_fs.rs:282</a>
+                <a class="code-link" href="../crates/localityd/src/virtual_fs.rs">virtual_fs.rs:282</a>
               </div>
               <div class="step">
                 <strong>Bytes served</strong>
                 <p>FUSE serves cached bytes; File Provider copies materialized Markdown to its transfer path.</p>
-                <a class="code-link" href="../crates/afs-fuse/src/main.rs">main.rs:646</a>
+                <a class="code-link" href="../platform/linux/locality-fuse/src/main.rs">main.rs:646</a>
               </div>
               <div class="step">
                 <strong>Write committed</strong>
                 <p>Virtual write paths submit final bytes back to daemon-owned dirty state.</p>
-                <a class="code-link" href="../crates/afsd/src/virtual_fs.rs">virtual_fs.rs:447</a>
+                <a class="code-link" href="../crates/localityd/src/virtual_fs.rs">virtual_fs.rs:447</a>
               </div>
               <div class="step">
                 <strong>Push remains explicit</strong>
                 <p>Created, renamed, or deleted virtual items become pending mutations handled by the normal push pipeline.</p>
-                <a class="code-link" href="../crates/afsd/src/virtual_fs.rs">virtual_fs.rs:547</a>
+                <a class="code-link" href="../crates/localityd/src/virtual_fs.rs">virtual_fs.rs:547</a>
               </div>
             </div>
           </article>
@@ -1115,7 +1115,7 @@
               </div>
               <div class="truth-row">
                 <strong>Decision</strong>
-                <p><a class="code-link" href="../crates/afs-core/src/sync.rs">sync.rs:10</a> returns pull, push, conflict, automerge, noop, or delete projection.</p>
+                <p><a class="code-link" href="../crates/locality-core/src/sync.rs">sync.rs:10</a> returns pull, push, conflict, automerge, noop, or delete projection.</p>
               </div>
             </div>
           </article>
@@ -1125,7 +1125,7 @@
             <div class="truth-stack">
               <div class="truth-row">
                 <strong>Content</strong>
-                <p>Lives on disk in mount files, shadows, media/content cache, and in the source API. Direct mode has no AgentFS server in the content path.</p>
+                <p>Lives on disk in mount files, shadows, media/content cache, and in the source API. Direct mode has no Locality server in the content path.</p>
               </div>
               <div class="truth-row">
                 <strong>Secrets</strong>
@@ -1168,13 +1168,13 @@
             <tr>
               <td>Where do commands enter?</td>
               <td>
-                <a class="code-link" href="../crates/afs-cli/src/commands.rs">commands.rs:80</a>
-                <a class="code-link" href="../crates/afs-cli/src/main.rs">main.rs</a>
+                <a class="code-link" href="../crates/loc-cli/src/commands.rs">commands.rs:80</a>
+                <a class="code-link" href="../crates/loc-cli/src/main.rs">main.rs</a>
               </td>
               <td>Argument dispatch, JSON output switches, daemon fallback behavior, and exit code mapping.</td>
             </tr>
             <tr>
-              <td>How does desktop talk to AFS?</td>
+              <td>How does desktop talk to Locality?</td>
               <td>
                 <a class="code-link" href="../apps/desktop/src-tauri/src/main.rs">src-tauri/main.rs:134</a>
                 <a class="code-link" href="../apps/desktop/src/App.tsx">App.tsx</a>
@@ -1184,43 +1184,43 @@
             <tr>
               <td>Where is daemon serialization enforced?</td>
               <td>
-                <a class="code-link" href="../crates/afsd/src/server.rs">server.rs:28</a>
-                <a class="code-link" href="../crates/afsd/src/runtime.rs">runtime.rs:101</a>
-                <a class="code-link" href="../crates/afsd/src/ipc.rs">ipc.rs:16</a>
+                <a class="code-link" href="../crates/localityd/src/server.rs">server.rs:28</a>
+                <a class="code-link" href="../crates/localityd/src/runtime.rs">runtime.rs:101</a>
+                <a class="code-link" href="../crates/localityd/src/ipc.rs">ipc.rs:16</a>
               </td>
               <td>Socket handling submits JSON requests to <code>DaemonRuntime</code>, which queues one mutating worker at a time.</td>
             </tr>
             <tr>
               <td>How are online-only files served?</td>
               <td>
-                <a class="code-link" href="../crates/afsd/src/virtual_fs.rs">virtual_fs.rs:98</a>
-                <a class="code-link" href="../crates/afs-fuse/src/main.rs">afs-fuse:571</a>
-                <a class="code-link" href="../platform/macos/AgentFSFileProvider/Sources/AgentFSFileProvider/AgentFSDaemonClient.swift">DaemonClient.swift:139</a>
+                <a class="code-link" href="../crates/localityd/src/virtual_fs.rs">virtual_fs.rs:98</a>
+                <a class="code-link" href="../platform/linux/locality-fuse/src/main.rs">locality-fuse:571</a>
+                <a class="code-link" href="../platform/macos/LocalityFileProvider/Sources/LocalityFileProvider/LocalityDaemonClient.swift">DaemonClient.swift:139</a>
               </td>
               <td>Adapters map OS callbacks into <code>VirtualFsItem</code>, <code>children</code>, <code>materialize</code>, and write/mutation IPC calls.</td>
             </tr>
             <tr>
               <td>Where is pull implemented?</td>
               <td>
-                <a class="code-link" href="../crates/afsd/src/pull.rs">pull.rs:39</a>
-                <a class="code-link" href="../crates/afsd/src/reconcile.rs">reconcile.rs:104</a>
-                <a class="code-link" href="../crates/afsd/src/hydration.rs">hydration.rs:44</a>
+                <a class="code-link" href="../crates/localityd/src/pull.rs">pull.rs:39</a>
+                <a class="code-link" href="../crates/localityd/src/reconcile.rs">reconcile.rs:104</a>
+                <a class="code-link" href="../crates/localityd/src/hydration.rs">hydration.rs:44</a>
               </td>
               <td>Mount root pulls enumerate and stub; entity pulls hydrate; scheduled reconciliation queues policy-selected hydrations.</td>
             </tr>
             <tr>
               <td>Where is push safety implemented?</td>
               <td>
-                <a class="code-link" href="../crates/afs-core/src/push.rs">core push.rs:59</a>
-                <a class="code-link" href="../crates/afsd/src/push.rs">daemon push.rs:47</a>
-                <a class="code-link" href="../crates/afs-core/src/journal.rs">journal.rs:17</a>
+                <a class="code-link" href="../crates/locality-core/src/push.rs">core push.rs:59</a>
+                <a class="code-link" href="../crates/localityd/src/push.rs">daemon push.rs:47</a>
+                <a class="code-link" href="../crates/locality-core/src/journal.rs">journal.rs:17</a>
               </td>
               <td>Core plans/gates; daemon prepares job, journals preimages, invokes connector apply, and reconciles.</td>
             </tr>
             <tr>
               <td>What exactly can a connector do?</td>
               <td>
-                <a class="code-link" href="../crates/afs-connector/src/lib.rs">connector lib.rs:113</a>
+                <a class="code-link" href="../crates/locality-connector/src/lib.rs">connector lib.rs:113</a>
                 <a class="code-link" href="../docs/connector-sdk.md">connector-sdk.md</a>
               </td>
               <td>Enumerate, list children, fetch, render, parse, check concurrency, apply push plan, and apply undo plan.</td>
@@ -1228,8 +1228,8 @@
             <tr>
               <td>How does Notion map to Markdown?</td>
               <td>
-                <a class="code-link" href="../crates/afs-notion/src/render.rs">render.rs:40</a>
-                <a class="code-link" href="../crates/afs-notion/src/projection.rs">projection.rs</a>
+                <a class="code-link" href="../crates/locality-notion/src/render.rs">render.rs:40</a>
+                <a class="code-link" href="../crates/locality-notion/src/projection.rs">projection.rs</a>
                 <a class="code-link" href="../docs/notion-canonical-format.md">notion-canonical-format.md</a>
               </td>
               <td>Native page bundles render into canonical documents; unsupported or lossy blocks stay directive-backed.</td>
@@ -1237,7 +1237,7 @@
             <tr>
               <td>How are Notion writes applied?</td>
               <td>
-                <a class="code-link" href="../crates/afs-notion/src/apply.rs">apply.rs:27</a>
+                <a class="code-link" href="../crates/locality-notion/src/apply.rs">apply.rs:27</a>
                 <a class="code-link" href="../docs/notion-object-support.md">notion-object-support.md</a>
               </td>
               <td>Concurrency check, supported block/property writes, database row creation, and apply effects for journal/reconcile.</td>
@@ -1245,18 +1245,18 @@
             <tr>
               <td>What is durable schema?</td>
               <td>
-                <a class="code-link" href="../crates/afs-store/src/sqlite.rs">sqlite.rs:866</a>
-                <a class="code-link" href="../crates/afs-store/src/records.rs">records.rs:62</a>
-                <a class="code-link" href="../docs/afs-store.md">afs-store.md</a>
+                <a class="code-link" href="../crates/locality-store/src/sqlite.rs">sqlite.rs:866</a>
+                <a class="code-link" href="../crates/locality-store/src/records.rs">records.rs:62</a>
+                <a class="code-link" href="../docs/locality-store.md">locality-store.md</a>
               </td>
               <td>Mounts, connections, profiles, entities, shadows, hydration jobs, virtual mutations, and journals.</td>
             </tr>
             <tr>
               <td>Where are invariants tested?</td>
               <td>
-                <a class="code-link" href="../crates/afs-core/tests">afs-core/tests</a>
-                <a class="code-link" href="../crates/afsd/tests">afsd/tests</a>
-                <a class="code-link" href="../crates/afs-notion/tests">afs-notion/tests</a>
+                <a class="code-link" href="../crates/locality-core/tests">locality-core/tests</a>
+                <a class="code-link" href="../crates/localityd/tests">localityd/tests</a>
+                <a class="code-link" href="../crates/locality-notion/tests">locality-notion/tests</a>
               </td>
               <td>State-machine, push pipeline, hydration, scheduler, Notion fetch/render/apply, CLI workflows, and SQLite persistence tests.</td>
             </tr>
@@ -1283,22 +1283,22 @@
               <div class="code-item">
                 <strong>CLI and daemon loop</strong>
                 <p>Commands can use daemon IPC and fall back carefully for non-push direct execution.</p>
-                <a class="code-link" href="../crates/afs-cli/src/commands.rs">commands.rs</a>
+                <a class="code-link" href="../crates/loc-cli/src/commands.rs">commands.rs</a>
               </div>
               <div class="code-item">
                 <strong>Core push contract</strong>
                 <p>Validation, diff planning, guardrails, journaled execution hooks, and undo contracts exist.</p>
-                <a class="code-link" href="../crates/afs-core/src/push.rs">push.rs</a>
+                <a class="code-link" href="../crates/locality-core/src/push.rs">push.rs</a>
               </div>
               <div class="code-item">
                 <strong>Notion read/write slice</strong>
                 <p>Live-capable reads, rendering, schemas, supported block/property writes, and row creation.</p>
-                <a class="code-link" href="../crates/afs-notion/src/lib.rs">afs-notion</a>
+                <a class="code-link" href="../crates/locality-notion/src/lib.rs">locality-notion</a>
               </div>
               <div class="code-item">
                 <strong>Virtual projection boundary</strong>
                 <p>Shared daemon API for macOS File Provider and Linux FUSE metadata, materialization, and writes.</p>
-                <a class="code-link" href="../crates/afsd/src/virtual_fs.rs">virtual_fs.rs</a>
+                <a class="code-link" href="../crates/localityd/src/virtual_fs.rs">virtual_fs.rs</a>
               </div>
             </div>
           </article>
@@ -1331,9 +1331,9 @@
 
         <p class="note">
           Reading order for a deep dive: start with <code>docs/architecture.md</code>, then trace one
-          flow above through CLI or desktop, <code>afsd::runtime</code>, <code>afs-core::push</code> or
-          <code>afs-core::sync</code>, <code>afs-store::sqlite</code>, and finally
-          <code>afs-notion</code>.
+          flow above through CLI or desktop, <code>localityd::runtime</code>, <code>locality-core::push</code> or
+          <code>locality-core::sync</code>, <code>locality-store::sqlite</code>, and finally
+          <code>locality-notion</code>.
         </p>
       </section>
     </main>

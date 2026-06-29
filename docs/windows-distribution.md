@@ -1,8 +1,8 @@
 # Windows Distribution
 
-AFS ships on Windows as a Tauri-generated NSIS installer. The Windows package
+Locality ships on Windows as a Tauri-generated NSIS installer. The Windows package
 contains the desktop app plus the sidecars needed for the product runtime:
-`afs.exe`, `afsd.exe`, and `afs-cloud-files.exe`.
+`loc.exe`, `localityd.exe`, and `locality-cloud-files.exe`.
 
 ## Local Package Build
 
@@ -24,7 +24,7 @@ The Tauri pre-bundle hook runs:
 apps/desktop/scripts/prepare-windows-bundle.ps1
 ```
 
-That script builds `afs-cli`, `afsd`, and `afs-cloud-files` in release mode,
+That script builds `loc-cli`, `localityd`, and `locality-cloud-files` in release mode,
 stages the three sidecars under `apps/desktop/src-tauri/windows/`, and lets the
 NSIS hook copy them next to the installed desktop executable.
 
@@ -32,8 +32,8 @@ Expected local artifacts:
 
 ```text
 target/release/bundle/nsis/*.exe
-target/release/bundle/windows/AFS-beta-windows-x86_64-setup.exe
-target/release/bundle/windows/AFS-beta-windows-x86_64-setup.exe.sha256
+target/release/bundle/windows/Locality-beta-windows-x86_64-setup.exe
+target/release/bundle/windows/Locality-beta-windows-x86_64-setup.exe.sha256
 ```
 
 The publish script requires a clean git working tree by default because the
@@ -44,19 +44,19 @@ for local throwaway builds.
 
 The Windows desktop app uses the same platform lifecycle layer as the CLI. When
 a Windows Cloud Files mount is activated or opened, the app registers the sync
-root if needed and supervises `afs-cloud-files.exe run` for that mount.
+root if needed and supervises `locality-cloud-files.exe run` for that mount.
 
 Installed files:
 
 ```text
-AFS.exe
-afs.exe
-afsd.exe
-afs-cloud-files.exe
+Locality.exe
+loc.exe
+localityd.exe
+locality-cloud-files.exe
 ```
 
 The NSIS uninstall hook removes the installed sidecars, the per-user Windows
-login item, and AFS-managed terminal command shims. It does not delete
+login item, and Locality-managed terminal command shims. It does not delete
 user-visible mount folders.
 
 ## Code Signing
@@ -85,7 +85,7 @@ Artifact Signing account, resource group, or subscription.
 For local release-like signing with an exportable Authenticode certificate, set:
 
 ```powershell
-$env:AFS_WINDOWS_CODESIGN = "1"
+$env:LOCALITY_WINDOWS_CODESIGN = "1"
 $env:WINDOWS_CODESIGN_CERT_SHA1 = "<certificate-thumbprint>"
 ```
 
@@ -110,15 +110,15 @@ When `TAURI_UPDATER_PUBKEY` and `TAURI_SIGNING_PRIVATE_KEY` are set,
 copies the stable alias to:
 
 ```text
-target/release/bundle/updater/AFS-release-windows-x86_64.nsis.zip
-target/release/bundle/updater/AFS-release-windows-x86_64.nsis.zip.sig
+target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip
+target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip.sig
 ```
 
 Render the Windows updater manifest with:
 
 ```powershell
 $env:UPDATER_MANIFEST_OUTPUT = "target/release/bundle/updater/latest-windows.json"
-$env:UPDATER_WINDOWS_X86_64_ARTIFACT = "target/release/bundle/updater/AFS-release-windows-x86_64.nsis.zip"
+$env:UPDATER_WINDOWS_X86_64_ARTIFACT = "target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip"
 bash scripts/render-tauri-updater-manifest.sh
 ```
 
@@ -132,10 +132,10 @@ Artifact Signing, builds the NSIS package, renders `latest-windows.json`, create
 updates the GitHub Release, and uploads:
 
 ```text
-AFS-release-windows-x86_64-setup.exe
-AFS-release-windows-x86_64-setup.exe.sha256
-AFS-release-windows-x86_64.nsis.zip
-AFS-release-windows-x86_64.nsis.zip.sig
+Locality-release-windows-x86_64-setup.exe
+Locality-release-windows-x86_64-setup.exe.sha256
+Locality-release-windows-x86_64.nsis.zip
+Locality-release-windows-x86_64.nsis.zip.sig
 latest-windows.json
 SHA256SUMS-windows
 ```
@@ -163,8 +163,8 @@ Optional repository variable:
 ## Live E2E
 
 The Windows live Notion test is `tests/windows_cloud_files_live.ps1`. It creates
-a disposable Notion page, mounts it as `windows-cloud-files`, starts `afsd`,
-starts the Cloud Files provider, runs `afs doctor --json` against the live
+a disposable Notion page, mounts it as `windows-cloud-files`, starts `localityd`,
+starts the Cloud Files provider, runs `loc doctor --json` against the live
 state, then verifies browse, hydrate, edit, push, create, rename, delete, and
 archive behavior through the real mounted directory.
 
@@ -172,12 +172,12 @@ Run locally:
 
 ```powershell
 $env:NOTION_TOKEN = "..."
-$env:AFS_NOTION_LIVE_PARENT_PAGE = "..."
-$env:AFS_WINDOWS_CLOUD_FILES_LIVE = "1"
+$env:LOCALITY_NOTION_LIVE_PARENT_PAGE = "..."
+$env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE = "1"
 pwsh ./tests/windows_cloud_files_live.ps1
 ```
 
 GitHub Actions runs the same script from
 `.github/workflows/notion-live-e2e.yml` on `windows-latest` when the
 `notion-live-e2e` environment provides `NOTION_TOKEN` and
-`AFS_NOTION_LIVE_PARENT_PAGE`.
+`LOCALITY_NOTION_LIVE_PARENT_PAGE`.

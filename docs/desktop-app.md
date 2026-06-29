@@ -1,15 +1,15 @@
 # Desktop App Plan
 
-This document captures the product and interaction plan for the AFS desktop app.
+This document captures the product and interaction plan for the Locality desktop app.
 It is subordinate to `plan.md`: the desktop app is a user-facing orchestration
 surface over the existing CLI, daemon, connector, store, and projection layers.
 
 ## Product Goal
 
-The desktop app should make AFS feel useful within the first session. The target
+The desktop app should make Locality feel useful within the first session. The target
 experience is not "configure a sync tool"; it is:
 
-1. Install AFS.
+1. Install Locality.
 2. Connect Notion.
 3. Mount the user's Notion workspace as local files.
 4. Locate a specific Notion page as a local file path.
@@ -26,8 +26,8 @@ Onboarding also installs local agent guidance for detected agents such as Claude
 Code, Codex, Warp, Cursor-compatible tools, Gemini CLI, and Cline/Roo. See
 [agent-guidance.md](agent-guidance.md) for install targets and fallback
 behavior. The same installer also configures the local authenticated MCP
-fallback for supported agents and refreshes periodically while AFS is running,
-so agents installed after AFS can still discover the fallback without another
+fallback for supported agents and refreshes periodically while Locality is running,
+so agents installed after Locality can still discover the fallback without another
 setup flow.
 
 ## Product Principles
@@ -53,7 +53,7 @@ The first-run flow should be a compact wizard with a single primary path.
 
 ### 1. Welcome
 
-Purpose: establish what AFS does in one sentence.
+Purpose: establish what Locality does in one sentence.
 
 Primary action: `Connect Notion`.
 
@@ -66,11 +66,11 @@ Clicking `Connect Notion` on the welcome screen should immediately open the
 broker-backed Notion OAuth flow. The second onboarding screen should help the
 user complete that browser flow rather than ask them to open Notion again.
 Notion's picker is where the user grants access to the pages, teamspaces, or
-workspace content that AFS can see.
+workspace content that Locality can see.
 
 The app should explain the security model in plain terms:
 
-- AFS only sees Notion content the user grants.
+- Locality only sees Notion content the user grants.
 - Credentials are stored securely in the OS credential store.
 - The broker protects the Notion OAuth client secret.
 - Local edits do not change Notion until push.
@@ -80,21 +80,31 @@ The app should explain the security model in plain terms:
 Default mount base:
 
 ```text
-~/Library/CloudStorage/AFS
+~/Library/CloudStorage/Locality
 ```
 
 Suggested concrete folder:
 
 ```text
-~/Library/CloudStorage/AFS/notion
+~/Library/CloudStorage/Locality/notion
 ```
 
-On macOS, the real AFS root should live at `~/Library/CloudStorage/AFS` because
-that is the user-visible location controlled by File Provider. Each connector
-gets a stable child folder such as `notion`, `linear`, or `gmail`. AFS should not
-create a Documents alias or symlink; the app should show the CloudStorage folder
-directly. This step should be framed as "Where should your Notion files appear?"
-rather than "configure mount root."
+On macOS, the real Locality root is assigned by File Provider and must be read from
+`NSFileProviderManager.getUserVisibleURL`. Packaged builds and the local
+development bundle identify the host app as `Locality`, so new installs should
+resolve to `~/Library/CloudStorage/Locality`. Older roots such as `Locality` and
+`Locality-Locality` are repair aliases only. Each connector gets a stable child folder
+such as `notion`, `linear`, or `gmail`. Locality should not create a Documents alias
+or symlink; the app should show the actual CloudStorage folder directly. This
+step should be framed as "Where should your Notion files appear?" rather than
+"configure mount root."
+
+Local diagnostics live under the Locality state root in `logs/`. Desktop actions and
+File Provider repair failures are mirrored to `desktop.log` with event markers
+such as `[file_provider.open_domain_failed]`; daemon-managed runs continue to
+write localityd logs in the same folder. The UI should point support and power users
+to that one directory instead of asking them to inspect terminal output,
+launchd, and helper logs separately.
 
 ### 4. Create Workspace Mount
 
@@ -123,7 +133,7 @@ The app can track setup internally with human concepts:
 
 Do not show hydration queues, polling intervals, or low-level daemon concepts in
 the onboarding UI. Do not make the user wait for the full workspace projection
-or initial sync to finish before moving forward. Once Notion is connected, AFS
+or initial sync to finish before moving forward. Once Notion is connected, Locality
 should begin prefetching top-level directories and files so the chosen mount
 point feels populated quickly. The UI should not show an extra checklist screen
 where most items complete instantly; once the folder and agent instructions are
@@ -154,12 +164,12 @@ button, not a second full-width button.
 
 After setup, the app should make it easy to continue into the locate flow. A
 user should be able to paste a Notion URL immediately into a text field with
-placeholder guidance, and AFS should prioritize that page's local file
+placeholder guidance, and Locality should prioritize that page's local file
 preparation instead of waiting for the rest of the workspace to finish.
 
 ## Locate And Search
 
-Finding work should feel closer to Notion search than filesystem browsing. AFS
+Finding work should feel closer to Notion search than filesystem browsing. Locality
 should support direct URL locate, title search, and path-fragment search from the
 same input so users do not need to remember whether they are holding a Notion URL
 or only a page name. This is especially important once a workspace has hundreds
@@ -168,14 +178,14 @@ or thousands of pages.
 User story:
 
 1. User pastes a Notion page/database URL or types a page title/path fragment.
-2. AFS searches the local SQLite entity index first.
-3. If the input contains a Notion ID, AFS resolves that ID exactly through the
+2. Locality searches the local SQLite entity index first.
+3. If the input contains a Notion ID, Locality resolves that ID exactly through the
    mounted workspace.
-4. If the item is present but online-only, AFS prioritizes it for local
+4. If the item is present but online-only, Locality prioritizes it for local
    preparation.
 5. The app shows the corresponding local file or directory path.
 6. The user can copy the path for an agent or reveal it in Finder.
-7. If the item is not yet present locally, AFS explains that the page must be
+7. If the item is not yet present locally, Locality explains that the page must be
    granted in Notion and synced before it can appear.
 
 This should be available from:
@@ -188,8 +198,8 @@ This should be available from:
 Suggested command/API shape:
 
 ```text
-afs locate notion <url> --json
-afs search <query> --connector notion --json
+loc locate notion <url> --json
+loc search <query> --connector notion --json
 ```
 
 The response should include the mount, local path, entity type, whether the file
@@ -231,12 +241,12 @@ Required behavior:
   mounted workspace.
 
 The "magical" behavior is not a large first sync. It is that the user can paste
-or search for the thing they care about and AFS makes the right local file ready
+or search for the thing they care about and Locality makes the right local file ready
 without asking them to understand hydration, indexing, or daemon queues.
 
 ## Local Index Roadmap
 
-Use progressive indexing so AFS remains reliable while becoming more useful:
+Use progressive indexing so Locality remains reliable while becoming more useful:
 
 1. Metadata index: mount ID, remote ID, kind, title, projected path, hydration
    state, remote edited time, dirty/conflict/pending-push flags.
@@ -262,9 +272,9 @@ sync mechanics.
 
 ### Tray Status
 
-- Green: AFS is running and all mounts are ready.
+- Green: Locality is running and all mounts are ready.
 - Yellow: attention needed, such as pending changes or reconnect required.
-- Red: AFS is stopped or an action failed.
+- Red: Locality is stopped or an action failed.
 
 ### Tray Menu
 
@@ -277,7 +287,7 @@ Primary items:
 - Settings
 - Quit Options
 
-Avoid showing last sync time. Users should be able to assume AFS syncs
+Avoid showing last sync time. Users should be able to assume Locality syncs
 intelligently. Avoid showing hydration queue counts; hydration is an
 implementation detail.
 
@@ -311,7 +321,7 @@ Core messages:
 - Local edits become pending changes first.
 - Push shows a clear plan before updating Notion.
 - Large or destructive pushes require confirmation.
-- AFS keeps a journal so pushes can be inspected and, where supported, undone.
+- Locality keeps a journal so pushes can be inspected and, where supported, undone.
 - Read-only mounts are available for research-only use.
 - Credentials are stored outside project files.
 
@@ -321,6 +331,15 @@ Important language:
 - Use "review push" instead of "sync now" when remote writes are involved.
 - Use "restore local file" for local recovery from shadow state.
 - Use "undo push" only for journal-backed remote undo.
+- Live Mode is opt-in, rate-limited to one sync action per tick, and must keep
+  the same push guardrails: stop on conflicts, blocked files, and
+  review-required changes. The normal local-write path comes from File Provider
+  callbacks; a visible-file reconciliation fallback is throttled and scoped to
+  the active already-hydrated page. When there is no local pending change, Live
+  Mode fetches one already-hydrated page into the daemon content cache and
+  compares the rendered shadow before touching the visible CloudStorage
+  projection, so stale Notion metadata does not hide body edits and unchanged
+  files are not repeatedly read or rewritten.
 
 ## Main App Structure
 
@@ -331,6 +350,9 @@ Shows the current state in product terms:
 - connected workspaces;
 - mounted folders;
 - a Notion URL input for opening a page as a local file;
+- an explicit Live Mode toggle for users who want clean hydrated pages checked
+  for remote changes and safe pending changes pushed continuously without
+  opening the review flow;
 - pending changes;
 - attention items;
 - connector suggestions.
@@ -383,7 +405,7 @@ Initial target operations:
 - undo supported pushes;
 - reconnect or disconnect a workspace.
 
-The first implementation can call existing `afs --json` commands as a sidecar.
+The first implementation can call existing `loc --json` commands as a sidecar.
 Once the shape stabilizes, the same operations can move behind a shared Rust API
 or daemon IPC client.
 
@@ -400,7 +422,7 @@ or daemon IPC client.
 
 ### Stage 2: Tauri Shell
 
-- Add a Tauri app that bundles `afs` and `afsd` as sidecars.
+- Add a Tauri app that bundles `loc` and `localityd` as sidecars.
 - Implement tray status and menu.
 - Implement first-run Notion onboarding.
 - Implement open/reveal folder actions.

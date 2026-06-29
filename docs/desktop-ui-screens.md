@@ -6,7 +6,7 @@ handling rather than implementation details.
 
 ## Design Philosophy
 
-AFS should feel like a calm native desktop utility: compact, trustworthy,
+Locality should feel like a calm native desktop utility: compact, trustworthy,
 fast, and precise. The app should not feel like a SaaS dashboard wrapped in a
 desktop shell. It should help users connect a workspace, find a local path, and
 understand pending changes without exposing sync machinery.
@@ -46,7 +46,7 @@ Core rules:
 The main window should use a compact left sidebar:
 
 ```text
-AFS
+Locality
   Home
   Pending Changes
   Activity
@@ -98,7 +98,7 @@ Daily Use
 
 ### Screen 1: Welcome
 
-Goal: establish what AFS does and get the user to connect Notion.
+Goal: establish what Locality does and get the user to connect Notion.
 
 Primary action: `Connect Notion`
 
@@ -108,12 +108,12 @@ Layout:
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│ AFS                                            1 of 4        │
+│ Locality                                            1 of 4        │
 │                                                              │
 │ Let your agents edit Notion as local files.                  │
 │                                                              │
-│ AFS mounts your Notion workspace in CloudStorage. Agents edit│
-│ local files, then AFS syncs reviewed changes back to Notion. │
+│ Locality mounts your Notion workspace in CloudStorage. Agents edit│
+│ local files, then Locality syncs reviewed changes back to Notion. │
 │                                                              │
 │ [ Connect Notion ]                                           │
 │                                                              │
@@ -146,12 +146,12 @@ Layout:
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│ AFS                                            2 of 4        │
+│ Locality                                            2 of 4        │
 │                                                              │
 │ Finish connecting in Notion                                  │
 │                                                              │
 │ A browser window is open. Choose your workspace, pick the    │
-│ pages AFS can use, then approve access.                      │
+│ pages Locality can use, then approve access.                      │
 │                                                              │
 │ ✓ Browser opened                                             │
 │ ○ Select workspace and pages                                 │
@@ -178,7 +178,7 @@ Goal: choose where the workspace appears locally.
 Default value:
 
 ```text
-~/Library/CloudStorage/AFS/notion
+~/Library/CloudStorage/Locality/notion
 ```
 
 Primary action: `Continue`
@@ -189,12 +189,12 @@ Layout:
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│ AFS                                            3 of 4        │
+│ Locality                                            3 of 4        │
 │                                                              │
 │ Where should your Notion files appear?                       │
 │                                                              │
 │ ┌──────────────────────────────────────────────────────────┐ │
-│ │ ~/Library/CloudStorage/AFS/notion                              [... ]│ │
+│ │ ~/Library/CloudStorage/Locality/notion                              [... ]│ │
 │ └──────────────────────────────────────────────────────────┘ │
 │                                                              │
 │ [ Continue ]                                                 │
@@ -208,8 +208,8 @@ Validation:
 
 - empty path: disable primary action;
 - path outside user home: allow only with an explicit confirmation;
-- existing non-empty folder: allow if it is already an AFS mount, otherwise ask
-  the user to choose another folder or confirm creating `AFS/Notion 2`.
+- existing non-empty folder: allow if it is already an Locality mount, otherwise ask
+  the user to choose another folder or confirm creating `Locality/Notion 2`.
 
 ### Screen 4: Ready, Syncing In Background
 
@@ -226,16 +226,16 @@ Layout:
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│ AFS                                            4 of 4        │
+│ Locality                                            4 of 4        │
 │                                                              │
 │  ✓                                                           │
-│ AFS is ready                                                 │
-│ Your Notion folder is mounted. AFS syncs quietly while        │
+│ Locality is ready                                                 │
+│ Your Notion folder is mounted. Locality syncs quietly while        │
 │ agents edit local Markdown.                                  │
 │                                                              │
 │ ┌──────────────────────────────────────────────────────────┐ │
 │ │ Notion folder                         [ Copy ]           │ │
-│ │ ~/Library/CloudStorage/AFS/notion                                  │ │
+│ │ ~/Library/CloudStorage/Locality/notion                                  │ │
 │ └──────────────────────────────────────────────────────────┘ │
 │                                                              │
 │ [ Open Notion Folder ]                                      │
@@ -251,8 +251,8 @@ Layout:
 │ │ leadership review.                              [ Copy ]  │ │
 │ └──────────────────────────────────────────────────────────┘ │
 │                                                              │
-│ Agents can use AFS                                           │
-│ Now your agents know how to use `afs` to view and edit        │
+│ Agents can use Locality                                           │
+│ Now your agents know how to use `loc` to view and edit        │
 │ Notion. Installed for Claude, Codex, Warp, AGENTS.md,         │
 │ and Copilot.                                                 │
 └──────────────────────────────────────────────────────────────┘
@@ -260,7 +260,7 @@ Layout:
 
 Behavior:
 
-- AFS should begin reading accessible top-level Notion structure immediately
+- Locality should begin reading accessible top-level Notion structure immediately
   after connection, before the user reaches this screen.
 - Do not block on full workspace enumeration.
 - Show setup success as a small celebratory status pill. Mention background
@@ -324,11 +324,11 @@ Layout:
 
 ```text
 ┌──────────────────────────────────────┐
-│ AFS                           Ready  │
+│ Locality                           Ready  │
 │                                      │
 │ Notion                               │
 │ CodeFlash                            │
-│ ~/Library/CloudStorage/AFS/notion               │
+│ ~/Library/CloudStorage/Locality/notion               │
 │                                      │
 │ [ Open Notion Folder ]               │
 │                                      │
@@ -351,7 +351,7 @@ Attention state:
 
 ```text
 ┌──────────────────────────────────────┐
-│ AFS                    Needs Review  │
+│ Locality                    Needs Review  │
 │                                      │
 │ Pending Changes                  3   │
 │ roadmap.md                           │
@@ -382,9 +382,9 @@ Quit Options
 `Quit Completely...` should show a confirmation dialog:
 
 ```text
-Quit AFS completely?
+Quit Locality completely?
 
-Background sync will stop until AFS is opened again.
+Background sync will stop until Locality is opened again.
 
 [ Cancel ]  [ Quit Completely ]
 ```
@@ -397,7 +397,7 @@ Layout:
 
 ```text
 ┌───────────────┬──────────────────────────────────────────────┐
-│ AFS           │ Home                                         │
+│ Locality           │ Home                                         │
 │               │                                              │
 │ Home          │ ...                                          │
 │ Pending       │                                              │
@@ -413,7 +413,7 @@ Sidebar bottom status:
 - `Notion Ready`
 - `Pending Changes`
 - `Reconnect Needed`
-- `AFS Stopped`
+- `Locality Stopped`
 
 ## Home
 
@@ -430,7 +430,7 @@ Home
 
 Notion workspace
 CodeFlash
-~/Library/CloudStorage/AFS/notion
+~/Library/CloudStorage/Locality/notion
 
 Open a Notion page
 ┌──────────────────────────────────────────────────────────────┐
@@ -461,7 +461,7 @@ Empty state:
 
 - no connections: primary `Connect Notion`;
 - connected but no mount: primary `Create Notion Folder`;
-- daemon stopped: primary `Start AFS`.
+- daemon stopped: primary `Start Locality`.
 
 ### Open Notion Page Result
 
@@ -473,10 +473,10 @@ Preparing result:
 
 ```text
 Preparing this page
-AFS is making the local file available now.
+Locality is making the local file available now.
 
 Roadmap 2026
-~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md
+~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md
 
 [ Copy Path ]    Reveal in Finder
 ```
@@ -488,7 +488,7 @@ Roadmap 2026
 Page
 
 ┌──────────────────────────────────────────────────────────────┐
-│ ~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md      │
+│ ~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md      │
 └──────────────────────────────────────────────────────────────┘
 
 [ Copy Path ]    Reveal in Finder
@@ -498,8 +498,8 @@ Error states:
 
 - URL not recognized: "Paste a Notion page or database URL.";
 - no matching mount: "This page is not in a mounted workspace.";
-- no access: "AFS does not have access to this Notion page.";
-- preparation failed: "AFS could not prepare this file. Try again."
+- no access: "Locality does not have access to this Notion page.";
+- preparation failed: "Locality could not prepare this file. Try again."
 
 ## Pending Changes
 
@@ -631,10 +631,10 @@ Layout:
 Notion
 
 CodeFlash
-~/Library/CloudStorage/AFS/notion
+~/Library/CloudStorage/Locality/notion
 
 Location
-~/Library/CloudStorage/AFS/notion        [ Move... ]
+~/Library/CloudStorage/Locality/notion        [ Move... ]
 
 [ Open Folder ]
 
@@ -704,7 +704,7 @@ Failed item:
 
 ```text
 Push failed
-Launch Plan was changed in Notion before AFS could update it.
+Launch Plan was changed in Notion before Locality could update it.
 
 [ Review Conflict ]
 ```
@@ -719,9 +719,9 @@ Sections:
 Settings
 
 General
-[x] Launch AFS at login
-[x] Show AFS in the menu bar
-Default folder: ~/Library/CloudStorage/AFS
+[x] Launch Locality at login
+[x] Show Locality in the menu bar
+Default folder: ~/Library/CloudStorage/Locality
 
 Connections
 Notion        CodeFlash        [ Manage ]
@@ -731,7 +731,7 @@ Push confirmation: Require for large changes
 Default new mount mode: Edit enabled
 
 Updates
-Automatically keep AFS up to date
+Automatically keep Locality up to date
 
 Advanced
 Diagnostics...
@@ -749,14 +749,14 @@ Layout:
 ```text
 Diagnostics
 
-AFS process        Running
-State folder       ~/.afs
+Locality process        Running
+State folder       ~/.loc
 Mounts watched     1
 Projection         macOS File Provider
 
 [ Copy Diagnostic Summary ]
 [ Open Logs Folder ]
-[ Restart AFS ]
+[ Restart Locality ]
 ```
 
 Allowed technical terms here:

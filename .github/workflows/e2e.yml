@@ -23,13 +23,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run architecture behavior e2e
-        run: cargo test -p afs-cli --test architecture_behavior -- --test-threads=1
+        run: cargo test -p loc-cli --test architecture_behavior -- --test-threads=1
       - name: Run shared projection contract e2e
-        run: cargo test -p afs-cli --test projection_contract -- --test-threads=1
+        run: cargo test -p loc-cli --test projection_contract -- --test-threads=1
       - name: Run doctor diagnostics e2e
-        run: cargo test -p afs-cli --test doctor -- --test-threads=1
+        run: cargo test -p loc-cli --test doctor -- --test-threads=1
       - name: Run local push workflow e2e
-        run: cargo test -p afs-cli --test e2e_push_workflow -- --test-threads=1
+        run: cargo test -p loc-cli --test e2e_push_workflow -- --test-threads=1
 
   linux-fuse:
     name: Linux FUSE e2e
@@ -49,4 +49,4 @@ jobs:
             exit 1
           fi
       - name: Run real Linux FUSE smoke test
-        run: AFS_FUSE_SMOKE=1 AFS_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh
+        run: LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 tests/linux_fuse_smoke.sh

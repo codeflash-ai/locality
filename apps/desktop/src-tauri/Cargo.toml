@@ -1,5 +1,5 @@
 [package]
-name = "afs-desktop"
+name = "locality-desktop"
 version = "0.1.3"
 edition.workspace = true
 license.workspace = true
@@ -10,12 +10,12 @@ rust-version.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-afs-cli = { path = "../../../crates/afs-cli" }
-afs-core.workspace = true
-afs-notion.workspace = true
-afs-platform.workspace = true
-afs-store.workspace = true
-afsd = { path = "../../../crates/afsd" }
+loc-cli = { path = "../../../crates/loc-cli" }
+locality-core.workspace = true
+locality-notion.workspace = true
+locality-platform.workspace = true
+locality-store.workspace = true
+localityd = { path = "../../../crates/localityd" }
 notify = "8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

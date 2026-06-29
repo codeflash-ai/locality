@@ -28,11 +28,12 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
+  Zap,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const distributionChannel = (import.meta.env.VITE_AFS_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
+const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
 
 type AppView = "home" | "mount" | "pending" | "review" | "activity" | "settings";
@@ -61,6 +62,7 @@ type DesktopSnapshot = {
     status: string;
     provider?: ProviderRuntimeSummary | null;
   };
+  needsOnboarding: boolean;
   settings: {
     launchAtLogin: boolean;
     showMenuBar: boolean;
@@ -75,7 +77,8 @@ type PendingChange = {
   localPath: string;
   summary: string;
   state: "safe" | "needs_review" | "conflict" | "blocked";
-  autoSave: {
+  issueCodes: string[];
+  liveMode: {
     enabled: boolean;
     state: "off" | "active" | "blocked" | "paused_remote_changed" | "paused_failure";
     label: string;
@@ -183,7 +186,7 @@ const sampleSnapshot: DesktopSnapshot = {
   mount: {
     connector: "notion",
     workspaceName: "CodeFlash",
-    localPath: "~/Library/CloudStorage/AFS/notion",
+    localPath: "~/Library/CloudStorage/Locality/notion",
     notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
     accessScope: "Initial Idea",
     projection: "macOS File Provider",
@@ -191,6 +194,7 @@ const sampleSnapshot: DesktopSnapshot = {
     status: "ready",
     provider: null,
   },
+  needsOnboarding: false,
   settings: {
     launchAtLogin: true,
     showMenuBar: true,
@@ -201,21 +205,24 @@ const sampleSnapshot: DesktopSnapshot = {
       localPath: "Engineering/Roadmap 2026/page.md",
       summary: "2 text edits",
       state: "safe",
-      autoSave: { enabled: false, state: "off", label: "Auto-save off" },
+      issueCodes: [],
+      liveMode: { enabled: false, state: "off", label: "Live Mode off" },
     },
     {
       title: "Launch Plan",
       localPath: "Marketing/Launch Plan/page.md",
       summary: "needs review: large deletion",
       state: "needs_review",
-      autoSave: { enabled: false, state: "off", label: "Auto-save off" },
+      issueCodes: ["large_deletion"],
+      liveMode: { enabled: false, state: "off", label: "Live Mode off" },
     },
     {
       title: "Customer Notes",
       localPath: "Sales/Customer Notes/page.md",
       summary: "1 property edit",
       state: "safe",
-      autoSave: { enabled: true, state: "active", label: "Auto-save on" },
+      issueCodes: [],
+      liveMode: { enabled: true, state: "active", label: "Live Mode on" },
     },
   ],
   activity: [
@@ -253,6 +260,49 @@ const sampleSnapshot: DesktopSnapshot = {
   ],
 };
 
+const loadingSnapshot: DesktopSnapshot = {
+  ...sampleSnapshot,
+  health: {
+    state: "checking_freshness",
+    attentionCount: 0,
+  },
+  connection: {
+    ...sampleSnapshot.connection,
+    workspaceName: "Loading",
+    accountLabel: "",
+    status: "loading",
+  },
+  mount: {
+    ...sampleSnapshot.mount,
+    workspaceName: "Loading",
+    localPath: "~/Library/CloudStorage/Locality",
+    notionUrl: null,
+    accessScope: "Checking access",
+    status: "loading",
+    provider: null,
+  },
+  needsOnboarding: false,
+  pendingChanges: [],
+  activity: [],
+};
+
+const snapshotLoadFailed: DesktopSnapshot = {
+  ...loadingSnapshot,
+  health: {
+    state: "stopped",
+    attentionCount: 0,
+  },
+  connection: {
+    ...loadingSnapshot.connection,
+    status: "unknown",
+  },
+  mount: {
+    ...loadingSnapshot.mount,
+    status: "unknown",
+  },
+  needsOnboarding: false,
+};
+
 const samplePushPlan: PushPlan = {
   title: "Review Push",
   summary: "3 files will update Notion.",
@@ -268,19 +318,19 @@ const sampleSearchResults: LocatedItem[] = [
   {
     title: "Roadmap 2026",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
     state: "ready",
   },
   {
     title: "Launch Plan",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/AFS/notion/Marketing/Launch Plan/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion/Marketing/Launch Plan/page.md",
     state: "online_only",
   },
 ];
 
 function suggestedAgentPrompt(mountPath: string) {
-  return `Use AFS to edit my Notion workspace. Open the Notion files under ${mountPath}, make the requested edits directly in Markdown, and leave the changes pending for AFS review.`;
+  return `Use Locality to edit my Notion workspace. Open the Notion files under ${mountPath}, make the requested edits directly in Markdown, and leave the changes pending for Locality review.`;
 }
 
 function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallReport {
@@ -292,20 +342,20 @@ function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallRepor
       {
         agent: "Claude Code / Claude Desktop / Claude Cowork",
         status: "installed",
-        path: "~/.claude/skills/afs/SKILL.md",
-        detail: "Installed the AFS skill for Claude local agents.",
+        path: "~/.claude/skills/locality/SKILL.md",
+        detail: "Installed the Locality skill for Claude local agents.",
       },
       {
         agent: "Codex",
         status: "installed",
-        path: "~/.codex/skills/afs/SKILL.md",
-        detail: "Installed the AFS skill for Codex.",
+        path: "~/.codex/skills/locality/SKILL.md",
+        detail: "Installed the Locality skill for Codex.",
       },
       {
         agent: "Warp",
         status: "installed",
-        path: "~/.agents/skills/afs/SKILL.md",
-        detail: "Installed the AFS skill for Warp.",
+        path: "~/.agents/skills/locality/SKILL.md",
+        detail: "Installed the Locality skill for Warp.",
       },
     ],
   };
@@ -313,6 +363,29 @@ function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallRepor
 
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function routeForcesMainApp(route: string) {
+  return route === "#app";
+}
+
+function routeForcesOnboarding(route: string) {
+  return route === "#onboarding" || route === "#onboarding-ready";
+}
+
+function previewRouteStartsOnboarding(route: string) {
+  return !isTauriRuntime() && (route === "" || route === "#");
+}
+
+function snapshotNeedsOnboarding(snapshot: DesktopSnapshot) {
+  return snapshot.needsOnboarding || connectionMissing(snapshot) || mountMissing(snapshot);
+}
+
+function routeShouldShowOnboarding(route: string, snapshot: DesktopSnapshot) {
+  if (route === "#tray" || routeForcesMainApp(route)) {
+    return false;
+  }
+  return routeForcesOnboarding(route) || previewRouteStartsOnboarding(route) || snapshotNeedsOnboarding(snapshot);
 }
 
 async function callCommand<T>(command: string, args?: Record<string, unknown>, fallback?: T) {
@@ -328,6 +401,16 @@ async function callCommand<T>(command: string, args?: Record<string, unknown>, f
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function liveModeReportNeedsRefresh(message: string) {
+  return message.includes("synced") || message.includes("pulled") || message.includes("paused");
+}
+
+function liveModeTooltip(enabled: boolean) {
+  return enabled
+    ? "Live Mode is watching safe local edits, pushing them to Notion, and pulling remote Notion changes when no review is needed. It pauses when a change needs review."
+    : "Turn on Live Mode to keep this local Notion folder in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
 }
 
 function emptyUpdateStatus(): UpdateStatus {
@@ -392,14 +475,19 @@ function useNotionSearchResults(query: string, enabled = true) {
 }
 
 export default function App() {
-  const [snapshot, setSnapshot] = useState<DesktopSnapshot>(sampleSnapshot);
+  const initialRoute = window.location.hash;
+  const [snapshot, setSnapshot] = useState<DesktopSnapshot>(() =>
+    isTauriRuntime() ? loadingSnapshot : sampleSnapshot,
+  );
   const [snapshotLoaded, setSnapshotLoaded] = useState(() => !isTauriRuntime());
   const [view, setView] = useState<AppView>("home");
-  const route = window.location.hash;
-  const [showOnboarding, setShowOnboarding] = useState(() => route === "#onboarding-ready");
+  const [route, setRoute] = useState(initialRoute);
+  const [showOnboarding, setShowOnboarding] = useState(() =>
+    routeForcesOnboarding(initialRoute) || previewRouteStartsOnboarding(initialRoute),
+  );
   const [onboardingKey, setOnboardingKey] = useState(0);
   const [onboardingInitialStep, setOnboardingInitialStep] = useState<1 | 4>(() =>
-    route === "#onboarding-ready" ? 4 : 1,
+    initialRoute === "#onboarding-ready" ? 4 : 1,
   );
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
   const refreshSnapshotPromise = useRef<Promise<void> | null>(null);
@@ -458,14 +546,14 @@ export default function App() {
       const update = await check();
       if (!update) {
         if (!options.silent) {
-          setUpdateStatus({ state: "current", message: "AFS is up to date.", update: null });
+          setUpdateStatus({ state: "current", message: "Locality is up to date.", update: null });
         }
         return;
       }
 
       setUpdateStatus({
         state: "available",
-        message: `AFS ${update.version} is ready to install.`,
+        message: `Locality ${update.version} is ready to install.`,
         update,
         version: update.version,
       });
@@ -498,19 +586,19 @@ export default function App() {
     setUpdateStatus((current) => ({
       ...current,
       state: "installing",
-      message: current.version ? `Installing AFS ${current.version}.` : "Installing update.",
+      message: current.version ? `Installing Locality ${current.version}.` : "Installing update.",
     }));
 
     try {
       const update = updateStatus.update ?? (await check());
       if (!update) {
-        setUpdateStatus({ state: "current", message: "AFS is up to date.", update: null });
+        setUpdateStatus({ state: "current", message: "Locality is up to date.", update: null });
         return;
       }
       await update.downloadAndInstall();
       setUpdateStatus({
         state: "installing",
-        message: "Restarting AFS to finish the update.",
+        message: "Restarting Locality to finish the update.",
         update: null,
         version: update.version,
       });
@@ -531,7 +619,7 @@ export default function App() {
       }
       await refreshSnapshot();
     })().catch(() => {
-      setSnapshot(sampleSnapshot);
+      setSnapshot(isTauriRuntime() ? snapshotLoadFailed : sampleSnapshot);
       setSnapshotLoaded(true);
     });
   }, []);
@@ -549,17 +637,36 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const handleHashChange = () => setRoute(window.location.hash);
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, []);
+
+  useEffect(() => {
     if (!snapshotLoaded || route === "#tray") {
       return;
     }
 
     if (route === "#onboarding-ready") {
+      setOnboardingInitialStep(4);
+      setShowOnboarding(true);
+      return;
+    }
+
+    if (routeShouldShowOnboarding(route, snapshot)) {
+      setOnboardingInitialStep(1);
       setShowOnboarding(true);
       return;
     }
 
     setShowOnboarding(false);
-  }, [route, snapshotLoaded]);
+  }, [
+    route,
+    snapshot.connection.status,
+    snapshot.mount.status,
+    snapshot.needsOnboarding,
+    snapshotLoaded,
+  ]);
 
   useEffect(() => {
     const handleOpenView = (event: Event) => {
@@ -571,8 +678,8 @@ export default function App() {
       setView(nextView);
     };
 
-    window.addEventListener("afs-open-view", handleOpenView);
-    return () => window.removeEventListener("afs-open-view", handleOpenView);
+    window.addEventListener("loc-open-view", handleOpenView);
+    return () => window.removeEventListener("loc-open-view", handleOpenView);
   }, []);
 
   useEffect(() => {
@@ -580,9 +687,9 @@ export default function App() {
       void refreshSnapshot().catch(() => undefined);
     };
 
-    window.addEventListener("afs-refresh-snapshot", refresh);
+    window.addEventListener("loc-refresh-snapshot", refresh);
     return () => {
-      window.removeEventListener("afs-refresh-snapshot", refresh);
+      window.removeEventListener("loc-refresh-snapshot", refresh);
     };
   }, []);
 
@@ -616,7 +723,10 @@ export default function App() {
     return <TrayPopover snapshot={snapshot} />;
   }
 
-  if (showOnboarding) {
+  const shouldRenderOnboarding =
+    showOnboarding || (snapshotLoaded && routeShouldShowOnboarding(route, snapshot));
+
+  if (shouldRenderOnboarding) {
     return (
       <Onboarding
         key={onboardingKey}
@@ -630,6 +740,10 @@ export default function App() {
         }}
       />
     );
+  }
+
+  if (isTauriRuntime() && !snapshotLoaded && !routeForcesMainApp(route)) {
+    return <SetupLoading />;
   }
 
   return (
@@ -650,6 +764,26 @@ export default function App() {
         setShowOnboarding(true);
       }}
     />
+  );
+}
+
+function SetupLoading() {
+  return (
+    <main className="setup-shell">
+      <section className="setup-window">
+        <WindowChrome title="Locality Setup" meta="Checking" />
+        <SetupContent mark={<BrandTile>Locality</BrandTile>}>
+          <div>
+            <div className="sync-note">
+              <Loader2 className="spin" />
+              Checking setup
+            </div>
+            <h1>Checking your Locality setup</h1>
+            <p>Locality is checking your Notion connection and local folder.</p>
+          </div>
+        </SetupContent>
+      </section>
+    </main>
   );
 }
 
@@ -678,6 +812,7 @@ function Onboarding({
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
   const [mountError, setMountError] = useState("");
+  const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
 
@@ -808,29 +943,40 @@ function Onboarding({
   }
 
   async function startMount() {
+    if (mounting) {
+      return;
+    }
+
     setMountError("");
-    const report = await callCommand<ActionReport>(
-      "create_workspace_mount",
-      { path: mountPath },
-      { ok: true, message: "Created demo mount." },
-    );
-    if (!report.ok) {
-      setMountError(report.message);
-      return;
+    setMounting(true);
+    try {
+      const report = await callCommand<ActionReport>(
+        "create_workspace_mount",
+        { path: mountPath },
+        { ok: true, message: "Created demo mount." },
+      );
+      if (!report.ok) {
+        setMountError(report.message);
+        return;
+      }
+      const cliReady = await ensureCliAvailable();
+      if (!cliReady) {
+        return;
+      }
+      const nextSnapshot = await callCommand<DesktopSnapshot>(
+        "desktop_snapshot",
+        undefined,
+        sampleSnapshot,
+      );
+      setMountPathDirty(false);
+      setMountPath(nextSnapshot.mount.localPath);
+      await installAgentGuidance(nextSnapshot.mount.localPath);
+      setStep(4);
+    } catch (error) {
+      setMountError(errorMessage(error));
+    } finally {
+      setMounting(false);
     }
-    const cliReady = await ensureCliAvailable();
-    if (!cliReady) {
-      return;
-    }
-    const nextSnapshot = await callCommand<DesktopSnapshot>(
-      "desktop_snapshot",
-      undefined,
-      sampleSnapshot,
-    );
-    setMountPathDirty(false);
-    setMountPath(nextSnapshot.mount.localPath);
-    await installAgentGuidance(nextSnapshot.mount.localPath);
-    setStep(4);
   }
 
   async function ensureCliAvailable() {
@@ -841,7 +987,7 @@ function Onboarding({
     const report = await callCommand<ActionReport>(
       "ensure_terminal_cli_available",
       undefined,
-      { ok: true, message: "AFS terminal command is ready." },
+      { ok: true, message: "Locality terminal command is ready." },
     );
     if (!report.ok) {
       setMountError(report.message);
@@ -896,7 +1042,7 @@ function Onboarding({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -912,14 +1058,14 @@ function Onboarding({
   return (
     <main className="setup-shell">
       <section className="setup-window">
-        <WindowChrome title="AFS Setup" meta={`${step} of 4`} />
+        <WindowChrome title="Locality Setup" meta={`${step} of 4`} />
         {step === 1 && (
-          <SetupContent mark={<BrandTile>AFS</BrandTile>}>
+          <SetupContent mark={<BrandTile>Locality</BrandTile>}>
             <div>
               <h1>Let your agents edit Notion as local files.</h1>
               <p>
                 Mount your Notion workspace in CloudStorage. Agents edit local
-                files, then AFS syncs reviewed changes back to Notion.
+                files, then Locality syncs reviewed changes back to Notion.
               </p>
             </div>
             <PrimaryButton onClick={startConnect}>Connect Notion</PrimaryButton>
@@ -945,8 +1091,8 @@ function Onboarding({
                 {oauthReady
                   ? `${
                       connectedWorkspace || "Your workspace"
-                    } is ready. Next, choose where AFS should place the local folder.`
-                  : "A browser window is open. Choose your workspace, pick the pages AFS can use, then approve access."}
+                    } is ready. Next, choose where Locality should place the local folder.`
+                  : "A browser window is open. Choose your workspace, pick the pages Locality can use, then approve access."}
               </p>
             </div>
             <ProgressList
@@ -969,28 +1115,29 @@ function Onboarding({
         )}
 
         {step === 3 && (
-          <SetupContent mark={<BrandTile variant="folder" />}>
+          <SetupContent mark={<BrandTile variant={mounting ? "progress" : "folder"} />}>
             <div>
               <h1>Where should your Notion files appear?</h1>
               <p>
-                AFS keeps every source under one CloudStorage root. Notion will appear as the
+                Locality keeps every source under one CloudStorage root. Notion will appear as the
                 live folder Finder and agents open.
               </p>
             </div>
             <div className="path-field">
               <input
                 value={mountPath}
+                disabled={mounting}
                 onChange={(event) => {
                   setMountPathDirty(true);
                   setMountPath(event.target.value);
                 }}
               />
-              <SecondaryButton compact onClick={chooseFolder}>
+              <SecondaryButton compact disabled={mounting} onClick={chooseFolder}>
                 Choose
               </SecondaryButton>
             </div>
-            <PrimaryButton disabled={!mountPath.trim()} onClick={startMount}>
-              Continue
+            <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
+              {mounting ? "Mounting Notion" : "Continue"}
             </PrimaryButton>
             {mountError && <p className="field-error">{mountError}</p>}
             <p className="quiet-note">
@@ -1003,11 +1150,15 @@ function Onboarding({
         {step === 4 && (
           <SetupContent mark={<BrandTile variant="ready" />} variant="final">
             <div>
-              <h1>AFS is ready</h1>
+              <h1>Locality is ready</h1>
               <p>
-                Your Notion folder is mounted. AFS will keep syncing the workspace quietly in the
-                background while agents edit local Markdown.
+                Your Notion folder is mounted. Agents can edit local Markdown now, and Locality
+                will keep review controls close when those edits are ready.
               </p>
+            </div>
+            <div className="live-mode-intro">
+              <Zap />
+              <span>Live Mode can watch this folder, sync safe edits, and pause when a change needs review.</span>
             </div>
             <div className="ready-folder">
               <FolderOpen />
@@ -1051,7 +1202,7 @@ function Onboarding({
               <div className="agent-prompt-row">
                 <div className="agent-demo-command">
                   {agentGuidanceReport?.prompt ||
-                    `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for AFS review.`}
+                    `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for Locality review.`}
                 </div>
                 <SecondaryButton
                   compact
@@ -1059,7 +1210,7 @@ function Onboarding({
                   onClick={() =>
                     copyText(
                       agentGuidanceReport?.prompt ||
-                        `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for AFS review.`,
+                        `In ${mountPath}, find the Q4 launch plan and make it sharper for leadership review. Keep the edits ready for Locality review.`,
                     )
                   }
                 >
@@ -1091,7 +1242,7 @@ function AgentGuidanceSummary({
       : failed
         ? "Agent skills need attention"
         : report
-          ? "Agents can use AFS"
+          ? "Agents can use Locality"
           : "Preparing agents";
 
   return (
@@ -1100,10 +1251,10 @@ function AgentGuidanceSummary({
         {state === "installing" ? <Loader2 className="spin-icon" /> : failed ? <AlertTriangle /> : <Bot />}
         <span>{title}</span>
       </div>
-      {state === "installing" && <p>Installing the AFS skill for local agents.</p>}
+      {state === "installing" && <p>Installing the Locality skill for local agents.</p>}
       {state !== "installing" && installedAgents.length > 0 && (
         <p>
-          Now your agents know how to use <code>afs</code> to view and edit Notion. Installed for{" "}
+          Now your agents know how to use <code>loc</code> to view and edit Notion. Installed for{" "}
           <strong>{formatList(installedAgents)}</strong>.
         </p>
       )}
@@ -1111,7 +1262,7 @@ function AgentGuidanceSummary({
         <p>{fallbackTargets[0].detail}</p>
       )}
       {state !== "installing" && installedAgents.length === 0 && fallbackTargets.length === 0 && !failed && (
-        <p>AFS is preparing local agent instructions for this Notion folder.</p>
+        <p>Locality is preparing local agent instructions for this Notion folder.</p>
       )}
       {failed && report?.targets.find((target) => target.status === "failed")?.detail && (
         <p>{report.targets.find((target) => target.status === "failed")?.detail}</p>
@@ -1167,7 +1318,7 @@ function MainShell({
   return (
     <main className="app-frame">
       <WindowChrome
-        title="AFS"
+        title="Locality"
         meta={meta}
         metaTitle={statusTitle}
         onMetaClick={statusTarget ? () => onViewChange(statusTarget) : undefined}
@@ -1176,7 +1327,7 @@ function MainShell({
         <aside className="sidebar">
           <div className="sidebar-brand">
             <ApertureIcon />
-            <strong>AFS</strong>
+            <strong>Locality</strong>
           </div>
           <nav>
             <SidebarButton active={view === "home"} icon={<Home />} onClick={() => onViewChange("home")}>
@@ -1298,7 +1449,7 @@ function UpdateBanner({
   return (
     <div className="update-banner">
       <div>
-        <strong>{status.version ? `AFS ${status.version} available` : "AFS update available"}</strong>
+        <strong>{status.version ? `Locality ${status.version} available` : "Locality update available"}</strong>
         <p>{status.message}</p>
       </div>
       <div className="update-banner-actions">
@@ -1337,7 +1488,88 @@ function HomeView({
   const [locateError, setLocateError] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [actionError, setActionError] = useState("");
+  const [liveModeEnabled, setLiveModeEnabled] = useState(false);
+  const [liveModeBusy, setLiveModeBusy] = useState(false);
+  const [liveModeState, setLiveModeState] = useState<"idle" | "active" | "error">("idle");
+  const [liveModeMessage, setLiveModeMessage] = useState("");
+  const liveModeInFlight = useRef(false);
+  const liveModeSnapshot = useRef(snapshot);
+  const refreshHomeSnapshot = useRef(onRefresh);
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
+
+  useEffect(() => {
+    liveModeSnapshot.current = snapshot;
+  }, [snapshot]);
+
+  useEffect(() => {
+    refreshHomeSnapshot.current = onRefresh;
+  }, [onRefresh]);
+
+  useEffect(() => {
+    if (!liveModeEnabled) {
+      setLiveModeBusy(false);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const runTick = async () => {
+      if (cancelled || liveModeInFlight.current) {
+        return;
+      }
+
+      const currentSnapshot = liveModeSnapshot.current;
+      if (connectionMissing(currentSnapshot) || mountMissing(currentSnapshot)) {
+        setLiveModeEnabled(false);
+        setLiveModeState("error");
+        setLiveModeMessage("Live Mode needs a connected Notion folder.");
+        return;
+      }
+
+      liveModeInFlight.current = true;
+      setLiveModeBusy(true);
+      try {
+        const report = await callCommand<ActionReport>(
+          "live_mode_tick",
+          undefined,
+          { ok: true, message: "Live Mode checked for changes." },
+        );
+        if (cancelled) {
+          return;
+        }
+        if (!report.ok) {
+          setLiveModeEnabled(false);
+          setLiveModeState("error");
+          setLiveModeMessage(report.message);
+          return;
+        }
+        setLiveModeState("active");
+        if (report.message) {
+          setLiveModeMessage((current) => (current === report.message ? current : report.message));
+        }
+        if (liveModeReportNeedsRefresh(report.message)) {
+          await refreshHomeSnapshot.current().catch(() => undefined);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setLiveModeEnabled(false);
+          setLiveModeState("error");
+          setLiveModeMessage(errorMessage(error));
+        }
+      } finally {
+        liveModeInFlight.current = false;
+        if (!cancelled) {
+          setLiveModeBusy(false);
+        }
+      }
+    };
+
+    void runTick();
+    const interval = window.setInterval(runTick, 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [liveModeEnabled]);
 
   async function connectNotion() {
     setActionError("");
@@ -1379,6 +1611,13 @@ function HomeView({
     }
   }
 
+  function toggleLiveMode() {
+    setActionError("");
+    setLiveModeMessage("");
+    setLiveModeState(liveModeEnabled ? "idle" : "active");
+    setLiveModeEnabled((enabled) => !enabled);
+  }
+
   async function locatePage() {
     if (!url.trim()) {
       return;
@@ -1392,7 +1631,7 @@ function HomeView({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1421,7 +1660,7 @@ function HomeView({
           <BrandTile variant="notion">N</BrandTile>
           <div>
             <h2>Connect your Notion workspace</h2>
-            <p>AFS needs access before it can create local files for agents.</p>
+            <p>Locality needs access before it can create local files for agents.</p>
           </div>
           <PrimaryButton icon={<ChevronRight />} onClick={() => void connectNotion()}>
             Connect Notion
@@ -1433,7 +1672,7 @@ function HomeView({
           <BrandTile variant="folder" />
           <div>
             <h2>Create your Notion folder</h2>
-            <p>Use the default source folder under the shared AFS CloudStorage root.</p>
+            <p>Use the default source folder under the shared Locality CloudStorage root.</p>
           </div>
           <PrimaryButton
             icon={<FolderOpen />}
@@ -1452,6 +1691,22 @@ function HomeView({
               <p className="path-line">{snapshot.mount.localPath}</p>
             </div>
             <div className="button-row">
+              <button
+                className={`live-mode-control has-tooltip ${liveModeEnabled ? "active" : ""}`}
+                aria-pressed={liveModeEnabled}
+                aria-label={`${liveModeEnabled ? "Turn off" : "Turn on"} Live Mode`}
+                data-tooltip={liveModeTooltip(liveModeEnabled)}
+                title={liveModeTooltip(liveModeEnabled)}
+                onClick={toggleLiveMode}
+              >
+                <span className="live-mode-copy">
+                  {liveModeBusy ? <Loader2 className="spin-icon" /> : <Zap />}
+                  <span>Live Mode</span>
+                </span>
+                <span className={`toggle ${liveModeEnabled ? "enabled" : ""}`} aria-hidden="true">
+                  <i />
+                </span>
+              </button>
               <SecondaryButton icon={<FolderOpen />} onClick={() => void openWorkspaceFolder(snapshot.mount.localPath)}>
                 Open Folder
               </SecondaryButton>
@@ -1461,6 +1716,11 @@ function HomeView({
             </div>
           </section>
           {actionError && <p className="field-error">{actionError}</p>}
+          {liveModeMessage && (
+            <p className={liveModeState === "error" ? "field-error" : "quiet-note inline-note"}>
+              {liveModeMessage}
+            </p>
+          )}
 
           <section className="panel locate-panel">
             <LocateBox
@@ -1605,7 +1865,7 @@ function MountDetailView({
           <p className="label">Notion folder</p>
           <h2>{snapshot.mount.localPath}</h2>
           <p>
-            AFS follows your Notion workspace hierarchy here, starting with the pages and databases
+            Locality follows your Notion workspace hierarchy here, starting with the pages and databases
             your connection can access.
           </p>
         </div>
@@ -1677,8 +1937,8 @@ function MountDetailView({
         <summary>Advanced diagnostics</summary>
         <div className="settings-grid compact-settings">
           <div className="panel">
-            <SettingRow title="AFS process" value={snapshot.health.state === "stopped" ? "Stopped" : "Running"} />
-            <SettingRow title="State folder" value="~/.afs" />
+            <SettingRow title="Locality process" value={snapshot.health.state === "stopped" ? "Stopped" : "Running"} />
+            <SettingRow title="State folder" value="~/.loc" />
             <SettingRow title="Connector" value={snapshot.mount.connector} />
           </div>
           <div className="panel">
@@ -1869,7 +2129,7 @@ function ReviewView({
       <ViewHeader title={plan.title}>
         <StatusPill
           tone={pushState === "error" ? "danger" : isPushing ? "warn" : "ready"}
-          title={isPushing ? "AFS is writing the approved local changes to Notion." : "This push is ready for review."}
+          title={isPushing ? "Locality is writing the approved local changes to Notion." : "This push is ready for review."}
         >
           {pushState === "error" ? "Needs Attention" : isPushing ? "Pushing" : pushSucceeded ? "Pushed" : "Safe"}
         </StatusPill>
@@ -1877,7 +2137,7 @@ function ReviewView({
       <p className="view-copy">{plan.summary}</p>
       {isPushing && (
         <p className="quiet-note inline-note">
-          Writing changes to Notion. You can keep reviewing this window while AFS finishes.
+          Writing changes to Notion. You can keep reviewing this window while Locality finishes.
         </p>
       )}
       {pushSucceeded && (
@@ -2064,7 +2324,7 @@ function SettingsView({
     const report = await callCommand<ActionReport>(
       "ensure_runtime_ready",
       undefined,
-      { ok: true, message: "AFS runtime is running." },
+      { ok: true, message: "Locality runtime is running." },
     );
     setDiagnosticMessage(report.message);
     await onRefresh().catch(() => undefined);
@@ -2072,9 +2332,9 @@ function SettingsView({
 
   function copyDiagnostics() {
     const summary = [
-      `AFS process: ${daemonStopped ? "Stopped" : "Running"}`,
+      `Locality process: ${daemonStopped ? "Stopped" : "Running"}`,
       snapshot.mount.provider ? `Provider: ${providerStatusLabel(snapshot.mount.provider)}` : null,
-      "State folder: ~/.afs",
+      "State folder: ~/.loc",
       `Projection: ${snapshot.mount.projection}`,
       `Connection: ${snapshot.connection.status}`,
       `Mount: ${snapshot.mount.status}`,
@@ -2082,6 +2342,16 @@ function SettingsView({
     ].filter(Boolean).join("\n");
     copyText(summary);
     setDiagnosticMessage("Copied diagnostics summary.");
+  }
+
+  async function openLogsFolder() {
+    setDiagnosticMessage("");
+    const report = await callCommand<ActionReport>(
+      "open_logs_folder",
+      undefined,
+      { ok: true, message: "Opened logs folder." },
+    );
+    setDiagnosticMessage(report.message);
   }
 
   async function updateDesktopSetting(key: "launch_at_login" | "show_menu_bar", enabled: boolean) {
@@ -2114,7 +2384,7 @@ function SettingsView({
 
   async function resetLocalState() {
     const confirmed = window.confirm(
-      "Reset local AFS state? This clears AFS metadata, cache, mount registration, and connector credentials. It does not delete your local files.",
+      "Reset local Locality state? This clears Locality metadata, cache, mount registration, and connector credentials. It does not delete your local files.",
     );
     if (!confirmed) {
       return;
@@ -2124,9 +2394,9 @@ function SettingsView({
     setResettingState(true);
     try {
       const report = await callCommand<ActionReport>(
-        "reset_local_afs_state",
+        "reset_locality_state",
         undefined,
-        { ok: true, message: "AFS local state was reset." },
+        { ok: true, message: "Locality local state was reset." },
       );
       setResetMessage(report.message);
       if (report.ok) {
@@ -2166,24 +2436,24 @@ function SettingsView({
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Settings" }]} />
-      <ViewHeader title="AFS controls" />
+      <ViewHeader title="Locality controls" />
 
       <section className="settings-grid">
         <div className="panel">
           <PanelTitle title="Startup" />
           <ToggleRow
-            title="Launch AFS at login"
+            title="Launch Locality at login"
             enabled={localSettings.launchAtLogin}
             busy={busySetting === "launch_at_login"}
             onToggle={(enabled) => void updateDesktopSetting("launch_at_login", enabled)}
           />
           <ToggleRow
-            title="Show AFS in the menu bar"
+            title="Show Locality in the menu bar"
             enabled={localSettings.showMenuBar}
             busy={busySetting === "show_menu_bar"}
             onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
           />
-          <SettingRow title="Default folder" value="~/Library/CloudStorage/AFS" />
+          <SettingRow title="Default folder" value="~/Library/CloudStorage/Locality" />
           {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
         </div>
 
@@ -2227,7 +2497,7 @@ function SettingsView({
         <div className="panel">
           <PanelTitle title="Agent Instructions" />
           <SettingRow title="Local agents" value="Claude, Codex, Warp, Cursor, Gemini, Cline/Roo" />
-          <SettingRow title="Notion guidance" value="Installed under /AFS/notion" />
+          <SettingRow title="Notion guidance" value="Installed under /Locality/notion" />
           <SecondaryButton
             compact
             icon={installingAgents ? <Loader2 className="spin-icon" /> : <Bot />}
@@ -2241,18 +2511,21 @@ function SettingsView({
 
         <div className="panel">
           <PanelTitle title="Diagnostics" />
-          <SettingRow title="AFS process" value={daemonStopped ? "Stopped" : "Running"} />
+          <SettingRow title="Locality process" value={daemonStopped ? "Stopped" : "Running"} />
           {snapshot.mount.provider && (
             <SettingRow title="Provider" value={providerStatusLabel(snapshot.mount.provider)} />
           )}
-          <SettingRow title="State folder" value="~/.afs" />
+          <SettingRow title="State folder" value="~/.loc" />
           <SettingRow title="Projection" value={snapshot.mount.projection} />
           <div className="button-row">
             <SecondaryButton compact onClick={copyDiagnostics}>
               Copy Summary
             </SecondaryButton>
+            <SecondaryButton compact icon={<FolderOpen />} onClick={() => void openLogsFolder()}>
+              Open Logs
+            </SecondaryButton>
             <SecondaryButton compact disabled={!runtimeNeedsRepair} onClick={() => void repairRuntime()}>
-              {runtimeNeedsRepair ? "Start AFS" : "Repair AFS"}
+              {runtimeNeedsRepair ? "Start Locality" : "Repair Locality"}
             </SecondaryButton>
           </div>
           {diagnosticMessage && <p className="quiet-note inline-note">{diagnosticMessage}</p>}
@@ -2260,7 +2533,7 @@ function SettingsView({
 
         <div className="panel">
           <PanelTitle title="Developer" />
-          <SettingRow title="Local database" value="~/.afs/state.sqlite3" />
+          <SettingRow title="Local database" value="~/.loc/state.sqlite3" />
           <SettingRow title="Reset behavior" value="Preserve local files" />
           <SecondaryButton
             compact
@@ -2340,7 +2613,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/AFS/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -2369,7 +2642,7 @@ function TrayPopover({ snapshot }: { snapshot: DesktopSnapshot }) {
       <header className="tray-header">
         <div className="tray-title">
           <ApertureIcon state={healthIconState(snapshot.health.state)} />
-          <strong>AFS</strong>
+          <strong>Locality</strong>
         </div>
         <StatusPill
           tone={healthTone(snapshot.health.state)}
@@ -2532,10 +2805,10 @@ function FileChangeList({
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [details, setDetails] = useState<Record<string, FileDetailStatus>>({});
   const [editors, setEditors] = useState<Record<string, FileEditorStatus>>({});
-  const [autoSaveOverrides, setAutoSaveOverrides] = useState<Record<string, PendingChange["autoSave"]>>({});
+  const [liveModeOverrides, setLiveModeOverrides] = useState<Record<string, PendingChange["liveMode"]>>({});
 
   useEffect(() => {
-    setAutoSaveOverrides((current) => {
+    setLiveModeOverrides((current) => {
       let changed = false;
       const next = { ...current };
       const activePaths = new Set(changes.map((change) => change.localPath));
@@ -2549,9 +2822,9 @@ function FileChangeList({
         const override = next[change.localPath];
         if (
           override &&
-          override.enabled === change.autoSave.enabled &&
-          override.state === change.autoSave.state &&
-          override.label === change.autoSave.label
+          override.enabled === change.liveMode.enabled &&
+          override.state === change.liveMode.state &&
+          override.label === change.liveMode.label
         ) {
           delete next[change.localPath];
           changed = true;
@@ -2705,26 +2978,26 @@ function FileChangeList({
     }
   }
 
-  async function toggleAutoSave(change: PendingChange, enabled: boolean) {
+  async function toggleFileLiveMode(change: PendingChange, enabled: boolean) {
     const path = joinMountPath(mountPath, change.localPath);
-    const optimisticState: PendingChange["autoSave"] = {
-      ...change.autoSave,
+    const optimisticState: PendingChange["liveMode"] = {
+      ...change.liveMode,
       enabled,
       state: enabled ? "active" : "off",
-      label: enabled ? "Auto-save on" : "Auto-save off",
+      label: enabled ? "Live Mode on" : "Live Mode off",
       reason: null,
     };
-    setAutoSaveOverrides((current) => ({
+    setLiveModeOverrides((current) => ({
       ...current,
       [change.localPath]: optimisticState,
     }));
     setActions((current) => ({
       ...current,
-      [change.localPath]: { state: "working", message: enabled ? "Turning on auto-save..." : "Turning off auto-save..." },
+      [change.localPath]: { state: "working", message: enabled ? "Turning on Live Mode..." : "Turning off Live Mode..." },
     }));
 
     try {
-      const report = await callCommand<ActionReport>("set_auto_save_for_file", {
+      const report = await callCommand<ActionReport>("set_live_mode_for_file", {
         change: { path, enabled },
       });
       setActions((current) => ({
@@ -2735,16 +3008,16 @@ function FileChangeList({
         },
       }));
       if (!report.ok) {
-        setAutoSaveOverrides((current) => ({
+        setLiveModeOverrides((current) => ({
           ...current,
-          [change.localPath]: change.autoSave,
+          [change.localPath]: change.liveMode,
         }));
       }
       await onRefresh?.().catch(() => undefined);
     } catch (error) {
-      setAutoSaveOverrides((current) => ({
+      setLiveModeOverrides((current) => ({
         ...current,
-        [change.localPath]: change.autoSave,
+        [change.localPath]: change.liveMode,
       }));
       setActions((current) => ({
         ...current,
@@ -2765,7 +3038,7 @@ function FileChangeList({
         const shouldReviewBeforePush = Boolean(!confirmDangerous && change.state === "needs_review" && onReview);
         const actionNeedsReview = Boolean(action?.state === "error" && pushNeedsReview(action.message) && onReview);
         const isSelected = selectedPath === change.localPath;
-        const autoSave = autoSaveOverrides[change.localPath] ?? change.autoSave;
+        const liveMode = liveModeOverrides[change.localPath] ?? change.liveMode;
         return (
           <article className={`file-row ${change.state} ${isSelected ? "expanded" : ""}`} key={change.localPath}>
             <div className="file-state">
@@ -2810,26 +3083,46 @@ function FileChangeList({
               )}
             </div>
             <div className="file-row-actions">
-              <div className={`auto-save-control ${autoSave.state}`}>
-                <span title={autoSave.reason || autoSave.label}>{autoSave.label}</span>
+              <div className={`file-live-mode ${liveMode.state}`}>
+                <span title={liveMode.reason || liveMode.label}>
+                  <Zap />
+                  {liveMode.label}
+                </span>
                 <button
-                  className={`toggle ${autoSave.enabled ? "enabled" : ""}`}
+                  className={`toggle ${liveMode.enabled ? "enabled" : ""}`}
                   type="button"
                   disabled={isWorking}
-                  aria-label={`${autoSave.enabled ? "Turn off" : "Turn on"} auto-save for ${change.title}`}
-                  onClick={() => void toggleAutoSave(change, !autoSave.enabled)}
+                  aria-label={`${liveMode.enabled ? "Turn off" : "Turn on"} Live Mode for ${change.title}`}
+                  onClick={() => void toggleFileLiveMode(change, !liveMode.enabled)}
                 >
                   <i />
                 </button>
               </div>
-              <SecondaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "diff")}>
-                Diff
-              </SecondaryButton>
-              <SecondaryButton compact disabled={isWorking} onClick={() => void runFileAction(change, "resolve")}>
-                Resolve
-              </SecondaryButton>
+              <div className="file-utility-actions">
+                <IconButton
+                  label="Show diff"
+                  disabled={isWorking}
+                  icon={<Search />}
+                  onClick={() => void runFileAction(change, "diff")}
+                />
+                <IconButton
+                  label="Pull latest"
+                  disabled={isWorking}
+                  icon={<RefreshCw />}
+                  onClick={() => void runFileAction(change, "resolve")}
+                />
+                <IconButton
+                  label="Open file"
+                  disabled={isWorking}
+                  icon={<FolderOpen />}
+                  onClick={() =>
+                    void callCommand("open_path", { path: joinMountPath(mountPath, change.localPath) }, { ok: true })
+                  }
+                />
+              </div>
               <PrimaryButton
                 compact
+                icon={shouldReviewBeforePush ? <ListChecks /> : <ShieldCheck />}
                 disabled={isWorking}
                 onClick={() => {
                   if (shouldReviewBeforePush) {
@@ -2841,15 +3134,6 @@ function FileChangeList({
               >
                 {shouldReviewBeforePush ? "Review" : "Push"}
               </PrimaryButton>
-              <SecondaryButton
-                compact
-                disabled={isWorking}
-                onClick={() =>
-                  void callCommand("open_path", { path: joinMountPath(mountPath, change.localPath) }, { ok: true })
-                }
-              >
-                Open
-              </SecondaryButton>
             </div>
             {isSelected && (
               <div className="file-detail-panel">
@@ -3123,6 +3407,24 @@ function SearchResultList({
 }
 
 function LocatedPath({ item }: { item: LocatedItem }) {
+  const [revealing, setRevealing] = useState(false);
+  const [revealError, setRevealError] = useState("");
+
+  async function revealLocatedPath() {
+    setRevealing(true);
+    setRevealError("");
+    try {
+      const report = await callCommand<ActionReport>("reveal_path", { path: item.localPath }, { ok: true, message: "" });
+      if (!report.ok) {
+        setRevealError(report.message);
+      }
+    } catch (error) {
+      setRevealError(errorMessage(error));
+    } finally {
+      setRevealing(false);
+    }
+  }
+
   return (
     <div className="located-path">
       <div>
@@ -3134,10 +3436,11 @@ function LocatedPath({ item }: { item: LocatedItem }) {
         <SecondaryButton compact icon={<Copy />} onClick={() => copyText(item.localPath)}>
           Copy Path
         </SecondaryButton>
-        <SecondaryButton compact icon={<FolderOpen />} onClick={() => void callCommand("reveal_path", { path: item.localPath }, { ok: true })}>
-          Reveal in Finder
+        <SecondaryButton compact busy={revealing} icon={<FolderOpen />} onClick={() => void revealLocatedPath()}>
+          {revealing ? "Preparing..." : "Reveal in Finder"}
         </SecondaryButton>
       </div>
+      {revealError && <p className="field-error">{revealError}</p>}
     </div>
   );
 }
@@ -3352,18 +3655,20 @@ function PrimaryButton({
   children,
   icon,
   compact,
+  busy,
   disabled,
   onClick,
 }: {
   children: React.ReactNode;
   icon?: React.ReactNode;
   compact?: boolean;
+  busy?: boolean;
   disabled?: boolean;
   onClick?: () => void;
 }) {
   return (
-    <button className={`primary-button ${compact ? "compact" : ""}`} disabled={disabled} onClick={onClick}>
-      {icon}
+    <button className={`primary-button ${compact ? "compact" : ""}`} disabled={disabled || busy} onClick={onClick} aria-busy={busy ? "true" : "false"}>
+      {busy ? <Loader2 className="spin-icon" /> : icon}
       <span>{children}</span>
     </button>
   );
@@ -3373,19 +3678,39 @@ function SecondaryButton({
   children,
   icon,
   compact,
+  busy,
   disabled,
   onClick,
 }: {
   children: React.ReactNode;
   icon?: React.ReactNode;
   compact?: boolean;
+  busy?: boolean;
   disabled?: boolean;
   onClick?: () => void;
 }) {
   return (
-    <button className={`secondary-button ${compact ? "compact" : ""}`} disabled={disabled} onClick={onClick}>
-      {icon}
+    <button className={`secondary-button ${compact ? "compact" : ""}`} disabled={disabled || busy} onClick={onClick} aria-busy={busy ? "true" : "false"}>
+      {busy ? <Loader2 className="spin-icon" /> : icon}
       <span>{children}</span>
+    </button>
+  );
+}
+
+function IconButton({
+  label,
+  icon,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  icon: React.ReactNode;
+  disabled?: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <button className="icon-button has-tooltip" type="button" disabled={disabled} onClick={onClick} aria-label={label} title={label} data-tooltip={label}>
+      {icon}
     </button>
   );
 }
@@ -3578,16 +3903,16 @@ function healthDescription(state: string, attentionCount: number) {
     return `${attentionCount} local change${attentionCount === 1 ? "" : "s"} waiting for review or push.`;
   }
   if (state === "reconnect_needed") {
-    return "Notion needs to be reconnected before AFS can sync this workspace.";
+    return "Notion needs to be reconnected before Locality can sync this workspace.";
   }
   if (state === "stopped") {
-    return "The AFS daemon is stopped. Background sync, hydration, and auto-save are paused; direct actions can still run from the app.";
+    return "The Locality daemon is stopped. Background sync, hydration, and Live Mode are paused; direct actions can still run from the app.";
   }
   if (state === "runtime_stopped") {
-    return "The filesystem provider is stopped or unregistered. Use Repair AFS in Settings to restore online-only file access.";
+    return "The filesystem provider is stopped or unregistered. Use Repair Locality in Settings to restore online-only file access.";
   }
   if (state === "checking_freshness") {
-    return "AFS is checking the local mount and Notion freshness state.";
+    return "Locality is checking the local mount and Notion freshness state.";
   }
   return "Notion is connected, the mount is ready, and remote writes remain explicit.";
 }

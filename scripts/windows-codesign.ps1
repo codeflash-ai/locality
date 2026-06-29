@@ -1,19 +1,19 @@
 $ErrorActionPreference = "Stop"
 
-function Test-AfsWindowsCodeSigningRequested {
+function Test-LocalityWindowsCodeSigningRequested {
     return (
-        $env:AFS_WINDOWS_CODESIGN -eq "1" -or
+        $env:LOCALITY_WINDOWS_CODESIGN -eq "1" -or
         -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_CERT_SHA1) -or
         -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_CERT_SUBJECT) -or
         -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_SUBJECT)
     )
 }
 
-function Test-AfsWindowsExternalCodeSigningRequested {
-    return $env:AFS_WINDOWS_EXTERNAL_CODESIGN -eq "1"
+function Test-LocalityWindowsExternalCodeSigningRequested {
+    return $env:LOCALITY_WINDOWS_EXTERNAL_CODESIGN -eq "1"
 }
 
-function Get-AfsSignTool {
+function Get-LocalitySignTool {
     if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNTOOL)) {
         if (Test-Path -LiteralPath $env:WINDOWS_SIGNTOOL) {
             return (Resolve-Path -LiteralPath $env:WINDOWS_SIGNTOOL).Path
@@ -44,20 +44,20 @@ function Get-AfsSignTool {
     throw "signtool.exe was not found. Install the Windows SDK or set WINDOWS_SIGNTOOL."
 }
 
-function Invoke-AfsWindowsCodeSign {
+function Invoke-LocalityWindowsCodeSign {
     param(
         [Parameter(Mandatory = $true)]
         [string] $Path
     )
 
-    if (-not (Test-AfsWindowsCodeSigningRequested)) {
+    if (-not (Test-LocalityWindowsCodeSigningRequested)) {
         return $false
     }
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Cannot sign missing file: $Path"
     }
 
-    $signTool = Get-AfsSignTool
+    $signTool = Get-LocalitySignTool
     $timestamp = if ($env:WINDOWS_CODESIGN_TIMESTAMP_URL) {
         $env:WINDOWS_CODESIGN_TIMESTAMP_URL
     } else {
@@ -86,7 +86,7 @@ function Invoke-AfsWindowsCodeSign {
     return $true
 }
 
-function Assert-AfsWindowsSigned {
+function Assert-LocalityWindowsSigned {
     param(
         [Parameter(Mandatory = $true)]
         [string] $Path

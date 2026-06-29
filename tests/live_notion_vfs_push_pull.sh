@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${AFS_LIVE_NOTION_VFS_PUSH_PULL:-}" != "1" ]]; then
-  echo "skip: set AFS_LIVE_NOTION_VFS_PUSH_PULL=1 to run the live Notion VFS push/pull test"
+if [[ "${LOCALITY_LIVE_NOTION_VFS_PUSH_PULL:-}" != "1" ]]; then
+  echo "skip: set LOCALITY_LIVE_NOTION_VFS_PUSH_PULL=1 to run the live Notion VFS push/pull test"
   exit 0
 fi
 
@@ -22,7 +22,7 @@ if ! command -v fusermount3 >/dev/null 2>&1; then
 fi
 
 notion_token="${NOTION_TOKEN:-${NOTION_AT:-}}"
-page_id="${AFS_NOTION_PAGE_ID:-${NOTION_PAGE_ID:-}}"
+page_id="${LOCALITY_NOTION_PAGE_ID:-${NOTION_PAGE_ID:-}}"
 
 if [[ -z "$notion_token" ]]; then
   echo "missing NOTION_TOKEN or NOTION_AT" >&2
@@ -30,27 +30,27 @@ if [[ -z "$notion_token" ]]; then
 fi
 
 if [[ -z "$page_id" ]]; then
-  echo "missing AFS_NOTION_PAGE_ID or NOTION_PAGE_ID" >&2
+  echo "missing LOCALITY_NOTION_PAGE_ID or NOTION_PAGE_ID" >&2
   exit 1
 fi
 normalized_page_id="$(printf '%s' "$page_id" | tr '[:upper:]' '[:lower:]' | tr -d '-')"
 
-afs_bin="${AFS_BIN:-./target/debug/afs}"
-afsd_bin="${AFSD_BIN:-./target/debug/afsd}"
-fuse_bin="${AFS_FUSE_BIN:-./target/debug/afs-fuse}"
-mount_id="${AFS_LIVE_NOTION_VFS_MOUNT_ID:-notion-live-vfs-push-pull-$$}"
-tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/afs-live-notion-vfs.XXXXXX")"
-state_root="${AFS_LIVE_NOTION_VFS_STATE:-$tmp_root/state}"
-afs_root="${AFS_LIVE_NOTION_VFS_ROOT:-$tmp_root/afs}"
-mount_root="$afs_root/notion"
-daemon_log="$tmp_root/afsd.log"
-fuse_log="$tmp_root/afs-fuse.log"
+loc_bin="${LOCALITY_BIN:-./target/debug/loc}"
+localityd_bin="${LOCALITYD_BIN:-./target/debug/localityd}"
+fuse_bin="${LOCALITY_FUSE_BIN:-./target/debug/locality-fuse}"
+mount_id="${LOCALITY_LIVE_NOTION_VFS_MOUNT_ID:-notion-live-vfs-push-pull-$$}"
+tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-live-notion-vfs.XXXXXX")"
+state_root="${LOCALITY_LIVE_NOTION_VFS_STATE:-$tmp_root/state}"
+loc_root="${LOCALITY_LIVE_NOTION_VFS_ROOT:-$tmp_root/loc}"
+mount_root="$loc_root/notion"
+daemon_log="$tmp_root/localityd.log"
+fuse_log="$tmp_root/locality-fuse.log"
 original_file="$tmp_root/original-page.md"
 initial_pull="$tmp_root/initial-pull.json"
 file_pull="$tmp_root/file-pull.json"
 push_output="$tmp_root/push.json"
 pull_after_push="$tmp_root/pull-after-push.json"
-afsd_pid=""
+localityd_pid=""
 fuse_pid=""
 page_file=""
 restore_needed=0
@@ -84,21 +84,21 @@ cleanup() {
   set +e
   if [[ "$restore_needed" == "1" && -n "$page_file" && -f "$original_file" && -e "$page_file" ]]; then
     cp "$original_file" "$page_file"
-    AFS_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
-      "$afs_bin" push "$page_file" -y --json >/dev/null 2>&1
+    LOCALITY_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
+      "$loc_bin" push "$page_file" -y --json >/dev/null 2>&1
   fi
-  if mountpoint -q "$afs_root"; then
-    fusermount3 -uz "$afs_root" >/dev/null 2>&1
+  if mountpoint -q "$loc_root"; then
+    fusermount3 -uz "$loc_root" >/dev/null 2>&1
   fi
   if [[ -n "$fuse_pid" ]] && kill -0 "$fuse_pid" >/dev/null 2>&1; then
     kill "$fuse_pid" >/dev/null 2>&1
     wait "$fuse_pid" >/dev/null 2>&1
   fi
-  if [[ -n "$afsd_pid" ]] && kill -0 "$afsd_pid" >/dev/null 2>&1; then
-    kill "$afsd_pid" >/dev/null 2>&1
-    wait "$afsd_pid" >/dev/null 2>&1
+  if [[ -n "$localityd_pid" ]] && kill -0 "$localityd_pid" >/dev/null 2>&1; then
+    kill "$localityd_pid" >/dev/null 2>&1
+    wait "$localityd_pid" >/dev/null 2>&1
   fi
-  if [[ "${AFS_LIVE_NOTION_VFS_KEEP_TMP:-}" == "1" ]]; then
+  if [[ "${LOCALITY_LIVE_NOTION_VFS_KEEP_TMP:-}" == "1" ]]; then
     echo "kept live Notion VFS temp root: $tmp_root"
   else
     rm -rf "$tmp_root"
@@ -107,29 +107,29 @@ cleanup() {
 trap on_error ERR
 trap cleanup EXIT
 
-if [[ ! -x "$afs_bin" || ! -x "$afsd_bin" || ! -x "$fuse_bin" ]]; then
-  cargo build -p afsd -p afs-cli -p afs-fuse
+if [[ ! -x "$loc_bin" || ! -x "$localityd_bin" || ! -x "$fuse_bin" ]]; then
+  cargo build -p localityd -p loc-cli -p locality-fuse
 fi
 
 wait_for_daemon() {
   for _ in {1..80}; do
-    if AFS_STATE_DIR="$state_root" "$afs_bin" daemon status --state-dir "$state_root" --json \
+    if LOCALITY_STATE_DIR="$state_root" "$loc_bin" daemon status --state-dir "$state_root" --json \
       | grep -q '"state": "running"'; then
       return 0
     fi
     sleep 0.25
   done
-  echo "afsd did not become ready" >&2
+  echo "localityd did not become ready" >&2
   return 1
 }
 
 wait_for_mount() {
   for _ in {1..80}; do
-    if mountpoint -q "$afs_root"; then
+    if mountpoint -q "$loc_root"; then
       return 0
     fi
     if [[ -n "$fuse_pid" ]] && ! kill -0 "$fuse_pid" >/dev/null 2>&1; then
-      echo "afs-fuse exited before mount became ready" >&2
+      echo "locality-fuse exited before mount became ready" >&2
       return 1
     fi
     sleep 0.25
@@ -159,44 +159,44 @@ assert_no_conflict_markers() {
 }
 
 step="creating temp directories"
-mkdir -p "$state_root" "$afs_root" "$mount_root"
+mkdir -p "$state_root" "$loc_root" "$mount_root"
 
 step="registering Notion Linux FUSE mount"
-AFS_STATE_DIR="$state_root" AFS_DAEMON_DISABLE=1 NOTION_TOKEN="$notion_token" \
-  "$afs_bin" mount notion "$mount_root" \
+LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 NOTION_TOKEN="$notion_token" \
+  "$loc_bin" mount notion "$mount_root" \
     --root-page "$page_id" \
     --mount-id "$mount_id" \
     --projection linux-fuse \
     --json >/dev/null
 
-step="starting afsd"
-AFS_STATE_DIR="$state_root" AFS_DAEMON_TCP_ADDR=off NOTION_TOKEN="$notion_token" \
-  "$afsd_bin" >"$daemon_log" 2>&1 &
-afsd_pid="$!"
+step="starting localityd"
+LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_TCP_ADDR=off NOTION_TOKEN="$notion_token" \
+  "$localityd_bin" >"$daemon_log" 2>&1 &
+localityd_pid="$!"
 wait_for_daemon
 
-step="starting afs-fuse"
-AFS_STATE_DIR="$state_root" "$fuse_bin" \
+step="starting locality-fuse"
+LOCALITY_STATE_DIR="$state_root" "$fuse_bin" \
   --mount-id "$mount_id" \
   --state-dir "$state_root" \
-  --mountpoint "$afs_root" >"$fuse_log" 2>&1 &
+  --mountpoint "$loc_root" >"$fuse_log" 2>&1 &
 fuse_pid="$!"
 wait_for_mount
 
 step="pulling root page"
-AFS_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
-  "$afs_bin" pull "$mount_root" --json >"$initial_pull"
+LOCALITY_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
+  "$loc_bin" pull "$mount_root" --json >"$initial_pull"
 step="locating pulled page file"
 page_file="$(find_pulled_page_file)"
 step="pulling page file"
-AFS_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
-  "$afs_bin" pull "$page_file" --json >"$file_pull"
+LOCALITY_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
+  "$loc_bin" pull "$page_file" --json >"$file_pull"
 
 step="saving original content"
 cp "$page_file" "$original_file"
 restore_needed=1
 
-marker="AFS live VFS push-pull block $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$"
+marker="Locality live VFS push-pull block $(date -u +%Y-%m-%dT%H:%M:%SZ)-$$"
 step="editing page file"
 edit_file="$tmp_root/edited-page.md"
 awk -v marker="$marker" '
@@ -224,12 +224,12 @@ cp "$edit_file" "$page_file"
 
 step="pushing edited page file through the direct CLI path"
 push_exit=0
-AFS_DAEMON_DISABLE=1 AFS_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
-  "$afs_bin" push "$page_file" -y --json >"$push_output" || push_exit=$?
+LOCALITY_DAEMON_DISABLE=1 LOCALITY_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
+  "$loc_bin" push "$page_file" -y --json >"$push_output" || push_exit=$?
 step="pulling immediately after push"
 pull_exit=0
-AFS_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
-  "$afs_bin" pull "$page_file" --json >"$pull_after_push" || pull_exit=$?
+LOCALITY_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
+  "$loc_bin" pull "$page_file" --json >"$pull_after_push" || pull_exit=$?
 
 step="checking for conflict markers"
 assert_no_conflict_markers "$page_file"
@@ -247,7 +247,7 @@ fi
 
 step="restoring original content"
 cp "$original_file" "$page_file"
-AFS_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" "$afs_bin" push "$page_file" -y --json >/dev/null
+LOCALITY_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" "$loc_bin" push "$page_file" -y --json >/dev/null
 restore_needed=0
 
 echo "live Notion VFS push/pull test passed"

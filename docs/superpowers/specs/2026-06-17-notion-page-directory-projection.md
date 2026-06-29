@@ -111,7 +111,7 @@ its parent folder.
 
 ### 3. Update Notion projection
 
-Change `afs-notion` path allocation so page entries use
+Change `locality-notion` path allocation so page entries use
 `<slug>/page.md` for clean sibling names and `<slug shortid>/page.md` only
 when a sibling collision requires a remote-ID suffix. Reserve both the directory stem and the legacy
 `<stem>.md` sibling while allocating names, so the new layout cannot collide
@@ -161,7 +161,7 @@ block automatic migration and ask the user to push, restore, or resolve first.
 
 ### 6. Add a migration command/path
 
-Add an explicit migration path, likely `afs migrate notion-page-layout <mount>`,
+Add an explicit migration path, likely `loc migrate notion-page-layout <mount>`,
 before flipping defaults. The migration should:
 
 - scan entities, virtual mutations, hydration jobs, freshness observations, and
@@ -174,7 +174,7 @@ before flipping defaults. The migration should:
   and pending creates/renames/deletes.
 
 Keep old-path lookup aliases for at least one release where practical, so
-`afs search`, `afs info`, and explicit CLI paths can explain that
+`loc search`, `loc info`, and explicit CLI paths can explain that
 `roadmap.md` moved to `roadmap/page.md`.
 
 ### 7. Update docs and guidance
@@ -192,13 +192,13 @@ that directory are child Notion content.
 
 Add focused tests before broader snapshots:
 
-- `afs-notion` path allocation produces `<stem>/page.md` and reserves legacy
+- `locality-notion` path allocation produces `<stem>/page.md` and reserves legacy
   sibling names.
 - Virtual FS listings show one folder per page and include `page.md` inside the
   page folder.
 - Materializing and writing `page.md` hydrate and dirty the page entity.
-- `afs search` returns the `page.md` path for pages.
-- `afs status`, `afs diff`, `afs inspect`, `afs pull`, and `afs push` accept
+- `loc search` returns the `page.md` path for pages.
+- `loc status`, `loc diff`, `loc inspect`, `loc pull`, and `loc push` accept
   `page.md` paths.
 - Database row creation still accepts a new `.md` file directly under a database
   directory and reconciles to `<row-stem>/page.md`.

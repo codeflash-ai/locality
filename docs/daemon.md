@@ -1,6 +1,6 @@
 # Daemon
 
-`afsd` is the local supervisor for mounted AgentFS trees. The daemon is the
+`localityd` is the local supervisor for mounted Locality trees. The daemon is the
 stateful execution owner: CLI surfaces and future IPC submit jobs, while the
 daemon mutates local files, shadows, hydration state, journals, and remote
 sources through one serialized boundary.
@@ -15,47 +15,47 @@ state advancement cannot drift across separate store handles.
 
 The boundary keeps responsibilities sharp:
 
-- `afs-core` decides pure sync state and validates plans;
+- `locality-core` decides pure sync state and validates plans;
 - connectors enumerate, fetch, render, and apply source-specific mutations;
-- `afsd` executes jobs and is the only layer that advances durable sync state or
+- `localityd` executes jobs and is the only layer that advances durable sync state or
   mutates the local projection.
 
 ## Process Management
 
-`afsd` stays intentionally small: it runs the daemon in the foreground and owns
+`localityd` stays intentionally small: it runs the daemon in the foreground and owns
 the runtime, sockets, watchers, scheduler, and job queue. User-facing process
-management lives in `afs daemon ...`:
+management lives in `loc daemon ...`:
 
-- `afs daemon start` starts a background daemon. On macOS this installs and
-  bootstraps `~/Library/LaunchAgents/ai.codeflash.afs.afsd.plist` by default,
+- `loc daemon start` starts a background daemon. On macOS this installs and
+  bootstraps `~/Library/LaunchAgents/ai.codeflash.locality.localityd.plist` by default,
   with `RunAtLoad` and `KeepAlive` so it starts at login and restarts after
   crashes.
-- `afs daemon start --session` starts a detached child process that inherits the
-  current shell environment and writes `~/.afs/afsd.pid`. This is useful for
+- `loc daemon start --session` starts a detached child process that inherits the
+  current shell environment and writes `~/.loc/localityd.pid`. This is useful for
   development credentials and temporary test state, but it does not survive
   logout.
 - On Windows, session mode uses localhost TCP control IPC. `--tcp-addr off` is
   rejected for daemon start because Windows does not have the Unix socket
   fallback used by macOS/Linux CLI control.
-- `afs daemon status` pings the daemon control endpoint and reports the state
+- `loc daemon status` pings the daemon control endpoint and reports the state
   root, socket path, TCP address, manager, log path, runtime queue counts,
   scheduler mode, and watched mount roots.
-- `afs daemon reload` asks the running daemon to reconcile file watches with the
+- `loc daemon reload` asks the running daemon to reconcile file watches with the
   current SQLite mount table.
-- `afs daemon stop` unloads the LaunchAgent or kills the session pid file when
-  the CLI owns the daemon. A manually started foreground `afsd` still needs to be
+- `loc daemon stop` unloads the LaunchAgent or kills the session pid file when
+  the CLI owns the daemon. A manually started foreground `localityd` still needs to be
   stopped directly.
 
-The process manager passes `AFS_STATE_DIR` to the daemon it starts. `--tcp-addr`
-persists `AFS_DAEMON_TCP_ADDR` for that managed daemon. `--include-env <KEY>` is
+The process manager passes `LOCALITY_STATE_DIR` to the daemon it starts. `--tcp-addr`
+persists `LOCALITY_DAEMON_TCP_ADDR` for that managed daemon. `--include-env <KEY>` is
 available for short-lived development variables that launchd would not otherwise
-inherit; long-lived connector auth should move to `afs connect` and keychain
+inherit; long-lived connector auth should move to `loc connect` and keychain
 storage instead of plist environment variables.
 
 ## Foreground Daemon
 
-`afsd` now runs a foreground Unix-socket server at `AFS_STATE_DIR/afsd.sock`
-or `~/.afs/afsd.sock` on Unix, plus a localhost TCP listener at
+`localityd` now runs a foreground Unix-socket server at `LOCALITY_STATE_DIR/localityd.sock`
+or `~/.loc/localityd.sock` on Unix, plus a localhost TCP listener at
 `127.0.0.1:38567` by default. On Windows, the TCP listener is the daemon control
 endpoint. It also serves a lightweight MCP-over-HTTP endpoint at
 `http://127.0.0.1:38568/mcp` by default. On Unix, CLI `pull` and `push` try the
@@ -64,23 +64,23 @@ endpoint is unavailable, they fall back to the same in-process executor; if the
 daemon accepts a request but does not answer within the CLI timeout, `pull`
 falls back to direct execution while `push` fails closed to avoid duplicate
 remote writes. The macOS File Provider extension uses the TCP listener because
-the extension is sandboxed. Set `AFS_DAEMON_TCP_ADDR=off` to disable daemon TCP
+the extension is sandboxed. Set `LOCALITY_DAEMON_TCP_ADDR=off` to disable daemon TCP
 on Unix, or set it to `host:port` to move the listener. Set
-`AFS_MCP_ADDR=off` to disable the MCP endpoint, or set it to `host:port` to move
-the endpoint. Setting `AFS_DAEMON_DISABLE=1` forces the CLI fallback path, which
-is useful for tests and recovery. Set `AFS_DAEMON_REQUEST_TIMEOUT_MS` to tune the
+`LOCALITY_MCP_ADDR=off` to disable the MCP endpoint, or set it to `host:port` to move
+the endpoint. Setting `LOCALITY_DAEMON_DISABLE=1` forces the CLI fallback path, which
+is useful for tests and recovery. Set `LOCALITY_DAEMON_REQUEST_TIMEOUT_MS` to tune the
 CLI daemon request timeout.
 
-The MCP endpoint exposes one tool named `afs`. The tool accepts CLI-style
+The MCP endpoint exposes one tool named `loc`. The tool accepts CLI-style
 arguments as `argv`, plus optional `cwd` and `timeoutMs`. It is a fallback for
-agent sandboxes that cannot run the host `afs` binary directly; agents that can
-run `afs` should keep using the CLI. URL-based clients use the daemon HTTP
-endpoint with a per-install bearer token stored at `AFS_STATE_DIR/mcp-token` or
-`~/.afs/mcp-token`; the desktop agent installer writes that token into supported
+agent sandboxes that cannot run the host `loc` binary directly; agents that can
+run `loc` should keep using the CLI. URL-based clients use the daemon HTTP
+endpoint with a per-install bearer token stored at `LOCALITY_STATE_DIR/mcp-token` or
+`~/.loc/mcp-token`; the desktop agent installer writes that token into supported
 local agent MCP config files. Claude Desktop is configured differently: it
-launches `afs mcp` and communicates over stdio because Claude Desktop's local
+launches `loc mcp` and communicates over stdio because Claude Desktop's local
 MCP config expects a command-shaped local server. The endpoint does not do work
-while idle; the listener thread blocks on accept and only spawns the host `afs`
+while idle; the listener thread blocks on accept and only spawns the host `loc`
 binary for actual MCP tool calls. To avoid exposing this host bridge to
 arbitrary browser origins, requests with an `Origin` header are accepted only
 from localhost origins.
@@ -94,7 +94,7 @@ to pings, and two pull/push/hydration mutations cannot advance durable state at
 the same time.
 
 For macOS File Provider mounts, the Swift extension normally sends writes to the
-daemon through `modifyItem`. AFS also has a narrow reconciliation fallback at
+daemon through `modifyItem`. Locality also has a narrow reconciliation fallback at
 review and push boundaries: explicit-path status, diff, push, auto-save, and
 desktop file actions can import a newer visible CloudStorage file into the
 daemon content cache before planning. This fallback is intentionally scoped to
@@ -103,7 +103,7 @@ projection.
 
 ## Operator Guide
 
-Reset a local macOS test machine to a clean AFS install state:
+Reset a local macOS test machine to a clean Locality install state:
 
 ```bash
 make clean-start-plan
@@ -112,9 +112,9 @@ make clean-start
 
 `make clean-start-plan` is a dry run. `make clean-start` stops the desktop app,
 daemon, and File Provider extension; unregisters File Provider domains; removes
-safe AFS mount roots such as `~/Documents/AFS`, `~/Library/CloudStorage/AFS`,
-and `~/Library/CloudStorage/AFS-*`;
-deletes `~/.afs`; removes the installed `/Applications/AFS.app`; and deletes AFS
+safe Locality mount roots such as `~/Documents/Locality`, `~/Library/CloudStorage/Locality`,
+and `~/Library/CloudStorage/Locality-*`;
+deletes `~/.loc`; removes the installed `/Applications/Locality.app`; and deletes Locality
 connection credentials from the keychain. Run
 `scripts/clean-start.sh --yes --keep-credentials` when testing app install state
 without clearing OAuth/PAT credentials.
@@ -122,59 +122,59 @@ without clearing OAuth/PAT credentials.
 Start the daemon in the foreground:
 
 ```bash
-afsd
+localityd
 ```
 
 From a source checkout, use either repo-root command:
 
 ```bash
 make run-daemon
-cargo run -p afsd
+cargo run -p localityd
 ```
 
 On startup it prints the socket path, watched mounts, and auth source:
 
 ```text
-afsd listening on /Users/alice/.afs/afsd.sock
-afsd watching 1 mount: /Users/alice/afs/notion
-afsd auth: connection notion-work
+localityd listening on /Users/alice/.loc/localityd.sock
+localityd watching 1 mount: /Users/alice/loc/notion
+localityd auth: connection notion-work
 ```
 
 Check health from the CLI:
 
 ```bash
-afs daemon status
+loc daemon status
 ```
 
 Successful output:
 
 ```text
-daemon running  socket=/Users/alice/.afs/afsd.sock  ping=ok
+daemon running  socket=/Users/alice/.loc/localityd.sock  ping=ok
 ```
 
 Stopped output:
 
 ```text
-daemon stopped  socket=/Users/alice/.afs/afsd.sock
-  hint: run `afsd` in another terminal
+daemon stopped  socket=/Users/alice/.loc/localityd.sock
+  hint: run `localityd` in another terminal
 ```
 
-`afs pull` and `afs push` try the daemon first. Human success output includes `(via daemon)` or `(via cli)`, and JSON reports include `via`. If the socket is unavailable, the CLI falls back to direct execution and prints:
+`loc pull` and `loc push` try the daemon first. Human success output includes `(via daemon)` or `(via cli)`, and JSON reports include `via`. If the socket is unavailable, the CLI falls back to direct execution and prints:
 
 ```text
-afsd not running; executing pull directly (start afsd for background hydration)
+localityd not running; executing pull directly (start localityd for background hydration)
 ```
 
 If a `pull` request times out after being submitted, the CLI also falls back and
 prints:
 
 ```text
-afsd did not respond within 5000ms; executing pull directly
+localityd did not respond within 5000ms; executing pull directly
 ```
 
 Timed-out `push` requests do not fall back because the daemon may already own an
 in-flight remote mutation. Stop or recover the daemon before retrying the push.
-Set `AFS_DAEMON_DISABLE=1` to force direct execution without the fallback warning.
+Set `LOCALITY_DAEMON_DISABLE=1` to force direct execution without the fallback warning.
 
 ## Runtime Loop
 
@@ -192,7 +192,7 @@ important invariant: daemon-managed mutations are serialized through one queue.
 Watcher events use the same queue, so local filesystem changes cannot race
 remote pull, hydration, or push reconciliation. Runtime status includes the
 current active job kind, target, start time, and elapsed time so wedged workers
-are visible through `afs daemon status`.
+are visible through `loc daemon status`.
 
 ## Virtual Filesystem Projections
 
@@ -214,7 +214,7 @@ macOS File Provider uses this boundary through compatibility IPC names
 (`file_provider_item`, `file_provider_children`, and
 `file_provider_materialize`). The Swift extension copies the materialized path
 into File Provider's transfer directory before completing `fetchContents`, so the
-system can take ownership without moving AgentFS's canonical hydrated copy.
+system can take ownership without moving Locality's canonical hydrated copy.
 
 Linux uses a separate FUSE projection adapter over the same daemon boundary.
 `readdir` and `getattr` read store metadata, `open`/`read` block on daemon
@@ -224,9 +224,9 @@ callbacks become pending virtual mutations. inotify is not sufficient for
 online-only reads because it observes filesystem activity after the kernel has
 already asked for file contents; fanotify permission events can block opens but
 still require a backing file to exist before allowing the open. FUSE is the clean
-Linux equivalent because AgentFS directly serves the read.
+Linux equivalent because Locality directly serves the read.
 
-Virtual projection contents are materialized under `~/.afs/content/<mount-id>/`
+Virtual projection contents are materialized under `~/.loc/content/<mount-id>/`
 instead of under the mounted root. This avoids recursive FUSE calls when the root
 is itself a virtual mount and gives macOS/Linux adapters one stable byte source.
 
@@ -240,7 +240,7 @@ use the fallback watcher path below.
 
 The foreground daemon starts a `notify` watcher for every mount loaded from the
 SQLite store at startup, and `reload_mounts` reconciles those watches with the
-current mount table without restarting the process. `afs mount` calls this IPC
+current mount table without restarting the process. `loc mount` calls this IPC
 after saving a mount, so persistent daemons begin watching newly mounted
 directories immediately. Create and modify notifications are normalized to
 `Write` events, native access/open notifications are normalized to `Read` events
@@ -267,8 +267,8 @@ hydration worker path. Reads of hydrated, dirty, or conflicted files are ignored
 
 ## Push Execution
 
-`afsd::push::execute_push_job` prepares an explicit push job from the target
-path, asks `afs-core` to plan and gate the mutation, and then executes the
+`localityd::push::execute_push_job` prepares an explicit push job from the target
+path, asks `locality-core` to plan and gate the mutation, and then executes the
 approved plan through a combined journal/check/apply/reconcile host. The host
 owns one mutable store reference for the entire transaction:
 
@@ -325,7 +325,7 @@ matches the Synced Tree shadow body, the executor skips that request and marks
 the entity `dirty` when the hydration ladder allows it. Source or I/O failures
 leave the request in the queue so a later daemon tick can retry.
 
-`afsd::notion` wires `NotionConnector` into this source boundary. It uses the
+`localityd::notion` wires `NotionConnector` into this source boundary. It uses the
 Notion connector's fetch path and path-aware render method so daemon hydration
 persists the same shadow snapshot and media projection that CLI pull uses.
 
@@ -337,9 +337,18 @@ matches the previous shadow. Diverged visible files are left alone so background
 remote refresh cannot erase a local edit that missed the normal File Provider
 write callback.
 
+Desktop Live Mode uses the same boundary in a bounded loop. The primary
+local-write path is File Provider `modifyItem`; the visible CloudStorage
+reconciliation fallback is throttled and scoped to the selected
+already-hydrated page so the app does not poll the user-visible file every tick.
+Remote checks fetch one already-hydrated page into the daemon content cache and
+compare the rendered shadow before refreshing the visible projection. This avoids
+relying on Notion page metadata that can miss some body edits, while leaving
+unchanged CloudStorage replicas untouched.
+
 ## Scheduled Pull Reconciliation
 
-`reconcile_scheduled_pull` is the daemon-side counterpart to `afs pull` for
+`reconcile_scheduled_pull` is the daemon-side counterpart to `loc pull` for
 background refresh. It executes a strategy decision rather than owning scheduling
 policy itself:
 

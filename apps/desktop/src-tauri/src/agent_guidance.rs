@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-const MANAGED_START: &str = "<!-- AFS_AGENT_GUIDANCE_START -->";
-const MANAGED_END: &str = "<!-- AFS_AGENT_GUIDANCE_END -->";
-const DEFAULT_NOTION_MOUNT: &str = "~/Library/CloudStorage/AFS/notion";
-const MCP_SERVER_NAME: &str = "afs";
+const MANAGED_START: &str = "<!-- LOCALITY_AGENT_GUIDANCE_START -->";
+const MANAGED_END: &str = "<!-- LOCALITY_AGENT_GUIDANCE_END -->";
+const DEFAULT_NOTION_MOUNT: &str = "~/Library/CloudStorage/Locality/notion";
+const MCP_SERVER_NAME: &str = "loc";
+const SKILL_DIR_NAME: &str = "locality";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,10 +90,10 @@ pub fn install_agent_guidance(mount_path: Option<&str>) -> AgentGuidanceInstallR
 
     if targets.is_empty() {
         targets.push(AgentGuidanceTarget {
-            agent: "AFS Notion folder".to_string(),
+            agent: "Locality Notion folder".to_string(),
             status: "available".to_string(),
             path: Some(format!("{mount_path}/AGENTS.md")),
-            detail: "No supported local agent install was detected. AFS guidance is still available inside the Notion folder.".to_string(),
+            detail: "No supported local agent install was detected. Locality guidance is still available inside the Notion folder.".to_string(),
         });
     }
 
@@ -113,13 +114,13 @@ fn install_mcp_targets(home: &Path) -> Vec<AgentGuidanceTarget> {
         return Vec::new();
     }
 
-    let token = match afsd::mcp::ensure_mcp_token(&default_state_root()) {
+    let token = match localityd::mcp::ensure_mcp_token(&default_state_root()) {
         Ok(token) => token,
         Err(error) => {
             return vec![AgentGuidanceTarget {
-                agent: "AFS MCP".to_string(),
+                agent: "Locality MCP".to_string(),
                 status: "failed".to_string(),
-                path: Some(display_path(&afsd::mcp::mcp_token_path(
+                path: Some(display_path(&localityd::mcp::mcp_token_path(
                     &default_state_root(),
                 ))),
                 detail: error,
@@ -156,52 +157,52 @@ fn agent_target_specs(home: &Path) -> Vec<AgentTargetSpec> {
     vec![
         AgentTargetSpec {
             agent: "Claude Code / Claude Desktop / Claude Cowork",
-            path: home.join(".claude/skills/afs/SKILL.md"),
+            path: skill_path(home, ".claude/skills"),
             kind: InstallKind::Skill,
             detected: claude_detected,
-            detail: "Installed the AFS skill for Claude local agents.",
+            detail: "Installed the Locality skill for Claude local agents.",
         },
         AgentTargetSpec {
             agent: "Codex",
-            path: home.join(".codex/skills/afs/SKILL.md"),
+            path: skill_path(home, ".codex/skills"),
             kind: InstallKind::Skill,
             detected: codex_detected,
-            detail: "Installed the AFS skill for Codex.",
+            detail: "Installed the Locality skill for Codex.",
         },
         AgentTargetSpec {
             agent: "Warp",
-            path: home.join(".agents/skills/afs/SKILL.md"),
+            path: skill_path(home, ".agents/skills"),
             kind: InstallKind::Skill,
             detected: warp_detected,
-            detail: "Installed the AFS skill for Warp and Oz skills discovery.",
+            detail: "Installed the Locality skill for Warp and Oz skills discovery.",
         },
         AgentTargetSpec {
             agent: "OpenCode",
-            path: home.join(".agents/skills/afs/SKILL.md"),
+            path: skill_path(home, ".agents/skills"),
             kind: InstallKind::Skill,
             detected: opencode_detected,
-            detail: "Installed the AFS skill for OpenCode's shared skill discovery.",
+            detail: "Installed the Locality skill for OpenCode's shared skill discovery.",
         },
         AgentTargetSpec {
             agent: "Gemini CLI",
             path: home.join(".gemini/GEMINI.md"),
             kind: InstallKind::ManagedInstructions,
             detected: gemini_detected,
-            detail: "Installed a managed AFS section in Gemini's global instructions.",
+            detail: "Installed a managed Locality section in Gemini's global instructions.",
         },
         AgentTargetSpec {
             agent: "Shared AGENTS.md agents",
             path: home.join(".agents/AGENTS.md"),
             kind: InstallKind::ManagedInstructions,
             detected: shared_agents_detected,
-            detail: "Installed fallback AFS instructions for agents that read global AGENTS.md.",
+            detail: "Installed fallback Locality instructions for agents that read global AGENTS.md.",
         },
         AgentTargetSpec {
             agent: "GitHub Copilot CLI",
             path: home.join(".copilot/copilot-instructions.md"),
             kind: InstallKind::ManagedInstructions,
             detected: copilot_detected,
-            detail: "Installed a managed AFS section in Copilot CLI instructions.",
+            detail: "Installed a managed Locality section in Copilot CLI instructions.",
         },
     ]
 }
@@ -224,42 +225,42 @@ fn mcp_target_specs(home: &Path) -> Vec<McpTargetSpec> {
             path: home.join(".claude.json"),
             kind: McpInstallKind::McpServersJson,
             detected: claude_detected,
-            detail: "Configured the AFS MCP fallback for Claude local agents.",
+            detail: "Configured the Locality MCP fallback for Claude local agents.",
         },
         McpTargetSpec {
             agent: "Claude Desktop MCP",
             path: home.join("Library/Application Support/Claude/claude_desktop_config.json"),
             kind: McpInstallKind::ClaudeDesktopJson,
             detected: mac_app_exists(home, "Claude.app"),
-            detail: "Configured the local AFS MCP fallback for Claude Desktop.",
+            detail: "Configured the local Locality MCP fallback for Claude Desktop.",
         },
         McpTargetSpec {
             agent: "Codex MCP",
             path: home.join(".codex/config.toml"),
             kind: McpInstallKind::CodexToml,
             detected: codex_detected,
-            detail: "Configured the AFS MCP fallback for Codex.",
+            detail: "Configured the Locality MCP fallback for Codex.",
         },
         McpTargetSpec {
             agent: "Cursor MCP",
             path: home.join(".cursor/mcp.json"),
             kind: McpInstallKind::McpServersJson,
             detected: cursor_detected,
-            detail: "Configured the AFS MCP fallback for Cursor.",
+            detail: "Configured the Locality MCP fallback for Cursor.",
         },
         McpTargetSpec {
             agent: "Windsurf MCP",
             path: home.join(".windsurf/mcp.json"),
             kind: McpInstallKind::McpServersJson,
             detected: windsurf_detected,
-            detail: "Configured the AFS MCP fallback for Windsurf.",
+            detail: "Configured the Locality MCP fallback for Windsurf.",
         },
         McpTargetSpec {
             agent: "GitHub Copilot MCP",
             path: home.join(".config/github-copilot/intellij/mcp.json"),
             kind: McpInstallKind::CopilotServersJson,
             detected: copilot_detected,
-            detail: "Configured the AFS MCP fallback for GitHub Copilot.",
+            detail: "Configured the Locality MCP fallback for GitHub Copilot.",
         },
     ]
 }
@@ -288,6 +289,10 @@ fn install_target(spec: &AgentTargetSpec, mount_path: &str) -> AgentGuidanceTarg
             detail: error,
         },
     }
+}
+
+fn skill_path(home: &Path, skills_root: &str) -> PathBuf {
+    home.join(skills_root).join(SKILL_DIR_NAME).join("SKILL.md")
 }
 
 fn install_mcp_target(spec: &McpTargetSpec, token: &str) -> AgentGuidanceTarget {
@@ -319,13 +324,13 @@ fn install_mcp_target(spec: &McpTargetSpec, token: &str) -> AgentGuidanceTarget 
 fn skill_markdown(mount_path: &str) -> String {
     format!(
         r#"---
-name: afs
-description: Use AFS when the user wants to find, read, or edit Notion/company docs through local filesystem files.
+name: locality
+description: Use Locality when the user wants to find, read, or edit Notion/company docs through local filesystem files.
 ---
 
-# AFS
+# Locality
 
-AFS projects connected company sources, including Notion, into the local filesystem so agents can edit normal Markdown files and let the user review/push the changes back.
+Locality projects connected company sources, including Notion, into the local filesystem so agents can edit normal Markdown files and let the user review/push the changes back.
 
 ## Where to work
 
@@ -337,31 +342,32 @@ AFS projects connected company sources, including Notion, into the local filesys
 
 1. If the user gives a Notion URL, locate the matching local Markdown file before editing.
 2. Edit the local Markdown file directly.
-3. Do not edit AFS identity frontmatter, block IDs, `::afs{{...}}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
-4. Leave edits pending for AFS review and tell the user what changed.
-5. If an AFS CLI is available, use `afs status` only when you need to inspect pending changes; regular clean files hydrate automatically on open.
-6. Only push when the user explicitly asks. Run `afs diff <file>` first, then `afs push <file> -y` for safe plans.
-7. If push says the remote changed since last sync, run `afs pull <file>`, resolve any inline conflict markers in the Markdown, rerun `afs diff <file>`, then push again.
+3. Do not edit Locality identity frontmatter, block IDs, `::loc{{...}}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
+4. Leave edits pending for Locality review and tell the user what changed.
+5. If an Locality CLI is available, use `loc status` only when you need to inspect pending changes; regular clean files hydrate automatically on open.
+6. If desktop Live Mode is on, safe local edits may sync automatically. Do not run routine `loc pull` or `loc push` after every edit.
+7. Only push when the user explicitly asks or when Live Mode pauses for review. Run `loc diff <file>` first, then `loc push <file> -y` for safe plans.
+8. If push says the remote changed since last sync, run `loc pull <file>`, resolve any inline conflict markers in the Markdown, rerun `loc diff <file>`, then push again.
 
 ## Creating Notion Content
 
 - Read `{mount_path}/AGENTS.md` for connector-specific creation rules.
 - Pages are directories; edit or create the `page.md` inside the page directory.
 - To create a child page, create `parent-page/new-page/page.md`.
-- New `page.md` files need YAML frontmatter with `title: "..."` and no `afs:` identity block.
-- Existing files already have an `afs:` block; preserve it and edit only the body, `title`, and supported property frontmatter.
+- New `page.md` files need YAML frontmatter with `title: "..."` and no `loc:` identity block.
+- Existing files already have an `loc:` block; preserve it and edit only the body, `title`, and supported property frontmatter.
 - Database rows can be created as `database/new-row/page.md` or, where supported, direct `database/new-row.md` files.
 
 ## MCP fallback
 
-If your sandbox cannot run the host `afs` CLI, use the MCP tool named `afs`.
+If your sandbox cannot run the host `loc` CLI, use the MCP tool named `loc`.
 Pass the same CLI arguments as JSON `argv`, for example:
 
 ```json
 {{"argv":["status","{mount_path}","--json"]}}
 ```
 
-AFS configures this fallback automatically for supported local agents. Prefer
+Locality configures this fallback automatically for supported local agents. Prefer
 direct CLI execution whenever it is available.
 
 ## Suggested user prompt
@@ -383,7 +389,7 @@ fn managed_instruction_block(mount_path: &str) -> String {
 
 fn suggested_agent_prompt(mount_path: &str) -> String {
     format!(
-        "Use AFS to edit my Notion workspace. Open the Notion files under {mount_path}, make the requested edits directly in Markdown, and leave the changes pending for AFS review."
+        "Use Locality to edit my Notion workspace. Open the Notion files under {mount_path}, make the requested edits directly in Markdown, and leave the changes pending for Locality review."
     )
 }
 
@@ -419,7 +425,7 @@ fn write_managed_section(path: &Path, block: &str) -> Result<&'static str, Strin
 
 fn install_codex_mcp_config(path: &Path, token: &str) -> Result<&'static str, String> {
     let existing = fs::read_to_string(path).unwrap_or_default();
-    let stripped = remove_toml_table(&existing, "mcp_servers.afs");
+    let stripped = remove_toml_table(&existing, "mcp_servers.loc");
     let block = format!(
         "[mcp_servers.{MCP_SERVER_NAME}]\nurl = \"{}\"\nhttp_headers = {{ Authorization = \"Bearer {token}\" }}\n",
         mcp_endpoint()
@@ -528,24 +534,24 @@ fn mcp_server_json(token: &str) -> Value {
 
 fn claude_desktop_mcp_server_json() -> Value {
     json!({
-        "command": afs_cli_command(),
+        "command": loc_cli_command(),
         "args": ["mcp"],
         "env": {
-            "AFS_STATE_DIR": default_state_root().display().to_string()
+            "LOCALITY_STATE_DIR": default_state_root().display().to_string()
         }
     })
 }
 
-fn afs_cli_command() -> String {
+fn loc_cli_command() -> String {
     if let Ok(current) = env::current_exe()
         && let Some(parent) = current.parent()
     {
-        let sibling = parent.join("afs");
+        let sibling = parent.join("loc");
         if sibling.is_file() {
             return sibling.display().to_string();
         }
     }
-    "afs".to_string()
+    "loc".to_string()
 }
 
 fn read_json_config(path: &Path) -> Result<Value, String> {
@@ -666,11 +672,11 @@ fn normalized_mount_path(mount_path: Option<&str>) -> String {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    afs_platform::user_home()
+    locality_platform::user_home()
 }
 
 fn default_state_root() -> PathBuf {
-    if let Ok(value) = env::var("AFS_STATE_DIR") {
+    if let Ok(value) = env::var("LOCALITY_STATE_DIR") {
         let path = PathBuf::from(value);
         if path.is_absolute() {
             return path;
@@ -680,11 +686,11 @@ fn default_state_root() -> PathBuf {
         }
     }
 
-    afs_platform::default_state_root()
+    locality_platform::default_state_root()
 }
 
 fn mcp_endpoint() -> String {
-    format!("http://{}/mcp", afsd::mcp::DEFAULT_MCP_ADDR)
+    format!("http://{}/mcp", localityd::mcp::DEFAULT_MCP_ADDR)
 }
 
 fn command_exists(command: &str) -> bool {
@@ -774,22 +780,24 @@ mod tests {
 
     #[test]
     fn skill_mentions_mount_and_review_workflow() {
-        let skill = skill_markdown("~/Library/CloudStorage/AFS/notion");
+        let skill = skill_markdown("~/Library/CloudStorage/Locality/notion");
 
-        assert!(skill.contains("name: afs"));
-        assert!(skill.contains("~/Library/CloudStorage/AFS/notion"));
-        assert!(skill.contains("pending for AFS review"));
-        assert!(skill.contains("afs diff <file>"));
+        assert!(skill.contains("name: locality"));
+        assert!(skill.contains("~/Library/CloudStorage/Locality/notion"));
+        assert!(skill.contains("pending for Locality review"));
+        assert!(skill.contains("If desktop Live Mode is on"));
+        assert!(skill.contains("Do not run routine `loc pull` or `loc push`"));
+        assert!(skill.contains("loc diff <file>"));
         assert!(skill.contains("Creating Notion Content"));
         assert!(skill.contains("parent-page/new-page/page.md"));
-        assert!(skill.contains("no `afs:` identity block"));
+        assert!(skill.contains("no `loc:` identity block"));
         assert!(skill.contains("remote changed since last sync"));
-        assert!(skill.contains("AFS configures this fallback automatically"));
+        assert!(skill.contains("Locality configures this fallback automatically"));
     }
 
     #[test]
     fn managed_section_replace_preserves_user_content() {
-        let existing = "Before\n\n<!-- AFS_AGENT_GUIDANCE_START -->\nold\n<!-- AFS_AGENT_GUIDANCE_END -->\n\nAfter\n";
+        let existing = "Before\n\n<!-- LOCALITY_AGENT_GUIDANCE_START -->\nold\n<!-- LOCALITY_AGENT_GUIDANCE_END -->\n\nAfter\n";
         let next = replace_managed_section(existing, "new block\n");
 
         assert!(next.contains("Before"));
@@ -802,8 +810,8 @@ mod tests {
     fn normalized_mount_uses_default_for_empty_input() {
         assert_eq!(normalized_mount_path(Some("  ")), DEFAULT_NOTION_MOUNT);
         assert_eq!(
-            normalized_mount_path(Some("~/Library/CloudStorage/AFS/notion/")),
-            "~/Library/CloudStorage/AFS/notion"
+            normalized_mount_path(Some("~/Library/CloudStorage/Locality/notion/")),
+            "~/Library/CloudStorage/Locality/notion"
         );
     }
 
@@ -813,8 +821,27 @@ mod tests {
     }
 
     #[test]
+    fn install_target_writes_locality_skill_name() {
+        let temp = temp_root("locality-agent-guidance-skill-name");
+        let spec = AgentTargetSpec {
+            agent: "Codex",
+            path: temp.join(".codex/skills/locality/SKILL.md"),
+            kind: InstallKind::Skill,
+            detected: true,
+            detail: "Installed the Locality skill for Codex.",
+        };
+        let target = install_target(&spec, "~/Library/CloudStorage/Locality/notion");
+        let skill = fs::read_to_string(temp.join(".codex/skills/locality/SKILL.md"))
+            .expect("read locality skill");
+
+        assert_eq!(target.status, "installed");
+        assert!(skill.contains("name: locality"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn command_detection_respects_path() {
-        let temp = temp_root("afs-agent-guidance-path");
+        let temp = temp_root("loc-agent-guidance-path");
         let bin = temp.join("bin");
         fs::create_dir_all(&bin).expect("create bin");
         fs::write(bin.join("codex"), "").expect("write command");
@@ -831,7 +858,7 @@ mod tests {
 
     #[test]
     fn copilot_detection_requires_copilot_state() {
-        let temp = temp_root("afs-agent-guidance-copilot");
+        let temp = temp_root("loc-agent-guidance-copilot");
 
         assert!(!gh_copilot_extension_exists(&temp));
         fs::create_dir_all(temp.join(".config/gh/extensions/gh-copilot"))
@@ -842,12 +869,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_mcp_config_replaces_existing_afs_table() {
-        let temp = temp_root("afs-agent-guidance-codex-mcp");
+    fn codex_mcp_config_replaces_existing_loc_table() {
+        let temp = temp_root("loc-agent-guidance-codex-mcp");
         let config = temp.join("config.toml");
         fs::write(
             &config,
-            "model = \"gpt\"\n\n[mcp_servers.afs]\nurl = \"old\"\n\n[mcp_servers.other]\nurl = \"keep\"\n",
+            "model = \"gpt\"\n\n[mcp_servers.loc]\nurl = \"old\"\n\n[mcp_servers.other]\nurl = \"keep\"\n",
         )
         .expect("write config");
 
@@ -856,7 +883,7 @@ mod tests {
 
         assert!(contents.contains("model = \"gpt\""));
         assert!(contents.contains("[mcp_servers.other]"));
-        assert!(contents.contains("[mcp_servers.afs]"));
+        assert!(contents.contains("[mcp_servers.loc]"));
         assert!(contents.contains("Authorization = \"Bearer secret-token\""));
         assert!(!contents.contains("url = \"old\""));
         let _ = fs::remove_dir_all(temp);
@@ -864,7 +891,7 @@ mod tests {
 
     #[test]
     fn mcp_json_config_preserves_other_servers() {
-        let temp = temp_root("afs-agent-guidance-json-mcp");
+        let temp = temp_root("loc-agent-guidance-json-mcp");
         let config = temp.join("mcp.json");
         fs::write(
             &config,
@@ -880,9 +907,9 @@ mod tests {
             json["mcpServers"]["other"]["url"],
             "https://example.test/mcp"
         );
-        assert_eq!(json["mcpServers"]["afs"]["type"], "http");
+        assert_eq!(json["mcpServers"]["loc"]["type"], "http");
         assert_eq!(
-            json["mcpServers"]["afs"]["headers"]["Authorization"],
+            json["mcpServers"]["loc"]["headers"]["Authorization"],
             "Bearer secret-token"
         );
         let _ = fs::remove_dir_all(temp);
@@ -890,11 +917,11 @@ mod tests {
 
     #[test]
     fn claude_desktop_mcp_config_uses_local_stdio_command() {
-        let temp = temp_root("afs-agent-guidance-claude-desktop-mcp");
+        let temp = temp_root("loc-agent-guidance-claude-desktop-mcp");
         let config = temp.join("claude_desktop_config.json");
         fs::write(
             &config,
-            r#"{"mcpServers":{"other":{"command":"node","args":["server.js"]},"afs":{"type":"http","url":"http://127.0.0.1:38568/mcp","headers":{"Authorization":"Bearer stale"}}}}"#,
+            r#"{"mcpServers":{"other":{"command":"node","args":["server.js"]},"loc":{"type":"http","url":"http://127.0.0.1:38568/mcp","headers":{"Authorization":"Bearer stale"}}}}"#,
         )
         .expect("write config");
 
@@ -903,18 +930,18 @@ mod tests {
         let json: Value = serde_json::from_str(&contents).expect("json");
 
         assert_eq!(json["mcpServers"]["other"]["command"], "node");
-        assert_eq!(json["mcpServers"]["afs"]["command"], "afs");
-        assert_eq!(json["mcpServers"]["afs"]["args"], json!(["mcp"]));
-        assert!(json["mcpServers"]["afs"]["env"]["AFS_STATE_DIR"].is_string());
-        assert!(json["mcpServers"]["afs"].get("url").is_none());
-        assert!(json["mcpServers"]["afs"].get("headers").is_none());
-        assert!(json["mcpServers"]["afs"].get("type").is_none());
+        assert_eq!(json["mcpServers"]["loc"]["command"], "loc");
+        assert_eq!(json["mcpServers"]["loc"]["args"], json!(["mcp"]));
+        assert!(json["mcpServers"]["loc"]["env"]["LOCALITY_STATE_DIR"].is_string());
+        assert!(json["mcpServers"]["loc"].get("url").is_none());
+        assert!(json["mcpServers"]["loc"].get("headers").is_none());
+        assert!(json["mcpServers"]["loc"].get("type").is_none());
         let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
     fn copilot_json_config_accepts_comment_only_template() {
-        let temp = temp_root("afs-agent-guidance-copilot-mcp");
+        let temp = temp_root("loc-agent-guidance-copilot-mcp");
         let config = temp.join("mcp.json");
         fs::write(
             &config,
@@ -927,7 +954,7 @@ mod tests {
         let json: Value = serde_json::from_str(&contents).expect("json");
 
         assert_eq!(
-            json["servers"]["afs"]["requestInit"]["headers"]["Authorization"],
+            json["servers"]["loc"]["requestInit"]["headers"]["Authorization"],
             "Bearer secret-token"
         );
         let _ = fs::remove_dir_all(temp);

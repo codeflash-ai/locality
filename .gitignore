@@ -1,10 +1,12 @@
 /target/
 node_modules/
 dist/
-/.afs/
+/.loc/
 /.tmp/
+/.worktrees/
 /.idea/
 *.db
 *.db-shm
 *.db-wal
 .DS_Store
+/platform/macos/AgentFSFileProvider/.build/

@@ -20,8 +20,8 @@ jobs:
     environment: notion-live-e2e
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      AFS_NOTION_LIVE_PARENT_PAGE: ${{ secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
-      AFS_NOTION_LIVE_DIR: /tmp/afs-notion-live
+      LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE }}
+      LOCALITY_NOTION_LIVE_DIR: /tmp/locality-notion-live
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,18 +29,18 @@ jobs:
       - name: Check live Notion secrets
         id: live-secrets
         run: |
-          if [ -n "$NOTION_TOKEN" ] && [ -n "$AFS_NOTION_LIVE_PARENT_PAGE" ]; then
+          if [ -n "$NOTION_TOKEN" ] && [ -n "$LOCALITY_NOTION_LIVE_PARENT_PAGE" ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::Skipping live Notion e2e because NOTION_TOKEN or AFS_NOTION_LIVE_PARENT_PAGE is not configured."
+            echo "::notice::Skipping live Notion e2e because NOTION_TOKEN or LOCALITY_NOTION_LIVE_PARENT_PAGE is not configured."
             echo "configured=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Run connector live integrity tests
         if: steps.live-secrets.outputs.configured == 'true'
-        run: cargo test -p afs-notion --test live_integrity -- --ignored --test-threads=1
+        run: cargo test -p locality-notion --test live_integrity -- --ignored --test-threads=1
       - name: Run mounted workflow live e2e
         if: steps.live-secrets.outputs.configured == 'true'
-        run: cargo test -p afs-cli --test e2e_push_workflow live_ -- --ignored --test-threads=1
+        run: cargo test -p loc-cli --test e2e_push_workflow live_ -- --ignored --test-threads=1
 
   windows-cloud-files-live:
     name: Windows Cloud Files live e2e
@@ -49,9 +49,9 @@ jobs:
     environment: notion-live-e2e
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      AFS_NOTION_LIVE_PARENT_PAGE: ${{ secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
-      AFS_WINDOWS_CLOUD_FILES_LIVE: "1"
-      AFS_WINDOWS_CLOUD_FILES_LIVE_REQUIRED: "1"
+      LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE }}
+      LOCALITY_WINDOWS_CLOUD_FILES_LIVE: "1"
+      LOCALITY_WINDOWS_CLOUD_FILES_LIVE_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -60,10 +60,10 @@ jobs:
         id: live-secrets
         shell: pwsh
         run: |
-          if ($env:NOTION_TOKEN -and $env:AFS_NOTION_LIVE_PARENT_PAGE) {
+          if ($env:NOTION_TOKEN -and $env:LOCALITY_NOTION_LIVE_PARENT_PAGE) {
             "configured=true" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host "::notice::Skipping Windows Cloud Files live e2e because NOTION_TOKEN or AFS_NOTION_LIVE_PARENT_PAGE is not configured."
+            Write-Host "::notice::Skipping Windows Cloud Files live e2e because NOTION_TOKEN or LOCALITY_NOTION_LIVE_PARENT_PAGE is not configured."
             "configured=false" >> $env:GITHUB_OUTPUT
           }
       - name: Run Windows Cloud Files live Notion e2e

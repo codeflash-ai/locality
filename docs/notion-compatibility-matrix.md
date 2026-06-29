@@ -1,17 +1,17 @@
 # Notion Compatibility Matrix
 
 This matrix describes what the Notion connector currently exposes through the
-AFS filesystem projection. It is written for users and agents editing mounted
+Locality filesystem projection. It is written for users and agents editing mounted
 Notion content. For lower-level API object coverage, see
 `docs/notion-object-support.md`.
 
 Support terms:
 
-- **Read/write** means AFS renders the Notion feature to local files and can
+- **Read/write** means Locality renders the Notion feature to local files and can
   push supported local edits back to Notion.
-- **Read-only** means AFS renders the feature but blocks edits that would be
+- **Read-only** means Locality renders the feature but blocks edits that would be
   lossy or unsafe.
-- **Unsupported** means AFS does not currently expose a safe filesystem edit
+- **Unsupported** means Locality does not currently expose a safe filesystem edit
   surface for the feature.
 
 ## Workspace And Filesystem Projection
@@ -24,7 +24,7 @@ Support terms:
 | Database / data source | Read/enumerate | Directory | Database rows appear as Markdown files under the database directory. |
 | Data source schema | Read/validation source | `_schema.yaml` | Used to validate database row property edits before writing to Notion. |
 | Database row | Read/write/create row | Markdown file with frontmatter | Editing row body and supported properties is supported. Creating a new Markdown file under a database directory creates a row when the database has one writable data source. |
-| Image asset cache | Read/download for images | `.afs/media/` directory | Images referenced by supported image blocks are copied locally so agents can inspect them without colliding with projected Notion content named `media`. |
+| Image asset cache | Read/download for images | `.loc/media/` directory | Images referenced by supported image blocks are copied locally so agents can inspect them without colliding with projected Notion content named `media`. |
 
 ## Blocks
 
@@ -43,13 +43,13 @@ Support terms:
 | Code | Read/write | Fenced code block | Simple language and content edits round-trip. |
 | Divider | Read/write | `---` |  |
 | Equation | Read/write | Display math block | Inline equations are covered by rich text. |
-| Table | Read/write with stable shape | Markdown table | Cell edits, row appends, and trailing row deletes are supported. Width/header-mode changes are blocked. |
+| Table | Read/write with stable shape | Markdown table | Cell edits, row appends, and trailing row deletes are supported. Width/header-mode changes and detected non-trailing row deletes are blocked before journaled apply. |
 | Bookmark | Read/write for existing blocks | Markdown link | Caption and URL edits update the existing block. |
 | Embed | Read/write for existing blocks | Markdown link | Caption and URL edits update the existing block. |
-| Link preview | Read-only | Markdown link | The current Notion API rejects safe creation/write shapes for this block. |
-| Child page link | Read; direct edit blocked | Markdown link to Notion page | The link target carries the stable page ID for lookup. Edit the child page's `page.md` or title frontmatter rather than the parent link. |
-| Link to page | Read; retarget blocked | Markdown link to Notion page | Direct target PATCH is not reliable in the Notion API, so retargeting is guarded. |
-| Link to database | Read; retarget blocked | Markdown link to Notion database | Replacement needs undo-aware block identity support before AFS can write it safely. |
+| Link preview | Read-only | Markdown link | The current Notion API rejects safe creation/write shapes for this block, so edits, moves, and deletes are blocked before journaled apply. |
+| Child page link | Read; direct edit/move/delete blocked | Markdown link to Notion page | The link target carries the stable page ID for lookup. Edit, move, rename, or delete the child page through its projected page directory rather than the parent link. |
+| Link to page | Read; move/delete allowed; retarget blocked | Markdown link to Notion page | Direct target PATCH is not reliable in the Notion API, so retargeting is blocked before journaled apply. |
+| Link to database | Read; move/delete allowed; retarget blocked | Markdown link to Notion database | Replacement needs undo-aware block identity support before Locality can write it safely, so retargeting is blocked before journaled apply. |
 | Image with external or Notion-hosted URL | Read/write for existing URL blocks | Markdown image | Existing URL/caption edits push. Local uploads are not supported yet. |
 | Video with external or Notion-hosted URL | Read/write for existing URL blocks | Markdown link | Existing URL/caption edits push. |
 | File with external or Notion-hosted URL | Read/write for existing URL blocks | Markdown link | Existing URL/caption edits push. |
@@ -62,7 +62,7 @@ Support terms:
 | Breadcrumb | Read-only | Guarded directive | Generated navigation block with no meaningful Markdown edit surface. |
 | Synced block | Read-only | Guarded directive | Source/copy semantics are protected to avoid lossy writes. |
 | Template, meeting notes, transcription, tab, AI block, custom block, button | Read-only or unsupported | Guarded directive when returned by the API | These blocks do not yet have a safe Markdown writer. |
-| Unknown future block | Read-only | Guarded directive | AFS preserves the block ID and blocks lossy edits. |
+| Unknown future block | Read-only | Guarded directive | Locality preserves the block ID and blocks lossy edits. |
 
 ## Rich Text
 
@@ -77,7 +77,7 @@ Support terms:
 | Date mention | Read/write with explicit syntax | Readable date text or `@date(...)` | Plain date-looking text is not auto-promoted to a typed Notion mention. |
 | User mention | Read/write by ID | Readable mention text or `@user(...)` | Name/email lookup is deferred; write explicit Notion user IDs. |
 | Link-preview mention | Read-only | Markdown link | Notion write validation currently rejects safe synthesis of this mention type. |
-| Unknown mention variant | Read-only fallback | Plain text or directive | AFS avoids silently flattening unsupported typed objects. |
+| Unknown mention variant | Read-only fallback | Plain text or directive | Locality avoids silently flattening unsupported typed objects. |
 
 ## Database Properties
 
@@ -102,11 +102,11 @@ Support terms:
 | Created time, created by, last edited time, last edited by | Read-only | Frontmatter value | Managed by Notion. |
 | Unique ID | Read-only | Frontmatter value | Generated by Notion. |
 | Verification | Read-only | Frontmatter value when returned | Not a normal row edit field. |
-| Button property | Unsupported write | Not exposed as editable content | Action trigger, not persisted row content for AFS. |
+| Button property | Unsupported write | Not exposed as editable content | Action trigger, not persisted row content for Locality. |
 
 ## Intentional Gaps
 
-- Local media upload and hosted-file rewrites are deferred until AFS has size
+- Local media upload and hosted-file rewrites are deferred until Locality has size
   limits, retention rules, dedupe, and local path ownership semantics.
 - Table width changes and header-mode changes are blocked until the planner can
   represent them without replacing the table unsafely.

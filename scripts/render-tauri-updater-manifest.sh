@@ -7,7 +7,7 @@ OUTPUT="${UPDATER_MANIFEST_OUTPUT:-${UPDATER_DIR}/latest-macos.json}"
 VERSION="${UPDATER_VERSION:-}"
 BASE_URL="${UPDATER_BASE_URL:-${PUBLISH_RELEASE_BASE_URL:-}}"
 RELEASE_TAG="${GITHUB_RELEASE_TAG:-${PUBLISH_RELEASE_TAG:-}}"
-NOTES="${UPDATER_NOTES:-AFS desktop update.}"
+NOTES="${UPDATER_NOTES:-Locality desktop update.}"
 PUB_DATE="${UPDATER_PUB_DATE:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}"
 
 log() {
@@ -71,7 +71,7 @@ main() {
   VERSION="${VERSION:-$(version_from_tauri_config)}"
   [[ -n "${VERSION}" ]] || fail "set UPDATER_VERSION or define bundle.version in tauri.conf.json"
   if [[ -z "${BASE_URL}" && -n "${RELEASE_TAG}" ]]; then
-    BASE_URL="https://github.com/codeflash-ai/afs/releases/download/${RELEASE_TAG}"
+    BASE_URL="https://github.com/codeflash-ai/locality/releases/download/${RELEASE_TAG}"
   fi
 
   local -a archives=()
