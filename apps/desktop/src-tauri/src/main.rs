@@ -9,10 +9,10 @@ use std::io;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc;
 use std::sync::{
-    Mutex, OnceLock,
+    Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 #[cfg(target_os = "macos")]
 use std::thread;
@@ -127,6 +127,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250);
 const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
+const LIVE_MODE_RUNNER_ACTIVE_INTERVAL: Duration = Duration::from_millis(500);
+const LIVE_MODE_RUNNER_IDLE_RECHECK: Duration = Duration::from_secs(5 * 60);
+const LIVE_MODE_STATE_CHANGED_FILE: &str = "live-mode.changed";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1194,9 +1197,60 @@ fn live_mode_enabled_mount(state_root: &Path) -> Result<Option<MountConfig>, Str
     Ok(enabled.then_some(mount))
 }
 
+#[derive(Debug, Default)]
+struct LiveModeWakeState {
+    generation: u64,
+}
+
+fn live_mode_wake_state() -> &'static (Mutex<LiveModeWakeState>, Condvar) {
+    static STATE: OnceLock<(Mutex<LiveModeWakeState>, Condvar)> = OnceLock::new();
+    STATE.get_or_init(|| (Mutex::new(LiveModeWakeState::default()), Condvar::new()))
+}
+
+fn live_mode_wake_generation() -> u64 {
+    let (state, _) = live_mode_wake_state();
+    state
+        .lock()
+        .expect("live mode wake lock poisoned")
+        .generation
+}
+
+fn notify_live_mode_state_changed() {
+    let (state, cvar) = live_mode_wake_state();
+    {
+        let mut state = state.lock().expect("live mode wake lock poisoned");
+        state.generation = state.generation.wrapping_add(1);
+    }
+    cvar.notify_all();
+}
+
+fn publish_live_mode_state_changed(state_root: &Path) {
+    notify_live_mode_state_changed();
+    let path = live_mode_state_changed_path(state_root);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, live_mode_timestamp());
+}
+
+fn live_mode_state_changed_path(state_root: &Path) -> PathBuf {
+    state_root.join(LIVE_MODE_STATE_CHANGED_FILE)
+}
+
+fn wait_for_live_mode_state_change(last_seen: &mut u64, timeout: Duration) -> bool {
+    let (state, cvar) = live_mode_wake_state();
+    let guard = state.lock().expect("live mode wake lock poisoned");
+    let (guard, timeout) = cvar
+        .wait_timeout_while(guard, timeout, |state| state.generation == *last_seen)
+        .expect("live mode wake lock poisoned");
+    let changed = guard.generation != *last_seen;
+    *last_seen = guard.generation;
+    changed && !timeout.timed_out()
+}
+
 fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionReport, String> {
     let state_root = default_state_root();
-    let mut store = SqliteStateStore::open(state_root)
+    let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let mounts = store
         .load_mounts()
@@ -1218,6 +1272,7 @@ fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionRep
     store
         .save_mount_live_mode(record)
         .map_err(|error| format!("Could not update Live Mode state: {error}"))?;
+    publish_live_mode_state_changed(&state_root);
 
     Ok(ActionReport {
         ok: true,
@@ -3416,15 +3471,13 @@ fn start_state_change_watcher(app: AppHandle) {
         loop {
             match rx.recv() {
                 Ok(Ok(event)) => {
-                    if !debounce_state_events_require_refresh(
-                        &rx,
-                        &state_root,
-                        &content_roots,
-                        event,
-                    ) {
-                        continue;
+                    let actions = debounce_state_events(&rx, &state_root, &content_roots, event);
+                    if actions.wake_live_mode {
+                        notify_live_mode_state_changed();
                     }
-                    refresh_desktop_surfaces(&app);
+                    if actions.refresh_surfaces {
+                        refresh_desktop_surfaces(&app);
+                    }
                 }
                 Ok(Err(error)) => desktop_log(
                     "warn",
@@ -3469,34 +3522,57 @@ fn watch_virtual_content_roots(
     vec![content_root]
 }
 
-fn debounce_state_events_require_refresh(
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StateEventActions {
+    refresh_surfaces: bool,
+    wake_live_mode: bool,
+}
+
+impl StateEventActions {
+    fn include(&mut self, other: Self) {
+        self.refresh_surfaces |= other.refresh_surfaces;
+        self.wake_live_mode |= other.wake_live_mode;
+    }
+}
+
+fn debounce_state_events(
     rx: &mpsc::Receiver<notify::Result<notify::Event>>,
     state_root: &Path,
     content_roots: &[PathBuf],
     first_event: notify::Event,
-) -> bool {
-    let mut should_refresh = state_event_requires_refresh(&first_event, state_root, content_roots);
+) -> StateEventActions {
+    let mut actions = state_event_actions(&first_event, state_root, content_roots);
     std::thread::sleep(std::time::Duration::from_millis(150));
     while let Ok(event) = rx.try_recv() {
         match event {
             Ok(event) => {
-                should_refresh |= state_event_requires_refresh(&event, state_root, content_roots);
+                actions.include(state_event_actions(&event, state_root, content_roots));
             }
             Err(error) => eprintln!("loc desktop state watcher event failed: {error}"),
         }
     }
-    should_refresh
+    actions
 }
 
-fn state_event_requires_refresh(
+fn state_event_actions(
     event: &notify::Event,
     state_root: &Path,
     content_roots: &[PathBuf],
-) -> bool {
-    event
-        .paths
-        .iter()
-        .any(|path| state_event_path_requires_refresh(path, state_root, content_roots))
+) -> StateEventActions {
+    let mut actions = StateEventActions::default();
+    for path in &event.paths {
+        actions.refresh_surfaces |=
+            state_event_path_requires_refresh(path, state_root, content_roots);
+        actions.wake_live_mode |= state_event_path_wakes_live_mode(path, state_root);
+    }
+    actions
+}
+
+fn state_event_path_wakes_live_mode(path: &Path, state_root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(state_root) else {
+        return false;
+    };
+    relative == Path::new(LIVE_MODE_STATE_CHANGED_FILE)
 }
 
 fn state_event_path_requires_refresh(
@@ -3518,6 +3594,9 @@ fn state_event_path_requires_refresh(
     let file_name = relative.file_name().and_then(|name| name.to_str());
     if file_name.is_some_and(|name| name.starts_with("state.sqlite3")) {
         return false;
+    }
+    if relative == Path::new(LIVE_MODE_STATE_CHANGED_FILE) {
+        return true;
     }
 
     match relative.components().next() {
@@ -7163,29 +7242,32 @@ mod tests {
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
 
     use super::{
-        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup,
-        MonitorScreenBounds, PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
-        clear_mount_cached_projection, clear_state_root_contents, conflict_preview,
-        connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
-        diff_report_message, exact_located_entity_record, failed_push_summary,
-        has_unresolved_conflict_markers, hydration_after_editor_write, inspect_install_state,
-        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
-        is_notion_access_lost_message, is_unsupported_schema_version_message,
-        live_mode_content_hash_changed, live_mode_e2e_append_local_marker,
-        live_mode_e2e_append_remote_marker, live_mode_e2e_notion_api, live_mode_e2e_page_id,
-        live_mode_e2e_page_path, live_mode_e2e_remote_text, live_mode_e2e_wait_until,
-        live_mode_merge_remote_drift_markdown, live_mode_remote_pull_candidates,
-        live_mode_should_reconcile_local_target_for_key, live_mode_target, live_mode_tick_blocking,
-        live_mode_tick_from_snapshot, load_desktop_activity, mount_has_pending_local_changes,
-        mount_has_unfinished_journals, notion_id_from_url, parse_daemon_build_info_json,
-        pending_changes_from_status, preserve_mount_pending_local_changes, pull_error_message,
-        pull_report_message, push_action_message, record_current_install_marker,
-        record_desktop_activity, sample_live_mode_status, sample_snapshot,
-        screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
-        should_prioritize_located_result, state_event_path_requires_refresh,
+        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LIVE_MODE_STATE_CHANGED_FILE,
+        LiveModeE2eCleanup, MonitorScreenBounds, PendingChange, ScreenBounds, TerminalCliLinkState,
+        TrayVisualState, clear_mount_cached_projection, clear_state_root_contents,
+        conflict_preview, connection_metadata_changed, current_daemon_build_id,
+        current_desktop_build_id, diff_report_message, exact_located_entity_record,
+        failed_push_summary, has_unresolved_conflict_markers, hydration_after_editor_write,
+        inspect_install_state, install_terminal_cli_link_at,
+        install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
+        is_unsupported_schema_version_message, live_mode_content_hash_changed,
+        live_mode_e2e_append_local_marker, live_mode_e2e_append_remote_marker,
+        live_mode_e2e_notion_api, live_mode_e2e_page_id, live_mode_e2e_page_path,
+        live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_merge_remote_drift_markdown,
+        live_mode_remote_pull_candidates, live_mode_should_reconcile_local_target_for_key,
+        live_mode_target, live_mode_tick_blocking, live_mode_tick_from_snapshot,
+        live_mode_wake_generation, load_desktop_activity, mount_has_pending_local_changes,
+        mount_has_unfinished_journals, notify_live_mode_state_changed, notion_id_from_url,
+        parse_daemon_build_info_json, pending_changes_from_status,
+        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
+        push_action_message, record_current_install_marker, record_desktop_activity,
+        sample_live_mode_status, sample_snapshot, screen_bounds_for_anchor_from_monitors,
+        shell_single_quote, should_hide_tray_popover, should_prioritize_located_result,
+        state_event_path_requires_refresh, state_event_path_wakes_live_mode,
         summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
         tray_popover_anchor, tray_popover_position, unique_suffix, validate_mount_root,
-        virtual_projection_refresh_signal_identifiers, write_terminal_cli_path_section,
+        virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
+        write_terminal_cli_path_section,
     };
 
     #[test]
@@ -9032,6 +9114,40 @@ mod tests {
     }
 
     #[test]
+    fn state_watcher_uses_explicit_live_mode_signal_without_refreshing_on_sqlite() {
+        let temp = TestTempDir::new("state-watch-live-mode");
+        let state_root = temp.path().join(".loc");
+        let content_roots = vec![temp.path().join("group-content")];
+
+        for path in [
+            state_root.join("state.sqlite3"),
+            state_root.join("state.sqlite3-wal"),
+            state_root.join("state.sqlite3-shm"),
+        ] {
+            assert!(
+                !state_event_path_wakes_live_mode(&path, &state_root),
+                "{} should not wake Live Mode",
+                path.display()
+            );
+            assert!(
+                !state_event_path_requires_refresh(&path, &state_root, &content_roots),
+                "{} should not refresh desktop surfaces",
+                path.display()
+            );
+        }
+
+        assert!(state_event_path_wakes_live_mode(
+            &state_root.join(LIVE_MODE_STATE_CHANGED_FILE),
+            &state_root
+        ));
+        assert!(state_event_path_requires_refresh(
+            &state_root.join(LIVE_MODE_STATE_CHANGED_FILE),
+            &state_root,
+            &content_roots
+        ));
+    }
+
+    #[test]
     fn state_watcher_refreshes_for_user_visible_state_changes() {
         let temp = TestTempDir::new("state-watch-refresh");
         let state_root = temp.path().join(".loc");
@@ -9053,6 +9169,27 @@ mod tests {
             &state_root,
             &content_roots
         ));
+    }
+
+    #[test]
+    fn live_mode_wake_signal_unblocks_wait_without_polling_state() {
+        let mut generation = live_mode_wake_generation();
+
+        notify_live_mode_state_changed();
+
+        let started = Instant::now();
+        assert!(wait_for_live_mode_state_change(
+            &mut generation,
+            Duration::from_secs(1)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        let started = Instant::now();
+        assert!(!wait_for_live_mode_state_change(
+            &mut generation,
+            Duration::from_millis(10)
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(5));
     }
 
     #[test]
@@ -9707,15 +9844,21 @@ fn start_agent_guidance_refresher() {
 
 fn start_live_mode_runner(app: AppHandle) {
     std::thread::spawn(move || {
+        let mut wake_generation = live_mode_wake_generation();
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
             if !mount_live_mode_enabled() {
+                wait_for_live_mode_state_change(
+                    &mut wake_generation,
+                    LIVE_MODE_RUNNER_IDLE_RECHECK,
+                );
                 continue;
             }
             let report = live_mode_tick_blocking();
             if live_mode_tick_should_refresh_surfaces(&report) {
                 refresh_desktop_surfaces(&app);
             }
+            wake_generation = live_mode_wake_generation();
+            wait_for_live_mode_state_change(&mut wake_generation, LIVE_MODE_RUNNER_ACTIVE_INTERVAL);
         }
     });
 }

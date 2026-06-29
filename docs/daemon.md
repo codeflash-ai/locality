@@ -344,7 +344,10 @@ already-hydrated page so the app does not poll the user-visible file every tick.
 Remote checks fetch one already-hydrated page into the daemon content cache and
 compare the rendered shadow before refreshing the visible projection. This avoids
 relying on Notion page metadata that can miss some body edits, while leaving
-unchanged CloudStorage replicas untouched.
+unchanged CloudStorage replicas untouched. The desktop runner must not poll the
+SQLite state store while Live Mode is off. Live Mode state changes publish an
+explicit local signal under the state root; the app's watcher wakes the runner
+from that signal, while ordinary SQLite WAL/SHM churn remains ignored.
 
 ## Scheduled Pull Reconciliation
 

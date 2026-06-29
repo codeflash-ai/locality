@@ -343,7 +343,10 @@ Important language:
   Mode fetches one already-hydrated page into the daemon content cache and
   compares the rendered shadow before touching the visible CloudStorage
   projection, so stale Notion metadata does not hide body edits and unchanged
-  files are not repeatedly read or rewritten.
+  files are not repeatedly read or rewritten. When Live Mode is disabled, the
+  desktop runner must sleep on an explicit Live Mode state-change signal rather
+  than polling durable SQLite; toggles write that signal so the app wakes only
+  when the source-of-truth state changes.
 
 ## Main App Structure
 
