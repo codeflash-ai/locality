@@ -903,7 +903,7 @@ function SetupLoading() {
     <main className="setup-shell">
       <section className="setup-window">
         <WindowChrome title="Locality Setup" meta="Checking" />
-        <SetupContent mark={<BrandTile>Locality</BrandTile>}>
+        <SetupContent mark={<BrandTile />}>
           <div>
             <div className="sync-note">
               <Loader2 className="spin" />
@@ -3922,7 +3922,7 @@ function BrandTile({
       {variant === "folder" && <FolderOpen />}
       {variant === "progress" && <Loader2 />}
       {variant === "ready" && <Check />}
-      {!variant && children}
+      {!variant && (children ? <span className="brand-word">{children}</span> : <ApertureIcon />)}
       {variant === "notion" && children}
     </div>
   );

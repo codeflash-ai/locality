@@ -386,13 +386,35 @@ p {
   width: 58px;
   height: 58px;
   margin-bottom: 28px;
+  overflow: hidden;
   border: 1px solid rgba(8, 123, 114, 0.14);
   border-radius: 17px;
   background: var(--accent-soft);
   color: var(--accent);
-  font-size: 16px;
+  font-size: 12px;
   font-weight: 900;
+  line-height: 1;
   box-shadow: 0 10px 24px rgba(8, 123, 114, 0.08);
+}
+
+.brand-tile .brand-word {
+  display: block;
+  max-width: calc(100% - 12px);
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.brand-tile .aperture-icon {
+  width: 36px;
+  height: 24px;
+}
+
+.brand-tile .aperture-icon svg {
+  width: 29px;
+  height: 19px;
+  overflow: hidden;
 }
 
 .brand-tile.notion {
