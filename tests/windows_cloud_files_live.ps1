@@ -439,7 +439,7 @@ try {
     }
 
     Write-Step "starting Cloud Files provider"
-    Invoke-Native -FilePath $locBin -Arguments @("file-provider", "start", $mountId, "--json") -Step "loc file-provider start" -NoCapture | Out-Null
+    Invoke-Native -FilePath $locBin -Arguments @("file-provider", "start", $mountId, "--json") -Step "loc file-provider start" | Out-Null
     Wait-ForCondition -Name "Cloud Files provider lifecycle" -Condition {
         $output = Invoke-Native -FilePath $locBin -Arguments @("file-provider", "status", $mountId, "--json") -Step "loc file-provider status"
         return $output.Contains('"state": "running"')

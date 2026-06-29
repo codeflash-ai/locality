@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   notion-live:
-    name: Notion live e2e
+    name: Notion connector live e2e
     runs-on: ubuntu-latest
     environment: notion-live-e2e
     env:
@@ -27,19 +27,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check live Notion secrets
-        id: live-secrets
         run: |
-          if [ -n "$NOTION_TOKEN" ] && [ -n "$LOCALITY_NOTION_LIVE_PARENT_PAGE" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::Skipping live Notion e2e because NOTION_TOKEN or LOCALITY_NOTION_LIVE_PARENT_PAGE is not configured."
-            echo "configured=false" >> "$GITHUB_OUTPUT"
+          missing=()
+          [ -n "$NOTION_TOKEN" ] || missing+=("NOTION_TOKEN")
+          [ -n "$LOCALITY_NOTION_LIVE_PARENT_PAGE" ] || missing+=("LOCALITY_NOTION_LIVE_PARENT_PAGE or AFS_NOTION_LIVE_PARENT_PAGE")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Live Notion e2e is required on main but missing secrets: ${missing[*]}"
+            exit 1
           fi
       - name: Run connector live integrity tests
-        if: steps.live-secrets.outputs.configured == 'true'
         run: cargo test -p locality-notion --test live_integrity -- --ignored --test-threads=1
+
+  mounted-workflow-live:
+    name: Notion mounted workflow live e2e
+    runs-on: ubuntu-latest
+    environment: notion-live-e2e
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE || secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
+      LOCALITY_NOTION_LIVE_DIR: /tmp/locality-notion-live
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check live Notion secrets
+        run: |
+          missing=()
+          [ -n "$NOTION_TOKEN" ] || missing+=("NOTION_TOKEN")
+          [ -n "$LOCALITY_NOTION_LIVE_PARENT_PAGE" ] || missing+=("LOCALITY_NOTION_LIVE_PARENT_PAGE or AFS_NOTION_LIVE_PARENT_PAGE")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Live Notion e2e is required on main but missing secrets: ${missing[*]}"
+            exit 1
+          fi
       - name: Run mounted workflow live e2e
-        if: steps.live-secrets.outputs.configured == 'true'
         run: cargo test -p loc-cli --test e2e_push_workflow live_ -- --ignored --test-threads=1
 
   windows-cloud-files-live:
@@ -57,16 +77,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check live Notion secrets
-        id: live-secrets
         shell: pwsh
         run: |
-          if ($env:NOTION_TOKEN -and $env:LOCALITY_NOTION_LIVE_PARENT_PAGE) {
-            "configured=true" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "::notice::Skipping Windows Cloud Files live e2e because NOTION_TOKEN or LOCALITY_NOTION_LIVE_PARENT_PAGE is not configured."
-            "configured=false" >> $env:GITHUB_OUTPUT
+          $missing = @()
+          if (-not $env:NOTION_TOKEN) {
+            $missing += "NOTION_TOKEN"
+          }
+          if (-not $env:LOCALITY_NOTION_LIVE_PARENT_PAGE) {
+            $missing += "LOCALITY_NOTION_LIVE_PARENT_PAGE or AFS_NOTION_LIVE_PARENT_PAGE"
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "::error::Live Notion e2e is required on main but missing secrets: $($missing -join ', ')"
+            exit 1
           }
       - name: Run Windows Cloud Files live Notion e2e
-        if: steps.live-secrets.outputs.configured == 'true'
         shell: pwsh
         run: ./tests/windows_cloud_files_live.ps1

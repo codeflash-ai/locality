@@ -24,6 +24,12 @@ const LIVE_PARENT_ENV: &str = "LOCALITY_NOTION_LIVE_PARENT_PAGE";
 const LIVE_DIR_ENV: &str = "LOCALITY_NOTION_LIVE_DIR";
 const TOKEN_ENV: &str = "NOTION_TOKEN";
 const LIVE_IMAGE_URL: &str = "https://www.w3.org/Icons/w3c_home.png";
+const LIVE_VIDEO_URL: &str =
+    "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
+const LIVE_PDF_URL: &str =
+    "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf";
+const LIVE_AUDIO_URL: &str =
+    "https://interactive-examples.mdn.mozilla.net/media/cc0-audio/t-rex-roar.mp3";
 
 #[test]
 #[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE"]
@@ -1028,7 +1034,7 @@ fn rich_block_children(parent_page_id: &str) -> Vec<Value> {
             "type": "video",
             "video": {
                 "type": "external",
-                "external": { "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ" },
+                "external": { "url": LIVE_VIDEO_URL },
                 "caption": rich_text("External video")
             }
         }),
@@ -1037,7 +1043,7 @@ fn rich_block_children(parent_page_id: &str) -> Vec<Value> {
             "type": "file",
             "file": {
                 "type": "external",
-                "external": { "url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf" },
+                "external": { "url": LIVE_PDF_URL },
                 "caption": rich_text("External file")
             }
         }),
@@ -1046,7 +1052,7 @@ fn rich_block_children(parent_page_id: &str) -> Vec<Value> {
             "type": "pdf",
             "pdf": {
                 "type": "external",
-                "external": { "url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf" },
+                "external": { "url": LIVE_PDF_URL },
                 "caption": rich_text("External PDF")
             }
         }),
@@ -1055,7 +1061,7 @@ fn rich_block_children(parent_page_id: &str) -> Vec<Value> {
             "type": "audio",
             "audio": {
                 "type": "external",
-                "external": { "url": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3" },
+                "external": { "url": LIVE_AUDIO_URL },
                 "caption": rich_text("External audio")
             }
         }),
