@@ -367,6 +367,13 @@ already hydrated pages with changed Remote Tree versions are queued for refresh.
 Project- or mount-specific strategies can dispatch on `MountConfig` without
 changing the reconciliation mechanics.
 
+Workspace-level virtual mounts, such as desktop File Provider or FUSE mounts
+without a `remote_root_id`, continue to skip full scheduled enumeration. After a
+scheduled tick reconciles normal mounts, the runtime separately queues at most
+100 cheap `observe_entity` freshness jobs for active or already-hydrated pages
+known in SQLite under those workspace mounts. Stub and virtual pages are left to
+hydrate or observe through open, locate, or browse activity.
+
 For hydrated, dirty, or conflicted entities, enumeration preserves the Synced
 Tree remote version until hydration writes a new shadow. That version is the
 push precondition for the current Local Tree file, so it must advance with the

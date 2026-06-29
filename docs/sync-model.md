@@ -352,6 +352,10 @@ Current daemon implementation:
   cheap `observe_entity` jobs.
 - FileProvider/FUSE read/write/mutation responses enqueue the same observation
   jobs, so online-only mounts do not depend on host file watcher events.
+- Workspace-level virtual mounts do not run full scheduled workspace polls, but
+  scheduled ticks enqueue a bounded batch of cheap `observe_entity` jobs for
+  active, dirty, conflicted, or already-hydrated pages that are already known
+  locally.
 - Freshness workers call the connector observation API and persist
   `remote_observations` plus updated `freshness_states`.
 - These observations do not hydrate content and do not replace local files yet.
@@ -407,13 +411,12 @@ Current implementation:
   executor skips without fetching remote content or inserting conflict markers.
 - Successful hydration clears the entity's pending remote hint so status returns
   to `all_synced` once the local shadow and remote version agree.
-- On virtual projections with a visible local replica, currently macOS File
-  Provider and Windows Cloud Files, successful `remote_fast_forward` hydration
-  also refreshes already-materialized visible replicas that still match the
-  previous Synced Tree shadow. Visible files that have diverged are skipped so a
-  missed provider write is not overwritten. This does not add full workspace
-  polling for virtual mounts; the remote change must still be observed by
-  freshness jobs, scheduled enumeration, or an explicit user action first.
+- On macOS File Provider mounts, successful `remote_fast_forward` hydration also
+  refreshes already-materialized visible CloudStorage replicas that still match
+  the previous Synced Tree shadow. Visible files that have diverged are skipped
+  so a missed File Provider write is not overwritten. Workspace virtual mounts
+  still avoid full workspace polling; their scheduled background path is limited
+  to bounded per-entity freshness checks for known active or hydrated pages.
 
 ### Stage 8: Remote Change Explanation
 
