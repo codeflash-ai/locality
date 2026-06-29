@@ -1751,7 +1751,7 @@ p {
 
 .file-row {
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) 312px;
+  grid-template-columns: 32px minmax(0, 1fr) 348px;
   align-items: center;
   gap: 16px;
   padding: 16px;
@@ -1825,7 +1825,7 @@ p {
   grid-template-columns: minmax(0, 1fr) 104px;
   align-items: center;
   gap: 8px;
-  min-width: 286px;
+  min-width: 322px;
 }
 
 .file-live-mode {

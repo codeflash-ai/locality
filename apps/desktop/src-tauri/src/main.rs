@@ -37,6 +37,7 @@ use loc_cli::pull::{PullReport, run_pull_with_state_root};
 use loc_cli::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
 };
+use loc_cli::restore::{RestoreOptions, run_restore};
 use loc_cli::search::{
     SearchOptions, SearchResult, notion_id_from_url, run_search_with_access_roots,
 };
@@ -832,6 +833,31 @@ async fn pull_notion_file(app: AppHandle, path: String) -> ActionReport {
         Err(error) => ActionReport {
             ok: false,
             message: format!("Pull worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
+async fn reset_notion_file_to_remote(app: AppHandle, path: String) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        match reset_target_to_remote_direct(&target) {
+            Ok(report) => ActionReport {
+                ok: report.ok && report.skipped_dirty == 0 && report.conflicts.is_empty(),
+                message: reset_to_remote_message(&report),
+            },
+            Err(message) => ActionReport { ok: false, message },
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Reset worker failed: {error}"),
         },
     };
 
@@ -4575,11 +4601,14 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let connection_id = preferred_notion_connection_id(&store)?;
+    let mount_id = MountId::new("notion-main");
+    let preserved =
+        prepare_existing_workspace_mount_for_remount(&mut store, &state_root, &mount_id)?;
 
     let mount_report = run_mount(
         &mut store,
         MountOptions {
-            mount_id: MountId::new("notion-main"),
+            mount_id,
             connector: "notion".to_string(),
             root,
             remote_root_id: None,
@@ -4602,11 +4631,21 @@ fn create_notion_workspace_mount(path: &str) -> Result<String, String> {
         activate_virtual_projection_mount(&state_root, &mount, true)?;
     }
 
-    Ok(format!(
+    let mut message = format!(
         "Mounted Notion workspace at {} with {}.",
         absolute_display_path(&mount_access_root(&mount)),
         projection_label(&mount.projection)
-    ))
+    );
+    if let Some(preserved) = preserved {
+        message.push_str(&format!(
+            " Locality preserved {} pending local change{} at `{}` and cleared the old cached paths before remounting.",
+            preserved.count,
+            if preserved.count == 1 { "" } else { "s" },
+            preserved.directory.display()
+        ));
+    }
+
+    Ok(message)
 }
 
 fn preferred_notion_connection_id(
@@ -6481,6 +6520,39 @@ fn connection_metadata_key(
     )
 }
 
+fn prepare_existing_workspace_mount_for_remount(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    mount_id: &MountId,
+) -> Result<Option<PreservedLocalChanges>, String> {
+    let Some(mount) = store
+        .get_mount(mount_id)
+        .map_err(|error| format!("Could not inspect existing Notion mount: {error}"))?
+    else {
+        return Ok(None);
+    };
+
+    if mount_has_unfinished_journals(store, mount_id)? {
+        return Err(
+            "A Notion push is still in progress. Wait for it to finish before remounting this workspace."
+                .to_string(),
+        );
+    }
+
+    if mount.projection.uses_virtual_filesystem() {
+        reconcile_desktop_projection_changes(store, state_root, Some(&mount.root))?;
+    }
+
+    let preserved = if mount_has_pending_local_changes(store, state_root, mount_id)? {
+        preserve_mount_pending_local_changes(store, state_root, mount_id)?
+    } else {
+        None
+    };
+    clear_mount_cached_projection(store, state_root, mount_id)?;
+
+    Ok(preserved)
+}
+
 fn mount_has_pending_local_changes(
     store: &SqliteStateStore,
     _state_root: &Path,
@@ -6927,6 +6999,49 @@ fn pull_target_direct(target: &Path) -> Result<PullReport, String> {
         .map_err(|error| error.message())
 }
 
+fn reset_target_to_remote_direct(target: &Path) -> Result<PullReport, String> {
+    let state_root = default_state_root();
+    let target = absolute_path(target)?;
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
+
+    run_restore(
+        &mut store,
+        &target,
+        RestoreOptions {
+            force: true,
+            state_root: Some(state_root.clone()),
+        },
+    )
+    .map_err(|error| error.message())?;
+    refresh_visible_target_from_cache(&state_root, &mount, &relative_path, &target)?;
+
+    let credentials = open_credential_store(&state_root);
+    let connector = resolve_source_for_path(&store, credentials.as_ref(), &target)
+        .map_err(|error| error.message())?;
+
+    run_pull_with_state_root(&mut store, &connector, target, Some(&state_root))
+        .map_err(|error| error.message())
+}
+
+fn refresh_visible_target_from_cache(
+    state_root: &Path,
+    mount: &MountConfig,
+    relative_path: &Path,
+    target: &Path,
+) -> Result<(), String> {
+    if !mount.projection.uses_virtual_filesystem() || !target.is_file() {
+        return Ok(());
+    }
+    let content_path = virtual_fs_content_path(state_root, &mount.mount_id, relative_path)
+        .map_err(|error| error.to_string())?;
+    let contents = fs::read(&content_path)
+        .map_err(|error| format!("Could not read restored local cache: {error}"))?;
+    write_file_atomic(target, &contents)
+        .map_err(|error| format!("Could not refresh visible file after reset: {error}"))
+}
+
 fn diff_target_direct(target: &Path) -> Result<DiffReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
@@ -7152,16 +7267,35 @@ fn pull_report_message(report: &PullReport) -> String {
     if !report.conflicts.is_empty() {
         return "Pulled the latest Notion version and wrote conflict markers into the local file. Open the file, resolve the markers, then push again.".to_string();
     }
+    if report.skipped_dirty > 0
+        && (report.hydrated > 0 || report.enumerated > 0 || report.stubbed > 0)
+    {
+        return "Synced available Notion updates and kept pending local edits unchanged. Use Push or Reset to remote for the pending files.".to_string();
+    }
     if report.hydrated > 0 {
         return "Synced the latest Notion version for this file.".to_string();
     }
     if report.skipped_dirty > 0 {
-        return "Locality kept your local edits because the file is still dirty. Review the diff, then push or restore the file.".to_string();
+        return "Locality kept your local edits because the file is still dirty. Review the diff, then push or reset the file to remote.".to_string();
     }
     if report.enumerated > 0 || report.stubbed > 0 {
         return "Synced the latest Notion index for this mount.".to_string();
     }
     "Pulled the latest Notion content.".to_string()
+}
+
+fn reset_to_remote_message(report: &PullReport) -> String {
+    if !report.conflicts.is_empty() || report.skipped_dirty > 0 {
+        return pull_report_message(report);
+    }
+    if report.hydrated > 0 {
+        return "Discarded local edits and restored the latest Notion version for this file."
+            .to_string();
+    }
+    if report.enumerated > 0 || report.stubbed > 0 {
+        return "Discarded local edits and refreshed the Notion index for this mount.".to_string();
+    }
+    "Discarded local edits and restored the synced Notion version for this file.".to_string()
 }
 
 fn diff_report_message(report: &DiffReport) -> String {
@@ -7286,15 +7420,16 @@ mod tests {
         live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
         mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
         parse_daemon_build_info_json, pending_changes_from_status,
-        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
-        push_action_message, record_current_install_marker, record_desktop_activity,
-        sample_live_mode_status, sample_snapshot, screen_bounds_for_anchor_from_monitors,
-        shell_single_quote, should_hide_tray_popover, should_prioritize_located_result,
-        state_event_path_requires_refresh, state_event_path_wakes_live_mode,
-        summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
-        tray_popover_anchor, tray_popover_position, unique_suffix, validate_mount_root,
-        virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
-        wake_live_mode_runner, write_terminal_cli_path_section,
+        prepare_existing_workspace_mount_for_remount, preserve_mount_pending_local_changes,
+        pull_error_message, pull_report_message, push_action_message,
+        record_current_install_marker, record_desktop_activity, refresh_visible_target_from_cache,
+        reset_to_remote_message, sample_live_mode_status, sample_snapshot,
+        screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
+        should_prioritize_located_result, state_event_path_requires_refresh,
+        state_event_path_wakes_live_mode, summarize_virtual_projection_children,
+        terminal_cli_link_state, tray_icon_image, tray_popover_anchor, tray_popover_position,
+        unique_suffix, validate_mount_root, virtual_projection_refresh_signal_identifiers,
+        wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
     };
 
     #[test]
@@ -8470,6 +8605,98 @@ mod tests {
     }
 
     #[test]
+    fn workspace_remount_preserves_pending_changes_and_clears_stale_cache() {
+        let temp = TestTempDir::new("workspace-remount-clears-stale-cache");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let mount_root = temp.path().join("notion");
+        let relative_path = Path::new("engineering-wiki/2026-06-26/page.md");
+        let entity = EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "2026-06-26",
+            relative_path,
+        )
+        .with_hydration(HydrationState::Dirty);
+
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &mount_root)
+                    .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save mount");
+        store.save_entity(entity).expect("save dirty entity");
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    remote_id,
+                    "remote body\n",
+                    11,
+                    vec![RemoteId::new("block-1")],
+                )
+                .expect("shadow"),
+            )
+            .expect("save shadow");
+        let content_path =
+            localityd::virtual_fs::virtual_fs_content_path(temp.path(), &mount_id, relative_path)
+                .expect("content path");
+        fs::create_dir_all(content_path.parent().expect("content parent"))
+            .expect("create content parent");
+        fs::write(&content_path, "pending local body\n").expect("write content cache");
+
+        let preserved =
+            prepare_existing_workspace_mount_for_remount(&mut store, temp.path(), &mount_id)
+                .expect("prepare remount")
+                .expect("preserved pending local change");
+
+        assert_eq!(preserved.count, 1);
+        assert!(preserved.directory.join(relative_path).exists());
+        assert!(
+            store.get_mount(&mount_id).expect("get mount").is_some(),
+            "remount preparation must leave the mount record so run_mount can update it"
+        );
+        assert!(
+            store
+                .list_entities(&mount_id)
+                .expect("list entities")
+                .is_empty(),
+            "stale page paths must not survive a workspace remount"
+        );
+        assert!(!localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id).exists());
+    }
+
+    #[test]
+    fn reset_refreshes_visible_file_provider_copy_from_cache() {
+        let temp = TestTempDir::new("reset-refreshes-visible-copy");
+        let mount_id = MountId::new("notion-main");
+        let mount_root = temp.path().join("notion");
+        let relative_path = Path::new("engineering-wiki/standups/page.md");
+        let mount = MountConfig::new(mount_id.clone(), "notion", &mount_root)
+            .projection(ProjectionMode::MacosFileProvider);
+        let content_path =
+            localityd::virtual_fs::virtual_fs_content_path(temp.path(), &mount_id, relative_path)
+                .expect("content path");
+        let visible_path = mount_root.join(relative_path);
+        fs::create_dir_all(content_path.parent().expect("content parent"))
+            .expect("create content parent");
+        fs::create_dir_all(visible_path.parent().expect("visible parent"))
+            .expect("create visible parent");
+        fs::write(&content_path, "remote restored body\n").expect("write cache");
+        fs::write(&visible_path, "dirty visible body\n").expect("write visible");
+
+        refresh_visible_target_from_cache(temp.path(), &mount, relative_path, &visible_path)
+            .expect("refresh visible");
+
+        assert_eq!(
+            fs::read_to_string(&visible_path).expect("read visible"),
+            "remote restored body\n"
+        );
+    }
+
+    #[test]
     fn pending_changes_hide_clean_failed_journal_audit_entries() {
         let status = status_report_with_entry(status_entry(
             loc_cli::status::StatusState::Clean,
@@ -8621,6 +8848,50 @@ mod tests {
         };
 
         assert!(pull_report_message(&report).contains("conflict markers"));
+    }
+
+    #[test]
+    fn pull_report_message_explains_partial_mount_refresh_with_pending_changes() {
+        let report = loc_cli::pull::PullReport {
+            ok: false,
+            command: "pull".to_string(),
+            via: "cli".to_string(),
+            mount_id: "notion-main".to_string(),
+            root: "/tmp/notion".to_string(),
+            target: "/tmp/notion".to_string(),
+            enumerated: 1,
+            stubbed: 2,
+            hydrated: 0,
+            skipped_dirty: 1,
+            conflicts: vec![],
+        };
+
+        let message = pull_report_message(&report);
+
+        assert!(message.contains("Synced available Notion updates"));
+        assert!(message.contains("Reset to remote"));
+    }
+
+    #[test]
+    fn reset_to_remote_message_confirms_discarded_local_edits() {
+        let report = loc_cli::pull::PullReport {
+            ok: true,
+            command: "pull".to_string(),
+            via: "cli".to_string(),
+            mount_id: "notion-main".to_string(),
+            root: "/tmp/notion".to_string(),
+            target: "/tmp/notion/page.md".to_string(),
+            enumerated: 0,
+            stubbed: 0,
+            hydrated: 1,
+            skipped_dirty: 0,
+            conflicts: vec![],
+        };
+
+        let message = reset_to_remote_message(&report);
+
+        assert!(message.contains("Discarded local edits"));
+        assert!(message.contains("latest Notion version"));
     }
 
     fn status_report_with_entry(
@@ -9859,6 +10130,7 @@ fn main() {
             push_to_notion,
             push_notion_file,
             pull_notion_file,
+            reset_notion_file_to_remote,
             live_mode_tick,
             set_mount_live_mode,
             diff_notion_file,
