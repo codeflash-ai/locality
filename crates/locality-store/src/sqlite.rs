@@ -1944,6 +1944,13 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::OlderComponent {
             component_id,
+            found,
+            current: SCHEMA_VERSION,
+        } if component_id == "core:schema" && *found == user_version && user_version < SCHEMA_VERSION
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
             found: 1,
             current: LINUX_FUSE_PROJECTION_LAYOUT_VERSION,
         } if component_id == "projection:linux_fuse"

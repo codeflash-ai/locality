@@ -566,6 +566,14 @@ fn sqlite_store_v14_missing_live_mode_component_migrates_to_v15() {
         )
         .expect("delete live mode component");
     connection
+        .execute(
+            "UPDATE state_components
+             SET version = 14
+             WHERE component_id = 'core:schema'",
+            [],
+        )
+        .expect("mark v14 schema component");
+    connection
         .execute_batch("PRAGMA user_version = 14;")
         .expect("mark v14 state");
     drop(connection);
