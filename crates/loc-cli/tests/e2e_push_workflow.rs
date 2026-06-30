@@ -4909,6 +4909,7 @@ fn desktop_style_locate_notion_url_path(
             query: url.to_string(),
             connector: Some("notion".to_string()),
             limit: 8,
+            include_stale_access: false,
         },
     )
     .expect("search exact located Notion URL");

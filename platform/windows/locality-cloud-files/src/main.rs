@@ -2259,7 +2259,58 @@ fn seed_root_placeholders(context: &ProviderContext) -> Result<usize, HelperErro
     let children = context.children(&context.root_identifier())?;
     create_placeholders_in_directory(&context.sync_root, &children.children)?;
     remember_placeholder_children(context, &context.sync_root, &children.children);
+    seed_existing_child_directory_placeholders(context, &context.sync_root, &children.children)?;
     Ok(children.children.len())
+}
+
+#[cfg(target_os = "windows")]
+fn seed_existing_child_directory_placeholders(
+    context: &ProviderContext,
+    directory: &Path,
+    items: &[localityd::file_provider::FileProviderItem],
+) -> Result<(), HelperError> {
+    for item in existing_child_directory_items(directory, items)? {
+        let child_directory = directory.join(&item.filename);
+        let children = context.children(&item.identifier)?;
+        trace_cloud_files(format!(
+            "seed existing child directory placeholders directory=`{}` identifier=`{}` count={}",
+            child_directory.display(),
+            item.identifier,
+            children.children.len()
+        ));
+        create_placeholders_in_directory(&child_directory, &children.children)?;
+        remember_placeholder_children(context, &child_directory, &children.children);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn existing_child_directory_items(
+    directory: &Path,
+    items: &[localityd::file_provider::FileProviderItem],
+) -> Result<Vec<localityd::file_provider::FileProviderItem>, HelperError> {
+    let mut existing_directories = Vec::new();
+    for item in items {
+        if item.kind != localityd::file_provider::FileProviderItemKind::Folder {
+            continue;
+        }
+        let child_path = directory.join(&item.filename);
+        match child_path.try_exists() {
+            Ok(false) => continue,
+            Ok(true) => {
+                if child_path.is_dir() {
+                    existing_directories.push(item.clone());
+                }
+            }
+            Err(error) => {
+                return Err(HelperError::io(
+                    "inspect existing child directory placeholder seed target",
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(existing_directories)
 }
 
 #[cfg(target_os = "windows")]
@@ -3925,6 +3976,72 @@ mod tests {
         };
 
         assert_eq!(placeholder_size_for_item(&item), 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn existing_child_directory_items_only_returns_preexisting_folders() {
+        let temp = unique_test_state_dir("existing-child-dirs");
+        let sync_root = temp.join("Locality");
+        let existing_mount = sync_root.join("notion-main");
+        std::fs::create_dir_all(&existing_mount).expect("create existing mount dir");
+
+        let items = vec![
+            localityd::file_provider::FileProviderItem {
+                identifier: "mount:notion-main".to_string(),
+                parent_identifier: Some(
+                    localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string(),
+                ),
+                filename: "notion-main".to_string(),
+                kind: localityd::file_provider::FileProviderItemKind::Folder,
+                entity_kind: None,
+                remote_id: None,
+                path: "notion-main".to_string(),
+                hydration: None,
+                content_type: "public.folder".to_string(),
+                remote_edited_at: None,
+                materialized_path: None,
+                byte_size: None,
+            },
+            localityd::file_provider::FileProviderItem {
+                identifier: "mount:notion-other".to_string(),
+                parent_identifier: Some(
+                    localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string(),
+                ),
+                filename: "notion-other".to_string(),
+                kind: localityd::file_provider::FileProviderItemKind::Folder,
+                entity_kind: None,
+                remote_id: None,
+                path: "notion-other".to_string(),
+                hydration: None,
+                content_type: "public.folder".to_string(),
+                remote_edited_at: None,
+                materialized_path: None,
+                byte_size: None,
+            },
+            localityd::file_provider::FileProviderItem {
+                identifier: "AGENTS.md".to_string(),
+                parent_identifier: Some("mount:notion-main".to_string()),
+                filename: "AGENTS.md".to_string(),
+                kind: localityd::file_provider::FileProviderItemKind::File,
+                entity_kind: None,
+                remote_id: None,
+                path: "notion-main/AGENTS.md".to_string(),
+                hydration: None,
+                content_type: "text/markdown".to_string(),
+                remote_edited_at: None,
+                materialized_path: None,
+                byte_size: Some(123),
+            },
+        ];
+
+        let existing =
+            existing_child_directory_items(&sync_root, &items).expect("list existing child dirs");
+
+        assert_eq!(existing.len(), 1);
+        assert_eq!(existing[0].identifier, "mount:notion-main");
+
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[cfg(target_os = "windows")]

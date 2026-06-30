@@ -9,6 +9,8 @@ ARCH="$(uname -m)"
 TARGET="${ARCH}-apple-macos14.0"
 SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
 
+"${ROOT}/scripts/unmount-existing-domains.sh"
+
 rm -rf "${APP}" "${BUILD_ROOT}/Locality.app"
 mkdir -p \
   "${APP}/Contents/MacOS" \

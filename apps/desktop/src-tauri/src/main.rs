@@ -69,7 +69,7 @@ use locality_platform::{
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-    ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
+    ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, FreshnessStateRecord,
     FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, JournalRepository,
     MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState,
     MountLiveModeStateChangeError, MountRepository, ProjectionMode, RemoteObservationRecord,
@@ -151,6 +151,7 @@ struct DesktopSnapshot {
     needs_onboarding: bool,
     settings: DesktopSettings,
     pending_changes: Vec<PendingChange>,
+    recent_files: Vec<LocatedItem>,
     activity: Vec<ActivityItem>,
     suggestions: Vec<ConnectorSuggestion>,
 }
@@ -2062,6 +2063,13 @@ fn load_desktop_snapshot_from_store(
         None => Vec::new(),
     };
     let live_mode = mount_live_mode_summary(store, mount.as_ref(), &pending_changes);
+    let recent_files = match mount.as_ref() {
+        Some(mount) if desktop_mount_has_current_access(mount, connection.as_ref()) => {
+            recent_files_for_mount(store, state_root, mount, 6)?
+        }
+        None => Vec::new(),
+        Some(_) => Vec::new(),
+    };
     let daemon_ready = send_request(state_root, &DaemonRequest::Ping)
         .map(|response| response.ok)
         .unwrap_or(false);
@@ -2091,6 +2099,7 @@ fn load_desktop_snapshot_from_store(
         needs_onboarding,
         settings: desktop_settings(),
         pending_changes,
+        recent_files,
         activity: activity_from_journals(&journals, store, state_root),
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
@@ -2137,6 +2146,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
         needs_onboarding: false,
         settings: desktop_settings(),
         pending_changes: Vec::new(),
+        recent_files: Vec::new(),
         activity: vec![ActivityItem {
             title: "Could not load Locality state".to_string(),
             detail: message,
@@ -2166,6 +2176,23 @@ fn desktop_needs_onboarding(
     mount: Option<&MountConfig>,
 ) -> bool {
     !matches!(connection, Some(connection) if connection.status == "active") || mount.is_none()
+}
+
+fn desktop_mount_has_current_access(
+    mount: &MountConfig,
+    connection: Option<&ConnectionRecord>,
+) -> bool {
+    let Some(connection_id) = mount.connection_id.as_ref() else {
+        return true;
+    };
+
+    matches!(
+        connection,
+        Some(connection)
+            if connection.status == "active"
+                && connection.connector == mount.connector
+                && connection.connection_id == *connection_id
+    )
 }
 
 fn choose_connection(
@@ -2537,6 +2564,118 @@ where
             live_mode,
         })
         .collect()
+}
+
+fn recent_files_for_mount(
+    store: &SqliteStateStore,
+    state_root: &Path,
+    mount: &MountConfig,
+    limit: usize,
+) -> Result<Vec<LocatedItem>, String> {
+    let status = run_status(
+        store,
+        StatusOptions {
+            state_root: Some(state_root.to_path_buf()),
+            mount_id: Some(mount.mount_id.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .map_err(|error| error.message())?;
+    let freshness = store
+        .list_freshness_states(&mount.mount_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|state| (state.remote_id.0.clone(), state))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut files = status
+        .mounts
+        .iter()
+        .flat_map(|mount| mount.entries.iter())
+        .filter_map(|entry| {
+            let freshness = freshness.get(&entry.entity_id);
+            let sort_value = recent_file_sort_value(entry, freshness)?;
+            Some((
+                sort_value,
+                entry.title.clone(),
+                LocatedItem {
+                    title: entry.title.clone(),
+                    kind: search_kind_label(&entry.kind).to_string(),
+                    local_path: display_path(Path::new(&entry.absolute_path)),
+                    state: located_state_for_status_entry(entry).to_string(),
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    files.truncate(limit);
+    Ok(files.into_iter().map(|(_, _, item)| item).collect())
+}
+
+fn recent_file_sort_value(
+    entry: &loc_cli::status::StatusEntry,
+    freshness: Option<&FreshnessStateRecord>,
+) -> Option<u128> {
+    let freshness_value = freshness
+        .into_iter()
+        .flat_map(|freshness| {
+            [
+                freshness.last_local_change_at.as_deref(),
+                freshness.last_opened_at.as_deref(),
+                freshness.last_checked_at.as_deref(),
+            ]
+        })
+        .flatten()
+        .filter_map(timestamp_sort_value)
+        .max()
+        .unwrap_or(0);
+
+    if freshness_value > 0 {
+        return Some(freshness_value);
+    }
+
+    if matches!(
+        entry.state,
+        StatusState::Dirty | StatusState::Conflicted | StatusState::Error | StatusState::Missing
+    ) || !matches!(entry.sync_state, StatusSyncState::AllSynced)
+    {
+        return Some(1);
+    }
+
+    None
+}
+
+fn timestamp_sort_value(value: &str) -> Option<u128> {
+    let value = value.trim();
+    if let Some(millis) = value.strip_prefix("unix_ms:") {
+        return millis.parse::<u128>().ok();
+    }
+    value.parse::<u128>().ok()
+}
+
+fn located_state_for_status_entry(entry: &loc_cli::status::StatusEntry) -> &'static str {
+    if matches!(
+        entry.state,
+        StatusState::Conflicted | StatusState::Error | StatusState::Missing
+    ) || matches!(entry.sync_state, StatusSyncState::Conflicted)
+    {
+        return "conflict";
+    }
+    if matches!(entry.state, StatusState::Dirty)
+        || matches!(
+            entry.sync_state,
+            StatusSyncState::PendingLocalChanges | StatusSyncState::ReviewNeeded
+        )
+    {
+        return "pending_changes";
+    }
+    if matches!(entry.sync_state, StatusSyncState::RemoteUpdateAvailable) {
+        return "remote_update_available";
+    }
+    if matches!(entry.state, StatusState::Stub) {
+        return "online_only";
+    }
+    "ready"
 }
 
 fn live_mode_status_for_entry(
@@ -3343,6 +3482,7 @@ fn search_notion_results(query: &str, limit: usize) -> Result<Vec<SearchResult>,
             query: query.to_string(),
             connector: Some("notion".to_string()),
             limit,
+            include_stale_access: false,
         },
         mount_access_root,
     )
@@ -7756,6 +7896,7 @@ mod tests {
 
     use loc_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
     use locality_core::canonical::render_canonical_markdown;
+    use locality_core::freshness::FreshnessTier;
     use locality_core::journal::{JournalEntry, JournalStatus, PushId};
     use locality_core::model::{
         CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
@@ -7765,9 +7906,10 @@ mod tests {
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
-        InMemoryStateStore, JournalRepository, LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig,
-        MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState, MountRepository,
-        ProjectionMode, ShadowRepository, SqliteStateStore,
+        FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
+        LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
+        MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
+        ShadowRepository, SqliteStateStore,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
@@ -7961,6 +8103,29 @@ mod tests {
             .expect("save google connection");
         store.save_mount(google_mount).expect("save google mount");
         store.save_mount(notion_mount).expect("save notion mount");
+        let notion_remote_id = RemoteId::new("notion-page-1");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    MountId::new("notion-main"),
+                    notion_remote_id.clone(),
+                    EntityKind::Page,
+                    "Standups with Locality",
+                    "Standups with Locality/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save notion entity");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    MountId::new("notion-main"),
+                    notion_remote_id.clone(),
+                    FreshnessTier::Hot,
+                )
+                .opened_at("unix_ms:1782033300000"),
+            )
+            .expect("save notion freshness");
         let google_remote_id = RemoteId::new("doc-1");
         store
             .save_entity(
@@ -8007,6 +8172,13 @@ mod tests {
                 .connector_name,
             "Google Docs"
         );
+        assert_eq!(snapshot.recent_files.len(), 1);
+        assert_eq!(snapshot.recent_files[0].title, "Standups with Locality");
+        assert!(
+            snapshot.recent_files[0]
+                .local_path
+                .ends_with("Standups with Locality/page.md")
+        );
         assert_eq!(
             snapshot
                 .mounts
@@ -8016,6 +8188,52 @@ mod tests {
                 .pending_change_count,
             1
         );
+    }
+
+    #[test]
+    fn desktop_snapshot_hides_recent_files_for_inactive_mount_access() {
+        let temp = TestTempDir::new("desktop-stale-recent-files");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mut connection = test_connection("workspace-1", "CodeFlash");
+        connection.status = "revoked".to_string();
+        let remote_id = RemoteId::new("stale-page-1");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("codeflash-wiki"),
+        )
+        .with_connection_id(connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+        store.save_connection(connection).expect("save connection");
+        store.save_mount(mount).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    MountId::new("notion-main"),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Old Access Page",
+                    "Old Access Page/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save stale entity");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    MountId::new("notion-main"),
+                    remote_id,
+                    FreshnessTier::Hot,
+                )
+                .opened_at("unix_ms:1782033300000"),
+            )
+            .expect("save stale freshness");
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+
+        assert!(snapshot.needs_onboarding);
+        assert!(snapshot.recent_files.is_empty());
     }
 
     #[test]
@@ -10348,6 +10566,14 @@ fn sample_snapshot() -> DesktopSnapshot {
             show_menu_bar: true,
         },
         pending_changes: sample_pending_changes(),
+        recent_files: vec![LocatedItem {
+            title: "Roadmap 2026".to_string(),
+            kind: "Page".to_string(),
+            local_path: absolute_display_path(
+                &default_notion_mount_root().join("Engineering/Roadmap 2026/page.md"),
+            ),
+            state: "ready".to_string(),
+        }],
         activity: vec![
             ActivityItem {
                 title: "Pushed Roadmap 2026 to Notion".to_string(),
@@ -10784,9 +11010,8 @@ fn main() {
         .setup(move |app| {
             if desktop_smoke_test_requested() {
                 configure_main_window_chrome(app);
-                build_tray(app)?;
-                app.app_handle().exit(0);
-                return Ok(());
+                // Keep release smoke tests isolated from the user's daemon state.
+                std::process::exit(0);
             }
             if let Err(error) = apply_launch_at_login_preference() {
                 eprintln!("loc desktop could not apply launch-at-login preference: {error}");
@@ -10992,7 +11217,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
                         .unwrap_or_else(|_| PathBuf::from(snapshot.mount.local_path));
                     let _ = open_virtual_mount_or_path(&path);
                 }
-                show_main_window_with_view(app, Some("mount"));
+                show_main_window_with_view(app, Some("files"));
             }
             "review_pending" => show_main_window_with_view(app, Some("pending")),
             "hide_menubar" => {
@@ -11059,7 +11284,6 @@ fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
         return;
     }
 
-    refresh_tray_icon(app);
     let scale_factor = window.scale_factor().unwrap_or(1.0);
     let popover_size = window.outer_size().unwrap_or_else(|_| {
         PhysicalSize::new(
@@ -11073,6 +11297,7 @@ fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
     let _ = window.eval("window.dispatchEvent(new CustomEvent('loc-refresh-snapshot'));");
     let _ = window.show();
     let _ = window.set_focus();
+    schedule_tray_icon_refresh(app.clone());
 }
 
 fn screen_bounds_for_tray_anchor(

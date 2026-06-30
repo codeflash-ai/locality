@@ -7,8 +7,9 @@ use loc_cli::search::{SearchError, SearchOptions, notion_id_from_url, run_search
 use locality_core::freshness::RemoteVersion;
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_store::{
-    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
-    ProjectionMode, RemoteObservationRecord, RemoteObservationRepository, SqliteStateStore,
+    ConnectionId, ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
+    InMemoryStateStore, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
+    RemoteObservationRepository, SqliteStateStore,
 };
 
 #[test]
@@ -23,6 +24,7 @@ fn search_ranks_title_path_and_remote_id_matches() {
             query: "roadmap".to_string(),
             connector: Some("notion".to_string()),
             limit: 10,
+            include_stale_access: false,
         },
     )
     .expect("title search");
@@ -34,6 +36,7 @@ fn search_ranks_title_path_and_remote_id_matches() {
             query: "product".to_string(),
             connector: Some("notion".to_string()),
             limit: 10,
+            include_stale_access: false,
         },
     )
     .expect("path search");
@@ -47,6 +50,7 @@ fn search_ranks_title_path_and_remote_id_matches() {
                     .to_string(),
             connector: Some("notion".to_string()),
             limit: 10,
+            include_stale_access: false,
         },
     )
     .expect("id search");
@@ -246,6 +250,7 @@ fn search_filters_connectors_and_rejects_empty_queries() {
             query: "roadmap".to_string(),
             connector: Some("notion".to_string()),
             limit: 10,
+            include_stale_access: false,
         },
     )
     .expect("notion search");
@@ -254,6 +259,81 @@ fn search_filters_connectors_and_rejects_empty_queries() {
 
     let empty = run_search(&store, SearchOptions::new("   ")).expect_err("empty query");
     assert!(matches!(empty, SearchError::EmptyQuery));
+}
+
+#[test]
+fn search_hides_inactive_connection_mounts_by_default() {
+    let fixture = SearchFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let current_mount_id = MountId::new("notion-current");
+    let stale_mount_id = MountId::new("notion-stale");
+    store
+        .save_connection(test_connection("current", "active"))
+        .expect("save active connection");
+    store
+        .save_connection(test_connection("stale", "revoked"))
+        .expect("save stale connection");
+    store
+        .save_mount(
+            MountConfig::new(
+                current_mount_id.clone(),
+                "notion",
+                fixture.root.join("current"),
+            )
+            .with_connection_id(ConnectionId::new("current")),
+        )
+        .expect("save current mount");
+    store
+        .save_mount(
+            MountConfig::new(stale_mount_id.clone(), "notion", fixture.root.join("stale"))
+                .with_connection_id(ConnectionId::new("stale")),
+        )
+        .expect("save stale mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                current_mount_id.clone(),
+                RemoteId::new("current-roadmap"),
+                EntityKind::Page,
+                "Roadmap Current",
+                "Roadmap Current/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save current entity");
+    store
+        .save_entity(
+            EntityRecord::new(
+                stale_mount_id.clone(),
+                RemoteId::new("stale-roadmap"),
+                EntityKind::Page,
+                "Roadmap Stale",
+                "Roadmap Stale/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save stale entity");
+
+    let current = run_search(&store, SearchOptions::new("roadmap")).expect("current search");
+    assert_eq!(current.results.len(), 1);
+    assert_eq!(current.results[0].mount_id, "notion-current");
+
+    let all = run_search(
+        &store,
+        SearchOptions {
+            query: "roadmap".to_string(),
+            connector: None,
+            limit: 10,
+            include_stale_access: true,
+        },
+    )
+    .expect("all search");
+    assert_eq!(all.results.len(), 2);
+    assert!(
+        all.results
+            .iter()
+            .any(|result| result.mount_id == "notion-stale")
+    );
 }
 
 #[test]
@@ -358,6 +438,7 @@ fn search_absolute_path_uses_mount_point_root() {
             query: "Roadmap".to_string(),
             connector: None,
             limit: 10,
+            include_stale_access: false,
         },
     )
     .expect("search");
@@ -439,6 +520,26 @@ impl SearchFixture {
 impl Drop for SearchFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn test_connection(connection_id: &str, status: &str) -> ConnectionRecord {
+    ConnectionRecord {
+        connection_id: ConnectionId::new(connection_id),
+        profile_id: None,
+        connector: "notion".to_string(),
+        display_name: connection_id.to_string(),
+        account_label: Some("agent@example.com".to_string()),
+        workspace_id: Some("workspace".to_string()),
+        workspace_name: Some("Workspace".to_string()),
+        auth_kind: "oauth".to_string(),
+        secret_ref: format!("connection:{connection_id}"),
+        scopes: Vec::new(),
+        capabilities_json: "{}".to_string(),
+        status: status.to_string(),
+        created_at: "2026-06-30T00:00:00Z".to_string(),
+        updated_at: "2026-06-30T00:00:00Z".to_string(),
+        expires_at: None,
     }
 }
 

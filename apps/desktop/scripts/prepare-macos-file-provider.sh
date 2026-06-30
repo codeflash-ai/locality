@@ -12,6 +12,7 @@ LOCALITY_OUT="${ROOT}/apps/desktop/src-tauri/macos/loc"
   cd "${ROOT}"
   cargo build -p loc-cli -p localityd --release
 )
+node "${ROOT}/apps/desktop/scripts/stop-daemon-for-build.mjs" --loc "${ROOT}/target/release/loc"
 APP="$("${FILE_PROVIDER_ROOT}/scripts/build-dev-bundle.sh")"
 
 rm -rf "${OUT}"

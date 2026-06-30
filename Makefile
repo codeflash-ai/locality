@@ -155,6 +155,10 @@ test-linux-publish-config: ## Validate Linux package publish configuration.
 test-macos-publish-config: ## Validate macOS package publish configuration.
 	tests/macos_publish_config.sh
 
+.PHONY: test-macos-file-provider-build-config
+test-macos-file-provider-build-config: ## Validate macOS File Provider rebuild hooks.
+	tests/macos_file_provider_build_config.sh
+
 .PHONY: fmt
 fmt: ## Format Rust code.
 	$(CARGO) fmt --all

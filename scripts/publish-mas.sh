@@ -296,6 +296,7 @@ main() {
   log "building Mac App Store-channel app bundle"
   VITE_LOCALITY_DISTRIBUTION_CHANNEL=mas \
   LOCALITY_DISTRIBUTION_CHANNEL=mas \
+  LOCALITY_SKIP_FILE_PROVIDER_UNMOUNT_FOR_BUILD=1 \
   APPLE_SIGNING_IDENTITY="${app_signing_identity}" \
     npm --prefix "${DESKTOP_DIR}" run tauri -- build --bundles app --config "${config_json}"
 
