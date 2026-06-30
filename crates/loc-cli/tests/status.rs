@@ -93,6 +93,81 @@ fn status_reports_mount_live_mode_state() {
 }
 
 #[test]
+fn status_hides_stale_disabled_live_mode_error_when_entries_are_clean() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nSame paragraph.");
+    store
+        .save_mount_live_mode(
+            MountLiveModeRecord::new(fixture.mount_id.clone(), true, "1").error(
+                "Live Mode could not inspect Notion changes: network unavailable",
+                "2",
+                "2",
+            ),
+        )
+        .expect("save live mode");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.mounts[0].live_mode.enabled);
+    assert_eq!(report.mounts[0].live_mode.state, "off");
+    assert_eq!(report.mounts[0].live_mode.label, "Live Mode off");
+    assert_eq!(report.mounts[0].live_mode.reason, None);
+}
+
+#[test]
+fn status_keeps_disabled_live_mode_error_when_entries_need_attention() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nLocal edit.");
+    store
+        .save_mount_live_mode(
+            MountLiveModeRecord::new(fixture.mount_id.clone(), true, "1").error(
+                "Live Mode paused for `Roadmap`: local edits pending review.",
+                "2",
+                "2",
+            ),
+        )
+        .expect("save live mode");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.mounts[0].live_mode.enabled);
+    assert_eq!(report.mounts[0].live_mode.state, "error");
+    assert_eq!(report.mounts[0].live_mode.label, "Live Mode paused");
+    assert_eq!(
+        report.mounts[0].live_mode.reason.as_deref(),
+        Some("Live Mode paused for `Roadmap`: local edits pending review.")
+    );
+}
+
+#[test]
 fn status_treats_content_cache_absolute_media_href_as_clean() {
     let fixture = StatusFixture::new();
     let mut store = fixture.store();

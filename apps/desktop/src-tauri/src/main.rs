@@ -1383,12 +1383,23 @@ fn record_mount_live_mode_tick_result(
         .unwrap_or_else(|| MountLiveModeRecord::new(mount_id.clone(), true, now.clone()));
     let record = if report.ok {
         record.active(non_empty_string(report.message.clone()), now.clone(), now)
-    } else {
+    } else if live_mode_failure_should_pause(&report.message) {
         record.error(report.message.clone(), now.clone(), now)
+    } else {
+        record.active(non_empty_string(report.message.clone()), now.clone(), now)
     };
     store
         .save_mount_live_mode(record)
         .map_err(|error| format!("Live Mode could not update its state: {error}"))
+}
+
+fn live_mode_failure_should_pause(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    message.starts_with("Live Mode paused for")
+        || message.contains("Review required before pushing")
+        || lower.contains("conflict")
+        || lower.contains("changed since last sync")
+        || lower.contains("could not identify the remote page")
 }
 
 fn live_mode_timestamp() -> String {
@@ -2123,6 +2134,20 @@ impl MountLiveModeSummary {
                 ..Self::off()
             };
         };
+        if !record.enabled
+            && record.state == MountLiveModeState::Error
+            && !record
+                .last_reason
+                .as_deref()
+                .is_some_and(live_mode_failure_should_pause)
+        {
+            return Self {
+                pending_count,
+                review_count,
+                covered_count,
+                ..Self::off()
+            };
+        }
         let state = mount_live_mode_state_label(record);
 
         Self {
@@ -7424,14 +7449,15 @@ mod tests {
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository,
-        LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountRepository, ProjectionMode,
+        LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
+        MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
         ShadowRepository, SqliteStateStore,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
 
     use super::{
-        DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup,
+        ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup,
         MonitorScreenBounds, PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
         clear_mount_cached_projection, clear_state_root_contents, conflict_preview,
         connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
@@ -7449,13 +7475,13 @@ mod tests {
         pending_changes_from_status, prepare_existing_workspace_mount_for_remount,
         preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
         push_action_message, record_current_install_marker, record_desktop_activity,
-        refresh_visible_target_from_cache, reset_to_remote_message, sample_live_mode_status,
-        sample_snapshot, screen_bounds_for_anchor_from_monitors, shell_single_quote,
-        should_hide_tray_popover, should_prioritize_located_result,
-        state_event_path_requires_refresh, state_event_path_wakes_live_mode,
-        summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
-        tray_popover_anchor, tray_popover_position, unique_suffix,
-        unsupported_notion_locator_url_message, validate_mount_root,
+        record_mount_live_mode_tick_result, refresh_visible_target_from_cache,
+        reset_to_remote_message, sample_live_mode_status, sample_snapshot,
+        screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
+        should_prioritize_located_result, state_event_path_requires_refresh,
+        state_event_path_wakes_live_mode, summarize_virtual_projection_children,
+        terminal_cli_link_state, tray_icon_image, tray_popover_anchor, tray_popover_position,
+        unique_suffix, unsupported_notion_locator_url_message, validate_mount_root,
         virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
         wake_live_mode_runner, write_terminal_cli_path_section,
     };
@@ -7945,6 +7971,99 @@ mod tests {
         assert!(report.message.contains("Launch Plan"));
         assert!(report.message.contains("needs review"));
         assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn live_mode_summary_hides_stale_disabled_error_without_pending_changes() {
+        let record = MountLiveModeRecord::new(MountId::new("notion-main"), true, "1").error(
+            "Live Mode could not inspect Notion changes: network unavailable",
+            "2",
+            "2",
+        );
+
+        let summary = super::MountLiveModeSummary::from_record(Some(&record), &[]);
+
+        assert!(!summary.enabled);
+        assert_eq!(summary.state, "off");
+        assert_eq!(summary.label, "Live Mode off");
+        assert_eq!(summary.reason, None);
+    }
+
+    #[test]
+    fn live_mode_transient_failures_remain_enabled_for_retry() {
+        let temp = TestTempDir::new("live-mode-transient-failure");
+        let mount_id = MountId::new("notion-main");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                temp.path().join("notion"),
+            ))
+            .expect("save mount");
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(mount_id.clone(), true, "1"))
+            .expect("save live mode");
+        drop(store);
+
+        record_mount_live_mode_tick_result(
+            temp.path(),
+            &mount_id,
+            &ActionReport {
+                ok: false,
+                message: "Live Mode could not inspect Notion changes: network unavailable"
+                    .to_string(),
+            },
+        )
+        .expect("record transient result");
+
+        let store = SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen store");
+        let record = store
+            .get_mount_live_mode(&mount_id)
+            .expect("load live mode")
+            .expect("live mode record");
+        assert!(record.enabled);
+        assert_eq!(record.state, MountLiveModeState::Active);
+        assert_eq!(
+            record.last_reason.as_deref(),
+            Some("Live Mode could not inspect Notion changes: network unavailable")
+        );
+    }
+
+    #[test]
+    fn live_mode_review_failures_pause_until_user_action() {
+        let temp = TestTempDir::new("live-mode-review-failure");
+        let mount_id = MountId::new("notion-main");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        store
+            .save_mount(MountConfig::new(
+                mount_id.clone(),
+                "notion",
+                temp.path().join("notion"),
+            ))
+            .expect("save mount");
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(mount_id.clone(), true, "1"))
+            .expect("save live mode");
+        drop(store);
+
+        record_mount_live_mode_tick_result(
+            temp.path(),
+            &mount_id,
+            &ActionReport {
+                ok: false,
+                message: "Live Mode paused for `Roadmap`: needs review.".to_string(),
+            },
+        )
+        .expect("record review result");
+
+        let store = SqliteStateStore::open(temp.path().to_path_buf()).expect("reopen store");
+        let record = store
+            .get_mount_live_mode(&mount_id)
+            .expect("load live mode")
+            .expect("live mode record");
+        assert!(!record.enabled);
+        assert_eq!(record.state, MountLiveModeState::Error);
     }
 
     #[test]

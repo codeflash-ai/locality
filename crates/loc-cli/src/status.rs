@@ -397,6 +397,15 @@ impl StatusLiveMode {
         let Some(record) = record else {
             return Self::off();
         };
+        if !record.enabled
+            && record.state == MountLiveModeState::Error
+            && !record
+                .last_reason
+                .as_deref()
+                .is_some_and(status_live_mode_error_should_pause)
+        {
+            return Self::off();
+        }
         let (state, label) = if !record.enabled && record.state != MountLiveModeState::Error {
             ("off", "Live Mode off")
         } else {
@@ -425,6 +434,15 @@ impl StatusLiveMode {
             last_run_at: None,
         }
     }
+}
+
+fn status_live_mode_error_should_pause(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    message.starts_with("Live Mode paused for")
+        || message.contains("Review required before pushing")
+        || lower.contains("conflict")
+        || lower.contains("changed since last sync")
+        || lower.contains("could not identify the remote page")
 }
 
 impl StatusSummary {
