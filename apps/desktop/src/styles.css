@@ -1747,6 +1747,11 @@ p {
   vertical-align: middle;
 }
 
+.mounts-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .mounts-table th {
   background: rgba(246, 250, 249, 0.92);
   color: var(--muted);
@@ -1766,12 +1771,12 @@ p {
 
 .mounts-table th:nth-child(1),
 .mounts-table td:nth-child(1) {
-  width: 21%;
+  width: 20%;
 }
 
 .mounts-table th:nth-child(2),
 .mounts-table td:nth-child(2) {
-  width: 24%;
+  width: 25%;
 }
 
 .mounts-table th:nth-child(3),
@@ -1782,12 +1787,27 @@ p {
 .mounts-table td:nth-child(5),
 .mounts-table th:nth-child(6),
 .mounts-table td:nth-child(6) {
-  width: 11%;
+  width: 10%;
 }
 
 .mounts-table th:nth-child(7),
 .mounts-table td:nth-child(7) {
-  width: 20%;
+  width: 15%;
+}
+
+.mounts-table td:nth-child(7) {
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.mounts-table .status-pill {
+  display: inline-block;
+  line-height: 24px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
 }
 
 .mount-name-button {
