@@ -400,6 +400,7 @@ Layout:
 │ Locality           │ Home                                         │
 │               │                                              │
 │ Home          │ ...                                          │
+│ Files         │                                              │
 │ Pending       │                                              │
 │ Activity      │                                              │
 │ Settings      │                                              │
@@ -437,6 +438,10 @@ Open a Notion page
 │ Paste Notion URL to get the local file path                  │
 └──────────────────────────────────────────────────────────────┘
 [ Open Page ]    Open Notion Folder
+
+Recent Files
+Standups with Locality
+~/Library/CloudStorage/Locality/notion-main/Engineering Wiki/Standups with Locality/page.md
 
 Pending Changes
 No pending changes
@@ -500,6 +505,63 @@ Error states:
 - no matching mount: "This page is not in a mounted workspace.";
 - no access: "Locality does not have access to this Notion page.";
 - preparation failed: "Locality could not prepare this file. Try again."
+
+## Files
+
+Goal: help users and agents find files that are usable in the current mounted
+access without surfacing old disconnected Notion access by default.
+
+Default search scope:
+
+```text
+Current access only
+```
+
+This means:
+
+- active mounts only;
+- active connections only;
+- files under those mount roots only;
+- no disconnected or revoked access unless an advanced/diagnostic scope is
+  explicitly selected.
+
+Layout:
+
+```text
+Files
+
+Search mounted files
+┌──────────────────────────────────────────────────────────────┐
+│ Search current Notion files                                  │
+└──────────────────────────────────────────────────────────────┘
+
+Recent Files
+@Last Friday
+General / Engineering Wiki / Standups with Locality
+~/Library/CloudStorage/Locality/notion-main/engineering-wiki/standups-with-locality/last-friday/page.md
+[ Copy Path ] [ Reveal ]
+
+Mounted Workspaces
+Engineering Wiki
+~/Library/CloudStorage/Locality/notion-main/engineering-wiki
+[ Open ]
+```
+
+Recent files should come from current active mount state, such as opened files,
+local changes, or files needing review. If the mount is tied to a revoked or
+inactive connection, recent files should be hidden and the user should be routed
+to reconnect or change access.
+
+Search results should label safety states clearly:
+
+- `Ready`
+- `Online Only`
+- `Pending`
+- `Remote Update`
+- `Conflict`
+
+Normal search should not show stale entities from old access scopes. Recovery
+or diagnostics can expose old access with a deliberate advanced filter.
 
 ## Pending Changes
 
