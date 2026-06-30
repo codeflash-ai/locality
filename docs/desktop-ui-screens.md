@@ -88,11 +88,42 @@ Daily Use
   Home
   Pending Changes
   Push Review
+  Mounts
   Mount Detail
   Activity
   Settings
   Diagnostics
 ```
+
+## Daily Use Mounts
+
+The sidebar label is `Mounts`. The first screen lists every registered mount point
+from the desktop snapshot instead of immediately showing the preferred Notion
+mount.
+
+The list uses a compact table with these columns:
+
+- Mount: connector name, workspace label, mount id, and a `Primary` marker for
+  the preferred mount used by Home, tray, and Pending Changes.
+- Local path: the local mount-point folder.
+- Projection: plain files, macOS File Provider, Linux FUSE, or Windows Cloud
+  Files.
+- Access: read-only or edit-enabled.
+- Content: indexed item count and pending-change count.
+- Status: mount/provider status label.
+- Actions: open folder, copy path, and open details.
+
+Clicking the mount name or Details opens Mount Detail for that mount. The detail
+screen keeps the existing mount controls, but all path-based actions use the
+selected mount rather than the preferred snapshot mount. The breadcrumb is:
+
+```text
+Home / Mounts / <mount-id>
+```
+
+The `Mounts` breadcrumb returns to the table without changing the selected
+mount in backend state. No backend mount selection command is introduced by this
+screen.
 
 ## First-Run Onboarding
 
