@@ -2179,7 +2179,7 @@ function MountsView({
                     <td>{row.content}</td>
                     <td>
                       <StatusPill tone={row.tone} title={row.status}>
-                        {row.status}
+                        <span className="mount-status-text">{row.status}</span>
                       </StatusPill>
                     </td>
                     <td>

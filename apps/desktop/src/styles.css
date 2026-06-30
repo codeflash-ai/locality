@@ -1795,18 +1795,23 @@ p {
   width: 15%;
 }
 
+.mounts-table td:nth-child(6),
 .mounts-table td:nth-child(7) {
   overflow: visible;
   text-overflow: clip;
 }
 
 .mounts-table .status-pill {
-  display: inline-block;
-  line-height: 24px;
   max-width: 100%;
+  overflow: visible;
+  vertical-align: middle;
+}
+
+.mount-status-text {
+  display: block;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  vertical-align: middle;
   white-space: nowrap;
 }
 
