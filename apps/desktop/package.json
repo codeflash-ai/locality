@@ -7,6 +7,7 @@
     "dev": "vite --host 127.0.0.1 --port 1420",
     "dev:prepare": "node ./scripts/prepare-dev-sidecars.mjs",
     "build": "tsc && vite build",
+    "test": "vitest",
     "build:mac": "tauri build --bundles dmg && bash ./scripts/postprocess-dmg-volume-icon.sh",
     "build:mas": "VITE_LOCALITY_DISTRIBUTION_CHANNEL=mas LOCALITY_DISTRIBUTION_CHANNEL=mas tauri build --bundles app",
     "build:linux": "tauri build --bundles deb,rpm",
@@ -34,6 +35,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.7.2",
-    "vite": "^6.0.1"
+    "vite": "^6.0.1",
+    "vitest": "^4.1.9"
   }
 }
