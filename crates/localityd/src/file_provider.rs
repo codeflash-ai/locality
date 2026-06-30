@@ -1440,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_windows_projection_from_mount_root_writes_under_source_directory() {
+    fn refresh_windows_projection_from_mount_root_writes_under_mount_point_directory() {
         let root = temp_root("loc-file-provider-windows-root-refresh");
         let state_root = temp_root("loc-file-provider-windows-root-refresh-state");
         let mount_id = MountId::new("notion-main");
@@ -1477,16 +1477,16 @@ mod tests {
         let report = refresh_visible_projection(&store, &state_root, Some(&root), &[])
             .expect("refresh projection");
 
-        let source_visible_path = root.join("notion/roadmap/page.md");
-        let wrong_root_path = root.join("roadmap/page.md");
+        let visible_path = root.join("roadmap/page.md");
+        let obsolete_connector_child_path = root.join("notion/roadmap/page.md");
         assert_eq!(report.checked, 1);
         assert_eq!(report.refreshed, 1);
         assert!(
-            fs::read_to_string(source_visible_path)
-                .expect("read source projection")
+            fs::read_to_string(visible_path)
+                .expect("read mount point projection")
                 .contains("Pulled remote body.")
         );
-        assert!(!wrong_root_path.exists());
+        assert!(!obsolete_connector_child_path.exists());
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(state_root);
