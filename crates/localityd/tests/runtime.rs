@@ -29,8 +29,9 @@ use localityd::runtime::{
     workspace_virtual_freshness_jobs,
 };
 use localityd::scheduler::PullSchedulerTick;
-use localityd::virtual_fs::virtual_fs_content_root;
-use localityd::virtual_fs::{ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport};
+use localityd::virtual_fs::{
+    ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport, virtual_fs_content_root,
+};
 use localityd::watcher::{FileEvent, FileEventKind};
 use serde_json::json;
 
