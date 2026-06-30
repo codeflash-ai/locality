@@ -45,12 +45,10 @@ management lives in `loc daemon ...`:
 - `loc daemon stop` unloads the LaunchAgent or kills the session pid file when
   the CLI owns the daemon. A manually started foreground `localityd` still needs to be
   stopped directly.
-- The desktop app forces a fresh runtime on launch: it first runs the broad
-  daemon stop path for the current state root, terminates any remaining
-  `localityd` process by name on supported desktop platforms, then starts the
-  bundled `localityd` in session mode and reloads mounts. This avoids an older,
-  manually started, or login-started daemon continuing to serve the desktop app
-  after the app has launched.
+- Desktop development and macOS bundle preparation stop the existing daemon as
+  part of the make/Tauri sidecar build path. The build first compiles a fresh
+  `loc`, runs `loc daemon stop`, then terminates any remaining `localityd`
+  process by name so the next app launch cannot keep talking to an older daemon.
 
 The process manager passes `LOCALITY_STATE_DIR` to the daemon it starts. `--tcp-addr`
 persists `LOCALITY_DAEMON_TCP_ADDR` for that managed daemon. `--include-env <KEY>` is

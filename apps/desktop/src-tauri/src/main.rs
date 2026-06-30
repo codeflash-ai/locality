@@ -139,13 +139,6 @@ const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(
 const LIVE_MODE_RUNNER_ACTIVE_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_MODE_RUNNER_IDLE_RECHECK: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Debug, PartialEq, Eq)]
-struct DaemonRestartCommandPlan {
-    stop_args: Vec<String>,
-    start_args: Vec<String>,
-    force_terminate_existing_processes: bool,
-}
-
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopSnapshot {
@@ -5080,69 +5073,8 @@ fn ensure_daemon_running_locked(state_root: &Path) -> Result<(), String> {
     start_daemon_for_current_binary(state_root)
 }
 
-fn restart_daemon_for_desktop_launch(state_root: &Path) -> Result<(), String> {
-    let _guard = daemon_lifecycle_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    desktop_log(
-        "info",
-        "daemon.desktop_launch_restart",
-        "restarting localityd for desktop app launch",
-    );
-    let current_build = expected_daemon_build_info();
-    restart_daemon_for_current_binary_with_plan(
-        state_root,
-        &current_build,
-        desktop_launch_daemon_restart_command_plan(state_root),
-    )
-}
-
-fn start_fresh_daemon_for_desktop_launch(app: AppHandle) {
-    std::thread::spawn(move || {
-        let state_root = default_state_root();
-        match restart_daemon_for_desktop_launch(&state_root) {
-            Ok(()) => {
-                desktop_log(
-                    "info",
-                    "daemon.desktop_launch_restart_complete",
-                    "started fresh localityd for desktop app launch",
-                );
-                if let Err(error) = reload_daemon_mounts(&state_root) {
-                    desktop_log(
-                        "warn",
-                        "daemon.desktop_launch_reload_failed",
-                        format!("could not reload localityd mounts after desktop launch: {error}"),
-                    );
-                }
-                if let Err(error) = ensure_virtual_projection_runtimes_for_state(&state_root) {
-                    desktop_log(
-                        "warn",
-                        "daemon.desktop_launch_provider_failed",
-                        format!(
-                            "could not ensure virtual projection runtime after desktop launch: {error}"
-                        ),
-                    );
-                }
-                refresh_desktop_surfaces(&app);
-            }
-            Err(error) => {
-                desktop_log(
-                    "warn",
-                    "daemon.desktop_launch_restart_failed",
-                    format!("could not restart localityd for desktop app launch: {error}"),
-                );
-                refresh_desktop_surfaces(&app);
-            }
-        }
-    });
-}
-
 fn start_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
-    start_daemon_for_current_binary_with_args(&daemon_control_args("start", state_root))
-}
-
-fn start_daemon_for_current_binary_with_args(args: &[String]) -> Result<(), String> {
-    let report = run_daemon_control(args)
+    let report = run_daemon_control(&daemon_control_args("start", state_root))
         .map_err(|error| format!("Could not start localityd: {}", error.message()))?;
     if report.state == DaemonRunState::Running {
         Ok(())
@@ -5181,23 +5113,7 @@ fn restart_daemon_for_current_binary(
     state_root: &Path,
     expected_build: &DaemonBuildInfo,
 ) -> Result<(), String> {
-    restart_daemon_for_current_binary_with_plan(
-        state_root,
-        expected_build,
-        DaemonRestartCommandPlan {
-            stop_args: daemon_control_args_any_manager("stop", state_root),
-            start_args: daemon_control_args("start", state_root),
-            force_terminate_existing_processes: false,
-        },
-    )
-}
-
-fn restart_daemon_for_current_binary_with_plan(
-    state_root: &Path,
-    expected_build: &DaemonBuildInfo,
-    plan: DaemonRestartCommandPlan,
-) -> Result<(), String> {
-    let stop_error = run_daemon_control(&plan.stop_args)
+    let stop_error = run_daemon_control(&daemon_control_args_any_manager("stop", state_root))
         .err()
         .map(|error| error.message());
     if let Some(message) = stop_error.as_ref() {
@@ -5206,16 +5122,8 @@ fn restart_daemon_for_current_binary_with_plan(
             "daemon.stop_before_restart_failed",
             format!("could not stop existing localityd before restart: {message}"),
         );
-        if daemon_is_ready(state_root) && !plan.force_terminate_existing_processes {
-            return Err(format!(
-                "Could not stop existing localityd before restart: {message}"
-            ));
-        }
     }
-    if plan.force_terminate_existing_processes {
-        terminate_existing_localityd_processes_before_restart(state_root)?;
-    }
-    start_daemon_for_current_binary_with_args(&plan.start_args)?;
+    start_daemon_for_current_binary(state_root)?;
     match running_daemon_build(state_root) {
         Some(build) if &build == expected_build => Ok(()),
         Some(build) => {
@@ -5228,65 +5136,6 @@ fn restart_daemon_for_current_binary_with_plan(
             ))
         }
         None => Err("localityd restarted, but did not report build metadata.".to_string()),
-    }
-}
-
-fn terminate_existing_localityd_processes_before_restart(state_root: &Path) -> Result<(), String> {
-    match force_terminate_localityd_processes() {
-        Ok(true) => {
-            desktop_log(
-                "info",
-                "daemon.force_terminated_existing",
-                "terminated existing localityd process before starting fresh daemon",
-            );
-            let started = Instant::now();
-            while started.elapsed() < Duration::from_secs(2) {
-                if !daemon_is_ready(state_root) {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err("existing localityd is still responding after termination request".to_string())
-        }
-        Ok(false) => Ok(()),
-        Err(error) => {
-            desktop_log(
-                "warn",
-                "daemon.force_terminate_failed",
-                format!("could not terminate existing localityd processes: {error}"),
-            );
-            Ok(())
-        }
-    }
-}
-
-fn force_terminate_localityd_processes() -> io::Result<bool> {
-    let Some((program, args)) = localityd_force_terminate_command_for_target(std::env::consts::OS)
-    else {
-        return Ok(false);
-    };
-    let mut command = Command::new(program);
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-    let status = command.args(args).status()?;
-    Ok(status.success())
-}
-
-fn localityd_force_terminate_command_for_target(
-    target_os: &str,
-) -> Option<(&'static str, Vec<&'static str>)> {
-    match target_os {
-        "macos" | "linux" => Some(("pkill", vec!["-x", "localityd"])),
-        "windows" => Some(("taskkill", vec!["/IM", "localityd.exe", "/F", "/T"])),
-        _ => None,
-    }
-}
-
-fn desktop_launch_daemon_restart_command_plan(state_root: &Path) -> DaemonRestartCommandPlan {
-    DaemonRestartCommandPlan {
-        stop_args: daemon_control_args_any_manager("stop", state_root),
-        start_args: daemon_control_args("start", state_root),
-        force_terminate_existing_processes: true,
     }
 }
 
@@ -8057,56 +7906,6 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("worker entered after lock release");
         thread.join().expect("worker joined");
-    }
-
-    #[test]
-    fn desktop_launch_daemon_restart_stops_any_manager_before_session_start() {
-        let state_root = PathBuf::from("/tmp/locality-desktop-launch");
-
-        let plan = super::desktop_launch_daemon_restart_command_plan(&state_root);
-
-        assert_eq!(plan.stop_args[0], "stop");
-        assert!(plan.stop_args.contains(&"--state-dir".to_string()));
-        assert!(!plan.stop_args.contains(&"--session".to_string()));
-        assert_eq!(plan.start_args[0], "start");
-        assert!(plan.start_args.contains(&"--session".to_string()));
-        assert!(plan.start_args.contains(&"--state-dir".to_string()));
-        assert!(plan.start_args.contains(&state_root.display().to_string()));
-        assert!(plan.force_terminate_existing_processes);
-    }
-
-    #[test]
-    fn normal_daemon_restart_plan_does_not_force_terminate_other_processes() {
-        let state_root = PathBuf::from("/tmp/locality-build-restart");
-        let plan = super::DaemonRestartCommandPlan {
-            stop_args: super::daemon_control_args_any_manager("stop", &state_root),
-            start_args: super::daemon_control_args("start", &state_root),
-            force_terminate_existing_processes: false,
-        };
-
-        assert_eq!(plan.stop_args[0], "stop");
-        assert_eq!(plan.start_args[0], "start");
-        assert!(!plan.force_terminate_existing_processes);
-    }
-
-    #[test]
-    fn localityd_force_terminate_command_is_platform_specific() {
-        assert_eq!(
-            super::localityd_force_terminate_command_for_target("macos"),
-            Some(("pkill", vec!["-x", "localityd"]))
-        );
-        assert_eq!(
-            super::localityd_force_terminate_command_for_target("linux"),
-            Some(("pkill", vec!["-x", "localityd"]))
-        );
-        assert_eq!(
-            super::localityd_force_terminate_command_for_target("windows"),
-            Some(("taskkill", vec!["/IM", "localityd.exe", "/F", "/T"]))
-        );
-        assert_eq!(
-            super::localityd_force_terminate_command_for_target("freebsd"),
-            None
-        );
     }
 
     #[test]
@@ -10997,7 +10796,6 @@ fn main() {
             build_tray(app)?;
             start_desktop_activation_listener(app.app_handle().clone(), activation_event_handle);
             sync_tray_visibility(app.app_handle(), &desktop_settings());
-            start_fresh_daemon_for_desktop_launch(app.app_handle().clone());
             start_state_change_watcher(app.app_handle().clone());
             start_live_mode_runner(app.app_handle().clone());
             start_windows_cloud_files_provider_supervisor();
