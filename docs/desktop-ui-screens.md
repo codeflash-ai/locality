@@ -432,6 +432,7 @@ Layout:
 │ Locality           │ Home                                         │
 │               │                                              │
 │ Home          │ ...                                          │
+│ Mounts        │                                              │
 │ Pending       │                                              │
 │ Activity      │                                              │
 │ Settings      │                                              │
