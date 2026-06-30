@@ -181,6 +181,36 @@ fn linux_fuse_mount_keeps_mount_point_virtual() {
 }
 
 #[test]
+fn virtual_mount_rejects_direct_home_child_mount_point() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let mut store = InMemoryStateStore::new();
+    let root = PathBuf::from(home).join("notion-main");
+
+    let error = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root,
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect_err("unsafe virtual parent rejected");
+
+    assert_eq!(error.code(), "unsafe_virtual_projection_root");
+    assert!(error.message().contains("home directory"));
+    assert!(
+        store.load_mounts().expect("load mounts").is_empty(),
+        "unsafe mount must not be persisted"
+    );
+}
+
+#[test]
 fn mount_persists_connection_id() {
     let fixture = MountFixture::new("loc-cli-mount-connection");
     let mut store = InMemoryStateStore::new();

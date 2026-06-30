@@ -15,7 +15,7 @@ use locality_core::path_projection::{
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRepository, MountConfig, MountRepository,
-    ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    ProjectionMode, ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
     VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
@@ -90,8 +90,92 @@ pub fn virtual_projection_root(mount: &MountConfig) -> PathBuf {
         .unwrap_or_else(|| mount.root.clone())
 }
 
+pub fn validate_virtual_projection_root(mount: &MountConfig) -> LocalityResult<()> {
+    if !matches!(
+        mount.projection,
+        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
+    ) {
+        return Ok(());
+    }
+
+    let projection_root = virtual_projection_root(mount);
+    if let Some(reason) = unsafe_virtual_projection_root_reason(&projection_root) {
+        return Err(LocalityError::InvalidState(format!(
+            "unsafe virtual projection root `{}` for mount `{}` at `{}`: {reason}; choose an explicit shared directory such as `~/Locality/{}` instead",
+            projection_root.display(),
+            mount.mount_id.0,
+            mount.root.display(),
+            mount_point_directory_name(mount)
+        )));
+    }
+
+    Ok(())
+}
+
 pub fn virtual_projection_mount_point(mount: &MountConfig) -> PathBuf {
     virtual_projection_root(mount).join(mount_point_directory_name(mount))
+}
+
+fn unsafe_virtual_projection_root_reason(root: &Path) -> Option<&'static str> {
+    if root.as_os_str().is_empty() {
+        return Some("the shared provider root is empty");
+    }
+    if root.parent().is_none() {
+        return Some("the shared provider root is a filesystem root");
+    }
+    if home_directories()
+        .iter()
+        .any(|home| paths_equal_for_platform(root, home))
+    {
+        return Some("the shared provider root is the user home directory");
+    }
+    if home_directories()
+        .iter()
+        .filter_map(|home| home.parent())
+        .any(|home_parent| paths_equal_for_platform(root, home_parent))
+    {
+        return Some("the shared provider root is the user home container directory");
+    }
+    None
+}
+
+fn home_directories() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(home) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+            homes.push(PathBuf::from(home));
+        }
+    }
+    if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+        && !drive.is_empty()
+        && !path.is_empty()
+    {
+        homes.push(PathBuf::from(format!(
+            "{}{}",
+            drive.to_string_lossy(),
+            path.to_string_lossy()
+        )));
+    }
+    homes
+}
+
+#[cfg(windows)]
+fn paths_equal_for_platform(left: &Path, right: &Path) -> bool {
+    path_key(left) == path_key(right)
+}
+
+#[cfg(not(windows))]
+fn paths_equal_for_platform(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn path_key(path: &Path) -> String {
+    let mut value = path.display().to_string().replace('/', "\\");
+    while value.ends_with('\\') && value.len() > 3 {
+        value.pop();
+    }
+    value.to_ascii_lowercase()
 }
 
 pub fn virtual_fs_ancestor_container_identifiers<S>(
@@ -2509,9 +2593,9 @@ mod tests {
         create_virtual_fs_directory, create_virtual_fs_file,
         materialize_virtual_fs_item_with_content_root, mount_point_identifier,
         refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
-        virtual_fs_ancestor_container_identifiers, virtual_fs_children,
-        virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_item,
-        virtual_fs_item_with_content_root,
+        validate_virtual_projection_root, virtual_fs_ancestor_container_identifiers,
+        virtual_fs_children, virtual_fs_children_with_content_root, virtual_fs_content_path,
+        virtual_fs_item, virtual_fs_item_with_content_root, virtual_projection_root,
     };
 
     #[test]
@@ -3948,6 +4032,66 @@ mod tests {
         assert!(!content_root.exists());
 
         let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn virtual_projection_validation_rejects_filesystem_root_provider_root() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/")
+            .projection(ProjectionMode::LinuxFuse);
+
+        let error = validate_virtual_projection_root(&mount).expect_err("filesystem root rejected");
+
+        assert!(matches!(error, LocalityError::InvalidState(_)));
+        assert!(error.to_string().contains("filesystem root"));
+    }
+
+    #[test]
+    fn virtual_projection_validation_rejects_home_directory_provider_root() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            PathBuf::from(home).join("notion-main"),
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        let error = validate_virtual_projection_root(&mount).expect_err("home root rejected");
+
+        assert!(matches!(error, LocalityError::InvalidState(_)));
+        assert!(error.to_string().contains("home directory"));
+    }
+
+    #[test]
+    fn virtual_projection_validation_rejects_home_container_provider_root() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let Some(home_parent) = home.parent().map(|path| path.to_path_buf()) else {
+            return;
+        };
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", home)
+            .projection(ProjectionMode::LinuxFuse);
+
+        let error =
+            validate_virtual_projection_root(&mount).expect_err("home container root rejected");
+
+        assert_eq!(virtual_projection_root(&mount), home_parent);
+        assert!(matches!(error, LocalityError::InvalidState(_)));
+        assert!(error.to_string().contains("home container"));
+    }
+
+    #[test]
+    fn virtual_projection_validation_accepts_explicit_shared_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        validate_virtual_projection_root(&mount).expect("explicit shared root is safe");
     }
 
     fn assert_plain_files_virtual_error<T: std::fmt::Debug>(

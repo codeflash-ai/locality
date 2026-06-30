@@ -113,6 +113,7 @@ pub enum LinuxFuseRegistrationError {
     EnvMissing(String),
     Io(String),
     SystemctlFailed(String),
+    UnsafeProjectionRoot(String),
     UnsupportedPlatform(String),
 }
 
@@ -214,6 +215,7 @@ impl LinuxFuseRegistrationError {
             Self::EnvMissing(_) => "env_missing",
             Self::Io(_) => "io_error",
             Self::SystemctlFailed(_) => "systemctl_failed",
+            Self::UnsafeProjectionRoot(_) => "unsafe_projection_root",
             Self::UnsupportedPlatform(_) => "unsupported_platform",
         }
     }
@@ -230,6 +232,7 @@ impl LinuxFuseRegistrationError {
             Self::EnvMissing(message)
             | Self::Io(message)
             | Self::SystemctlFailed(message)
+            | Self::UnsafeProjectionRoot(message)
             | Self::UnsupportedPlatform(message) => message.clone(),
         }
     }
@@ -240,6 +243,7 @@ pub enum WindowsCloudFilesHelperError {
     DaemonNotRunning,
     Missing,
     Failed(String),
+    UnsafeProjectionRoot(String),
     UnsupportedPlatform(String),
 }
 
@@ -249,6 +253,7 @@ impl WindowsCloudFilesHelperError {
             Self::DaemonNotRunning => "daemon_not_running",
             Self::Missing => "helper_missing",
             Self::Failed(_) => "helper_failed",
+            Self::UnsafeProjectionRoot(_) => "unsafe_projection_root",
             Self::UnsupportedPlatform(_) => "unsupported_platform",
         }
     }
@@ -263,7 +268,9 @@ impl WindowsCloudFilesHelperError {
                 "locality-cloud-files was not found; build or install the Windows Cloud Files helper"
                     .to_string()
             }
-            Self::Failed(message) | Self::UnsupportedPlatform(message) => message.clone(),
+            Self::Failed(message)
+            | Self::UnsafeProjectionRoot(message)
+            | Self::UnsupportedPlatform(message) => message.clone(),
         }
     }
 }
@@ -413,6 +420,8 @@ pub fn register_linux_fuse_mount(
     state_root: &Path,
     mount: &MountConfig,
 ) -> Result<LinuxFuseRegistrationReport, LinuxFuseRegistrationError> {
+    localityd::virtual_fs::validate_virtual_projection_root(mount)
+        .map_err(|error| LinuxFuseRegistrationError::UnsafeProjectionRoot(error.to_string()))?;
     if !daemon_is_running(state_root) {
         return Err(LinuxFuseRegistrationError::DaemonNotRunning);
     }
@@ -604,6 +613,8 @@ pub fn register_windows_cloud_files_sync_root(
     mount: &MountConfig,
     display_name: &str,
 ) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    localityd::virtual_fs::validate_virtual_projection_root(mount)
+        .map_err(|error| WindowsCloudFilesHelperError::UnsafeProjectionRoot(error.to_string()))?;
     #[cfg(target_os = "windows")]
     {
         run_windows_cloud_files_helper(
@@ -642,6 +653,8 @@ pub fn run_windows_cloud_files_provider(
     state_root: &Path,
     mount: &MountConfig,
 ) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    localityd::virtual_fs::validate_virtual_projection_root(mount)
+        .map_err(|error| WindowsCloudFilesHelperError::UnsafeProjectionRoot(error.to_string()))?;
     #[cfg(target_os = "windows")]
     {
         run_windows_cloud_files_helper("run", windows_cloud_files_run_args(state_root, mount))

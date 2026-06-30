@@ -81,6 +81,15 @@ where
 {
     let root = absolute_path(&options.root)?;
     if options.projection.uses_virtual_filesystem() {
+        let proposed = MountConfig::new(options.mount_id.clone(), "pending", &root)
+            .projection(options.projection.clone());
+        localityd::virtual_fs::validate_virtual_projection_root(&proposed).map_err(|error| {
+            MountError::UnsafeVirtualProjectionRoot {
+                root: root.clone(),
+                projection_root: localityd::virtual_fs::virtual_projection_root(&proposed),
+                message: error.to_string(),
+            }
+        })?;
         reject_duplicate_virtual_mount_point(store, &options.mount_id, &root, &options.projection)?;
     }
 
@@ -132,6 +141,11 @@ pub enum MountError {
         mount_point: String,
         existing_mount_id: MountId,
     },
+    UnsafeVirtualProjectionRoot {
+        root: PathBuf,
+        projection_root: PathBuf,
+        message: String,
+    },
     ReadGuidance {
         path: PathBuf,
         message: String,
@@ -149,6 +163,7 @@ impl MountError {
             Self::CreateRoot { .. } => "create_mount_root_failed",
             Self::CurrentDir(_) => "current_dir_failed",
             Self::MountPointConflict { .. } => "mount_point_conflict",
+            Self::UnsafeVirtualProjectionRoot { .. } => "unsafe_virtual_projection_root",
             Self::ReadGuidance { .. } => "read_mount_guidance_failed",
             Self::Store(_) => "store_error",
             Self::WriteGuidance { .. } => "write_mount_guidance_failed",
@@ -172,6 +187,15 @@ impl MountError {
                 "mount `{}` already uses mount point `{mount_point}` under `{}`",
                 existing_mount_id.0,
                 root.display()
+            ),
+            Self::UnsafeVirtualProjectionRoot {
+                root,
+                projection_root,
+                message,
+            } => format!(
+                "virtual mount `{}` would register unsafe shared provider root `{}`: {message}",
+                root.display(),
+                projection_root.display()
             ),
             Self::ReadGuidance { path, message } => {
                 format!(
