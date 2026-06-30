@@ -470,6 +470,30 @@ impl HydrationQueue {
         self.pending.remove(&key)
     }
 
+    pub fn debug_requests(&self, limit: usize) -> Vec<HydrationRequest> {
+        let mut requests = self
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| {
+                self.pending
+                    .get(key)
+                    .cloned()
+                    .map(|request| (index, request))
+            })
+            .collect::<Vec<_>>();
+        requests.sort_by(|(left_index, left), (right_index, right)| {
+            hydration_priority(&right.reason)
+                .cmp(&hydration_priority(&left.reason))
+                .then_with(|| left_index.cmp(right_index))
+        });
+        requests
+            .into_iter()
+            .take(limit)
+            .map(|(_, request)| request)
+            .collect()
+    }
+
     pub fn drain_ready_with(
         &mut self,
         mut hydrate: impl FnMut(HydrationRequest) -> LocalityResult<()>,

@@ -25,6 +25,7 @@ use locality_core::hydration::{HydrationPolicy, HydrationReason, HydrationReques
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::pull::PullMode;
 use locality_core::shadow::ShadowDocument;
+use locality_notion::client::notion_request_debug_status;
 use locality_store::{
     AutoSaveRepository, AutoSaveState, EntityRecord, EntityRepository, FreshnessStateRecord,
     FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
@@ -41,8 +42,14 @@ use crate::freshness::{
     FreshnessQueue, freshness_timestamp, freshness_unix_ms, optimized_freshness_decision,
     parse_freshness_timestamp, record_file_opened, record_local_change,
 };
-use crate::hydration::{HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationQueue};
-use crate::ipc::{DaemonActiveJobStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
+use crate::hydration::{
+    HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationPriority, HydrationQueue,
+    hydration_priority,
+};
+use crate::ipc::{
+    DaemonActiveJobStatus, DaemonDebugQueueItem, DaemonDebugQueueSection, DaemonDebugQueueStatus,
+    DaemonRequest, DaemonResponse, DaemonRuntimeStatus,
+};
 use crate::pull::run_pull_with_state_root;
 use crate::push::{
     execute_auto_save_push_job_with_content_root, execute_push_job_with_content_root,
@@ -74,6 +81,7 @@ const MAX_WORKSPACE_FRESHNESS_JOBS_PER_TICK: usize = 100;
 const AUTO_FAST_FORWARD_ACTIVE_LEASE_MS: u64 = 30_000;
 const MAX_CHILD_REFRESH_WORKERS: usize = 3;
 const MAX_BACKGROUND_CHILD_REFRESH_WORKERS: usize = 2;
+const DEBUG_QUEUE_ITEM_LIMIT: usize = 25;
 
 impl DaemonRuntimeHandle {
     pub fn request(&self, request: DaemonRequest) -> DaemonResponse {
@@ -972,6 +980,32 @@ impl ChildRefreshQueue {
         self.pending.remove(&key)
     }
 
+    fn debug_requests(&self, limit: usize) -> Vec<ChildRefreshRequest> {
+        let mut requests = self
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| {
+                self.pending
+                    .get(key)
+                    .cloned()
+                    .map(|request| (index, request))
+            })
+            .collect::<Vec<_>>();
+        requests.sort_by(|(left_index, left), (right_index, right)| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.depth.cmp(&right.depth))
+                .then_with(|| left_index.cmp(right_index))
+        });
+        requests
+            .into_iter()
+            .take(limit)
+            .map(|(_, request)| request)
+            .collect()
+    }
+
     fn next_ready_index(
         &self,
         active: &BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
@@ -1136,6 +1170,9 @@ impl RuntimeState {
             }
             DaemonRequest::Status => {
                 let _ = respond_to.send(DaemonResponse::ok(self.status()));
+            }
+            DaemonRequest::DebugQueueStatus => {
+                let _ = respond_to.send(DaemonResponse::ok(self.debug_queue_status()));
             }
             DaemonRequest::ReloadMounts => {
                 let _ = respond_to.send(DaemonResponse::error(
@@ -1967,6 +2004,142 @@ impl RuntimeState {
         }
     }
 
+    /// Debug-only diagnostics for the desktop Activity queue tab.
+    ///
+    /// This reads the runtime's in-memory queues without touching connector or
+    /// store state so it stays cheap and cannot affect scheduling.
+    fn debug_queue_status(&self) -> DaemonDebugQueueStatus {
+        let now = freshness_timestamp();
+        let freshness_metrics = self.freshness.metrics(Some(&now));
+        let active = self.debug_active_jobs();
+        let mut sections = Vec::new();
+
+        sections.push(debug_notion_transport_section());
+
+        sections.push(DaemonDebugQueueSection {
+            name: "pending_requests".to_string(),
+            label: "Daemon work queue".to_string(),
+            total: self.pending_requests.len(),
+            ready: Some(self.pending_requests.len()),
+            deferred: None,
+            items: self
+                .pending_requests
+                .iter()
+                .take(DEBUG_QUEUE_ITEM_LIMIT)
+                .map(debug_mutating_request_item)
+                .collect(),
+        });
+
+        sections.push(DaemonDebugQueueSection {
+            name: "hydrations".to_string(),
+            label: "Hydration fetches".to_string(),
+            total: self.hydration.len(),
+            ready: Some(self.hydration.len()),
+            deferred: None,
+            items: self
+                .hydration
+                .debug_requests(DEBUG_QUEUE_ITEM_LIMIT)
+                .into_iter()
+                .map(debug_hydration_item)
+                .collect(),
+        });
+
+        sections.push(DaemonDebugQueueSection {
+            name: "deferred_hydrations".to_string(),
+            label: "Hydration retries".to_string(),
+            total: self.deferred_hydration.len(),
+            ready: Some(0),
+            deferred: Some(self.deferred_hydration.len()),
+            items: self
+                .deferred_hydration
+                .iter()
+                .take(DEBUG_QUEUE_ITEM_LIMIT)
+                .cloned()
+                .map(debug_hydration_item)
+                .collect(),
+        });
+
+        sections.push(DaemonDebugQueueSection {
+            name: "freshness".to_string(),
+            label: "Freshness observations".to_string(),
+            total: freshness_metrics.total_jobs,
+            ready: Some(freshness_metrics.ready_jobs),
+            deferred: Some(freshness_metrics.deferred_jobs),
+            items: self
+                .freshness
+                .debug_jobs(Some(&now), DEBUG_QUEUE_ITEM_LIMIT)
+                .into_iter()
+                .map(debug_freshness_item)
+                .collect(),
+        });
+
+        sections.push(DaemonDebugQueueSection {
+            name: "child_refreshes".to_string(),
+            label: "Directory discovery".to_string(),
+            total: self.child_refreshes.len(),
+            ready: None,
+            deferred: None,
+            items: self
+                .child_refreshes
+                .debug_requests(DEBUG_QUEUE_ITEM_LIMIT)
+                .into_iter()
+                .map(debug_child_refresh_item)
+                .collect(),
+        });
+
+        sections.push(DaemonDebugQueueSection {
+            name: "scheduled_pull".to_string(),
+            label: "Scheduled pull".to_string(),
+            total: usize::from(self.pending_scheduled_tick.is_some()),
+            ready: Some(usize::from(self.pending_scheduled_tick.is_some())),
+            deferred: None,
+            items: self
+                .pending_scheduled_tick
+                .as_ref()
+                .map(debug_scheduled_pull_item)
+                .into_iter()
+                .collect(),
+        });
+
+        DaemonDebugQueueStatus {
+            generated_at_unix_ms: unix_time_ms(),
+            active,
+            sections,
+            scheduler_mode: match self.scheduler.config.mode {
+                PullMode::Polling => "polling",
+                PullMode::Relay => "relay",
+            }
+            .to_string(),
+            active_interval_ms: self
+                .scheduler
+                .config
+                .active_interval
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            cold_interval_ms: self
+                .scheduler
+                .config
+                .cold_interval
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        }
+    }
+
+    fn debug_active_jobs(&self) -> Vec<DaemonActiveJobStatus> {
+        let mut active = Vec::new();
+        if let Some(job) = &self.active_job {
+            active.push(job.status());
+        }
+        active.extend(
+            self.active_child_refreshes
+                .values()
+                .map(|active| active.status.status()),
+        );
+        active
+    }
+
     fn status(&self) -> DaemonRuntimeStatus {
         let freshness_metrics = self.freshness.metrics(Some(&freshness_timestamp()));
         let active_child_refresh = self
@@ -2010,6 +2183,182 @@ impl RuntimeState {
                 .try_into()
                 .unwrap_or(u64::MAX),
         }
+    }
+}
+
+fn debug_mutating_request_item(request: &MutatingRequest) -> DaemonDebugQueueItem {
+    let (kind, target) = request.active_status_parts();
+    DaemonDebugQueueItem {
+        kind,
+        target,
+        mount_id: None,
+        remote_id: None,
+        path: None,
+        reason: None,
+        priority: Some("exclusive".to_string()),
+        next_eligible_at: None,
+    }
+}
+
+fn debug_notion_transport_section() -> DaemonDebugQueueSection {
+    let status = notion_request_debug_status();
+    let active_count = status.active.len();
+    let waiting_for_token = status.waiting_for_token;
+    let mut items = status
+        .active
+        .into_iter()
+        .map(|request| DaemonDebugQueueItem {
+            kind: format!("{} {}", request.method, request.path),
+            target: Some(request.path),
+            mount_id: None,
+            remote_id: None,
+            path: None,
+            reason: Some(format!("attempt {}", request.attempt)),
+            priority: Some(format!(
+                "active {}ms, waited {}ms",
+                request.elapsed_ms, request.waited_for_token_ms
+            )),
+            next_eligible_at: None,
+        })
+        .collect::<Vec<_>>();
+
+    if waiting_for_token > 0 {
+        items.push(DaemonDebugQueueItem {
+            kind: "waiting_for_notion_rate_limit".to_string(),
+            target: Some(format!("{} request(s)", waiting_for_token)),
+            mount_id: None,
+            remote_id: None,
+            path: None,
+            reason: status
+                .limiter
+                .cooldown_remaining_ms
+                .map(|ms| format!("cooldown {ms}ms")),
+            priority: Some(format!(
+                "{:.2}/{:.2} tokens",
+                status.limiter.tokens, status.limiter.burst
+            )),
+            next_eligible_at: None,
+        });
+    }
+
+    if let Some(last) = status.last_completed {
+        items.push(DaemonDebugQueueItem {
+            kind: format!("last {} {}", last.method, last.path),
+            target: Some(last.status),
+            mount_id: None,
+            remote_id: None,
+            path: None,
+            reason: Some(format!("attempt {}", last.attempt)),
+            priority: Some(format!("completed in {}ms", last.elapsed_ms)),
+            next_eligible_at: Some(format!("unix_ms:{}", last.completed_at_unix_ms)),
+        });
+    }
+
+    DaemonDebugQueueSection {
+        name: "notion_transport".to_string(),
+        label: "Notion HTTP transport".to_string(),
+        total: active_count + waiting_for_token,
+        ready: Some(active_count),
+        deferred: Some(waiting_for_token),
+        items,
+    }
+}
+
+fn debug_hydration_item(request: HydrationRequest) -> DaemonDebugQueueItem {
+    DaemonDebugQueueItem {
+        kind: "hydration".to_string(),
+        target: Some(request.path.display().to_string()),
+        mount_id: Some(request.mount_id.0),
+        remote_id: Some(request.remote_id.0),
+        path: Some(request.path.display().to_string()),
+        reason: Some(hydration_reason_label(&request.reason).to_string()),
+        priority: Some(hydration_priority_label(hydration_priority(&request.reason)).to_string()),
+        next_eligible_at: None,
+    }
+}
+
+fn debug_freshness_item(debug: crate::freshness::FreshnessQueueDebugJob) -> DaemonDebugQueueItem {
+    let job = debug.job;
+    let target = job
+        .remote_id
+        .as_ref()
+        .map(|remote_id| format!("{}:{}", job.mount_id.as_str(), remote_id.as_str()))
+        .or_else(|| Some(job.mount_id.as_str().to_string()));
+    DaemonDebugQueueItem {
+        kind: format!("{:?}", job.kind),
+        target,
+        mount_id: Some(job.mount_id.0),
+        remote_id: job.remote_id.map(|remote_id| remote_id.0),
+        path: None,
+        reason: Some(format!("{:?}", job.reason)),
+        priority: Some(if debug.ready {
+            job.tier.as_str().to_string()
+        } else {
+            format!("deferred {}", job.tier.as_str())
+        }),
+        next_eligible_at: job.next_eligible_at,
+    }
+}
+
+fn debug_child_refresh_item(request: ChildRefreshRequest) -> DaemonDebugQueueItem {
+    DaemonDebugQueueItem {
+        kind: "virtual_fs_refresh_children".to_string(),
+        target: Some(format!(
+            "{}:{}",
+            request.mount_id, request.container_identifier
+        )),
+        mount_id: Some(request.mount_id),
+        remote_id: None,
+        path: None,
+        reason: Some(format!("depth {}", request.depth)),
+        priority: Some(child_refresh_priority_label(request.priority).to_string()),
+        next_eligible_at: None,
+    }
+}
+
+fn debug_scheduled_pull_item(tick: &PullSchedulerTick) -> DaemonDebugQueueItem {
+    let reason = match (tick.poll_active, tick.poll_cold) {
+        (true, true) => "active+cold",
+        (true, false) => "active",
+        (false, true) => "cold",
+        (false, false) => "empty",
+    };
+    DaemonDebugQueueItem {
+        kind: "scheduled_pull".to_string(),
+        target: None,
+        mount_id: None,
+        remote_id: None,
+        path: None,
+        reason: Some(reason.to_string()),
+        priority: Some("scheduled".to_string()),
+        next_eligible_at: None,
+    }
+}
+
+fn hydration_reason_label(reason: &HydrationReason) -> &'static str {
+    match reason {
+        HydrationReason::ExplicitPull => "explicit_pull",
+        HydrationReason::FileOpen => "file_open",
+        HydrationReason::Policy => "policy",
+        HydrationReason::RemoteFastForward => "remote_fast_forward",
+        HydrationReason::LiveModeRemoteFastForward => "live_mode_remote_fast_forward",
+        HydrationReason::StubRead => "stub_read",
+        HydrationReason::Prefetch => "prefetch",
+    }
+}
+
+fn hydration_priority_label(priority: HydrationPriority) -> &'static str {
+    match priority {
+        HydrationPriority::Low => "low",
+        HydrationPriority::Normal => "normal",
+        HydrationPriority::High => "high",
+    }
+}
+
+fn child_refresh_priority_label(priority: ChildRefreshPriority) -> &'static str {
+    match priority {
+        ChildRefreshPriority::Background => "background",
+        ChildRefreshPriority::Interactive => "interactive",
     }
 }
 

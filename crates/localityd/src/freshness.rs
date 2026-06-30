@@ -37,6 +37,12 @@ pub struct FreshnessBatch {
     pub metrics_before: FreshnessQueueMetrics,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshnessQueueDebugJob {
+    pub job: SyncJob,
+    pub ready: bool,
+}
+
 impl FreshnessQueue {
     pub fn new() -> Self {
         Self::default()
@@ -173,6 +179,18 @@ impl FreshnessQueue {
             }
         }
         metrics
+    }
+
+    pub fn debug_jobs(&self, now: Option<&str>, limit: usize) -> Vec<FreshnessQueueDebugJob> {
+        let mut jobs = self.jobs.values().cloned().collect::<Vec<_>>();
+        jobs.sort_by(compare_jobs);
+        jobs.into_iter()
+            .take(limit)
+            .map(|job| FreshnessQueueDebugJob {
+                ready: is_ready(&job, now),
+                job,
+            })
+            .collect()
     }
 }
 

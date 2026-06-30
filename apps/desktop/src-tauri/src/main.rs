@@ -80,7 +80,10 @@ use locality_store::{
 use localityd::autosave::auto_save_timestamp;
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use localityd::hydration::HydrationSource;
-use localityd::ipc::{DaemonBuildInfo, DaemonRequest, DaemonStatusReport, send_request};
+use localityd::ipc::{
+    DaemonBuildInfo, DaemonDebugQueueStatus, DaemonRequest, DaemonStatusReport, send_request,
+    send_request_with_timeout,
+};
 use localityd::media::{document_with_absolute_media_hrefs, update_hydrated_media_manifest};
 use localityd::push::execute_auto_save_push_job_with_content_root;
 use localityd::source::{
@@ -490,6 +493,33 @@ async fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
     };
     refresh_tray_icon_for_snapshot(&app, &snapshot);
     snapshot
+}
+
+#[tauri::command]
+async fn debug_notion_queue_status() -> Result<DaemonDebugQueueStatus, String> {
+    tauri::async_runtime::spawn_blocking(debug_notion_queue_status_blocking)
+        .await
+        .map_err(|error| format!("Could not inspect daemon debug queue: {error}"))?
+}
+
+fn debug_notion_queue_status_blocking() -> Result<DaemonDebugQueueStatus, String> {
+    let response = send_request_with_timeout(
+        &default_state_root(),
+        &DaemonRequest::DebugQueueStatus,
+        Duration::from_secs(1),
+    )
+    .map_err(|error| format!("Daemon debug queue is unavailable: {}", error.message()))?;
+    if !response.ok {
+        return Err(response
+            .error
+            .map(|error| error.message)
+            .unwrap_or_else(|| "Daemon debug queue returned an unknown error.".to_string()));
+    }
+    let payload = response
+        .payload
+        .ok_or_else(|| "Daemon debug queue returned an empty response.".to_string())?;
+    serde_json::from_value(payload)
+        .map_err(|error| format!("Could not decode daemon debug queue: {error}"))
 }
 
 #[tauri::command]
@@ -10330,6 +10360,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             desktop_snapshot,
+            debug_notion_queue_status,
             connect_notion,
             change_notion_access,
             notion_login_link,

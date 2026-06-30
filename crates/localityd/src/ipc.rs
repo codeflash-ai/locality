@@ -16,6 +16,7 @@ pub const DEFAULT_TCP_ADDR: &str = "127.0.0.1:38567";
 pub enum DaemonRequest {
     Ping,
     Status,
+    DebugQueueStatus,
     ReloadMounts,
     Shutdown,
     Pull {
@@ -139,6 +140,45 @@ pub struct DaemonRuntimeStatus {
     pub scheduler_mode: String,
     pub active_interval_ms: u64,
     pub cold_interval_ms: u64,
+}
+
+/// Debug-only queue snapshot for the desktop Activity debug tab.
+///
+/// This is intentionally a read-only diagnostics surface, not a public API for
+/// scheduling policy. Keep it easy to delete when the network policy stabilizes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonDebugQueueStatus {
+    pub generated_at_unix_ms: u64,
+    pub active: Vec<DaemonActiveJobStatus>,
+    pub sections: Vec<DaemonDebugQueueSection>,
+    pub scheduler_mode: String,
+    pub active_interval_ms: u64,
+    pub cold_interval_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonDebugQueueSection {
+    pub name: String,
+    pub label: String,
+    pub total: usize,
+    pub ready: Option<usize>,
+    pub deferred: Option<usize>,
+    pub items: Vec<DaemonDebugQueueItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonDebugQueueItem {
+    pub kind: String,
+    pub target: Option<String>,
+    pub mount_id: Option<String>,
+    pub remote_id: Option<String>,
+    pub path: Option<String>,
+    pub reason: Option<String>,
+    pub priority: Option<String>,
+    pub next_eligible_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

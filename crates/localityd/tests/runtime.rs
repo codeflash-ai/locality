@@ -788,6 +788,38 @@ fn runtime_reports_status_snapshot() {
 }
 
 #[test]
+fn runtime_reports_debug_queue_snapshot() {
+    let runtime = DaemonRuntime::spawn_with_runner(
+        relay_config("debug-queue-snapshot"),
+        EventRunner {
+            event_tx: mpsc::channel().0,
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::DebugQueueStatus);
+    assert!(response.ok);
+    let payload = response.payload.expect("debug queue payload");
+    let snapshot: localityd::ipc::DaemonDebugQueueStatus =
+        serde_json::from_value(payload).expect("decode debug queue");
+    assert_eq!(snapshot.scheduler_mode, "relay");
+    assert!(snapshot.active.is_empty());
+    assert!(
+        snapshot
+            .sections
+            .iter()
+            .any(|section| section.name == "notion_transport")
+    );
+    assert!(
+        snapshot
+            .sections
+            .iter()
+            .any(|section| section.name == "hydrations")
+    );
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_shutdown_request_stops_runtime() {
     let runtime = DaemonRuntime::spawn_with_runner(
         relay_config("shutdown-request"),

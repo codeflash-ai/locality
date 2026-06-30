@@ -3,10 +3,11 @@
 //! The connector depends on this trait rather than directly on HTTP so tests
 //! can run against deterministic fixtures and live API calls stay isolated.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use locality_core::{LocalityError, LocalityResult};
 use reqwest::StatusCode;
@@ -31,7 +32,53 @@ const DEFAULT_NOTION_REQUEST_BURST: f64 = 3.0;
 const DEFAULT_NOTION_RATE_LIMIT_RETRIES: usize = 4;
 
 static NOTION_RATE_LIMITER: OnceLock<Mutex<NotionRateLimiter>> = OnceLock::new();
+static NOTION_REQUEST_DEBUG: OnceLock<Mutex<NotionRequestDebugState>> = OnceLock::new();
+static NOTION_REQUEST_DEBUG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static NOTION_REQUEST_DEBUG_ENABLED_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotionRequestDebugStatus {
+    pub waiting_for_token: usize,
+    pub active: Vec<NotionRequestDebugActive>,
+    pub last_completed: Option<NotionRequestDebugCompleted>,
+    pub limiter: NotionRateLimiterDebugStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotionRequestDebugActive {
+    pub id: u64,
+    pub method: String,
+    pub path: String,
+    pub attempt: usize,
+    pub waited_for_token_ms: u64,
+    pub started_at_unix_ms: u64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotionRequestDebugCompleted {
+    pub id: u64,
+    pub method: String,
+    pub path: String,
+    pub attempt: usize,
+    pub waited_for_token_ms: u64,
+    pub elapsed_ms: u64,
+    pub status: String,
+    pub completed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotionRateLimiterDebugStatus {
+    pub tokens: f64,
+    pub burst: f64,
+    pub requests_per_second: f64,
+    pub cooldown_remaining_ms: Option<u64>,
+}
 
 pub fn notion_http_client() -> Client {
     ensure_reqwest_crypto_provider();
@@ -121,6 +168,142 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
     }
 }
 
+#[derive(Debug, Default)]
+struct NotionRequestDebugState {
+    waiting_for_token: usize,
+    active: BTreeMap<u64, NotionRequestDebugActiveInternal>,
+    last_completed: Option<NotionRequestDebugCompleted>,
+}
+
+#[derive(Clone, Debug)]
+struct NotionRequestDebugActiveInternal {
+    id: u64,
+    method: String,
+    path: String,
+    attempt: usize,
+    waited_for_token_ms: u64,
+    started_at: Instant,
+    started_at_unix_ms: u64,
+}
+
+impl NotionRequestDebugActiveInternal {
+    fn public_status(&self) -> NotionRequestDebugActive {
+        NotionRequestDebugActive {
+            id: self.id,
+            method: self.method.clone(),
+            path: self.path.clone(),
+            attempt: self.attempt,
+            waited_for_token_ms: self.waited_for_token_ms,
+            started_at_unix_ms: self.started_at_unix_ms,
+            elapsed_ms: duration_ms(self.started_at.elapsed()),
+        }
+    }
+}
+
+pub fn notion_request_debug_status() -> NotionRequestDebugStatus {
+    enable_notion_request_debug_for(Duration::from_secs(3));
+    let limiter = notion_rate_limiter()
+        .lock()
+        .expect("notion request rate limiter lock poisoned")
+        .debug_status();
+    let state = notion_request_debug_state()
+        .lock()
+        .expect("notion request debug lock poisoned");
+    NotionRequestDebugStatus {
+        waiting_for_token: state.waiting_for_token,
+        active: state
+            .active
+            .values()
+            .map(NotionRequestDebugActiveInternal::public_status)
+            .collect(),
+        last_completed: state.last_completed.clone(),
+        limiter,
+    }
+}
+
+fn enable_notion_request_debug_for(duration: Duration) {
+    let until = unix_time_ms().saturating_add(duration_ms(duration));
+    NOTION_REQUEST_DEBUG_ENABLED_UNTIL_MS.fetch_max(until, Ordering::Relaxed);
+}
+
+fn notion_request_debug_enabled() -> bool {
+    unix_time_ms() <= NOTION_REQUEST_DEBUG_ENABLED_UNTIL_MS.load(Ordering::Relaxed)
+}
+
+fn notion_request_debug_state() -> &'static Mutex<NotionRequestDebugState> {
+    NOTION_REQUEST_DEBUG.get_or_init(|| Mutex::new(NotionRequestDebugState::default()))
+}
+
+fn record_notion_token_wait_start() -> bool {
+    if !notion_request_debug_enabled() {
+        return false;
+    }
+    let mut state = notion_request_debug_state()
+        .lock()
+        .expect("notion request debug lock poisoned");
+    state.waiting_for_token = state.waiting_for_token.saturating_add(1);
+    true
+}
+
+fn record_notion_token_wait_end(recorded: bool) {
+    if !recorded {
+        return;
+    }
+    let mut state = notion_request_debug_state()
+        .lock()
+        .expect("notion request debug lock poisoned");
+    state.waiting_for_token = state.waiting_for_token.saturating_sub(1);
+}
+
+fn start_notion_request_debug(
+    method: &str,
+    path: &str,
+    attempt: usize,
+    waited_for_token: Duration,
+) -> Option<u64> {
+    if !notion_request_debug_enabled() {
+        return None;
+    }
+    let id = NOTION_REQUEST_DEBUG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let active = NotionRequestDebugActiveInternal {
+        id,
+        method: method.to_string(),
+        path: path.to_string(),
+        attempt,
+        waited_for_token_ms: duration_ms(waited_for_token),
+        started_at: Instant::now(),
+        started_at_unix_ms: unix_time_ms(),
+    };
+    notion_request_debug_state()
+        .lock()
+        .expect("notion request debug lock poisoned")
+        .active
+        .insert(id, active);
+    Some(id)
+}
+
+fn finish_notion_request_debug(id: Option<u64>, status: impl Into<String>) {
+    let Some(id) = id else {
+        return;
+    };
+    let mut state = notion_request_debug_state()
+        .lock()
+        .expect("notion request debug lock poisoned");
+    let Some(active) = state.active.remove(&id) else {
+        return;
+    };
+    state.last_completed = Some(NotionRequestDebugCompleted {
+        id: active.id,
+        method: active.method,
+        path: active.path,
+        attempt: active.attempt,
+        waited_for_token_ms: active.waited_for_token_ms,
+        elapsed_ms: duration_ms(active.started_at.elapsed()),
+        status: status.into(),
+        completed_at_unix_ms: unix_time_ms(),
+    });
+}
+
 #[derive(Clone, Debug)]
 pub struct HttpNotionApi {
     config: NotionConfig,
@@ -151,7 +334,7 @@ impl HttpNotionApi {
             .map(|(key, value)| ((*key).to_string(), value.clone()))
             .collect::<Vec<_>>();
 
-        self.send_request_with_retry(|| {
+        self.send_request_with_retry("GET", path, || {
             let mut request = self
                 .client
                 .get(&url)
@@ -210,8 +393,11 @@ impl HttpNotionApi {
             "{}/v1/file_uploads/{}/send",
             DEFAULT_NOTION_API_BASE_URL, upload_id
         );
+        let upload_path = format!("/v1/file_uploads/{upload_id}/send");
         for attempt in 0..=notion_rate_limit_retries() {
-            acquire_notion_request_token();
+            let waited_for_token = acquire_notion_request_token();
+            let request_debug_id =
+                start_notion_request_debug("POST", &upload_path, attempt, waited_for_token);
             let part = multipart::Part::bytes(bytes.clone())
                 .file_name(filename.to_string())
                 .mime_str(content_type)
@@ -227,9 +413,14 @@ impl HttpNotionApi {
                 .multipart(form)
                 .send()
                 .map_err(|error| {
+                    finish_notion_request_debug(
+                        request_debug_id,
+                        format!("transport error: {error}"),
+                    );
                     LocalityError::Io(format!("notion file upload failed: {error}"))
                 })?;
             let status = response.status();
+            finish_notion_request_debug(request_debug_id, format!("HTTP {status}"));
             if status.is_success() {
                 return Ok(upload_id);
             }
@@ -276,7 +467,7 @@ impl HttpNotionApi {
             path.trim_start_matches('/')
         );
 
-        self.send_request_with_retry(|| {
+        self.send_request_with_retry(method.as_str(), path, || {
             let mut request = self
                 .client
                 .request(method.clone(), &url)
@@ -291,27 +482,40 @@ impl HttpNotionApi {
 
     fn send_request_with_retry<T>(
         &self,
+        method: &str,
+        path: &str,
         mut build_request: impl FnMut() -> reqwest::blocking::RequestBuilder,
     ) -> LocalityResult<T>
     where
         T: DeserializeOwned,
     {
         for attempt in 0..=notion_rate_limit_retries() {
-            acquire_notion_request_token();
+            let waited_for_token = acquire_notion_request_token();
+            let request_debug_id =
+                start_notion_request_debug(method, path, attempt, waited_for_token);
             let response = match build_request().send() {
                 Ok(response) => response,
                 Err(error)
                     if is_retryable_notion_transport_error(&error)
                         && attempt < notion_rate_limit_retries() =>
                 {
+                    finish_notion_request_debug(
+                        request_debug_id,
+                        format!("retryable transport error: {error}"),
+                    );
                     record_notion_transient_request_failure(attempt);
                     continue;
                 }
                 Err(error) => {
+                    finish_notion_request_debug(
+                        request_debug_id,
+                        format!("transport error: {error}"),
+                    );
                     return Err(LocalityError::Io(format!("notion request failed: {error}")));
                 }
             };
             let status = response.status();
+            finish_notion_request_debug(request_debug_id, format!("HTTP {status}"));
 
             if status.is_success() {
                 return response.json().map_err(|error| {
@@ -360,6 +564,19 @@ fn notion_http_timeout() -> Duration {
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_NOTION_HTTP_TIMEOUT)
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn notion_rate_limit_retries() -> usize {
@@ -434,21 +651,49 @@ impl NotionRateLimiter {
         self.tokens = 0.0;
         self.last_refill = Instant::now();
     }
+
+    fn debug_status(&self) -> NotionRateLimiterDebugStatus {
+        let now = Instant::now();
+        let burst = notion_request_burst();
+        let requests_per_second = notion_requests_per_second();
+        let cooldown_remaining = self
+            .cooldown_until
+            .filter(|cooldown_until| *cooldown_until > now)
+            .map(|cooldown_until| cooldown_until.saturating_duration_since(now));
+        let tokens = if cooldown_remaining.is_some() {
+            self.tokens
+        } else {
+            let elapsed = now.saturating_duration_since(self.last_refill);
+            (self.tokens + elapsed.as_secs_f64() * requests_per_second).min(burst)
+        };
+        NotionRateLimiterDebugStatus {
+            tokens,
+            burst,
+            requests_per_second,
+            cooldown_remaining_ms: cooldown_remaining.map(duration_ms),
+        }
+    }
 }
 
 fn notion_rate_limiter() -> &'static Mutex<NotionRateLimiter> {
     NOTION_RATE_LIMITER.get_or_init(|| Mutex::new(NotionRateLimiter::new()))
 }
 
-fn acquire_notion_request_token() {
+fn acquire_notion_request_token() -> Duration {
+    let mut waited = Duration::ZERO;
     loop {
         let wait = notion_rate_limiter()
             .lock()
             .expect("notion request rate limiter lock poisoned")
             .acquire();
         match wait {
-            Some(delay) if !delay.is_zero() => thread::sleep(delay),
-            _ => return,
+            Some(delay) if !delay.is_zero() => {
+                let recorded_wait = record_notion_token_wait_start();
+                thread::sleep(delay);
+                record_notion_token_wait_end(recorded_wait);
+                waited = waited.saturating_add(delay);
+            }
+            _ => return waited,
         }
     }
 }
@@ -741,7 +986,7 @@ mod tests {
                 .expect("build timeout client"),
         };
         let mut attempts = 0;
-        let result = api.send_request_with_retry::<Value>(|| {
+        let result = api.send_request_with_retry::<Value>("GET", "/test", || {
             attempts += 1;
             api.client.get(&url)
         });

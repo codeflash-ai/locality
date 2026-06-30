@@ -109,6 +109,42 @@ type ActivityItem = {
   undoAvailable: boolean;
 };
 
+type DebugQueueStatus = {
+  generatedAtUnixMs: number;
+  active: DebugQueueActive[];
+  sections: DebugQueueSection[];
+  schedulerMode: string;
+  activeIntervalMs: number;
+  coldIntervalMs: number;
+};
+
+type DebugQueueActive = {
+  kind: string;
+  target?: string | null;
+  elapsedMs: number;
+  startedAtUnixMs: number;
+};
+
+type DebugQueueSection = {
+  name: string;
+  label: string;
+  total: number;
+  ready?: number | null;
+  deferred?: number | null;
+  items: DebugQueueItem[];
+};
+
+type DebugQueueItem = {
+  kind: string;
+  target?: string | null;
+  mountId?: string | null;
+  remoteId?: string | null;
+  path?: string | null;
+  reason?: string | null;
+  priority?: string | null;
+  nextEligibleAt?: string | null;
+};
+
 type ConnectorSuggestion = {
   connector: string;
   description: string;
@@ -296,6 +332,67 @@ const sampleSnapshot: DesktopSnapshot = {
       state: "planned",
     },
   ],
+};
+
+const sampleDebugQueueStatus: DebugQueueStatus = {
+  generatedAtUnixMs: 1782033300000,
+  active: [
+    {
+      kind: "hydration",
+      target: "~/Library/CloudStorage/Locality/notion/Launch Plan/page.md",
+      elapsedMs: 842,
+      startedAtUnixMs: 1782033299158,
+    },
+  ],
+  sections: [
+    {
+      name: "hydrations",
+      label: "Hydration fetches",
+      total: 2,
+      ready: 2,
+      deferred: null,
+      items: [
+        {
+          kind: "hydration",
+          target: "Launch Plan/page.md",
+          mountId: "notion-main",
+          remoteId: "launch-plan",
+          path: "Launch Plan/page.md",
+          reason: "live_mode_remote_fast_forward",
+          priority: "high",
+        },
+        {
+          kind: "hydration",
+          target: "Roadmap/page.md",
+          mountId: "notion-main",
+          remoteId: "roadmap",
+          path: "Roadmap/page.md",
+          reason: "policy",
+          priority: "normal",
+        },
+      ],
+    },
+    {
+      name: "freshness",
+      label: "Freshness observations",
+      total: 1,
+      ready: 1,
+      deferred: 0,
+      items: [
+        {
+          kind: "ObserveEntity",
+          target: "notion-main:launch-plan",
+          mountId: "notion-main",
+          remoteId: "launch-plan",
+          reason: "RemoteMaybeChanged",
+          priority: "hot",
+        },
+      ],
+    },
+  ],
+  schedulerMode: "polling",
+  activeIntervalMs: 5000,
+  coldIntervalMs: 60000,
 };
 
 const loadingSnapshot: DesktopSnapshot = {
@@ -2290,6 +2387,7 @@ function ReviewView({
 }
 
 function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome: () => void }) {
+  const [tab, setTab] = useState<"recent" | "debug">("recent");
   const grouped = useMemo(() => {
     return snapshot.activity.reduce<Record<string, ActivityItem[]>>((acc, item) => {
       const label = activityGroupLabel(item);
@@ -2301,31 +2399,218 @@ function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome:
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Activity" }]} />
-      <ViewHeader title="Recent activity" />
-      {Object.entries(grouped).map(([when, items]) => (
-        <section className="activity-group" key={when}>
-          <p className="label">{when}</p>
-          {items.map((item) => (
-            <article className="activity-item" key={`${when}-${item.kind}-${item.title}-${item.occurredAt ?? item.when}`}>
-              <span className="activity-time" title={activityFullTimeLabel(item)}>
-                <Clock3 />
-                <span>{activityTimeLabel(item)}</span>
-              </span>
-              <div>
-                <h3>{item.title}</h3>
-                <p>{item.detail}</p>
-              </div>
-              {item.undoAvailable && (
-                <SecondaryButton compact icon={<RotateCcw />}>
-                  Undo Push
-                </SecondaryButton>
-              )}
-            </article>
-          ))}
-        </section>
-      ))}
+      <ViewHeader title="Activity">
+        <div className="activity-tabs" role="tablist" aria-label="Activity sections">
+          <button className={tab === "recent" ? "active" : ""} onClick={() => setTab("recent")} role="tab">
+            Recent
+          </button>
+          <button className={tab === "debug" ? "active" : ""} onClick={() => setTab("debug")} role="tab">
+            Queue Debug
+          </button>
+        </div>
+      </ViewHeader>
+      {tab === "recent" ? (
+        Object.entries(grouped).map(([when, items]) => (
+          <section className="activity-group" key={when}>
+            <p className="label">{when}</p>
+            {items.map((item) => (
+              <article className="activity-item" key={`${when}-${item.kind}-${item.title}-${item.occurredAt ?? item.when}`}>
+                <span className="activity-time" title={activityFullTimeLabel(item)}>
+                  <Clock3 />
+                  <span>{activityTimeLabel(item)}</span>
+                </span>
+                <div>
+                  <h3>{item.title}</h3>
+                  <p>{item.detail}</p>
+                </div>
+                {item.undoAvailable && (
+                  <SecondaryButton compact icon={<RotateCcw />}>
+                    Undo Push
+                  </SecondaryButton>
+                )}
+              </article>
+            ))}
+          </section>
+        ))
+      ) : (
+        <DebugQueueView />
+      )}
     </div>
   );
+}
+
+function DebugQueueView() {
+  const [status, setStatus] = useState<DebugQueueStatus | null>(() =>
+    isTauriRuntime() ? null : sampleDebugQueueStatus,
+  );
+  const [loading, setLoading] = useState(() => isTauriRuntime());
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function refresh() {
+      try {
+        const next = await callCommand<DebugQueueStatus>(
+          "debug_notion_queue_status",
+          undefined,
+          sampleDebugQueueStatus,
+        );
+        if (!cancelled) {
+          setStatus(next);
+          setError(null);
+          setLoading(false);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setError(errorMessage(error));
+          setLoading(false);
+        }
+      }
+    }
+
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  return (
+    <section className="debug-queue-panel">
+      <div className="debug-queue-heading">
+        <div>
+          <p className="label">Debug only</p>
+          <h2>Notion request queue</h2>
+          <p>Runtime queue snapshot. This tab polls only while it is open.</p>
+        </div>
+        <div className="debug-queue-meta">
+          {loading ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+          <span>{status ? `Updated ${debugTimestampLabel(status.generatedAtUnixMs)}` : "Waiting"}</span>
+        </div>
+      </div>
+
+      {error && <p className="debug-queue-error">{error}</p>}
+      {status && (
+        <>
+          <div className="debug-queue-summary">
+            <Metric label="Active" value={status.active.length} />
+            <Metric label="Scheduler" value={status.schedulerMode} />
+            <Metric label="Active poll" value={formatDuration(status.activeIntervalMs)} />
+            <Metric label="Cold poll" value={formatDuration(status.coldIntervalMs)} />
+          </div>
+          <DebugActiveJobs active={status.active} />
+          <div className="debug-queue-sections">
+            {status.sections.map((section) => (
+              <DebugQueueSectionView section={section} key={section.name} />
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function DebugActiveJobs({ active }: { active: DebugQueueActive[] }) {
+  return (
+    <section className="debug-queue-section">
+      <div className="debug-queue-section-header">
+        <div>
+          <h3>Currently executing</h3>
+          <p>{active.length ? `${active.length} active request${active.length === 1 ? "" : "s"}` : "No active request"}</p>
+        </div>
+      </div>
+      {active.length ? (
+        active.map((item) => (
+          <DebugQueueRow
+            key={`${item.kind}-${item.target ?? ""}-${item.startedAtUnixMs}`}
+            title={item.kind}
+            detail={item.target || "No target"}
+            meta={[`elapsed ${formatDuration(item.elapsedMs)}`, `started ${debugTimestampLabel(item.startedAtUnixMs)}`]}
+          />
+        ))
+      ) : (
+        <p className="debug-queue-empty">The daemon is idle.</p>
+      )}
+    </section>
+  );
+}
+
+function DebugQueueSectionView({ section }: { section: DebugQueueSection }) {
+  const meta = [
+    `${section.total} total`,
+    section.ready === null || section.ready === undefined ? null : `${section.ready} ready`,
+    section.deferred === null || section.deferred === undefined ? null : `${section.deferred} deferred`,
+  ].filter(Boolean) as string[];
+
+  return (
+    <section className="debug-queue-section">
+      <div className="debug-queue-section-header">
+        <div>
+          <h3>{section.label}</h3>
+          <p>{meta.join(" · ")}</p>
+        </div>
+      </div>
+      {section.items.length ? (
+        section.items.map((item, index) => (
+          <DebugQueueRow
+            key={`${section.name}-${item.kind}-${item.target ?? item.remoteId ?? index}`}
+            title={item.kind}
+            detail={item.target || item.path || item.remoteId || "No target"}
+            meta={[item.priority, item.reason, item.nextEligibleAt ? `eligible ${item.nextEligibleAt}` : null].filter(Boolean) as string[]}
+          />
+        ))
+      ) : (
+        <p className="debug-queue-empty">No queued requests.</p>
+      )}
+    </section>
+  );
+}
+
+function DebugQueueRow({ title, detail, meta }: { title: string; detail: string; meta: string[] }) {
+  return (
+    <article className="debug-queue-row">
+      <div>
+        <strong>{title}</strong>
+        <p>{detail}</p>
+      </div>
+      {meta.length > 0 && (
+        <div className="debug-queue-tags">
+          {meta.map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
+      )}
+    </article>
+  );
+}
+
+function debugTimestampLabel(unixMs: number) {
+  if (!Number.isFinite(unixMs) || unixMs <= 0) {
+    return "unknown";
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(unixMs));
+}
+
+function formatDuration(ms: number) {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return "unknown";
+  }
+  if (ms < 1000) {
+    return `${Math.round(ms)}ms`;
+  }
+  if (ms < 60_000) {
+    const seconds = ms / 1000;
+    return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`;
+  }
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }
 
 function activityGroupLabel(item: ActivityItem) {
@@ -4141,7 +4426,7 @@ function PathRow({ path }: { path: string }) {
   );
 }
 
-function Metric({ label, value }: { label: string; value: number }) {
+function Metric({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <article className="metric">
       <strong>{value}</strong>

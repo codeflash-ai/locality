@@ -65,6 +65,22 @@ fn queue_drains_high_priority_before_policy_and_prefetch() {
 }
 
 #[test]
+fn debug_requests_follow_drain_priority_without_mutating_queue() {
+    let mut queue = HydrationQueue::new();
+    queue.queue_request(request("mount", "prefetch", HydrationReason::Prefetch));
+    queue.queue_request(request("mount", "policy", HydrationReason::Policy));
+    queue.queue_request(request("mount", "read", HydrationReason::StubRead));
+
+    let ids = queue
+        .debug_requests(2)
+        .into_iter()
+        .map(|request| request.remote_id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![RemoteId::new("read"), RemoteId::new("policy")]);
+    assert_eq!(queue.len(), 3);
+}
+
+#[test]
 fn duplicate_entity_request_is_deduped_and_promoted() {
     let mut queue = HydrationQueue::new();
     let mut low = request("mount", "page-1", HydrationReason::Prefetch);
