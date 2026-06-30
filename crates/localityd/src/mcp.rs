@@ -35,10 +35,10 @@ Call the MCP tool with arguments exactly as you would pass them after `loc`.
 Examples:
 
 - {"argv":["--help"]}
-- {"argv":["status","/Users/me/Library/CloudStorage/Locality/notion","--json"]}
-- {"argv":["diff","/Users/me/Library/CloudStorage/Locality/notion/Plan/page.md","--json"]}
-- {"argv":["pull","/Users/me/Library/CloudStorage/Locality/notion/Plan/page.md","--json"]}
-- {"argv":["push","/Users/me/Library/CloudStorage/Locality/notion/Plan/page.md","--yes","--json"]}
+- {"argv":["status","/Users/me/Library/CloudStorage/Locality/notion-main","--json"]}
+- {"argv":["diff","/Users/me/Library/CloudStorage/Locality/notion-main/Plan/page.md","--json"]}
+- {"argv":["pull","/Users/me/Library/CloudStorage/Locality/notion-main/Plan/page.md","--json"]}
+- {"argv":["push","/Users/me/Library/CloudStorage/Locality/notion-main/Plan/page.md","--yes","--json"]}
 
 Regular online-only files hydrate automatically when opened. Use `loc pull`
 only when you need to force a clean local file to match the latest remote copy.

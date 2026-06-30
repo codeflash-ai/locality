@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 locality-core.workspace = true
+locality-store.workspace = true
 localityd = { path = "../../../crates/localityd" }
 base64 = "0.22"
 bytes = "1"

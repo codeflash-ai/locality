@@ -32,15 +32,16 @@ use locality_notion::media::resolve_media_href_with_content_root;
 use locality_notion::{NotionConfig, NotionConnector};
 use locality_store::{
     ConnectionId, EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository,
-    MountRepository, ProjectionMode, VirtualMutationRepository,
+    MountConfig, MountRepository, ProjectionMode, VirtualMutationRepository,
 };
 use localityd::hydration::{HydrationExecutor, HydrationOutcome, HydrationQueue};
 use localityd::reconcile::{DefaultFetchScheduleStrategy, reconcile_scheduled_pull};
 use localityd::scheduler::PullScheduler;
 use localityd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, materialize_virtual_fs_item_with_content_root,
-    refresh_virtual_fs_children, rename_virtual_fs_item, source_root_identifier,
-    trash_virtual_fs_item, virtual_fs_children_with_content_root, virtual_fs_content_root,
+    mount_point_directory_name, mount_point_identifier, refresh_virtual_fs_children,
+    rename_virtual_fs_item, trash_virtual_fs_item, virtual_fs_children_with_content_root,
+    virtual_fs_content_root,
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -2036,30 +2037,30 @@ fn live_lazy_virtual_mount_enumerates_children_and_hydrates_on_open() {
         root_children
             .children
             .iter()
-            .any(|item| item.filename == "notion"),
+            .any(|item| item.filename == fixture.virtual_root_directory_name()),
         "{root_children:#?}"
     );
 
-    let source_root = source_root_identifier("notion");
+    let mount_point_root = fixture.virtual_root_identifier();
     assert_eq!(
-        refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
-            .expect("refresh source root metadata"),
+        refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &mount_point_root)
+            .expect("refresh mount point root metadata"),
         1
     );
-    let source_children = virtual_fs_children_with_content_root(
+    let mount_point_children = virtual_fs_children_with_content_root(
         &store,
         &content_root,
         &fixture.mount_id,
-        &source_root,
+        &mount_point_root,
     )
-    .expect("list source root");
-    let scratch_folder = find_virtual_folder(&source_children.children, &scratch.id);
+    .expect("list mount point root");
+    let scratch_folder = find_virtual_folder(&mount_point_children.children, &scratch.id);
     assert!(
         !content_root
             .join(&scratch_folder.path)
             .join("page.md")
             .exists(),
-        "listing the source root must not hydrate the root page body"
+        "listing the mount point root must not hydrate the root page body"
     );
 
     assert_eq!(
@@ -2749,17 +2750,17 @@ fn live_virtual_page_directory_delete_archives_remote_child_page() {
     let mut store = InMemoryStateStore::new();
     mount_virtual_workspace(&fixture, &mut store, &parent.id);
     let content_root = fixture.content_root();
-    let source_root = source_root_identifier("notion");
-    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
-        .expect("refresh source root");
-    let source_children = virtual_fs_children_with_content_root(
+    let mount_point_root = fixture.virtual_root_identifier();
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &mount_point_root)
+        .expect("refresh mount point root");
+    let mount_point_children = virtual_fs_children_with_content_root(
         &store,
         &content_root,
         &fixture.mount_id,
-        &source_root,
+        &mount_point_root,
     )
-    .expect("list source root");
-    let parent_folder = find_virtual_folder(&source_children.children, &parent.id);
+    .expect("list mount point root");
+    let parent_folder = find_virtual_folder(&mount_point_children.children, &parent.id);
     refresh_virtual_fs_children(
         &mut store,
         &connector,
@@ -2893,17 +2894,17 @@ fn live_virtual_database_row_directory_delete_archives_remote_row() {
     let mut store = InMemoryStateStore::new();
     mount_virtual_workspace(&fixture, &mut store, &parent.id);
     let content_root = fixture.content_root();
-    let source_root = source_root_identifier("notion");
-    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
-        .expect("refresh source root");
-    let source_children = virtual_fs_children_with_content_root(
+    let mount_point_root = fixture.virtual_root_identifier();
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &mount_point_root)
+        .expect("refresh mount point root");
+    let mount_point_children = virtual_fs_children_with_content_root(
         &store,
         &content_root,
         &fixture.mount_id,
-        &source_root,
+        &mount_point_root,
     )
-    .expect("list source root");
-    let parent_folder = find_virtual_folder(&source_children.children, &parent.id);
+    .expect("list mount point root");
+    let parent_folder = find_virtual_folder(&mount_point_children.children, &parent.id);
     refresh_virtual_fs_children(
         &mut store,
         &connector,
@@ -3045,17 +3046,17 @@ fn live_virtual_page_directory_rename_updates_remote_title_and_reconciles() {
     let mut store = InMemoryStateStore::new();
     mount_virtual_workspace(&fixture, &mut store, &parent.id);
     let content_root = fixture.content_root();
-    let source_root = source_root_identifier("notion");
-    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
-        .expect("refresh source root");
-    let source_children = virtual_fs_children_with_content_root(
+    let mount_point_root = fixture.virtual_root_identifier();
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &mount_point_root)
+        .expect("refresh mount point root");
+    let mount_point_children = virtual_fs_children_with_content_root(
         &store,
         &content_root,
         &fixture.mount_id,
-        &source_root,
+        &mount_point_root,
     )
-    .expect("list source root");
-    let parent_folder = find_virtual_folder(&source_children.children, &parent.id);
+    .expect("list mount point root");
+    let parent_folder = find_virtual_folder(&mount_point_children.children, &parent.id);
     refresh_virtual_fs_children(
         &mut store,
         &connector,
@@ -3495,9 +3496,9 @@ fn live_locate_notion_url_returns_markdown_path_and_can_prioritize_hydration() {
     let mut store = InMemoryStateStore::new();
     mount_virtual_workspace(&fixture, &mut store, &scratch.id);
     let content_root = fixture.content_root();
-    let source_root = source_root_identifier("notion");
-    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
-        .expect("index source root");
+    let mount_point_root = fixture.virtual_root_identifier();
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &mount_point_root)
+        .expect("index mount point root");
 
     let url = notion_object_url(&scratch.id);
     let search = run_search(&store, SearchOptions::new(url)).expect("locate by Notion URL");
@@ -3557,17 +3558,17 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
     mount_virtual_workspace(&fixture, &mut store, &scratch.id);
     let content_root = fixture.content_root();
 
-    let source_root = source_root_identifier("notion");
-    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &source_root)
-        .expect("refresh source root");
-    let source_children = virtual_fs_children_with_content_root(
+    let mount_point_root = fixture.virtual_root_identifier();
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &mount_point_root)
+        .expect("refresh mount point root");
+    let mount_point_children = virtual_fs_children_with_content_root(
         &store,
         &content_root,
         &fixture.mount_id,
-        &source_root,
+        &mount_point_root,
     )
-    .expect("list source root");
-    let scratch_folder = find_virtual_folder(&source_children.children, &scratch.id).clone();
+    .expect("list mount point root");
+    let scratch_folder = find_virtual_folder(&mount_point_children.children, &scratch.id).clone();
     refresh_virtual_children_until_remote_folder(
         &mut store,
         &connector,
@@ -3628,8 +3629,8 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
     .expect("list refreshed parent children");
     let child_folder = find_virtual_folder(&parent_children.children, &child.id);
     let located_relative_path = located_child_path
-        .strip_prefix(fixture.root.join("notion"))
-        .expect("located path under source root");
+        .strip_prefix(&fixture.root)
+        .expect("located path under mount point root");
     assert_eq!(
         Path::new(&child_folder.path).join("page.md"),
         located_relative_path,
@@ -4708,6 +4709,19 @@ impl E2eFixture {
         virtual_fs_content_root(&self.state_root, &self.mount_id)
     }
 
+    fn mount_config(&self) -> MountConfig {
+        MountConfig::new(self.mount_id.clone(), "notion", self.root.clone())
+            .projection(ProjectionMode::LinuxFuse)
+    }
+
+    fn virtual_root_identifier(&self) -> String {
+        mount_point_identifier(&self.mount_config())
+    }
+
+    fn virtual_root_directory_name(&self) -> String {
+        mount_point_directory_name(&self.mount_config())
+    }
+
     fn page_file(&self) -> PathBuf {
         collect_files(&self.root)
             .into_iter()
@@ -4764,16 +4778,17 @@ impl Drop for E2eFixture {
 }
 
 fn mount_virtual_workspace(fixture: &E2eFixture, store: &mut InMemoryStateStore, root_id: &str) {
+    let mount = fixture.mount_config();
     run_mount(
         store,
         MountOptions {
-            mount_id: fixture.mount_id.clone(),
-            connector: "notion".to_string(),
-            root: fixture.root.clone(),
+            mount_id: mount.mount_id,
+            connector: mount.connector,
+            root: mount.root,
             remote_root_id: Some(RemoteId::new(root_id.to_string())),
             connection_id: None,
             read_only: false,
-            projection: ProjectionMode::LinuxFuse,
+            projection: mount.projection,
         },
     )
     .expect("mount virtual live workspace");
@@ -4786,9 +4801,9 @@ fn hydrate_virtual_root_page(
     content_root: &Path,
     page_id: &str,
 ) {
-    let source_root = source_root_identifier("notion");
-    refresh_virtual_fs_children(store, connector, &fixture.mount_id, &source_root)
-        .expect("refresh virtual source root");
+    let mount_point_root = fixture.virtual_root_identifier();
+    refresh_virtual_fs_children(store, connector, &fixture.mount_id, &mount_point_root)
+        .expect("refresh virtual mount point root");
     materialize_virtual_fs_item_with_content_root(
         store,
         connector,

@@ -51,17 +51,9 @@ type DesktopSnapshot = {
     accountLabel: string;
     status: string;
   };
-  mount: {
-    connector: string;
-    workspaceName: string;
-    localPath: string;
-    notionUrl?: string | null;
-    accessScope: string;
-    projection: string;
-    readOnly: boolean;
-    status: string;
-    provider?: ProviderRuntimeSummary | null;
-  };
+  mount: MountSummary;
+  mounts: MountSummary[];
+  activeMountId?: string | null;
   liveMode: MountLiveMode;
   needsOnboarding: boolean;
   settings: {
@@ -71,6 +63,25 @@ type DesktopSnapshot = {
   pendingChanges: PendingChange[];
   activity: ActivityItem[];
   suggestions: ConnectorSuggestion[];
+};
+
+type MountSummary = {
+  mountId: string;
+  connector: string;
+  connectorName: string;
+  connectionId?: string | null;
+  workspaceName: string;
+  localPath: string;
+  notionUrl?: string | null;
+  accessScope: string;
+  remoteRootId?: string | null;
+  projection: string;
+  readOnly: boolean;
+  status: string;
+  rootExists: boolean;
+  entityCount: number;
+  pendingChangeCount: number;
+  provider?: ProviderRuntimeSummary | null;
 };
 
 type MountLiveMode = {
@@ -230,6 +241,25 @@ type AgentGuidanceInstallReport = {
   prompt: string;
 };
 
+const sampleMount: MountSummary = {
+  mountId: "notion-main",
+  connector: "notion",
+  connectorName: "Notion",
+  connectionId: "notion-main",
+  workspaceName: "CodeFlash",
+  localPath: "~/Library/CloudStorage/Locality/notion-main",
+  notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
+  accessScope: "Initial Idea",
+  remoteRootId: "37b3ac0ebb88802cbcf4d53c9cfc4972",
+  projection: "macOS File Provider",
+  readOnly: false,
+  status: "ready",
+  rootExists: true,
+  entityCount: 24,
+  pendingChangeCount: 3,
+  provider: null,
+};
+
 const sampleSnapshot: DesktopSnapshot = {
   health: {
     state: "ready",
@@ -241,17 +271,9 @@ const sampleSnapshot: DesktopSnapshot = {
     accountLabel: "saurabh@codeflash.ai",
     status: "ready",
   },
-  mount: {
-    connector: "notion",
-    workspaceName: "CodeFlash",
-    localPath: "~/Library/CloudStorage/Locality/notion",
-    notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
-    accessScope: "Initial Idea",
-    projection: "macOS File Provider",
-    readOnly: false,
-    status: "ready",
-    provider: null,
-  },
+  mount: sampleMount,
+  mounts: [sampleMount],
+  activeMountId: sampleMount.mountId,
   liveMode: {
     enabled: false,
     state: "off",
@@ -410,7 +432,7 @@ const loadingSnapshot: DesktopSnapshot = {
   mount: {
     ...sampleSnapshot.mount,
     workspaceName: "Loading",
-    localPath: "~/Library/CloudStorage/Locality",
+    localPath: "~/Library/CloudStorage/Locality/notion-main",
     notionUrl: null,
     accessScope: "Checking access",
     status: "loading",
@@ -463,13 +485,13 @@ const sampleSearchResults: LocatedItem[] = [
   {
     title: "Roadmap 2026",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
     state: "ready",
   },
   {
     title: "Launch Plan",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/Locality/notion/Marketing/Launch Plan/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion-main/Marketing/Launch Plan/page.md",
     state: "online_only",
   },
 ];
@@ -551,7 +573,7 @@ function errorMessage(error: unknown) {
 function liveModeTooltip(enabled: boolean) {
   return enabled
     ? "Live Mode is watching safe local edits, pushing them to Notion, and pulling remote Notion changes when no review is needed. It pauses when a change needs review."
-    : "Turn on Live Mode to keep this local Notion folder in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
+    : "Turn on Live Mode to keep this Notion mount point in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
 }
 
 function trayLiveModeLabel(liveMode: MountLiveMode, busy: boolean) {
@@ -1015,7 +1037,7 @@ function SetupLoading() {
               Checking setup
             </div>
             <h1>Checking your Locality setup</h1>
-            <p>Locality is checking your Notion connection and local folder.</p>
+            <p>Locality is checking your Notion connection and mount point.</p>
           </div>
         </SetupContent>
       </section>
@@ -1286,7 +1308,7 @@ function Onboarding({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1363,7 +1385,7 @@ function Onboarding({
               </h1>
               <p>
                 {connectionReady
-                  ? `${workspaceLabel} is ready. Next, choose where Locality should place the local folder.`
+                  ? `${workspaceLabel} is ready. Next, choose where Locality should place the Notion mount point.`
                   : oauthInFlight
                     ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
                     : "Connect the workspace you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
@@ -1426,6 +1448,10 @@ function Onboarding({
               {mounting ? "Mounting Notion" : "Create Local Folder"}
             </PrimaryButton>
             {mountError && <p className="field-error">{mountError}</p>}
+            <p className="quiet-note">
+              The Notion mount point will include AGENTS.md and CLAUDE.md to help your agents edit
+              files natively.
+            </p>
           </SetupContent>
         )}
 
@@ -1434,7 +1460,7 @@ function Onboarding({
             <div>
               <h1>Locality is ready!</h1>
               <p>
-                Your Notion files are now mounted locally. Agents can open this folder, edit
+                Your Notion mount point is ready. Agents can open this folder, edit
                 Markdown, and leave changes for Locality review. Open the app to review changes,
                 manage sync, and turn on Live Mode when you want file saves to update Notion and
                 new Notion changes to appear locally.
@@ -1518,7 +1544,7 @@ function AgentGuidanceSummary({
         <p>{fallbackTargets[0].detail}</p>
       )}
       {state !== "installing" && installedAgents.length === 0 && fallbackTargets.length === 0 && !failed && (
-        <p>Locality is preparing local agent instructions for this Notion folder.</p>
+        <p>Locality is preparing local agent instructions for this Notion mount point.</p>
       )}
       {failed && report?.targets.find((target) => target.status === "failed")?.detail && (
         <p>{report.targets.find((target) => target.status === "failed")?.detail}</p>
@@ -1806,7 +1832,7 @@ function HomeView({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1846,14 +1872,14 @@ function HomeView({
         <section className="empty-action-panel">
           <BrandTile variant="folder" />
           <div>
-            <h2>Create your Notion folder</h2>
-            <p>Use the default source folder under the shared Locality CloudStorage root.</p>
+            <h2>Create your Notion mount point</h2>
+            <p>Use the default notion-main mount point under the shared Locality CloudStorage root.</p>
           </div>
           <PrimaryButton
             icon={<FolderOpen />}
             onClick={() => void createMount()}
           >
-            Create Notion Folder
+            Create Notion Mount Point
           </PrimaryButton>
           {actionError && <p className="field-error">{actionError}</p>}
         </section>
@@ -2063,7 +2089,7 @@ function MountDetailView({
           <FolderOpen />
         </div>
         <div>
-          <p className="label">Notion folder</p>
+          <p className="label">Notion mount point</p>
           <h2>{snapshot.mount.localPath}</h2>
           <p>
             Locality follows your Notion workspace hierarchy here, starting with the pages and databases
@@ -2853,7 +2879,7 @@ function SettingsView({
             busy={busySetting === "show_menu_bar"}
             onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
           />
-          <SettingRow title="Default folder" value="~/Library/CloudStorage/Locality" />
+          <SettingRow title="Default Notion mount point" value="~/Library/CloudStorage/Locality/notion-main" />
           {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
         </div>
 
@@ -2897,7 +2923,7 @@ function SettingsView({
         <div className="panel">
           <PanelTitle title="Agent Instructions" />
           <SettingRow title="Local agents" value="Claude, Codex, Warp, Cursor, Gemini, Cline/Roo" />
-          <SettingRow title="Notion guidance" value="Installed under /Locality/notion" />
+          <SettingRow title="Notion guidance" value="Installed under /Locality/notion-main" />
           <SecondaryButton
             compact
             icon={installingAgents ? <Loader2 className="spin-icon" /> : <Bot />}
@@ -3026,7 +3052,7 @@ function TrayPopover({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );

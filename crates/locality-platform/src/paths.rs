@@ -71,7 +71,7 @@ impl DefaultHostPaths {
 
 impl HostPaths for DefaultHostPaths {
     fn state_root(&self) -> PathBuf {
-        if let Some(path) = self.first_var_path(&["LOCALITY_STATE_DIR", "AFS_STATE_DIR"]) {
+        if let Some(path) = self.first_var_path(&["LOCALITY_STATE_DIR"]) {
             return path;
         }
 
@@ -101,11 +101,9 @@ impl HostPaths for DefaultHostPaths {
             }
         }
 
-        if let Some(path) = self.first_existing_path(
-            self.user_home()
-                .into_iter()
-                .flat_map(|home| [home.join(".loc"), home.join(".afs")]),
-        ) {
+        if let Some(path) =
+            self.first_existing_path(self.user_home().into_iter().map(|home| home.join(".loc")))
+        {
             return path;
         }
 
@@ -234,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn afs_state_dir_alias_overrides_platform_default() {
+    fn afs_state_dir_alias_does_not_override_platform_default() {
         let paths = DefaultHostPaths::for_target_with_env(
             "windows",
             [
@@ -243,7 +241,10 @@ mod tests {
             ],
         );
 
-        assert_eq!(paths.state_root(), PathBuf::from(r"D:\afs-state"));
+        assert_eq!(
+            paths.state_root(),
+            PathBuf::from(r"C:\Users\Ada\AppData\Local").join("Locality")
+        );
     }
 
     #[test]
@@ -268,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_state_root_prefers_existing_legacy_dot_afs_directory() {
+    fn unix_state_root_ignores_existing_legacy_dot_afs_directory() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -279,7 +280,7 @@ mod tests {
 
         let paths = DefaultHostPaths::for_target_with_env("linux", [("HOME", home.as_os_str())]);
 
-        assert_eq!(paths.state_root(), legacy_root);
+        assert_eq!(paths.state_root(), home.join(".loc"));
 
         let _ = fs::remove_dir_all(home);
     }

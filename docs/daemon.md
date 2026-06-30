@@ -39,7 +39,7 @@ management lives in `loc daemon ...`:
   fallback used by macOS/Linux CLI control.
 - `loc daemon status` pings the daemon control endpoint and reports the state
   root, socket path, TCP address, manager, log path, runtime queue counts,
-  scheduler mode, and watched mount roots.
+  scheduler mode, watched shared projection roots, and mount-point folders.
 - `loc daemon reload` asks the running daemon to reconcile file watches with the
   current SQLite mount table.
 - `loc daemon stop` unloads the LaunchAgent or kills the session pid file when
@@ -132,11 +132,11 @@ make run-daemon
 cargo run -p localityd
 ```
 
-On startup it prints the socket path, watched mounts, and auth source:
+On startup it prints the socket path, watched roots/mount points, and auth source:
 
 ```text
 localityd listening on /Users/alice/.loc/localityd.sock
-localityd watching 1 mount: /Users/alice/loc/notion
+localityd watching shared root /Users/alice/Locality with mount point notion-main
 localityd auth: connection notion-work
 ```
 
@@ -238,11 +238,12 @@ use the fallback watcher path below.
 
 ## File Watching
 
-The foreground daemon starts a `notify` watcher for every mount loaded from the
-SQLite store at startup, and `reload_mounts` reconciles those watches with the
-current mount table without restarting the process. `loc mount` calls this IPC
-after saving a mount, so persistent daemons begin watching newly mounted
-directories immediately. Create and modify notifications are normalized to
+The foreground daemon starts `notify` watchers for plain-file mount roots and
+for shared projection roots/mount-point folders loaded from the SQLite store at
+startup. `reload_mounts` reconciles those watches with the current mount table
+without restarting the process. `loc mount` calls this IPC after saving a mount,
+so persistent daemons begin watching newly mounted directories immediately.
+Create and modify notifications are normalized to
 `Write` events, native access/open notifications are normalized to `Read` events
 when the platform reports them, and remove/rename notifications are delivered
 but ignored until delete/rename planning is wired.
@@ -255,10 +256,10 @@ feedback from hydration, scheduled pull, and explicit pull without relying on
 fragile timing windows or global path ignore lists.
 
 The daemon also runs a stub access watcher. It scans only stored `virtual` and
-`stub` entity paths under watched mounts and emits a `Read` event when a stub's
-access time advances. This covers platforms where the regular watcher does not
-surface open/read notifications to user-space. The scan only submits daemon
-events; the runtime decides whether to queue hydration.
+`stub` entity paths under watched mount-point folders and emits a `Read` event
+when a stub's access time advances. This covers platforms where the regular
+watcher does not surface open/read notifications to user-space. The scan only
+submits daemon events; the runtime decides whether to queue hydration.
 
 Read events are resolved inside `DaemonRuntime`. A read on a `virtual` or `stub`
 entity creates a high-priority `StubRead` hydration request and returns to the

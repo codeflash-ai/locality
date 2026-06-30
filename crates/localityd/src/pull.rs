@@ -1130,12 +1130,7 @@ fn projected_report_path(mount: &MountConfig, relative_path: &Path) -> PathBuf {
         mount.projection,
         ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
     ) {
-        return mount
-            .root
-            .join(crate::virtual_fs::source_root_directory_name(
-                &mount.connector,
-            ))
-            .join(relative_path);
+        return crate::virtual_fs::virtual_projection_mount_point(mount).join(relative_path);
     }
 
     mount.root.join(relative_path)

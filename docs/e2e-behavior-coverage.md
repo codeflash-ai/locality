@@ -28,7 +28,7 @@ Optional:
 export LOCALITY_NOTION_LIVE_DIR=/tmp/locality-notion-live
 export LOCALITY_WINDOWS_CLOUD_FILES_LIVE=1
 export LOCALITY_DESKTOP_LIVE_MODE_E2E=1
-export LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE=~/Library/CloudStorage/Locality-Locality/notion/path/to/scratch/page.md
+export LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE=~/Library/CloudStorage/Locality/notion-main/path/to/scratch/page.md
 ```
 
 Run:
@@ -37,7 +37,7 @@ Run:
 cargo test -p locality-notion --test live_integrity -- --ignored --test-threads=1
 cargo test -p loc-cli --test e2e_push_workflow live_ -- --ignored --test-threads=1
 LOCALITY_DESKTOP_LIVE_MODE_E2E=1 \
-  LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE=~/Library/CloudStorage/Locality-Locality/notion/path/to/scratch/page.md \
+  LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE=~/Library/CloudStorage/Locality/notion-main/path/to/scratch/page.md \
   cargo test -p locality-desktop live_mode_bidirectional_cloudstorage_markdown_e2e -- --ignored --exact --test-threads=1
 pwsh ./tests/windows_cloud_files_live.ps1
 ```
@@ -65,7 +65,7 @@ Coverage labels:
 |---|---|---|---|---|
 | E2E-001 | OAuth broker connection stores a refresh handle/metadata without shipping or persisting a Notion client secret locally. | Gap | `crates/loc-cli/tests/connect.rs` covers broker secret separation with a fake broker. | Add a broker-backed live auth smoke, likely outside normal CI unless using a test OAuth integration. |
 | E2E-002 | New install/onboarding can reset stale local beta state, install the terminal-visible `loc` command, then proceed through connection and mount setup. | Gap | Desktop command/unit coverage plus manual DMG testing. | Needs a desktop automation harness or scripted signed-app smoke on macOS. |
-| E2E-003 | Workspace mount is created under the macOS CloudStorage Locality root, with source folders below `Locality/notion` and no Documents symlink dependency. | Gap | Mount path validation tests in `apps/desktop/src-tauri/src/main.rs`. | Real File Provider mount behavior is manual-only on macOS. |
+| E2E-003 | Workspace mount is created as a mount-point folder under the macOS CloudStorage Locality root, for example `Locality/notion-main`, with no Documents symlink dependency. | Gap | Mount path validation tests in `apps/desktop/src-tauri/src/main.rs`. | Real File Provider mount behavior is manual-only on macOS. |
 | E2E-004 | A mounted workspace can expose top-level source directories and page/database entries without materializing every page body. | Covered live for virtual filesystem core | `architecture_behavior::local_virtual_mount_supports_browse_open_edit_review_push_round_trip`; `tests/linux_fuse_smoke.sh`. | Live Notion now exercises the lazy virtual filesystem path directly; kernel FUSE/File Provider registration remains local/manual. |
 | E2E-005 | Opening/listing a nested page directory lazily discovers immediate children only. | Covered live for virtual filesystem core | `architecture_behavior::local_virtual_mount_supports_browse_open_edit_review_push_round_trip`. | Kernel FUSE/File Provider shell/Finder path still needs platform e2e. |
 | E2E-006 | Opening `page.md` hydrates full page content into canonical Markdown. | Covered live | Local pull and architecture behavior tests. | Covered through plain-file pull; real File Provider open hydration remains manual/macOS. |
@@ -152,6 +152,7 @@ Coverage labels:
 | Database schema and row writes | Strong | Schema, validation, property update, body update, and row create are covered. |
 | Media download/upload | Covered for common file-like media | Live tests download image, video, file, PDF, and audio assets locally; upload edited image bytes; and append local video, PDF, audio, and HTML uploads while verifying local links after reconciliation. Broader media pruning/cache lifecycle is not covered. |
 | Mounted workflow | Good for core, partial for platform kernels | Live tests cover plain-file mounted workflow, virtual filesystem lazy paths, Windows Cloud Files registration, and macOS CloudStorage Live Mode against live Notion. Linux FUSE live Notion and broader macOS File Provider create/rename/delete coverage remain open. |
+| Shared root mount points | Covered by Linux FUSE smoke, macOS File Provider domain children tests, Windows Cloud Files live test | Verifies one Locality root exposes multiple mount-point folders mapped to distinct mount IDs/connectors. |
 | Desktop onboarding/tray/review UI | Partial live | Live Mode sync semantics are covered through the desktop tick loop against a real CloudStorage page; onboarding, tray, and review UI automation remain manual. |
 | Freshness/drift/auto-fast-forward | Partial live | Live tests cover drift preflight, dirty-pull conflict recovery, fast-forward apply/skip behavior, and scheduled pull queuing/applying a remote fast-forward. Long-running scheduler budget assertions remain local-only. |
 | OAuth broker | Local only | Secret separation is tested; real OAuth UX/broker round-trip is manual. |

@@ -5,6 +5,8 @@
 //! than shelling through `loc file-provider`, so the CLI and desktop app share
 //! the same platform boundary.
 
+#[cfg(target_os = "linux")]
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -15,14 +17,32 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use locality_store::MountConfig;
+#[cfg(target_os = "linux")]
+use locality_store::ProjectionMode;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use localityd::ipc::{DaemonRequest, send_request_with_timeout};
 #[cfg(target_os = "windows")]
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use serde::Serialize;
 use serde_json::Value;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const DEFAULT_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const LINUX_FUSE_ROOT_HINT_MAX_BYTES: usize = 48;
+#[cfg(target_os = "linux")]
+const LINUX_FUSE_UNIT_PREFIX: &str = "ai.codeflash.locality.fuse.";
+#[cfg(target_os = "linux")]
+const LEGACY_AFS_FUSE_UNIT_PREFIX: &str = "ai.codeflash.afs.fuse.";
+#[cfg(target_os = "linux")]
+const LEGACY_AGENTFS_FUSE_UNIT_PREFIX: &str = "ai.codeflash.agentfs.fuse.";
+#[cfg(target_os = "linux")]
+const LINUX_FUSE_UNIT_SUFFIX: &str = ".service";
+#[cfg(target_os = "linux")]
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+#[cfg(target_os = "linux")]
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 #[cfg(target_os = "windows")]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 #[cfg(target_os = "windows")]
@@ -32,6 +52,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(target_os = "windows")]
 const HIDDEN_WINDOWS_PROCESS_FLAGS: u32 =
     CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW;
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_CLOUD_FILES_SYNC_ROOT_ID_PREFIX: &str = "codeflash.ai.loc!default!";
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_CLOUD_FILES_SHARED_SYNC_ROOT_COMPONENT: &str = "locality";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileProviderHelperReport {
@@ -89,7 +113,98 @@ pub enum LinuxFuseRegistrationError {
     EnvMissing(String),
     Io(String),
     SystemctlFailed(String),
+    UnsafeProjectionRoot(String),
     UnsupportedPlatform(String),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinuxFuseUnitFile {
+    unit_name: String,
+    unit_path: PathBuf,
+    contents: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StaleLinuxFuseUnit {
+    unit_name: String,
+    unit_path: PathBuf,
+    mountpoint: Option<PathBuf>,
+    legacy: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LinuxFuseManagedUnit {
+    unit_name: String,
+    mountpoint: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinuxFuseLifecycleAction {
+    Start,
+    Stop,
+    Status,
+    Restart,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxFuseLifecycleAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Status => "status",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LinuxFuseRootReport {
+    pub root_id: String,
+    pub service: String,
+    pub mountpoint: String,
+    pub state_dir: String,
+    pub mount_ids: Vec<String>,
+    pub registered: bool,
+    pub active: Option<bool>,
+    pub unit_path: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LinuxFuseLifecycleReport {
+    pub message: String,
+    pub action: String,
+    pub state: String,
+    pub mount_id: String,
+    pub root_id: String,
+    pub service: String,
+    pub mountpoint: String,
+    pub state_dir: String,
+    pub registered: bool,
+    pub active: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LinuxFuseStaleUnitReport {
+    pub service: String,
+    pub unit_path: String,
+    pub mountpoint: Option<String>,
+    pub legacy: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinuxFuseExecStart {
+    state_dir: Option<PathBuf>,
+    mountpoint: Option<PathBuf>,
+    has_mount_id: bool,
 }
 
 impl LinuxFuseRegistrationError {
@@ -100,6 +215,7 @@ impl LinuxFuseRegistrationError {
             Self::EnvMissing(_) => "env_missing",
             Self::Io(_) => "io_error",
             Self::SystemctlFailed(_) => "systemctl_failed",
+            Self::UnsafeProjectionRoot(_) => "unsafe_projection_root",
             Self::UnsupportedPlatform(_) => "unsupported_platform",
         }
     }
@@ -116,6 +232,7 @@ impl LinuxFuseRegistrationError {
             Self::EnvMissing(message)
             | Self::Io(message)
             | Self::SystemctlFailed(message)
+            | Self::UnsafeProjectionRoot(message)
             | Self::UnsupportedPlatform(message) => message.clone(),
         }
     }
@@ -126,6 +243,7 @@ pub enum WindowsCloudFilesHelperError {
     DaemonNotRunning,
     Missing,
     Failed(String),
+    UnsafeProjectionRoot(String),
     UnsupportedPlatform(String),
 }
 
@@ -135,6 +253,7 @@ impl WindowsCloudFilesHelperError {
             Self::DaemonNotRunning => "daemon_not_running",
             Self::Missing => "helper_missing",
             Self::Failed(_) => "helper_failed",
+            Self::UnsafeProjectionRoot(_) => "unsafe_projection_root",
             Self::UnsupportedPlatform(_) => "unsupported_platform",
         }
     }
@@ -149,7 +268,9 @@ impl WindowsCloudFilesHelperError {
                 "locality-cloud-files was not found; build or install the Windows Cloud Files helper"
                     .to_string()
             }
-            Self::Failed(message) | Self::UnsupportedPlatform(message) => message.clone(),
+            Self::Failed(message)
+            | Self::UnsafeProjectionRoot(message)
+            | Self::UnsupportedPlatform(message) => message.clone(),
         }
     }
 }
@@ -184,7 +305,8 @@ enum WindowsCloudFilesProviderState {
 #[cfg(target_os = "windows")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct WindowsCloudFilesProcessMetadata {
-    mount_id: String,
+    #[serde(alias = "mount_id")]
+    root_id: String,
     pid: u32,
     helper: PathBuf,
     sync_root: PathBuf,
@@ -199,6 +321,7 @@ struct WindowsCloudFilesLifecycleReport {
     message: String,
     state: WindowsCloudFilesProviderState,
     mount_id: String,
+    root_id: String,
     sync_root: String,
     state_dir: String,
     helper: String,
@@ -297,13 +420,17 @@ pub fn register_linux_fuse_mount(
     state_root: &Path,
     mount: &MountConfig,
 ) -> Result<LinuxFuseRegistrationReport, LinuxFuseRegistrationError> {
+    localityd::virtual_fs::validate_virtual_projection_root(mount)
+        .map_err(|error| LinuxFuseRegistrationError::UnsafeProjectionRoot(error.to_string()))?;
     if !daemon_is_running(state_root) {
         return Err(LinuxFuseRegistrationError::DaemonNotRunning);
     }
 
     let locality_fuse =
         locality_fuse_helper_path().ok_or(LinuxFuseRegistrationError::HelperMissing)?;
-    let service = linux_fuse_unit_name(&mount.mount_id.0);
+    repair_legacy_linux_fuse_units_for_state(state_root)?;
+    let root_id = linux_fuse_root_id(mount);
+    let service = linux_fuse_unit_name(&root_id);
     let unit_path = linux_fuse_unit_path(&service)?;
     write_linux_fuse_unit(&unit_path, &locality_fuse, state_root, mount)?;
     run_systemctl_user(&["daemon-reload"])?;
@@ -313,8 +440,71 @@ pub fn register_linux_fuse_mount(
     Ok(LinuxFuseRegistrationReport {
         service,
         unit_path,
-        mountpoint: mount.root.clone(),
+        mountpoint: localityd::virtual_fs::virtual_projection_root(mount),
         locality_fuse,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn list_linux_fuse_roots(
+    state_root: &Path,
+    mounts: &[MountConfig],
+) -> Result<FileProviderHelperReport, LinuxFuseRegistrationError> {
+    let unit_files = read_linux_fuse_unit_files()?;
+    let helper_report = linux_fuse_list_payload_for_state(state_root, mounts, unit_files)?;
+    Ok(FileProviderHelperReport {
+        helper: PathBuf::from("systemctl"),
+        helper_report,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_linux_fuse_lifecycle(
+    state_root: &Path,
+    mount: &MountConfig,
+    action: LinuxFuseLifecycleAction,
+) -> Result<FileProviderHelperReport, LinuxFuseRegistrationError> {
+    let (registered, active) = match action {
+        LinuxFuseLifecycleAction::Start | LinuxFuseLifecycleAction::Restart => {
+            register_linux_fuse_mount(state_root, mount)?;
+            (true, true)
+        }
+        LinuxFuseLifecycleAction::Stop => {
+            let service = linux_fuse_unit_name(&linux_fuse_root_id(mount));
+            let unit_path = linux_fuse_unit_path(&service)?;
+            let mountpoint = localityd::virtual_fs::virtual_projection_root(mount);
+            stop_linux_fuse_lifecycle_with(
+                &service,
+                &mountpoint,
+                &unit_path,
+                |service| run_systemctl_user(&["stop", service]),
+                |mountpoint| {
+                    let _ = Command::new("fusermount3")
+                        .arg("-uz")
+                        .arg(mountpoint)
+                        .output();
+                },
+                |service| {
+                    let _ = run_systemctl_user(&["reset-failed", service]);
+                },
+            )?
+        }
+        LinuxFuseLifecycleAction::Status => {
+            let service = linux_fuse_unit_name(&linux_fuse_root_id(mount));
+            let registered = linux_fuse_unit_path(&service)?.exists();
+            let active = if registered {
+                linux_fuse_unit_is_active(&service)?
+            } else {
+                false
+            };
+            (registered, active)
+        }
+    };
+    let report = linux_fuse_lifecycle_report(action, state_root, mount, registered, active);
+    Ok(FileProviderHelperReport {
+        helper: PathBuf::from("systemctl"),
+        helper_report: serde_json::to_value(report)
+            .map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))?,
     })
 }
 
@@ -329,11 +519,102 @@ pub fn register_linux_fuse_mount(
     )))
 }
 
+#[cfg(target_os = "linux")]
+fn linux_fuse_lifecycle_report(
+    action: LinuxFuseLifecycleAction,
+    state_root: &Path,
+    mount: &MountConfig,
+    registered: bool,
+    active: bool,
+) -> LinuxFuseLifecycleReport {
+    let root_id = linux_fuse_root_id(mount);
+    let service = linux_fuse_unit_name(&root_id);
+    let mountpoint = localityd::virtual_fs::virtual_projection_root(mount);
+    let state = if active { "running" } else { "stopped" };
+    LinuxFuseLifecycleReport {
+        message: format!(
+            "Linux FUSE provider {state} for `{}` at {}",
+            mount.mount_id.0,
+            mountpoint.display()
+        ),
+        action: action.as_str().to_string(),
+        state: state.to_string(),
+        mount_id: mount.mount_id.0.clone(),
+        root_id,
+        service,
+        mountpoint: mountpoint.display().to_string(),
+        state_dir: state_root.display().to_string(),
+        registered,
+        active,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_fuse_lifecycle_with(
+    service: &str,
+    mountpoint: &Path,
+    unit_path: &Path,
+    stop_service: impl FnOnce(&str) -> Result<(), LinuxFuseRegistrationError>,
+    unmount: impl FnOnce(&Path),
+    reset_failed: impl FnOnce(&str),
+) -> Result<(bool, bool), LinuxFuseRegistrationError> {
+    let registered = unit_path.exists();
+    if registered {
+        stop_service(service)?;
+    }
+    unmount(mountpoint);
+    reset_failed(service);
+    Ok((registered, false))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn repair_linux_fuse_units_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+) -> Result<Vec<StaleLinuxFuseUnit>, LinuxFuseRegistrationError> {
+    let unit_files = read_linux_fuse_unit_files()?;
+    let stale = stale_and_deprecated_linux_fuse_units_for_state(state_root, mounts, unit_files);
+    remove_stale_linux_fuse_units(stale)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn restart_linux_fuse_units_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+) -> Result<Vec<LinuxFuseManagedUnit>, LinuxFuseRegistrationError> {
+    let unit_files = read_linux_fuse_unit_files()?;
+    let units = restartable_linux_fuse_units_for_state(state_root, mounts, unit_files);
+    restart_linux_fuse_units(units)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn stop_linux_fuse_units_for_state(
+    state_root: &Path,
+) -> Result<Vec<LinuxFuseManagedUnit>, LinuxFuseRegistrationError> {
+    let unit_files = read_linux_fuse_unit_files()?;
+    let units = stoppable_linux_fuse_units_for_state(state_root, unit_files);
+    stop_linux_fuse_units(units)
+}
+
+#[cfg(target_os = "linux")]
+fn repair_legacy_linux_fuse_units_for_state(
+    state_root: &Path,
+) -> Result<Vec<StaleLinuxFuseUnit>, LinuxFuseRegistrationError> {
+    let unit_files = read_linux_fuse_unit_files()?;
+    let stale = combine_stale_linux_fuse_units(
+        legacy_linux_fuse_units_for_state(state_root, unit_files.clone()),
+        deprecated_linux_fuse_units(unit_files),
+    );
+    remove_stale_linux_fuse_units(stale)
+}
+
 pub fn register_windows_cloud_files_sync_root(
     state_root: &Path,
     mount: &MountConfig,
     display_name: &str,
 ) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    localityd::virtual_fs::validate_virtual_projection_root(mount)
+        .map_err(|error| WindowsCloudFilesHelperError::UnsafeProjectionRoot(error.to_string()))?;
     #[cfg(target_os = "windows")]
     {
         run_windows_cloud_files_helper(
@@ -372,6 +653,8 @@ pub fn run_windows_cloud_files_provider(
     state_root: &Path,
     mount: &MountConfig,
 ) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    localityd::virtual_fs::validate_virtual_projection_root(mount)
+        .map_err(|error| WindowsCloudFilesHelperError::UnsafeProjectionRoot(error.to_string()))?;
     #[cfg(target_os = "windows")]
     {
         run_windows_cloud_files_helper("run", windows_cloud_files_run_args(state_root, mount))
@@ -501,12 +784,12 @@ fn start_windows_cloud_files_lifecycle(
     }
 
     let helper = windows_cloud_files_helper_path().ok_or(WindowsCloudFilesHelperError::Missing)?;
-    let existing = read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)?;
+    let root_id = windows_cloud_files_lifecycle_root_id(mount);
+    let existing = read_windows_cloud_files_lifecycle_metadata_for_mount(state_root, mount)?;
     if let Some(metadata) = existing
         && windows_process_is_running(metadata.pid, &metadata.helper)
     {
-        let registered =
-            windows_cloud_files_registration_marker_exists(state_root, &mount.mount_id.0);
+        let registered = windows_cloud_files_registration_marker_exists(state_root, mount);
         if !registered {
             register_windows_cloud_files_sync_root(state_root, mount, display_name)?;
         }
@@ -529,8 +812,8 @@ fn start_windows_cloud_files_lifecycle(
     let log_dir = windows_cloud_files_log_dir(state_root);
     std::fs::create_dir_all(&log_dir)
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
-    let stdout_log = windows_cloud_files_stdout_log_path(state_root, &mount.mount_id.0);
-    let stderr_log = windows_cloud_files_stderr_log_path(state_root, &mount.mount_id.0);
+    let stdout_log = windows_cloud_files_stdout_log_path(state_root, &root_id);
+    let stderr_log = windows_cloud_files_stderr_log_path(state_root, &root_id);
     let stdout = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -553,10 +836,10 @@ fn start_windows_cloud_files_lifecycle(
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
     let pid = child.id();
     let metadata = WindowsCloudFilesProcessMetadata {
-        mount_id: mount.mount_id.0.clone(),
+        root_id: root_id.clone(),
         pid,
         helper: helper.clone(),
-        sync_root: mount.root.clone(),
+        sync_root: windows_cloud_files_projection_root(mount),
         state_dir: state_root.to_path_buf(),
         stdout_log,
         stderr_log,
@@ -577,7 +860,7 @@ fn start_windows_cloud_files_lifecycle(
             WindowsCloudFilesProviderState::Running,
         )),
         Ok(Some(status)) => {
-            let _ = remove_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0);
+            let _ = remove_windows_cloud_files_lifecycle_metadata(state_root, &root_id);
             Err(WindowsCloudFilesHelperError::Failed(format!(
                 "locality-cloud-files exited immediately with {status}; see {}",
                 metadata.stderr_log.display()
@@ -592,14 +875,29 @@ fn stop_windows_cloud_files_lifecycle(
     state_root: &Path,
     mount: &MountConfig,
 ) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
+    let root_id = windows_cloud_files_lifecycle_root_id(mount);
     let helper = windows_cloud_files_helper_path().unwrap_or_else(|| {
-        read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)
+        read_windows_cloud_files_lifecycle_metadata(state_root, &root_id)
             .ok()
             .flatten()
+            .filter(|metadata| {
+                windows_cloud_files_lifecycle_metadata_matches_mount(&metadata.sync_root, mount)
+            })
+            .or_else(|| {
+                read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)
+                    .ok()
+                    .flatten()
+                    .filter(|metadata| {
+                        windows_cloud_files_lifecycle_metadata_matches_mount(
+                            &metadata.sync_root,
+                            mount,
+                        )
+                    })
+            })
             .map(|metadata| metadata.helper)
             .unwrap_or_else(|| PathBuf::from("locality-cloud-files"))
     });
-    let metadata = read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)?;
+    let metadata = read_windows_cloud_files_lifecycle_metadata_for_mount(state_root, mount)?;
     let mut stopped_pid = None;
     if let Some(metadata) = &metadata
         && windows_process_is_running(metadata.pid, &metadata.helper)
@@ -607,6 +905,7 @@ fn stop_windows_cloud_files_lifecycle(
         stop_windows_process(metadata.pid)?;
         stopped_pid = Some(metadata.pid);
     }
+    let _ = remove_windows_cloud_files_lifecycle_metadata(state_root, &root_id);
     let _ = remove_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0);
     Ok(windows_cloud_files_lifecycle_report(
         WindowsCloudFilesLifecycleAction::Stop,
@@ -614,7 +913,7 @@ fn stop_windows_cloud_files_lifecycle(
         state_root,
         helper,
         daemon_is_running(state_root),
-        windows_cloud_files_registration_status(state_root, &mount.mount_id.0),
+        windows_cloud_files_registration_status(state_root, mount),
         stopped_pid,
         false,
         WindowsCloudFilesProviderState::Stopped,
@@ -626,7 +925,7 @@ fn status_windows_cloud_files_lifecycle(
     state_root: &Path,
     mount: &MountConfig,
 ) -> Result<FileProviderHelperReport, WindowsCloudFilesHelperError> {
-    let metadata = read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)?;
+    let metadata = read_windows_cloud_files_lifecycle_metadata_for_mount(state_root, mount)?;
     let helper = windows_cloud_files_helper_path()
         .or_else(|| metadata.as_ref().map(|metadata| metadata.helper.clone()))
         .unwrap_or_else(|| PathBuf::from("locality-cloud-files"));
@@ -647,7 +946,7 @@ fn status_windows_cloud_files_lifecycle(
         state_root,
         helper,
         daemon_is_running(state_root),
-        windows_cloud_files_registration_status(state_root, &mount.mount_id.0),
+        windows_cloud_files_registration_status(state_root, mount),
         pid,
         stale_pid_file,
         state,
@@ -668,11 +967,15 @@ fn windows_cloud_files_lifecycle_report(
 ) -> FileProviderHelperReport {
     let helper_present = helper.exists();
     let message = windows_cloud_files_lifecycle_message(action, &mount.mount_id.0, state, pid);
+    let root_id = windows_cloud_files_lifecycle_root_id(mount);
     let report = WindowsCloudFilesLifecycleReport {
         message,
         state,
         mount_id: mount.mount_id.0.clone(),
-        sync_root: mount.root.display().to_string(),
+        root_id: root_id.clone(),
+        sync_root: windows_cloud_files_projection_root(mount)
+            .display()
+            .to_string(),
         state_dir: state_root.display().to_string(),
         helper: helper.display().to_string(),
         helper_present,
@@ -680,13 +983,13 @@ fn windows_cloud_files_lifecycle_report(
         registered,
         pid,
         stale_pid_file,
-        pid_file: windows_cloud_files_lifecycle_file(state_root, &mount.mount_id.0)
+        pid_file: windows_cloud_files_lifecycle_file(state_root, &root_id)
             .display()
             .to_string(),
-        stdout_log: windows_cloud_files_stdout_log_path(state_root, &mount.mount_id.0)
+        stdout_log: windows_cloud_files_stdout_log_path(state_root, &root_id)
             .display()
             .to_string(),
-        stderr_log: windows_cloud_files_stderr_log_path(state_root, &mount.mount_id.0)
+        stderr_log: windows_cloud_files_stderr_log_path(state_root, &root_id)
             .display()
             .to_string(),
     };
@@ -748,7 +1051,7 @@ fn windows_cloud_files_lifecycle_message(
 }
 
 #[cfg(target_os = "windows")]
-fn windows_cloud_files_registration_status(state_root: &Path, mount_id: &str) -> Option<bool> {
+fn windows_cloud_files_registration_status(state_root: &Path, mount: &MountConfig) -> Option<bool> {
     let report = run_windows_cloud_files_helper(
         "list",
         vec!["--state-dir".to_string(), helper_path_arg(state_root)],
@@ -758,18 +1061,91 @@ fn windows_cloud_files_registration_status(state_root: &Path, mount_id: &str) ->
         .helper_report
         .get("roots")
         .and_then(Value::as_array)?;
-    Some(roots.iter().any(|root| {
-        root.get("mount_id")
+    Some(windows_cloud_files_roots_contain_registration(roots, mount))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_roots_contain_registration(roots: &[Value], mount: &MountConfig) -> bool {
+    let expected_sync_root_id = windows_cloud_files_shared_sync_root_id(mount);
+    let expected_sync_root_key =
+        windows_cloud_files_path_key(&windows_cloud_files_projection_root(mount));
+    roots.iter().any(|root| {
+        let sync_root_id_matches = root
+            .get("sync_root_id")
+            .or_else(|| root.get("id"))
             .and_then(Value::as_str)
-            .is_some_and(|registered_mount_id| registered_mount_id == mount_id)
-    }))
+            .is_some_and(|sync_root_id| sync_root_id == expected_sync_root_id);
+        let legacy_mount_matches = root
+            .get("mount_id")
+            .and_then(Value::as_str)
+            .is_some_and(|registered_mount_id| registered_mount_id == mount.mount_id.0);
+        let legacy_shared_path_matches = root
+            .get("sync_root_id")
+            .or_else(|| root.get("id"))
+            .and_then(Value::as_str)
+            .is_some_and(|sync_root_id| sync_root_id == "codeflash.ai.loc!default!locality")
+            && root
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| {
+                    windows_cloud_files_path_key(Path::new(path)) == expected_sync_root_key
+                });
+
+        sync_root_id_matches || legacy_mount_matches || legacy_shared_path_matches
+    })
 }
 
 #[cfg(target_os = "windows")]
-fn windows_cloud_files_registration_marker_exists(state_root: &Path, mount_id: &str) -> bool {
-    locality_platform::windows_cloud_files_registration_marker_dir(state_root, mount_id)
-        .join("registration.json")
-        .exists()
+fn windows_cloud_files_registration_marker_exists(state_root: &Path, mount: &MountConfig) -> bool {
+    let expected_sync_root_id = windows_cloud_files_shared_sync_root_id(mount);
+    let expected_sync_root_key =
+        windows_cloud_files_path_key(&windows_cloud_files_projection_root(mount));
+    windows_cloud_files_marker_matches(
+        state_root,
+        &expected_sync_root_id,
+        &expected_sync_root_id,
+        &expected_sync_root_key,
+    ) || windows_cloud_files_marker_matches(
+        state_root,
+        &mount.mount_id.0,
+        &expected_sync_root_id,
+        &expected_sync_root_key,
+    ) || windows_cloud_files_marker_matches(
+        state_root,
+        WINDOWS_CLOUD_FILES_SHARED_SYNC_ROOT_COMPONENT,
+        &expected_sync_root_id,
+        &expected_sync_root_key,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_marker_matches(
+    state_root: &Path,
+    marker_key: &str,
+    expected_sync_root_id: &str,
+    expected_sync_root_key: &str,
+) -> bool {
+    let marker_path =
+        locality_platform::windows_cloud_files_registration_marker_dir(state_root, marker_key)
+            .join("registration.json");
+    let Ok(json) = std::fs::read_to_string(marker_path) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_str::<Value>(&json) else {
+        return false;
+    };
+    marker
+        .get("sync_root_id")
+        .or_else(|| marker.get("id"))
+        .and_then(Value::as_str)
+        .is_some_and(|sync_root_id| sync_root_id == expected_sync_root_id)
+        || marker
+            .get("path")
+            .or_else(|| marker.get("sync_root"))
+            .and_then(Value::as_str)
+            .is_some_and(|path| {
+                windows_cloud_files_path_key(Path::new(path)) == expected_sync_root_key
+            })
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -826,6 +1202,31 @@ fn windows_cloud_files_lifecycle_fragment(value: &str) -> String {
     format!("{sanitized}-{:016x}", stable_lifecycle_hash(value))
 }
 
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_lifecycle_root_id(mount: &MountConfig) -> String {
+    let root = windows_cloud_files_projection_root(mount);
+    let root = root.display().to_string();
+    format!("root-{}", windows_cloud_files_lifecycle_fragment(&root))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_lifecycle_metadata_matches_mount(
+    metadata_sync_root: &Path,
+    mount: &MountConfig,
+) -> bool {
+    windows_cloud_files_path_key(metadata_sync_root)
+        == windows_cloud_files_path_key(&windows_cloud_files_projection_root(mount))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_path_key(path: &Path) -> String {
+    let mut value = path.display().to_string().replace('/', "\\");
+    while value.ends_with('\\') && value.len() > 3 {
+        value.pop();
+    }
+    value.to_ascii_lowercase()
+}
+
 #[cfg(any(test, target_os = "windows"))]
 fn stable_lifecycle_hash(value: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
@@ -834,6 +1235,29 @@ fn stable_lifecycle_hash(value: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_cloud_files_lifecycle_metadata_for_mount(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<Option<WindowsCloudFilesProcessMetadata>, WindowsCloudFilesHelperError> {
+    let root_id = windows_cloud_files_lifecycle_root_id(mount);
+    let shared =
+        read_windows_cloud_files_lifecycle_metadata(state_root, &root_id)?.filter(|metadata| {
+            windows_cloud_files_lifecycle_metadata_matches_mount(&metadata.sync_root, mount)
+        });
+    if shared.is_some() {
+        return Ok(shared);
+    }
+
+    Ok(
+        read_windows_cloud_files_lifecycle_metadata(state_root, &mount.mount_id.0)?.filter(
+            |metadata| {
+                windows_cloud_files_lifecycle_metadata_matches_mount(&metadata.sync_root, mount)
+            },
+        ),
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -862,7 +1286,7 @@ fn write_windows_cloud_files_lifecycle_metadata(
     let json = serde_json::to_string_pretty(metadata)
         .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))?;
     std::fs::write(
-        windows_cloud_files_lifecycle_file(state_root, &metadata.mount_id),
+        windows_cloud_files_lifecycle_file(state_root, &metadata.root_id),
         json,
     )
     .map_err(|error| WindowsCloudFilesHelperError::Failed(error.to_string()))
@@ -965,15 +1389,13 @@ fn configure_hidden_windows_command(command: &mut Command) {
 fn windows_cloud_files_register_args(
     state_root: &Path,
     mount: &MountConfig,
-    display_name: &str,
+    _display_name: &str,
 ) -> Vec<String> {
     vec![
-        "--mount-id".to_string(),
-        mount.mount_id.0.clone(),
         "--display-name".to_string(),
-        display_name.to_string(),
+        "Locality".to_string(),
         "--sync-root".to_string(),
-        helper_path_arg(&mount.root),
+        helper_path_arg(&windows_cloud_files_projection_root(mount)),
         "--state-dir".to_string(),
         helper_path_arg(state_root),
     ]
@@ -982,19 +1404,15 @@ fn windows_cloud_files_register_args(
 #[cfg(any(test, target_os = "windows"))]
 fn windows_cloud_files_open_args(mount: &MountConfig) -> Vec<String> {
     vec![
-        "--mount-id".to_string(),
-        mount.mount_id.0.clone(),
         "--sync-root".to_string(),
-        helper_path_arg(&mount.root),
+        helper_path_arg(&windows_cloud_files_projection_root(mount)),
     ]
 }
 
 fn windows_cloud_files_run_args(state_root: &Path, mount: &MountConfig) -> Vec<String> {
     vec![
-        "--mount-id".to_string(),
-        mount.mount_id.0.clone(),
         "--sync-root".to_string(),
-        helper_path_arg(&mount.root),
+        helper_path_arg(&windows_cloud_files_projection_root(mount)),
         "--state-dir".to_string(),
         helper_path_arg(state_root),
     ]
@@ -1014,6 +1432,40 @@ fn windows_cloud_files_unregister_args(state_root: &Path, mount_id: &str) -> Vec
         "--state-dir".to_string(),
         helper_path_arg(state_root),
     ]
+}
+
+fn windows_cloud_files_projection_root(mount: &MountConfig) -> PathBuf {
+    let root = localityd::virtual_fs::virtual_projection_root(mount);
+    if !root.as_os_str().is_empty() {
+        return root;
+    }
+
+    windows_style_parent(&mount.root).unwrap_or(root)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_shared_sync_root_id(mount: &MountConfig) -> String {
+    windows_cloud_files_shared_sync_root_id_for_projection_root(
+        &windows_cloud_files_projection_root(mount),
+    )
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_cloud_files_shared_sync_root_id_for_projection_root(sync_root: &Path) -> String {
+    format!(
+        "{WINDOWS_CLOUD_FILES_SYNC_ROOT_ID_PREFIX}{WINDOWS_CLOUD_FILES_SHARED_SYNC_ROOT_COMPONENT}-{:016x}",
+        stable_lifecycle_hash(&windows_cloud_files_path_key(sync_root))
+    )
+}
+
+fn windows_style_parent(path: &Path) -> Option<PathBuf> {
+    let value = path.to_str()?;
+    let (parent, _) = value.rsplit_once(['\\', '/'])?;
+    if parent.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(parent))
+    }
 }
 
 fn helper_path_arg(path: &Path) -> String {
@@ -1252,13 +1704,11 @@ fn write_linux_fuse_unit(
         .map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))?;
     std::fs::create_dir_all(&log_dir)
         .map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))?;
-    std::fs::create_dir_all(&mount.root)
+    let projection_root = localityd::virtual_fs::virtual_projection_root(mount);
+    std::fs::create_dir_all(&projection_root)
         .map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))?;
 
-    let log_path = log_dir.join(format!(
-        "locality-fuse.{}.log",
-        sanitize_systemd_fragment(&mount.mount_id.0)
-    ));
+    let log_path = log_dir.join(format!("locality-fuse.{}.log", linux_fuse_root_id(mount)));
     let unit = linux_fuse_unit_contents(locality_fuse, state_root, mount, &log_path);
     std::fs::write(unit_path, unit)
         .map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))
@@ -1271,13 +1721,12 @@ pub(crate) fn linux_fuse_unit_contents(
     mount: &MountConfig,
     log_path: &Path,
 ) -> String {
+    let projection_root = localityd::virtual_fs::virtual_projection_root(mount);
     format!(
-        "[Unit]\nDescription=Locality FUSE mount for {mount_id}\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={locality_fuse} --mount-id {mount_id_arg} --state-dir {state_root} --mountpoint {mountpoint}\nExecStop=/usr/bin/fusermount3 -uz {mountpoint}\nKillSignal=SIGINT\nTimeoutStopSec=10\nLimitCORE=0\nRestart=on-failure\nRestartSec=2\nStandardOutput=append:{log_path}\nStandardError=append:{log_path}\n\n[Install]\nWantedBy=default.target\n",
-        mount_id = mount.mount_id.0,
+        "[Unit]\nDescription=Locality FUSE root for {mountpoint}\nAfter=default.target\n\n[Service]\nType=simple\nExecStart={locality_fuse} --state-dir {state_root} --mountpoint {mountpoint}\nExecStop=/usr/bin/fusermount3 -uz {mountpoint}\nKillSignal=SIGINT\nTimeoutStopSec=10\nLimitCORE=0\nRestart=on-failure\nRestartSec=2\nStandardOutput=append:{log_path}\nStandardError=append:{log_path}\n\n[Install]\nWantedBy=default.target\n",
         locality_fuse = systemd_quote(&locality_fuse.display().to_string()),
-        mount_id_arg = systemd_quote(&mount.mount_id.0),
         state_root = systemd_quote(&state_root.display().to_string()),
-        mountpoint = systemd_quote(&mount.root.display().to_string()),
+        mountpoint = systemd_quote(&projection_root.display().to_string()),
         log_path = log_path.display(),
     )
 }
@@ -1304,8 +1753,523 @@ pub(crate) fn run_systemctl_user(args: &[&str]) -> Result<(), LinuxFuseRegistrat
     ))
 }
 
+#[cfg(target_os = "linux")]
+fn read_linux_fuse_unit_files() -> Result<Vec<LinuxFuseUnitFile>, LinuxFuseRegistrationError> {
+    let unit_dir = home_dir_path()?.join(".config/systemd/user");
+    let entries = match std::fs::read_dir(&unit_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(LinuxFuseRegistrationError::Io(error.to_string())),
+    };
+
+    let mut units = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| LinuxFuseRegistrationError::Io(error.to_string()))?;
+        let unit_path = entry.path();
+        let Some(unit_name) = unit_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_locality_fuse_unit_name(unit_name) {
+            continue;
+        }
+        let contents = match std::fs::read_to_string(&unit_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(LinuxFuseRegistrationError::Io(error.to_string())),
+        };
+        units.push(LinuxFuseUnitFile {
+            unit_name: unit_name.to_string(),
+            unit_path,
+            contents,
+        });
+    }
+    Ok(units)
+}
+
+#[cfg(target_os = "linux")]
+fn stale_linux_fuse_units_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<StaleLinuxFuseUnit> {
+    let desired_units = desired_linux_fuse_unit_names(mounts);
+    unit_files
+        .into_iter()
+        .filter_map(|unit| {
+            let exec_start = parse_linux_fuse_exec_start(&unit.contents)?;
+            let state_dir = exec_start.state_dir.as_deref()?;
+            if !same_path_for_linux_fuse_state(state_dir, state_root) {
+                return None;
+            }
+            if !exec_start.has_mount_id && desired_units.contains(&unit.unit_name) {
+                return None;
+            }
+            Some(StaleLinuxFuseUnit {
+                unit_name: unit.unit_name,
+                unit_path: unit.unit_path,
+                mountpoint: exec_start.mountpoint,
+                legacy: exec_start.has_mount_id,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn stale_and_deprecated_linux_fuse_units_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<StaleLinuxFuseUnit> {
+    combine_stale_linux_fuse_units(
+        stale_linux_fuse_units_for_state(state_root, mounts, unit_files.clone()),
+        deprecated_linux_fuse_units(unit_files),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_linux_fuse_units_for_state(
+    state_root: &Path,
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<StaleLinuxFuseUnit> {
+    unit_files
+        .into_iter()
+        .filter_map(|unit| {
+            let exec_start = parse_linux_fuse_exec_start(&unit.contents)?;
+            let state_dir = exec_start.state_dir.as_deref()?;
+            if !exec_start.has_mount_id || !same_path_for_linux_fuse_state(state_dir, state_root) {
+                return None;
+            }
+            Some(StaleLinuxFuseUnit {
+                unit_name: unit.unit_name,
+                unit_path: unit.unit_path,
+                mountpoint: exec_start.mountpoint,
+                legacy: true,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn deprecated_linux_fuse_units(unit_files: Vec<LinuxFuseUnitFile>) -> Vec<StaleLinuxFuseUnit> {
+    unit_files
+        .into_iter()
+        .filter_map(|unit| {
+            let exec_start = parse_linux_fuse_exec_start(&unit.contents)?;
+            let uses_deprecated_unit_name = is_deprecated_linux_fuse_unit_name(&unit.unit_name);
+            let uses_deprecated_state_root = exec_start
+                .state_dir
+                .as_deref()
+                .is_some_and(is_deprecated_linux_fuse_state_root);
+            if !uses_deprecated_unit_name && !uses_deprecated_state_root {
+                return None;
+            }
+            Some(StaleLinuxFuseUnit {
+                unit_name: unit.unit_name,
+                unit_path: unit.unit_path,
+                mountpoint: exec_start.mountpoint,
+                legacy: true,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn combine_stale_linux_fuse_units(
+    left: Vec<StaleLinuxFuseUnit>,
+    right: Vec<StaleLinuxFuseUnit>,
+) -> Vec<StaleLinuxFuseUnit> {
+    let mut combined = BTreeMap::<String, StaleLinuxFuseUnit>::new();
+    for unit in left.into_iter().chain(right) {
+        match combined.entry(unit.unit_name.clone()) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                existing.legacy |= unit.legacy;
+                if existing.mountpoint.is_none() {
+                    existing.mountpoint = unit.mountpoint;
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(unit);
+            }
+        }
+    }
+    combined.into_values().collect()
+}
+
+#[cfg(target_os = "linux")]
+fn restartable_linux_fuse_units_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<LinuxFuseManagedUnit> {
+    let desired_units = desired_linux_fuse_unit_names(mounts);
+    unit_files
+        .into_iter()
+        .filter_map(|unit| {
+            let exec_start = parse_linux_fuse_exec_start(&unit.contents)?;
+            let state_dir = exec_start.state_dir.as_deref()?;
+            if exec_start.has_mount_id
+                || !same_path_for_linux_fuse_state(state_dir, state_root)
+                || !desired_units.contains(&unit.unit_name)
+            {
+                return None;
+            }
+            Some(LinuxFuseManagedUnit {
+                unit_name: unit.unit_name,
+                mountpoint: exec_start.mountpoint,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn stoppable_linux_fuse_units_for_state(
+    state_root: &Path,
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<LinuxFuseManagedUnit> {
+    unit_files
+        .into_iter()
+        .filter_map(|unit| {
+            let exec_start = parse_linux_fuse_exec_start(&unit.contents)?;
+            let state_dir = exec_start.state_dir.as_deref()?;
+            if !same_path_for_linux_fuse_state(state_dir, state_root) {
+                return None;
+            }
+            Some(LinuxFuseManagedUnit {
+                unit_name: unit.unit_name,
+                mountpoint: exec_start.mountpoint,
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_root_reports_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Vec<LinuxFuseRootReport> {
+    let mut registered = BTreeMap::new();
+    for unit in unit_files {
+        let Some(exec_start) = parse_linux_fuse_exec_start(&unit.contents) else {
+            continue;
+        };
+        let Some(unit_state_root) = exec_start.state_dir.as_deref() else {
+            continue;
+        };
+        if exec_start.has_mount_id || !same_path_for_linux_fuse_state(unit_state_root, state_root) {
+            continue;
+        }
+        registered.insert(
+            unit.unit_name,
+            (unit.unit_path.display().to_string(), exec_start.mountpoint),
+        );
+    }
+
+    let mut roots = BTreeMap::<PathBuf, Vec<String>>::new();
+    for mount in mounts
+        .iter()
+        .filter(|mount| mount.projection == ProjectionMode::LinuxFuse)
+    {
+        roots
+            .entry(localityd::virtual_fs::virtual_projection_root(mount))
+            .or_default()
+            .push(mount.mount_id.0.clone());
+    }
+
+    roots
+        .into_iter()
+        .map(|(mountpoint, mut mount_ids)| {
+            mount_ids.sort();
+            let root_id = linux_fuse_root_id_for_projection_root(&mountpoint);
+            let service = linux_fuse_unit_name(&root_id);
+            let registered_unit = registered.get(&service).filter(|(_, unit_mountpoint)| {
+                unit_mountpoint.as_deref().is_some_and(|unit_mountpoint| {
+                    same_path_for_linux_fuse_state(unit_mountpoint, &mountpoint)
+                })
+            });
+            LinuxFuseRootReport {
+                root_id,
+                service,
+                mountpoint: mountpoint.display().to_string(),
+                state_dir: state_root.display().to_string(),
+                mount_ids,
+                registered: registered_unit.is_some(),
+                active: None,
+                unit_path: registered_unit.map(|(unit_path, _)| unit_path.clone()),
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_list_payload_for_state(
+    state_root: &Path,
+    mounts: &[MountConfig],
+    unit_files: Vec<LinuxFuseUnitFile>,
+) -> Result<Value, LinuxFuseRegistrationError> {
+    let stale_units = linux_fuse_stale_unit_reports(
+        stale_and_deprecated_linux_fuse_units_for_state(state_root, mounts, unit_files.clone()),
+    );
+    let mut roots = linux_fuse_root_reports_for_state(state_root, mounts, unit_files);
+    for root in &mut roots {
+        root.active = if root.registered {
+            Some(linux_fuse_unit_is_active(&root.service)?)
+        } else {
+            Some(false)
+        };
+    }
+    Ok(serde_json::json!({
+        "message": "Linux FUSE roots listed",
+        "roots": roots,
+        "stale_units": stale_units,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_stale_unit_reports(units: Vec<StaleLinuxFuseUnit>) -> Vec<LinuxFuseStaleUnitReport> {
+    units
+        .into_iter()
+        .map(|unit| LinuxFuseStaleUnitReport {
+            service: unit.unit_name,
+            unit_path: unit.unit_path.display().to_string(),
+            mountpoint: unit
+                .mountpoint
+                .map(|mountpoint| mountpoint.display().to_string()),
+            legacy: unit.legacy,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_unit_is_active(service: &str) -> Result<bool, LinuxFuseRegistrationError> {
+    let output = Command::new("systemctl")
+        .arg("--user")
+        .args(["is-active", "--quiet", service])
+        .output()
+        .map_err(|error| LinuxFuseRegistrationError::SystemctlFailed(error.to_string()))?;
+    Ok(output.status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_stale_linux_fuse_units(
+    stale: Vec<StaleLinuxFuseUnit>,
+) -> Result<Vec<StaleLinuxFuseUnit>, LinuxFuseRegistrationError> {
+    if stale.is_empty() {
+        return Ok(stale);
+    }
+
+    let mut first_error = None;
+    for unit in &stale {
+        if let Err(error) = run_systemctl_user(&["disable", "--now", unit.unit_name.as_str()])
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Some(mountpoint) = &unit.mountpoint {
+            let _ = Command::new("fusermount3")
+                .arg("-uz")
+                .arg(mountpoint)
+                .output();
+        }
+        match std::fs::remove_file(&unit.unit_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if first_error.is_none() => {
+                first_error = Some(LinuxFuseRegistrationError::Io(error.to_string()));
+            }
+            Err(_) => {}
+        }
+        let _ = run_systemctl_user(&["reset-failed", unit.unit_name.as_str()]);
+    }
+
+    if let Err(error) = run_systemctl_user(&["daemon-reload"])
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(stale)
+}
+
+#[cfg(target_os = "linux")]
+fn restart_linux_fuse_units(
+    units: Vec<LinuxFuseManagedUnit>,
+) -> Result<Vec<LinuxFuseManagedUnit>, LinuxFuseRegistrationError> {
+    for unit in &units {
+        run_systemctl_user(&["restart", unit.unit_name.as_str()])?;
+    }
+    Ok(units)
+}
+
+#[cfg(target_os = "linux")]
+fn stop_linux_fuse_units(
+    units: Vec<LinuxFuseManagedUnit>,
+) -> Result<Vec<LinuxFuseManagedUnit>, LinuxFuseRegistrationError> {
+    let mut first_error = None;
+    for unit in &units {
+        if let Err(error) = run_systemctl_user(&["stop", unit.unit_name.as_str()])
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Some(mountpoint) = &unit.mountpoint {
+            let _ = Command::new("fusermount3")
+                .arg("-uz")
+                .arg(mountpoint)
+                .output();
+        }
+        let _ = run_systemctl_user(&["reset-failed", unit.unit_name.as_str()]);
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(units)
+}
+
+#[cfg(target_os = "linux")]
+fn desired_linux_fuse_unit_names(mounts: &[MountConfig]) -> BTreeSet<String> {
+    mounts
+        .iter()
+        .filter(|mount| mount.projection == ProjectionMode::LinuxFuse)
+        .map(|mount| linux_fuse_unit_name(&linux_fuse_root_id(mount)))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_fuse_exec_start(contents: &str) -> Option<LinuxFuseExecStart> {
+    let line = contents
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("ExecStart="))?;
+    let args = split_systemd_exec_args(line);
+    let helper = args.first()?;
+    if !Path::new(helper)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_linux_fuse_helper_name)
+    {
+        return None;
+    }
+
+    Some(LinuxFuseExecStart {
+        state_dir: command_flag_value(&args, "--state-dir").map(PathBuf::from),
+        mountpoint: command_flag_value(&args, "--mountpoint").map(PathBuf::from),
+        has_mount_id: command_has_flag(&args, "--mount-id"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn split_systemd_exec_args(value: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut token_started = false;
+
+    for character in value.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            token_started = true;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            token_started = true;
+            continue;
+        }
+        if character == '"' {
+            in_quotes = !in_quotes;
+            token_started = true;
+            continue;
+        }
+        if character.is_whitespace() && !in_quotes {
+            if token_started {
+                args.push(std::mem::take(&mut current));
+                token_started = false;
+            }
+            continue;
+        }
+        current.push(character);
+        token_started = true;
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    if token_started {
+        args.push(current);
+    }
+    args
+}
+
+#[cfg(target_os = "linux")]
+fn command_flag_value(args: &[String], flag: &str) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == flag {
+            return args.get(index + 1).cloned();
+        }
+        if let Some(value) = arg
+            .strip_prefix(flag)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn command_has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| {
+        arg == flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn is_linux_fuse_helper_name(name: &str) -> bool {
+    matches!(name, "locality-fuse" | "afs-fuse" | "agentfs-fuse")
+}
+
+#[cfg(target_os = "linux")]
+fn is_deprecated_linux_fuse_state_root(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some(".afs")
+}
+
+#[cfg(target_os = "linux")]
+fn is_deprecated_linux_fuse_unit_name(unit_name: &str) -> bool {
+    (unit_name.starts_with(LEGACY_AFS_FUSE_UNIT_PREFIX)
+        || unit_name.starts_with(LEGACY_AGENTFS_FUSE_UNIT_PREFIX))
+        && unit_name.ends_with(LINUX_FUSE_UNIT_SUFFIX)
+}
+
+#[cfg(target_os = "linux")]
+fn same_path_for_linux_fuse_state(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_locality_fuse_unit_name(unit_name: &str) -> bool {
+    (unit_name.starts_with(LINUX_FUSE_UNIT_PREFIX) || is_deprecated_linux_fuse_unit_name(unit_name))
+        && unit_name.ends_with(LINUX_FUSE_UNIT_SUFFIX)
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn daemon_is_running(state_root: &Path) -> bool {
+pub(crate) fn daemon_is_running(state_root: &Path) -> bool {
     matches!(
         send_request_with_timeout(
             state_root,
@@ -1319,9 +2283,22 @@ fn daemon_is_running(state_root: &Path) -> bool {
 #[cfg(target_os = "linux")]
 pub(crate) fn linux_fuse_unit_name(mount_id: &str) -> String {
     format!(
-        "ai.codeflash.locality.fuse.{}.service",
+        "{LINUX_FUSE_UNIT_PREFIX}{}{LINUX_FUSE_UNIT_SUFFIX}",
         sanitize_systemd_fragment(mount_id)
     )
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_fuse_root_id(mount: &MountConfig) -> String {
+    let root = localityd::virtual_fs::virtual_projection_root(mount);
+    linux_fuse_root_id_for_projection_root(&root)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fuse_root_id_for_projection_root(root: &Path) -> String {
+    let root = root.display().to_string();
+    let hint = bounded_systemd_hint(&root, LINUX_FUSE_ROOT_HINT_MAX_BYTES);
+    format!("root-{hint}-{}", stable_hex_hash(&root))
 }
 
 #[cfg(target_os = "linux")]
@@ -1345,7 +2322,41 @@ fn sanitize_systemd_fragment(value: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
+fn bounded_systemd_hint(value: &str, max_bytes: usize) -> String {
+    let sanitized = sanitize_systemd_fragment(value);
+    let mut hint = String::with_capacity(max_bytes.min(sanitized.len()));
+    for character in sanitized.chars() {
+        if hint.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        hint.push(character);
+    }
+    let hint = hint.trim_matches('_');
+    if hint.is_empty() {
+        "root".to_string()
+    } else {
+        hint.to_string()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stable_hex_hash(value: &str) -> String {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(target_os = "linux")]
 fn systemd_quote(value: &str) -> String {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '-' | '_' | ':')
+    }) {
+        return value.to_string();
+    }
+
     let escaped = value
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -1420,33 +2431,502 @@ mod linux_tests {
     use locality_store::{MountConfig, ProjectionMode};
 
     #[test]
-    fn linux_fuse_systemd_unit_uses_mount_specific_helper_args() {
+    fn linux_fuse_systemd_unit_uses_shared_root_helper_args() {
         let mount = MountConfig::new(
             MountId::new("notion/main"),
             "notion",
             "/home/example/loc notion",
         )
         .projection(ProjectionMode::LinuxFuse);
-        let unit_name = super::linux_fuse_unit_name(&mount.mount_id.0);
+        let root_id = super::linux_fuse_root_id(&mount);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+        let log_path = format!("/home/example/.loc/logs/locality-fuse.{root_id}.log");
         let unit = super::linux_fuse_unit_contents(
             std::path::Path::new("/opt/agent fs/locality-fuse"),
             std::path::Path::new("/home/example/.loc"),
             &mount,
-            std::path::Path::new("/home/example/.loc/logs/locality-fuse.notion_main.log"),
+            std::path::Path::new(&log_path),
         );
 
-        assert_eq!(unit_name, "ai.codeflash.locality.fuse.notion_main.service");
+        assert!(root_id.starts_with("root-home_example-"));
+        assert!(root_id.len() <= 80);
+        assert_eq!(
+            unit_name,
+            format!("ai.codeflash.locality.fuse.{root_id}.service")
+        );
         assert!(unit.contains("ExecStart=\"/opt/agent fs/locality-fuse\""));
-        assert!(unit.contains("--mount-id \"notion/main\""));
-        assert!(unit.contains("--state-dir \"/home/example/.loc\""));
-        assert!(unit.contains("--mountpoint \"/home/example/loc notion\""));
-        assert!(unit.contains("ExecStop=/usr/bin/fusermount3 -uz \"/home/example/loc notion\""));
+        assert!(!unit.contains("--mount-id"));
+        assert!(unit.contains("--state-dir /home/example/.loc"));
+        assert!(unit.contains("--mountpoint /home/example"));
+        assert!(unit.contains("ExecStop=/usr/bin/fusermount3 -uz /home/example"));
         assert!(unit.contains("TimeoutStopSec=10"));
         assert!(unit.contains("LimitCORE=0"));
         assert!(unit.contains("Restart=on-failure"));
-        assert!(unit.contains(
-            "StandardOutput=append:/home/example/.loc/logs/locality-fuse.notion_main.log"
+        assert!(unit.contains(&format!("StandardOutput=append:{log_path}")));
+    }
+
+    #[test]
+    fn linux_fuse_root_id_distinguishes_sanitized_collisions() {
+        let colon_root = MountConfig::new(MountId::new("colon"), "notion", "/tmp/a:b/notion")
+            .projection(ProjectionMode::LinuxFuse);
+        let question_root = MountConfig::new(MountId::new("question"), "notion", "/tmp/a?b/notion")
+            .projection(ProjectionMode::LinuxFuse);
+
+        let colon_id = super::linux_fuse_root_id(&colon_root);
+        let question_id = super::linux_fuse_root_id(&question_root);
+
+        assert_ne!(colon_id, question_id);
+        assert_ne!(
+            super::linux_fuse_unit_name(&colon_id),
+            super::linux_fuse_unit_name(&question_id)
+        );
+    }
+
+    #[test]
+    fn linux_fuse_root_id_is_bounded_for_long_roots() {
+        let long_component = "x".repeat(300);
+        let root = format!("/tmp/{long_component}/notion");
+        let mount = MountConfig::new(MountId::new("long"), "notion", root)
+            .projection(ProjectionMode::LinuxFuse);
+
+        let root_id = super::linux_fuse_root_id(&mount);
+
+        assert!(
+            root_id.len() <= 80,
+            "root id should be bounded, got {} bytes: {root_id}",
+            root_id.len()
+        );
+    }
+
+    #[test]
+    fn stale_linux_fuse_units_include_legacy_mount_id_units_for_current_state() {
+        let stale = super::stale_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[],
+            vec![linux_fuse_unit_file(
+                "ai.codeflash.locality.fuse.notion-main.service",
+                "[Service]\nExecStart=/opt/locality-fuse --mount-id notion-main --state-dir /home/example/.loc --mountpoint /home/example/Locality/notion-main\n",
+            )],
+        );
+
+        assert_eq!(
+            stale,
+            vec![super::StaleLinuxFuseUnit {
+                unit_name: "ai.codeflash.locality.fuse.notion-main.service".to_string(),
+                unit_path: std::path::PathBuf::from(
+                    "/tmp/systemd/ai.codeflash.locality.fuse.notion-main.service"
+                ),
+                mountpoint: Some(std::path::PathBuf::from(
+                    "/home/example/Locality/notion-main"
+                )),
+                legacy: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn stale_linux_fuse_units_ignore_other_state_roots() {
+        let stale = super::stale_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[],
+            vec![linux_fuse_unit_file(
+                "ai.codeflash.locality.fuse.notion-main.service",
+                "[Service]\nExecStart=/opt/locality-fuse --mount-id notion-main --state-dir /tmp/other/.loc --mountpoint /home/example/Locality/notion-main\n",
+            )],
+        );
+
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn stale_linux_fuse_units_keep_desired_shared_root_units() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let root_id = super::linux_fuse_root_id(&mount);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/locality-fuse"),
+            std::path::Path::new("/home/example/.loc"),
+            &mount,
+            std::path::Path::new("/home/example/.loc/logs/locality-fuse.log"),
+        );
+
+        let stale = super::stale_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[mount],
+            vec![super::LinuxFuseUnitFile {
+                unit_name,
+                unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                contents: unit,
+            }],
+        );
+
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn stale_linux_fuse_units_include_current_state_shared_units_not_in_mount_state() {
+        let old_mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let root_id = super::linux_fuse_root_id(&old_mount);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/locality-fuse"),
+            std::path::Path::new("/home/example/.loc"),
+            &old_mount,
+            std::path::Path::new("/home/example/.loc/logs/locality-fuse.log"),
+        );
+
+        let stale = super::stale_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[],
+            vec![super::LinuxFuseUnitFile {
+                unit_name: unit_name.clone(),
+                unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                contents: unit,
+            }],
+        );
+
+        assert_eq!(
+            stale,
+            vec![super::StaleLinuxFuseUnit {
+                unit_name,
+                unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                mountpoint: Some(std::path::PathBuf::from("/home/example/Locality")),
+                legacy: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn restartable_linux_fuse_units_include_desired_shared_root_units_for_current_state() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let root_id = super::linux_fuse_root_id(&mount);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/locality-fuse"),
+            std::path::Path::new("/home/example/.loc"),
+            &mount,
+            std::path::Path::new("/home/example/.loc/logs/locality-fuse.log"),
+        );
+
+        let restartable = super::restartable_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[mount],
+            vec![super::LinuxFuseUnitFile {
+                unit_name: unit_name.clone(),
+                unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                contents: unit,
+            }],
+        );
+
+        assert_eq!(
+            restartable,
+            vec![super::LinuxFuseManagedUnit {
+                unit_name,
+                mountpoint: Some(std::path::PathBuf::from("/home/example/Locality")),
+            }]
+        );
+    }
+
+    #[test]
+    fn stoppable_linux_fuse_units_include_all_current_state_units() {
+        let shared_mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let shared_root_id = super::linux_fuse_root_id(&shared_mount);
+        let shared_unit_name = super::linux_fuse_unit_name(&shared_root_id);
+        let shared_unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/locality-fuse"),
+            std::path::Path::new("/home/example/.loc"),
+            &shared_mount,
+            std::path::Path::new("/home/example/.loc/logs/locality-fuse.log"),
+        );
+
+        let stoppable = super::stoppable_linux_fuse_units_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            vec![
+                super::LinuxFuseUnitFile {
+                    unit_name: shared_unit_name.clone(),
+                    unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                    contents: shared_unit,
+                },
+                linux_fuse_unit_file(
+                    "ai.codeflash.locality.fuse.legacy.service",
+                    "[Service]\nExecStart=/opt/locality-fuse --mount-id notion-main --state-dir /home/example/.loc --mountpoint /home/example/Locality/notion-main\n",
+                ),
+                linux_fuse_unit_file(
+                    "ai.codeflash.locality.fuse.other-state.service",
+                    "[Service]\nExecStart=/opt/locality-fuse --state-dir /tmp/other/.loc --mountpoint /home/example/Locality\n",
+                ),
+            ],
+        );
+
+        assert_eq!(
+            stoppable,
+            vec![
+                super::LinuxFuseManagedUnit {
+                    unit_name: shared_unit_name,
+                    mountpoint: Some(std::path::PathBuf::from("/home/example/Locality")),
+                },
+                super::LinuxFuseManagedUnit {
+                    unit_name: "ai.codeflash.locality.fuse.legacy.service".to_string(),
+                    mountpoint: Some(std::path::PathBuf::from(
+                        "/home/example/Locality/notion-main"
+                    )),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_fuse_root_reports_group_mount_points_by_shared_root() {
+        let notion = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let docs = MountConfig::new(
+            MountId::new("google-docs-main"),
+            "google-docs",
+            "/home/example/Locality/google-docs-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let other = MountConfig::new(
+            MountId::new("notion-other"),
+            "notion",
+            "/home/example/Other/notion-other",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let plain = MountConfig::new(
+            MountId::new("plain"),
+            "notion",
+            "/home/example/Locality/plain",
+        );
+        let root_id = super::linux_fuse_root_id(&notion);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/opt/locality-fuse"),
+            std::path::Path::new("/home/example/.loc"),
+            &notion,
+            std::path::Path::new("/home/example/.loc/logs/locality-fuse.log"),
+        );
+
+        let roots = super::linux_fuse_root_reports_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[notion, docs, other, plain],
+            vec![super::LinuxFuseUnitFile {
+                unit_name: unit_name.clone(),
+                unit_path: std::path::PathBuf::from("/tmp/systemd/shared.service"),
+                contents: unit,
+            }],
+        );
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].mountpoint, "/home/example/Locality");
+        assert_eq!(roots[0].mount_ids, vec!["google-docs-main", "notion-main"]);
+        assert_eq!(roots[0].service, unit_name);
+        assert!(roots[0].registered);
+        assert_eq!(roots[1].mountpoint, "/home/example/Other");
+        assert_eq!(roots[1].mount_ids, vec!["notion-other"]);
+        assert!(!roots[1].registered);
+    }
+
+    #[test]
+    fn linux_fuse_lifecycle_report_uses_shared_root_metadata() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let root_id = super::linux_fuse_root_id(&mount);
+        let service = super::linux_fuse_unit_name(&root_id);
+
+        let report = super::linux_fuse_lifecycle_report(
+            super::LinuxFuseLifecycleAction::Status,
+            std::path::Path::new("/home/example/.loc"),
+            &mount,
+            false,
+            false,
+        );
+
+        assert_eq!(report.action, "status");
+        assert_eq!(report.state, "stopped");
+        assert_eq!(report.mount_id, "notion-main");
+        assert_eq!(report.root_id, root_id);
+        assert_eq!(report.service, service);
+        assert_eq!(report.mountpoint, "/home/example/Locality");
+        assert_eq!(report.state_dir, "/home/example/.loc");
+        assert!(!report.registered);
+    }
+
+    #[test]
+    fn linux_fuse_root_reports_ignore_units_for_other_mountpoints() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let root_id = super::linux_fuse_root_id(&mount);
+        let unit_name = super::linux_fuse_unit_name(&root_id);
+
+        let roots = super::linux_fuse_root_reports_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[mount],
+            vec![linux_fuse_unit_file(
+                &unit_name,
+                "[Service]\nExecStart=/opt/locality-fuse --state-dir /home/example/.loc --mountpoint /home/example/Other\n",
+            )],
+        );
+
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].mountpoint, "/home/example/Locality");
+        assert!(!roots[0].registered);
+        assert_eq!(roots[0].unit_path, None);
+    }
+
+    #[test]
+    fn linux_fuse_list_payload_includes_legacy_stale_units() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        let payload = super::linux_fuse_list_payload_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[mount],
+            vec![linux_fuse_unit_file(
+                "ai.codeflash.locality.fuse.notion-main.service",
+                "[Service]\nExecStart=/opt/locality-fuse --mount-id notion-main --state-dir /home/example/.loc --mountpoint /home/example/Locality/notion-main\n",
+            )],
+        )
+        .expect("list payload");
+        let stale_units = payload
+            .get("stale_units")
+            .and_then(serde_json::Value::as_array)
+            .expect("stale units");
+
+        assert_eq!(stale_units.len(), 1);
+        assert_eq!(
+            stale_units[0]
+                .get("service")
+                .and_then(serde_json::Value::as_str),
+            Some("ai.codeflash.locality.fuse.notion-main.service")
+        );
+        assert_eq!(
+            stale_units[0]
+                .get("mountpoint")
+                .and_then(serde_json::Value::as_str),
+            Some("/home/example/Locality/notion-main")
+        );
+        assert_eq!(
+            stale_units[0]
+                .get("legacy")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn linux_fuse_list_payload_includes_deprecated_afs_units_from_legacy_state_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/home/example/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        let payload = super::linux_fuse_list_payload_for_state(
+            std::path::Path::new("/home/example/.loc"),
+            &[mount],
+            vec![linux_fuse_unit_file(
+                "ai.codeflash.afs.fuse.notion-main.service",
+                "[Service]\nExecStart=/opt/afs-fuse --mount-id notion-main --state-dir /home/example/.afs --mountpoint /home/example/Documents/AFS\n",
+            )],
+        )
+        .expect("list payload");
+        let stale_units = payload
+            .get("stale_units")
+            .and_then(serde_json::Value::as_array)
+            .expect("stale units");
+
+        assert_eq!(stale_units.len(), 1);
+        assert_eq!(
+            stale_units[0]
+                .get("service")
+                .and_then(serde_json::Value::as_str),
+            Some("ai.codeflash.afs.fuse.notion-main.service")
+        );
+        assert_eq!(
+            stale_units[0]
+                .get("mountpoint")
+                .and_then(serde_json::Value::as_str),
+            Some("/home/example/Documents/AFS")
+        );
+        assert_eq!(
+            stale_units[0]
+                .get("legacy")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn linux_fuse_unit_name_filter_accepts_deprecated_afs_units() {
+        assert!(super::is_locality_fuse_unit_name(
+            "ai.codeflash.afs.fuse.notion-main.service"
         ));
+    }
+
+    #[test]
+    fn linux_fuse_stop_lifecycle_skips_missing_units() {
+        let unmounted = std::cell::Cell::new(false);
+        let reset = std::cell::Cell::new(false);
+        let missing_unit = std::env::temp_dir().join("locality-missing-fuse-unit.service");
+
+        let (registered, active) = super::stop_linux_fuse_lifecycle_with(
+            "ai.codeflash.locality.fuse.root-home.service",
+            std::path::Path::new("/home/example/Locality"),
+            &missing_unit,
+            |_| panic!("systemctl stop should be skipped when the unit file is missing"),
+            |_| unmounted.set(true),
+            |_| reset.set(true),
+        )
+        .expect("missing units should be an idempotent stop");
+
+        assert!(!registered);
+        assert!(!active);
+        assert!(unmounted.get());
+        assert!(reset.get());
+    }
+
+    fn linux_fuse_unit_file(unit_name: &str, contents: &str) -> super::LinuxFuseUnitFile {
+        super::LinuxFuseUnitFile {
+            unit_name: unit_name.to_string(),
+            unit_path: std::path::PathBuf::from(format!("/tmp/systemd/{unit_name}")),
+            contents: contents.to_string(),
+        }
     }
 }
 
@@ -1454,6 +2934,26 @@ mod linux_tests {
 mod tests {
     use locality_core::model::MountId;
     use locality_store::{MountConfig, ProjectionMode};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_fuse_unit_uses_shared_projection_root() {
+        let mount = MountConfig::new(
+            locality_core::model::MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+        let unit = super::linux_fuse_unit_contents(
+            std::path::Path::new("/usr/bin/locality-fuse"),
+            std::path::Path::new("/tmp/.loc"),
+            &mount,
+            std::path::Path::new("/tmp/locality-fuse.log"),
+        );
+
+        assert!(unit.contains("--mountpoint /tmp/Locality"));
+        assert!(!unit.contains("--mount-id notion-main"));
+    }
 
     #[test]
     fn macos_file_provider_display_name_strips_locality_cloudstorage_prefix() {
@@ -1473,7 +2973,7 @@ mod tests {
         );
         assert_eq!(
             super::macos_file_provider_display_name(
-                std::path::Path::new("/Users/example/Library/CloudStorage/Locality/notion"),
+                std::path::Path::new("/Users/example/Library/CloudStorage/Locality/notion-main"),
                 "fallback",
             ),
             ""
@@ -1553,7 +3053,7 @@ mod tests {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            r"C:\Users\Ada\Locality",
+            r"C:\Users\Ada\Locality\notion-main",
         )
         .projection(ProjectionMode::WindowsCloudFiles);
 
@@ -1564,10 +3064,8 @@ mod tests {
                 "Notion"
             ),
             vec![
-                "--mount-id",
-                "notion-main",
                 "--display-name",
-                "Notion",
+                "Locality",
                 "--sync-root",
                 r"C:\Users\Ada\Locality",
                 "--state-dir",
@@ -1582,7 +3080,7 @@ mod tests {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            r"C:\Users\Ada\Locality",
+            r"C:\Users\Ada\Locality\notion-main",
         )
         .projection(ProjectionMode::WindowsCloudFiles);
         let current_dir = std::env::current_dir().expect("current dir");
@@ -1595,10 +3093,8 @@ mod tests {
                 "Notion"
             ),
             vec![
-                "--mount-id",
-                "notion-main",
                 "--display-name",
-                "Notion",
+                "Locality",
                 "--sync-root",
                 r"C:\Users\Ada\Locality",
                 "--state-dir",
@@ -1612,18 +3108,13 @@ mod tests {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
-            r"C:\Users\Ada\Locality",
+            r"C:\Users\Ada\Locality\notion-main",
         )
         .projection(ProjectionMode::WindowsCloudFiles);
 
         assert_eq!(
             super::windows_cloud_files_open_args(&mount),
-            vec![
-                "--mount-id",
-                "notion-main",
-                "--sync-root",
-                r"C:\Users\Ada\Locality"
-            ]
+            vec!["--sync-root", r"C:\Users\Ada\Locality"]
         );
         assert_eq!(
             super::windows_cloud_files_run_args(
@@ -1631,8 +3122,6 @@ mod tests {
                 &mount,
             ),
             vec![
-                "--mount-id",
-                "notion-main",
                 "--sync-root",
                 r"C:\Users\Ada\Locality",
                 "--state-dir",
@@ -1646,8 +3135,6 @@ mod tests {
             ),
             vec![
                 "run",
-                "--mount-id",
-                "notion-main",
                 "--sync-root",
                 r"C:\Users\Ada\Locality",
                 "--state-dir",
@@ -1665,6 +3152,86 @@ mod tests {
                 "--state-dir",
                 r"C:\Users\Ada\AppData\Local\Locality",
             ]
+        );
+    }
+
+    #[test]
+    fn windows_cloud_files_run_args_use_shared_projection_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            r"C:\Users\Ada\Locality\notion-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+
+        let args = super::windows_cloud_files_run_command_args(
+            std::path::Path::new(r"C:\Users\Ada\.loc"),
+            &mount,
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair[0] == "--sync-root" && pair[1] == r"C:\Users\Ada\Locality" })
+        );
+        assert!(!args.windows(2).any(|pair| pair[0] == "--mount-id"));
+    }
+
+    #[test]
+    fn windows_cloud_files_registration_status_accepts_shared_root_id_field() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            r"C:\Users\Ada\Locality\notion-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let roots = serde_json::json!([
+            {
+                "id": super::windows_cloud_files_shared_sync_root_id(&mount),
+                "mount_id": null,
+                "display_name": "Locality",
+                "path": r"C:\Users\Ada\Locality"
+            }
+        ]);
+
+        assert!(super::windows_cloud_files_roots_contain_registration(
+            roots.as_array().expect("roots array"),
+            &mount
+        ));
+    }
+
+    #[test]
+    fn windows_cloud_files_registration_status_rejects_other_shared_root_id() {
+        let mount_a = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            r"C:\Users\Ada\Locality\notion-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let mount_b = MountConfig::new(
+            MountId::new("linear-main"),
+            "linear",
+            r"D:\Teams\Grace\Locality\linear-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let roots = serde_json::json!([
+            {
+                "id": super::windows_cloud_files_shared_sync_root_id(&mount_b),
+                "mount_id": null,
+                "display_name": "Locality",
+                "path": r"D:\Teams\Grace\Locality"
+            }
+        ]);
+        let roots = roots.as_array().expect("roots array");
+
+        assert!(!super::windows_cloud_files_roots_contain_registration(
+            roots, &mount_a
+        ));
+        assert!(super::windows_cloud_files_roots_contain_registration(
+            roots, &mount_b
+        ));
+        assert_ne!(
+            super::windows_cloud_files_shared_sync_root_id(&mount_a),
+            super::windows_cloud_files_shared_sync_root_id(&mount_b)
         );
     }
 
@@ -1693,6 +3260,27 @@ mod tests {
                 .join("logs")
                 .join(format!("locality-cloud-files.{fragment}.err.log"))
         );
+    }
+
+    #[test]
+    fn windows_cloud_files_lifecycle_metadata_rejects_old_mount_point_sync_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            r"C:\Users\Ada\Locality\notion-main",
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+
+        assert!(
+            !super::windows_cloud_files_lifecycle_metadata_matches_mount(
+                std::path::Path::new(r"C:\Users\Ada\Locality\notion-main"),
+                &mount
+            )
+        );
+        assert!(super::windows_cloud_files_lifecycle_metadata_matches_mount(
+            std::path::Path::new(r"C:\Users\Ada\Locality"),
+            &mount
+        ));
     }
 
     #[test]

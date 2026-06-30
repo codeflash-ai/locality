@@ -10,10 +10,8 @@ use std::path::{Path, PathBuf};
 use locality_core::model::{EntityKind, HydrationState, RemoteId};
 use locality_store::{
     EntityRecord, EntityRepository, EntitySearchCandidate, EntitySearchRepository, MountConfig,
-    MountRepository, ProjectionMode, RemoteObservationRecord, RemoteObservationRepository,
-    StoreError,
+    MountRepository, RemoteObservationRecord, RemoteObservationRepository, StoreError,
 };
-use localityd::virtual_fs::source_root_directory_name;
 use serde::Serialize;
 
 const DEFAULT_LIMIT: usize = 10;
@@ -592,12 +590,7 @@ fn source_display_name(connector: &str) -> String {
 }
 
 fn default_access_root(mount: &MountConfig) -> PathBuf {
-    match mount.projection {
-        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles => mount
-            .root
-            .join(source_root_directory_name(&mount.connector)),
-        ProjectionMode::PlainFiles | ProjectionMode::MacosFileProvider => mount.root.clone(),
-    }
+    mount.root.clone()
 }
 
 fn entity_kind_name(kind: &EntityKind) -> &str {

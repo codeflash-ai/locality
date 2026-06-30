@@ -46,8 +46,10 @@ $cloudFilesBin = if ($env:LOCALITY_CLOUD_FILES_BIN) { $env:LOCALITY_CLOUD_FILES_
 $unique = "{0}-{1}" -f (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss"), ([Guid]::NewGuid().ToString("N").Substring(0, 8))
 $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) "loc-windows-cloud-files-live-$unique"
 $stateRoot = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_STATE) { $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_STATE } else { Join-Path $tmpRoot "state" }
-$syncRoot = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_ROOT) { $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_ROOT } else { Join-Path $tmpRoot "Locality" }
-$mountId = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID) { $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID } else { "notion-windows-cloud-live-$unique" }
+$removeLocalityRoot = -not $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_ROOT
+$LocalityRoot = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_ROOT) { $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_ROOT } else { Join-Path $tmpRoot "Locality" }
+$NotionMount = Join-Path $LocalityRoot "notion-main"
+$mountId = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID) { $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID } else { "notion-main" }
 $scratchPageId = $null
 $createdChildPageId = $null
 $tcpAddr = $null
@@ -258,6 +260,22 @@ function New-DirectoryWithTimeout {
     } | Out-Null
 }
 
+function Assert-SamePath {
+    param(
+        [string] $Actual,
+        [string] $Expected,
+        [string] $Name
+    )
+    if (-not $Actual) {
+        throw "$Name was not reported"
+    }
+    $actualFull = [System.IO.Path]::GetFullPath($Actual).TrimEnd([char[]] @("\", "/"))
+    $expectedFull = [System.IO.Path]::GetFullPath($Expected).TrimEnd([char[]] @("\", "/"))
+    if (-not [System.StringComparer]::OrdinalIgnoreCase.Equals($actualFull, $expectedFull)) {
+        throw "$Name was '$Actual', expected '$Expected'"
+    }
+}
+
 function Get-NotionBlockText {
     param([string] $PageId)
     $response = Invoke-Notion -Method GET -Path ("blocks/{0}/children?page_size=100" -f (Normalize-NotionId $PageId))
@@ -345,8 +363,8 @@ function Wait-ForStatusContains {
 }
 
 try {
-    Write-Step "preparing temp state and sync root"
-    New-Item -ItemType Directory -Force -Path $stateRoot, $syncRoot | Out-Null
+    Write-Step "preparing temp state and shared Locality root"
+    New-Item -ItemType Directory -Force -Path $stateRoot, $LocalityRoot, $NotionMount | Out-Null
 
     if (-not ((Test-Path -LiteralPath $locBin) -and (Test-Path -LiteralPath $localitydBin) -and (Test-Path -LiteralPath $cloudFilesBin))) {
         Push-Location $repoRoot
@@ -405,7 +423,7 @@ try {
     $env:LOCALITY_DAEMON_DISABLE = "1"
     try {
         Invoke-Native -FilePath $locBin -Arguments @(
-            "mount", "notion", $syncRoot,
+            "mount", "notion", $NotionMount,
             "--root-page", $scratchPageId,
             "--mount-id", $mountId,
             "--projection", "windows-cloud-files",
@@ -440,11 +458,16 @@ try {
     }
 
     Write-Step "starting Cloud Files provider"
-    Invoke-Native -FilePath $locBin -Arguments @("file-provider", "start", $mountId, "--json") -Step "loc file-provider start" -NoCapture | Out-Null
+    $providerStartOutput = Invoke-Native -FilePath $locBin -Arguments @("file-provider", "start", $NotionMount, "--json") -Step "loc file-provider start"
+    $providerStart = $providerStartOutput | ConvertFrom-Json
+    Assert-SamePath -Actual $providerStart.helper_report.sync_root -Expected $LocalityRoot -Name "Cloud Files start sync root"
     Wait-ForCondition -Name "Cloud Files provider lifecycle" -Condition {
-        $output = Invoke-Native -FilePath $locBin -Arguments @("file-provider", "status", $mountId, "--json") -Step "loc file-provider status"
+        $output = Invoke-Native -FilePath $locBin -Arguments @("file-provider", "status", $NotionMount, "--json") -Step "loc file-provider status"
         return $output.Contains('"state": "running"')
     }
+    $providerStatusOutput = Invoke-Native -FilePath $locBin -Arguments @("file-provider", "status", $NotionMount, "--json") -Step "loc file-provider status"
+    $providerStatus = $providerStatusOutput | ConvertFrom-Json
+    Assert-SamePath -Actual $providerStatus.helper_report.sync_root -Expected $LocalityRoot -Name "registered Cloud Files sync root"
     Write-Step "running loc doctor"
     $doctorOutput = Invoke-Native -FilePath $locBin -Arguments @("doctor", "--json") -Step "loc doctor"
     $doctor = $doctorOutput | ConvertFrom-Json
@@ -452,7 +475,7 @@ try {
         throw "loc doctor reported $($doctor.status) during live Cloud Files e2e: $doctorOutput"
     }
 
-    $sourceRoot = Join-Path $syncRoot "notion"
+    $sourceRoot = $NotionMount
     $pageDir = Join-Path $sourceRoot (ConvertTo-LocalitySlug $scratchTitle)
     $pageFile = Join-Path $pageDir "page.md"
     Write-Step "waiting for source root"
@@ -534,12 +557,12 @@ try {
 } finally {
     if (Test-Path -LiteralPath $locBin) {
         try {
-            Invoke-Native -FilePath $locBin -Arguments @("file-provider", "stop", $mountId, "--json") -Step "loc file-provider stop" | Out-Null
+            Invoke-Native -FilePath $locBin -Arguments @("file-provider", "stop", $NotionMount, "--json") -Step "loc file-provider stop" | Out-Null
         } catch {
             Write-Warning "Cloud Files provider stop failed: $($_.Exception.Message)"
         }
         try {
-            Invoke-Native -FilePath $locBin -Arguments @("file-provider", "unregister", $mountId, "--json") -Step "loc file-provider unregister" | Out-Null
+            Invoke-Native -FilePath $locBin -Arguments @("file-provider", "unregister", $NotionMount, "--json") -Step "loc file-provider unregister" | Out-Null
         } catch {
             Write-Warning "Cloud Files unregister failed: $($_.Exception.Message)"
         }
@@ -570,8 +593,14 @@ try {
 
     if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_KEEP_TMP -eq "1") {
         Write-Host "kept Windows Cloud Files live temp root: $tmpRoot"
-    } elseif ((Test-Path -LiteralPath $tmpRoot) -and $tmpRoot.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase)) {
-        Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "kept Windows Cloud Files Locality root: $LocalityRoot"
+    } else {
+        if ($removeLocalityRoot -and (Test-Path -LiteralPath $LocalityRoot) -and $LocalityRoot.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $LocalityRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if ((Test-Path -LiteralPath $tmpRoot) -and $tmpRoot.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 

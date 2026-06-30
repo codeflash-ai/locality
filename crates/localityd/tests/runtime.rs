@@ -260,7 +260,7 @@ fn runtime_file_provider_children_bypasses_active_background_refreshes() {
     let response_thread = thread::spawn(move || {
         foreground_handle.request(DaemonRequest::FileProviderChildren {
             mount_id: "notion-main".to_string(),
-            container_identifier: "source:notion".to_string(),
+            container_identifier: "mount:notion-main".to_string(),
         })
     });
 
@@ -268,7 +268,7 @@ fn runtime_file_provider_children_bypasses_active_background_refreshes() {
         foreground_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("foreground children request"),
-        ("notion-main".to_string(), "source:notion".to_string())
+        ("notion-main".to_string(), "mount:notion-main".to_string())
     );
     assert!(response_thread.join().expect("foreground response").ok);
     release_blocked_runner(&release);
@@ -871,7 +871,7 @@ fn runtime_routes_push_request_through_runner() {
 }
 
 #[test]
-fn runtime_prime_virtual_mounts_queues_root_and_source_refreshes() {
+fn runtime_prime_virtual_mounts_queues_root_and_mount_point_refreshes() {
     let config = relay_config("prime-virtual-mount");
     let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
     store
@@ -908,11 +908,11 @@ fn runtime_prime_virtual_mounts_queues_root_and_source_refreshes() {
     assert_eq!(
         refreshes,
         vec![
+            ("notion-main".to_string(), "mount:notion-main".to_string()),
             (
                 "notion-main".to_string(),
                 ROOT_CONTAINER_IDENTIFIER.to_string()
             ),
-            ("notion-main".to_string(), "source:notion".to_string()),
         ]
     );
     runtime.shutdown();
@@ -963,7 +963,7 @@ fn runtime_background_virtual_refreshes_walk_breadth_first() {
         "notion-main".to_string(),
         ROOT_CONTAINER_IDENTIFIER.to_string(),
     );
-    let source = ("notion-main".to_string(), "source:notion".to_string());
+    let source = ("notion-main".to_string(), "mount:notion-main".to_string());
     let page_a = ("notion-main".to_string(), "children:page-a".to_string());
     let page_b = ("notion-main".to_string(), "children:page-b".to_string());
     let page_a1 = ("notion-main".to_string(), "children:page-a1".to_string());
@@ -997,9 +997,9 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
 
     simulation.advance_to(0, SchedulerInputAction::InitialEnumeration);
     simulation.prime_virtual_mounts();
-    let [root_refresh, source_refresh] = simulation.expect_started_set([
+    let [mount_point_refresh, root_refresh] = simulation.expect_started_set([
         SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, ROOT_CONTAINER_IDENTIFIER),
-        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "source:notion"),
+        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "mount:notion-main"),
     ]);
 
     simulation.advance_to(
@@ -1063,9 +1063,9 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
 
     simulation.advance_to(
         70,
-        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "source:notion"),
+        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "mount:notion-main"),
     );
-    simulation.release(source_refresh);
+    simulation.release(mount_point_refresh);
     simulation.expect_no_start();
 
     simulation.advance_to(
@@ -1101,12 +1101,12 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
     simulation.expect_no_start();
 
     simulation.assert_timeline([
+        SchedulerTimelineEntry::new(0, SchedulerOpKind::RefreshChildren, "mount:notion-main"),
         SchedulerTimelineEntry::new(
             0,
             SchedulerOpKind::RefreshChildren,
             ROOT_CONTAINER_IDENTIFIER,
         ),
-        SchedulerTimelineEntry::new(0, SchedulerOpKind::RefreshChildren, "source:notion"),
         SchedulerTimelineEntry::new(10, SchedulerOpKind::RefreshChildren, "children:page-a"),
         SchedulerTimelineEntry::new(20, SchedulerOpKind::FileProviderRead, "page-open"),
         SchedulerTimelineEntry::new(50, SchedulerOpKind::Pull, "ManualSync.md"),
@@ -1143,7 +1143,7 @@ fn default_runner_virtual_fs_children_is_cache_only() {
     let response = DefaultRuntimeJobRunner.run_virtual_fs_children(
         state_root,
         mount_id.0.clone(),
-        "source:notion".to_string(),
+        "mount:notion-main".to_string(),
     );
 
     assert!(
@@ -1185,6 +1185,136 @@ fn default_runner_virtual_fs_children_rejects_plain_files_mount() {
     assert_eq!(
         error.message,
         "unsupported feature: plain-files mounts do not support virtual filesystem operations"
+    );
+}
+
+#[test]
+fn virtual_projection_root_children_lists_mount_points_for_shared_root() {
+    use locality_core::model::MountId;
+    use locality_store::{InMemoryStateStore, MountConfig, MountRepository, ProjectionMode};
+    use localityd::virtual_projection::virtual_projection_root_children;
+
+    let mut store = InMemoryStateStore::new();
+    let root = std::env::temp_dir().join("locality-shared-root-test");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                root.join("notion-main"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save notion");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-my-company"),
+                "notion",
+                root.join("notion-my-company"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save notion company");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("google-docs-main"),
+                "google-docs",
+                root.join("google-docs-main"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save google docs");
+
+    let report = virtual_projection_root_children(&store, &root, ProjectionMode::LinuxFuse)
+        .expect("root children");
+
+    let filenames = report
+        .children
+        .iter()
+        .map(|child| child.filename.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        filenames,
+        vec!["google-docs-main", "notion-main", "notion-my-company"]
+    );
+    assert!(
+        report
+            .children
+            .iter()
+            .all(|child| child.identifier.starts_with("m:"))
+    );
+}
+
+#[test]
+fn runtime_virtual_projection_root_children_lists_mount_points_for_shared_root() {
+    let config = relay_config("shared-root-runtime-children");
+    let root = temp_root("shared-root-runtime-projection");
+    let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                root.join("notion-main"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save notion");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-my-company"),
+                "notion",
+                root.join("notion-my-company"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save notion company");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("google-docs-main"),
+                "google-docs",
+                root.join("google-docs-main"),
+            )
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save google docs");
+    drop(store);
+
+    let runtime = DaemonRuntime::spawn(config).expect("spawn runtime");
+    let response = runtime
+        .handle()
+        .request(DaemonRequest::VirtualProjectionRootChildren {
+            projection_root: root,
+            projection: ProjectionMode::LinuxFuse,
+        });
+    runtime.shutdown();
+
+    assert!(
+        response.ok,
+        "shared projection root children request failed: {:?}",
+        response.error
+    );
+    let payload = response.payload.expect("children payload");
+    let report: VirtualFsChildrenReport =
+        serde_json::from_value(payload).expect("decode children report");
+    let filenames = report
+        .children
+        .iter()
+        .map(|child| child.filename.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        filenames,
+        vec!["google-docs-main", "notion-main", "notion-my-company"]
+    );
+    assert!(
+        report
+            .children
+            .iter()
+            .all(|child| child.identifier.starts_with("m:"))
     );
 }
 
@@ -1730,6 +1860,7 @@ fn assert_hydration_jobs_drained(state_root: PathBuf) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn wait_for_file_contains(path: &Path, needle: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -2068,7 +2199,7 @@ impl ScriptedSchedulerState {
         container_identifier: &str,
     ) -> LocalityResult<usize> {
         let entries = match container_identifier {
-            "source:notion" => vec![
+            "mount:notion-main" => vec![
                 EntityRecord::new(
                     self.mount_id.clone(),
                     RemoteId::new("page-a"),
@@ -2661,7 +2792,7 @@ impl RuntimeJobRunner for BreadthFirstRefreshRunner {
 
         let mut store = SqliteStateStore::open(state_root).map_err(LocalityError::from)?;
         let entries = match container_identifier.as_str() {
-            "source:notion" => vec![
+            "mount:notion-main" => vec![
                 EntityRecord::new(
                     self.mount_id.clone(),
                     RemoteId::new("page-a"),

@@ -58,7 +58,7 @@ The JSONL shape should stay stable enough for support tooling:
   "event": "mount.open_folder.failed",
   "mount_id": "notion-main",
   "connector": "notion",
-  "path": "/Users/example/Library/CloudStorage/Locality-Locality/notion",
+  "path": "/Users/example/Library/CloudStorage/Locality/notion-main",
   "message": "Could not open folder",
   "code": "open_folder_failed"
 }
@@ -141,4 +141,3 @@ relevant timeline slice so users do not have to search raw files.
 - Rotation should cap disk usage by default, for example 25 MB per source and
   7-14 days of retention.
 - The UI reads a summarized projection, not full logs, during normal refresh.
-

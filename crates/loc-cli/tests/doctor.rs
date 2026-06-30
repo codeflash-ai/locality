@@ -96,6 +96,48 @@ fn doctor_reports_mount_and_connection_findings() {
     let _ = fs::remove_dir_all(missing_mount_root);
 }
 
+#[test]
+fn doctor_reports_virtual_projection_root_and_mount_point_separately() {
+    let state_root = temp_root("loc-cli-doctor-virtual-state");
+    let shared_root = temp_root("loc-cli-doctor-shared-root");
+    fs::create_dir_all(&shared_root).expect("shared root");
+    let mount_point_root = shared_root.join("notion-main");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+    store
+        .save_mount(
+            MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                mount_point_root.clone(),
+            )
+            .with_remote_root_id(RemoteId::new("page-root"))
+            .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save virtual mount");
+    drop(store);
+
+    let report = run_doctor(DoctorOptions {
+        state_root: Some(state_root.clone()),
+    });
+
+    let mount = report
+        .mounts
+        .iter()
+        .find(|mount| mount.mount_id == "notion-main")
+        .expect("doctor mount");
+    let expected_mount_point = mount_point_root.display().to_string();
+    assert_eq!(mount.root, shared_root.display().to_string());
+    assert_eq!(
+        mount.mount_point.as_deref(),
+        Some(expected_mount_point.as_str())
+    );
+    assert!(mount.root_exists);
+    assert!(!has_finding(&report, "mount_root_missing"));
+
+    let _ = fs::remove_dir_all(state_root);
+    let _ = fs::remove_dir_all(shared_root);
+}
+
 fn has_finding(report: &loc_cli::doctor::DoctorReport, code: &str) -> bool {
     report.findings.iter().any(|finding| finding.code == code)
 }

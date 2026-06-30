@@ -38,15 +38,16 @@ does not expose arbitrary Drive traversal as a Locality mount.
 Drive folders project as local directories. Google Docs project as page
 directories containing `page.md`.
 
-Examples:
+Examples under a shared Locality root:
 
 ```text
-google-docs/
-  project-notes/
-    page.md
-  planning/
-    sprint-plan/
+~/Locality/
+  google-docs-main/
+    project-notes/
       page.md
+    planning/
+      sprint-plan/
+        page.md
 ```
 
 Non-Google-Docs Drive files are ignored by the V1 connector.
@@ -87,7 +88,7 @@ insertion fails, preventing partial empty remote documents.
 
 Live testing found and fixed several integration issues:
 
-- Creating a directory under the Google Docs source root now uses the mount
+- Creating a directory under the Google Docs mount-point root now uses the mount
   workspace folder id as the remote parent.
 - Push planning now treats the mount remote root as a valid directory parent for
   pending creates.
@@ -120,18 +121,18 @@ Connect with the local broker:
 Mount a workspace folder:
 
 ```bash
-./target/debug/loc mount google-docs ~/Locality/google-docs --workspace-folder "Locality" --projection linux-fuse
+./target/debug/loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection linux-fuse
 ```
 
 Force enumeration and hydration:
 
 ```bash
-./target/debug/loc pull --json "$HOME/Locality/google-docs/google-docs"
+./target/debug/loc pull --json "$HOME/Locality/google-docs-main"
 ```
 
 Inspect planned pushes:
 
 ```bash
-./target/debug/loc status "$HOME/Locality/google-docs/google-docs"
-./target/debug/loc diff "$HOME/Locality/google-docs/google-docs"
+./target/debug/loc status "$HOME/Locality/google-docs-main"
+./target/debug/loc diff "$HOME/Locality/google-docs-main"
 ```

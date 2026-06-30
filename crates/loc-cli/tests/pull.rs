@@ -22,14 +22,12 @@ use locality_notion::dto::{
     RichTextDto, SelectOptionDto, SelectPropertySchemaDto, TextRichTextDto, TitleBlockDto,
 };
 use locality_notion::{NotionConfig, NotionConnector};
-#[cfg(target_os = "macos")]
-use locality_store::MountConfig;
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    InMemoryStateStore, MountRepository, ProjectionMode, RemoteObservationRecord,
+    InMemoryStateStore, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository,
 };
-use localityd::virtual_fs::{source_root_directory_name, virtual_fs_content_root};
+use localityd::virtual_fs::{virtual_fs_content_root, virtual_projection_mount_point};
 
 #[test]
 fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
@@ -580,7 +578,7 @@ fn pull_windows_cloud_files_refreshes_clean_visible_replica_after_pull() {
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
         .join("roadmap")
         .join("page.md");
-    let visible_path = fixture.source_root().join("roadmap").join("page.md");
+    let visible_path = fixture.mount_point_root().join("roadmap").join("page.md");
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed clean visible replica");
@@ -609,7 +607,7 @@ fn pull_windows_cloud_files_refreshes_clean_visible_replica_after_pull() {
 }
 
 #[test]
-fn pull_virtual_mount_accepts_source_directory_as_root_target() {
+fn pull_virtual_mount_accepts_mount_point_directory_as_root_target() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("loc-cli-pull-state");
     let mut store = InMemoryStateStore::new();
@@ -619,10 +617,10 @@ fn pull_virtual_mount_accepts_source_directory_as_root_target() {
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        fixture.source_root(),
+        fixture.mount_point_root(),
         Some(&state_root),
     )
-    .expect("pull virtual source root");
+    .expect("pull virtual mount point root");
 
     assert!(report.ok);
     assert_eq!(report.enumerated, 4);
@@ -638,7 +636,7 @@ fn pull_virtual_mount_accepts_source_directory_as_root_target() {
 }
 
 #[test]
-fn pull_virtual_file_accepts_source_directory_target() {
+fn pull_virtual_file_accepts_mount_point_directory_target() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("loc-cli-pull-state");
     let mut store = InMemoryStateStore::new();
@@ -650,10 +648,10 @@ fn pull_virtual_file_accepts_source_directory_target() {
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        fixture.source_child_file("roadmap"),
+        fixture.mount_point_child_file("roadmap"),
         Some(&state_root),
     )
-    .expect("pull virtual source file target");
+    .expect("pull virtual mount point file target");
 
     assert!(report.ok);
     assert_eq!(report.enumerated, 0);
@@ -669,7 +667,7 @@ fn pull_virtual_file_accepts_source_directory_target() {
 }
 
 #[test]
-fn pull_virtual_file_conflict_reports_source_directory_path() {
+fn pull_virtual_file_conflict_reports_mount_point_directory_path() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("loc-cli-pull-state");
     let mut store = InMemoryStateStore::new();
@@ -696,7 +694,7 @@ fn pull_virtual_file_conflict_reports_source_directory_path() {
     entity.hydration = HydrationState::Dirty;
     store.save_entity(entity).expect("mark cache dirty");
 
-    let target = fixture.source_root().join("roadmap").join("page.md");
+    let target = fixture.mount_point_root().join("roadmap").join("page.md");
     let report = run_pull_with_state_root(
         &mut store,
         &fixture.connector_with(
@@ -735,7 +733,7 @@ fn pull_virtual_database_directory_hydrates_rows_when_under_limit() {
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        fixture.source_database_dir(),
+        fixture.mount_point_database_dir(),
         Some(&state_root),
     )
     .expect("pull virtual database directory");
@@ -786,7 +784,7 @@ fn pull_virtual_database_directory_leaves_rows_online_only_when_over_limit() {
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        fixture.source_database_dir(),
+        fixture.mount_point_database_dir(),
         Some(&state_root),
     )
     .expect("pull virtual database directory");
@@ -841,7 +839,7 @@ fn pull_virtual_database_directory_keeps_dirty_row_at_local_path() {
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        fixture.source_database_dir(),
+        fixture.mount_point_database_dir(),
         Some(&state_root),
     )
     .expect("pull virtual database directory");
@@ -1205,6 +1203,12 @@ impl PullFixture {
         assert_eq!(store.load_mounts().expect("mounts").len(), 1);
     }
 
+    fn mount_config(&self, projection: ProjectionMode) -> MountConfig {
+        MountConfig::new(self.mount_id.clone(), "notion", self.root.clone())
+            .with_remote_root_id(self.root_page_id.clone())
+            .projection(projection)
+    }
+
     fn connector(&self, root_title: &str) -> NotionConnector {
         self.connector_with(root_title, "Root body.", "2026-06-10T00:00:00.000Z")
     }
@@ -1292,12 +1296,12 @@ impl PullFixture {
             .join("page.md")
     }
 
-    fn source_root(&self) -> PathBuf {
-        self.root.join(source_root_directory_name("notion"))
+    fn mount_point_root(&self) -> PathBuf {
+        virtual_projection_mount_point(&self.mount_config(ProjectionMode::LinuxFuse))
     }
 
-    fn source_child_file(&self, root_slug: &str) -> PathBuf {
-        self.source_root()
+    fn mount_point_child_file(&self, root_slug: &str) -> PathBuf {
+        self.mount_point_root()
             .join(root_slug)
             .join("design-notes")
             .join("page.md")
@@ -1307,8 +1311,8 @@ impl PullFixture {
         self.root.join("roadmap").join("tasks").join("_schema.yaml")
     }
 
-    fn source_database_dir(&self) -> PathBuf {
-        self.source_root().join("roadmap").join("tasks")
+    fn mount_point_database_dir(&self) -> PathBuf {
+        self.mount_point_root().join("roadmap").join("tasks")
     }
 
     fn row_file(&self) -> PathBuf {

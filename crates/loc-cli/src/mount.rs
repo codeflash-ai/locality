@@ -80,8 +80,20 @@ where
     S: MountRepository,
 {
     let root = absolute_path(&options.root)?;
+    if options.projection.uses_virtual_filesystem() {
+        let proposed = MountConfig::new(options.mount_id.clone(), "pending", &root)
+            .projection(options.projection.clone());
+        localityd::virtual_fs::validate_virtual_projection_root(&proposed).map_err(|error| {
+            MountError::UnsafeVirtualProjectionRoot {
+                root: root.clone(),
+                projection_root: localityd::virtual_fs::virtual_projection_root(&proposed),
+                message: error.to_string(),
+            }
+        })?;
+        reject_duplicate_virtual_mount_point(store, &options.mount_id, &root, &options.projection)?;
+    }
 
-    let guidance = if options.projection == ProjectionMode::MacosFileProvider {
+    let guidance = if options.projection.uses_virtual_filesystem() {
         virtual_mount_guidance(&root)
     } else {
         std::fs::create_dir_all(&root).map_err(|error| MountError::CreateRoot {
@@ -119,11 +131,30 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MountError {
-    CreateRoot { path: PathBuf, message: String },
+    CreateRoot {
+        path: PathBuf,
+        message: String,
+    },
     CurrentDir(String),
-    ReadGuidance { path: PathBuf, message: String },
+    MountPointConflict {
+        root: PathBuf,
+        mount_point: String,
+        existing_mount_id: MountId,
+    },
+    UnsafeVirtualProjectionRoot {
+        root: PathBuf,
+        projection_root: PathBuf,
+        message: String,
+    },
+    ReadGuidance {
+        path: PathBuf,
+        message: String,
+    },
     Store(StoreError),
-    WriteGuidance { path: PathBuf, message: String },
+    WriteGuidance {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl MountError {
@@ -131,6 +162,8 @@ impl MountError {
         match self {
             Self::CreateRoot { .. } => "create_mount_root_failed",
             Self::CurrentDir(_) => "current_dir_failed",
+            Self::MountPointConflict { .. } => "mount_point_conflict",
+            Self::UnsafeVirtualProjectionRoot { .. } => "unsafe_virtual_projection_root",
             Self::ReadGuidance { .. } => "read_mount_guidance_failed",
             Self::Store(_) => "store_error",
             Self::WriteGuidance { .. } => "write_mount_guidance_failed",
@@ -146,6 +179,24 @@ impl MountError {
                 )
             }
             Self::CurrentDir(message) => format!("failed to resolve current directory: {message}"),
+            Self::MountPointConflict {
+                root,
+                mount_point,
+                existing_mount_id,
+            } => format!(
+                "mount `{}` already uses mount point `{mount_point}` under `{}`",
+                existing_mount_id.0,
+                root.display()
+            ),
+            Self::UnsafeVirtualProjectionRoot {
+                root,
+                projection_root,
+                message,
+            } => format!(
+                "virtual mount `{}` would register unsafe shared provider root `{}`: {message}",
+                root.display(),
+                projection_root.display()
+            ),
             Self::ReadGuidance { path, message } => {
                 format!(
                     "failed to read mount guidance `{}`: {message}",
@@ -161,6 +212,41 @@ impl MountError {
             }
         }
     }
+}
+
+fn reject_duplicate_virtual_mount_point<S>(
+    store: &S,
+    mount_id: &MountId,
+    root: &Path,
+    projection: &ProjectionMode,
+) -> Result<(), MountError>
+where
+    S: MountRepository,
+{
+    let proposed =
+        MountConfig::new(mount_id.clone(), "pending", root).projection(projection.clone());
+    let proposed_root = localityd::virtual_fs::virtual_projection_root(&proposed);
+    let proposed_mount_point = localityd::virtual_fs::mount_point_directory_name(&proposed);
+
+    for existing in store.load_mounts().map_err(MountError::Store)? {
+        if existing.mount_id == *mount_id || existing.projection != *projection {
+            continue;
+        }
+        if !existing.projection.uses_virtual_filesystem() {
+            continue;
+        }
+        if localityd::virtual_fs::virtual_projection_root(&existing) == proposed_root
+            && localityd::virtual_fs::mount_point_directory_name(&existing) == proposed_mount_point
+        {
+            return Err(MountError::MountPointConflict {
+                root: proposed_root,
+                mount_point: proposed_mount_point,
+                existing_mount_id: existing.mount_id,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn install_mount_guidance(root: &Path, connector: &str) -> Result<MountGuidanceReport, MountError> {

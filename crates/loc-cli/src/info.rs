@@ -223,7 +223,7 @@ fn resolve_subject(
         let role = role_for_exact_entity(&entity.kind);
         let child_context = child_context_for_entity(entity);
         let schema_path = if matches!(entity.kind, EntityKind::Database) {
-            Some(access_root.join(&entity.path).join("_schema.yaml"))
+            Some(database_schema_path(access_root, entity))
         } else {
             None
         };
@@ -248,7 +248,7 @@ fn resolve_subject(
     if let Some(entity) = nearest_directory_entity(relative_path, entities) {
         let role = role_for_exact_entity(&entity.kind);
         let schema_path = if matches!(entity.kind, EntityKind::Database) {
-            Some(access_root.join(&entity.path).join("_schema.yaml"))
+            Some(database_schema_path(access_root, entity))
         } else {
             None
         };
@@ -434,6 +434,12 @@ fn info_entity(access_root: &Path, entity: &EntityRecord) -> InfoEntity {
         content_hash: entity.content_hash.clone(),
         remote_edited_at: entity.remote_edited_at.clone(),
     }
+}
+
+fn database_schema_path(access_root: &Path, entity: &EntityRecord) -> PathBuf {
+    let mut schema_relative_path = entity.path.clone();
+    schema_relative_path.push("_schema.yaml");
+    locality_platform::join_logical_path(access_root, &schema_relative_path)
 }
 
 fn suggestions(subject_context: &SubjectContext) -> Vec<String> {

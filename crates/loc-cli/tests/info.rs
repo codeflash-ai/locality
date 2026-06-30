@@ -198,9 +198,11 @@ fn info_runner_works_with_sqlite_state_store() {
 }
 
 #[test]
-fn info_for_linux_fuse_reports_entity_absolute_path_under_source_root() {
+fn info_for_linux_fuse_reports_entity_absolute_path_under_mount_point_root() {
     let fixture = InfoFixture::new();
-    let visible_root = fixture.root.join("notion");
+    let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+        .projection(ProjectionMode::LinuxFuse);
+    let visible_root = mount.root.clone();
     let visible_file = visible_root.join("roadmap").join("page.md");
     if let Some(parent) = visible_file.parent() {
         fs::create_dir_all(parent).expect("visible parent");
@@ -208,12 +210,7 @@ fn info_for_linux_fuse_reports_entity_absolute_path_under_source_root() {
     fs::write(&visible_file, "").expect("visible page");
 
     let mut store = InMemoryStateStore::new();
-    store
-        .save_mount(
-            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
-                .projection(ProjectionMode::LinuxFuse),
-        )
-        .expect("save linux fuse mount");
+    store.save_mount(mount).expect("save linux fuse mount");
     store
         .save_entity(
             entity_record(
@@ -244,6 +241,59 @@ fn info_for_linux_fuse_reports_entity_absolute_path_under_source_root() {
             .as_ref()
             .map(|entity| entity.absolute_path.as_str()),
         Some(expected.as_str())
+    );
+}
+
+#[test]
+fn targeted_info_uses_matched_access_root_for_entity_and_schema_paths() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    let mount = MountConfig::new(mount_id.clone(), "notion", PathBuf::from("/"))
+        .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save mount");
+    store
+        .save_entity(entity_record(
+            &mount_id,
+            "database-1",
+            EntityKind::Database,
+            "Tasks",
+            "roadmap/tasks",
+        ))
+        .expect("save database");
+
+    let access_root = PathBuf::from("/notion-main");
+    let report = run_info(
+        &store,
+        InfoOptions {
+            path: Some(access_root.join("roadmap/tasks")),
+        },
+    )
+    .expect("info report");
+
+    assert_eq!(report.mount.root, mount.root.display().to_string());
+    assert_eq!(report.subject.role, InfoRole::DatabaseDirectory);
+    assert_eq!(report.subject.path, "roadmap/tasks");
+    let expected_schema = locality_platform::join_logical_path(
+        &access_root,
+        &PathBuf::from("roadmap/tasks/_schema.yaml"),
+    )
+    .display()
+    .to_string();
+    let expected_entity_path =
+        locality_platform::join_logical_path(&access_root, &PathBuf::from("roadmap/tasks"))
+            .display()
+            .to_string();
+    assert_eq!(
+        report.subject.schema_path.as_deref(),
+        Some(expected_schema.as_str())
+    );
+    assert_eq!(
+        report
+            .subject
+            .entity
+            .as_ref()
+            .map(|entity| entity.absolute_path.as_str()),
+        Some(expected_entity_path.as_str())
     );
 }
 

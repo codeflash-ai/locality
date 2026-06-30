@@ -70,7 +70,7 @@ action sets, health checks, and remote relay execution.
 agent/editor/grep
       |
       v
-platform projection under ~/loc/<mount>
+platform projection under ~/Locality/notion-main
       |
       v
 localityd virtual_fs boundary, watcher fallback, and hydration engine
@@ -91,24 +91,25 @@ Locality exposes one product-level shape across platforms:
 
 ```text
 Locality/
-  notion/
-  linear/
-  github/
+  notion-main/
+  notion-my-company/
+  google-docs-main/
 ```
 
 The physical root is platform-specific. On macOS, File Provider assigns the
 user-visible root and Locality reads it from `NSFileProviderManager`; packaged builds
 and the local development bundle identify the host app as `Locality`, so new roots
 should appear as `~/Library/CloudStorage/Locality`. Windows uses a Cloud Files root
-and Linux uses `~/Locality` or the configured FUSE mount. Command handling treats the
-connector child folder, such as `<root>/notion`, as the mount boundary and
-normalizes older macOS File Provider root names such as `Locality` and `Locality-Locality`
-only so existing local paths continue to resolve during upgrades.
+and Linux uses `~/Locality` or the configured shared FUSE root. Command handling
+treats the mount-point folder, such as `<root>/notion-main`, as the mount
+boundary and normalizes older macOS File Provider root names such as `Locality`
+and `Locality-Locality` only so existing local paths continue to resolve during
+upgrades.
 
 Every file operation resolves through this boundary:
 
 ```text
-input path -> canonical connector root -> mount_id -> connection_id -> remote_id
+input path -> canonical mount point -> mount_id -> connection_id -> remote_id
 ```
 
 Path normalization rejects traversal components and symlink escapes before a

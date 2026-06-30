@@ -3,6 +3,7 @@
 !define LOCALITY_RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
 !define LOCALITY_RUN_VALUE "Locality"
 !define LOCALITY_SHIM_MARKER "rem LOCALITY_TERMINAL_CLI_SHIM"
+!define LOCALITY_SIDECAR_SOURCE_DIR "${__FILEDIR__}"
 
 !macro FIND_LOCALITY_PROCESS_IMAGE IMAGE_NAME OUTVAR
   !if "${INSTALLMODE}" == "currentUser"
@@ -115,9 +116,9 @@
 !macro NSIS_HOOK_POSTINSTALL
   SetOutPath "$INSTDIR"
   !insertmacro PREPARE_LOCALITY_SIDECAR_FILES
-  File /oname=loc.exe "${__FILEDIR__}\loc.exe"
-  File /oname=localityd.exe "${__FILEDIR__}\localityd.exe"
-  File /oname=locality-cloud-files.exe "${__FILEDIR__}\locality-cloud-files.exe"
+  File /oname=loc.exe "${LOCALITY_SIDECAR_SOURCE_DIR}\loc.exe"
+  File /oname=localityd.exe "${LOCALITY_SIDECAR_SOURCE_DIR}\localityd.exe"
+  File /oname=locality-cloud-files.exe "${LOCALITY_SIDECAR_SOURCE_DIR}\locality-cloud-files.exe"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL

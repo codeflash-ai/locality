@@ -9,6 +9,8 @@ use std::os::unix::net::UnixStream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use locality_store::ProjectionMode;
+
 pub const DEFAULT_TCP_ADDR: &str = "127.0.0.1:38567";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +50,10 @@ pub enum DaemonRequest {
     VirtualFsChildren {
         mount_id: String,
         container_identifier: String,
+    },
+    VirtualProjectionRootChildren {
+        projection_root: PathBuf,
+        projection: ProjectionMode,
     },
     VirtualFsMaterialize {
         mount_id: String,
@@ -554,10 +560,12 @@ mod tests {
     #[cfg(unix)]
     use super::DaemonClientError;
     use super::{DaemonEndpoint, DaemonRequest, DaemonResponse, DaemonTransport};
+    use locality_store::ProjectionMode;
     #[cfg(unix)]
     use std::io::{BufRead, BufReader};
     #[cfg(unix)]
     use std::net::TcpListener;
+    use std::path::PathBuf;
     #[cfg(unix)]
     use std::sync::Mutex;
     use std::time::Duration;
@@ -577,6 +585,22 @@ mod tests {
             DaemonRequest::VirtualFsItem {
                 mount_id: "notion-main".to_string(),
                 identifier: "page-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn virtual_projection_root_children_command_decodes() {
+        let request: DaemonRequest = serde_json::from_str(
+            r#"{"command":"virtual_projection_root_children","projection_root":"/home/example/Locality","projection":"linux_fuse"}"#,
+        )
+        .expect("decode shared projection root children request");
+
+        assert_eq!(
+            request,
+            DaemonRequest::VirtualProjectionRootChildren {
+                projection_root: PathBuf::from("/home/example/Locality"),
+                projection: ProjectionMode::LinuxFuse,
             }
         );
     }

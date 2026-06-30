@@ -36,8 +36,8 @@ use localityd::hydration::{HydratedEntity, HydrationSource};
 use localityd::push::{PushJobAction, execute_push_job_with_content_root};
 use localityd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, commit_virtual_fs_write,
-    materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
-    source_root_identifier, virtual_fs_children_refresh_needed,
+    materialize_virtual_fs_item_with_content_root, mount_point_directory_name,
+    mount_point_identifier, refresh_virtual_fs_children, virtual_fs_children_refresh_needed,
     virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_content_root,
 };
 
@@ -56,27 +56,37 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
         ROOT_CONTAINER_IDENTIFIER,
     )
     .expect("browse mount root");
-    assert_folder(&root_children.children, "notion");
+    let mount = fixture.mount_config();
+    let mount_point_root = mount_point_identifier(&mount);
+    assert_folder(&root_children.children, &mount_point_directory_name(&mount));
     assert!(
         root_children
             .children
             .iter()
             .all(|child| child.filename != "AGENTS.md" && child.filename != "CLAUDE.md"),
-        "agent guidance belongs under the connector root, not the shared Locality root"
+        "agent guidance belongs under the mount point root, not the shared Locality root"
     );
 
-    let source_children = virtual_fs_children_with_content_root(
+    let mount_point_children = virtual_fs_children_with_content_root(
         &store,
         &content_root,
         &fixture.mount_id,
-        &source_root_identifier("notion"),
+        &mount_point_root,
     )
-    .expect("browse notion source root");
-    assert_readonly_guidance(&source_children.children, "AGENTS.md");
-    assert_readonly_guidance(&source_children.children, "CLAUDE.md");
-    assert_folder(&source_children.children, "Teamspace Home");
+    .expect("browse notion mount point root");
+    assert_readonly_guidance(
+        &mount_point_children.children,
+        "AGENTS.md",
+        &mount_point_root,
+    );
+    assert_readonly_guidance(
+        &mount_point_children.children,
+        "CLAUDE.md",
+        &mount_point_root,
+    );
+    assert_folder(&mount_point_children.children, "Teamspace Home");
     assert!(
-        !source_children
+        !mount_point_children
             .children
             .iter()
             .any(|child| child.filename == "Teamspace Home.md"),
@@ -84,7 +94,7 @@ fn local_virtual_mount_supports_browse_open_edit_review_push_round_trip() {
     );
     assert!(
         !fixture.content_path("Teamspace Home/page.md").exists(),
-        "browsing the source root must not hydrate page bodies"
+        "browsing the mount point root must not hydrate page bodies"
     );
 
     let parent_container = "children:page-1";
@@ -313,13 +323,13 @@ impl BehaviorFixture {
         SqliteStateStore::open(self.state_root.clone()).expect("open sqlite store")
     }
 
+    fn mount_config(&self) -> MountConfig {
+        MountConfig::new(self.mount_id.clone(), "notion", self.root.clone())
+            .projection(ProjectionMode::LinuxFuse)
+    }
+
     fn seed_workspace(&self, store: &mut SqliteStateStore) {
-        store
-            .save_mount(
-                MountConfig::new(self.mount_id.clone(), "notion", self.root.clone())
-                    .projection(ProjectionMode::LinuxFuse),
-            )
-            .expect("save mount");
+        store.save_mount(self.mount_config()).expect("save mount");
         store
             .save_entity(
                 EntityRecord::new(
@@ -554,14 +564,21 @@ fn assert_folder(children: &[localityd::virtual_fs::VirtualFsItem], filename: &s
     assert_eq!(child.kind, localityd::virtual_fs::VirtualFsItemKind::Folder);
 }
 
-fn assert_readonly_guidance(children: &[localityd::virtual_fs::VirtualFsItem], filename: &str) {
+fn assert_readonly_guidance(
+    children: &[localityd::virtual_fs::VirtualFsItem],
+    filename: &str,
+    expected_parent_identifier: &str,
+) {
     let child = children
         .iter()
         .find(|child| child.filename == filename)
         .unwrap_or_else(|| panic!("missing guidance `{filename}`"));
     assert_eq!(child.kind, localityd::virtual_fs::VirtualFsItemKind::File);
     assert_eq!(child.entity_kind, None);
-    assert_eq!(child.parent_identifier.as_deref(), Some("source:notion"));
+    assert_eq!(
+        child.parent_identifier.as_deref(),
+        Some(expected_parent_identifier)
+    );
 }
 
 fn entry_state(report: &loc_cli::status::StatusReport, path: &str) -> StatusState {

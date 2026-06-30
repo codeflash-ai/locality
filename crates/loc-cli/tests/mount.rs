@@ -141,6 +141,76 @@ fn macos_file_provider_mount_keeps_source_root_virtual() {
 }
 
 #[test]
+fn linux_fuse_mount_keeps_mount_point_virtual() {
+    let fixture = MountFixture::new("loc-cli-mount-linux-fuse");
+    let mut store = InMemoryStateStore::new();
+
+    let report = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect("mount");
+
+    assert_eq!(
+        report.guidance.agents_md.action,
+        GuidanceFileAction::Virtual
+    );
+    assert_eq!(
+        report.guidance.claude_md.action,
+        GuidanceFileAction::Virtual
+    );
+    assert!(
+        !fixture.root.exists(),
+        "Linux FUSE mount-point roots are virtual and must not be created before daemon state is updated"
+    );
+
+    let mount = store
+        .get_mount(&MountId::new("notion-main"))
+        .expect("load mount")
+        .expect("mount exists");
+    assert_eq!(mount.root, fixture.root);
+    assert_eq!(mount.projection, ProjectionMode::LinuxFuse);
+}
+
+#[test]
+fn virtual_mount_rejects_direct_home_child_mount_point() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let mut store = InMemoryStateStore::new();
+    let root = PathBuf::from(home).join("notion-main");
+
+    let error = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root,
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect_err("unsafe virtual parent rejected");
+
+    assert_eq!(error.code(), "unsafe_virtual_projection_root");
+    assert!(error.message().contains("home directory"));
+    assert!(
+        store.load_mounts().expect("load mounts").is_empty(),
+        "unsafe mount must not be persisted"
+    );
+}
+
+#[test]
 fn mount_persists_connection_id() {
     let fixture = MountFixture::new("loc-cli-mount-connection");
     let mut store = InMemoryStateStore::new();
@@ -231,6 +301,82 @@ fn mount_can_persist_google_docs_workspace_folder() {
         Some(RemoteId::new("workspace-folder"))
     );
     assert!(read_to_string(fixture.agents_file()).contains("Google Docs"));
+}
+
+#[test]
+fn mount_options_preserve_google_docs_workspace_folder_id_from_resolver() {
+    let fixture = MountFixture::new("loc-cli-mount-google-docs-reusable");
+    let mut store = InMemoryStateStore::new();
+    let report = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("google-docs-secondary"),
+            connector: "google-docs".to_string(),
+            root: fixture.root.join("google-docs-secondary"),
+            remote_root_id: Some(RemoteId::new("drive-folder-secondary")),
+            connection_id: Some(ConnectionId::new("google-docs-default")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect("mount google docs");
+
+    assert_eq!(report.mount_id, "google-docs-secondary");
+    assert_eq!(
+        report.remote_root_id.as_deref(),
+        Some("drive-folder-secondary")
+    );
+    assert_eq!(
+        store
+            .get_mount(&MountId::new("google-docs-secondary"))
+            .expect("read mount")
+            .expect("mount saved")
+            .remote_root_id,
+        Some(RemoteId::new("drive-folder-secondary"))
+    );
+}
+
+#[test]
+fn virtual_mount_rejects_duplicate_mount_point_under_same_root() {
+    let fixture = MountFixture::new("loc-cli-duplicate-mount-point");
+    let mut store = InMemoryStateStore::new();
+    let first_root = fixture.root.join("notion-main");
+    let duplicate_root = fixture.root.join("notion-main");
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root: first_root,
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("work-a")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect("first mount");
+
+    let error = run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: MountId::new("notion-my-company"),
+            connector: "notion".to_string(),
+            root: duplicate_root,
+            remote_root_id: None,
+            connection_id: Some(ConnectionId::new("work-b")),
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect_err("duplicate mount point rejected");
+
+    assert_eq!(error.code(), "mount_point_conflict");
+    assert!(
+        error
+            .message()
+            .contains("already uses mount point `notion-main` under")
+    );
 }
 
 struct MountFixture {

@@ -41,6 +41,8 @@ use crate::repository::{
 
 const DB_FILE: &str = "state.sqlite3";
 const SCHEMA_VERSION: i64 = 15;
+const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
+const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
 const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
 const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
@@ -83,7 +85,16 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "projection:linux_fuse",
         component_kind: "projection_layout",
-        current_version: 1,
+        current_version: LINUX_FUSE_PROJECTION_LAYOUT_VERSION,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "projection:windows_cloud_files",
+        component_kind: "projection_layout",
+        current_version: WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION,
         min_reader_version: 1,
         required: true,
         rebuildable: false,
@@ -1512,7 +1523,14 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
     }
     if user_version == SCHEMA_VERSION {
         repair_missing_state_components(connection)?;
+        ensure_state_components_allow_schema_migration(connection, user_version)?;
+        migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
+        migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
         return Ok(());
+    }
+
+    if user_version >= 13 {
+        ensure_state_components_allow_schema_migration(connection, user_version)?;
     }
 
     connection.execute_batch(
@@ -1847,7 +1865,6 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
 
     if user_version < 13 {
         create_state_management_tables(connection)?;
-        seed_current_state_components(connection)?;
         record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
     }
 
@@ -1893,11 +1910,71 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
 
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
+        migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
+        migrate_windows_cloud_files_projection_layout_to_v2(connection, user_version < 13)?;
         seed_current_state_components(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
 
     Ok(())
+}
+
+fn ensure_state_components_allow_schema_migration(
+    connection: &Connection,
+    user_version: i64,
+) -> StoreResult<()> {
+    let blocking_issues = inspect_state_component_issues(connection)?
+        .into_iter()
+        .filter(|issue| !state_component_issue_allows_schema_migration(issue, user_version))
+        .collect::<Vec<_>>();
+
+    if blocking_issues.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::StateCompatibility(format!(
+            "state components are not safe to migrate: {blocking_issues:?}",
+        )))
+    }
+}
+
+fn state_component_issue_allows_schema_migration(
+    issue: &StateCompatibilityIssue,
+    user_version: i64,
+) -> bool {
+    matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found,
+            current: SCHEMA_VERSION,
+        } if component_id == "core:schema" && *found == user_version && user_version < SCHEMA_VERSION
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found: 1,
+            current: LINUX_FUSE_PROJECTION_LAYOUT_VERSION,
+        } if component_id == "projection:linux_fuse"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found: 1,
+            current: WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION,
+        } if component_id == "projection:windows_cloud_files"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if component_id == "projection:windows_cloud_files"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < 14 && component_id == "durable:auto_save"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < 15 && component_id == "durable:live_mode"
+    )
 }
 
 fn mount_from_row(row: MountRow) -> StoreResult<MountConfig> {
@@ -2527,6 +2604,183 @@ fn create_state_management_tables(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+fn migrate_linux_fuse_projection_layout_to_v2(
+    connection: &Connection,
+    pre_state_components_schema: bool,
+) -> StoreResult<()> {
+    migrate_virtual_projection_layout_to_v2(
+        connection,
+        pre_state_components_schema,
+        "projection:linux_fuse",
+        ProjectionMode::LinuxFuse,
+        LINUX_FUSE_PROJECTION_LAYOUT_VERSION,
+        MissingProjectionComponent::Error,
+    )
+}
+
+fn migrate_windows_cloud_files_projection_layout_to_v2(
+    connection: &Connection,
+    pre_state_components_schema: bool,
+) -> StoreResult<()> {
+    migrate_virtual_projection_layout_to_v2(
+        connection,
+        pre_state_components_schema,
+        "projection:windows_cloud_files",
+        ProjectionMode::WindowsCloudFiles,
+        WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION,
+        MissingProjectionComponent::TreatAsV1,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MissingProjectionComponent {
+    Error,
+    TreatAsV1,
+}
+
+fn migrate_virtual_projection_layout_to_v2(
+    connection: &Connection,
+    pre_state_components_schema: bool,
+    component_id: &str,
+    projection: ProjectionMode,
+    layout_version: i64,
+    missing_component: MissingProjectionComponent,
+) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let component = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = ?1",
+            params![component_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if let Some((component_version, min_reader_version)) = component {
+        if component_version > layout_version {
+            return Err(StoreError::StateCompatibility(format!(
+                "state component {component_id} version {component_version} is newer than supported version {layout_version}",
+            )));
+        }
+        if min_reader_version > layout_version {
+            return Err(StoreError::StateCompatibility(format!(
+                "state component {component_id} requires reader version {min_reader_version}, but supported version is {layout_version}",
+            )));
+        }
+        if component_version >= layout_version {
+            return Ok(());
+        }
+    } else if !pre_state_components_schema && missing_component == MissingProjectionComponent::Error
+    {
+        return Err(StoreError::StateCompatibility(format!(
+            "missing required state component {component_id}"
+        )));
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    let projection_json = to_json(&projection)?;
+    let mounts = {
+        let mut statement = transaction.prepare(
+            "SELECT mount_id, connector, root
+         FROM mounts
+         WHERE projection_json = ?1
+         ORDER BY mount_id",
+        )?;
+        let rows = statement.query_map(params![projection_json], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for (mount_id, connector, root) in mounts {
+        let connector_root = connector_root_directory_name(&connector);
+        let mount_id_root = connector_root_directory_name(&mount_id);
+        let root = PathBuf::from(root);
+        let root_file_name = root.file_name().and_then(|name| name.to_str());
+        let already_mount_point_root = root_file_name == Some(connector_root.as_str())
+            || (projection == ProjectionMode::WindowsCloudFiles
+                && root_file_name.is_some_and(|name| {
+                    name == mount_id.as_str() || name == mount_id_root.as_str()
+                }));
+        let migrated_root = if already_mount_point_root {
+            root
+        } else {
+            root.join(connector_root)
+        };
+        transaction.execute(
+            "UPDATE mounts
+             SET root = ?1
+             WHERE mount_id = ?2",
+            params![path_to_text(&migrated_root), mount_id],
+        )?;
+    }
+
+    let definition = CURRENT_COMPONENT_DEFINITIONS
+        .iter()
+        .find(|definition| definition.component_id == component_id)
+        .expect("known state component definition");
+    let updated_at = unix_timestamp_string();
+    transaction.execute(
+        "INSERT INTO state_components (
+            component_id,
+            component_kind,
+            version,
+            min_reader_version,
+            required,
+            rebuildable,
+            data_json,
+            updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(component_id) DO UPDATE SET
+            component_kind = excluded.component_kind,
+            version = excluded.version,
+            min_reader_version = excluded.min_reader_version,
+            required = excluded.required,
+            rebuildable = excluded.rebuildable,
+            data_json = excluded.data_json,
+            updated_at = excluded.updated_at",
+        params![
+            definition.component_id,
+            definition.component_kind,
+            layout_version,
+            definition.min_reader_version,
+            bool_to_int(definition.required),
+            bool_to_int(definition.rebuildable),
+            definition.data_json,
+            &updated_at,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn connector_root_directory_name(connector: &str) -> String {
+    let normalized = connector
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() {
+                Some(character.to_ascii_lowercase())
+            } else if matches!(character, '-' | '_') {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if normalized.is_empty() {
+        "source".to_string()
+    } else {
+        normalized
+    }
+}
+
 fn seed_current_state_components(connection: &Connection) -> StoreResult<()> {
     create_state_management_tables(connection)?;
     let updated_at = unix_timestamp_string();
@@ -2570,6 +2824,9 @@ fn seed_missing_state_components(connection: &Connection) -> StoreResult<()> {
     create_state_management_tables(connection)?;
     let updated_at = unix_timestamp_string();
     for definition in CURRENT_COMPONENT_DEFINITIONS {
+        if !repairable_missing_state_component(definition.component_id) {
+            continue;
+        }
         connection.execute(
             "INSERT OR IGNORE INTO state_components (
                 component_id,
@@ -2597,10 +2854,23 @@ fn seed_missing_state_components(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+fn repairable_missing_state_component(component_id: &str) -> bool {
+    !matches!(
+        component_id,
+        "projection:linux_fuse" | "projection:windows_cloud_files"
+    )
+}
+
 fn repair_missing_state_components(connection: &Connection) -> StoreResult<()> {
     if inspect_state_component_issues(connection)?
         .iter()
-        .any(|issue| matches!(issue, StateCompatibilityIssue::MissingComponent { .. }))
+        .any(|issue| {
+            matches!(
+                issue,
+                StateCompatibilityIssue::MissingComponent { component_id }
+                    if repairable_missing_state_component(component_id)
+            )
+        })
     {
         seed_missing_state_components(connection)?;
     }

@@ -9,6 +9,7 @@ use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, MountConfig,
     MountRepository, ProjectionMode, SqliteStateStore, open_credential_store,
 };
+use localityd::virtual_fs::{virtual_projection_mount_point, virtual_projection_root};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -111,6 +112,8 @@ pub struct DoctorMount {
     pub mount_id: String,
     pub connector: String,
     pub root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount_point: Option<String>,
     pub root_exists: bool,
     pub projection: String,
     pub read_only: bool,
@@ -243,10 +246,17 @@ pub fn print_doctor_report(report: &DoctorReport) {
     }
     println!("mounts: {}", report.mounts.len());
     for mount in &report.mounts {
-        println!(
-            "  {}: {} {} at {}",
-            mount.mount_id, mount.connector, mount.projection, mount.root
-        );
+        if let Some(mount_point) = &mount.mount_point {
+            println!(
+                "  {}: {} {} root={} mount_point={}",
+                mount.mount_id, mount.connector, mount.projection, mount.root, mount_point
+            );
+        } else {
+            println!(
+                "  {}: {} {} at {}",
+                mount.mount_id, mount.connector, mount.projection, mount.root
+            );
+        }
         if let Some(provider) = &mount.provider {
             let registered = provider
                 .registered
@@ -557,7 +567,8 @@ fn mount_statuses(
     mounts
         .into_iter()
         .map(|mount| {
-            let root_exists = mount.root.exists();
+            let (root, mount_point) = doctor_mount_paths(&mount);
+            let root_exists = root.exists();
             if !root_exists {
                 findings.push(DoctorFinding::mount(
                     DoctorSeverity::Warning,
@@ -565,7 +576,7 @@ fn mount_statuses(
                     format!(
                         "Mount `{}` root does not exist: `{}`.",
                         mount.mount_id.0,
-                        mount.root.display()
+                        root.display()
                     ),
                     &mount.mount_id.0,
                     None,
@@ -603,7 +614,8 @@ fn mount_statuses(
             DoctorMount {
                 mount_id: mount.mount_id.0,
                 connector: mount.connector,
-                root: mount.root.display().to_string(),
+                root: root.display().to_string(),
+                mount_point: mount_point.map(|path| path.display().to_string()),
                 root_exists,
                 projection: projection_cli_value(&mount.projection).to_string(),
                 read_only: mount.read_only,
@@ -612,6 +624,17 @@ fn mount_statuses(
             }
         })
         .collect()
+}
+
+fn doctor_mount_paths(mount: &MountConfig) -> (PathBuf, Option<PathBuf>) {
+    if mount.projection.uses_virtual_filesystem() {
+        (
+            virtual_projection_root(mount),
+            Some(virtual_projection_mount_point(mount)),
+        )
+    } else {
+        (mount.root.clone(), None)
+    }
 }
 
 fn provider_status(
@@ -714,7 +737,8 @@ fn linux_provider_status(mount: &MountConfig, findings: &mut Vec<DoctorFinding>)
     #[cfg(target_os = "linux")]
     {
         let helper = file_provider::locality_fuse_helper_path();
-        let service = file_provider::linux_fuse_unit_name(&mount.mount_id.0);
+        let root_id = file_provider::linux_fuse_root_id(mount);
+        let service = file_provider::linux_fuse_unit_name(&root_id);
         let unit_path = file_provider::linux_fuse_unit_path(&service)
             .ok()
             .map(|path| path.display().to_string());

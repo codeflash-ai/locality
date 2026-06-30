@@ -387,6 +387,192 @@ fn status_without_path_outside_mount_reports_all_mounts() {
 }
 
 #[test]
+fn status_without_path_from_shared_linux_fuse_root_reports_only_that_root() {
+    let shared_root = TempRoot::new("loc-cli-status-cwd-shared-root");
+    let other_root = TempRoot::new("loc-cli-status-cwd-other-root");
+    let mut store = InMemoryStateStore::new();
+    let notion = MountConfig::new(
+        MountId::new("notion-main"),
+        "notion",
+        shared_root.path.join("notion-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    let google = MountConfig::new(
+        MountId::new("google-docs-main"),
+        "google-docs",
+        shared_root.path.join("google-docs-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    let other = MountConfig::new(
+        MountId::new("notion-other"),
+        "notion",
+        other_root.path.join("notion-other"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(notion.clone()).expect("save notion mount");
+    store.save_mount(google.clone()).expect("save google mount");
+    store.save_mount(other.clone()).expect("save other mount");
+    store
+        .save_entity(entity_record(
+            &notion.mount_id,
+            "notion-page",
+            "Roadmap/page.md",
+            HydrationState::Stub,
+        ))
+        .expect("save notion entity");
+    store
+        .save_entity(entity_record(
+            &google.mount_id,
+            "google-page",
+            "Docs/page.md",
+            HydrationState::Stub,
+        ))
+        .expect("save google entity");
+    store
+        .save_entity(entity_record(
+            &other.mount_id,
+            "other-page",
+            "Other/page.md",
+            HydrationState::Stub,
+        ))
+        .expect("save other entity");
+
+    let _lock = cwd_lock().lock().expect("cwd lock");
+    let _cwd = CurrentDirGuard::enter(&shared_root.path);
+    let report = run_status(&store, StatusOptions::default()).expect("status report");
+    let mount_ids = report
+        .mounts
+        .iter()
+        .map(|mount| mount.mount_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(report.target, None);
+    assert_eq!(mount_ids, vec!["google-docs-main", "notion-main"]);
+    assert_eq!(report.summary.total, 2);
+    assert_eq!(report.summary.stub, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn status_shared_linux_fuse_root_matches_canonical_path_alias() {
+    let real_shared_root = TempRoot::new("loc-cli-status-real-shared-root");
+    let alias_parent = TempRoot::new("loc-cli-status-shared-root-alias-parent");
+    let alias_shared_root = alias_parent.path.join("Locality");
+    std::os::unix::fs::symlink(&real_shared_root.path, &alias_shared_root)
+        .expect("create shared root alias");
+    let other_root = TempRoot::new("loc-cli-status-alias-other-root");
+    let mut store = InMemoryStateStore::new();
+    let notion = MountConfig::new(
+        MountId::new("notion-main"),
+        "notion",
+        alias_shared_root.join("notion-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    let google = MountConfig::new(
+        MountId::new("google-docs-main"),
+        "google-docs",
+        alias_shared_root.join("google-docs-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    let other = MountConfig::new(
+        MountId::new("notion-other"),
+        "notion",
+        other_root.path.join("notion-other"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(notion.clone()).expect("save notion mount");
+    store.save_mount(google.clone()).expect("save google mount");
+    store.save_mount(other.clone()).expect("save other mount");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(real_shared_root.path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("shared root alias status report");
+    let mount_ids = report
+        .mounts
+        .iter()
+        .map(|mount| mount.mount_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(mount_ids, vec!["google-docs-main", "notion-main"]);
+
+    let _lock = cwd_lock().lock().expect("cwd lock");
+    let _cwd = CurrentDirGuard::enter(&real_shared_root.path);
+    let report =
+        run_status(&store, StatusOptions::default()).expect("shared root alias cwd status report");
+    let mount_ids = report
+        .mounts
+        .iter()
+        .map(|mount| mount.mount_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(report.target, None);
+    assert_eq!(mount_ids, vec!["google-docs-main", "notion-main"]);
+}
+
+#[test]
+fn status_for_shared_linux_fuse_root_reports_all_mount_points() {
+    let shared_root = TempRoot::new("loc-cli-status-shared-root");
+    let mut store = InMemoryStateStore::new();
+    let notion = MountConfig::new(
+        MountId::new("notion-main"),
+        "notion",
+        shared_root.path.join("notion-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    let google = MountConfig::new(
+        MountId::new("google-docs-main"),
+        "google-docs",
+        shared_root.path.join("google-docs-main"),
+    )
+    .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(notion.clone()).expect("save notion mount");
+    store.save_mount(google.clone()).expect("save google mount");
+    store
+        .save_entity(entity_record(
+            &notion.mount_id,
+            "notion-page",
+            "Roadmap/page.md",
+            HydrationState::Stub,
+        ))
+        .expect("save notion entity");
+    store
+        .save_entity(entity_record(
+            &google.mount_id,
+            "google-page",
+            "Docs/page.md",
+            HydrationState::Stub,
+        ))
+        .expect("save google entity");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(shared_root.path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("shared root status report");
+    let mount_ids = report
+        .mounts
+        .iter()
+        .map(|mount| mount.mount_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        report.target.as_deref(),
+        Some(shared_root.path.to_str().expect("utf8 root"))
+    );
+    assert_eq!(mount_ids, vec!["google-docs-main", "notion-main"]);
+    assert_eq!(report.summary.total, 2);
+    assert_eq!(report.summary.stub, 2);
+}
+
+#[test]
 fn status_scopes_to_explicit_mount_id_without_path() {
     let fixture = StatusFixture::new();
     let second_root = TempRoot::new("loc-cli-status-explicit-mount-second");
@@ -588,12 +774,9 @@ fn status_runner_works_with_sqlite_state_store() {
 fn status_reads_virtual_projection_from_content_cache() {
     let fixture = StatusFixture::new();
     let mut store = InMemoryStateStore::new();
-    store
-        .save_mount(
-            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
-                .projection(ProjectionMode::LinuxFuse),
-        )
-        .expect("save virtual mount");
+    let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+        .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save virtual mount");
     fixture.hydrated_page(
         &mut store,
         "page-1",
@@ -628,12 +811,7 @@ fn status_reads_virtual_projection_from_content_cache() {
     assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
     assert_eq!(
         status_entry(&report, "Roadmap.md").absolute_path,
-        fixture
-            .root
-            .join("notion")
-            .join("Roadmap.md")
-            .display()
-            .to_string()
+        mount.root.join("Roadmap.md").display().to_string()
     );
 }
 
@@ -741,12 +919,9 @@ fn status_reports_missing_virtual_content_cache_stubs_without_materializing_each
 fn status_reports_pending_virtual_creates_and_deletes() {
     let fixture = StatusFixture::new();
     let mut store = InMemoryStateStore::new();
-    store
-        .save_mount(
-            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
-                .projection(ProjectionMode::LinuxFuse),
-        )
-        .expect("save virtual mount");
+    let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+        .projection(ProjectionMode::LinuxFuse);
+    store.save_mount(mount.clone()).expect("save virtual mount");
     fixture.hydrated_page(
         &mut store,
         "page-1",
@@ -791,12 +966,7 @@ fn status_reports_pending_virtual_creates_and_deletes() {
     assert_eq!(entry_issue(&report, "Roadmap.md"), "pending_virtual_delete");
     assert_eq!(
         status_entry(&report, "Draft.md").absolute_path,
-        fixture
-            .root
-            .join("notion")
-            .join("Draft.md")
-            .display()
-            .to_string()
+        mount.root.join("Draft.md").display().to_string()
     );
 }
 

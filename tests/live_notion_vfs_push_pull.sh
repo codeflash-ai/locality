@@ -38,11 +38,11 @@ normalized_page_id="$(printf '%s' "$page_id" | tr '[:upper:]' '[:lower:]' | tr -
 loc_bin="${LOCALITY_BIN:-./target/debug/loc}"
 localityd_bin="${LOCALITYD_BIN:-./target/debug/localityd}"
 fuse_bin="${LOCALITY_FUSE_BIN:-./target/debug/locality-fuse}"
-mount_id="${LOCALITY_LIVE_NOTION_VFS_MOUNT_ID:-notion-live-vfs-push-pull-$$}"
+mount_id="${LOCALITY_LIVE_NOTION_VFS_MOUNT_ID:-notion-main}"
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-live-notion-vfs.XXXXXX")"
 state_root="${LOCALITY_LIVE_NOTION_VFS_STATE:-$tmp_root/state}"
-loc_root="${LOCALITY_LIVE_NOTION_VFS_ROOT:-$tmp_root/loc}"
-mount_root="$loc_root/notion"
+LOCALITY_ROOT="${LOCALITY_LIVE_NOTION_VFS_ROOT:-$tmp_root/Locality}"
+NOTION_MOUNT="${LOCALITY_LIVE_NOTION_VFS_MOUNT:-$LOCALITY_ROOT/notion-main}"
 daemon_log="$tmp_root/localityd.log"
 fuse_log="$tmp_root/locality-fuse.log"
 original_file="$tmp_root/original-page.md"
@@ -87,8 +87,8 @@ cleanup() {
     LOCALITY_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
       "$loc_bin" push "$page_file" -y --json >/dev/null 2>&1
   fi
-  if mountpoint -q "$loc_root"; then
-    fusermount3 -uz "$loc_root" >/dev/null 2>&1
+  if mountpoint -q "$LOCALITY_ROOT"; then
+    fusermount3 -uz "$LOCALITY_ROOT" >/dev/null 2>&1
   fi
   if [[ -n "$fuse_pid" ]] && kill -0 "$fuse_pid" >/dev/null 2>&1; then
     kill "$fuse_pid" >/dev/null 2>&1
@@ -125,7 +125,7 @@ wait_for_daemon() {
 
 wait_for_mount() {
   for _ in {1..80}; do
-    if mountpoint -q "$loc_root"; then
+    if mountpoint -q "$LOCALITY_ROOT"; then
       return 0
     fi
     if [[ -n "$fuse_pid" ]] && ! kill -0 "$fuse_pid" >/dev/null 2>&1; then
@@ -145,7 +145,7 @@ find_pulled_page_file() {
       printf '%s\n' "$file"
       return 0
     fi
-  done < <(find "$mount_root" -name page.md -type f -print)
+  done < <(find "$NOTION_MOUNT" -name page.md -type f -print)
   return 1
 }
 
@@ -159,11 +159,11 @@ assert_no_conflict_markers() {
 }
 
 step="creating temp directories"
-mkdir -p "$state_root" "$loc_root" "$mount_root"
+mkdir -p "$state_root" "$LOCALITY_ROOT" "$NOTION_MOUNT"
 
 step="registering Notion Linux FUSE mount"
 LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_DISABLE=1 NOTION_TOKEN="$notion_token" \
-  "$loc_bin" mount notion "$mount_root" \
+  "$loc_bin" mount notion "$NOTION_MOUNT" \
     --root-page "$page_id" \
     --mount-id "$mount_id" \
     --projection linux-fuse \
@@ -177,15 +177,14 @@ wait_for_daemon
 
 step="starting locality-fuse"
 LOCALITY_STATE_DIR="$state_root" "$fuse_bin" \
-  --mount-id "$mount_id" \
   --state-dir "$state_root" \
-  --mountpoint "$loc_root" >"$fuse_log" 2>&1 &
+  --mountpoint "$LOCALITY_ROOT" >"$fuse_log" 2>&1 &
 fuse_pid="$!"
 wait_for_mount
 
 step="pulling root page"
 LOCALITY_STATE_DIR="$state_root" NOTION_TOKEN="$notion_token" \
-  "$loc_bin" pull "$mount_root" --json >"$initial_pull"
+  "$loc_bin" pull "$NOTION_MOUNT" --json >"$initial_pull"
 step="locating pulled page file"
 page_file="$(find_pulled_page_file)"
 step="pulling page file"

@@ -19,13 +19,13 @@ use locality_core::shadow::rendered_bodies_equivalent;
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
     JournalRepository, MountConfig, MountLiveModeRecord, MountLiveModeRepository,
-    MountLiveModeState, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository,
+    MountLiveModeState, MountRepository, RemoteObservationRecord, RemoteObservationRepository,
+    ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    VirtualMutationRepository,
 };
 use localityd::file_provider as daemon_file_provider;
 use localityd::virtual_fs::{
-    source_root_directory_name, virtual_fs_content_path, virtual_fs_content_root,
+    virtual_fs_content_path, virtual_fs_content_root, virtual_projection_root,
 };
 use serde::Serialize;
 
@@ -531,7 +531,7 @@ where
     }
 
     match target {
-        Some(target) => resolve_target_scope(store, mounts, target).map(|scope| vec![scope]),
+        Some(target) => resolve_target_scopes(store, mounts, target),
         None => resolve_default_scopes(store, mounts),
     }
 }
@@ -557,6 +557,10 @@ where
             mount: mount.clone(),
             filter,
         }]);
+    }
+
+    if let Some(scopes) = shared_virtual_root_scopes(mounts, &cwd) {
+        return Ok(scopes);
     }
 
     Ok(mounts
@@ -593,21 +597,66 @@ where
     Ok(StatusScope { mount, filter })
 }
 
-fn resolve_target_scope<S>(
+fn resolve_target_scopes<S>(
     store: &S,
     mounts: &[MountConfig],
     target: &Path,
-) -> Result<StatusScope, StatusError>
+) -> Result<Vec<StatusScope>, StatusError>
 where
     S: EntityRepository + VirtualMutationRepository,
 {
-    let mount = find_mount_for_path(mounts, target)
-        .cloned()
-        .ok_or_else(|| StatusError::MountNotFound(target.to_path_buf()))?;
-    let relative_path = relative_entity_path(&mount, target)?;
-    let filter = scope_filter_for_relative_path(store, &mount, &relative_path)?;
+    if let Some(mount) = find_mount_for_path(mounts, target).cloned() {
+        let relative_path = relative_entity_path(&mount, target)?;
+        let filter = scope_filter_for_relative_path(store, &mount, &relative_path)?;
+        return Ok(vec![StatusScope { mount, filter }]);
+    }
 
-    Ok(StatusScope { mount, filter })
+    if let Some(scopes) = shared_virtual_root_scopes(mounts, target) {
+        return Ok(scopes);
+    }
+
+    Err(StatusError::MountNotFound(target.to_path_buf()))
+}
+
+fn shared_virtual_root_scopes(mounts: &[MountConfig], target: &Path) -> Option<Vec<StatusScope>> {
+    let shared_root_mounts = shared_virtual_root_mounts(mounts, target);
+    if shared_root_mounts.is_empty() {
+        return None;
+    }
+
+    Some(
+        shared_root_mounts
+            .into_iter()
+            .map(|mount| StatusScope {
+                mount: mount.clone(),
+                filter: ScopeFilter::All,
+            })
+            .collect(),
+    )
+}
+
+fn shared_virtual_root_mounts<'a>(
+    mounts: &'a [MountConfig],
+    target: &Path,
+) -> Vec<&'a MountConfig> {
+    mounts
+        .iter()
+        .filter(|mount| {
+            mount.projection.uses_virtual_filesystem()
+                && paths_match_existing_root(&virtual_projection_root(mount), target)
+        })
+        .collect()
+}
+
+fn paths_match_existing_root(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn scope_filter_for_relative_path<S>(
@@ -814,18 +863,6 @@ where
 }
 
 fn projected_absolute_path(mount: &MountConfig, relative_path: &Path) -> PathBuf {
-    if matches!(
-        mount.projection,
-        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
-    ) {
-        return locality_platform::join_logical_path(
-            &mount
-                .root
-                .join(source_root_directory_name(&mount.connector)),
-            relative_path,
-        );
-    }
-
     locality_platform::join_logical_path(&mount.root, relative_path)
 }
 

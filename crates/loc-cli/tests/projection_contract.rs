@@ -33,9 +33,10 @@ use localityd::hydration::{HydratedEntity, HydrationSource};
 use localityd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, commit_virtual_fs_write, create_virtual_fs_directory,
     create_virtual_fs_file, materialize_virtual_fs_item_with_content_root,
-    refresh_virtual_fs_children, rename_virtual_fs_item, source_root_identifier,
-    trash_virtual_fs_item, virtual_fs_children_with_content_root, virtual_fs_content_path,
-    virtual_fs_content_root,
+    mount_point_directory_name, mount_point_identifier, refresh_virtual_fs_children,
+    rename_virtual_fs_item, trash_virtual_fs_item, virtual_fs_children_with_content_root,
+    virtual_fs_content_path, virtual_fs_content_root, virtual_projection_mount_point,
+    virtual_projection_root,
 };
 
 #[test]
@@ -54,19 +55,20 @@ fn virtual_projection_modes_share_browse_hydrate_write_contract() {
             ROOT_CONTAINER_IDENTIFIER,
         )
         .expect("browse virtual root");
-        assert_child_folder(&root.children, "notion");
+        let mount = fixture.mount_config();
+        assert_child_folder(&root.children, &mount_point_directory_name(&mount));
 
-        let source_root = virtual_fs_children_with_content_root(
+        let mount_point_root = virtual_fs_children_with_content_root(
             &store,
             &content_root,
             &fixture.mount_id,
-            &source_root_identifier("notion"),
+            &mount_point_identifier(&mount),
         )
-        .expect("browse connector root");
-        assert_child_folder(&source_root.children, "Home");
+        .expect("browse mount point root");
+        assert_child_folder(&mount_point_root.children, "Home");
         assert!(
             !fixture.content_path("Home/page.md").exists(),
-            "{projection:?} source-root enumeration must stay metadata-only"
+            "{projection:?} mount-point root enumeration must stay metadata-only"
         );
 
         let refreshed = refresh_virtual_fs_children(
@@ -209,6 +211,18 @@ fn virtual_projection_modes_share_create_rename_delete_contract() {
     }
 }
 
+#[test]
+fn linux_fuse_shared_root_keeps_mount_point_as_user_access_path() {
+    let fixture = ProjectionFixture::new(ProjectionMode::LinuxFuse);
+    let mount = fixture.mount_config();
+
+    assert_eq!(
+        virtual_projection_root(&mount),
+        mount.root.parent().expect("mount root has shared parent")
+    );
+    assert_eq!(virtual_projection_mount_point(&mount), mount.root);
+}
+
 fn virtual_projection_modes() -> [ProjectionMode; 3] {
     [
         ProjectionMode::MacosFileProvider,
@@ -251,13 +265,13 @@ impl ProjectionFixture {
             .expect("content path")
     }
 
+    fn mount_config(&self) -> MountConfig {
+        MountConfig::new(self.mount_id.clone(), "notion", self.root.clone())
+            .projection(self.projection.clone())
+    }
+
     fn seed_home_page(&self, store: &mut SqliteStateStore) {
-        store
-            .save_mount(
-                MountConfig::new(self.mount_id.clone(), "notion", self.root.clone())
-                    .projection(self.projection.clone()),
-            )
-            .expect("save mount");
+        store.save_mount(self.mount_config()).expect("save mount");
         store
             .save_entity(
                 EntityRecord::new(

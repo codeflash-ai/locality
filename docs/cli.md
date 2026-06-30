@@ -91,8 +91,9 @@ Auth failures exit `1` and include `suggested_command` when there is an obvious 
 
 `loc doctor [--json]` runs read-only local diagnostics. It inspects daemon
 status, SQLite compatibility, configured connections, credential availability,
-mount roots, projection support for the current platform, and native provider
-lifecycle state for macOS File Provider, Linux FUSE, or Windows Cloud Files.
+shared projection roots, mount-point folders, projection support for the current
+platform, and native provider lifecycle state for macOS File Provider, Linux
+FUSE, or Windows Cloud Files.
 
 The command does not initialize missing SQLite state, run migrations, write
 credentials, register providers, start daemons, or reset anything. Recovery is
@@ -108,6 +109,15 @@ never includes credential values:
   "command": "doctor",
   "status": "error",
   "platform": "windows",
+  "mounts": [
+    {
+      "mount_id": "notion-main",
+      "connector": "notion",
+      "root": "C:\\Users\\Alice\\Locality",
+      "mount_point": "C:\\Users\\Alice\\Locality\\notion-main",
+      "projection": "windows-cloud-files"
+    }
+  ],
   "findings": [
     {
       "severity": "error",
@@ -159,7 +169,7 @@ print compact safety labels. JSON output is stable enough for tools:
       "kind": "page",
       "remote_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "path": "Engineering/Roadmap 2026/page.md",
-      "absolute_path": "/Users/alice/loc/notion/Engineering/Roadmap 2026/page.md",
+      "absolute_path": "/Users/alice/Locality/notion-main/Engineering/Roadmap 2026/page.md",
       "state": "ready",
       "safety": {
         "agent_readable": true,
@@ -200,9 +210,9 @@ Examples:
 ```bash
 loc templates list
 loc templates validate ./templates/packs/founder-proof-of-work
-loc templates new founder-proof-of-work ~/loc/founder-proof
-loc templates new focused-inbox ~/loc/focused-inbox --json
-loc templates apply founder-proof-of-work weekly-update --to ~/Library/CloudStorage/Locality/notion --title "Week 26 Update"
+loc templates new founder-proof-of-work ~/Locality/founder-proof
+loc templates new focused-inbox ~/Locality/focused-inbox --json
+loc templates apply founder-proof-of-work weekly-update --to ~/Library/CloudStorage/Locality/notion-main --title "Week 26 Update"
 ```
 
 Bundled packs today:
@@ -225,23 +235,40 @@ path into Notion creation without bypassing the explicit push model.
 
 ## Initial `loc mount` and `loc pull`
 
-`loc mount notion <path> --root-page <page-id> [--connection <id>]` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. In virtual projections, the shared Locality root lists connector folders and the guidance appears inside the connector folder, for example `/Locality/notion/AGENTS.md` and `/Locality/notion/CLAUDE.md`. With one active Notion connection, mount auto-assigns it. With multiple active Notion connections, pass `--connection <id>`. Existing mounts without `connection_id` continue to work through the legacy `NOTION_TOKEN` fallback.
+`loc mount notion <path> --root-page <page-id> [--connection <id>]` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. In virtual projections, the shared Locality root lists mount-point folders named from the mount path, and the guidance appears inside that mount-point folder, for example `/Locality/notion-main/AGENTS.md` and `/Locality/notion-main/CLAUDE.md`. With one active Notion connection, mount auto-assigns it. With multiple active Notion connections, pass `--connection <id>`. Existing mounts without `connection_id` continue to work through the legacy `NOTION_TOKEN` fallback.
 
-Workspace Notion mounts use the access granted to the connected integration. If the integration is granted pages from multiple Notion teamspaces, Locality enumerates those accessible top-level pages and databases together under the Notion connector root. Locality does not currently create separate teamspace grouping folders.
+Workspace Notion mounts use the access granted to the connected integration. If the integration is granted pages from multiple Notion teamspaces, Locality enumerates those accessible top-level pages and databases together under the mount-point root. Locality does not currently create separate teamspace grouping folders.
 
 Projection choices are platform-specific. Linux binaries accept `plain-files` and
 `linux-fuse`; macOS binaries accept `plain-files` and `macos-file-provider`;
 Windows binaries accept `plain-files` and `windows-cloud-files`.
 
-`loc mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. On Linux, `--projection linux-fuse` records the equivalent virtual projection and registers the per-mount FUSE service. On Windows, `--projection windows-cloud-files` records a Cloud Files sync root. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension, FUSE helper, or Cloud Files provider lists dataless files from the daemon and materializes a file on open.
+Concrete shared-root examples:
+
+```text
+~/Locality/
+  notion-main/
+  notion-my-company/
+  google-docs-main/
+```
+
+```bash
+loc mount notion ~/Locality/notion-main --workspace --projection linux-fuse
+loc mount notion ~/Locality/notion-my-company --workspace --mount-id notion-my-company --connection notion-company --projection linux-fuse
+loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection linux-fuse
+loc file-provider register ~/Locality/notion-main
+loc file-provider open notion-main
+```
+
+`loc mount notion <path> --root-page <page-id> --projection macos-file-provider` records a macOS File Provider mount. On Linux, `--projection linux-fuse` records the equivalent virtual projection under the shared FUSE root. On Windows, `--projection windows-cloud-files` records a Cloud Files sync root under the shared Locality root. Scheduled pull for virtual projections updates SQLite metadata and queues hydration, but does not write placeholder Markdown bodies. The File Provider extension, FUSE helper, or Cloud Files provider lists dataless files from the daemon and materializes a file on open.
 
 The canonical user-facing virtual projection shape is `<File Provider
-root>/<connector>/...`, for example `~/Library/CloudStorage/Locality/notion` in
+root>/<mount-point>/...`, for example `~/Library/CloudStorage/Locality/notion-main` in
 packaged macOS builds. The exact macOS root is assigned by File Provider and is
 reported by `loc file-provider open <mount>` and the desktop app; local
-development bundles may use names such as `Locality/notion`. Command paths are
+development bundles may use names such as `Locality/notion-main`. Command paths are
 normalized before matching and path traversal or symlink escapes outside the
-connector folder are rejected.
+mount-point folder are rejected.
 
 Linux should expose the same online-only behavior through a FUSE projection
 helper rather than through inotify-triggered placeholder files. The daemon API for
@@ -267,12 +294,12 @@ current platform's virtual projection: `macos_file_provider` on macOS,
 shells out to the signed app-bundle helper at
 `Locality.app/Contents/MacOS/locality-file-providerctl`; `LOCALITY_FILE_PROVIDERCTL` can
 override the helper path for development. On Linux this command can be rerun
-to repair or restart the per-mount systemd user service for `locality-fuse`;
+to repair or restart the systemd user service for the shared FUSE root;
 `LOCALITY_FUSE_BIN` can override the helper binary path for development.
 
 On Windows, `loc file-provider start <mount>` registers or repairs the sync
-root, starts `locality-cloud-files.exe` as a detached per-mount provider process, and
-writes per-mount PID and log metadata under the Locality state directory. `status`
+root, starts `locality-cloud-files.exe` as a detached provider runtime, and
+writes provider PID and log metadata under the Locality state directory. `status`
 reports provider state, daemon reachability, sync-root registration, PID
 metadata, and log paths. `stop` stops the provider runtime without unregistering
 the sync root; `restart` performs stop then start. `LOCALITY_CLOUD_FILES_BIN` can
@@ -423,7 +450,7 @@ JSON output includes:
 Human output is a compact summary:
 
 ```text
-inspect /Users/alice/Library/CloudStorage/Locality/notion/Roadmap/page.md
+inspect /Users/alice/Library/CloudStorage/Locality/notion-main/Roadmap/page.md
   mount: notion-main  entity: page-1
   title: Roadmap
   Synced Tree version: 2026-06-10T00:00:00Z
@@ -497,9 +524,9 @@ Unsupported-operation JSON shape:
 Typical recovery:
 
 ```bash
-loc status ~/loc/notion
-loc restore ~/loc/notion/initial-idea/page.md
-loc status ~/loc/notion
+loc status ~/Locality/notion-main
+loc restore ~/Locality/notion-main/initial-idea/page.md
+loc status ~/Locality/notion-main
 ```
 
 ## `loc daemon status`
@@ -508,13 +535,13 @@ loc status ~/loc/notion
 when the daemon is running, requests a daemon status snapshot. On macOS/Linux
 the CLI uses the Unix socket; on Windows it uses the configured or persisted
 localhost TCP address. JSON output includes process-manager state, runtime queue
-counts, scheduler mode, watched mount count, and watched roots.
+counts, scheduler mode, watched mount-point count, and watched root paths.
 Runtime queue counts include mutating requests, hydration work, scheduled pulls,
 and freshness work. Freshness metrics report pending/ready/deferred jobs plus
 ready and total budget units, which helps diagnose sync pressure without
 requiring a full workspace scan.
 
-`loc daemon reload [--json]` tells a running daemon to reconcile its watched mount roots with the current SQLite mount table. `loc mount` sends the same IPC request after saving a new mount, so a persistent daemon starts watching newly mounted directories without a restart.
+`loc daemon reload [--json]` tells a running daemon to reconcile watched plain-file roots, shared projection roots, and mount-point folders with the current SQLite mount table. `loc mount` sends the same IPC request after saving a new mount, so a persistent daemon starts watching newly mounted directories without a restart.
 
 Human output:
 

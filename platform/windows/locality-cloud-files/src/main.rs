@@ -6,11 +6,16 @@ use locality_platform::{
     cloud_files_mount_id_component, decode_cloud_files_mount_id_component,
     windows_cloud_files_registration_marker_dir,
 };
+use locality_store::MountConfig;
+use locality_store::{MountRepository, ProjectionMode, SqliteStateStore};
 use serde::{Deserialize, Serialize};
 
 const COMMAND_NAME: &str = "locality-cloud-files";
 const PROVIDER_ID: &str = "codeflash.ai.loc";
 const SYNC_ROOT_ID_PREFIX: &str = "codeflash.ai.loc!default!";
+const SHARED_SYNC_ROOT_COMPONENT: &str = "locality";
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 #[cfg(target_os = "windows")]
 const PROVIDER_GUID: u128 = 0xa4ee620b_cab8_4fc5_a942_68ad2854e19f;
 
@@ -44,7 +49,7 @@ enum Command {
 #[derive(Debug, Args)]
 struct RegisterArgs {
     #[arg(long)]
-    mount_id: String,
+    mount_id: Option<String>,
 
     #[arg(long)]
     display_name: String,
@@ -59,7 +64,7 @@ struct RegisterArgs {
 #[derive(Debug, Args)]
 struct RunArgs {
     #[arg(long)]
-    mount_id: String,
+    mount_id: Option<String>,
 
     #[arg(long)]
     sync_root: PathBuf,
@@ -71,7 +76,7 @@ struct RunArgs {
 #[derive(Debug, Args)]
 struct OpenArgs {
     #[arg(long)]
-    mount_id: String,
+    mount_id: Option<String>,
 
     #[arg(long)]
     sync_root: PathBuf,
@@ -201,16 +206,24 @@ impl Command {
 
 fn register(args: RegisterArgs) -> Result<CommandReport, HelperError> {
     ensure_supported_platform()?;
-    validate_mount_id(&args.mount_id)?;
+    if let Some(mount_id) = args.mount_id.as_deref() {
+        validate_mount_id(mount_id)?;
+    }
     validate_display_name(&args.display_name)?;
     validate_absolute_directory_candidate(&args.sync_root, "sync root")?;
     validate_absolute_directory_candidate(&args.state_dir, "state dir")?;
 
-    let sync_root_id = sync_root_id_for_mount(&args.mount_id);
     let sync_root = prepare_directory(&args.sync_root, "create sync root")?;
+    let projection_root = provider_daemon_projection_root(&args.sync_root, &sync_root);
+    let sync_root_id = sync_root_id_for_optional_mount(args.mount_id.as_deref(), &projection_root);
     let state_dir = prepare_directory(&args.state_dir, "create state dir")?;
 
-    register_cloud_filter_sync_root(&sync_root_id, &args.display_name, &sync_root)?;
+    register_cloud_filter_sync_root(
+        &sync_root_id,
+        &args.display_name,
+        &sync_root,
+        root_identity_for_optional_mount(args.mount_id.as_deref()).as_bytes(),
+    )?;
     let shell_registration =
         register_shell_sync_root(&sync_root_id, &args.display_name, &sync_root);
     let (shell_registered, shell_registration_error) = match shell_registration {
@@ -223,7 +236,7 @@ fn register(args: RegisterArgs) -> Result<CommandReport, HelperError> {
         ok: true,
         command: COMMAND_NAME,
         action: "register",
-        mount_id: Some(args.mount_id),
+        mount_id: args.mount_id,
         display_name: Some(args.display_name),
         sync_root: Some(path_for_report(&sync_root)),
         sync_root_id: Some(sync_root_id),
@@ -237,19 +250,27 @@ fn register(args: RegisterArgs) -> Result<CommandReport, HelperError> {
 
 fn run_provider(args: RunArgs) -> Result<CommandReport, HelperError> {
     ensure_supported_platform()?;
-    validate_mount_id(&args.mount_id)?;
+    if let Some(mount_id) = args.mount_id.as_deref() {
+        validate_mount_id(mount_id)?;
+    }
     validate_absolute_directory_candidate(&args.sync_root, "sync root")?;
     validate_absolute_directory_candidate(&args.state_dir, "state dir")?;
 
-    let sync_root_id = sync_root_id_for_mount(&args.mount_id);
     let sync_root = canonical_or_original(&args.sync_root);
-    run_cloud_filter_provider(&args.mount_id, &sync_root, &args.state_dir)?;
+    let projection_root = provider_daemon_projection_root(&args.sync_root, &sync_root);
+    let sync_root_id = sync_root_id_for_optional_mount(args.mount_id.as_deref(), &projection_root);
+    run_cloud_filter_provider(
+        args.mount_id.as_deref(),
+        &sync_root,
+        &projection_root,
+        &args.state_dir,
+    )?;
 
     Ok(CommandReport {
         ok: true,
         command: COMMAND_NAME,
         action: "run",
-        mount_id: Some(args.mount_id),
+        mount_id: args.mount_id,
         display_name: None,
         sync_root: Some(path_for_report(&sync_root)),
         sync_root_id: Some(sync_root_id),
@@ -263,20 +284,24 @@ fn run_provider(args: RunArgs) -> Result<CommandReport, HelperError> {
 
 fn open(args: OpenArgs) -> Result<CommandReport, HelperError> {
     ensure_supported_platform()?;
-    validate_mount_id(&args.mount_id)?;
+    if let Some(mount_id) = args.mount_id.as_deref() {
+        validate_mount_id(mount_id)?;
+    }
     validate_absolute_directory_candidate(&args.sync_root, "sync root")?;
 
     let sync_root = canonical_or_original(&args.sync_root);
+    let projection_root = provider_daemon_projection_root(&args.sync_root, &sync_root);
+    let sync_root_id = sync_root_id_for_optional_mount(args.mount_id.as_deref(), &projection_root);
     open_sync_root(&sync_root)?;
 
     Ok(CommandReport {
         ok: true,
         command: COMMAND_NAME,
         action: "open",
-        mount_id: Some(args.mount_id.clone()),
+        mount_id: args.mount_id.clone(),
         display_name: None,
         sync_root: Some(path_for_report(&sync_root)),
-        sync_root_id: Some(sync_root_id_for_mount(&args.mount_id)),
+        sync_root_id: Some(sync_root_id),
         provider_id: Some(PROVIDER_ID.to_string()),
         roots: None,
         cloud_filter_registered: None,
@@ -288,12 +313,21 @@ fn open(args: OpenArgs) -> Result<CommandReport, HelperError> {
 fn unregister(args: UnregisterArgs) -> Result<CommandReport, HelperError> {
     ensure_supported_platform()?;
     validate_mount_id(&args.mount_id)?;
-    let sync_root_id = sync_root_id_for_mount(&args.mount_id);
-    let marker = args.state_dir.as_deref().and_then(|state_dir| {
-        read_registration_marker(state_dir, &args.mount_id)
-            .ok()
-            .flatten()
-    });
+    let (sync_root_id, marker) = match args.state_dir.as_deref() {
+        Some(state_dir) => {
+            if let Some((sync_root_id, marker)) =
+                shared_registration_for_unregister_target(state_dir, &args.mount_id)?
+            {
+                (sync_root_id, marker)
+            } else {
+                (
+                    sync_root_id_for_mount(&args.mount_id),
+                    read_registration_marker(state_dir, &args.mount_id)?,
+                )
+            }
+        }
+        None => (sync_root_id_for_mount(&args.mount_id), None),
+    };
     let shell_root = if marker.is_none() {
         list_shell_sync_roots()?
             .into_iter()
@@ -305,11 +339,21 @@ fn unregister(args: UnregisterArgs) -> Result<CommandReport, HelperError> {
         .as_ref()
         .map(|marker| marker.sync_root.clone())
         .or_else(|| shell_root.as_ref().and_then(|root| root.path.clone()));
+    let matched_legacy_shared_marker = marker.as_ref().is_some_and(|marker| {
+        args.mount_id == SHARED_SYNC_ROOT_COMPONENT
+            || marker.sync_root_id == legacy_sync_root_id_for_projection_root()
+    });
     if let Some(sync_root) = sync_root.as_deref() {
         unregister_cloud_filter_sync_root(Path::new(sync_root))?;
     }
     let _ = unregister_shell_sync_root(&sync_root_id);
     if let Some(state_dir) = args.state_dir.as_deref() {
+        if is_shared_sync_root_id(&sync_root_id) {
+            remove_shared_registration_marker(state_dir, &sync_root_id)?;
+            if matched_legacy_shared_marker {
+                remove_registration_marker_at(&legacy_shared_registration_marker_dir(state_dir))?;
+            }
+        }
         remove_registration_marker(state_dir, &args.mount_id)?;
     }
 
@@ -366,6 +410,9 @@ fn reset(args: StateDirArgs) -> Result<CommandReport, HelperError> {
             (args.state_dir.as_deref(), root.mount_id.as_deref())
         {
             remove_registration_marker(state_dir, mount_id)?;
+        } else if let (Some(state_dir), None) = (args.state_dir.as_deref(), root.mount_id.as_ref())
+        {
+            remove_shared_registration_marker(state_dir, &root.id)?;
         }
     }
 
@@ -503,6 +550,10 @@ fn canonical_or_original(path: &Path) -> PathBuf {
     platform_display_path(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
 }
 
+fn provider_daemon_projection_root(sync_root_arg: &Path, _sync_root: &Path) -> PathBuf {
+    platform_display_path(sync_root_arg.to_path_buf())
+}
+
 fn platform_display_path(path: PathBuf) -> PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -539,15 +590,107 @@ fn sync_root_id_for_mount(mount_id: &str) -> String {
     )
 }
 
+fn legacy_sync_root_id_for_projection_root() -> String {
+    format!("{SYNC_ROOT_ID_PREFIX}{SHARED_SYNC_ROOT_COMPONENT}")
+}
+
+fn sync_root_id_for_projection_root(sync_root: &Path) -> String {
+    format!(
+        "{SYNC_ROOT_ID_PREFIX}{}",
+        shared_sync_root_component_for_projection_root(sync_root)
+    )
+}
+
+fn shared_sync_root_component_for_projection_root(sync_root: &Path) -> String {
+    format!(
+        "{SHARED_SYNC_ROOT_COMPONENT}-{}",
+        stable_hex_hash(&projection_root_key(sync_root))
+    )
+}
+
+fn projection_root_key(path: &Path) -> String {
+    let mut value = path.display().to_string().replace('/', "\\");
+    while value.ends_with('\\') && value.len() > 3 {
+        value.pop();
+    }
+    value.to_ascii_lowercase()
+}
+
+fn stable_hex_hash(value: &str) -> String {
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+fn sync_root_id_for_optional_mount(mount_id: Option<&str>, sync_root: &Path) -> String {
+    mount_id
+        .map(sync_root_id_for_mount)
+        .unwrap_or_else(|| sync_root_id_for_projection_root(sync_root))
+}
+
+fn root_identity_for_optional_mount(mount_id: Option<&str>) -> String {
+    mount_id
+        .map(projection_root_identifier)
+        .unwrap_or_else(|| localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string())
+}
+
+#[test]
+fn sync_root_ids_are_distinct_for_shared_projection_roots() {
+    let ada = sync_root_id_for_projection_root(Path::new(r"C:\Users\Ada\Locality"));
+    let grace = sync_root_id_for_projection_root(Path::new(r"D:\Teams\Grace\Locality"));
+
+    assert!(ada.starts_with("codeflash.ai.loc!default!locality-"));
+    assert!(grace.starts_with("codeflash.ai.loc!default!locality-"));
+    assert_ne!(ada, grace);
+    assert_eq!(
+        ada,
+        sync_root_id_for_projection_root(Path::new(r"c:\users\ada\locality\"))
+    );
+}
+
+fn projection_root_identifier(mount_id: &str) -> String {
+    format!("mount:{mount_id}")
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn mount_id_from_sync_root_id(sync_root_id: &str) -> Option<String> {
+    if is_shared_sync_root_id(sync_root_id) {
+        return None;
+    }
     sync_root_id
         .strip_prefix(SYNC_ROOT_ID_PREFIX)
         .and_then(decode_cloud_files_mount_id_component)
 }
 
+fn is_shared_sync_root_id(sync_root_id: &str) -> bool {
+    sync_root_id
+        .strip_prefix(SYNC_ROOT_ID_PREFIX)
+        .is_some_and(is_shared_sync_root_component)
+}
+
+fn is_shared_sync_root_component(component: &str) -> bool {
+    if component == SHARED_SYNC_ROOT_COMPONENT {
+        return true;
+    }
+    let Some(hash) = component.strip_prefix("locality-") else {
+        return false;
+    };
+    hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn registration_marker_dir(state_dir: &Path, mount_id: &str) -> PathBuf {
     windows_cloud_files_registration_marker_dir(state_dir, mount_id)
+}
+
+fn legacy_shared_registration_marker_dir(state_dir: &Path) -> PathBuf {
+    registration_marker_dir(state_dir, SHARED_SYNC_ROOT_COMPONENT)
+}
+
+fn shared_registration_marker_dir(state_dir: &Path, sync_root_id: &str) -> PathBuf {
+    registration_marker_dir(state_dir, sync_root_id)
 }
 
 fn write_registration_marker(
@@ -556,7 +699,11 @@ fn write_registration_marker(
     sync_root: &Path,
     sync_root_id: &str,
 ) -> Result<(), HelperError> {
-    let marker_dir = registration_marker_dir(state_dir, &args.mount_id);
+    let marker_dir = args
+        .mount_id
+        .as_deref()
+        .map(|mount_id| registration_marker_dir(state_dir, mount_id))
+        .unwrap_or_else(|| shared_registration_marker_dir(state_dir, sync_root_id));
     std::fs::create_dir_all(&marker_dir)
         .map_err(|error| HelperError::io("create cloud files state", error))?;
     let marker = RegistrationMarker {
@@ -576,7 +723,13 @@ fn read_registration_marker(
     state_dir: &Path,
     mount_id: &str,
 ) -> Result<Option<RegistrationMarker>, HelperError> {
-    let marker_path = registration_marker_dir(state_dir, mount_id).join("registration.json");
+    read_registration_marker_at(&registration_marker_dir(state_dir, mount_id))
+}
+
+fn read_registration_marker_at(
+    marker_dir: &Path,
+) -> Result<Option<RegistrationMarker>, HelperError> {
+    let marker_path = marker_dir.join("registration.json");
     match std::fs::read_to_string(&marker_path) {
         Ok(json) => serde_json::from_str(&json)
             .map(Some)
@@ -587,6 +740,84 @@ fn read_registration_marker(
             error,
         )),
     }
+}
+
+fn read_shared_registration_marker(
+    state_dir: &Path,
+    sync_root: &Path,
+    sync_root_id: &str,
+) -> Result<Option<RegistrationMarker>, HelperError> {
+    if let Some(marker) =
+        read_registration_marker_at(&shared_registration_marker_dir(state_dir, sync_root_id))?
+    {
+        return Ok(Some(marker));
+    }
+
+    let legacy = read_legacy_shared_registration_marker(state_dir)?;
+    Ok(legacy
+        .filter(|marker| shared_marker_matches_projection_root(marker, sync_root, sync_root_id)))
+}
+
+fn read_legacy_shared_registration_marker(
+    state_dir: &Path,
+) -> Result<Option<RegistrationMarker>, HelperError> {
+    read_registration_marker_at(&legacy_shared_registration_marker_dir(state_dir))
+}
+
+fn shared_marker_matches_projection_root(
+    marker: &RegistrationMarker,
+    sync_root: &Path,
+    sync_root_id: &str,
+) -> bool {
+    marker.sync_root_id == sync_root_id
+        || (marker.sync_root_id == legacy_sync_root_id_for_projection_root()
+            && projection_root_key(Path::new(&marker.sync_root)) == projection_root_key(sync_root))
+}
+
+fn shared_registration_for_unregister_target(
+    state_dir: &Path,
+    mount_id: &str,
+) -> Result<Option<(String, Option<RegistrationMarker>)>, HelperError> {
+    if mount_id == SHARED_SYNC_ROOT_COMPONENT {
+        let marker = read_legacy_shared_registration_marker(state_dir)?;
+        let sync_root_id = marker
+            .as_ref()
+            .map(|marker| marker.sync_root_id.clone())
+            .filter(|sync_root_id| is_shared_sync_root_id(sync_root_id))
+            .unwrap_or_else(legacy_sync_root_id_for_projection_root);
+        return Ok(Some((sync_root_id, marker)));
+    }
+
+    let Ok(store) = SqliteStateStore::open(state_dir.to_path_buf()) else {
+        return Ok(None);
+    };
+    let mount_id = locality_core::model::MountId::new(mount_id);
+    let Some(mount) = store
+        .get_mount(&mount_id)
+        .map_err(|error| HelperError::new("state_read_failed", error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    if mount.projection != ProjectionMode::WindowsCloudFiles {
+        return Ok(None);
+    }
+
+    let sync_root = localityd::virtual_fs::virtual_projection_root(&mount);
+    let sync_root_id = sync_root_id_for_projection_root(&sync_root);
+    let shared = read_shared_registration_marker(state_dir, &sync_root, &sync_root_id)?;
+    if shared.is_some() {
+        return Ok(Some((sync_root_id, shared)));
+    }
+
+    let legacy_mount_marker = read_registration_marker(state_dir, &mount.mount_id.0)?;
+    if legacy_mount_marker.is_some() {
+        return Ok(Some((
+            sync_root_id_for_mount(&mount.mount_id.0),
+            legacy_mount_marker,
+        )));
+    }
+
+    Ok(Some((sync_root_id, None)))
 }
 
 fn list_marker_sync_roots(state_dir: &Path) -> Result<Vec<SyncRootReport>, HelperError> {
@@ -619,7 +850,7 @@ fn list_marker_sync_roots(state_dir: &Path) -> Result<Vec<SyncRootReport>, Helpe
         }
         roots.push(SyncRootReport {
             id: marker.sync_root_id,
-            mount_id: Some(marker.mount_id),
+            mount_id: marker.mount_id,
             display_name: Some(marker.display_name),
             path: Some(marker.sync_root),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -658,9 +889,72 @@ fn remove_registration_marker(state_dir: &Path, mount_id: &str) -> Result<(), He
     Ok(())
 }
 
+fn remove_shared_registration_marker(
+    state_dir: &Path,
+    sync_root_id: &str,
+) -> Result<(), HelperError> {
+    let removed_marker =
+        read_registration_marker_at(&shared_registration_marker_dir(state_dir, sync_root_id))?;
+    remove_registration_marker_at(&shared_registration_marker_dir(state_dir, sync_root_id))?;
+    if sync_root_id == legacy_sync_root_id_for_projection_root() {
+        remove_registration_marker_at(&legacy_shared_registration_marker_dir(state_dir))?;
+    } else if let Some(marker) = removed_marker {
+        remove_matching_legacy_shared_registration_marker(state_dir, &marker, sync_root_id)?;
+    }
+    Ok(())
+}
+
+fn remove_matching_legacy_shared_registration_marker(
+    state_dir: &Path,
+    removed_marker: &RegistrationMarker,
+    sync_root_id: &str,
+) -> Result<(), HelperError> {
+    let Some(legacy_marker) = read_legacy_shared_registration_marker(state_dir)? else {
+        return Ok(());
+    };
+    if shared_marker_matches_projection_root(
+        &legacy_marker,
+        Path::new(&removed_marker.sync_root),
+        sync_root_id,
+    ) {
+        remove_registration_marker_at(&legacy_shared_registration_marker_dir(state_dir))?;
+    }
+    Ok(())
+}
+
+fn remove_registration_marker_at(marker_dir: &Path) -> Result<(), HelperError> {
+    let marker_path = marker_dir.join("registration.json");
+    match std::fs::remove_file(&marker_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(HelperError::io(
+                "remove cloud files registration marker",
+                error,
+            ));
+        }
+    }
+    match std::fs::remove_dir(marker_dir) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(error) => {
+            return Err(HelperError::io(
+                "remove cloud files registration directory",
+                error,
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RegistrationMarker {
-    mount_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mount_id: Option<String>,
     display_name: String,
     sync_root: String,
     sync_root_id: String,
@@ -672,6 +966,7 @@ fn register_cloud_filter_sync_root(
     sync_root_id: &str,
     display_name: &str,
     sync_root: &Path,
+    root_identity: &[u8],
 ) -> Result<(), HelperError> {
     let _ = display_name;
     use windows::Win32::Storage::CloudFilters::{
@@ -690,7 +985,6 @@ fn register_cloud_filter_sync_root(
     let provider_name = wide_str("Locality");
     let provider_version = wide_str(env!("CARGO_PKG_VERSION"));
     let identity = sync_root_id.as_bytes();
-    let root_identity = localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.as_bytes();
     let registration = CF_SYNC_REGISTRATION {
         StructSize: std::mem::size_of::<CF_SYNC_REGISTRATION>() as u32,
         ProviderName: PCWSTR::from_raw(provider_name.as_ptr()),
@@ -737,6 +1031,7 @@ fn register_cloud_filter_sync_root(
     _sync_root_id: &str,
     _display_name: &str,
     _sync_root: &Path,
+    _root_identity: &[u8],
 ) -> Result<(), HelperError> {
     Err(HelperError::new(
         "unsupported_platform",
@@ -790,8 +1085,9 @@ const STATUS_UNSUCCESSFUL_VALUE: i32 = 0xC0000001_u32 as i32;
 #[cfg(target_os = "windows")]
 #[derive(Clone, Debug)]
 struct ProviderContext {
-    mount_id: String,
+    legacy_mount_id: Option<String>,
     sync_root: PathBuf,
+    projection_root: PathBuf,
     state_dir: PathBuf,
     identity_index: ProviderIdentityIndex,
     local_file_index: ProviderLocalFileIndex,
@@ -883,6 +1179,55 @@ struct ProviderLocalFileIndex {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct ResolvedIdentifier {
+    mount: MountConfig,
+    daemon_identifier: String,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Debug, Eq, PartialEq)]
+struct LegacyResolvedIdentifier {
+    mount_id: locality_core::model::MountId,
+    daemon_identifier: String,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn resolve_legacy_provider_identifier(
+    legacy_mount_id: Option<&str>,
+    identifier: &str,
+) -> Result<Option<LegacyResolvedIdentifier>, HelperError> {
+    let Some(legacy_mount_id) = legacy_mount_id else {
+        return Ok(None);
+    };
+    let legacy_mount_id = locality_core::model::MountId::new(legacy_mount_id);
+
+    if !identifier.starts_with(localityd::virtual_projection::SHARED_IDENTIFIER_PREFIX) {
+        return Ok(Some(LegacyResolvedIdentifier {
+            mount_id: legacy_mount_id,
+            daemon_identifier: identifier.to_string(),
+        }));
+    }
+
+    let unwrapped = localityd::virtual_projection::unwrap_identifier(identifier)
+        .map_err(|error| HelperError::new("invalid_identifier", error.to_string()))?;
+    if unwrapped.mount_id != legacy_mount_id {
+        return Err(HelperError::new(
+            "mount_outside_sync_root",
+            format!(
+                "identifier belongs to mount `{}`, not legacy provider mount `{}`",
+                unwrapped.mount_id.0, legacy_mount_id.0
+            ),
+        ));
+    }
+
+    Ok(Some(LegacyResolvedIdentifier {
+        mount_id: legacy_mount_id,
+        daemon_identifier: unwrapped.daemon_identifier,
+    }))
+}
+
+#[cfg(target_os = "windows")]
 impl ProviderLocalFileIndex {
     fn remember(&self, path: &Path, identifier: &str) {
         let fingerprint = local_file_fingerprint(path).ok().flatten();
@@ -925,30 +1270,68 @@ impl ProviderLocalFileIndex {
 
 #[cfg(target_os = "windows")]
 impl ProviderContext {
+    fn root_identifier(&self) -> String {
+        self.legacy_mount_id
+            .as_deref()
+            .map(projection_root_identifier)
+            .unwrap_or_else(|| localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string())
+    }
+
     fn children(
         &self,
         container_identifier: &str,
     ) -> Result<localityd::file_provider::FileProviderChildrenReport, HelperError> {
-        self.request(
+        if self.legacy_mount_id.is_none()
+            && container_identifier == localityd::file_provider::ROOT_CONTAINER_IDENTIFIER
+        {
+            return self.request(
+                &localityd::ipc::DaemonRequest::VirtualProjectionRootChildren {
+                    projection_root: self.projection_root.clone(),
+                    projection: ProjectionMode::WindowsCloudFiles,
+                },
+                METADATA_REQUEST_TIMEOUT,
+            );
+        }
+
+        let resolved = self.resolve_identifier(container_identifier)?;
+        let mut report: localityd::file_provider::FileProviderChildrenReport = self.request(
             &localityd::ipc::DaemonRequest::FileProviderChildren {
-                mount_id: self.mount_id.clone(),
-                container_identifier: container_identifier.to_string(),
+                mount_id: resolved.mount.mount_id.0.clone(),
+                container_identifier: resolved.daemon_identifier.clone(),
             },
             METADATA_REQUEST_TIMEOUT,
-        )
+        )?;
+        if self.legacy_mount_id.is_none() {
+            report.container_identifier = container_identifier.to_string();
+            report.children = report
+                .children
+                .into_iter()
+                .map(|item| localityd::virtual_projection::wrap_item(&resolved.mount, item))
+                .collect();
+        }
+        Ok(report)
     }
 
     fn read(
         &self,
         identifier: &str,
     ) -> Result<localityd::file_provider::FileProviderReadReport, HelperError> {
-        self.request(
+        let resolved = self.resolve_identifier(identifier)?;
+        let mut report: localityd::file_provider::FileProviderReadReport = self.request(
             &localityd::ipc::DaemonRequest::FileProviderRead {
-                mount_id: self.mount_id.clone(),
-                identifier: identifier.to_string(),
+                mount_id: resolved.mount.mount_id.0.clone(),
+                identifier: resolved.daemon_identifier.clone(),
             },
             MATERIALIZE_REQUEST_TIMEOUT,
-        )
+        )?;
+        if self.legacy_mount_id.is_none() {
+            report.identifier = localityd::virtual_projection::wrap_identifier(
+                &resolved.mount.mount_id,
+                &report.identifier,
+            );
+            report.item = localityd::virtual_projection::wrap_item(&resolved.mount, report.item);
+        }
+        Ok(report)
     }
 
     fn commit_write(
@@ -959,14 +1342,22 @@ impl ProviderContext {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD as BASE64;
 
-        self.request(
+        let resolved = self.resolve_identifier(identifier)?;
+        let mut report: localityd::virtual_fs::VirtualFsWriteReport = self.request(
             &localityd::ipc::DaemonRequest::VirtualFsCommitWrite {
-                mount_id: self.mount_id.clone(),
-                identifier: identifier.to_string(),
+                mount_id: resolved.mount.mount_id.0.clone(),
+                identifier: resolved.daemon_identifier.clone(),
                 contents_base64: BASE64.encode(contents),
             },
             MUTATION_REQUEST_TIMEOUT,
-        )
+        )?;
+        if self.legacy_mount_id.is_none() {
+            report.identifier = localityd::virtual_projection::wrap_identifier(
+                &resolved.mount.mount_id,
+                &report.identifier,
+            );
+        }
+        Ok(report)
     }
 
     fn create_file(
@@ -974,14 +1365,17 @@ impl ProviderContext {
         parent_identifier: &str,
         filename: &str,
     ) -> Result<localityd::virtual_fs::VirtualFsMutationReport, HelperError> {
-        self.request(
+        let resolved = self.resolve_identifier(parent_identifier)?;
+        let mut report: localityd::virtual_fs::VirtualFsMutationReport = self.request(
             &localityd::ipc::DaemonRequest::VirtualFsCreateFile {
-                mount_id: self.mount_id.clone(),
-                parent_identifier: parent_identifier.to_string(),
+                mount_id: resolved.mount.mount_id.0.clone(),
+                parent_identifier: resolved.daemon_identifier.clone(),
                 filename: filename.to_string(),
             },
             MUTATION_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_mutation_report(&resolved.mount, &mut report);
+        Ok(report)
     }
 
     fn create_directory(
@@ -989,14 +1383,17 @@ impl ProviderContext {
         parent_identifier: &str,
         dirname: &str,
     ) -> Result<localityd::virtual_fs::VirtualFsMutationReport, HelperError> {
-        self.request(
+        let resolved = self.resolve_identifier(parent_identifier)?;
+        let mut report: localityd::virtual_fs::VirtualFsMutationReport = self.request(
             &localityd::ipc::DaemonRequest::VirtualFsCreateDirectory {
-                mount_id: self.mount_id.clone(),
-                parent_identifier: parent_identifier.to_string(),
+                mount_id: resolved.mount.mount_id.0.clone(),
+                parent_identifier: resolved.daemon_identifier.clone(),
                 dirname: dirname.to_string(),
             },
             MUTATION_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_mutation_report(&resolved.mount, &mut report);
+        Ok(report)
     }
 
     fn rename(
@@ -1005,28 +1402,112 @@ impl ProviderContext {
         new_parent_identifier: &str,
         new_filename: &str,
     ) -> Result<localityd::virtual_fs::VirtualFsMutationReport, HelperError> {
-        self.request(
+        let resolved = self.resolve_identifier(identifier)?;
+        let parent = self.resolve_identifier(new_parent_identifier)?;
+        if resolved.mount.mount_id != parent.mount.mount_id {
+            return Err(HelperError::new(
+                "unsupported_rename",
+                "Windows Cloud Files renames across Locality mounts are not supported",
+            ));
+        }
+        let mut report: localityd::virtual_fs::VirtualFsMutationReport = self.request(
             &localityd::ipc::DaemonRequest::VirtualFsRename {
-                mount_id: self.mount_id.clone(),
-                identifier: identifier.to_string(),
-                new_parent_identifier: new_parent_identifier.to_string(),
+                mount_id: resolved.mount.mount_id.0.clone(),
+                identifier: resolved.daemon_identifier.clone(),
+                new_parent_identifier: parent.daemon_identifier,
                 new_filename: new_filename.to_string(),
             },
             MUTATION_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_mutation_report(&resolved.mount, &mut report);
+        Ok(report)
     }
 
     fn trash(
         &self,
         identifier: &str,
     ) -> Result<localityd::virtual_fs::VirtualFsMutationReport, HelperError> {
-        self.request(
+        let resolved = self.resolve_identifier(identifier)?;
+        let mut report: localityd::virtual_fs::VirtualFsMutationReport = self.request(
             &localityd::ipc::DaemonRequest::VirtualFsTrash {
-                mount_id: self.mount_id.clone(),
-                identifier: identifier.to_string(),
+                mount_id: resolved.mount.mount_id.0.clone(),
+                identifier: resolved.daemon_identifier.clone(),
             },
             MUTATION_REQUEST_TIMEOUT,
-        )
+        )?;
+        self.wrap_mutation_report(&resolved.mount, &mut report);
+        Ok(report)
+    }
+
+    fn wrap_mutation_report(
+        &self,
+        mount: &MountConfig,
+        report: &mut localityd::virtual_fs::VirtualFsMutationReport,
+    ) {
+        if self.legacy_mount_id.is_some() {
+            return;
+        }
+        report.identifier =
+            localityd::virtual_projection::wrap_identifier(&mount.mount_id, &report.identifier);
+        report.item = localityd::virtual_projection::wrap_item(mount, report.item.clone());
+        report.path = report.item.path.clone();
+    }
+
+    fn resolve_identifier(&self, identifier: &str) -> Result<ResolvedIdentifier, HelperError> {
+        if let Some(resolved) =
+            resolve_legacy_provider_identifier(self.legacy_mount_id.as_deref(), identifier)?
+        {
+            let mount = self.load_mount_config(&resolved.mount_id)?;
+            return Ok(ResolvedIdentifier {
+                mount,
+                daemon_identifier: resolved.daemon_identifier,
+            });
+        }
+
+        let unwrapped = localityd::virtual_projection::unwrap_identifier(identifier)
+            .map_err(|error| HelperError::new("invalid_identifier", error.to_string()))?;
+        let mount = self.load_mount_config(&unwrapped.mount_id)?;
+        Ok(ResolvedIdentifier {
+            mount,
+            daemon_identifier: unwrapped.daemon_identifier,
+        })
+    }
+
+    fn load_mount_config(
+        &self,
+        mount_id: &locality_core::model::MountId,
+    ) -> Result<MountConfig, HelperError> {
+        let store = SqliteStateStore::open(self.state_dir.clone())
+            .map_err(|error| HelperError::new("state_open_failed", error.to_string()))?;
+        let mount = store
+            .get_mount(mount_id)
+            .map_err(|error| HelperError::new("state_read_failed", error.to_string()))?
+            .ok_or_else(|| {
+                HelperError::new(
+                    "mount_not_found",
+                    format!("mount `{}` was not found in Locality state", mount_id.0),
+                )
+            })?;
+        if mount.projection != ProjectionMode::WindowsCloudFiles {
+            return Err(HelperError::new(
+                "invalid_mount",
+                format!("mount `{}` is not a Windows Cloud Files mount", mount_id.0),
+            ));
+        }
+        if self.legacy_mount_id.is_none()
+            && !shared_provider_mount_matches_projection_root(&mount, &self.projection_root)
+        {
+            return Err(HelperError::new(
+                "mount_outside_sync_root",
+                format!(
+                    "mount `{}` belongs to Windows Cloud Files sync root `{}`, not provider sync root `{}`",
+                    mount_id.0,
+                    localityd::virtual_fs::virtual_projection_root(&mount).display(),
+                    self.projection_root.display()
+                ),
+            ));
+        }
+        Ok(mount)
     }
 
     fn remember_path_identity(&self, path: &Path, identifier: &str) {
@@ -1245,7 +1726,7 @@ fn is_remove_like_event(kind: &notify::event::EventKind) -> bool {
     )
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(test, target_os = "windows"))]
 fn is_modify_like_event(kind: &notify::event::EventKind) -> bool {
     local_modify_event_kind(kind).is_some()
 }
@@ -1450,9 +1931,9 @@ fn local_path_disappeared(error: &HelperError) -> bool {
         || error.message.contains("cannot find the file")
 }
 
-#[cfg(target_os = "windows")]
 fn stale_pending_file_delete(identifier: &str, error: &HelperError) -> bool {
-    identifier.starts_with("local:") && error.message.contains("was not found in mount")
+    daemon_identifier_for_identity_check(identifier).starts_with("local:")
+        && error.message.contains("was not found in mount")
 }
 
 #[cfg(target_os = "windows")]
@@ -1478,7 +1959,7 @@ fn identity_for_path(
             match daemon_identity_for_path(context, &path) {
                 Ok(Some(refreshed)) => return Ok(Some(refreshed)),
                 Ok(None) => {}
-                Err(error) if error.code == "daemon_unavailable" => {}
+                Err(error) if cached_identity_refresh_unavailable(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -1488,8 +1969,22 @@ fn identity_for_path(
 }
 
 #[cfg(target_os = "windows")]
+fn cached_identity_refresh_unavailable(error: &HelperError) -> bool {
+    matches!(
+        error.code,
+        "daemon_unavailable" | "state_open_failed" | "mount_not_found"
+    )
+}
+
 fn is_local_identity(identifier: &str) -> bool {
+    let identifier = daemon_identifier_for_identity_check(identifier);
     identifier.starts_with("local:") || identifier.starts_with("children:local:")
+}
+
+fn daemon_identifier_for_identity_check(identifier: &str) -> std::borrow::Cow<'_, str> {
+    localityd::virtual_projection::unwrap_identifier(identifier)
+        .map(|unwrapped| std::borrow::Cow::Owned(unwrapped.daemon_identifier))
+        .unwrap_or_else(|_| std::borrow::Cow::Borrowed(identifier))
 }
 
 #[cfg(target_os = "windows")]
@@ -1502,12 +1997,10 @@ fn daemon_identity_for_path(
         None => return Ok(None),
     };
     if relative_path.as_os_str().is_empty() {
-        return Ok(Some(
-            localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string(),
-        ));
+        return Ok(Some(context.root_identifier()));
     }
 
-    let mut current_identifier = localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string();
+    let mut current_identifier = context.root_identifier();
     let mut current_path = context.sync_root.clone();
     for component in relative_path.components() {
         let std::path::Component::Normal(component) = component else {
@@ -1614,18 +2107,21 @@ fn retry_operation_until<T>(
 
 #[cfg(target_os = "windows")]
 fn run_cloud_filter_provider(
-    mount_id: &str,
+    mount_id: Option<&str>,
     sync_root: &Path,
+    projection_root: &Path,
     state_dir: &Path,
 ) -> Result<(), HelperError> {
     wait_for_daemon(state_dir)?;
-    let mut connected = connect_cloud_filter_sync_root(mount_id, sync_root, state_dir)?;
+    let mut connected =
+        connect_cloud_filter_sync_root(mount_id, sync_root, projection_root, state_dir)?;
     let seeded = seed_root_placeholders(&connected.context)?;
     connected.local_change_watcher = Some(start_local_change_watcher(
         connected.context.as_ref().clone(),
     )?);
+    let display_id = mount_id.unwrap_or(SHARED_SYNC_ROOT_COMPONENT);
     eprintln!(
-        "{COMMAND_NAME}: connected `{mount_id}` at `{}` and seeded {seeded} root placeholder{}",
+        "{COMMAND_NAME}: connected `{display_id}` at `{}` and seeded {seeded} root placeholder{}",
         sync_root.display(),
         plural(seeded)
     );
@@ -1635,8 +2131,9 @@ fn run_cloud_filter_provider(
 
 #[cfg(not(target_os = "windows"))]
 fn run_cloud_filter_provider(
-    _mount_id: &str,
+    _mount_id: Option<&str>,
     _sync_root: &Path,
+    _projection_root: &Path,
     _state_dir: &Path,
 ) -> Result<(), HelperError> {
     Err(HelperError::new(
@@ -1691,8 +2188,9 @@ fn wait_for_shutdown() -> Result<(), HelperError> {
 
 #[cfg(target_os = "windows")]
 fn connect_cloud_filter_sync_root(
-    mount_id: &str,
+    mount_id: Option<&str>,
     sync_root: &Path,
+    projection_root: &Path,
     state_dir: &Path,
 ) -> Result<ConnectedCloudProvider, HelperError> {
     use windows::Win32::Storage::CloudFilters::{
@@ -1704,8 +2202,9 @@ fn connect_cloud_filter_sync_root(
     use windows::core::PCWSTR;
 
     let context = Box::new(ProviderContext {
-        mount_id: mount_id.to_string(),
+        legacy_mount_id: mount_id.map(str::to_string),
         sync_root: sync_root.to_path_buf(),
+        projection_root: projection_root.to_path_buf(),
         state_dir: state_dir.to_path_buf(),
         identity_index: Default::default(),
         local_file_index: Default::default(),
@@ -1757,7 +2256,7 @@ fn connect_cloud_filter_sync_root(
 
 #[cfg(target_os = "windows")]
 fn seed_root_placeholders(context: &ProviderContext) -> Result<usize, HelperError> {
-    let children = context.children(localityd::file_provider::ROOT_CONTAINER_IDENTIFIER)?;
+    let children = context.children(&context.root_identifier())?;
     create_placeholders_in_directory(&context.sync_root, &children.children)?;
     remember_placeholder_children(context, &context.sync_root, &children.children);
     Ok(children.children.len())
@@ -1909,8 +2408,8 @@ unsafe fn handle_fetch_placeholders(
         )
     })?;
     let context = unsafe { provider_context(info) }?;
-    let container_identifier = callback_identifier(info)
-        .unwrap_or_else(|| localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string());
+    let container_identifier =
+        callback_identifier(info).unwrap_or_else(|| context.root_identifier());
     trace_cloud_files(format!(
         "fetch placeholders start container=`{container_identifier}`"
     ));
@@ -2129,9 +2628,8 @@ unsafe fn handle_delete(
     }
 }
 
-#[cfg(target_os = "windows")]
 fn stale_pending_page_directory_delete(identifier: &str, error: &HelperError) -> bool {
-    identifier.starts_with("children:local:")
+    daemon_identifier_for_identity_check(identifier).starts_with("children:local:")
         && error.message.contains("not present in daemon state")
 }
 
@@ -2218,7 +2716,7 @@ fn parent_identifier_for_path(
 ) -> Result<String, HelperError> {
     let parent = absolute_cloud_path(context, parent);
     if same_cloud_path(&parent, &context.sync_root) {
-        return Ok(localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string());
+        return Ok(context.root_identifier());
     }
     if let Some(identifier) = identity_for_path(context, &parent)? {
         return Ok(identifier);
@@ -2867,12 +3365,20 @@ fn path_is_under_sync_root(context: &ProviderContext, path: &Path) -> bool {
     path == root || path.starts_with(&(root + r"\"))
 }
 
-#[cfg(target_os = "windows")]
 fn same_cloud_path(left: &Path, right: &Path) -> bool {
     normalized_cloud_path_string(left) == normalized_cloud_path_string(right)
 }
 
-#[cfg(target_os = "windows")]
+fn shared_provider_mount_matches_projection_root(
+    mount: &MountConfig,
+    projection_root: &Path,
+) -> bool {
+    same_cloud_path(
+        &localityd::virtual_fs::virtual_projection_root(mount),
+        projection_root,
+    )
+}
+
 fn normalized_cloud_path_string(path: &Path) -> String {
     let path = platform_display_path(path.to_path_buf());
     path.to_string_lossy()
@@ -3105,6 +3611,14 @@ mod tests {
             mount_id_from_sync_root_id("codeflash.ai.loc!default!bad%XX"),
             None
         );
+        assert_eq!(
+            mount_id_from_sync_root_id("codeflash.ai.loc!default!locality"),
+            None
+        );
+        assert_eq!(
+            mount_id_from_sync_root_id("codeflash.ai.loc!default!locality-0123456789abcdef"),
+            None
+        );
     }
 
     #[test]
@@ -3115,6 +3629,279 @@ mod tests {
                 .join("cloud-files")
                 .join("notion%2Fmain")
         );
+    }
+
+    #[test]
+    fn shared_registration_markers_are_keyed_per_projection_root() {
+        let state_dir = unique_test_state_dir("shared-registration-markers");
+        let root_a = Path::new(r"C:\Users\Ada\Locality");
+        let root_b = Path::new(r"D:\Teams\Grace\Locality");
+        let id_a = sync_root_id_for_projection_root(root_a);
+        let id_b = sync_root_id_for_projection_root(root_b);
+
+        write_registration_marker(
+            &state_dir,
+            &RegisterArgs {
+                mount_id: None,
+                display_name: "Locality".to_string(),
+                sync_root: root_a.to_path_buf(),
+                state_dir: state_dir.clone(),
+            },
+            root_a,
+            &id_a,
+        )
+        .expect("write marker A");
+        write_registration_marker(
+            &state_dir,
+            &RegisterArgs {
+                mount_id: None,
+                display_name: "Locality".to_string(),
+                sync_root: root_b.to_path_buf(),
+                state_dir: state_dir.clone(),
+            },
+            root_b,
+            &id_b,
+        )
+        .expect("write marker B");
+
+        let roots = list_marker_sync_roots(&state_dir).expect("list marker roots");
+        let ids = roots
+            .into_iter()
+            .map(|root| root.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(ids.contains(&id_a));
+        assert!(ids.contains(&id_b));
+        assert_eq!(ids.len(), 2);
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn removing_root_specific_shared_marker_removes_matching_legacy_marker() {
+        let state_dir = unique_test_state_dir("shared-legacy-cleanup");
+        let root = Path::new(r"C:\Users\Ada\Locality");
+        let sync_root_id = sync_root_id_for_projection_root(root);
+
+        write_registration_marker(
+            &state_dir,
+            &RegisterArgs {
+                mount_id: None,
+                display_name: "Locality".to_string(),
+                sync_root: root.to_path_buf(),
+                state_dir: state_dir.clone(),
+            },
+            root,
+            &sync_root_id,
+        )
+        .expect("write root-specific marker");
+        write_marker_at(
+            &legacy_shared_registration_marker_dir(&state_dir),
+            &RegistrationMarker {
+                mount_id: None,
+                display_name: "Locality".to_string(),
+                sync_root: root.display().to_string(),
+                sync_root_id: legacy_sync_root_id_for_projection_root(),
+                provider_id: PROVIDER_ID.to_string(),
+            },
+        )
+        .expect("write legacy marker");
+
+        remove_shared_registration_marker(&state_dir, &sync_root_id).expect("remove shared marker");
+
+        assert!(
+            read_registration_marker_at(&shared_registration_marker_dir(&state_dir, &sync_root_id))
+                .expect("read root-specific marker")
+                .is_none()
+        );
+        assert!(
+            read_legacy_shared_registration_marker(&state_dir)
+                .expect("read legacy marker")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn provider_daemon_projection_root_preserves_original_sync_root_argument() {
+        let original = Path::new(r"C:\Users\Ada\Locality");
+        let canonicalized = Path::new(r"c:\users\ada\LOCALITY");
+
+        assert_eq!(
+            provider_daemon_projection_root(original, canonicalized),
+            PathBuf::from(r"C:\Users\Ada\Locality")
+        );
+    }
+
+    fn write_marker_at(marker_dir: &Path, marker: &RegistrationMarker) -> Result<(), HelperError> {
+        std::fs::create_dir_all(marker_dir)
+            .map_err(|error| HelperError::io("create test marker dir", error))?;
+        let json = serde_json::to_string_pretty(marker)
+            .map_err(|error| HelperError::new("serialization_failed", error.to_string()))?;
+        std::fs::write(marker_dir.join("registration.json"), json)
+            .map_err(|error| HelperError::io("write test marker", error))
+    }
+
+    fn unique_test_state_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "locality-cloud-files-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn projection_root_identifiers_namespace_mount_roots() {
+        assert_eq!(
+            projection_root_identifier("notion-main"),
+            "mount:notion-main"
+        );
+    }
+
+    #[test]
+    fn shared_provider_mount_scope_uses_projection_root_path_key() {
+        let mount = locality_store::MountConfig::new(
+            locality_core::model::MountId::new("notion-main"),
+            "notion",
+            Path::new("/Users/Ada/Locality/notion"),
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+
+        assert!(shared_provider_mount_matches_projection_root(
+            &mount,
+            Path::new("/users/ada/locality/")
+        ));
+        assert!(!shared_provider_mount_matches_projection_root(
+            &mount,
+            Path::new("/users/ada/other-locality")
+        ));
+    }
+
+    #[test]
+    fn legacy_provider_accepts_unwrapped_identifier_for_legacy_mount() {
+        let resolved = resolve_legacy_provider_identifier(Some("notion-main"), "page-1")
+            .expect("legacy identifier resolved")
+            .expect("legacy provider handled identifier");
+
+        assert_eq!(
+            resolved.mount_id,
+            locality_core::model::MountId::new("notion-main")
+        );
+        assert_eq!(resolved.daemon_identifier, "page-1");
+    }
+
+    #[test]
+    fn legacy_provider_accepts_wrapped_identifier_for_matching_mount() {
+        let identifier = localityd::virtual_projection::wrap_identifier(
+            &locality_core::model::MountId::new("notion-main"),
+            "page-1",
+        );
+
+        let resolved = resolve_legacy_provider_identifier(Some("notion-main"), &identifier)
+            .expect("legacy identifier resolved")
+            .expect("legacy provider handled identifier");
+
+        assert_eq!(
+            resolved.mount_id,
+            locality_core::model::MountId::new("notion-main")
+        );
+        assert_eq!(resolved.daemon_identifier, "page-1");
+    }
+
+    #[test]
+    fn legacy_provider_rejects_wrapped_identifier_for_other_mount() {
+        let identifier = localityd::virtual_projection::wrap_identifier(
+            &locality_core::model::MountId::new("notion-other"),
+            "page-1",
+        );
+
+        let error = resolve_legacy_provider_identifier(Some("notion-main"), &identifier)
+            .expect_err("cross-mount identifier rejected");
+
+        assert_eq!(error.code, "mount_outside_sync_root");
+        assert!(error.message.contains("notion-other"));
+        assert!(error.message.contains("notion-main"));
+    }
+
+    #[test]
+    fn wrapped_local_identities_are_recognized_for_refresh_and_stale_deletes() {
+        let local = localityd::virtual_projection::wrap_identifier(
+            &locality_core::model::MountId::new("notion-main"),
+            "local:123",
+        );
+        let child_local = localityd::virtual_projection::wrap_identifier(
+            &locality_core::model::MountId::new("notion-main"),
+            "children:local:123",
+        );
+        let missing_file = HelperError::new(
+            "daemon_error",
+            "invalid_state: virtual filesystem item `local:123` was not found in mount",
+        );
+        let missing_directory = HelperError::new(
+            "daemon_error",
+            "invalid_state: invalid state: virtual filesystem item `children:local:123` is not present in daemon state",
+        );
+
+        assert!(is_local_identity(&local));
+        assert!(is_local_identity(&child_local));
+        assert!(stale_pending_file_delete(&local, &missing_file));
+        assert!(stale_pending_page_directory_delete(
+            &child_local,
+            &missing_directory
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn shared_provider_rejects_wrapped_identifier_for_mount_under_other_projection_root() {
+        use locality_store::MountRepository;
+
+        let state_dir = unique_test_state_dir("shared-provider-cross-root");
+        let mut store = SqliteStateStore::open(state_dir.clone()).expect("open store");
+        store
+            .save_mount(
+                locality_store::MountConfig::new(
+                    locality_core::model::MountId::new("notion-main"),
+                    "notion",
+                    Path::new(r"C:\Users\Ada\Locality\notion"),
+                )
+                .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save first mount");
+        store
+            .save_mount(
+                locality_store::MountConfig::new(
+                    locality_core::model::MountId::new("notion-other"),
+                    "notion",
+                    Path::new(r"D:\Teams\Grace\Locality\notion"),
+                )
+                .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save second mount");
+        drop(store);
+        let context = ProviderContext {
+            legacy_mount_id: None,
+            sync_root: PathBuf::from(r"C:\Users\Ada\Locality"),
+            projection_root: PathBuf::from(r"C:\Users\Ada\Locality"),
+            state_dir: state_dir.clone(),
+            identity_index: Default::default(),
+            local_file_index: Default::default(),
+        };
+        let identifier = localityd::virtual_projection::wrap_identifier(
+            &locality_core::model::MountId::new("notion-other"),
+            "page-1",
+        );
+
+        let error = context
+            .resolve_identifier(&identifier)
+            .expect_err("cross-root identifier rejected");
+
+        assert_eq!(error.code, "mount_outside_sync_root");
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[cfg(target_os = "windows")]
@@ -3182,8 +3969,9 @@ mod tests {
     #[test]
     fn root_relative_cloud_paths_use_sync_root_drive() {
         let context = ProviderContext {
-            mount_id: "notion-main".to_string(),
+            legacy_mount_id: Some("notion-main".to_string()),
             sync_root: PathBuf::from(r"C:\Users\Ada\Locality\Notion"),
+            projection_root: PathBuf::from(r"C:\Users\Ada\Locality\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\Locality"),
             identity_index: Default::default(),
             local_file_index: Default::default(),
@@ -3199,8 +3987,9 @@ mod tests {
     #[test]
     fn sync_root_membership_is_case_insensitive() {
         let context = ProviderContext {
-            mount_id: "notion-main".to_string(),
+            legacy_mount_id: Some("notion-main".to_string()),
             sync_root: PathBuf::from(r"C:\Users\Ada\Locality\Notion"),
+            projection_root: PathBuf::from(r"C:\Users\Ada\Locality\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\Locality"),
             identity_index: Default::default(),
             local_file_index: Default::default(),
@@ -3298,8 +4087,9 @@ mod tests {
     #[test]
     fn parent_identifier_can_use_pending_local_directory_cache() {
         let context = ProviderContext {
-            mount_id: "notion-main".to_string(),
+            legacy_mount_id: Some("notion-main".to_string()),
             sync_root: PathBuf::from(r"C:\Users\Ada\Locality\Notion"),
+            projection_root: PathBuf::from(r"C:\Users\Ada\Locality\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\Locality"),
             identity_index: Default::default(),
             local_file_index: Default::default(),
@@ -3315,10 +4105,30 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn parent_identifier_for_sync_root_uses_projection_root_identifier() {
+        let context = ProviderContext {
+            legacy_mount_id: Some("notion-main".to_string()),
+            sync_root: PathBuf::from(r"C:\Users\Ada\Locality\notion-main"),
+            projection_root: PathBuf::from(r"C:\Users\Ada\Locality\notion-main"),
+            state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\Locality"),
+            identity_index: Default::default(),
+            local_file_index: Default::default(),
+        };
+
+        assert_eq!(
+            parent_identifier_for_path(&context, Path::new(r"C:\Users\Ada\Locality\notion-main"))
+                .expect("parent identifier"),
+            "mount:notion-main"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn identity_for_path_can_use_provider_cache() {
         let context = ProviderContext {
-            mount_id: "notion-main".to_string(),
+            legacy_mount_id: Some("notion-main".to_string()),
             sync_root: PathBuf::from(r"C:\Users\Ada\Locality\Notion"),
+            projection_root: PathBuf::from(r"C:\Users\Ada\Locality\Notion"),
             state_dir: PathBuf::from(r"C:\Users\Ada\AppData\Local\Locality"),
             identity_index: Default::default(),
             local_file_index: Default::default(),

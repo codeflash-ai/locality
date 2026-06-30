@@ -15,7 +15,7 @@ use locality_core::path_projection::{
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRepository, MountConfig, MountRepository,
-    ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
+    ProjectionMode, ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
     VirtualMutationRepository,
 };
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,7 @@ use crate::source::source_descriptor;
 
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
 pub const SOURCE_ROOT_PREFIX: &str = "source:";
+pub const MOUNT_POINT_PREFIX: &str = "mount:";
 const CHILDREN_PREFIX: &str = "children:";
 const PATH_PREFIX: &str = "path:";
 const LOCAL_PREFIX: &str = "local:";
@@ -67,6 +68,116 @@ pub fn source_root_directory_name(connector: &str) -> String {
     }
 }
 
+pub fn mount_point_identifier(mount: &MountConfig) -> String {
+    format!("{MOUNT_POINT_PREFIX}{}", mount.mount_id.0)
+}
+
+pub fn mount_point_directory_name(mount: &MountConfig) -> String {
+    mount
+        .root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| source_root_directory_name(&mount.mount_id.0))
+}
+
+pub fn virtual_projection_root(mount: &MountConfig) -> PathBuf {
+    mount
+        .root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| mount.root.clone())
+}
+
+pub fn validate_virtual_projection_root(mount: &MountConfig) -> LocalityResult<()> {
+    if !matches!(
+        mount.projection,
+        ProjectionMode::LinuxFuse | ProjectionMode::WindowsCloudFiles
+    ) {
+        return Ok(());
+    }
+
+    let projection_root = virtual_projection_root(mount);
+    if let Some(reason) = unsafe_virtual_projection_root_reason(&projection_root) {
+        return Err(LocalityError::InvalidState(format!(
+            "unsafe virtual projection root `{}` for mount `{}` at `{}`: {reason}; choose an explicit shared directory such as `~/Locality/{}` instead",
+            projection_root.display(),
+            mount.mount_id.0,
+            mount.root.display(),
+            mount_point_directory_name(mount)
+        )));
+    }
+
+    Ok(())
+}
+
+pub fn virtual_projection_mount_point(mount: &MountConfig) -> PathBuf {
+    virtual_projection_root(mount).join(mount_point_directory_name(mount))
+}
+
+fn unsafe_virtual_projection_root_reason(root: &Path) -> Option<&'static str> {
+    if root.as_os_str().is_empty() {
+        return Some("the shared provider root is empty");
+    }
+    if root.parent().is_none() {
+        return Some("the shared provider root is a filesystem root");
+    }
+    if home_directories()
+        .iter()
+        .any(|home| paths_equal_for_platform(root, home))
+    {
+        return Some("the shared provider root is the user home directory");
+    }
+    if home_directories()
+        .iter()
+        .filter_map(|home| home.parent())
+        .any(|home_parent| paths_equal_for_platform(root, home_parent))
+    {
+        return Some("the shared provider root is the user home container directory");
+    }
+    None
+}
+
+fn home_directories() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(home) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+            homes.push(PathBuf::from(home));
+        }
+    }
+    if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+        && !drive.is_empty()
+        && !path.is_empty()
+    {
+        homes.push(PathBuf::from(format!(
+            "{}{}",
+            drive.to_string_lossy(),
+            path.to_string_lossy()
+        )));
+    }
+    homes
+}
+
+#[cfg(windows)]
+fn paths_equal_for_platform(left: &Path, right: &Path) -> bool {
+    path_key(left) == path_key(right)
+}
+
+#[cfg(not(windows))]
+fn paths_equal_for_platform(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn path_key(path: &Path) -> String {
+    let mut value = path.display().to_string().replace('/', "\\");
+    while value.ends_with('\\') && value.len() > 3 {
+        value.pop();
+    }
+    value.to_ascii_lowercase()
+}
+
 pub fn virtual_fs_ancestor_container_identifiers<S>(
     store: &S,
     mount_id: &MountId,
@@ -93,7 +204,7 @@ where
 
     let mut identifiers = vec![
         ROOT_CONTAINER_IDENTIFIER.to_string(),
-        source_root_identifier(&mount.connector),
+        mount_point_identifier(&mount),
     ];
     let mut path = PathBuf::new();
     for component in target_container.components() {
@@ -237,7 +348,7 @@ where
 
     let container_path = container_path(&mount, &entities, &mutations, container_identifier)?;
     let mut children = Vec::new();
-    if container_identifier == source_root_identifier(&mount.connector) {
+    if container_identifier == mount_point_identifier(&mount) {
         children.extend(source_root_guidance_items(&mount));
     }
     let deleted_remote_ids = pending_deleted_remote_ids(&mutations);
@@ -571,6 +682,29 @@ where
         outcome,
         hydration: hydrated.hydration,
     })
+}
+
+pub fn materialize_virtual_fs_guidance_with_content_root<S>(
+    store: &S,
+    content_root: &Path,
+    mount_id: &MountId,
+    identifier: &str,
+) -> LocalityResult<Option<VirtualFsMaterializeReport>>
+where
+    S: MountRepository,
+{
+    if !is_guidance_identifier(identifier) {
+        return Ok(None);
+    }
+    let Some(mount) = store.get_mount(mount_id).map_err(LocalityError::from)? else {
+        return Ok(None);
+    };
+    if !mount.projection.uses_virtual_filesystem() {
+        return Err(LocalityError::Unsupported(
+            "plain-files mounts do not support virtual filesystem operations",
+        ));
+    }
+    materialize_guidance_item(&mount, content_root, identifier, true)
 }
 
 pub fn commit_virtual_fs_write<S>(
@@ -1252,7 +1386,7 @@ fn schema_item_for_container(
     container_identifier: &str,
 ) -> LocalityResult<Option<VirtualFsItem>> {
     if container_identifier == ROOT_CONTAINER_IDENTIFIER
-        || container_identifier == source_root_identifier(&mount.connector)
+        || container_identifier == mount_point_identifier(mount)
         || container_identifier.starts_with(CHILDREN_PREFIX)
         || container_identifier.starts_with(PATH_PREFIX)
     {
@@ -1284,7 +1418,7 @@ fn create_parent_remote_id(
         }
         return Ok(RemoteId::new(remote_id));
     }
-    if parent_identifier == source_root_identifier(&mount.connector) {
+    if parent_identifier == mount_point_identifier(mount) {
         if source_descriptor(&mount.connector)
             .source_root_create_parent_kind()
             .is_some()
@@ -1617,7 +1751,7 @@ fn resolve_item(
     if identifier == ROOT_CONTAINER_IDENTIFIER {
         return Ok(root_item(mount));
     }
-    if identifier == source_root_identifier(&mount.connector) {
+    if identifier == mount_point_identifier(mount) {
         return Ok(source_root_item(mount));
     }
     if let Some(item) = guidance_item_for_identifier(mount, identifier) {
@@ -1729,7 +1863,7 @@ fn guidance_item(mount: &MountConfig, filename: &str, identifier: &str) -> Virtu
     let contents = guidance_contents_for_connector(&mount.connector);
     VirtualFsItem {
         identifier: identifier.to_string(),
-        parent_identifier: Some(source_root_identifier(&mount.connector)),
+        parent_identifier: Some(mount_point_identifier(mount)),
         filename: filename.to_string(),
         kind: VirtualFsItemKind::File,
         entity_kind: None,
@@ -1744,9 +1878,9 @@ fn guidance_item(mount: &MountConfig, filename: &str, identifier: &str) -> Virtu
 }
 
 fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
-    let filename = source_root_directory_name(&mount.connector);
+    let filename = mount_point_directory_name(mount);
     VirtualFsItem {
-        identifier: source_root_identifier(&mount.connector),
+        identifier: mount_point_identifier(mount),
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: filename.clone(),
         kind: VirtualFsItemKind::Folder,
@@ -1756,7 +1890,7 @@ fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
         hydration: None,
         content_type: "public.folder".to_string(),
         remote_edited_at: None,
-        materialized_path: Some(mount.root.display().to_string()),
+        materialized_path: Some(virtual_projection_mount_point(mount).display().to_string()),
         byte_size: None,
     }
 }
@@ -2122,7 +2256,7 @@ fn container_path(
     if identifier == ROOT_CONTAINER_IDENTIFIER {
         return Ok(PathBuf::new());
     }
-    if identifier == source_root_identifier(&mount.connector) {
+    if identifier == mount_point_identifier(mount) {
         return Ok(PathBuf::new());
     }
 
@@ -2169,7 +2303,7 @@ fn child_container_for_identifier(
         return Ok(None);
     }
 
-    if identifier == source_root_identifier(&mount.connector) {
+    if identifier == mount_point_identifier(mount) {
         return Ok(Some(ChildContainer::Root));
     }
 
@@ -2225,6 +2359,7 @@ fn entity_identifier(identifier: &str) -> LocalityResult<String> {
     if identifier == ROOT_CONTAINER_IDENTIFIER
         || identifier.starts_with(CHILDREN_PREFIX)
         || identifier.starts_with(PATH_PREFIX)
+        || identifier.starts_with(MOUNT_POINT_PREFIX)
         || identifier.starts_with(SOURCE_ROOT_PREFIX)
         || identifier.starts_with(GUIDANCE_PREFIX)
     {
@@ -2391,7 +2526,7 @@ fn container_identifier_for_path(
     index: &ProviderIndex,
 ) -> String {
     if path.as_os_str().is_empty() {
-        return source_root_identifier(&mount.connector);
+        return mount_point_identifier(mount);
     }
 
     if let Some(entity) = index.entities_by_path.get(path)
@@ -2456,12 +2591,74 @@ mod tests {
         AGENTS_GUIDANCE_IDENTIFIER, CLAUDE_GUIDANCE_IDENTIFIER, ROOT_CONTAINER_IDENTIFIER,
         VirtualFsItemKind, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
         create_virtual_fs_directory, create_virtual_fs_file,
-        materialize_virtual_fs_item_with_content_root, refresh_virtual_fs_children,
-        rename_virtual_fs_item, source_root_identifier, trash_virtual_fs_item,
-        virtual_fs_ancestor_container_identifiers, virtual_fs_children,
-        virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_item,
-        virtual_fs_item_with_content_root,
+        materialize_virtual_fs_item_with_content_root, mount_point_identifier,
+        refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
+        validate_virtual_projection_root, virtual_fs_ancestor_container_identifiers,
+        virtual_fs_children, virtual_fs_children_with_content_root, virtual_fs_content_path,
+        virtual_fs_item, virtual_fs_item_with_content_root, virtual_projection_root,
     };
+
+    #[test]
+    fn virtual_fs_root_child_uses_mount_point_name_and_identifier() {
+        let mut store = InMemoryStateStore::new();
+        let mount_id = MountId::new("notion-main");
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", "/tmp/Locality/notion-main")
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+
+        let report = virtual_fs_children(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER)
+            .expect("root children");
+
+        assert_eq!(report.children.len(), 1);
+        assert_eq!(report.children[0].filename, "notion-main");
+        assert_eq!(report.children[0].identifier, "mount:notion-main");
+        assert_eq!(
+            report.children[0].parent_identifier.as_deref(),
+            Some(ROOT_CONTAINER_IDENTIFIER)
+        );
+    }
+
+    #[test]
+    fn mount_point_root_lists_guidance_files() {
+        let mut store = InMemoryStateStore::new();
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(mount_id.clone(), "notion", "/tmp/Locality/notion-main")
+            .projection(ProjectionMode::LinuxFuse);
+        store.save_mount(mount.clone()).expect("save mount");
+
+        let report = virtual_fs_children(&store, &mount_id, &mount_point_identifier(&mount))
+            .expect("mount point children");
+
+        assert!(
+            report
+                .children
+                .iter()
+                .any(|item| item.filename == "AGENTS.md")
+        );
+        assert!(
+            report
+                .children
+                .iter()
+                .any(|item| item.filename == "CLAUDE.md")
+        );
+        assert!(
+            report
+                .children
+                .iter()
+                .all(|item| item.parent_identifier.as_deref() == Some("mount:notion-main"))
+        );
+    }
+
+    #[test]
+    fn mount_point_identifier_is_not_a_materializable_entity_identifier() {
+        assert!(matches!(
+            super::entity_identifier("mount:notion-main"),
+            Err(LocalityError::InvalidState(_))
+        ));
+    }
 
     #[test]
     fn children_include_page_directories_with_page_body_files_inside() {
@@ -2500,10 +2697,10 @@ mod tests {
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].filename, "notion");
         assert_eq!(root.children[0].kind, VirtualFsItemKind::Folder);
-        assert_eq!(root.children[0].identifier, "source:notion");
+        assert_eq!(root.children[0].identifier, "mount:notion-main");
 
-        let report =
-            virtual_fs_children(&store, &mount_id, "source:notion").expect("source children");
+        let report = virtual_fs_children(&store, &mount_id, "mount:notion-main")
+            .expect("mount point children");
 
         assert_eq!(report.children.len(), 3);
         assert_eq!(report.children[0].filename, "AGENTS.md");
@@ -2511,14 +2708,14 @@ mod tests {
         assert_eq!(report.children[0].identifier, AGENTS_GUIDANCE_IDENTIFIER);
         assert_eq!(
             report.children[0].parent_identifier.as_deref(),
-            Some("source:notion")
+            Some("mount:notion-main")
         );
         assert_eq!(report.children[1].filename, "CLAUDE.md");
         assert_eq!(report.children[1].kind, VirtualFsItemKind::File);
         assert_eq!(report.children[1].identifier, CLAUDE_GUIDANCE_IDENTIFIER);
         assert_eq!(
             report.children[1].parent_identifier.as_deref(),
-            Some("source:notion")
+            Some("mount:notion-main")
         );
         assert_eq!(report.children[2].filename, "Home");
         assert_eq!(report.children[2].kind, VirtualFsItemKind::Folder);
@@ -2526,29 +2723,31 @@ mod tests {
     }
 
     #[test]
-    fn source_root_guidance_files_materialize_read_only_agent_instructions() {
+    fn mount_point_guidance_files_materialize_read_only_agent_instructions() {
         let mount_id = MountId::new("notion-main");
         let state_root = temp_root("loc-virtual-fs-guidance");
         let content_root = state_root.join("content/notion-main/files");
         let mut store = InMemoryStateStore::new();
-        store
-            .save_mount(virtual_mount(&mount_id))
-            .expect("save mount");
+        let mount = virtual_mount(&mount_id);
+        store.save_mount(mount.clone()).expect("save mount");
 
         let listed = virtual_fs_children_with_content_root(
             &store,
             &content_root,
             &mount_id,
-            &source_root_identifier("notion"),
+            &mount_point_identifier(&mount),
         )
-        .expect("list source root");
+        .expect("list mount point root");
         let agents = listed
             .children
             .iter()
             .find(|child| child.identifier == AGENTS_GUIDANCE_IDENTIFIER)
             .expect("agents guidance");
         assert_eq!(agents.filename, "AGENTS.md");
-        assert_eq!(agents.parent_identifier.as_deref(), Some("source:notion"));
+        assert_eq!(
+            agents.parent_identifier.as_deref(),
+            Some("mount:notion-main")
+        );
         assert_eq!(agents.kind, VirtualFsItemKind::File);
         assert_eq!(agents.entity_kind, None);
         assert_eq!(agents.hydration, Some(HydrationState::Stub));
@@ -2681,7 +2880,7 @@ mod tests {
             identifiers,
             vec![
                 "root".to_string(),
-                "source:notion".to_string(),
+                "mount:notion-main".to_string(),
                 "children:page-root".to_string(),
                 "children:page-child".to_string(),
             ]
@@ -2689,12 +2888,11 @@ mod tests {
     }
 
     #[test]
-    fn refresh_children_updates_cached_container_metadata() {
+    fn refresh_children_updates_cached_mount_point_metadata() {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
-        store
-            .save_mount(virtual_mount(&mount_id))
-            .expect("save mount");
+        let mount = virtual_mount(&mount_id);
+        store.save_mount(mount.clone()).expect("save mount");
         let mut connector = StaticChildrenConnector {
             entries: vec![TreeEntry {
                 mount_id: mount_id.clone(),
@@ -2709,13 +2907,15 @@ mod tests {
             }],
             expected_parent_path: PathBuf::new(),
         };
+        let mount_point_root = mount_point_identifier(&mount);
 
-        let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "source:notion")
-            .expect("refresh children");
+        let saved =
+            refresh_virtual_fs_children(&mut store, &connector, &mount_id, &mount_point_root)
+                .expect("refresh children");
         assert_eq!(saved, 1);
 
-        let report =
-            virtual_fs_children(&store, &mount_id, "source:notion").expect("source children");
+        let report = virtual_fs_children(&store, &mount_id, &mount_point_root)
+            .expect("mount point children");
         assert_eq!(report.children.len(), 3);
         assert_eq!(report.children[0].identifier, AGENTS_GUIDANCE_IDENTIFIER);
         assert_eq!(report.children[0].kind, VirtualFsItemKind::File);
@@ -2735,12 +2935,13 @@ mod tests {
             remote_edited_at: None,
             stub_frontmatter: None,
         });
-        let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "source:notion")
-            .expect("refresh cached children");
+        let saved =
+            refresh_virtual_fs_children(&mut store, &connector, &mount_id, &mount_point_root)
+                .expect("refresh cached children");
         assert_eq!(saved, 2);
 
-        let report =
-            virtual_fs_children(&store, &mount_id, "source:notion").expect("updated children");
+        let report = virtual_fs_children(&store, &mount_id, &mount_point_root)
+            .expect("updated mount point children");
         assert!(report.children.iter().any(|child| {
             child.identifier == "children:page-new" && child.kind == VirtualFsItemKind::Folder
         }));
@@ -3420,10 +3621,10 @@ mod tests {
             &mut store,
             &content_root,
             &mount_id,
-            &source_root_identifier("google-docs"),
+            "mount:google-docs-main",
             "Scratch Hydration",
         )
-        .expect("create google docs directory under source root");
+        .expect("create google docs directory under mount point root");
 
         assert!(created.identifier.starts_with("children:local:"));
         assert_eq!(created.item.filename, "Scratch Hydration");
@@ -3831,6 +4032,66 @@ mod tests {
         assert!(!content_root.exists());
 
         let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn virtual_projection_validation_rejects_filesystem_root_provider_root() {
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", "/")
+            .projection(ProjectionMode::LinuxFuse);
+
+        let error = validate_virtual_projection_root(&mount).expect_err("filesystem root rejected");
+
+        assert!(matches!(error, LocalityError::InvalidState(_)));
+        assert!(error.to_string().contains("filesystem root"));
+    }
+
+    #[test]
+    fn virtual_projection_validation_rejects_home_directory_provider_root() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            PathBuf::from(home).join("notion-main"),
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        let error = validate_virtual_projection_root(&mount).expect_err("home root rejected");
+
+        assert!(matches!(error, LocalityError::InvalidState(_)));
+        assert!(error.to_string().contains("home directory"));
+    }
+
+    #[test]
+    fn virtual_projection_validation_rejects_home_container_provider_root() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let Some(home_parent) = home.parent().map(|path| path.to_path_buf()) else {
+            return;
+        };
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", home)
+            .projection(ProjectionMode::LinuxFuse);
+
+        let error =
+            validate_virtual_projection_root(&mount).expect_err("home container root rejected");
+
+        assert_eq!(virtual_projection_root(&mount), home_parent);
+        assert!(matches!(error, LocalityError::InvalidState(_)));
+        assert!(error.to_string().contains("home container"));
+    }
+
+    #[test]
+    fn virtual_projection_validation_accepts_explicit_shared_root() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse);
+
+        validate_virtual_projection_root(&mount).expect("explicit shared root is safe");
     }
 
     fn assert_plain_files_virtual_error<T: std::fmt::Debug>(
