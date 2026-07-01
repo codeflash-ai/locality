@@ -299,6 +299,11 @@ drift against dirty local edits, verifies blocked pushes do not overwrite
 Notion, materializes conflicts, resolves them, pushes the resolution, and
 starts the next cycle from a clean durable state.
 
+`live_page_directory_create_then_move_pushes_under_final_parent` covers a
+desktop-file-manager workflow where a draft page directory is created under one
+mounted Notion parent, moved to another mounted parent before push, and then
+created remotely under the final parent only.
+
 `live_validation_failure_blocks_before_journal_and_remote_write`,
 `live_sqlite_restart_preserves_reconciled_journal_and_clean_status`, and the
 existing `live_remote_fast_forward_updates_clean_file_and_preserves_pending_file`

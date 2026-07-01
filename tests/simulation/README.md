@@ -57,6 +57,8 @@ The live tests create scratch pages under the configured parent and cover:
 - repeated live push/status/no-op-pull cycles across SQLite state reopen;
 - repeated live remote-drift conflicts, blocked pushes, conflict materialization,
   manual resolution, and SQLite state reopen;
+- local child page creation followed by a directory move before push, verifying
+  the created Notion page lands under the final parent;
 - validation failure before push journal or remote write;
 - SQLite-backed state reopen after a reconciled push;
 - remote fast-forward of clean virtual content while preserving pending local

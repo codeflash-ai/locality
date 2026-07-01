@@ -10162,6 +10162,188 @@ fn live_page_directory_create_pushes_child_page_and_refreshes_parent() {
 
 #[test]
 #[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_page_directory_create_then_move_pushes_under_final_parent() {
+    run_live_page_directory_create_then_move_pushes_under_final_parent();
+}
+
+fn run_live_page_directory_create_then_move_pushes_under_final_parent() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let root = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live page move root {}", unique_suffix()),
+        vec![paragraph_child("Root body before local create and move.")],
+    );
+    let source_parent_title = format!("Locality live page move source {}", unique_suffix());
+    let source_parent = cleanup.create_page(
+        &root.id,
+        &source_parent_title,
+        vec![paragraph_child(
+            "Source parent should not receive the moved page.",
+        )],
+    );
+    let target_parent_title = format!("Locality live page move target {}", unique_suffix());
+    let target_parent = cleanup.create_page(
+        &root.id,
+        &target_parent_title,
+        vec![paragraph_child(
+            "Target parent should receive the moved page.",
+        )],
+    );
+    let connector = NotionConnector::new(live_notion_config());
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new(root.id.clone())),
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live page create-move root");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull live page create-move root");
+
+    let source_entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(source_parent.id.clone()))
+        .expect("get source parent entity")
+        .expect("source parent entity");
+    let target_entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(target_parent.id.clone()))
+        .expect("get target parent entity")
+        .expect("target parent entity");
+    let source_dir = fixture.root.join(
+        source_entity
+            .path
+            .parent()
+            .expect("source parent directory"),
+    );
+    let target_dir = fixture.root.join(
+        target_entity
+            .path
+            .parent()
+            .expect("target parent directory"),
+    );
+    assert!(
+        source_dir.exists(),
+        "source parent directory should exist at {}",
+        source_dir.display()
+    );
+    assert!(
+        target_dir.exists(),
+        "target parent directory should exist at {}",
+        target_dir.display()
+    );
+
+    let child_title = format!("Locality live moved draft child {}", unique_suffix());
+    let child_body = "Created under the source directory, then moved before push.";
+    let draft_source_dir = source_dir.join(slug_for_test(&child_title));
+    fs::create_dir_all(&draft_source_dir).expect("create draft child under source parent");
+    let draft_source_path = draft_source_dir.join("page.md");
+    fs::write(
+        &draft_source_path,
+        format!("---\ntitle: \"{child_title}\"\n---\n# Moved child\n\n{child_body}\n"),
+    )
+    .expect("write moved draft page");
+
+    let draft_target_dir = target_dir.join(slug_for_test(&child_title));
+    fs::rename(&draft_source_dir, &draft_target_dir)
+        .expect("move draft child directory to target parent");
+    let draft_target_path = draft_target_dir.join("page.md");
+    assert!(
+        !draft_source_path.exists(),
+        "source path should be gone after move: {}",
+        draft_source_path.display()
+    );
+    assert!(
+        draft_target_path.exists(),
+        "target path should contain moved draft page: {}",
+        draft_target_path.display()
+    );
+
+    let diff = run_diff(&store, &draft_target_path).expect("diff moved draft page");
+    assert_eq!(diff.action, "confirm_plan", "{diff:#?}");
+    let plan = diff.plan.as_ref().expect("moved draft create plan");
+    assert_eq!(plan.summary.entities_created, 1, "{plan:#?}");
+
+    let push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &draft_target_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("push moved draft page");
+    assert!(push.ok, "{push:#?}");
+    assert_eq!(push.action, "reconciled", "{push:#?}");
+
+    let created_page_id = push
+        .changed_remote_ids
+        .iter()
+        .find(|id| *id != &root.id && *id != &source_parent.id && *id != &target_parent.id)
+        .unwrap_or_else(|| panic!("missing created page id in push output: {push:#?}"))
+        .clone();
+    cleanup.block_ids.push(created_page_id.clone());
+    let created_page = cleanup
+        .api
+        .retrieve_page(&created_page_id)
+        .expect("retrieve moved created page");
+    let created_parent_id = created_page
+        .parent
+        .as_ref()
+        .and_then(|parent| parent.page_id.as_ref())
+        .expect("created page parent id");
+    assert_eq!(
+        compact_notion_id(created_parent_id),
+        compact_notion_id(&target_parent.id),
+        "created page should be parented by the final target page: {created_page:#?}"
+    );
+
+    let created_entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(created_page_id.clone()))
+        .expect("get moved created child entity")
+        .expect("moved created child entity");
+    let reconciled_path = fixture.root.join(&created_entity.path);
+    assert!(
+        reconciled_path.starts_with(&target_dir),
+        "reconciled path should stay under target parent: {} not under {}",
+        reconciled_path.display(),
+        target_dir.display()
+    );
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(reconciled_path.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("clean moved child status");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let created_markdown = render_live_markdown(&connector, &created_page_id, &reconciled_path);
+    assert!(created_markdown.contains(&format!("title: \"{child_title}\"")));
+    assert!(created_markdown.contains(child_body));
+    let source_remote = render_live_page(&connector, &source_parent.id, &reconciled_path);
+    assert!(
+        !source_remote.contains(&child_title),
+        "source parent should not contain moved child link:\n{source_remote}"
+    );
+    let target_remote = render_live_page(&connector, &target_parent.id, &reconciled_path);
+    assert!(
+        target_remote.contains(&child_title),
+        "target parent should contain moved child link:\n{target_remote}"
+    );
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_undo_child_page_create_archives_remote_page() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(live_notion_config());

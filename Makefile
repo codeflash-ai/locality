@@ -161,6 +161,7 @@ test-simulation-live-notion: ## Run live Notion reliability e2e against scratch 
 	$(CARGO) test -p loc-cli --test e2e_push_workflow live_multi_seed_reliability_sequences_converge_notion -- --ignored --exact --test-threads=1
 	$(CARGO) test -p loc-cli --test e2e_push_workflow live_stress_repeated_push_reopen_status_noop_converges_notion -- --ignored --exact --test-threads=1
 	$(CARGO) test -p loc-cli --test e2e_push_workflow live_stress_repeated_drift_conflict_recovery_converges_notion -- --ignored --exact --test-threads=1
+	$(CARGO) test -p loc-cli --test e2e_push_workflow live_page_directory_create_then_move_pushes_under_final_parent -- --ignored --exact --test-threads=1
 	$(CARGO) test -p loc-cli --test e2e_push_workflow live_validation_failure_blocks_before_journal_and_remote_write -- --ignored --exact --test-threads=1
 	$(CARGO) test -p loc-cli --test e2e_push_workflow live_sqlite_restart_preserves_reconciled_journal_and_clean_status -- --ignored --exact --test-threads=1
 	$(CARGO) test -p loc-cli --test e2e_push_workflow live_remote_fast_forward_updates_clean_file_and_preserves_pending_file -- --ignored --exact --test-threads=1
