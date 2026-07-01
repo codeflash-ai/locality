@@ -3666,7 +3666,11 @@ fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
             continue;
         };
         match connector.resolve_page_path_entries(mount.mount_id.clone(), &remote_id) {
-            Ok(entries) if entries.iter().any(|entry| entry.remote_id == remote_id) => {
+            Ok(entries)
+                if entries
+                    .iter()
+                    .any(|entry| exact_notion_entry_matches(&entry.remote_id, &notion_id)) =>
+            {
                 save_exact_notion_entries(&mut store, entries)?;
                 return Ok(());
             }
@@ -3683,6 +3687,10 @@ fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
     }
 
     Err(last_error.unwrap_or_else(notion_access_miss_message))
+}
+
+fn exact_notion_entry_matches(remote_id: &RemoteId, compact_notion_id: &str) -> bool {
+    notion_id_from_url(remote_id.as_str()).as_deref() == Some(compact_notion_id)
 }
 
 fn save_exact_notion_entries(
@@ -8465,15 +8473,16 @@ mod tests {
         PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState, activity_timestamp,
         clear_mount_cached_projection, clear_state_root_contents, conflict_preview,
         connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
-        diff_report_message, exact_located_entity_record, failed_push_summary,
-        has_unresolved_conflict_markers, hydration_after_editor_write, inspect_install_state,
-        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
-        is_notion_access_lost_message, is_unsupported_schema_version_message,
-        live_mode_local_reconcile_targets_for_mount_at, live_mode_merge_remote_drift_markdown,
-        live_mode_remote_check_page_budget_for_rate, live_mode_remote_pull_candidates,
-        live_mode_remote_pull_scan_is_due_for_key, live_mode_should_reconcile_local_target_for_key,
-        live_mode_target, live_mode_tick_from_snapshot, live_mode_wake_generation,
-        load_desktop_activity, mark_mount_live_mode_syncing, mount_has_pending_local_changes,
+        diff_report_message, exact_located_entity_record, exact_notion_entry_matches,
+        failed_push_summary, has_unresolved_conflict_markers, hydration_after_editor_write,
+        inspect_install_state, install_terminal_cli_link_at,
+        install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
+        is_unsupported_schema_version_message, live_mode_local_reconcile_targets_for_mount_at,
+        live_mode_merge_remote_drift_markdown, live_mode_remote_check_page_budget_for_rate,
+        live_mode_remote_pull_candidates, live_mode_remote_pull_scan_is_due_for_key,
+        live_mode_should_reconcile_local_target_for_key, live_mode_target,
+        live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
+        mark_mount_live_mode_syncing, mount_has_pending_local_changes,
         mount_has_unfinished_journals, notion_id_from_url, parse_daemon_build_info_json,
         pending_changes_from_status, prepare_existing_workspace_mount_for_remount,
         preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
@@ -9654,6 +9663,14 @@ mod tests {
             .as_deref(),
             Some("37b3ac0ebb88802cbcf4d53c9cfc4972")
         );
+    }
+
+    #[test]
+    fn exact_notion_entry_match_accepts_hyphenated_api_ids() {
+        assert!(exact_notion_entry_matches(
+            &RemoteId::new("3903ac0e-bb88-80d6-ad20-f29c8156e453"),
+            "3903ac0ebb8880d6ad20f29c8156e453",
+        ));
     }
 
     #[test]
