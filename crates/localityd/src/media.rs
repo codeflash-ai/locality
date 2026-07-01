@@ -4,12 +4,24 @@ use locality_core::LocalityResult;
 use locality_core::canonical::render_canonical_markdown;
 use locality_core::model::CanonicalDocument;
 use locality_notion::media::{
-    DownloadedMediaAsset, resolve_media_href_with_content_root, update_media_manifest,
+    DownloadedMediaAsset, replace_media_manifest, resolve_media_href_with_content_root,
+    update_media_manifest,
 };
 
 use crate::hydration::HydratedAsset;
 
 pub fn update_hydrated_media_manifest(root: &Path, assets: &[HydratedAsset]) -> LocalityResult<()> {
+    update_media_manifest(root, &downloaded_media_assets(assets))
+}
+
+pub fn replace_hydrated_media_manifest(
+    root: &Path,
+    assets: &[HydratedAsset],
+) -> LocalityResult<()> {
+    replace_media_manifest(root, &downloaded_media_assets(assets))
+}
+
+fn downloaded_media_assets(assets: &[HydratedAsset]) -> Vec<DownloadedMediaAsset> {
     let downloaded = assets
         .iter()
         .filter_map(|asset| {
@@ -23,7 +35,7 @@ pub fn update_hydrated_media_manifest(root: &Path, assets: &[HydratedAsset]) -> 
             })
         })
         .collect::<Vec<_>>();
-    update_media_manifest(root, &downloaded)
+    downloaded
 }
 
 pub fn render_document_with_absolute_media_hrefs(

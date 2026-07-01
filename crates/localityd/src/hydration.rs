@@ -17,7 +17,7 @@ use locality_store::{
 
 use crate::media::{
     document_with_absolute_media_hrefs, render_document_with_absolute_media_hrefs,
-    update_hydrated_media_manifest,
+    replace_hydrated_media_manifest, update_hydrated_media_manifest,
 };
 use crate::shadow_match::{parsed_matches_shadow, shadows_match};
 
@@ -171,7 +171,7 @@ where
             let path = mount_relative_path(&output_root, &asset.path)?;
             write_binary_atomic(&path, &asset.bytes)?;
         }
-        update_hydrated_media_manifest(&output_root, &rendered.assets)?;
+        replace_hydrated_media_manifest(&output_root, &rendered.assets)?;
         write_atomic(
             &path,
             render_document_with_absolute_media_hrefs(

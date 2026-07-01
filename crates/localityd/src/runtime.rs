@@ -1821,8 +1821,12 @@ impl RuntimeState {
         }
     }
 
-    fn queue_freshness(&mut self, job: SyncJob) {
+    fn queue_freshness(&mut self, job: SyncJob) -> bool {
+        if !self.config.background_connector_sync {
+            return false;
+        }
         self.freshness.upsert(job);
+        true
     }
 
     fn queue_bounded_live_mode_remote_observe(&mut self, job: SyncJob) -> bool {
@@ -1832,8 +1836,7 @@ impl RuntimeState {
                 .matching_count(is_live_mode_remote_observe_job)
                 < live_mode_remote_observe_queue_budget(self.config.pull_scheduler.active_interval)
         {
-            self.queue_freshness(job);
-            return true;
+            return self.queue_freshness(job);
         }
         false
     }
@@ -1894,6 +1897,9 @@ impl RuntimeState {
         priority: ChildRefreshPriority,
         depth: u32,
     ) {
+        if !self.config.background_connector_sync {
+            return;
+        }
         let key = ChildRefreshKey {
             mount_id: mount_id.clone(),
             container_identifier: container_identifier.clone(),

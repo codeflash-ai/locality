@@ -60,8 +60,8 @@ use crate::autosave::{
 };
 use crate::execution::{PushJob, PushJobError, PushJobReport};
 use crate::file_provider;
-use crate::hydration::{HydratedEntity, HydrationSource, write_parent_database_schema_cache};
-use crate::media::{render_document_with_absolute_media_hrefs, update_hydrated_media_manifest};
+use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::media::{render_document_with_absolute_media_hrefs, replace_hydrated_media_manifest};
 use crate::shadow_match::shadows_match;
 use crate::source::{
     LocalSourceValidator, SourcePushValidator, SourceValidationContext, source_descriptor,
@@ -1555,18 +1555,11 @@ where
             entity = Some(page_entity);
         }
     }
-    let Some(entity) = entity.filter(|entity| entity.kind == EntityKind::Page) else {
-        return Ok(());
+    let database = match entity.filter(|entity| entity.kind == EntityKind::Page) {
+        Some(_) => database_parent_for_existing_page_path(store, &mount, &relative_path)?,
+        None => database_parent_for_create_path(store, &mount, &relative_path)?,
     };
-    let parent_path = page_container_path(&relative_path)
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
-    let Some(database) = store
-        .find_entity_by_path(&mount.mount_id, &parent_path)
-        .map_err(LocalityError::from)?
-        .filter(|entity| entity.kind == EntityKind::Database)
-    else {
+    let Some(database) = database else {
         return Ok(());
     };
     let output_root = if mount.projection.uses_virtual_filesystem() {
@@ -1584,8 +1577,68 @@ where
     {
         return Ok(());
     }
-    write_parent_database_schema_cache(store, source, &mount, &entity, &output_root)?;
+    if let Some(schema) = source.fetch_database_schema_yaml(&database.remote_id)? {
+        write_atomic(
+            &output_root.join(&database.path).join("_schema.yaml"),
+            schema,
+        )?;
+    }
     Ok(())
+}
+
+fn database_parent_for_existing_page_path<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> LocalityResult<Option<EntityRecord>>
+where
+    S: EntityRepository,
+{
+    let parent_path = page_container_path(relative_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    Ok(store
+        .find_entity_by_path(&mount.mount_id, &parent_path)
+        .map_err(LocalityError::from)?
+        .filter(|entity| entity.kind == EntityKind::Database))
+}
+
+fn database_parent_for_create_path<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> LocalityResult<Option<EntityRecord>>
+where
+    S: EntityRepository,
+{
+    let Some(parent_path) = relative_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if let Some(parent) = store
+        .find_entity_by_path(&mount.mount_id, parent_path)
+        .map_err(LocalityError::from)?
+        .filter(|entity| entity.kind == EntityKind::Database)
+    {
+        return Ok(Some(parent));
+    }
+
+    if is_page_document_path(relative_path)
+        && let Some(container_path) = parent_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+    {
+        return Ok(store
+            .find_entity_by_path(&mount.mount_id, container_path)
+            .map_err(LocalityError::from)?
+            .filter(|entity| entity.kind == EntityKind::Database));
+    }
+
+    Ok(None)
 }
 
 fn prepare_pending_create<S, Validator>(
@@ -2435,7 +2488,7 @@ where
         let path = mount_relative_path(output_root, &asset.path)?;
         write_binary_atomic(&path, &asset.bytes)?;
     }
-    update_hydrated_media_manifest(output_root, &rendered.assets)?;
+    replace_hydrated_media_manifest(output_root, &rendered.assets)?;
     write_atomic(
         path,
         render_document_with_absolute_media_hrefs(&rendered.document, &entity.path, output_root),
@@ -2638,12 +2691,54 @@ fn required_parent_entity<S>(
 where
     S: EntityRepository,
 {
-    parent_entity(store, mount, relative_path)?.ok_or_else(|| {
-        PushPrepareError::Store(StoreError::EntityPathMissing {
-            mount_id: mount.mount_id.clone(),
-            path: relative_path.to_path_buf(),
-        })
-    })
+    if let Some(parent) = parent_entity(store, mount, relative_path)? {
+        return Ok(parent);
+    }
+
+    if let Some(parent) = source_root_create_parent_entity(mount, relative_path) {
+        return Ok(parent);
+    }
+
+    Err(PushPrepareError::Store(StoreError::EntityPathMissing {
+        mount_id: mount.mount_id.clone(),
+        path: relative_path.to_path_buf(),
+    }))
+}
+
+fn source_root_create_parent_entity(
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Option<EntityRecord> {
+    if !is_direct_source_root_create_path(relative_path) {
+        return None;
+    }
+    let remote_id = mount.remote_root_id.as_ref()?;
+    let descriptor = source_descriptor(&mount.connector);
+    let kind = descriptor.source_root_create_parent_kind()?;
+    Some(EntityRecord::new(
+        mount.mount_id.clone(),
+        remote_id.clone(),
+        kind,
+        descriptor.display_name(),
+        PathBuf::new(),
+    ))
+}
+
+fn is_direct_source_root_create_path(relative_path: &Path) -> bool {
+    if relative_path.as_os_str().is_empty() {
+        return false;
+    }
+
+    if is_page_document_path(relative_path) {
+        let container_path = page_container_path(relative_path);
+        return container_path
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty());
+    }
+
+    relative_path
+        .parent()
+        .is_none_or(|parent| parent.as_os_str().is_empty())
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, PushPrepareError> {

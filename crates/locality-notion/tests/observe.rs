@@ -15,8 +15,9 @@ use locality_notion::dto::{
 use locality_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
 
+mod support;
+
 const LIVE_PARENT_ENV: &str = "LOCALITY_NOTION_LIVE_PARENT_PAGE";
-const TOKEN_ENV: &str = "NOTION_TOKEN";
 
 #[test]
 fn notion_observe_page_reads_metadata_without_hydrating_blocks() {
@@ -79,14 +80,13 @@ fn notion_observe_database_falls_back_to_database_metadata() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_notion_observe_page_reads_metadata_without_hydrating_blocks() {
-    std::env::var(TOKEN_ENV).expect("set NOTION_TOKEN");
     let parent_page_id =
         normalize_notion_id(&std::env::var(LIVE_PARENT_ENV).unwrap_or_else(|_| {
             panic!("set {LIVE_PARENT_ENV} to a writable Notion page ID or URL")
         }));
-    let api = Arc::new(LiveObserveApi::new());
+    let api = Arc::new(LiveObserveApi::new(support::live_notion_config()));
     let mut cleanup = LiveObserveCleanup::new(api.clone());
     let title = format!("Locality live observe {}", unique_suffix());
     let page = cleanup.create_page(&parent_page_id, &title);
@@ -151,9 +151,9 @@ struct LiveObserveApi {
 }
 
 impl LiveObserveApi {
-    fn new() -> Self {
+    fn new(config: NotionConfig) -> Self {
         Self {
-            inner: HttpNotionApi::new(NotionConfig::default()),
+            inner: HttpNotionApi::new(config),
             block_children_calls: AtomicUsize::new(0),
         }
     }

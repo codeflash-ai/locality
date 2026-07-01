@@ -14,7 +14,7 @@ use locality_core::conflict::{
 };
 use locality_core::freshness::RemoteVersion;
 use locality_core::hydration::{HydrationReason, HydrationRequest};
-use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, TreeEntry};
+use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::path_projection::{
     is_page_document_path, page_container_path, page_listing_parent_path,
 };
@@ -29,7 +29,8 @@ use crate::file_provider::{self, ProjectionRefreshBase};
 use crate::hydration::{HydratedAsset, HydratedEntity};
 use crate::media::{
     document_with_absolute_media_hrefs, has_missing_local_media_hrefs,
-    render_document_with_absolute_media_hrefs, update_hydrated_media_manifest,
+    render_document_with_absolute_media_hrefs, replace_hydrated_media_manifest,
+    update_hydrated_media_manifest,
 };
 use crate::shadow_match::{parsed_matches_shadow, shadows_match};
 use crate::source::SourceAdapter;
@@ -233,8 +234,9 @@ where
     let mut hydrated = 0;
     let mut skipped_dirty = 0;
     let mut conflicts = Vec::new();
-    if mount.remote_root_id.is_some()
-        && let Some(root_entry) = entries.first()
+    if let Some(root_entry) = entries
+        .first()
+        .filter(|entry| should_hydrate_mount_root_entry(mount, entry))
     {
         let root_entity = store
             .get_entity(&mount.mount_id, &root_entry.remote_id)
@@ -331,6 +333,29 @@ where
     }
 
     Ok(report)
+}
+
+fn should_hydrate_mount_root_entry(mount: &MountConfig, entry: &TreeEntry) -> bool {
+    entry.kind == EntityKind::Page
+        && mount
+            .remote_root_id
+            .as_ref()
+            .is_some_and(|remote_root_id| remote_ids_match(mount, remote_root_id, &entry.remote_id))
+}
+
+fn remote_ids_match(mount: &MountConfig, left: &RemoteId, right: &RemoteId) -> bool {
+    if left == right {
+        return true;
+    }
+    mount.connector == "notion"
+        && compact_remote_id(left.as_str()) == compact_remote_id(right.as_str())
+}
+
+fn compact_remote_id(remote_id: &str) -> String {
+    remote_id
+        .chars()
+        .filter(|character| *character != '-')
+        .collect()
 }
 
 fn should_repair_missing_media_for_entity(entity: &EntityRecord) -> bool {
@@ -1116,6 +1141,7 @@ where
 {
     let markdown =
         render_document_with_absolute_media_hrefs(&rendered.document, &entity.path, output_root);
+    replace_hydrated_media_manifest(output_root, &rendered.assets).map_err(PullError::Connector)?;
     write_atomic(path, markdown)?;
     store
         .save_shadow(&mount.mount_id, rendered.shadow.clone())

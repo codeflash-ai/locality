@@ -9,20 +9,21 @@ use locality_core::canonical::parse_canonical_markdown;
 use locality_core::journal::{PushId, PushOperationId};
 use locality_core::model::{MountId, RemoteId};
 use locality_core::planner::{PropertyValue, PushOperation, PushPlan};
+use locality_notion::NotionConnector;
 use locality_notion::client::{
     DEFAULT_NOTION_API_BASE_URL, DEFAULT_NOTION_VERSION, notion_http_client,
 };
 use locality_notion::dto::{DatabaseDto, NotionPageBundle, PageDto};
 use locality_notion::schema::validate_create_row_frontmatter;
-use locality_notion::{NotionConfig, NotionConnector};
 use reqwest::blocking::Client;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+mod support;
+
 const LIVE_PARENT_ENV: &str = "LOCALITY_NOTION_LIVE_PARENT_PAGE";
 const LIVE_DIR_ENV: &str = "LOCALITY_NOTION_LIVE_DIR";
-const TOKEN_ENV: &str = "NOTION_TOKEN";
 const LIVE_IMAGE_URL: &str = "https://www.w3.org/Icons/w3c_home.png";
 const LIVE_VIDEO_URL: &str =
     "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
@@ -32,12 +33,12 @@ const LIVE_AUDIO_URL: &str =
     "https://interactive-examples.mdn.mozilla.net/media/cc0-audio/t-rex-roar.mp3";
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE"]
 fn live_page_read_edit_write_verify_integrity_with_media_download() {
     let env = LiveEnv::from_env();
     let api = Arc::new(LiveNotion::new(env.token.clone()));
     let mut cleanup = LiveCleanup::new(api.clone());
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(support::live_notion_config());
     let title = format!("Locality live block integrity {}", unique_suffix());
     let page = cleanup.create_page(
         &env.parent_page_id,
@@ -276,12 +277,12 @@ fn live_page_read_edit_write_verify_integrity_with_media_download() {
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_LIVE_PARENT_PAGE"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE"]
 fn live_database_row_property_create_edit_verify_integrity() {
     let env = LiveEnv::from_env();
     let api = Arc::new(LiveNotion::new(env.token.clone()));
     let mut cleanup = LiveCleanup::new(api.clone());
-    let connector = NotionConnector::new(NotionConfig::default());
+    let connector = NotionConnector::new(support::live_notion_config());
     let people_user_id = cleanup.current_user_id();
     let scratch = cleanup.create_page(
         &env.parent_page_id,
@@ -555,7 +556,7 @@ struct LiveEnv {
 
 impl LiveEnv {
     fn from_env() -> Self {
-        let token = std::env::var(TOKEN_ENV).expect("set NOTION_TOKEN");
+        let token = support::live_notion_token();
         let parent_page = std::env::var(LIVE_PARENT_ENV).unwrap_or_else(|_| {
             panic!("set {LIVE_PARENT_ENV} to a writable Notion page ID or URL")
         });

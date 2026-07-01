@@ -1552,6 +1552,82 @@ fn apply_preserves_unchanged_mentions_and_parses_edited_rich_spans() {
 }
 
 #[test]
+fn apply_preserves_unchanged_colored_rich_text_when_editing_adjacent_text() {
+    let api = Arc::new(RecordingNotionApi::with_paragraph_rich_text(
+        "2026-06-10T00:00:00.000Z",
+        vec![
+            rich_text_part("Prefix original "),
+            annotated_text("Colored marker", |annotations| {
+                annotations.color = Some("red".to_string());
+            }),
+            rich_text_part(" suffix original."),
+        ],
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::UpdateBlock {
+            block_id: RemoteId::new("paragraph-1"),
+            content: "Prefix changed Colored marker suffix changed.".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply adjacent colored rich text edit");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Update {
+            block_id: "paragraph-1".to_string(),
+            body: json!({
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": "Prefix changed ",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": "Colored marker",
+                            },
+                            "annotations": {
+                                "bold": false,
+                                "italic": false,
+                                "strikethrough": false,
+                                "underline": false,
+                                "code": false,
+                                "color": "red",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": " suffix changed.",
+                            },
+                        },
+                    ],
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_parses_markdown_link_hrefs_with_balanced_parentheses() {
     let api = Arc::new(RecordingNotionApi::with_paragraph_rich_text(
         "2026-06-10T00:00:00.000Z",

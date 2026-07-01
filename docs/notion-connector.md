@@ -69,12 +69,16 @@ echo "$NOTION_TOKEN" | loc connect notion --token-stdin --name work
 To test against a real page:
 
 ```sh
-export NOTION_TOKEN='secret_...'
 export LOCALITY_NOTION_PAGE_ID='...'
 cargo test -p locality-notion live_fetch_and_render_page_from_environment -- --ignored
 ```
 
-The token must have access to the target page. Live tests are ignored by default; fixture-backed tests cover normal CI.
+`LOCALITY_NOTION_PAGE_ID` may be omitted when
+`LOCALITY_NOTION_LIVE_PARENT_PAGE` is already set; the smoke will fetch/render
+that page instead. Auth uses `NOTION_TOKEN` when explicitly set, otherwise it
+reads the installed Locality credential store for `connection:notion-default`
+under `~/.loc/credentials`. The token must have access to the target page. Live
+tests are ignored by default; fixture-backed tests cover normal CI.
 
 The broader live integrity suite creates and archives scratch content under a writable parent page. `LOCALITY_NOTION_LIVE_PARENT_PAGE` may be a page ID or a Notion page URL. `LOCALITY_NOTION_LIVE_DIR` is optional and controls where local media artifacts are downloaded:
 
@@ -90,17 +94,26 @@ Those tests cover broad block rendering, supported block edits/appends, media do
 The product-level mounted workflow test uses the same parent page, but exercises the Locality user path instead of only the connector boundary. It creates a scratch page, mounts it as plain files, pulls it locally, edits the Markdown file, verifies `loc status` reports pending changes, pushes the edit, fetches the page from Notion, and archives the scratch page:
 
 ```sh
-export NOTION_TOKEN='secret_...'
 export LOCALITY_NOTION_LIVE_PARENT_PAGE='https://app.notion.com/...'
 cargo test -p loc-cli --test e2e_push_workflow live_scratch_page_mount_edit_push_verifies_notion -- --ignored --exact
 ```
 
+Those workflow tests use `NOTION_TOKEN` when it is set, otherwise they read the
+installed Locality credential store for `connection:notion-default` under
+`~/.loc/credentials` on Linux/dev installs. The connector-level live tests use
+the same lookup. Set `LOCALITY_NOTION_LIVE_CONNECTION_ID` to use a different
+stored Notion connection. The mounted workflow and Linux FUSE live tests preflight
+`LOCALITY_NOTION_LIVE_PARENT_PAGE` and fail before scratch creation if it points
+to an archived, trashed, inaccessible, or non-page Notion object.
+
 GitHub Actions has a manual and `main`-branch `notion-live-e2e` workflow for
 these tests. The workflow should be backed by a disposable Notion
 workspace/account and secrets named `NOTION_TOKEN` and
-`LOCALITY_NOTION_LIVE_PARENT_PAGE`. The Windows job also mounts a live Cloud Files
-sync root and runs `loc doctor --json` against that live state before exercising
-provider file operations.
+`LOCALITY_NOTION_LIVE_PARENT_PAGE`. The connector, mounted workflow, Linux FUSE,
+and Windows Cloud Files jobs seed the stored credential path from `NOTION_TOKEN`
+and then run test/product commands with token environment variables removed. The
+Windows job also mounts a live Cloud Files sync root and runs `loc doctor
+--json` against that live state before exercising provider file operations.
 
 ## Initial Block Rendering
 
@@ -111,6 +124,7 @@ Inline rich text is represented with Notion DTOs first, then rendered through on
 - `RichTextDto` mirrors Notion's `text`, `mention`, and `equation` variants plus shared annotations and links.
 - `TextRichTextDto`, `MentionRichTextDto`, and `EquationRichTextDto` keep variant-specific payloads out of renderer control flow.
 - The renderer preserves whitespace around annotated spans so text like ` bold ` becomes ` **bold** ` instead of pulling spaces into Markdown delimiters.
+- Notion-only annotation state, such as non-default text colors, is not rendered into Markdown, but unchanged rich-text preimages preserve that state when adjacent Markdown text is edited and pushed. Block background colors are likewise preserved for ordinary text edits by sending only the changed editable fields in the Notion block update.
 - Page and database mentions render as normal Markdown links to Notion object URLs. Unchanged mention preimages still preserve typed Notion mentions during block updates, and agents can create or reassert typed links with `@page(<notion-page-id>)` and `@database(<notion-database-id>)`.
 - Unknown or partially populated rich text falls back to `plain_text` so live API additions remain readable.
 

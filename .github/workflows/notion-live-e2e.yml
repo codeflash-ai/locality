@@ -35,8 +35,15 @@ jobs:
             echo "::error::Live Notion e2e is required on main but missing secrets: ${missing[*]}"
             exit 1
           fi
+      - name: Seed stored Notion credential
+        run: |
+          secret_ref="connection:notion-default"
+          secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+          mkdir -p "$HOME/.loc/credentials"
+          printf '%s' "$NOTION_TOKEN" > "$HOME/.loc/credentials/$secret_hex"
+          chmod 600 "$HOME/.loc/credentials/$secret_hex"
       - name: Run connector live integrity tests
-        run: cargo test -p locality-notion --test live_integrity -- --ignored --test-threads=1
+        run: env -u NOTION_TOKEN -u NOTION_AT cargo test -p locality-notion --test live_integrity -- --ignored --test-threads=1
 
   mounted-workflow-live:
     name: Notion mounted workflow live e2e
@@ -59,8 +66,55 @@ jobs:
             echo "::error::Live Notion e2e is required on main but missing secrets: ${missing[*]}"
             exit 1
           fi
-      - name: Run mounted workflow live e2e
-        run: cargo test -p loc-cli --test e2e_push_workflow live_ -- --ignored --test-threads=1
+      - name: Seed stored Notion credential
+        run: |
+          secret_ref="connection:notion-default"
+          secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+          mkdir -p "$HOME/.loc/credentials"
+          printf '%s' "$NOTION_TOKEN" > "$HOME/.loc/credentials/$secret_hex"
+          chmod 600 "$HOME/.loc/credentials/$secret_hex"
+      - name: Run mounted workflow live e2e from stored credential
+        run: env -u NOTION_TOKEN -u NOTION_AT cargo test -p loc-cli --test e2e_push_workflow live_ -- --ignored --test-threads=1
+
+  linux-fuse-live:
+    name: Linux FUSE live Notion e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: notion-live-e2e
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      LOCALITY_NOTION_LIVE_PARENT_PAGE: ${{ secrets.LOCALITY_NOTION_LIVE_PARENT_PAGE || secrets.AFS_NOTION_LIVE_PARENT_PAGE }}
+      LOCALITY_LIVE_NOTION_VFS_PUSH_PULL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config sqlite3
+      - name: Check live Notion secrets and FUSE device
+        run: |
+          missing=()
+          [ -n "$NOTION_TOKEN" ] || missing+=("NOTION_TOKEN")
+          [ -n "$LOCALITY_NOTION_LIVE_PARENT_PAGE" ] || missing+=("LOCALITY_NOTION_LIVE_PARENT_PAGE or AFS_NOTION_LIVE_PARENT_PAGE")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Live Linux FUSE Notion e2e is required on main but missing secrets: ${missing[*]}"
+            exit 1
+          fi
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse is not present. Real Linux FUSE live Notion e2e cannot run on this runner."
+            exit 1
+          fi
+      - name: Seed stored Notion credential
+        run: |
+          secret_ref="connection:notion-default"
+          secret_hex="$(printf '%s' "$secret_ref" | od -An -tx1 -v | tr -d ' \n')"
+          mkdir -p "$HOME/.loc/credentials"
+          printf '%s' "$NOTION_TOKEN" > "$HOME/.loc/credentials/$secret_hex"
+          chmod 600 "$HOME/.loc/credentials/$secret_hex"
+      - name: Run Linux FUSE live Notion e2e from stored credential
+        run: env -u NOTION_TOKEN -u NOTION_AT tests/live_notion_vfs_push_pull.sh
 
   windows-cloud-files-live:
     name: Windows Cloud Files live e2e
@@ -90,6 +144,18 @@ jobs:
             Write-Host "::error::Live Notion e2e is required on main but missing secrets: $($missing -join ', ')"
             exit 1
           }
+      - name: Seed stored Notion credential
+        shell: pwsh
+        run: |
+          $secretRef = "connection:notion-default"
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($secretRef)
+          $secretHex = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+          $credentialDir = Join-Path $HOME ".loc\credentials"
+          New-Item -ItemType Directory -Force -Path $credentialDir | Out-Null
+          Set-Content -LiteralPath (Join-Path $credentialDir $secretHex) -Value $env:NOTION_TOKEN -NoNewline -Encoding utf8
       - name: Run Windows Cloud Files live Notion e2e
         shell: pwsh
-        run: ./tests/windows_cloud_files_live.ps1
+        run: |
+          Remove-Item Env:\NOTION_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:\NOTION_AT -ErrorAction SilentlyContinue
+          ./tests/windows_cloud_files_live.ps1

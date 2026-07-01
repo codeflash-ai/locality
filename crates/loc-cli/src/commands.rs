@@ -10,7 +10,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use locality_connector::ConnectorUndoApplier;
 use locality_connector::oauth_broker::OAuthBrokerStart;
 use locality_core::LocalityError;
-use locality_core::journal::PushId;
+use locality_core::journal::{JournalStatus, PushId};
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::path_projection::{
     page_container_path, page_document_path, page_listing_parent_path,
@@ -49,16 +49,16 @@ use crate::connect::{
     run_connect_notion_oauth, run_connection_show, run_connections, run_disconnect, run_profiles,
 };
 use crate::connector::{
-    ConnectorResolveError, SourceDescriptor, resolve_source_for_mount_id, resolve_source_for_path,
-    source_descriptor,
+    ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
+    resolve_source_for_mount_id, resolve_source_for_path, source_descriptor,
 };
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff_with_state_root};
 use crate::doctor::{DoctorOptions, doctor_exit_code, print_doctor_report, run_doctor};
 use crate::file_provider as file_provider_helper;
 use crate::history::{
-    HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo_with_applier_at_state_root,
-    undo_report_exit_code,
+    HistoryError, LogOptions, LogReport, UndoReport, run_log, run_undo,
+    run_undo_with_applier_at_state_root, undo_report_exit_code,
 };
 use crate::info::{InfoError, InfoOptions, InfoReport, run_info};
 use crate::inspect::{InspectError, InspectOptions, InspectReport, run_inspect};
@@ -2007,7 +2007,20 @@ fn mount_remote_root_id(
                     "loc mount notion requires --workspace or --root-page <page-id>",
                 ));
             }
-            Ok(root_page_id.map(RemoteId::new))
+            let remote_root_id = root_page_id.map(RemoteId::new);
+            let temp_mount = MountConfig {
+                mount_id: mount_id.clone(),
+                connector: descriptor.id().to_string(),
+                root: PathBuf::from(root),
+                remote_root_id: remote_root_id.clone(),
+                connection_id: connection_id.clone(),
+                read_only,
+                projection: projection.clone(),
+            };
+            let credentials = open_credential_store(state_root);
+            resolve_notion_connector_for_mount(store, credentials.as_ref(), &temp_mount)
+                .map_err(|error| connector_resolve_command_error("mount", error))?;
+            Ok(remote_root_id)
         }
         GOOGLE_DOCS_CONNECTOR_ID => {
             if has_flag(args, "--workspace") || flag_value(args, "--root-page").is_some() {
@@ -2748,6 +2761,26 @@ fn undo(args: &[String], json: bool) -> i32 {
         }
     };
     let state_root = default_state_root();
+
+    if !matches!(
+        journal.status,
+        JournalStatus::Applied | JournalStatus::Reconciled
+    ) {
+        return match run_undo(&mut store, push_id) {
+            Ok(report) if json => {
+                let exit_code = undo_report_exit_code(&report);
+                print_json(&report);
+                exit_code
+            }
+            Ok(report) => {
+                let exit_code = undo_report_exit_code(&report);
+                print_undo_report(&report);
+                exit_code
+            }
+            Err(error) => history_command_error("undo", json, error),
+        };
+    }
+
     let credentials = open_credential_store(&state_root);
     let connector =
         match resolve_source_for_mount_id(&store, credentials.as_ref(), &journal.mount_id) {

@@ -27,7 +27,15 @@ latest_notarized_dmg_for_arch() {
 }
 
 sha256_file() {
-  shasum -a 256 "$1" | awk '{print $1}'
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+    return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+    return
+  fi
+  fail "missing required command: shasum or sha256sum"
 }
 
 version_from_tauri_config() {
@@ -81,7 +89,6 @@ EOF
 }
 
 main() {
-  require_command shasum
   require_command sed
 
   VERSION="${VERSION:-$(version_from_tauri_config)}"

@@ -326,14 +326,19 @@ where
     for scope in scopes {
         let facts = MountStatusFacts::load(store, &scope.mount.mount_id);
         let mutations = scoped_virtual_mutations(store, &scope)?;
-        let deleted = mutations
+        let hidden_by_virtual_mutation = mutations
             .iter()
-            .filter(|mutation| mutation.mutation_kind == VirtualMutationKind::Delete)
+            .filter(|mutation| {
+                matches!(
+                    mutation.mutation_kind,
+                    VirtualMutationKind::Delete | VirtualMutationKind::Rename
+                )
+            })
             .filter_map(|mutation| mutation.target_remote_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         let mut entries = scoped_entities(store, &scope)?
             .into_iter()
-            .filter(|entity| !deleted.contains(&entity.remote_id))
+            .filter(|entity| !hidden_by_virtual_mutation.contains(&entity.remote_id))
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.path.cmp(&right.path));
 
@@ -344,7 +349,6 @@ where
         status_entries.extend(
             mutations
                 .into_iter()
-                .filter(|mutation| mutation.mutation_kind != VirtualMutationKind::Rename)
                 .map(|mutation| classify_virtual_mutation(&scope.mount, mutation, &state_root)),
         );
         status_entries.sort_by(|left, right| left.path.cmp(&right.path));

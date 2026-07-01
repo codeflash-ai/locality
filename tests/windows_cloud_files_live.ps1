@@ -25,11 +25,58 @@ if (-not $runningOnWindows) {
     exit 0
 }
 
-$notionToken = if ($env:NOTION_TOKEN) { $env:NOTION_TOKEN } else { $env:NOTION_AT }
+function ConvertTo-HexSecretRef {
+    param([string] $Value)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+    return -join ($bytes | ForEach-Object { $_.ToString("x2") })
+}
+
+function Read-StoredNotionAccessToken {
+    param([string] $ConnectionId)
+    $credentialStateRoot = if ($env:LOCALITY_NOTION_LIVE_CREDENTIAL_STATE_DIR) {
+        $env:LOCALITY_NOTION_LIVE_CREDENTIAL_STATE_DIR
+    } else {
+        Join-Path $HOME ".loc"
+    }
+    $secretRef = "connection:$ConnectionId"
+    $secretHex = ConvertTo-HexSecretRef $secretRef
+    $secretPath = Join-Path (Join-Path $credentialStateRoot "credentials") $secretHex
+    if (-not (Test-Path -LiteralPath $secretPath)) {
+        throw "missing NOTION_TOKEN/NOTION_AT and stored Notion credential $secretRef at $secretPath"
+    }
+
+    $secret = (Get-Content -LiteralPath $secretPath -Raw -Encoding UTF8).Trim()
+    if (-not $secret) {
+        throw "stored Notion credential $secretRef is empty"
+    }
+    if ($secret.StartsWith("{")) {
+        $parsed = $secret | ConvertFrom-Json
+        $token = if ($parsed.access_token) { $parsed.access_token } else { $parsed.token }
+    } else {
+        $token = $secret
+    }
+    if (-not $token -or -not $token.Trim()) {
+        throw "stored Notion credential $secretRef has an empty access token"
+    }
+    return $token.Trim()
+}
+
+$sourceConnectionId = if ($env:LOCALITY_NOTION_LIVE_CONNECTION_ID) {
+    $env:LOCALITY_NOTION_LIVE_CONNECTION_ID
+} else {
+    "notion-default"
+}
+$notionToken = if ($env:NOTION_TOKEN) {
+    $env:NOTION_TOKEN
+} elseif ($env:NOTION_AT) {
+    $env:NOTION_AT
+} else {
+    Read-StoredNotionAccessToken -ConnectionId $sourceConnectionId
+}
 $parentPageId = if ($env:LOCALITY_NOTION_LIVE_PARENT_PAGE) { $env:LOCALITY_NOTION_LIVE_PARENT_PAGE } else { $env:LOCALITY_NOTION_PAGE_ID }
 
 if (-not $notionToken) {
-    Write-Error "missing NOTION_TOKEN or NOTION_AT"
+    Write-Error "missing NOTION_TOKEN/NOTION_AT and stored Notion credential connection:$sourceConnectionId"
     exit 1
 }
 
@@ -50,6 +97,11 @@ $removeLocalityRoot = -not $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_ROOT
 $LocalityRoot = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_ROOT) { $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_ROOT } else { Join-Path $tmpRoot "Locality" }
 $NotionMount = Join-Path $LocalityRoot "notion-main"
 $mountId = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID) { $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_MOUNT_ID } else { "notion-main" }
+$connectionId = if ($env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_CONNECTION_ID) {
+    $env:LOCALITY_WINDOWS_CLOUD_FILES_LIVE_CONNECTION_ID
+} else {
+    "live-windows-cloud-files"
+}
 $scratchPageId = $null
 $createdChildPageId = $null
 $tcpAddr = $null
@@ -121,6 +173,7 @@ function Invoke-Native {
         [string[]] $Arguments,
         [string] $Step,
         [int] $TimeoutSeconds = 120,
+        [string] $StandardInput = $null,
         [switch] $NoCapture
     )
     Write-Step $Step
@@ -131,10 +184,15 @@ function Invoke-Native {
     $process.StartInfo.CreateNoWindow = $true
     $process.StartInfo.RedirectStandardOutput = -not $NoCapture
     $process.StartInfo.RedirectStandardError = -not $NoCapture
+    $process.StartInfo.RedirectStandardInput = $null -ne $StandardInput
     foreach ($argument in $Arguments) {
         [void] $process.StartInfo.ArgumentList.Add($argument)
     }
     [void] $process.Start()
+    if ($null -ne $StandardInput) {
+        $process.StandardInput.Write($StandardInput)
+        $process.StandardInput.Close()
+    }
     $stdout = $null
     $stderr = $null
     if (-not $NoCapture) {
@@ -377,7 +435,8 @@ try {
 
     $tcpAddr = Get-FreeTcpAddr
     $env:LOCALITY_STATE_DIR = $stateRoot
-    $env:NOTION_TOKEN = $notionToken
+    Remove-Item Env:\NOTION_TOKEN -ErrorAction SilentlyContinue
+    Remove-Item Env:\NOTION_AT -ErrorAction SilentlyContinue
     $env:LOCALITY_CLOUD_FILES_BIN = $cloudFilesBin
     $parentPageId = Normalize-NotionId $parentPageId
     $scratchTitle = "Locality Cloud Files live $unique"
@@ -418,6 +477,24 @@ try {
     }
     $scratchPageId = Normalize-NotionId $scratch.id
 
+    Write-Step "creating isolated Notion connection"
+    $previousDisable = $env:LOCALITY_DAEMON_DISABLE
+    $env:LOCALITY_DAEMON_DISABLE = "1"
+    try {
+        Invoke-Native -FilePath $locBin -Arguments @(
+            "connect", "notion",
+            "--name", $connectionId,
+            "--token-stdin",
+            "--json"
+        ) -Step "loc connect notion" -StandardInput $notionToken | Out-Null
+    } finally {
+        if ($null -eq $previousDisable) {
+            Remove-Item Env:\LOCALITY_DAEMON_DISABLE -ErrorAction SilentlyContinue
+        } else {
+            $env:LOCALITY_DAEMON_DISABLE = $previousDisable
+        }
+    }
+
     Write-Step "mounting Windows Cloud Files projection"
     $previousDisable = $env:LOCALITY_DAEMON_DISABLE
     $env:LOCALITY_DAEMON_DISABLE = "1"
@@ -425,6 +502,7 @@ try {
         Invoke-Native -FilePath $locBin -Arguments @(
             "mount", "notion", $NotionMount,
             "--root-page", $scratchPageId,
+            "--connection", $connectionId,
             "--mount-id", $mountId,
             "--projection", "windows-cloud-files",
             "--json"
@@ -449,7 +527,6 @@ try {
         "--state-dir", $stateRoot,
         "--tcp-addr", $tcpAddr,
         "--localityd-bin", $localitydBin,
-        "--include-env", "NOTION_TOKEN",
         "--json"
     ) -Step "loc daemon start" -NoCapture | Out-Null
     Wait-ForCondition -Name "localityd TCP endpoint" -Condition {

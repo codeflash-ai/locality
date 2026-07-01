@@ -256,7 +256,7 @@ assert_status_contains() {
 
 seed_fixture
 
-LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_TCP_ADDR=off LOCALITY_DAEMON_PULL_MODE=disabled NOTION_TOKEN="ci-fuse-smoke-token" \
+LOCALITY_STATE_DIR="$state_root" LOCALITY_DAEMON_TCP_ADDR=off LOCALITY_DAEMON_PULL_MODE=disabled LOCALITY_DAEMON_BACKGROUND_CONNECTOR_SYNC=disabled NOTION_TOKEN="ci-fuse-smoke-token" \
   "$localityd_bin" >"$daemon_log" 2>&1 &
 localityd_pid="$!"
 wait_for_daemon

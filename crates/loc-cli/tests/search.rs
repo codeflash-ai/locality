@@ -86,6 +86,10 @@ fn notion_id_parser_rejects_non_notion_urls_with_hex_suffixes() {
         notion_id_from_url("37b3ac0e-bb88-802c-bcf4-d53c9cfc4972").as_deref(),
         Some("37b3ac0ebb88802cbcf4d53c9cfc4972")
     );
+    assert_eq!(
+        notion_id_from_url("Locality live CLI binary 1042614-1782910284842818531"),
+        None
+    );
 }
 
 #[test]
@@ -220,6 +224,35 @@ fn search_matches_numeric_short_title_terms() {
 
     assert_eq!(report.results[0].title, "1:1 Notes");
     assert_eq!(report.results[0].path, "Meetings/1-1 Notes/page.md");
+}
+
+#[test]
+fn search_matches_free_text_titles_with_long_numeric_suffixes() {
+    let fixture = SearchFixture::new();
+    let mut store = fixture.sqlite_store();
+    fixture.seed_entities(&mut store);
+    let title = "Locality live CLI binary 1042614-1782910284842818531";
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("3903ac0ebb8881ea8916e16bfbcb6d7d"),
+                EntityKind::Page,
+                title,
+                "locality-live-cli-binary-1042614-1782910284842818531/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save long numeric suffix entity");
+
+    let report = run_search(&store, SearchOptions::new(title)).expect("title search");
+
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].title, title);
+    assert_eq!(
+        report.results[0].path,
+        "locality-live-cli-binary-1042614-1782910284842818531/page.md"
+    );
 }
 
 #[test]

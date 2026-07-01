@@ -51,14 +51,14 @@ use locality_core::freshness::RemoteVersion;
 use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::journal::{JournalEntry, JournalStatus};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use locality_notion::NotionConfig;
 use locality_notion::client::notion_requests_per_second_setting;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use locality_notion::client::{HttpNotionApi, NotionApi};
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use locality_notion::dto::{BlockDto, RichTextBlockDto, RichTextDto};
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use locality_notion::oauth::StoredNotionCredential;
 use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
@@ -4893,35 +4893,45 @@ fn resolve_vs_code_command() -> Option<PathBuf> {
 }
 
 fn vs_code_command_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    #[cfg(target_os = "macos")]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        candidates.push(PathBuf::from(
-            "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
-        ));
-        if let Some(home) = platform_user_home() {
-            candidates.push(
-                home.join("Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"),
-            );
-        }
-        candidates.push(PathBuf::from("/opt/homebrew/bin/code"));
-        candidates.push(PathBuf::from("/usr/local/bin/code"));
+        Vec::new()
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-            candidates.push(
-                PathBuf::from(local_app_data)
-                    .join("Programs")
-                    .join("Microsoft VS Code")
-                    .join("Code.exe"),
-            );
-        }
-    }
+        let mut candidates = Vec::new();
 
-    candidates
+        #[cfg(target_os = "macos")]
+        {
+            candidates.push(PathBuf::from(
+                "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+            ));
+            if let Some(home) = platform_user_home() {
+                candidates.push(
+                    home.join(
+                        "Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+                    ),
+                );
+            }
+            candidates.push(PathBuf::from("/opt/homebrew/bin/code"));
+            candidates.push(PathBuf::from("/usr/local/bin/code"));
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+                candidates.push(
+                    PathBuf::from(local_app_data)
+                        .join("Programs")
+                        .join("Microsoft VS Code")
+                        .join("Code.exe"),
+                );
+            }
+        }
+
+        candidates
+    }
 }
 
 fn find_command_on_path(name: &str) -> Option<PathBuf> {
@@ -8255,20 +8265,17 @@ mod tests {
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
 
     use super::{
-        ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, LiveModeE2eCleanup,
-        MonitorScreenBounds, PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
-        activity_timestamp, clear_mount_cached_projection, clear_state_root_contents,
-        conflict_preview, connection_metadata_changed, current_daemon_build_id,
-        current_desktop_build_id, diff_report_message, exact_located_entity_record,
-        failed_push_summary, has_unresolved_conflict_markers, hydration_after_editor_write,
-        inspect_install_state, install_terminal_cli_link_at,
-        install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
-        is_unsupported_schema_version_message, live_mode_e2e_append_local_marker,
-        live_mode_e2e_append_remote_marker, live_mode_e2e_notion_api, live_mode_e2e_page_id,
-        live_mode_e2e_page_path, live_mode_e2e_remote_text, live_mode_e2e_wait_until,
+        ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, MonitorScreenBounds,
+        PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState, activity_timestamp,
+        clear_mount_cached_projection, clear_state_root_contents, conflict_preview,
+        connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
+        diff_report_message, exact_located_entity_record, failed_push_summary,
+        has_unresolved_conflict_markers, hydration_after_editor_write, inspect_install_state,
+        install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
+        is_notion_access_lost_message, is_unsupported_schema_version_message,
         live_mode_merge_remote_drift_markdown, live_mode_remote_check_page_budget_for_rate,
         live_mode_remote_pull_candidates, live_mode_remote_pull_scan_is_due_for_key,
-        live_mode_should_reconcile_local_target_for_key, live_mode_target, live_mode_tick_blocking,
+        live_mode_should_reconcile_local_target_for_key, live_mode_target,
         live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
         mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
         parse_daemon_build_info_json, pending_changes_from_status,
@@ -8280,11 +8287,17 @@ mod tests {
         should_hide_tray_popover, should_prioritize_located_result,
         state_event_path_requires_refresh, state_event_path_wakes_live_mode,
         summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
-        tray_popover_anchor, tray_popover_position, unique_suffix,
-        unsupported_notion_locator_url_message, validate_mount_root,
-        virtual_projection_prefetch_container_identifiers,
+        tray_popover_anchor, tray_popover_position, unsupported_notion_locator_url_message,
+        validate_mount_root, virtual_projection_prefetch_container_identifiers,
         virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
         wake_live_mode_runner, write_terminal_cli_path_section,
+    };
+    #[cfg(target_os = "macos")]
+    use super::{
+        LiveModeE2eCleanup, live_mode_e2e_append_local_marker, live_mode_e2e_append_remote_marker,
+        live_mode_e2e_notion_api, live_mode_e2e_page_id, live_mode_e2e_page_path,
+        live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_tick_blocking,
+        unique_suffix,
     };
 
     #[test]
@@ -11123,21 +11136,21 @@ fn live_mode_target(path: &str) -> LiveModeRemoteTarget {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 struct LiveModeE2eCleanup {
     api: HttpNotionApi,
     page_id: String,
     run_id: String,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 impl Drop for LiveModeE2eCleanup {
     fn drop(&mut self) {
         let _ = live_mode_e2e_delete_marker_blocks(&self.api, &self.page_id, &self.run_id);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_page_path() -> PathBuf {
     let raw = std::env::var("LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE")
         .expect("set LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE to a scratch CloudStorage page.md path");
@@ -11149,7 +11162,7 @@ fn live_mode_e2e_page_path() -> PathBuf {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_page_id(page_path: &Path) -> String {
     if let Ok(page_id) = std::env::var("LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE_ID")
         && !page_id.trim().is_empty()
@@ -11165,7 +11178,7 @@ fn live_mode_e2e_page_id(page_path: &Path) -> String {
         .clone()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_notion_api(page_path: &Path) -> HttpNotionApi {
     if let Ok(token) = std::env::var("NOTION_TOKEN")
         && !token.trim().is_empty()
@@ -11212,7 +11225,7 @@ fn live_mode_e2e_notion_api(page_path: &Path) -> HttpNotionApi {
     HttpNotionApi::new(NotionConfig::default().with_token(token))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_append_local_marker(page_path: &Path, marker: &str) {
     let mut contents = fs::read_to_string(page_path).expect("read local page before edit");
     if !contents.ends_with('\n') {
@@ -11224,7 +11237,7 @@ fn live_mode_e2e_append_local_marker(page_path: &Path, marker: &str) {
     fs::write(page_path, contents).expect("write local live-mode marker");
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_append_remote_marker(api: &HttpNotionApi, page_id: &str, marker: &str) {
     api.append_block_children(
         page_id,
@@ -11244,7 +11257,7 @@ fn live_mode_e2e_append_remote_marker(api: &HttpNotionApi, page_id: &str, marker
     .expect("append remote Notion marker");
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_wait_until<F>(label: &str, mut condition: F)
 where
     F: FnMut() -> bool,
@@ -11263,7 +11276,7 @@ where
     panic!("{label} did not converge within {timeout}s");
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_remote_text(api: &HttpNotionApi, page_id: &str) -> String {
     live_mode_e2e_remote_blocks(api, page_id)
         .iter()
@@ -11272,7 +11285,7 @@ fn live_mode_e2e_remote_text(api: &HttpNotionApi, page_id: &str) -> String {
         .join("\n")
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_delete_marker_blocks(
     api: &HttpNotionApi,
     page_id: &str,
@@ -11287,7 +11300,7 @@ fn live_mode_e2e_delete_marker_blocks(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_remote_blocks(api: &HttpNotionApi, page_id: &str) -> Vec<BlockDto> {
     let mut blocks = Vec::new();
     let mut cursor = None;
@@ -11304,7 +11317,7 @@ fn live_mode_e2e_remote_blocks(api: &HttpNotionApi, page_id: &str) -> Vec<BlockD
     blocks
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_block_plain_text(block: &BlockDto) -> String {
     block
         .paragraph
@@ -11313,7 +11326,7 @@ fn live_mode_e2e_block_plain_text(block: &BlockDto) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_rich_text_block_plain_text(block: &RichTextBlockDto) -> String {
     block
         .rich_text
@@ -11322,7 +11335,7 @@ fn live_mode_e2e_rich_text_block_plain_text(block: &RichTextBlockDto) -> String 
         .collect::<String>()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn live_mode_e2e_rich_text_plain_text(text: &RichTextDto) -> String {
     if !text.plain_text.is_empty() {
         return text.plain_text.clone();
@@ -11333,7 +11346,7 @@ fn live_mode_e2e_rich_text_plain_text(text: &RichTextDto) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn unique_suffix() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)

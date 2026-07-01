@@ -36,6 +36,7 @@ pub struct DaemonConfig {
     pub runtime_tick_interval: Duration,
     pub hydration_retry_delay: Duration,
     pub pull_scheduler: PullSchedulerConfig,
+    pub background_connector_sync: bool,
 }
 
 impl Default for DaemonConfig {
@@ -47,6 +48,7 @@ impl Default for DaemonConfig {
             runtime_tick_interval: Duration::from_secs(1),
             hydration_retry_delay: Duration::from_secs(30),
             pull_scheduler: default_pull_scheduler_config(),
+            background_connector_sync: default_background_connector_sync(),
         }
     }
 }
@@ -106,4 +108,13 @@ fn default_pull_scheduler_config() -> PullSchedulerConfig {
         config.mode = PullMode::Relay;
     }
     config
+}
+
+fn default_background_connector_sync() -> bool {
+    !matches!(
+        std::env::var("LOCALITY_DAEMON_BACKGROUND_CONNECTOR_SYNC")
+            .ok()
+            .as_deref(),
+        Some("0" | "off" | "none" | "disabled")
+    )
 }

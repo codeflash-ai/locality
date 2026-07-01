@@ -24,6 +24,8 @@ require_executable "${ROOT}/scripts/publish-linux.sh"
 require_executable "${ROOT}/scripts/render-linux-repositories.sh"
 require_executable "${ROOT}/apps/desktop/scripts/prepare-bundle.sh"
 require_executable "${ROOT}/apps/desktop/scripts/prepare-linux-bundle.sh"
+[[ -f "${ROOT}/apps/desktop/scripts/prepare-bundle.mjs" ]] \
+  || fail "expected apps/desktop/scripts/prepare-bundle.mjs"
 
 grep -q '^publish-linux:' "${MAKEFILE}" || fail "Makefile is missing publish-linux target"
 grep -q '^render-linux-repositories:' "${MAKEFILE}" \
@@ -33,7 +35,7 @@ grep -q '^render-linux-repositories:' "${MAKEFILE}" \
 [[ "$(json_value '.scripts["build:linux"]' "${PACKAGE_JSON}")" == "tauri build --bundles deb,rpm" ]] \
   || fail "package.json build:linux must build deb and rpm bundles"
 
-[[ "$(json_value '.build.beforeBundleCommand' "${TAURI_CONF}")" == "./scripts/prepare-bundle.sh" ]] \
+[[ "$(json_value '.build.beforeBundleCommand' "${TAURI_CONF}")" == "node ./scripts/prepare-bundle.mjs" ]] \
   || fail "Tauri beforeBundleCommand must dispatch per platform"
 
 for binary in loc localityd locality-fuse; do

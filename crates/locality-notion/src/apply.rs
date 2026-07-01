@@ -1885,6 +1885,7 @@ struct InlineAnnotations {
     strikethrough: bool,
     underline: bool,
     code: bool,
+    color: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2088,6 +2089,7 @@ impl From<&RichTextAnnotationsDto> for InlineAnnotations {
             strikethrough: value.strikethrough,
             underline: value.underline,
             code: value.code,
+            color: non_default_annotation_color(&value.color),
         }
     }
 }
@@ -2100,9 +2102,16 @@ impl From<InlineAnnotations> for RichTextAnnotationsDto {
             strikethrough: value.strikethrough,
             underline: value.underline,
             code: value.code,
-            color: None,
+            color: value.color,
         }
     }
+}
+
+fn non_default_annotation_color(color: &Option<String>) -> Option<String> {
+    color
+        .as_deref()
+        .filter(|color| !color.is_empty() && *color != "default")
+        .map(str::to_string)
 }
 
 fn parse_rich_text_markdown(
@@ -3008,13 +3017,14 @@ fn insert_annotations(value: &mut Value, annotations: &InlineAnnotations) {
         return;
     }
 
+    let color = annotations.color.as_deref().unwrap_or("default");
     value["annotations"] = json!({
         "bold": annotations.bold,
         "italic": annotations.italic,
         "strikethrough": annotations.strikethrough,
         "underline": annotations.underline,
         "code": annotations.code,
-        "color": "default",
+        "color": color,
     });
 }
 

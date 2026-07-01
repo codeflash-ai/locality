@@ -298,20 +298,23 @@ where
 
 pub fn notion_id_from_url(url: &str) -> Option<String> {
     let url = url.trim();
-    if let Some(host) = source_url_host(url)
-        && !is_notion_url_host(&host)
-    {
+    let source_host = source_url_host(url);
+    if let Some(host) = source_host.as_deref() {
+        if !is_notion_url_host(host) {
+            return None;
+        }
+
+        let without_query = url.split(['?', '#']).next().unwrap_or(url);
+        for segment in without_query.rsplit('/') {
+            if let Some(candidate) = compact_notion_id_suffix(segment) {
+                return Some(candidate);
+            }
+        }
+
         return None;
     }
 
-    let without_query = url.split(['?', '#']).next().unwrap_or(url);
-    for segment in without_query.rsplit('/') {
-        if let Some(candidate) = compact_notion_id_suffix(segment) {
-            return Some(candidate);
-        }
-    }
-
-    compact_notion_id_suffix(url)
+    bare_notion_id(url)
 }
 
 pub fn source_url_host(value: &str) -> Option<String> {
@@ -646,6 +649,18 @@ fn entity_kind_name(kind: &EntityKind) -> &str {
 
 fn compact_path_id(path: &Path) -> String {
     compact_notion_id_suffix(&path.to_string_lossy()).unwrap_or_default()
+}
+
+fn bare_notion_id(value: &str) -> Option<String> {
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_hexdigit() || character == '-')
+    {
+        return None;
+    }
+
+    let compact = compact_notion_id(value);
+    (compact.len() == 32).then_some(compact)
 }
 
 fn compact_notion_id_suffix(value: &str) -> Option<String> {

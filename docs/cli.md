@@ -598,8 +598,12 @@ Undo plans are `complete`, `partial`, or `blocked`. Complete plans currently inc
 Ignored live test:
 
 ```bash
-NOTION_TOKEN=... LOCALITY_NOTION_LIVE_PARENT_PAGE=... \
+LOCALITY_NOTION_LIVE_PARENT_PAGE=... \
   cargo test -p loc-cli --test e2e_push_workflow live_scratch_page_mount_edit_push_verifies_notion -- --ignored --exact
 ```
+
+The live workflow test can use `NOTION_TOKEN` locally, but CI seeds the default
+stored Locality Notion credential in `~/.loc/credentials` and runs the mounted
+workflow with token environment variables removed.
 
 The test creates a scratch page under the configured live parent, mounts a temporary Notion projection, pulls the root page, edits the local Markdown file, verifies pending status, pushes with confirmation, verifies the edit through the Notion API, and archives the scratch page.

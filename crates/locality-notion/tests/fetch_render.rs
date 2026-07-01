@@ -21,6 +21,11 @@ use locality_notion::dto::{
 use locality_notion::{NotionConfig, NotionConnector};
 use serde_json::json;
 
+mod support;
+
+const PAGE_ID_ENV: &str = "LOCALITY_NOTION_PAGE_ID";
+const LIVE_PARENT_ENV: &str = "LOCALITY_NOTION_LIVE_PARENT_PAGE";
+
 #[test]
 fn fetch_recurses_paginated_block_children_and_render_preserves_shadow_ids() {
     let api = FixtureNotionApi::new();
@@ -2026,10 +2031,10 @@ fn enumerate_shared_workspace_keeps_shared_database_row_when_database_is_not_sha
 }
 
 #[test]
-#[ignore = "requires NOTION_TOKEN and LOCALITY_NOTION_PAGE_ID"]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_PAGE_ID or LOCALITY_NOTION_LIVE_PARENT_PAGE"]
 fn live_fetch_and_render_page_from_environment() {
-    let page_id = std::env::var("LOCALITY_NOTION_PAGE_ID").expect("LOCALITY_NOTION_PAGE_ID");
-    let connector = NotionConnector::new(NotionConfig::default());
+    let page_id = live_fetch_render_page_id();
+    let connector = NotionConnector::new(support::live_notion_config());
 
     let native = connector
         .fetch(FetchRequest {
@@ -2042,6 +2047,29 @@ fn live_fetch_and_render_page_from_environment() {
 
     assert!(!rendered.document.frontmatter.is_empty());
     assert_eq!(rendered.shadow.entity_id, native.remote_id);
+}
+
+fn live_fetch_render_page_id() -> String {
+    let page_id = std::env::var(PAGE_ID_ENV).or_else(|_| std::env::var(LIVE_PARENT_ENV));
+    normalize_notion_id(&page_id.unwrap_or_else(|_| panic!("{PAGE_ID_ENV} or {LIVE_PARENT_ENV}")))
+}
+
+fn normalize_notion_id(input: &str) -> String {
+    let mut value = input.trim();
+    if let Some((before_query, _)) = value.split_once('?') {
+        value = before_query;
+    }
+    if let Some((before_hash, _)) = value.split_once('#') {
+        value = before_hash;
+    }
+    let candidate = value
+        .rsplit(['/', '-'])
+        .find(|part| part.chars().filter(|ch| ch.is_ascii_hexdigit()).count() >= 32)
+        .unwrap_or(value);
+    candidate
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .collect::<String>()
 }
 
 #[derive(Debug)]

@@ -311,18 +311,61 @@ pub fn update_media_manifest(
     let mut manifest = load_media_manifest(mount_root)?;
     manifest.version = 1;
     for asset in assets {
-        let entry = MediaManifestEntry {
-            block_id: asset.block_id.clone(),
-            kind: asset.kind.clone(),
-            source_url: asset.source_url.clone(),
-            local_path: asset.local_path.clone(),
-            sha256: sha256_hex(&asset.bytes),
-            size: asset.bytes.len() as u64,
-        };
-        manifest
-            .assets
-            .insert(media_manifest_key(&asset.local_path), entry);
+        manifest.assets.insert(
+            media_manifest_key(&asset.local_path),
+            media_manifest_entry_for_asset(asset),
+        );
     }
+    write_media_manifest(mount_root, &manifest)
+}
+
+pub fn replace_media_manifest(
+    mount_root: &Path,
+    assets: &[DownloadedMediaAsset],
+) -> LocalityResult<()> {
+    let existing = load_media_manifest(mount_root)?;
+    let mut manifest = MediaManifest {
+        version: 1,
+        assets: BTreeMap::new(),
+    };
+    for asset in assets {
+        manifest.assets.insert(
+            media_manifest_key(&asset.local_path),
+            media_manifest_entry_for_asset(asset),
+        );
+    }
+
+    for (key, entry) in existing.assets {
+        if manifest.assets.contains_key(&key) {
+            continue;
+        }
+        if !is_media_path(&entry.local_path) {
+            continue;
+        }
+        validate_mount_relative_path(&entry.local_path)?;
+        let absolute_path = mount_root.join(&entry.local_path);
+        match std::fs::remove_file(&absolute_path) {
+            Ok(()) => prune_empty_media_dirs(mount_root, absolute_path.parent()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    write_media_manifest(mount_root, &manifest)
+}
+
+fn media_manifest_entry_for_asset(asset: &DownloadedMediaAsset) -> MediaManifestEntry {
+    MediaManifestEntry {
+        block_id: asset.block_id.clone(),
+        kind: asset.kind.clone(),
+        source_url: asset.source_url.clone(),
+        local_path: asset.local_path.clone(),
+        sha256: sha256_hex(&asset.bytes),
+        size: asset.bytes.len() as u64,
+    }
+}
+
+fn write_media_manifest(mount_root: &Path, manifest: &MediaManifest) -> LocalityResult<()> {
     let path = media_manifest_path(mount_root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -330,6 +373,24 @@ pub fn update_media_manifest(
     let json = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| LocalityError::Io(format!("media manifest encode failed: {error}")))?;
     write_atomic(&path, &json)
+}
+
+fn prune_empty_media_dirs(mount_root: &Path, start: Option<&Path>) {
+    let media_root = mount_root.join(media_root_path());
+    let Some(mut current) = start.map(Path::to_path_buf) else {
+        return;
+    };
+
+    while current.starts_with(&media_root) && current != media_root {
+        match std::fs::remove_dir(&current) {
+            Ok(()) => {
+                if !current.pop() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 pub fn media_manifest_entry<'a>(
