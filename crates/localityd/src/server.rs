@@ -33,7 +33,7 @@ pub fn run_foreground(config: &DaemonConfig) -> LocalityResult<()> {
         .lock()
         .expect("daemon watch manager")
         .reload_mounts()?;
-    if runtime_handle.prime_virtual_mounts().is_err() {
+    if config.background_connector_sync && runtime_handle.prime_virtual_mounts().is_err() {
         eprintln!("localityd could not queue virtual filesystem priming: runtime stopped");
     }
     let server = DaemonServerHandle {
@@ -224,7 +224,9 @@ fn handle_request(request: DaemonRequest, server: &DaemonServerHandle) -> Daemon
             let mut watch_manager = server.watch_manager.lock().expect("daemon watch manager");
             match watch_manager.reload_mounts() {
                 Ok(report) => {
-                    if server.runtime.prime_virtual_mounts().is_err() {
+                    if watch_manager.config.background_connector_sync
+                        && server.runtime.prime_virtual_mounts().is_err()
+                    {
                         eprintln!(
                             "localityd could not queue virtual filesystem priming after mount reload: runtime stopped"
                         );
@@ -519,6 +521,46 @@ mod tests {
                 ("notion-main".to_string(), "mount:notion-main".to_string()),
                 ("notion-main".to_string(), "root".to_string()),
             ]
+        );
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn reload_mounts_skips_virtual_directory_priming_when_disabled() {
+        let mut config = test_config("reload-skips-virtual-prime");
+        config.background_connector_sync = false;
+        let (refresh_tx, refresh_rx) = mpsc::channel();
+        let runtime =
+            DaemonRuntime::spawn_with_runner(config.clone(), RecordingRefreshRunner { refresh_tx })
+                .expect("spawn runtime");
+        let watch_manager = Arc::new(Mutex::new(
+            DaemonWatchManager::new(&config, runtime.handle()).expect("watch manager"),
+        ));
+        let server = DaemonServerHandle {
+            runtime: runtime.handle(),
+            watch_manager,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+
+        let mut store = SqliteStateStore::open(config.state_root.clone()).expect("open store");
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("notion-main"),
+                    "notion",
+                    temp_root("reload-skip-prime-mount"),
+                )
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save virtual mount");
+        drop(store);
+
+        let response = handle_request(DaemonRequest::ReloadMounts, &server);
+
+        assert!(response.ok, "{response:?}");
+        assert!(
+            refresh_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "virtual refresh should not be queued when priming is disabled"
         );
         runtime.shutdown();
     }

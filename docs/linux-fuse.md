@@ -60,7 +60,10 @@ The hosted test intentionally does not use Notion credentials. Live-provider
 e2e should use a disposable test workspace/account with narrowly scoped
 credentials. macOS File Provider e2e is not part of hosted CI; developers should
 run it on local Macs where the signed app/extension and user approval are
-available.
+available. The fixture-backed smoke starts `localityd` with
+`LOCALITY_DAEMON_BACKGROUND_CONNECTOR_SYNC=disabled` so directory listings,
+materialization, and local mutations exercise only the seeded daemon state
+instead of queueing connector-backed refresh work with the dummy token.
 
 ## Live Notion FUSE E2E
 
