@@ -56,6 +56,17 @@ impl FreshnessQueue {
         self.jobs.is_empty()
     }
 
+    pub fn contains(&self, job: &SyncJob) -> bool {
+        self.jobs.contains_key(&job.dedupe_key())
+    }
+
+    pub fn matching_count<F>(&self, mut predicate: F) -> usize
+    where
+        F: FnMut(&SyncJob) -> bool,
+    {
+        self.jobs.values().filter(|job| predicate(job)).count()
+    }
+
     pub fn upsert(&mut self, job: SyncJob) {
         let key = job.dedupe_key();
         let Some(existing) = self.jobs.get_mut(&key) else {
