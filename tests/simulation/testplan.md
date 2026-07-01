@@ -1,140 +1,191 @@
 # Simulation Harness Reliability Test Plan
 
-  ## Summary
+## Summary
 
-  Build a model-based randomized simulation harness that complements the existing scenario e2e tests rather than replacing
-  them. Existing tests already prove individual workflows across e2e_push_workflow, architecture_behavior,
-  projection_contract, daemon runtime tests, and live Notion e2e; the new harness should prove those guarantees survive long
-  interleavings of local edits, remote edits, hydration changes, validation failures, retries, rate limits, and crash/
-  restart points.
+The simulation harness is intended to make Locality sync reliability measurable
+under long, replayable interleavings rather than only isolated scenario tests.
+It complements the existing e2e suite by modeling local state, remote state,
+synced shadows, hydration state, validation failures, journal transitions,
+push fault points, and final recovery/convergence.
 
-  Primary target: nightly heavy reliability runs, per your preference. Add a small deterministic PR smoke test for fast
-  feedback, but optimize the design around long seeded runs with replayable failures.
+Primary target: extreme reliability. Fast deterministic smoke tests should run
+in PRs, while ignored nightly/live profiles should stress longer sequences and
+real Notion behavior.
 
-  ## Key Changes
+## Implemented Coverage
 
-  - Add a new simulation test target under tests/simulation or crates/localityd/tests/simulation.rs that drives the daemon/
-    core product path using fake connectors and durable stores.
+### Deterministic Core Simulation
 
-  - Use a deterministic scenario runner with:
-      - seeded random generation,
-      - full operation trace logging,
-      - replay by seed plus step count,
-      - explicit invariant checks after every step,
-      - final convergence checks after failures are disabled.
+Implemented in `crates/locality-core/tests/simulation_harness.rs`:
 
-  - Use the existing correctness boundaries:
-      - locality-core for sync classification, push planning, guardrails, journals, undo, and hydration state legality.
-      - locality-store SQLite/InMemory stores for durable state and replay behavior.
-      - localityd daemon push/pull/hydration paths for product-like orchestration.
-      - Existing fake connector patterns from local e2e tests for controlled remote behavior.
+- `simulation_smoke_replays_seeded_sequence_to_convergence`
+  - Replays a seeded scenario through local edits, remote edits, hydration,
+    validation blocking, push attempts, retries, and final convergence.
+- `simulation_replays_interrupted_pushes_without_losing_content`
+  - Exercises interrupted push points and verifies accepted local content is not
+    lost.
+- `simulation_nightly_profile_runs_many_seeded_sequences`
+  - Ignored heavy profile for many seeded sequences.
 
-  - Prefer adding proptest as a dev-dependency for shrinking generated operation sequences. If dependency churn is rejected
-    during implementation, use an internal deterministic PRNG and require seed replay, but keep the same scenario model.
+The model in `crates/locality-core/src/simulation_harness.rs` tracks:
 
-  ## Harness Model
+- local body, remote body, and synced body;
+- local dirty/conflicted state;
+- hydration state;
+- validation blocking;
+- journal terminal states;
+- injected push faults before apply, after mutation, and during reconcile;
+- final recovery after transient failures are disabled.
 
-  - Model state must track three explicit trees:
-      - remote: connector-owned pages, blocks, versions, archived state, and injected remote failures.
-      - local: mounted/cache Markdown content, dirty/conflicted markers, virtual mutations, and visible projection state
-        where relevant.
+### Daemon-Level Simulation
 
-      - synced: Locality shadows, entity records, hydration state, journals, and pending durable work.
+Implemented in `crates/localityd/tests/simulation.rs`:
 
-  - Supported generated actions:
-      - local body edits, frontmatter edits, creates, renames, deletes, restore, diff, push, pull, inspect;
-      - remote body edits, title/version changes, creates, archives, moves;
-      - hydration transitions: virtual, stub, hydrated, dirty, conflicted;
-      - scheduler/freshness ticks and explicit file-open hydration;
-      - validation failures: bad frontmatter, unsupported directive edits, schema/property errors, unresolved conflict
-        markers;
+- `simulation_smoke_exercises_core_reliability_harness`
+  - Daemon test target wrapper for the core reliability harness.
+- `simulation_nightly_reliability_profile`
+  - Ignored nightly profile for heavier seeded runs.
 
-      - fault injection: crash before journal append, after prepared journal, during apply, after partial apply effects,
-        during reconcile, during hydration, and during scheduled pull;
+### Live Notion E2E Equivalents
 
-      - connector failures: retryable network error, rate limit, stale remote version, unsupported operation, missing
-        credential.
+Implemented in `crates/loc-cli/tests/e2e_push_workflow.rs`:
 
-  - Every scenario must end with a recovery phase:
-      - disable transient failures,
-      - drain pending hydration/push/pull work,
-      - retry safe operations,
-      - assert convergence or an explicit review-needed/conflict state.
+- `live_seeded_reliability_sequence_push_drift_conflict_converges_notion`
+  - Creates disposable scratch pages in real Notion.
+  - Verifies local push convergence.
+  - Verifies remote drift blocks overwrite before apply.
+  - Materializes dirty-pull conflicts, resolves them, pushes the resolution, and
+    checks journal terminal states.
+- `live_multi_seed_reliability_sequences_converge_notion`
+  - Runs independent live seeded reliability sequences.
+- `live_stress_repeated_push_reopen_status_noop_converges_notion`
+  - Repeated live edit, push, journal reconciliation, SQLite reopen, clean
+    status, no-op pull, and remote-render verification.
+- `live_stress_repeated_drift_conflict_recovery_converges_notion`
+  - Repeated local-dirty plus remote-drift cycles.
+  - Verifies blocked push, reverted journal, conflict materialization,
+    resolution push, reconciled journal, SQLite reopen, and clean status before
+    the next cycle.
+- `live_page_directory_create_then_move_pushes_under_final_parent`
+  - Creates a new page directory under one mounted Notion parent, moves it to a
+    different mounted parent before push, and verifies the remote Notion page is
+    created under the final parent only.
+- `live_validation_failure_blocks_before_journal_and_remote_write`
+  - Invalid Locality frontmatter stops before journal creation or remote write.
+- `live_sqlite_restart_preserves_reconciled_journal_and_clean_status`
+  - Pushes to live Notion, reopens SQLite state, and verifies journal/status and
+    remote content remain correct.
+- `live_remote_fast_forward_updates_clean_file_and_preserves_pending_file`
+  - Verifies clean local content can fast-forward from remote while pending
+    local content is not overwritten.
 
-  ## Reliability Invariants
+## Reliability Invariants
 
-  - No content loss: every accepted local edit is either present remotely after convergence, preserved locally as dirty/
-    conflicted content, or explicitly rejected before mutation with a structured validation/guardrail result.
+The implemented and planned tests should enforce these invariants:
 
-  - Remote safety: remote writes never occur before required validation, confirmation, concurrency checks, and journal
-    preparation.
+- No content loss: accepted local edits are either present remotely after
+  convergence, preserved locally as dirty/conflicted content, or explicitly
+  rejected before mutation.
+- Remote safety: remote writes do not happen before validation, confirmation,
+  concurrency checks, and journal preparation.
+- Journal correctness: failed, reverted, and reconciled terminal states remain
+  durable, explicit, and replayable.
+- Convergence: when transient failures stop and conflicts are resolved or absent,
+  local, remote, and synced state converge to clean canonical content.
+- Conflict safety: dirty local content is never overwritten by pull, hydration,
+  scheduled refresh, or virtual projection reads.
+- Idempotency: interrupted pushes, retries, hydration jobs, and scheduled pulls
+  do not duplicate blocks, lose IDs, grow queues without bound, or create
+  duplicate journals.
+- Explainability: non-converged endings must be expected review states such as
+  validation blocked, confirmation required, remote drift review needed,
+  unresolved conflict, missing credential, or read-only blocked.
 
-  - Journal correctness: prepared/applying/applied/failed/reconciled/reverted states are durable, replayable, and never
-    leave ambiguous success after crash/restart.
+## Commands
 
-  - Convergence: when failures stop and conflicts are resolved or absent, local, remote, and synced shadows converge to the
-    same canonical content and clean status.
+Fast deterministic simulation smoke:
 
-  - Conflict safety: dirty local content is never overwritten by pull, hydration, scheduled refresh, or virtual projection
-    reads.
+```sh
+make test-simulation
+```
 
-  - Idempotency: replaying interrupted pushes, retries, hydration jobs, and scheduled pulls does not duplicate blocks, lose
-    IDs, grow queues unboundedly, or create duplicate journals.
+Equivalent direct commands:
 
-  - Bounded work: scheduler and hydration queues respect dedupe, priority, and rate-limit budgets across long runs.
-  - Explainability: non-converged endings must be one of the expected states: validation blocked, dangerous-plan
-    confirmation required, remote drift review needed, unresolved conflict, missing credential, or read-only blocked.
+```sh
+cargo test -p locality-core --test simulation_harness
+cargo test -p localityd --test simulation -- --test-threads=1
+```
 
-  ## Test Matrix
+Ignored nightly profile:
 
-  - Core model tests: randomized three-tree classification, hydration transition legality, guardrail decisions, directive
-    validation, push pipeline actions, and journaled executor failure points.
+```sh
+LOCALITY_SIMULATION_SEEDS=128 make test-simulation-nightly
+```
 
-  - Daemon/store simulation: multi-step scenarios through fake connectors and SQLite state roots, including process-restart
-    simulation by reopening the store between steps.
+Live Notion reliability equivalent:
 
-  - Projection scenarios: run selected simulations across mounted plain files plus virtual projection modes below OS
-    adapters: macOS File Provider, Linux FUSE, and Windows Cloud Files shared semantics.
+```sh
+export LOCALITY_NOTION_LIVE_PARENT_PAGE=...
+export NOTION_TOKEN=...
+make test-simulation-live-notion
+```
 
-  - Crash matrix: deterministic tests for each push stage:
-      - before journal,
-      - after prepared,
-      - after applying,
-      - after one or more apply effects,
-      - after remote mutation before reconcile,
-      - during reconcile,
-      - after failed journal.
+## CI
 
-  - Long-run nightly: hundreds to thousands of generated sequences, with larger trees, repeated scheduler ticks, mixed
-    local/remote edits, connector retries, rate limits, and restart points.
+Implemented CI wiring:
 
-  - Regression corpus: when a random failure is found, commit the seed and reduced action trace as a named deterministic
-    regression test.
+- `.github/workflows/simulation-nightly.yml`
+  - Runs the ignored `localityd` simulation profile with
+    `LOCALITY_SIMULATION_SEEDS=128`.
 
-  ## Commands And CI
+Implemented Make targets:
 
-  - Add fast PR smoke:
-      - cargo test -p locality-core simulation_smoke
-      - cargo test -p localityd --test simulation simulation_smoke -- --test-threads=1
+- `test-simulation`
+- `test-simulation-nightly`
+- `test-simulation-live-notion`
 
-  - Add nightly/manual heavy workflow:
-      - LOCALITY_SIMULATION_PROFILE=nightly cargo test -p localityd --test simulation -- --ignored --test-threads=1
+## Replay And Regression Workflow
 
-  - Add local exhaustive command:
-      - LOCALITY_SIMULATION_PROFILE=soak LOCALITY_SIMULATION_SEEDS=1000 cargo test -p localityd --test simulation --
-        --ignored --test-threads=1
+Simulation failures should print:
 
-  - Update docs:
-      - replace tests/simulation/README.md placeholder with how to run, how to replay seeds, invariant definitions, and how
-        to promote failures into regressions.
+- seed;
+- profile;
+- step index;
+- action name;
+- operation trace.
 
-      - update docs/e2e-behavior-coverage.md to mark randomized reliability simulation as local/nightly coverage, not live
-        Notion coverage.
+When a random or nightly failure is found:
 
-  ## Assumptions
+1. Replay with the reported seed and at least the failing step count.
+2. Reduce the trace if practical.
+3. Add a named deterministic regression test in
+   `crates/locality-core/tests/simulation_harness.rs` or
+   `crates/localityd/tests/simulation.rs`.
+4. Keep the original seed in the test name or failure message so the incident is
+   reproducible.
 
-  - The harness should not call live Notion; live scratch e2e remains the connector canary layer.
-  - Nightly reliability coverage is the primary goal; PR coverage should be intentionally small and deterministic.
-  - Production APIs should stay stable unless a small testability hook is unavoidable.
-  - Simulation failures must always print seed, profile, step index, action trace, and final model/store summaries so
-    another engineer can reproduce the failure directly.
+## Remaining Recommended Coverage
+
+- Broaden the simulation model beyond body strings into structured block trees,
+  child pages, databases, and media-bearing blocks.
+- Add generated create, rename, move, delete, restore, and undo actions to the
+  local simulation model.
+- Add durable SQLite reopen at more simulated fault points, not only selected
+  live e2e paths.
+- Add scheduler/freshness queue simulation with dedupe, priority, and budget
+  assertions.
+- Add OS adapter stress equivalents for macOS File Provider, Linux FUSE, and
+  Windows Cloud Files semantics.
+- Expand connector fault injection to include retryable network errors, rate
+  limits, stale remote versions, unsupported operations, and missing credentials.
+- Promote every discovered nightly failure into a committed deterministic
+  regression seed.
+
+## Assumptions
+
+- Fast PR coverage remains intentionally small and deterministic.
+- Nightly reliability coverage should be heavy and replayable.
+- Live Notion scratch tests remain the connector canary layer and should clean
+  up disposable remote content.
+- Production APIs should stay stable unless a small testability hook is needed
+  to make a reliability invariant observable.
