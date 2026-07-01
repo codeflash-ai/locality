@@ -15,8 +15,8 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, EntityRecord, EntityRepository,
     FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
-    InMemoryStateStore, MountConfig, MountRepository, ProjectionMode, ShadowRepository,
-    SqliteStateStore,
+    InMemoryStateStore, MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountRepository,
+    ProjectionMode, ShadowRepository, SqliteStateStore,
 };
 use localityd::DaemonConfig;
 use localityd::execution::{DaemonEventReport, PushJob};
@@ -488,6 +488,158 @@ fn workspace_virtual_mount_queues_hot_dirty_and_conflicted_pages_on_active_tick(
             ),
         ])
     );
+}
+
+#[test]
+fn workspace_virtual_mount_promotes_live_mode_active_page_to_immediate() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-live-mode-active");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    store
+        .save_mount_live_mode(MountLiveModeRecord::new(
+            mount_id.clone(),
+            true,
+            freshness_timestamp(),
+        ))
+        .expect("save live mode");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "active-page",
+        "Active",
+        "Active.md",
+        HydrationState::Hydrated,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("active-page"),
+                FreshnessTier::Hot,
+            )
+            .opened_at(freshness_timestamp())
+            .checked_at("unix_ms:100"),
+        )
+        .expect("save hot freshness");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: false,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].remote_id, Some(RemoteId::new("active-page")));
+    assert_eq!(jobs[0].reason, ChangeHintKind::FileOpened);
+    assert_eq!(jobs[0].tier, FreshnessTier::Immediate);
+}
+
+#[test]
+fn workspace_virtual_mount_caps_live_mode_active_pages_without_starving_other_freshness() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-live-mode-fairness");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    store
+        .save_mount_live_mode(MountLiveModeRecord::new(
+            mount_id.clone(),
+            true,
+            freshness_timestamp(),
+        ))
+        .expect("save live mode");
+
+    for index in 0..7 {
+        let remote_id = format!("active-page-{index}");
+        save_workspace_page(
+            &mut store,
+            &mount_id,
+            &remote_id,
+            &format!("Active {index}"),
+            &format!("Active {index}.md"),
+            HydrationState::Hydrated,
+        );
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new(remote_id),
+                    FreshnessTier::Hot,
+                )
+                .opened_at(freshness_timestamp())
+                .checked_at("unix_ms:100"),
+            )
+            .expect("save active freshness");
+    }
+
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "dirty-page",
+        "Dirty",
+        "Dirty.md",
+        HydrationState::Dirty,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("dirty-page"),
+                FreshnessTier::Hot,
+            )
+            .local_change_at(freshness_timestamp())
+            .checked_at("unix_ms:100"),
+        )
+        .expect("save dirty freshness");
+
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "background-page",
+        "Background",
+        "Background.md",
+        HydrationState::Hydrated,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("background-page"),
+                FreshnessTier::Warm,
+            )
+            .checked_at("unix_ms:100"),
+        )
+        .expect("save background freshness");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: true,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    let live_mode_active_jobs = jobs
+        .iter()
+        .filter(|job| {
+            job.reason == ChangeHintKind::FileOpened && job.tier == FreshnessTier::Immediate
+        })
+        .count();
+    assert_eq!(live_mode_active_jobs, 5);
+    assert!(jobs.iter().any(|job| {
+        job.remote_id.as_ref() == Some(&RemoteId::new("dirty-page"))
+            && job.reason == ChangeHintKind::LocalEdited
+    }));
+    assert!(jobs.iter().any(|job| {
+        job.remote_id.as_ref() == Some(&RemoteId::new("background-page"))
+            && job.reason == ChangeHintKind::BackgroundPoll
+    }));
 }
 
 #[test]

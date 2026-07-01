@@ -41,9 +41,19 @@ That script builds `loc`, `localityd`, and the Swift File Provider extension, st
 `LocalityFileProvider.appex` and `locality-file-providerctl` under
 `apps/desktop/src-tauri/macos/LocalityFileProvider/`, stages `loc` and `localityd`
 under `apps/desktop/src-tauri/macos/`, and Tauri copies those files into the
-final app bundle. After the Tauri DMG is created, `build-tauri` runs
+final app bundle. Rebuilding the Swift File Provider extension first unregisters
+existing Locality File Provider domains through the previous
+`locality-file-providerctl`, which unmounts Finder's current Locality domain
+before the old extension bundle is replaced. Set
+`LOCALITY_SKIP_FILE_PROVIDER_UNMOUNT_FOR_BUILD=1` for the rare case where you
+need to keep the old domain mounted while building. After the Tauri DMG is
+created, `build-tauri` runs
 `apps/desktop/scripts/postprocess-dmg-volume-icon.sh` so the mounted installer
 volume uses a disk-style Locality icon instead of the application icon.
+
+Release publish scripts set `LOCALITY_SKIP_FILE_PROVIDER_UNMOUNT_FOR_BUILD=1`
+because publishing artifacts should not mutate the developer's installed local
+File Provider domain.
 
 Expected local artifacts:
 

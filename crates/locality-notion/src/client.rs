@@ -586,6 +586,10 @@ fn notion_rate_limit_retries() -> usize {
         .unwrap_or(DEFAULT_NOTION_RATE_LIMIT_RETRIES)
 }
 
+pub fn notion_requests_per_second_setting() -> f64 {
+    notion_requests_per_second()
+}
+
 fn notion_requests_per_second() -> f64 {
     std::env::var("LOCALITY_NOTION_REQUESTS_PER_SECOND")
         .ok()

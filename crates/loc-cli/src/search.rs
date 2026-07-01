@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 
 use locality_core::model::{EntityKind, HydrationState, RemoteId};
 use locality_store::{
-    EntityRecord, EntityRepository, EntitySearchCandidate, EntitySearchRepository, MountConfig,
-    MountRepository, RemoteObservationRecord, RemoteObservationRepository, StoreError,
+    ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, EntitySearchCandidate,
+    EntitySearchRepository, MountConfig, MountRepository, RemoteObservationRecord,
+    RemoteObservationRepository, StoreError,
 };
 use serde::Serialize;
 
@@ -21,6 +22,7 @@ pub struct SearchOptions {
     pub query: String,
     pub connector: Option<String>,
     pub limit: usize,
+    pub include_stale_access: bool,
 }
 
 impl SearchOptions {
@@ -29,6 +31,7 @@ impl SearchOptions {
             query: query.into(),
             connector: None,
             limit: DEFAULT_LIMIT,
+            include_stale_access: false,
         }
     }
 }
@@ -101,7 +104,11 @@ impl SearchError {
 
 pub fn run_search<S>(store: &S, options: SearchOptions) -> Result<SearchReport, SearchError>
 where
-    S: MountRepository + EntityRepository + EntitySearchRepository + RemoteObservationRepository,
+    S: MountRepository
+        + ConnectionRepository
+        + EntityRepository
+        + EntitySearchRepository
+        + RemoteObservationRepository,
 {
     run_search_with_access_roots(store, options, default_access_root)
 }
@@ -112,7 +119,11 @@ pub fn run_search_with_access_roots<S, F>(
     mount_access_root: F,
 ) -> Result<SearchReport, SearchError>
 where
-    S: MountRepository + EntityRepository + EntitySearchRepository + RemoteObservationRepository,
+    S: MountRepository
+        + ConnectionRepository
+        + EntityRepository
+        + EntitySearchRepository
+        + RemoteObservationRepository,
     F: Fn(&MountConfig) -> PathBuf,
 {
     let query = options.query.trim().to_string();
@@ -125,11 +136,15 @@ where
 
     let notion_id = notion_id_from_url(&query);
     let mounts = store.load_mounts().map_err(SearchError::Store)?;
+    let active_connections = active_connections_by_id(store)?;
     let mut matches = Vec::new();
 
     for mount in mounts
         .into_iter()
         .filter(|mount| connector_matches(mount, options.connector.as_deref()))
+        .filter(|mount| {
+            options.include_stale_access || mount_has_current_access(mount, &active_connections)
+        })
     {
         let access_root = mount_access_root(&mount);
 
@@ -214,6 +229,32 @@ where
         count: results.len(),
         results,
     })
+}
+
+fn active_connections_by_id<S>(store: &S) -> Result<BTreeMap<String, ConnectionRecord>, SearchError>
+where
+    S: ConnectionRepository,
+{
+    Ok(store
+        .list_connections()
+        .map_err(SearchError::Store)?
+        .into_iter()
+        .filter(|connection| connection.status == "active")
+        .map(|connection| (connection.connection_id.0.clone(), connection))
+        .collect())
+}
+
+fn mount_has_current_access(
+    mount: &MountConfig,
+    active_connections: &BTreeMap<String, ConnectionRecord>,
+) -> bool {
+    let Some(connection_id) = &mount.connection_id else {
+        return true;
+    };
+
+    active_connections
+        .get(&connection_id.0)
+        .is_some_and(|connection| connection.connector == mount.connector)
 }
 
 fn has_exact_entity_match(results: &[SearchResult], notion_id: Option<&str>) -> bool {

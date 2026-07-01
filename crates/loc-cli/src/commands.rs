@@ -445,6 +445,8 @@ struct SearchArgs {
         help = "Maximum results."
     )]
     limit: usize,
+    #[arg(long, help = "Include stale, disconnected, or inactive mount access.")]
+    all: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -807,6 +809,7 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
             }
             push_optional_flag_value(&mut args, "--connector", options.connector.as_deref());
             push_flag_value(&mut args, "--limit", &options.limit.to_string());
+            push_flag(&mut args, "--all", options.all);
         }
         LocalityCommand::Templates { command } => {
             args.push("templates".to_string());
@@ -2236,6 +2239,7 @@ fn search(args: &[String], json: bool) -> i32 {
         query,
         connector: flag_value(args, "--connector").map(str::to_string),
         limit,
+        include_stale_access: has_flag(args, "--all"),
     };
 
     let report = match run_search(&store, options.clone()) {

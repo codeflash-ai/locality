@@ -49,7 +49,11 @@ platform/macos/LocalityFileProvider/scripts/install-dev-bundle.sh
 
 The script builds `Locality.app`, embeds `LocalityFileProvider.appex`, signs both
 ad-hoc, installs the app to `~/Applications/Locality.app`, registers it with
-LaunchServices, and starts the tiny background containing app.
+LaunchServices, and starts the tiny background containing app. Before rebuilding
+the bundle, it unregisters existing Locality File Provider domains so Finder
+does not keep a stale extension mounted from the previous build. Set
+`LOCALITY_SKIP_FILE_PROVIDER_UNMOUNT_FOR_BUILD=1` only when you intentionally
+need to inspect the old mounted domain while rebuilding.
 
 After creating a mount with `--projection macos-file-provider`, register it:
 

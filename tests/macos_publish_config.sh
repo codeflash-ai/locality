@@ -32,6 +32,8 @@ grep -q 'require_developer_id="1"' "${PUBLISH_SCRIPT}" \
   || fail "notarized publish must still require Developer ID signatures"
 grep -q 'PUBLISH_SKIP_NOTARIZATION' "${PUBLISH_SCRIPT}" \
   || fail "publish-macos must read PUBLISH_SKIP_NOTARIZATION"
+grep -q 'LOCALITY_SKIP_FILE_PROVIDER_UNMOUNT_FOR_BUILD=1' "${PUBLISH_SCRIPT}" \
+  || fail "publish-macos must not unregister local File Provider domains while publishing"
 grep -q 'notary_args' "${PUBLISH_SCRIPT}" \
   || fail "publish-macos must keep notarized publish support"
 grep -q 'skipping notarization and stapling' "${PUBLISH_SCRIPT}" \

@@ -809,6 +809,11 @@ fn refresh_projection_candidate_if_clean(
     let Ok(cache_contents) = std::fs::read(&content_path) else {
         return Ok(ProjectionRefreshOutcome::MissingCache);
     };
+    // Reading a macOS dataless File Provider placeholder from localityd can
+    // request hydration from localityd itself and wedge the runtime thread.
+    if projection_path_is_dataless_placeholder(&projection_path) {
+        return Ok(ProjectionRefreshOutcome::MissingProjection);
+    }
     let projection_contents = match std::fs::read(&projection_path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -879,6 +884,10 @@ fn projection_contents_match_shadow(contents: &[u8], shadow: &ShadowDocument) ->
 }
 
 fn projection_needs_read(projection_path: &Path, content_path: &Path, force_read: bool) -> bool {
+    if projection_path_is_dataless_placeholder(projection_path) {
+        return false;
+    }
+
     if force_read {
         return true;
     }
@@ -998,6 +1007,27 @@ fn yaml_quoted(value: &str) -> String {
 
 fn metadata_modified(metadata: &std::fs::Metadata) -> SystemTime {
     metadata.modified().unwrap_or(UNIX_EPOCH)
+}
+
+#[cfg(target_os = "macos")]
+const SF_DATALESS: u32 = 0x40000000;
+
+#[cfg(target_os = "macos")]
+fn projection_path_is_dataless_placeholder(path: &Path) -> bool {
+    use std::os::darwin::fs::MetadataExt;
+
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| projection_metadata_flags_are_dataless(metadata.st_flags()))
+}
+
+#[cfg(target_os = "macos")]
+fn projection_metadata_flags_are_dataless(flags: u32) -> bool {
+    flags & SF_DATALESS != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn projection_path_is_dataless_placeholder(_path: &Path) -> bool {
+    false
 }
 
 fn content_cache_path(content_root: &Path, relative_path: &Path) -> LocalityResult<PathBuf> {
@@ -1423,6 +1453,14 @@ mod tests {
 
         assert!(file_name.starts_with("page.md.tmp."));
         assert!(!file_name.starts_with('.'));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_dataless_flag_identifies_file_provider_placeholders() {
+        assert!(projection_metadata_flags_are_dataless(SF_DATALESS));
+        assert!(projection_metadata_flags_are_dataless(SF_DATALESS | 0x1));
+        assert!(!projection_metadata_flags_are_dataless(0));
     }
 
     #[test]

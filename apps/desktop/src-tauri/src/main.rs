@@ -53,6 +53,7 @@ use locality_core::journal::{JournalEntry, JournalStatus};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 #[cfg(all(test, target_os = "macos"))]
 use locality_notion::NotionConfig;
+use locality_notion::client::notion_requests_per_second_setting;
 #[cfg(all(test, target_os = "macos"))]
 use locality_notion::client::{HttpNotionApi, NotionApi};
 #[cfg(all(test, target_os = "macos"))]
@@ -69,7 +70,7 @@ use locality_platform::{
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-    ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
+    ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository, FreshnessStateRecord,
     FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, JournalRepository,
     MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState,
     MountLiveModeStateChangeError, MountRepository, ProjectionMode, RemoteObservationRecord,
@@ -151,6 +152,7 @@ struct DesktopSnapshot {
     needs_onboarding: bool,
     settings: DesktopSettings,
     pending_changes: Vec<PendingChange>,
+    recent_files: Vec<LocatedItem>,
     activity: Vec<ActivityItem>,
     suggestions: Vec<ConnectorSuggestion>,
 }
@@ -395,6 +397,8 @@ static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SURFACE_REFRESH_STATE: OnceLock<Mutex<SurfaceRefreshState>> = OnceLock::new();
 static LAUNCH_AT_LOGIN_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
 static LIVE_MODE_REMOTE_PULL_CURSOR: OnceLock<Mutex<usize>> = OnceLock::new();
+static LIVE_MODE_REMOTE_PULL_SCAN_TIMES: OnceLock<Mutex<BTreeMap<MountId, Instant>>> =
+    OnceLock::new();
 static LIVE_MODE_LOCAL_RECONCILE_TIMES: OnceLock<Mutex<BTreeMap<PathBuf, Instant>>> =
     OnceLock::new();
 static LIVE_MODE_TICK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -410,6 +414,11 @@ const TRAY_POPOVER_HEIGHT: f64 = 520.0;
 const TRAY_POPOVER_EDGE_MARGIN: f64 = 8.0;
 const TRAY_POPOVER_ANCHOR_OFFSET: f64 = 12.0;
 const LIVE_MODE_LOCAL_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+const LIVE_MODE_ACTIVE_REMOTE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const LIVE_MODE_ACTIVE_TARGET_WINDOW: Duration = Duration::from_secs(5 * 60);
+const LIVE_MODE_REMOTE_CHECK_ESTIMATED_REQUESTS_PER_PAGE: f64 = 1.0;
+const LIVE_MODE_REMOTE_CHECK_QUEUE_SHARE: f64 = 1.0 / 3.0;
+const LIVE_MODE_REMOTE_CHECK_MAX_BATCH_PAGES: usize = 5;
 
 #[derive(Default)]
 struct SurfaceRefreshState {
@@ -927,6 +936,59 @@ async fn pull_notion_file(app: AppHandle, path: String) -> ActionReport {
 }
 
 #[tauri::command]
+async fn check_notion_file(app: AppHandle, path: String) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        match queue_observe_target_direct(&target) {
+            Ok(()) => ActionReport {
+                ok: true,
+                message: "Checking Notion for this page.".to_string(),
+            },
+            Err(message) => ActionReport { ok: false, message },
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Check worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
+async fn keep_notion_file_as_draft(app: AppHandle, path: String) -> ActionReport {
+    let report = match tauri::async_runtime::spawn_blocking(move || {
+        let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
+        match keep_target_as_local_draft_direct(&target) {
+            Ok(draft_path) => ActionReport {
+                ok: true,
+                message: format!(
+                    "Kept a local draft at `{}` and removed the deleted Notion page from Locality.",
+                    draft_path.display()
+                ),
+            },
+            Err(message) => ActionReport { ok: false, message },
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Draft worker failed: {error}"),
+        },
+    };
+
+    refresh_desktop_surfaces(&app);
+    report
+}
+
+#[tauri::command]
 async fn reset_notion_file_to_remote(app: AppHandle, path: String) -> ActionReport {
     let report = match tauri::async_runtime::spawn_blocking(move || {
         let target = expand_tilde(&path).unwrap_or_else(|_| PathBuf::from(&path));
@@ -1156,35 +1218,48 @@ fn live_mode_tick_blocking_inner() -> ActionReport {
 }
 
 fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> ActionReport {
-    let remote_target = match live_mode_next_remote_pull_target_for_state_root(state_root, mount) {
-        Ok(target) => target,
-        Err(message) => {
-            return ActionReport { ok: false, message };
-        }
-    };
-    if let Some(target) = remote_target.as_ref()
-        && live_mode_should_reconcile_local_target(target)
-        && let Err(message) = live_mode_reconcile_local_target(target)
-    {
-        return ActionReport { ok: false, message };
-    }
-
     match load_desktop_snapshot() {
-        Ok(snapshot) => live_mode_tick_from_snapshot(
-            &snapshot,
-            remote_target.as_ref(),
-            |_change, target| {
-                let push_report = push_target_direct(target, false)?;
-                if push_report_exit_code(&push_report) == 0 {
-                    Ok(())
-                } else {
-                    Err(push_report_message(&push_report))
+        Ok(snapshot) => {
+            let remote_targets = if snapshot.pending_changes.is_empty()
+                && live_mode_remote_pull_scan_is_due(mount)
+            {
+                match live_mode_next_remote_pull_targets_for_state_root(
+                    state_root,
+                    mount,
+                    live_mode_remote_check_page_budget(),
+                ) {
+                    Ok(target) => target,
+                    Err(message) => {
+                        return ActionReport { ok: false, message };
+                    }
                 }
-            },
-            live_mode_queue_remote_observe,
-            live_mode_queue_remote_fast_forward,
-            live_mode_merge_remote_drift_target,
-        ),
+            } else {
+                Vec::new()
+            };
+            for target in &remote_targets {
+                if live_mode_should_reconcile_local_target(target)
+                    && let Err(message) = live_mode_reconcile_local_target(target)
+                {
+                    return ActionReport { ok: false, message };
+                }
+            }
+
+            live_mode_tick_from_snapshot(
+                &snapshot,
+                &remote_targets,
+                |_change, target| {
+                    let push_report = push_target_direct(target, false)?;
+                    if push_report_exit_code(&push_report) == 0 {
+                        Ok(())
+                    } else {
+                        Err(push_report_message(&push_report))
+                    }
+                },
+                live_mode_queue_remote_observe,
+                live_mode_queue_remote_fast_forward,
+                live_mode_merge_remote_drift_target,
+            )
+        }
         Err(message) => ActionReport {
             ok: false,
             message: format!("Live Mode could not inspect the desktop state: {message}"),
@@ -1194,7 +1269,7 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
 
 fn live_mode_tick_from_snapshot<Sync, Check, FastForward, Merge>(
     snapshot: &DesktopSnapshot,
-    remote_pull_target: Option<&LiveModeRemoteTarget>,
+    remote_pull_targets: &[LiveModeRemoteTarget],
     mut sync_target: Sync,
     mut check_remote_target: Check,
     mut fast_forward_remote_target: FastForward,
@@ -1214,16 +1289,24 @@ where
     }
 
     let Some(change) = snapshot.pending_changes.first() else {
-        if let Some(target) = remote_pull_target {
-            match check_remote_target(target) {
-                Ok(()) => {
-                    return ActionReport {
-                        ok: true,
-                        message: "Live Mode queued 1 remote check.".to_string(),
-                    };
+        if !remote_pull_targets.is_empty() {
+            for target in remote_pull_targets {
+                if let Err(message) = check_remote_target(target) {
+                    return ActionReport { ok: false, message };
                 }
-                Err(message) => return ActionReport { ok: false, message },
             }
+            return ActionReport {
+                ok: true,
+                message: format!(
+                    "Live Mode queued {} remote {}.",
+                    remote_pull_targets.len(),
+                    if remote_pull_targets.len() == 1 {
+                        "check"
+                    } else {
+                        "checks"
+                    }
+                ),
+            };
         }
 
         return ActionReport {
@@ -1497,37 +1580,106 @@ fn non_empty_string(value: String) -> Option<String> {
     }
 }
 
-fn live_mode_next_remote_pull_target_for_state_root(
+fn live_mode_next_remote_pull_targets_for_state_root(
     state_root: &Path,
     mount: &MountConfig,
-) -> Result<Option<LiveModeRemoteTarget>, String> {
+    limit: usize,
+) -> Result<Vec<LiveModeRemoteTarget>, String> {
     let store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
-    live_mode_next_remote_pull_target_for_mount(&store, mount)
+    live_mode_next_remote_pull_targets_for_mount(&store, mount, limit)
 }
 
-fn live_mode_next_remote_pull_target_for_mount<S>(
+fn live_mode_next_remote_pull_targets_for_mount<S>(
     store: &S,
     mount: &MountConfig,
-) -> Result<Option<LiveModeRemoteTarget>, String>
+    limit: usize,
+) -> Result<Vec<LiveModeRemoteTarget>, String>
 where
-    S: EntityRepository,
+    S: EntityRepository + FreshnessStateRepository,
 {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let candidates = live_mode_remote_pull_candidates(store, mount)?;
     if candidates.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let mut cursor = live_mode_remote_pull_cursor()
         .lock()
         .map_err(|_| "Live Mode remote pull cursor is unavailable.".to_string())?;
-    let index = *cursor % candidates.len();
-    *cursor = cursor.wrapping_add(1);
-    Ok(Some(candidates[index].clone()))
+    let start = *cursor % candidates.len();
+    let selected_count = limit.min(candidates.len());
+    let selected = (0..selected_count)
+        .map(|offset| candidates[(start + offset) % candidates.len()].clone())
+        .collect::<Vec<_>>();
+    *cursor = cursor.wrapping_add(selected_count);
+    Ok(selected)
 }
 
 fn live_mode_remote_pull_cursor() -> &'static Mutex<usize> {
     LIVE_MODE_REMOTE_PULL_CURSOR.get_or_init(|| Mutex::new(0))
+}
+
+fn live_mode_remote_check_page_budget() -> usize {
+    live_mode_remote_check_page_budget_for_rate(
+        notion_requests_per_second_setting(),
+        LIVE_MODE_ACTIVE_REMOTE_CHECK_INTERVAL,
+    )
+}
+
+fn live_mode_remote_check_page_budget_for_rate(
+    requests_per_second: f64,
+    interval: Duration,
+) -> usize {
+    if !requests_per_second.is_finite()
+        || requests_per_second <= 0.0
+        || interval.is_zero()
+        || !LIVE_MODE_REMOTE_CHECK_ESTIMATED_REQUESTS_PER_PAGE.is_finite()
+        || LIVE_MODE_REMOTE_CHECK_ESTIMATED_REQUESTS_PER_PAGE <= 0.0
+    {
+        return 1;
+    }
+
+    (((requests_per_second * interval.as_secs_f64() * LIVE_MODE_REMOTE_CHECK_QUEUE_SHARE)
+        / LIVE_MODE_REMOTE_CHECK_ESTIMATED_REQUESTS_PER_PAGE)
+        .floor()
+        .max(1.0) as usize)
+        .min(LIVE_MODE_REMOTE_CHECK_MAX_BATCH_PAGES)
+}
+
+fn live_mode_remote_pull_scan_is_due(mount: &MountConfig) -> bool {
+    let Ok(mut times) = live_mode_remote_pull_scan_times().lock() else {
+        return true;
+    };
+    live_mode_remote_pull_scan_is_due_for_key(
+        &mut times,
+        mount.mount_id.clone(),
+        Instant::now(),
+        LIVE_MODE_ACTIVE_REMOTE_CHECK_INTERVAL,
+    )
+}
+
+fn live_mode_remote_pull_scan_times() -> &'static Mutex<BTreeMap<MountId, Instant>> {
+    LIVE_MODE_REMOTE_PULL_SCAN_TIMES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn live_mode_remote_pull_scan_is_due_for_key(
+    times: &mut BTreeMap<MountId, Instant>,
+    key: MountId,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    if times
+        .get(&key)
+        .and_then(|last| now.checked_duration_since(*last))
+        .is_some_and(|elapsed| elapsed < interval)
+    {
+        return false;
+    }
+    times.insert(key, now);
+    true
 }
 
 fn live_mode_remote_pull_candidates<S>(
@@ -1535,15 +1687,27 @@ fn live_mode_remote_pull_candidates<S>(
     mount: &MountConfig,
 ) -> Result<Vec<LiveModeRemoteTarget>, String>
 where
-    S: EntityRepository,
+    S: EntityRepository + FreshnessStateRepository,
 {
     let access_root = mount_access_root(mount);
+    let now_ms = live_mode_now_ms();
+    let freshness_by_remote_id = store
+        .list_freshness_states(&mount.mount_id)
+        .map_err(|error| format!("Live Mode could not inspect file activity: {error}"))?
+        .into_iter()
+        .map(|state| (state.remote_id.clone(), state))
+        .collect::<BTreeMap<_, _>>();
     let mut candidates = store
         .list_entities(&mount.mount_id)
         .map_err(|error| format!("Live Mode could not inspect mounted pages: {error}"))?
         .into_iter()
         .filter(|entity| {
             entity.kind == EntityKind::Page && entity.hydration == HydrationState::Hydrated
+        })
+        .filter(|entity| {
+            let freshness = freshness_by_remote_id.get(&entity.remote_id);
+            live_mode_target_is_recently_active(freshness, now_ms)
+                && live_mode_remote_check_is_due(freshness, now_ms)
         })
         .map(|entity| LiveModeRemoteTarget {
             mount_id: mount.mount_id.clone(),
@@ -1557,6 +1721,58 @@ where
             .then_with(|| left.remote_id.0.cmp(&right.remote_id.0))
     });
     Ok(candidates)
+}
+
+fn live_mode_target_is_recently_active(
+    freshness: Option<&FreshnessStateRecord>,
+    now_ms: u128,
+) -> bool {
+    let Some(freshness) = freshness else {
+        return false;
+    };
+    freshness.remote_hint_pending
+        || live_mode_timestamp_is_within(
+            freshness.last_opened_at.as_deref(),
+            now_ms,
+            LIVE_MODE_ACTIVE_TARGET_WINDOW,
+        )
+        || live_mode_timestamp_is_within(
+            freshness.last_local_change_at.as_deref(),
+            now_ms,
+            LIVE_MODE_ACTIVE_TARGET_WINDOW,
+        )
+}
+
+fn live_mode_remote_check_is_due(freshness: Option<&FreshnessStateRecord>, now_ms: u128) -> bool {
+    let Some(freshness) = freshness else {
+        return true;
+    };
+    if freshness.remote_hint_pending {
+        return false;
+    }
+    !live_mode_timestamp_is_within(
+        freshness.last_checked_at.as_deref(),
+        now_ms,
+        LIVE_MODE_ACTIVE_REMOTE_CHECK_INTERVAL,
+    )
+}
+
+fn live_mode_timestamp_is_within(
+    timestamp: Option<&str>,
+    now_ms: u128,
+    interval: Duration,
+) -> bool {
+    let Some(timestamp_ms) = timestamp.and_then(timestamp_sort_value) else {
+        return false;
+    };
+    now_ms.saturating_sub(timestamp_ms) <= interval.as_millis()
+}
+
+fn live_mode_now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 fn live_mode_reconcile_local_target(target: &LiveModeRemoteTarget) -> Result<(), String> {
@@ -2062,6 +2278,13 @@ fn load_desktop_snapshot_from_store(
         None => Vec::new(),
     };
     let live_mode = mount_live_mode_summary(store, mount.as_ref(), &pending_changes);
+    let recent_files = match mount.as_ref() {
+        Some(mount) if desktop_mount_has_current_access(mount, connection.as_ref()) => {
+            recent_files_for_mount(store, state_root, mount, 6)?
+        }
+        None => Vec::new(),
+        Some(_) => Vec::new(),
+    };
     let daemon_ready = send_request(state_root, &DaemonRequest::Ping)
         .map(|response| response.ok)
         .unwrap_or(false);
@@ -2091,6 +2314,7 @@ fn load_desktop_snapshot_from_store(
         needs_onboarding,
         settings: desktop_settings(),
         pending_changes,
+        recent_files,
         activity: activity_from_journals(&journals, store, state_root),
         suggestions: vec![ConnectorSuggestion {
             connector: "Linear".to_string(),
@@ -2137,6 +2361,7 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
         needs_onboarding: false,
         settings: desktop_settings(),
         pending_changes: Vec::new(),
+        recent_files: Vec::new(),
         activity: vec![ActivityItem {
             title: "Could not load Locality state".to_string(),
             detail: message,
@@ -2166,6 +2391,23 @@ fn desktop_needs_onboarding(
     mount: Option<&MountConfig>,
 ) -> bool {
     !matches!(connection, Some(connection) if connection.status == "active") || mount.is_none()
+}
+
+fn desktop_mount_has_current_access(
+    mount: &MountConfig,
+    connection: Option<&ConnectionRecord>,
+) -> bool {
+    let Some(connection_id) = mount.connection_id.as_ref() else {
+        return true;
+    };
+
+    matches!(
+        connection,
+        Some(connection)
+            if connection.status == "active"
+                && connection.connector == mount.connector
+                && connection.connection_id == *connection_id
+    )
 }
 
 fn choose_connection(
@@ -2539,6 +2781,118 @@ where
         .collect()
 }
 
+fn recent_files_for_mount(
+    store: &SqliteStateStore,
+    state_root: &Path,
+    mount: &MountConfig,
+    limit: usize,
+) -> Result<Vec<LocatedItem>, String> {
+    let status = run_status(
+        store,
+        StatusOptions {
+            state_root: Some(state_root.to_path_buf()),
+            mount_id: Some(mount.mount_id.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .map_err(|error| error.message())?;
+    let freshness = store
+        .list_freshness_states(&mount.mount_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|state| (state.remote_id.0.clone(), state))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut files = status
+        .mounts
+        .iter()
+        .flat_map(|mount| mount.entries.iter())
+        .filter_map(|entry| {
+            let freshness = freshness.get(&entry.entity_id);
+            let sort_value = recent_file_sort_value(entry, freshness)?;
+            Some((
+                sort_value,
+                entry.title.clone(),
+                LocatedItem {
+                    title: entry.title.clone(),
+                    kind: search_kind_label(&entry.kind).to_string(),
+                    local_path: display_path(Path::new(&entry.absolute_path)),
+                    state: located_state_for_status_entry(entry).to_string(),
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    files.truncate(limit);
+    Ok(files.into_iter().map(|(_, _, item)| item).collect())
+}
+
+fn recent_file_sort_value(
+    entry: &loc_cli::status::StatusEntry,
+    freshness: Option<&FreshnessStateRecord>,
+) -> Option<u128> {
+    let freshness_value = freshness
+        .into_iter()
+        .flat_map(|freshness| {
+            [
+                freshness.last_local_change_at.as_deref(),
+                freshness.last_opened_at.as_deref(),
+                freshness.last_checked_at.as_deref(),
+            ]
+        })
+        .flatten()
+        .filter_map(timestamp_sort_value)
+        .max()
+        .unwrap_or(0);
+
+    if freshness_value > 0 {
+        return Some(freshness_value);
+    }
+
+    if matches!(
+        entry.state,
+        StatusState::Dirty | StatusState::Conflicted | StatusState::Error | StatusState::Missing
+    ) || !matches!(entry.sync_state, StatusSyncState::AllSynced)
+    {
+        return Some(1);
+    }
+
+    None
+}
+
+fn timestamp_sort_value(value: &str) -> Option<u128> {
+    let value = value.trim();
+    if let Some(millis) = value.strip_prefix("unix_ms:") {
+        return millis.parse::<u128>().ok();
+    }
+    value.parse::<u128>().ok()
+}
+
+fn located_state_for_status_entry(entry: &loc_cli::status::StatusEntry) -> &'static str {
+    if matches!(
+        entry.state,
+        StatusState::Conflicted | StatusState::Error | StatusState::Missing
+    ) || matches!(entry.sync_state, StatusSyncState::Conflicted)
+    {
+        return "conflict";
+    }
+    if matches!(entry.state, StatusState::Dirty)
+        || matches!(
+            entry.sync_state,
+            StatusSyncState::PendingLocalChanges | StatusSyncState::ReviewNeeded
+        )
+    {
+        return "pending_changes";
+    }
+    if matches!(entry.sync_state, StatusSyncState::RemoteUpdateAvailable) {
+        return "remote_update_available";
+    }
+    if matches!(entry.state, StatusState::Stub) {
+        return "online_only";
+    }
+    "ready"
+}
+
 fn live_mode_status_for_entry(
     store: &impl AutoSaveRepository,
     mount_id: &MountId,
@@ -2620,6 +2974,12 @@ fn status_summary_for_entry(entry: &loc_cli::status::StatusEntry) -> String {
     if matches!(entry.state, StatusState::Conflicted) {
         return "conflict".to_string();
     }
+    if status_issue_has_code(entry, "remote_deleted_with_local_pending") {
+        return "remote page deleted while local edits are pending".to_string();
+    }
+    if status_issue_has_code(entry, "remote_deleted") {
+        return "remote page deleted or unavailable".to_string();
+    }
     if matches!(entry.sync_state, StatusSyncState::RemoteUpdateAvailable) {
         return "remote update available".to_string();
     }
@@ -2635,6 +2995,10 @@ fn status_summary_for_entry(entry: &loc_cli::status::StatusEntry) -> String {
         return issue.message.clone();
     }
     "local edits pending review".to_string()
+}
+
+fn status_issue_has_code(entry: &loc_cli::status::StatusEntry, code: &str) -> bool {
+    entry.issues.iter().any(|issue| issue.code == code)
 }
 
 fn status_entry_needs_desktop_attention(entry: &loc_cli::status::StatusEntry) -> bool {
@@ -3343,6 +3707,7 @@ fn search_notion_results(query: &str, limit: usize) -> Result<Vec<SearchResult>,
             query: query.to_string(),
             connector: Some("notion".to_string()),
             limit,
+            include_stale_access: false,
         },
         mount_access_root,
     )
@@ -7377,6 +7742,121 @@ fn pull_target_direct(target: &Path) -> Result<PullReport, String> {
         .map_err(|error| error.message())
 }
 
+fn queue_observe_target_direct(target: &Path) -> Result<(), String> {
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let target = absolute_path(target)?;
+    let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
+    let entity = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(|error| format!("Could not inspect local metadata: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "No Locality file metadata found for `{}`.",
+                target.display()
+            )
+        })?;
+    let request = DaemonRequest::ObserveEntity {
+        mount_id: mount.mount_id.0,
+        remote_id: entity.remote_id.0,
+    };
+    match send_request(&state_root, &request) {
+        Ok(response) if response.ok => Ok(()),
+        Ok(response) => {
+            let message = response
+                .error
+                .map(|error| error.message)
+                .unwrap_or_else(|| "daemon rejected the freshness check".to_string());
+            Err(format!("Could not check Notion for this page: {message}"))
+        }
+        Err(error) => Err(format!(
+            "Could not reach the Locality daemon to check Notion for this page: {}",
+            error.message()
+        )),
+    }
+}
+
+fn keep_target_as_local_draft_direct(target: &Path) -> Result<PathBuf, String> {
+    let state_root = default_state_root();
+    let target = absolute_path(target)?;
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
+    let entity = store
+        .find_entity_by_path(&mount.mount_id, &relative_path)
+        .map_err(|error| format!("Could not inspect local metadata: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "No Locality file metadata found for `{}`.",
+                target.display()
+            )
+        })?;
+    let source_path = local_draft_source_path(&state_root, &mount, &relative_path, &target)
+        .ok_or_else(|| {
+            format!(
+                "No local draft contents are available for `{}`.",
+                target.display()
+            )
+        })?;
+    let recovery_dir = state_root
+        .join("recovered")
+        .join(&mount.mount_id.0)
+        .join(activity_timestamp().replace(':', "-"));
+    fs::create_dir_all(&recovery_dir).map_err(|error| {
+        format!(
+            "Could not create local draft recovery folder at `{}`: {error}",
+            recovery_dir.display()
+        )
+    })?;
+    let draft_path = copy_preserved_file(Some(&source_path), &recovery_dir, &relative_path)?
+        .ok_or_else(|| {
+            format!(
+                "Could not preserve local draft contents from `{}`.",
+                source_path.display()
+            )
+        })?;
+    fs::write(
+        recovery_dir.join("README.md"),
+        "Locality preserved this file as a local draft after its Notion page was deleted or became unavailable.\n\nReview the draft manually if you want to copy its contents into a new Notion page.\n",
+    )
+    .map_err(|error| {
+        format!(
+            "Could not write local draft recovery README in `{}`: {error}",
+            recovery_dir.display()
+        )
+    })?;
+
+    store
+        .delete_entity(&mount.mount_id, &entity.remote_id)
+        .map_err(|error| format!("Could not remove deleted Notion page metadata: {error}"))?;
+    store
+        .delete_freshness_state(&mount.mount_id, &entity.remote_id)
+        .map_err(|error| format!("Could not clear Notion freshness metadata: {error}"))?;
+    store
+        .delete_remote_observation(&mount.mount_id, &entity.remote_id)
+        .map_err(|error| format!("Could not clear Notion deletion metadata: {error}"))?;
+    if target.exists() {
+        let _ = fs::remove_file(&target);
+    }
+
+    Ok(draft_path)
+}
+
+fn local_draft_source_path(
+    state_root: &Path,
+    mount: &MountConfig,
+    relative_path: &Path,
+    target: &Path,
+) -> Option<PathBuf> {
+    if mount.projection.uses_virtual_filesystem() {
+        return virtual_fs_content_path(state_root, &mount.mount_id, relative_path)
+            .ok()
+            .filter(|path| path.is_file());
+    }
+    target.is_file().then(|| target.to_path_buf())
+}
+
 fn reset_target_to_remote_direct(target: &Path) -> Result<PullReport, String> {
     let state_root = default_state_root();
     let target = absolute_path(target)?;
@@ -7766,6 +8246,7 @@ mod tests {
 
     use loc_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
     use locality_core::canonical::render_canonical_markdown;
+    use locality_core::freshness::FreshnessTier;
     use locality_core::journal::{JournalEntry, JournalStatus, PushId};
     use locality_core::model::{
         CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
@@ -7775,23 +8256,25 @@ mod tests {
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, ConnectionId,
         ConnectionRecord, ConnectionRepository, ConnectorProfileId, EntityRecord, EntityRepository,
-        InMemoryStateStore, JournalRepository, LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig,
-        MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState, MountRepository,
-        ProjectionMode, ShadowRepository, SqliteStateStore,
+        FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
+        LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
+        MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
+        ShadowRepository, SqliteStateStore,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
 
     use super::{
         ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, MonitorScreenBounds,
-        PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
+        PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState, activity_timestamp,
         clear_mount_cached_projection, clear_state_root_contents, conflict_preview,
         connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
         diff_report_message, exact_located_entity_record, failed_push_summary,
         has_unresolved_conflict_markers, hydration_after_editor_write, inspect_install_state,
         install_terminal_cli_link_at, install_terminal_cli_link_in_path_dirs,
         is_notion_access_lost_message, is_unsupported_schema_version_message,
-        live_mode_merge_remote_drift_markdown, live_mode_remote_pull_candidates,
+        live_mode_merge_remote_drift_markdown, live_mode_remote_check_page_budget_for_rate,
+        live_mode_remote_pull_candidates, live_mode_remote_pull_scan_is_due_for_key,
         live_mode_should_reconcile_local_target_for_key, live_mode_target,
         live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
         mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
@@ -7975,6 +8458,29 @@ mod tests {
             .expect("save google connection");
         store.save_mount(google_mount).expect("save google mount");
         store.save_mount(notion_mount).expect("save notion mount");
+        let notion_remote_id = RemoteId::new("notion-page-1");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    MountId::new("notion-main"),
+                    notion_remote_id.clone(),
+                    EntityKind::Page,
+                    "Standups with Locality",
+                    "Standups with Locality/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save notion entity");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    MountId::new("notion-main"),
+                    notion_remote_id.clone(),
+                    FreshnessTier::Hot,
+                )
+                .opened_at("unix_ms:1782033300000"),
+            )
+            .expect("save notion freshness");
         let google_remote_id = RemoteId::new("doc-1");
         store
             .save_entity(
@@ -8021,6 +8527,13 @@ mod tests {
                 .connector_name,
             "Google Docs"
         );
+        assert_eq!(snapshot.recent_files.len(), 1);
+        assert_eq!(snapshot.recent_files[0].title, "Standups with Locality");
+        assert!(
+            snapshot.recent_files[0]
+                .local_path
+                .ends_with("Standups with Locality/page.md")
+        );
         assert_eq!(
             snapshot
                 .mounts
@@ -8030,6 +8543,52 @@ mod tests {
                 .pending_change_count,
             1
         );
+    }
+
+    #[test]
+    fn desktop_snapshot_hides_recent_files_for_inactive_mount_access() {
+        let temp = TestTempDir::new("desktop-stale-recent-files");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mut connection = test_connection("workspace-1", "CodeFlash");
+        connection.status = "revoked".to_string();
+        let remote_id = RemoteId::new("stale-page-1");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("codeflash-wiki"),
+        )
+        .with_connection_id(connection.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+        store.save_connection(connection).expect("save connection");
+        store.save_mount(mount).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    MountId::new("notion-main"),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Old Access Page",
+                    "Old Access Page/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save stale entity");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    MountId::new("notion-main"),
+                    remote_id,
+                    FreshnessTier::Hot,
+                )
+                .opened_at("unix_ms:1782033300000"),
+            )
+            .expect("save stale freshness");
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+
+        assert!(snapshot.needs_onboarding);
+        assert!(snapshot.recent_files.is_empty());
     }
 
     #[test]
@@ -8092,7 +8651,7 @@ mod tests {
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
-            None,
+            &[],
             |_, _| {
                 sync_calls += 1;
                 Ok(())
@@ -8125,7 +8684,7 @@ mod tests {
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
-            Some(&target),
+            std::slice::from_ref(&target),
             |_, _| {
                 sync_calls += 1;
                 Ok(())
@@ -8145,6 +8704,48 @@ mod tests {
     }
 
     #[test]
+    fn live_mode_tick_queues_bounded_remote_candidate_batch_without_pending_changes() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes.clear();
+        let first = live_mode_target("/tmp/Locality/notion/teamspace-home/hello-world/page.md");
+        let second = live_mode_target("/tmp/Locality/notion/teamspace-home/roadmap/page.md");
+        let targets = vec![first.clone(), second.clone()];
+        let mut checked = Vec::new();
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            &targets,
+            |_, _| panic!("remote-only tick should not sync local changes"),
+            |target| {
+                checked.push(target.path.clone());
+                Ok(())
+            },
+            |_| panic!("remote check should not queue a fast-forward"),
+            |_, _| panic!("remote-only tick should not merge local drift"),
+        );
+
+        assert!(report.ok);
+        assert_eq!(report.message, "Live Mode queued 2 remote checks.");
+        assert_eq!(checked, vec![first.path, second.path]);
+    }
+
+    #[test]
+    fn live_mode_remote_check_page_budget_tracks_notion_rps() {
+        assert_eq!(
+            live_mode_remote_check_page_budget_for_rate(3.0, Duration::from_secs(5)),
+            5
+        );
+        assert_eq!(
+            live_mode_remote_check_page_budget_for_rate(0.25, Duration::from_secs(3)),
+            1
+        );
+        assert_eq!(
+            live_mode_remote_check_page_budget_for_rate(f64::NAN, Duration::from_secs(5)),
+            1
+        );
+    }
+
+    #[test]
     fn live_mode_tick_reports_remote_queue_failure() {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes.clear();
@@ -8152,7 +8753,7 @@ mod tests {
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
-            Some(&target),
+            std::slice::from_ref(&target),
             |_, _| panic!("remote pull should not sync local changes"),
             |_| Err("daemon unreachable".to_string()),
             |_| panic!("remote check failure should not queue a fast-forward"),
@@ -8180,9 +8781,9 @@ mod tests {
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
-            Some(&live_mode_target(
+            &[live_mode_target(
                 "/tmp/Locality/notion/another-page/page.md",
-            )),
+            )],
             |_, _| panic!("remote-only change should not run a local push"),
             |_| panic!("remote-only pending change should not use the generic check cursor"),
             |target| {
@@ -8198,6 +8799,38 @@ mod tests {
         assert_eq!(pulled[0].mount_id, MountId::new("notion-main"));
         assert_eq!(pulled[0].remote_id, RemoteId::new("remote-page"));
         assert!(pulled[0].path.ends_with("Teamspace/Remote Page/page.md"));
+    }
+
+    #[test]
+    fn live_mode_tick_pauses_for_remote_deleted_pending_change() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes = vec![PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "remote-page".to_string(),
+            title: "Remote Page".to_string(),
+            local_path: "Teamspace/Remote Page/page.md".to_string(),
+            summary: "remote page deleted or unavailable".to_string(),
+            state: "needs_review".to_string(),
+            issue_codes: vec!["remote_deleted".to_string()],
+            live_mode: sample_live_mode_status(true),
+        }];
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            &[live_mode_target(
+                "/tmp/Locality/notion/another-page/page.md",
+            )],
+            |_, _| panic!("remote delete should not push"),
+            |_| panic!("remote delete should not use the generic check cursor"),
+            |_| panic!("remote delete should not fast-forward"),
+            |_, _| panic!("remote delete should not merge remote drift"),
+        );
+
+        assert!(!report.ok);
+        assert_eq!(
+            report.message,
+            "Live Mode paused for `Remote Page`: remote page deleted or unavailable."
+        );
     }
 
     #[test]
@@ -8252,6 +8885,32 @@ mod tests {
         assert!(live_mode_should_reconcile_local_target_for_key(
             &mut times,
             page,
+            now + Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
+    }
+
+    #[test]
+    fn live_mode_remote_pull_scan_is_throttled_per_mount() {
+        let mut times = BTreeMap::new();
+        let now = Instant::now();
+        let mount = MountId::new("notion-main");
+
+        assert!(live_mode_remote_pull_scan_is_due_for_key(
+            &mut times,
+            mount.clone(),
+            now,
+            Duration::from_secs(5),
+        ));
+        assert!(!live_mode_remote_pull_scan_is_due_for_key(
+            &mut times,
+            mount.clone(),
+            now + Duration::from_secs(1),
+            Duration::from_secs(5),
+        ));
+        assert!(live_mode_remote_pull_scan_is_due_for_key(
+            &mut times,
+            mount,
             now + Duration::from_secs(5),
             Duration::from_secs(5),
         ));
@@ -8338,7 +8997,7 @@ mod tests {
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
-            Some(&live_mode_target("/tmp/Locality/notion/Other/page.md")),
+            &[live_mode_target("/tmp/Locality/notion/Other/page.md")],
             |change, target| {
                 synced.push((change.title.clone(), target.to_path_buf()));
                 Ok(())
@@ -8373,7 +9032,7 @@ mod tests {
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
-            Some(&live_mode_target("/tmp/Locality/notion/Other/page.md")),
+            &[live_mode_target("/tmp/Locality/notion/Other/page.md")],
             |change, target| {
                 synced.push((change.title.clone(), target.to_path_buf()));
                 Ok(())
@@ -8415,7 +9074,7 @@ mod tests {
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
-            Some(&live_mode_target("/tmp/Locality/notion/Other/page.md")),
+            &[live_mode_target("/tmp/Locality/notion/Other/page.md")],
             |_, _| {
                 calls += 1;
                 Ok(())
@@ -8543,6 +9202,17 @@ mod tests {
             )
             .expect("save hydrated page");
         store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("page-hydrated"),
+                    FreshnessTier::Hot,
+                )
+                .opened_at(activity_timestamp())
+                .checked_at("unix_ms:1"),
+            )
+            .expect("save active freshness");
+        store
             .save_entity(
                 EntityRecord::new(
                     mount_id.clone(),
@@ -8578,6 +9248,41 @@ mod tests {
                 "/tmp/Locality/notion/teamspace-home/hello-world/page.md"
             )]
         );
+    }
+
+    #[test]
+    fn live_mode_remote_pull_candidates_skip_inactive_hydrated_pages() {
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(mount_id.clone(), "notion", "/tmp/Locality/notion");
+        let mut store = InMemoryStateStore::default();
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("inactive-page"),
+                    EntityKind::Page,
+                    "Inactive",
+                    "teamspace-home/inactive/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save hydrated page");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount_id,
+                    RemoteId::new("inactive-page"),
+                    FreshnessTier::Warm,
+                )
+                .opened_at("unix_ms:1")
+                .checked_at("unix_ms:2"),
+            )
+            .expect("save stale freshness");
+
+        let candidates = live_mode_remote_pull_candidates(&store, &mount).expect("candidates");
+
+        assert!(candidates.is_empty());
     }
 
     #[test]
@@ -9418,6 +10123,24 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].state, "blocked");
         assert!(changes[0].summary.contains("Previous push failed"));
+    }
+
+    #[test]
+    fn pending_changes_describe_remote_deleted_entries() {
+        let status = status_report_with_entry(status_entry(
+            loc_cli::status::StatusState::Clean,
+            loc_cli::status::StatusSyncState::RemoteUpdateAvailable,
+            0,
+            vec![status_issue("remote_deleted", "remote object was deleted")],
+        ));
+
+        let store = InMemoryStateStore::new();
+        let changes = pending_changes_from_status(&store, &status);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].state, "needs_review");
+        assert_eq!(changes[0].summary, "remote page deleted or unavailable");
+        assert_eq!(changes[0].issue_codes, vec!["remote_deleted"]);
     }
 
     #[test]
@@ -10362,6 +11085,14 @@ fn sample_snapshot() -> DesktopSnapshot {
             show_menu_bar: true,
         },
         pending_changes: sample_pending_changes(),
+        recent_files: vec![LocatedItem {
+            title: "Roadmap 2026".to_string(),
+            kind: "Page".to_string(),
+            local_path: absolute_display_path(
+                &default_notion_mount_root().join("Engineering/Roadmap 2026/page.md"),
+            ),
+            state: "ready".to_string(),
+        }],
         activity: vec![
             ActivityItem {
                 title: "Pushed Roadmap 2026 to Notion".to_string(),
@@ -10798,9 +11529,8 @@ fn main() {
         .setup(move |app| {
             if desktop_smoke_test_requested() {
                 configure_main_window_chrome(app);
-                build_tray(app)?;
-                app.app_handle().exit(0);
-                return Ok(());
+                // Keep release smoke tests isolated from the user's daemon state.
+                std::process::exit(0);
             }
             if let Err(error) = apply_launch_at_login_preference() {
                 eprintln!("loc desktop could not apply launch-at-login preference: {error}");
@@ -10837,6 +11567,8 @@ fn main() {
             push_to_notion,
             push_notion_file,
             pull_notion_file,
+            check_notion_file,
+            keep_notion_file_as_draft,
             reset_notion_file_to_remote,
             live_mode_tick,
             set_mount_live_mode,
@@ -11006,7 +11738,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
                         .unwrap_or_else(|_| PathBuf::from(snapshot.mount.local_path));
                     let _ = open_virtual_mount_or_path(&path);
                 }
-                show_main_window_with_view(app, Some("mount"));
+                show_main_window_with_view(app, Some("files"));
             }
             "review_pending" => show_main_window_with_view(app, Some("pending")),
             "hide_menubar" => {
@@ -11073,7 +11805,6 @@ fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
         return;
     }
 
-    refresh_tray_icon(app);
     let scale_factor = window.scale_factor().unwrap_or(1.0);
     let popover_size = window.outer_size().unwrap_or_else(|_| {
         PhysicalSize::new(
@@ -11087,6 +11818,7 @@ fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
     let _ = window.eval("window.dispatchEvent(new CustomEvent('loc-refresh-snapshot'));");
     let _ = window.show();
     let _ = window.set_focus();
+    schedule_tray_icon_refresh(app.clone());
 }
 
 fn screen_bounds_for_tray_anchor(

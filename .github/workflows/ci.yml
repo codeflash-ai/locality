@@ -114,6 +114,8 @@ jobs:
           echo "::warning::This hosted macOS job compiles the File Provider code, but does not register a real File Provider domain. Real online-only File Provider smoke needs a signed app/extension and macOS user approval."
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
+      - name: Validate macOS File Provider build hooks
+        run: tests/macos_file_provider_build_config.sh
       - name: Build macOS File Provider package
         run: swift build --package-path platform/macos/LocalityFileProvider
       - name: Install desktop dependencies
