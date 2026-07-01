@@ -14,6 +14,7 @@ use locality_notion::oauth::{
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerRefresh,
     NotionOAuthRefresh, StoredNotionCredential,
 };
+use locality_notion::render::render_comments_sidecar;
 use locality_notion::{NotionConfig, NotionConnector};
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
@@ -589,7 +590,7 @@ impl HydrationSource for NotionConnector {
                 local_media_block_ids,
             )?;
         }
-        let assets = fetched
+        let mut assets = fetched
             .downloaded
             .into_iter()
             .map(|asset| HydratedAsset {
@@ -601,7 +602,19 @@ impl HydrationSource for NotionConnector {
                     source_url: asset.source_url,
                 }),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if let Some(comments) = render_comments_sidecar(&bundle) {
+            let comments_path = request
+                .path
+                .parent()
+                .map(|parent| parent.join(".comments.md"))
+                .unwrap_or_else(|| PathBuf::from(".comments.md"));
+            assets.push(HydratedAsset {
+                path: comments_path,
+                bytes: comments.into_bytes(),
+                media: None,
+            });
+        }
 
         Ok(HydratedEntity {
             document: rendered.document,

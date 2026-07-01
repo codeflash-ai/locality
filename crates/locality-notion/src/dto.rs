@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct NotionPageBundle {
     pub page: PageDto,
     pub blocks: Vec<BlockTreeDto>,
+    #[serde(default)]
+    pub comments: Vec<CommentThreadDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +239,41 @@ pub type BlockListDto = PaginatedListDto<BlockDto>;
 pub type PageListDto = PaginatedListDto<PageDto>;
 pub type DatabaseListDto = PaginatedListDto<DatabaseDto>;
 pub type DataSourceListDto = PaginatedListDto<DataSourceDto>;
+pub type CommentListDto = PaginatedListDto<CommentDto>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentThreadDto {
+    pub anchor_id: String,
+    pub anchor_kind: CommentAnchorKind,
+    pub comments: Vec<CommentDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentAnchorKind {
+    Page,
+    Block {
+        block_kind: String,
+        #[serde(default)]
+        quote: Option<String>,
+    },
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentDto {
+    pub id: String,
+    #[serde(default)]
+    pub discussion_id: Option<String>,
+    #[serde(default)]
+    pub created_time: Option<String>,
+    #[serde(default)]
+    pub last_edited_time: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<UserMentionDto>,
+    #[serde(default)]
+    pub rich_text: Vec<RichTextDto>,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockDto {

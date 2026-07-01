@@ -33,9 +33,11 @@ const CHILDREN_PREFIX: &str = "children:";
 const PATH_PREFIX: &str = "path:";
 const LOCAL_PREFIX: &str = "local:";
 const SCHEMA_PREFIX: &str = "schema:";
+const COMMENTS_PREFIX: &str = "comments:";
 const GUIDANCE_PREFIX: &str = "guidance:";
 const AGENTS_FILE: &str = "AGENTS.md";
 const CLAUDE_FILE: &str = "CLAUDE.md";
+const COMMENTS_SIDECAR_FILENAME: &str = ".comments.md";
 const AGENTS_GUIDANCE_IDENTIFIER: &str = "guidance:AGENTS.md";
 const CLAUDE_GUIDANCE_IDENTIFIER: &str = "guidance:CLAUDE.md";
 
@@ -422,6 +424,15 @@ where
     {
         report.children.push(schema);
     }
+    if let Some(comments) =
+        comments_item_for_container(&mount, &entities, content_root, container_identifier)?
+        && !report
+            .children
+            .iter()
+            .any(|child| child.identifier == comments.identifier)
+    {
+        report.children.push(comments);
+    }
     for child in &mut report.children {
         rewrite_item_materialized_path(content_root, child)?;
     }
@@ -621,6 +632,32 @@ where
             hydration: HydrationState::Hydrated,
         });
     }
+    if let Some(remote_id) = identifier.strip_prefix(COMMENTS_PREFIX) {
+        let entity = require_entity(store, mount_id, &RemoteId::new(remote_id))?;
+        if entity.kind != EntityKind::Page {
+            return Err(LocalityError::Unsupported(
+                "only page comment sidecars can be materialized by the virtual filesystem",
+            ));
+        }
+        let path = content_path_for_relative(
+            content_root,
+            &page_container_path(&entity.path).join(COMMENTS_SIDECAR_FILENAME),
+        )?;
+        if !path.exists() {
+            return Err(LocalityError::InvalidState(format!(
+                "comments sidecar cache is missing for `{}`",
+                entity.path.display()
+            )));
+        }
+        return Ok(VirtualFsMaterializeReport {
+            mount_id: mount_id.0.clone(),
+            identifier: identifier.to_string(),
+            remote_id: remote_id.to_string(),
+            path: path.display().to_string(),
+            outcome: VirtualFsMaterializeOutcome::AlreadyMaterialized,
+            hydration: HydrationState::Hydrated,
+        });
+    }
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
     let entity = require_entity(store, mount_id, &remote_id)?;
     if entity.kind != EntityKind::Page {
@@ -757,6 +794,11 @@ where
     if identifier.starts_with(SCHEMA_PREFIX) {
         return Err(LocalityError::Unsupported(
             "database schema files are read-only in virtual filesystem mounts",
+        ));
+    }
+    if identifier.starts_with(COMMENTS_PREFIX) {
+        return Err(LocalityError::Unsupported(
+            "comment sidecars are read-only in virtual filesystem mounts",
         ));
     }
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
@@ -1245,6 +1287,11 @@ where
             item,
         });
     }
+    if identifier.starts_with(COMMENTS_PREFIX) {
+        return Err(LocalityError::Unsupported(
+            "comment sidecars are read-only in virtual filesystem mounts",
+        ));
+    }
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
     let entity = require_entity(store, mount_id, &remote_id)?;
     if entity.kind != EntityKind::Page {
@@ -1403,6 +1450,34 @@ fn schema_item_for_container(
     Ok(path
         .exists()
         .then(|| schema_item(mount, entity, Some(path))))
+}
+
+fn comments_item_for_container(
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+    content_root: &Path,
+    container_identifier: &str,
+) -> LocalityResult<Option<VirtualFsItem>> {
+    let Some(remote_id) = container_identifier.strip_prefix(CHILDREN_PREFIX) else {
+        return Ok(None);
+    };
+    if remote_id.starts_with(LOCAL_PREFIX) {
+        return Ok(None);
+    }
+    let remote_id = RemoteId::new(remote_id);
+    let Some(entity) = entities
+        .iter()
+        .find(|entity| entity.remote_id == remote_id && entity.kind == EntityKind::Page)
+    else {
+        return Ok(None);
+    };
+    let path = content_path_for_relative(
+        content_root,
+        &page_container_path(&entity.path).join(COMMENTS_SIDECAR_FILENAME),
+    )?;
+    Ok(path
+        .exists()
+        .then(|| comments_item(mount, entity, Some(path))))
 }
 
 fn create_parent_remote_id(
@@ -1797,6 +1872,14 @@ fn resolve_item(
         return Ok(schema_item(mount, entity, None));
     }
 
+    if let Some(remote_id) = identifier.strip_prefix(COMMENTS_PREFIX) {
+        let entity = entities
+            .iter()
+            .find(|entity| entity.remote_id.0 == remote_id && entity.kind == EntityKind::Page)
+            .ok_or_else(|| missing_identifier(identifier))?;
+        return Ok(comments_item(mount, entity, None));
+    }
+
     let remote_id = RemoteId::new(identifier);
     let entity = entities
         .iter()
@@ -2100,6 +2183,34 @@ fn schema_item(
     }
 }
 
+fn comments_item(
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    materialized_path: Option<PathBuf>,
+) -> VirtualFsItem {
+    let path = page_container_path(&entity.path).join(COMMENTS_SIDECAR_FILENAME);
+    let byte_size = materialized_path
+        .as_ref()
+        .and_then(|path| path.metadata().ok())
+        .map(|metadata| metadata.len());
+    VirtualFsItem {
+        identifier: format!("{COMMENTS_PREFIX}{}", entity.remote_id.0),
+        parent_identifier: Some(format!("{CHILDREN_PREFIX}{}", entity.remote_id.0)),
+        filename: COMMENTS_SIDECAR_FILENAME.to_string(),
+        kind: VirtualFsItemKind::File,
+        entity_kind: None,
+        remote_id: Some(entity.remote_id.0.clone()),
+        path: path_string(&path),
+        hydration: Some(HydrationState::Hydrated),
+        content_type: "net.daringfireball.markdown".to_string(),
+        remote_edited_at: entity.remote_edited_at.clone(),
+        materialized_path: materialized_path
+            .or_else(|| Some(mount.root.join(path).to_path_buf()))
+            .map(|path| path.display().to_string()),
+        byte_size,
+    }
+}
+
 fn rewrite_item_materialized_path(
     content_root: &Path,
     item: &mut VirtualFsItem,
@@ -2361,6 +2472,7 @@ fn entity_identifier(identifier: &str) -> LocalityResult<String> {
         || identifier.starts_with(PATH_PREFIX)
         || identifier.starts_with(MOUNT_POINT_PREFIX)
         || identifier.starts_with(SOURCE_ROOT_PREFIX)
+        || identifier.starts_with(COMMENTS_PREFIX)
         || identifier.starts_with(GUIDANCE_PREFIX)
     {
         return Err(LocalityError::InvalidState(format!(
@@ -2797,6 +2909,94 @@ mod tests {
             .expect_err("guidance writes are rejected"),
             LocalityError::Unsupported(
                 "agent guidance files are read-only in virtual filesystem mounts"
+            )
+        ));
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn hydrated_page_exposes_comments_sidecar_as_read_only_cached_file() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let state_root = temp_root("loc-virtual-fs-comments-sidecar");
+        let content_root = state_root.join("content/notion-main/files");
+        let comments_path = content_root.join("Roadmap/.comments.md");
+        std::fs::create_dir_all(comments_path.parent().expect("comments parent"))
+            .expect("create comments parent");
+        std::fs::write(&comments_path, "# Comments\n\n- cached\n").expect("write comments cache");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id,
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save page");
+
+        let listed = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &mount_id,
+            "children:page-1",
+        )
+        .expect("list page directory");
+        let comments = listed
+            .children
+            .iter()
+            .find(|child| child.identifier == "comments:page-1")
+            .expect("comments sidecar");
+        assert_eq!(comments.filename, ".comments.md");
+        assert_eq!(comments.path, "Roadmap/.comments.md");
+        assert_eq!(comments.kind, VirtualFsItemKind::File);
+        assert_eq!(comments.entity_kind, None);
+        assert_eq!(comments.hydration, Some(HydrationState::Hydrated));
+        assert_eq!(comments.byte_size, Some(21));
+
+        let materialized = materialize_virtual_fs_item_with_content_root(
+            &mut store,
+            &FailingHydrationSource,
+            &content_root,
+            &mount_id,
+            "comments:page-1",
+        )
+        .expect("materialize comments sidecar");
+        assert_eq!(std::path::Path::new(&materialized.path), comments_path);
+        assert_eq!(
+            std::fs::read_to_string(&comments_path).expect("read comments cache"),
+            "# Comments\n\n- cached\n"
+        );
+
+        let write_error = commit_virtual_fs_write(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "comments:page-1",
+            b"edited",
+        )
+        .expect_err("comments writes are read-only");
+        assert!(matches!(
+            write_error,
+            LocalityError::Unsupported(
+                "comment sidecars are read-only in virtual filesystem mounts"
+            )
+        ));
+
+        let delete_error =
+            trash_virtual_fs_item(&mut store, &content_root, &mount_id, "comments:page-1")
+                .expect_err("comments deletes are read-only");
+        assert!(matches!(
+            delete_error,
+            LocalityError::Unsupported(
+                "comment sidecars are read-only in virtual filesystem mounts"
             )
         ));
 

@@ -19,7 +19,7 @@ Sources used for the baseline:
 | Database | Read/enumerate as directory | fixture, live | Database containers project to directories. |
 | Data source | Read/query rows, render `_schema.yaml`, validate row property writes, create rows when database has exactly one data source | fixture, live, mounted live | Multi-data-source row writes are intentionally blocked until path/schema selection exists. |
 | User | Read when embedded in mentions/properties; writable by explicit ID in people properties | fixture, live property write | User objects are not mounted as standalone files in v1. |
-| Comment | Unsupported | none | Comments are not in the v1 filesystem model from `plan.md`; adding them needs a thread representation and write policy. |
+| Comment | Read-only sidecar | fixture, virtual | Unresolved page and block comments render to `.comments.md` next to `page.md`; local edits are generated metadata and are never pushed. |
 | File upload | Supported for existing image/video/file/pdf/audio block uploads and appended local media blocks from `.loc/media/`; external/download URLs are read and external file properties are writable | fixture, live media download/upload, live property write | Direct local uploads use single-part uploads and are capped at 20 MB. Multipart upload, retention policy, and dedupe remain future work. |
 | View | Unsupported | none | Views are database presentation state, not row/page content. |
 | Custom emoji | Unsupported | none | Emoji metadata is presentation state; emoji text still appears through rich text/plain text. |
@@ -121,8 +121,8 @@ Sources used for the baseline:
   represent them without losing Notion table semantics.
 - Layout and generated blocks (`column_*`, `breadcrumb`, `table_of_contents`,
   tabs) stay as directives because Markdown cannot represent their semantics.
-- Comments are not mounted because they need a separate thread model and push
-  policy.
+- Comments are read-only in `.comments.md`; create, resolve, update, and delete
+  operations remain deferred until Locality has a safe writable comment model.
 - People writes currently require explicit user IDs; name/email resolution is
   deferred. Relation writes currently require explicit related page IDs;
   path/title resolution is deferred.

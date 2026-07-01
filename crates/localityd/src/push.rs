@@ -68,6 +68,8 @@ use crate::source::{
 };
 use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
 
+const COMMENTS_SIDECAR_FILENAME: &str = ".comments.md";
+
 pub fn execute_push_job<S, Source>(
     store: &mut S,
     job: PushJob,
@@ -1344,6 +1346,15 @@ where
     }
 
     let Some(entity) = entity else {
+        if let Some(parent_page) = comments_sidecar_parent(store, &mount, &relative_path)? {
+            return Ok(PreparedPush {
+                absolute_path,
+                mount,
+                entity: parent_page.clone(),
+                shadows: Vec::new(),
+                pipeline: generated_sidecar_noop_pipeline(parent_page.remote_id),
+            });
+        }
         if relative_path.as_os_str().is_empty() || absolute_path.is_dir() {
             return prepare_pending_scope(
                 store,
@@ -1456,6 +1467,37 @@ where
         shadows: vec![shadow],
         pipeline,
     })
+}
+
+fn comments_sidecar_parent<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Result<Option<EntityRecord>, PushPrepareError>
+where
+    S: EntityRepository,
+{
+    if relative_path.file_name().and_then(|name| name.to_str()) != Some(COMMENTS_SIDECAR_FILENAME) {
+        return Ok(None);
+    }
+    let Some(parent) = relative_path.parent() else {
+        return Ok(None);
+    };
+    let page_path = page_document_path(parent);
+    store
+        .find_entity_by_path(&mount.mount_id, &page_path)
+        .map_err(PushPrepareError::Store)
+        .map(|entity| entity.filter(|entity| entity.kind == EntityKind::Page))
+}
+
+fn generated_sidecar_noop_pipeline(remote_id: RemoteId) -> PushPipelineResult {
+    PushPipelineResult {
+        validation: ValidationReport::clean(),
+        plan: Some(PushPlan::new(vec![remote_id], Vec::new())),
+        guardrail: GuardrailDecision::Proceed,
+        action: PushPipelineAction::Noop,
+        completed_stages: vec![PushStage::ParseAndValidate, PushStage::Diff],
+    }
 }
 
 fn prepare_direct_create<S, Validator>(

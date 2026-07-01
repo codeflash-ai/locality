@@ -7,7 +7,7 @@ use crate::docs_dto::{
     GoogleDocument, InlineObjectElement, Paragraph, ParagraphElement, StructuralElement, Table,
     TextStyle,
 };
-use crate::drive_dto::DriveFile;
+use crate::drive_dto::{DriveComment, DriveCommentReply, DriveCommentUser, DriveFile};
 use crate::oauth::GOOGLE_DOCS_CONNECTOR_ID;
 
 pub const GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND: &str = "google_docs_inline_object";
@@ -17,6 +17,10 @@ pub const GOOGLE_DOCS_TABLE_NATIVE_KIND: &str = "google_docs_table";
 pub struct GoogleDocsNativeBundle {
     pub drive_file: DriveFile,
     pub document: GoogleDocument,
+    #[serde(default)]
+    pub comments: Vec<DriveComment>,
+    #[serde(default)]
+    pub comments_unavailable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +108,128 @@ pub fn render_google_document(
         shadow,
         push_blocking_directives,
     })
+}
+
+pub fn render_comments_sidecar(bundle: &GoogleDocsNativeBundle) -> Option<String> {
+    if bundle.comments_unavailable {
+        return Some(
+            "comments unavailable: Google Drive connection lacks read comment capability\n"
+                .to_string(),
+        );
+    }
+    let comments = bundle
+        .comments
+        .iter()
+        .filter(|comment| !comment.deleted && !comment.resolved)
+        .collect::<Vec<_>>();
+    if comments.is_empty() {
+        return None;
+    }
+
+    let anchored = comments
+        .iter()
+        .copied()
+        .filter(|comment| comment.anchor.is_some() || comment.quoted_file_content.is_some())
+        .collect::<Vec<_>>();
+    let document = comments
+        .iter()
+        .copied()
+        .filter(|comment| comment.anchor.is_none() && comment.quoted_file_content.is_none())
+        .collect::<Vec<_>>();
+
+    let mut out = String::from("# Comments\n");
+    if !document.is_empty() {
+        out.push_str("\n## Document comments\n\n");
+        for comment in document {
+            render_comment(&mut out, comment, false);
+        }
+    }
+    if !anchored.is_empty() {
+        out.push_str("\n## Anchored comments\n");
+        for comment in anchored {
+            out.push_str(&format!("\n### {}\n", comment.id));
+            if let Some(quote) = comment
+                .quoted_file_content
+                .as_ref()
+                .and_then(|content| content.value.as_deref())
+                .filter(|quote| !quote.trim().is_empty())
+            {
+                out.push_str(&format!("\n> {}\n", quote.replace('\n', "\n> ")));
+            }
+            out.push('\n');
+            render_comment(&mut out, comment, true);
+        }
+    }
+
+    Some(out)
+}
+
+fn render_comment(out: &mut String, comment: &DriveComment, include_anchor: bool) {
+    let author = comment_author(comment.author.as_ref());
+    let created = comment.created_time.as_deref().unwrap_or("unknown");
+    if let Some(edited) = comment.modified_time.as_deref() {
+        out.push_str(&format!("- {author}, created {created}, edited {edited}\n"));
+    } else {
+        out.push_str(&format!("- {author}, created {created}\n"));
+    }
+    if include_anchor
+        && let Some(anchor) = comment
+            .anchor
+            .as_deref()
+            .filter(|anchor| !anchor.is_empty())
+    {
+        out.push_str(&format!("  - anchor: {anchor}\n"));
+    }
+    out.push_str(&format!("  - comment: {}\n", comment.id));
+    if let Some(content) = comment
+        .content
+        .as_deref()
+        .filter(|content| !content.trim().is_empty())
+    {
+        out.push_str(&format!("  - {}\n", content.replace('\n', "\n    ")));
+    }
+    for reply in comment.replies.iter().filter(|reply| !reply.deleted) {
+        render_reply(out, reply);
+    }
+}
+
+fn render_reply(out: &mut String, reply: &DriveCommentReply) {
+    let author = comment_author(reply.author.as_ref());
+    let created = reply.created_time.as_deref().unwrap_or("unknown");
+    if let Some(edited) = reply.modified_time.as_deref() {
+        out.push_str(&format!(
+            "  - reply {} by {author}, created {created}, edited {edited}\n",
+            reply.id
+        ));
+    } else {
+        out.push_str(&format!(
+            "  - reply {} by {author}, created {created}\n",
+            reply.id
+        ));
+    }
+    if let Some(action) = reply.action.as_deref().filter(|action| !action.is_empty()) {
+        out.push_str(&format!("    - action: {action}\n"));
+    }
+    if let Some(content) = reply
+        .content
+        .as_deref()
+        .filter(|content| !content.trim().is_empty())
+    {
+        out.push_str(&format!("    - {}\n", content.replace('\n', "\n      ")));
+    }
+}
+
+fn comment_author(author: Option<&DriveCommentUser>) -> String {
+    author
+        .and_then(|author| author.display_name.as_deref())
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            author
+                .and_then(|author| author.email_address.as_deref())
+                .filter(|email| !email.trim().is_empty())
+        })
+        .unwrap_or("Unknown author")
+        .to_string()
 }
 
 pub fn document_frontmatter(file: &DriveFile, docs_revision_id: &str) -> String {
@@ -579,6 +705,8 @@ mod tests {
                 }
             }))
             .expect("document"),
+            comments: Vec::new(),
+            comments_unavailable: false,
         };
 
         let rendered = render_google_document(&bundle).expect("render");
@@ -631,6 +759,8 @@ mod tests {
                 }
             }))
             .expect("document"),
+            comments: Vec::new(),
+            comments_unavailable: false,
         };
 
         let rendered = render_google_document(&bundle).expect("render");
@@ -674,6 +804,8 @@ mod tests {
                 }
             }))
             .expect("document"),
+            comments: Vec::new(),
+            comments_unavailable: false,
         };
 
         let rendered = render_google_document(&bundle).expect("render");
@@ -718,6 +850,8 @@ mod tests {
                 }
             }))
             .expect("document"),
+            comments: Vec::new(),
+            comments_unavailable: false,
         };
 
         let rendered = render_google_document(&bundle).expect("render");
@@ -751,6 +885,8 @@ mod tests {
                 }
             }))
             .expect("document"),
+            comments: Vec::new(),
+            comments_unavailable: false,
         };
 
         let rendered = render_google_document(&bundle).expect("render");
@@ -776,6 +912,8 @@ mod tests {
                 }
             }))
             .expect("document"),
+            comments: Vec::new(),
+            comments_unavailable: false,
         };
 
         let rendered = render_google_document(&bundle).expect("render");
@@ -808,6 +946,8 @@ mod tests {
                 }
             }))
             .expect("document"),
+            comments: Vec::new(),
+            comments_unavailable: false,
         };
 
         let rendered = render_google_document(&bundle).expect("render");
@@ -838,6 +978,8 @@ mod tests {
                 }
             }))
             .expect("document"),
+            comments: Vec::new(),
+            comments_unavailable: false,
         };
 
         let rendered = render_google_document(&bundle).expect("render");
@@ -885,6 +1027,8 @@ mod tests {
                 }
             }))
             .expect("document"),
+            comments: Vec::new(),
+            comments_unavailable: false,
         };
 
         let rendered = render_google_document(&bundle).expect("render");
@@ -925,6 +1069,8 @@ mod tests {
                 }
             }))
             .expect("document"),
+            comments: Vec::new(),
+            comments_unavailable: false,
         };
 
         let rendered = render_google_document(&bundle).expect("render");

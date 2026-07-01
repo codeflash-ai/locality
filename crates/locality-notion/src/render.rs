@@ -9,9 +9,10 @@ use locality_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use locality_core::{LocalityError, LocalityResult};
 
 use crate::dto::{
-    BlockDto, BlockTreeDto, DateMentionDto, EquationBlockDto, FileBlockDto, LinkToPageBlockDto,
-    MeetingNotesBlockDto, NotionPageBundle, PageDto, PagePropertyDto, RichTextBlockDto,
-    RichTextDto, SyncedBlockDto, TableBlockDto, TableRowBlockDto, UrlBlockDto,
+    BlockDto, BlockTreeDto, CommentAnchorKind, CommentDto, DateMentionDto, EquationBlockDto,
+    FileBlockDto, LinkToPageBlockDto, MeetingNotesBlockDto, NotionPageBundle, PageDto,
+    PagePropertyDto, RichTextBlockDto, RichTextDto, SyncedBlockDto, TableBlockDto,
+    TableRowBlockDto, UrlBlockDto,
 };
 use crate::media::{MediaAsset, is_downloadable_url, local_media_href, media_local_path};
 
@@ -68,6 +69,56 @@ pub fn render_native_entity_with_options(
 
 pub fn render_page_bundle(bundle: &NotionPageBundle) -> LocalityResult<NotionRenderedEntity> {
     render_page_bundle_with_options(bundle, &RenderOptions::default())
+}
+
+pub fn render_comments_sidecar(bundle: &NotionPageBundle) -> Option<String> {
+    if bundle
+        .comments
+        .iter()
+        .any(|thread| thread.anchor_kind == CommentAnchorKind::Unavailable)
+    {
+        return Some(
+            "comments unavailable: Notion connection lacks read comment capability\n".to_string(),
+        );
+    }
+    if bundle.comments.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("# Comments\n");
+    let page_threads = bundle
+        .comments
+        .iter()
+        .filter(|thread| thread.anchor_kind == CommentAnchorKind::Page)
+        .collect::<Vec<_>>();
+    let block_threads = bundle
+        .comments
+        .iter()
+        .filter(|thread| matches!(thread.anchor_kind, CommentAnchorKind::Block { .. }))
+        .collect::<Vec<_>>();
+
+    if !page_threads.is_empty() {
+        out.push_str("\n## Page comments\n\n");
+        for thread in page_threads {
+            render_comment_list(&mut out, &thread.comments);
+        }
+    }
+
+    if !block_threads.is_empty() {
+        out.push_str("\n## Block comments\n");
+        for thread in block_threads {
+            if let CommentAnchorKind::Block { block_kind, quote } = &thread.anchor_kind {
+                out.push_str(&format!("\n### {} ({block_kind})\n", thread.anchor_id));
+                if let Some(quote) = quote.as_deref().filter(|quote| !quote.trim().is_empty()) {
+                    out.push_str(&format!("\n> {}\n", quote.replace('\n', "\n> ")));
+                }
+                out.push('\n');
+                render_comment_list(&mut out, &thread.comments);
+            }
+        }
+    }
+
+    Some(out)
 }
 
 pub fn render_page_bundle_with_options(
@@ -192,6 +243,47 @@ fn render_markdown_body(blocks: &[RenderedBlock]) -> String {
     } else {
         format!("{body}\n")
     }
+}
+
+fn render_comment_list(out: &mut String, comments: &[CommentDto]) {
+    for comment in comments {
+        let author = comment_author(comment);
+        let created = comment.created_time.as_deref().unwrap_or("unknown");
+        if let Some(edited) = comment.last_edited_time.as_deref() {
+            out.push_str(&format!("- {author}, created {created}, edited {edited}\n"));
+        } else {
+            out.push_str(&format!("- {author}, created {created}\n"));
+        }
+        if let Some(discussion_id) = comment
+            .discussion_id
+            .as_deref()
+            .filter(|discussion_id| !discussion_id.is_empty())
+        {
+            out.push_str(&format!("  - discussion: {discussion_id}\n"));
+        }
+        out.push_str(&format!("  - comment: {}\n", comment.id));
+        let text = rich_text_to_markdown(&comment.rich_text);
+        if !text.trim().is_empty() {
+            out.push_str(&format!("  - {}\n", text.replace('\n', "\n    ")));
+        }
+    }
+}
+
+fn comment_author(comment: &CommentDto) -> String {
+    comment
+        .created_by
+        .as_ref()
+        .and_then(|user| user.name.as_deref())
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            comment
+                .created_by
+                .as_ref()
+                .map(|user| user.id.as_str())
+                .filter(|id| !id.trim().is_empty())
+        })
+        .unwrap_or("Unknown author")
+        .to_string()
 }
 
 fn should_tight_join(previous: &RenderedBlock, next: &RenderedBlock) -> bool {

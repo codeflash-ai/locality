@@ -50,6 +50,83 @@ pub struct DriveFileList {
     pub next_page_token: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveCommentList {
+    #[serde(default)]
+    pub comments: Vec<DriveComment>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveComment {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub anchor: Option<String>,
+    #[serde(default)]
+    pub quoted_file_content: Option<DriveCommentContent>,
+    #[serde(default)]
+    pub author: Option<DriveCommentUser>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub html_content: Option<String>,
+    #[serde(default)]
+    pub created_time: Option<String>,
+    #[serde(default)]
+    pub modified_time: Option<String>,
+    #[serde(default)]
+    pub resolved: bool,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub replies: Vec<DriveCommentReply>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveCommentContent {
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveCommentReply {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub author: Option<DriveCommentUser>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub html_content: Option<String>,
+    #[serde(default)]
+    pub created_time: Option<String>,
+    #[serde(default)]
+    pub modified_time: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveCommentUser {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub email_address: Option<String>,
+    #[serde(default)]
+    pub me: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DriveCreateFileRequest {

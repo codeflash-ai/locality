@@ -20,6 +20,7 @@ Support terms:
 |---|---|---|---|
 | Workspace page tree | Read/enumerate | Directories and Markdown files | Top-level pages and nested pages/databases can be discovered through the mounted tree. |
 | Page body | Read/write for supported blocks | Markdown file | Page content is rendered as Markdown with frontmatter for page metadata when available. |
+| Comments | Read-only | `.comments.md` sidecar | Unresolved page and block comments are regenerated during hydration. The sidecar is generated metadata; local writes/deletes are ignored in plain-file projections and rejected in virtual projections. |
 | Child page | Read/enumerate | Parent body link plus nested Markdown file | Parent pages show a readable link with the stable Notion page URL. The child page content is edited through the projected child Markdown file. New child pages are created through entity creation, not arbitrary block edits. |
 | Database / data source | Read/enumerate | Directory | Database rows appear as Markdown files under the database directory. |
 | Data source schema | Read/validation source | `_schema.yaml` | Used to validate database row property edits before writing to Notion. |
@@ -112,6 +113,6 @@ Support terms:
   represent them without replacing the table unsafely.
 - Layout and generated navigation blocks stay directive-backed because Markdown
   cannot represent their semantics.
-- Comments are not mounted yet; they need a separate thread model and write
-  policy.
+- Comments are projected read-only into `.comments.md`; writable comment actions
+  remain deferred.
 - People and relation writes currently require explicit Notion IDs.

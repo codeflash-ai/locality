@@ -9,14 +9,15 @@ use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::shadow::MarkdownBlockKind;
 use locality_notion::client::NotionApi;
 use locality_notion::dto::{
-    BlockDto, BlockListDto, BlockTreeDto, ColorOnlyBlockDto, DataSourceDto, DataSourcePropertyDto,
-    DataSourceSummaryDto, DatabaseDto, DatabaseListDto, DateMentionDto, EmptyBlockDto,
-    EquationBlockDto, EquationRichTextDto, ExternalFileDto, FileBlockDto, FilePropertyDto,
-    HostedFileDto, IdRefDto, LinkDto, LinkToPageBlockDto, MeetingNotesBlockDto, MentionRichTextDto,
-    PageDto, PageListDto, PagePropertyDto, PaginatedListDto, ParentDto, RichTextAnnotationsDto,
-    RichTextBlockDto, RichTextDto, SelectOptionDto, SelectPropertySchemaDto, SyncedBlockDto,
-    SyncedFromDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto,
-    UniqueIdPropertyDto, UrlBlockDto, VerificationPropertyDto,
+    BlockDto, BlockListDto, BlockTreeDto, ColorOnlyBlockDto, CommentDto, CommentListDto,
+    DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto, DatabaseDto, DatabaseListDto,
+    DateMentionDto, EmptyBlockDto, EquationBlockDto, EquationRichTextDto, ExternalFileDto,
+    FileBlockDto, FilePropertyDto, HostedFileDto, IdRefDto, LinkDto, LinkToPageBlockDto,
+    MeetingNotesBlockDto, MentionRichTextDto, PageDto, PageListDto, PagePropertyDto,
+    PaginatedListDto, ParentDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto,
+    SelectOptionDto, SelectPropertySchemaDto, SyncedBlockDto, SyncedFromDto, TableBlockDto,
+    TableRowBlockDto, TextRichTextDto, TitleBlockDto, UniqueIdPropertyDto, UrlBlockDto,
+    UserMentionDto, VerificationPropertyDto,
 };
 use locality_notion::{NotionConfig, NotionConnector};
 use serde_json::json;
@@ -69,6 +70,143 @@ fn fetch_recurses_paginated_block_children_and_render_preserves_shadow_ids() {
 }
 
 #[test]
+fn fetch_paginates_page_and_block_comments() {
+    let api = FixtureNotionApi::comments();
+    let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
+
+    let native = connector
+        .fetch(FetchRequest {
+            remote_id: RemoteId::new("page-1"),
+        })
+        .expect("fetch");
+    let bundle: locality_notion::dto::NotionPageBundle =
+        serde_json::from_slice(&native.raw).expect("native bundle");
+
+    assert_eq!(
+        bundle
+            .comments
+            .iter()
+            .map(|thread| (thread.anchor_id.as_str(), thread.comments.len()))
+            .collect::<Vec<_>>(),
+        vec![("page-1", 2), ("paragraph-1", 1)]
+    );
+}
+
+#[test]
+fn render_comments_sidecar_groups_page_and_block_threads() {
+    let bundle = locality_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: paragraph_block("paragraph-1", vec![rich_text("Plan paragraph.")]),
+            children: Vec::new(),
+        }],
+        comments: vec![
+            locality_notion::dto::CommentThreadDto {
+                anchor_id: "page-1".to_string(),
+                anchor_kind: locality_notion::dto::CommentAnchorKind::Page,
+                comments: vec![comment(
+                    "comment-page-1",
+                    "discussion-page",
+                    "Ada",
+                    "2026-06-11T10:00:00.000Z",
+                    vec![rich_text("Looks good.")],
+                )],
+            },
+            locality_notion::dto::CommentThreadDto {
+                anchor_id: "paragraph-1".to_string(),
+                anchor_kind: locality_notion::dto::CommentAnchorKind::Block {
+                    block_kind: "paragraph".to_string(),
+                    quote: Some("Plan paragraph.".to_string()),
+                },
+                comments: vec![comment(
+                    "comment-block-1",
+                    "discussion-block",
+                    "Grace",
+                    "2026-06-11T11:00:00.000Z",
+                    vec![linked_text("See docs", "https://example.com/docs")],
+                )],
+            },
+        ],
+    };
+
+    let sidecar = locality_notion::render::render_comments_sidecar(&bundle);
+
+    assert_eq!(
+        sidecar.as_deref(),
+        Some(concat!(
+            "# Comments\n\n",
+            "## Page comments\n\n",
+            "- Ada, created 2026-06-11T10:00:00.000Z\n",
+            "  - discussion: discussion-page\n",
+            "  - comment: comment-page-1\n",
+            "  - Looks good.\n\n",
+            "## Block comments\n\n",
+            "### paragraph-1 (paragraph)\n\n",
+            "> Plan paragraph.\n\n",
+            "- Grace, created 2026-06-11T11:00:00.000Z\n",
+            "  - discussion: discussion-block\n",
+            "  - comment: comment-block-1\n",
+            "  - [See docs](https://example.com/docs)\n"
+        ))
+    );
+}
+
+#[test]
+fn comment_permission_failure_renders_unavailable_notice_and_page_body() {
+    let api = FixtureNotionApi::comment_permission_denied();
+    let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
+
+    let native = connector
+        .fetch(FetchRequest {
+            remote_id: RemoteId::new("page-1"),
+        })
+        .expect("fetch still succeeds");
+    let bundle: locality_notion::dto::NotionPageBundle =
+        serde_json::from_slice(&native.raw).expect("native bundle");
+    let rendered = connector
+        .render_native_entity(&native)
+        .expect("render page body");
+
+    assert_eq!(rendered.document.body, "Plan paragraph.\n");
+    assert_eq!(
+        locality_notion::render::render_comments_sidecar(&bundle).as_deref(),
+        Some("comments unavailable: Notion connection lacks read comment capability\n")
+    );
+}
+
+#[test]
+fn comments_do_not_affect_shadow_ids_or_page_body() {
+    let with_comments = locality_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: paragraph_block("paragraph-1", vec![rich_text("Plan paragraph.")]),
+            children: Vec::new(),
+        }],
+        comments: vec![locality_notion::dto::CommentThreadDto {
+            anchor_id: "page-1".to_string(),
+            anchor_kind: locality_notion::dto::CommentAnchorKind::Page,
+            comments: vec![comment(
+                "comment-page-1",
+                "discussion-page",
+                "Ada",
+                "2026-06-11T10:00:00.000Z",
+                vec![rich_text("Looks good.")],
+            )],
+        }],
+    };
+    let mut without_comments = with_comments.clone();
+    without_comments.comments.clear();
+
+    let rendered_with =
+        locality_notion::render::render_page_bundle(&with_comments).expect("render with comments");
+    let rendered_without = locality_notion::render::render_page_bundle(&without_comments)
+        .expect("render without comments");
+
+    assert_eq!(rendered_with.document, rendered_without.document);
+    assert_eq!(rendered_with.shadow, rendered_without.shadow);
+}
+
+#[test]
 fn render_empty_paragraph_as_blank_line_without_shadow_marker() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page: page("page-1", "Roadmap"),
@@ -86,6 +224,7 @@ fn render_empty_paragraph_as_blank_line_without_shadow_marker() {
                 children: Vec::new(),
             },
         ],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -128,6 +267,7 @@ fn render_consecutive_empty_paragraphs_as_one_blank_line_each() {
                 children: Vec::new(),
             },
         ],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -185,6 +325,7 @@ fn render_consecutive_list_blocks_as_tight_markdown_list() {
                 children: Vec::new(),
             },
         ],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -222,6 +363,7 @@ fn render_rich_text_line_breaks_inside_one_shadow_block() {
             ),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -274,6 +416,7 @@ fn render_paragraph_escapes_literal_block_markers_at_start() {
                 children: Vec::new(),
             },
         ],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -326,6 +469,7 @@ fn render_rich_text_escapes_literal_break_tags() {
             block: paragraph_block("paragraph-1", vec![rich_text("Literal <br> tag")]),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -342,6 +486,7 @@ fn render_rich_text_escapes_literal_underline_tags() {
             block: paragraph_block("paragraph-1", vec![rich_text("Literal <u>tag</u>")]),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -358,6 +503,7 @@ fn render_rich_text_escapes_literal_equation_markers() {
             block: paragraph_block("paragraph-1", vec![rich_text("Literal $E=mc^2$ text")]),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -379,6 +525,7 @@ fn render_rich_text_escapes_literal_explicit_mention_markers() {
             ),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -403,6 +550,7 @@ fn render_rich_text_escapes_literal_markdown_inline_markers() {
             ),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -461,6 +609,7 @@ fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page,
         blocks: vec![block],
+        comments: Vec::new(),
     };
     let raw = serde_json::to_vec(&bundle).expect("raw");
     let native = locality_connector::NativeEntity {
@@ -502,6 +651,7 @@ fn render_code_block_uses_fence_longer_than_embedded_backticks() {
             ),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
     let raw = serde_json::to_vec(&bundle).expect("raw");
     let native = locality_connector::NativeEntity {
@@ -549,6 +699,7 @@ fn render_toggle_children_as_nested_markdown() {
                 },
             ],
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -641,6 +792,7 @@ fn render_richer_notion_block_coverage() {
                 children: Vec::new(),
             },
         ],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -920,6 +1072,7 @@ fn render_all_known_notion_block_objects_into_markdown_or_directives() {
                 children: Vec::new(),
             },
         ],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle_with_options(
@@ -1019,6 +1172,7 @@ fn render_table_as_markdown_table_with_row_shadow_metadata() {
                 },
             ],
         }],
+        comments: Vec::new(),
     };
     let raw = serde_json::to_vec(&bundle).expect("raw");
     let native = locality_connector::NativeEntity {
@@ -1079,6 +1233,7 @@ fn render_table_metadata_skips_blank_blocks_when_matching_shadow_blocks() {
                 children: Vec::new(),
             },
         ],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -1114,6 +1269,7 @@ fn render_malformed_table_as_directives() {
                 children: Vec::new(),
             }],
         }],
+        comments: Vec::new(),
     };
     let raw = serde_json::to_vec(&bundle).expect("raw");
     let native = locality_connector::NativeEntity {
@@ -1154,6 +1310,7 @@ fn render_media_blocks_as_markdown_links_and_tracks_local_paths() {
             ),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle_with_options(
@@ -1215,6 +1372,7 @@ fn render_file_like_media_blocks_as_local_links_when_downloaded() {
                 children: Vec::new(),
             },
         ],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle_with_options(
@@ -1267,6 +1425,7 @@ fn render_media_blocks_can_keep_failed_downloads_as_remote_urls() {
             ),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle_with_options(
@@ -1296,6 +1455,7 @@ fn render_relative_media_url_without_local_download_asset() {
             block: file_block("image-1", "image", "img_2.png", ""),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle_with_options(
@@ -1332,6 +1492,7 @@ fn render_notion_hosted_media_file_url_as_markdown_image() {
             block,
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -1357,6 +1518,7 @@ fn render_url_less_media_payload_as_directive() {
             block,
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -1415,6 +1577,7 @@ fn render_rich_text_annotations_links_mentions_and_equations() {
             ),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
     let raw = serde_json::to_vec(&bundle).expect("raw");
     let native = locality_connector::NativeEntity {
@@ -1446,6 +1609,7 @@ fn render_rich_text_link_escapes_unbalanced_href_parentheses() {
             ),
             children: Vec::new(),
         }],
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -1506,6 +1670,7 @@ fn render_database_row_properties_as_frontmatter() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page: row,
         blocks: Vec::new(),
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -1801,6 +1966,7 @@ fn render_all_supported_page_property_values_as_frontmatter() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page: row,
         blocks: Vec::new(),
+        comments: Vec::new(),
     };
 
     let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
@@ -2076,6 +2242,8 @@ fn normalize_notion_id(input: &str) -> String {
 struct FixtureNotionApi {
     pages: BTreeMap<String, PageDto>,
     children: BTreeMap<(String, Option<String>), BlockListDto>,
+    comments: BTreeMap<(String, Option<String>), CommentListDto>,
+    comment_error: Option<locality_core::LocalityError>,
     databases: BTreeMap<String, DatabaseDto>,
     data_sources: BTreeMap<String, DataSourceDto>,
     data_source_pages: BTreeMap<(String, Option<String>), PageListDto>,
@@ -2120,10 +2288,78 @@ impl FixtureNotionApi {
         Self {
             pages,
             children,
+            comments: BTreeMap::new(),
+            comment_error: None,
             databases: BTreeMap::new(),
             data_sources: BTreeMap::new(),
             data_source_pages: BTreeMap::new(),
         }
+    }
+
+    fn comments() -> Self {
+        let mut api = Self::new();
+        api.comments.insert(
+            ("page-1".to_string(), None),
+            PaginatedListDto {
+                results: vec![comment(
+                    "comment-page-1",
+                    "discussion-page",
+                    "Ada",
+                    "2026-06-11T10:00:00.000Z",
+                    vec![rich_text("Looks good.")],
+                )],
+                next_cursor: Some("page-comments-2".to_string()),
+                has_more: true,
+            },
+        );
+        api.comments.insert(
+            ("page-1".to_string(), Some("page-comments-2".to_string())),
+            PaginatedListDto {
+                results: vec![comment(
+                    "comment-page-2",
+                    "discussion-page",
+                    "Grace",
+                    "2026-06-11T10:30:00.000Z",
+                    vec![rich_text("Second page comment.")],
+                )],
+                next_cursor: None,
+                has_more: false,
+            },
+        );
+        api.comments.insert(
+            ("paragraph-1".to_string(), None),
+            PaginatedListDto {
+                results: vec![comment(
+                    "comment-block-1",
+                    "discussion-block",
+                    "Linus",
+                    "2026-06-11T11:00:00.000Z",
+                    vec![rich_text("Block comment.")],
+                )],
+                next_cursor: None,
+                has_more: false,
+            },
+        );
+        api
+    }
+
+    fn comment_permission_denied() -> Self {
+        let mut api = Self::new();
+        api.children.insert(
+            ("page-1".to_string(), None),
+            PaginatedListDto {
+                results: vec![paragraph_block(
+                    "paragraph-1",
+                    vec![rich_text("Plan paragraph.")],
+                )],
+                next_cursor: None,
+                has_more: false,
+            },
+        );
+        api.comment_error = Some(locality_core::LocalityError::Io(
+            "notion api returned HTTP 403: missing comment capability".to_string(),
+        ));
+        api
     }
 
     fn tree(root_page_id: &str) -> Self {
@@ -2210,6 +2446,8 @@ impl FixtureNotionApi {
         Self {
             pages,
             children,
+            comments: BTreeMap::new(),
+            comment_error: None,
             databases,
             data_sources,
             data_source_pages,
@@ -2275,6 +2513,8 @@ impl FixtureNotionApi {
         Self {
             pages,
             children,
+            comments: BTreeMap::new(),
+            comment_error: None,
             databases,
             data_sources: BTreeMap::new(),
             data_source_pages,
@@ -2317,6 +2557,8 @@ impl FixtureNotionApi {
                 (nested_page.id.clone(), nested_page),
             ]),
             children: BTreeMap::new(),
+            comments: BTreeMap::new(),
+            comment_error: None,
             databases: BTreeMap::from([(root_database.id.clone(), root_database)]),
             data_sources: BTreeMap::new(),
             data_source_pages: BTreeMap::new(),
@@ -2429,6 +2671,8 @@ impl FixtureNotionApi {
                 (row_page.id.clone(), row_page),
             ]),
             children,
+            comments: BTreeMap::new(),
+            comment_error: None,
             databases: BTreeMap::from([(database.id.clone(), database)]),
             data_sources: BTreeMap::new(),
             data_source_pages,
@@ -2450,6 +2694,8 @@ impl FixtureNotionApi {
         Self {
             pages: BTreeMap::from([(row_page.id.clone(), row_page)]),
             children: BTreeMap::new(),
+            comments: BTreeMap::new(),
+            comment_error: None,
             databases: BTreeMap::new(),
             data_sources: BTreeMap::new(),
             data_source_pages: BTreeMap::new(),
@@ -2513,6 +2759,8 @@ impl FixtureNotionApi {
         Self {
             pages,
             children,
+            comments: BTreeMap::new(),
+            comment_error: None,
             databases,
             data_sources: BTreeMap::new(),
             data_source_pages: BTreeMap::new(),
@@ -2569,6 +2817,21 @@ impl NotionApi for FixtureNotionApi {
         Ok(self
             .children
             .get(&(block_id.to_string(), start_cursor.map(str::to_string)))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn list_comments(
+        &self,
+        parent_id: &str,
+        start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<CommentListDto> {
+        if let Some(error) = &self.comment_error {
+            return Err(error.clone());
+        }
+        Ok(self
+            .comments
+            .get(&(parent_id.to_string(), start_cursor.map(str::to_string)))
             .cloned()
             .unwrap_or_default())
     }
@@ -2916,6 +3179,26 @@ fn rich_text(text: &str) -> RichTextDto {
         plain_text: text.to_string(),
         href: None,
         annotations: Default::default(),
+    }
+}
+
+fn comment(
+    id: &str,
+    discussion_id: &str,
+    author: &str,
+    created_time: &str,
+    rich_text: Vec<RichTextDto>,
+) -> CommentDto {
+    CommentDto {
+        id: id.to_string(),
+        discussion_id: Some(discussion_id.to_string()),
+        created_time: Some(created_time.to_string()),
+        last_edited_time: None,
+        created_by: Some(UserMentionDto {
+            id: format!("{author}-id"),
+            name: Some(author.to_string()),
+        }),
+        rich_text,
     }
 }
 

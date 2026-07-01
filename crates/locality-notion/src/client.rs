@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 
 use crate::NotionConfig;
 use crate::dto::{
-    BlockDto, BlockListDto, DataSourceDto, DataSourceListDto, DatabaseDto, DatabaseListDto,
-    PageDto, PageListDto,
+    BlockDto, BlockListDto, CommentListDto, DataSourceDto, DataSourceListDto, DatabaseDto,
+    DatabaseListDto, PageDto, PageListDto,
 };
 
 pub const DEFAULT_NOTION_API_BASE_URL: &str = "https://api.notion.com";
@@ -136,6 +136,14 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
         block_id: &str,
         start_cursor: Option<&str>,
     ) -> LocalityResult<BlockListDto>;
+    fn list_comments(
+        &self,
+        parent_id: &str,
+        start_cursor: Option<&str>,
+    ) -> LocalityResult<CommentListDto> {
+        let _ = (parent_id, start_cursor);
+        Err(LocalityError::NotImplemented("list Notion comments"))
+    }
     fn search_pages(&self, start_cursor: Option<&str>) -> LocalityResult<PageListDto>;
     fn search_databases(&self, start_cursor: Option<&str>) -> LocalityResult<DatabaseListDto> {
         let _ = start_cursor;
@@ -784,6 +792,22 @@ impl NotionApi for HttpNotionApi {
         }
 
         self.get_json(&format!("/v1/blocks/{block_id}/children"), &query)
+    }
+
+    fn list_comments(
+        &self,
+        parent_id: &str,
+        start_cursor: Option<&str>,
+    ) -> LocalityResult<CommentListDto> {
+        let mut query = vec![
+            ("block_id", parent_id.to_string()),
+            ("page_size", "100".to_string()),
+        ];
+        if let Some(start_cursor) = start_cursor {
+            query.push(("start_cursor", start_cursor.to_string()));
+        }
+
+        self.get_json("/v1/comments", &query)
     }
 
     fn search_pages(&self, start_cursor: Option<&str>) -> LocalityResult<PageListDto> {

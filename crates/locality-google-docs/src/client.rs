@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 
 use crate::docs_dto::{BatchUpdateDocumentRequest, GoogleDocument};
 use crate::drive_dto::{
-    DRIVE_FOLDER_MIME_TYPE, DriveCreateFileRequest, DriveFile, DriveFileList,
+    DRIVE_FOLDER_MIME_TYPE, DriveCommentList, DriveCreateFileRequest, DriveFile, DriveFileList,
     DriveUpdateFileRequest,
 };
 
@@ -16,6 +16,7 @@ pub const DEFAULT_GOOGLE_DRIVE_API_BASE_URL: &str = "https://www.googleapis.com/
 pub const DEFAULT_GOOGLE_DOCS_API_BASE_URL: &str = "https://docs.googleapis.com";
 const GOOGLE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const DRIVE_FILE_FIELDS: &str = "id, name, mimeType, parents, modifiedTime, version, trashed";
+const DRIVE_COMMENT_FIELDS: &str = "nextPageToken, comments(id, anchor, quotedFileContent/mimeType, quotedFileContent/value, author/displayName, author/emailAddress, content, htmlContent, createdTime, modifiedTime, resolved, deleted, replies(id, author/displayName, author/emailAddress, content, htmlContent, createdTime, modifiedTime, deleted, action))";
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
@@ -31,6 +32,14 @@ pub trait GoogleDriveApi: std::fmt::Debug + Send + Sync {
         name: &str,
         page_token: Option<&str>,
     ) -> LocalityResult<DriveFileList>;
+    fn list_comments(
+        &self,
+        file_id: &str,
+        page_token: Option<&str>,
+    ) -> LocalityResult<DriveCommentList> {
+        let _ = (file_id, page_token);
+        Err(LocalityError::NotImplemented("list Google Drive comments"))
+    }
     fn create_file(&self, request: DriveCreateFileRequest) -> LocalityResult<DriveFile>;
     fn update_file(
         &self,
@@ -218,6 +227,24 @@ impl GoogleDriveApi for HttpGoogleApiClient {
             format!("{}/files", self.drive_base_url),
             &request,
             vec![("fields".to_string(), DRIVE_FILE_FIELDS.to_string())],
+        )
+    }
+
+    fn list_comments(
+        &self,
+        file_id: &str,
+        page_token: Option<&str>,
+    ) -> LocalityResult<DriveCommentList> {
+        let mut query = vec![
+            ("fields".to_string(), DRIVE_COMMENT_FIELDS.to_string()),
+            ("includeDeleted".to_string(), "false".to_string()),
+        ];
+        if let Some(page_token) = page_token {
+            query.push(("pageToken".to_string(), page_token.to_string()));
+        }
+        self.get_json(
+            format!("{}/files/{file_id}/comments", self.drive_base_url),
+            query,
         )
     }
 

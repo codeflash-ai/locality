@@ -124,6 +124,40 @@ fn diff_page_directory_targets_page_document() {
 }
 
 #[test]
+fn diff_comments_sidecar_is_noop_for_parent_page() {
+    let fixture = DiffFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    fixture.write_page("Roadmap/page.md", "# Roadmap\n\nSame paragraph.");
+    let comments_path = fixture.write_page("Roadmap/.comments.md", "# Comments\n\nEdited.");
+
+    let report = run_diff(&store, comments_path).expect("diff comments sidecar");
+
+    assert!(report.ok);
+    assert_eq!(report.action, "noop");
+    assert_eq!(report.entity_id, "page-1");
+    assert!(report.plan.unwrap().operations.is_empty());
+}
+
+#[test]
 fn diff_virtual_projection_reads_daemon_content_cache() {
     let fixture = DiffFixture::new();
     let state_root = fixture.root.join("state");

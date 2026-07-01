@@ -38,6 +38,11 @@ does not expose arbitrary Drive traversal as a Locality mount.
 Drive folders project as local directories. Google Docs project as page
 directories containing `page.md`.
 
+Hydrated Google Docs with unresolved Drive comments also get a generated
+`.comments.md` sidecar next to `page.md`. The sidecar is read-only metadata:
+plain-file hydration rewrites it from Drive, virtual mounts expose it from the
+content cache, and local sidecar edits are never pushed back to Google.
+
 Examples under a shared Locality root:
 
 ```text
@@ -67,6 +72,12 @@ renderer supports common Google Docs structures:
 
 Unsupported Google Docs structures are rendered as `::loc{...}` directives and
 validated as push-blocking if an edit would be lossy.
+
+Comments are fetched through the Drive comments API during hydration. Locality
+renders unresolved document-level and anchored comments, including replies,
+author display names, timestamps, comment ids, anchors, and quoted file content
+when Drive returns it. Missing Drive comment capability leaves `page.md` usable
+and writes `.comments.md` with an unavailable notice.
 
 ## Push Behavior
 
@@ -104,8 +115,10 @@ Live testing found and fixed several integration issues:
 ## Current Limitations
 
 - Only Google Docs and Drive folders are projected.
-- Google Sheets, Slides, binary Drive files, comments, suggestions, and rich
+- Google Sheets, Slides, binary Drive files, suggestions, and rich
   unsupported Docs structures are not editable through V1.
+- Comments are read-only in `.comments.md`; create, reply, resolve, update, and
+  delete operations stay out of V1.
 - Unsupported structures must be preserved or they block push.
 - The OAuth broker project must have both Google Docs API and Google Drive API
   enabled.

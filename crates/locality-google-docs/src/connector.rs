@@ -281,9 +281,13 @@ impl Connector for GoogleDocsConnector {
             ));
         }
         let document = self.docs.get_document(request.remote_id.as_str())?;
+        let (comments, comments_unavailable) =
+            fetch_document_comments(self.drive.as_ref(), &drive_file.id)?;
         let bundle = GoogleDocsNativeBundle {
             drive_file,
             document,
+            comments,
+            comments_unavailable,
         };
         let raw = serde_json::to_vec(&bundle).map_err(|error| {
             LocalityError::Io(format!("google docs native encode failed: {error}"))
@@ -344,6 +348,43 @@ impl Connector for GoogleDocsConnector {
 
     fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
         Err(LocalityError::Unsupported("google docs undo"))
+    }
+}
+
+fn fetch_document_comments(
+    drive: &dyn GoogleDriveApi,
+    file_id: &str,
+) -> LocalityResult<(Vec<crate::drive_dto::DriveComment>, bool)> {
+    let mut cursor = None;
+    let mut comments = Vec::new();
+
+    loop {
+        let page = match drive.list_comments(file_id, cursor.as_deref()) {
+            Ok(page) => page,
+            Err(error) if is_comment_capability_error(&error) => return Ok((Vec::new(), true)),
+            Err(error) => return Err(error),
+        };
+        comments.extend(
+            page.comments
+                .into_iter()
+                .filter(|comment| !comment.deleted && !comment.resolved),
+        );
+        if page.next_page_token.is_none() {
+            break;
+        }
+        cursor = page.next_page_token;
+    }
+
+    Ok((comments, false))
+}
+
+fn is_comment_capability_error(error: &LocalityError) -> bool {
+    match error {
+        LocalityError::Guardrail(message) => message.to_ascii_lowercase().contains("permission"),
+        LocalityError::Io(message) => message.contains("HTTP 403"),
+        LocalityError::Unsupported(feature) => feature.contains("comment"),
+        LocalityError::NotImplemented(feature) => feature.contains("comment"),
+        _ => false,
     }
 }
 
@@ -3008,6 +3049,7 @@ mod tests {
     use locality_connector::{
         ApplyPlanRequest, Connector, EnumerateRequest, FetchRequest, ObserveRequest,
     };
+    use locality_core::LocalityError;
     use locality_core::journal::{PushId, PushOperationId};
     use locality_core::model::{EntityKind, MountId, RemoteId};
     use locality_core::planner::{PushOperation, PushPlan};
@@ -3020,8 +3062,10 @@ mod tests {
     use crate::client::{GoogleDocsApi, GoogleDriveApi};
     use crate::docs_dto::{BatchUpdateDocumentRequest, DocsRequest, GoogleDocument, Range};
     use crate::drive_dto::{
+        DriveComment, DriveCommentContent, DriveCommentList, DriveCommentReply, DriveCommentUser,
         DriveCreateFileRequest, DriveFile, DriveFileList, DriveUpdateFileRequest,
     };
+    use crate::render::GoogleDocsNativeBundle;
 
     #[test]
     fn enumerate_projects_workspace_folders_and_docs_as_page_directories() {
@@ -3100,6 +3144,155 @@ mod tests {
             String::from_utf8(native.raw)
                 .unwrap()
                 .contains("Launch Brief")
+        );
+    }
+
+    #[test]
+    fn fetch_paginates_google_doc_comments() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(doc_file("doc-1", "Launch Brief", "workspace"))
+                .with_comments(
+                    "doc-1",
+                    None,
+                    DriveCommentList {
+                        comments: vec![drive_comment(
+                            "comment-1",
+                            "Ada",
+                            "2026-06-11T10:00:00.000Z",
+                            "Looks good.",
+                            Some("Launch"),
+                        )],
+                        next_page_token: Some("cursor-2".to_string()),
+                    },
+                )
+                .with_comments(
+                    "doc-1",
+                    Some("cursor-2"),
+                    DriveCommentList {
+                        comments: vec![drive_comment(
+                            "comment-2",
+                            "Grace",
+                            "2026-06-11T10:30:00.000Z",
+                            "Second comment.",
+                            None,
+                        )],
+                        next_page_token: None,
+                    },
+                ),
+        );
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Hello\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs);
+
+        let native = connector
+            .fetch(FetchRequest {
+                remote_id: RemoteId::new("doc-1"),
+            })
+            .expect("fetch");
+        let bundle = serde_json::from_slice::<GoogleDocsNativeBundle>(&native.raw)
+            .expect("google docs bundle");
+
+        assert_eq!(bundle.comments.len(), 2);
+        assert_eq!(bundle.comments[0].id, "comment-1");
+        assert_eq!(bundle.comments[1].id, "comment-2");
+    }
+
+    #[test]
+    fn render_google_doc_comments_sidecar_includes_replies_and_anchors() {
+        let bundle = GoogleDocsNativeBundle {
+            drive_file: doc_file("doc-1", "Launch Brief", "workspace"),
+            document: document("doc-1", "Launch Brief", "rev-1", "Hello\n"),
+            comments: vec![DriveComment {
+                id: "comment-1".to_string(),
+                anchor: Some("kix.anchor".to_string()),
+                quoted_file_content: Some(DriveCommentContent {
+                    mime_type: Some("text/plain".to_string()),
+                    value: Some("Launch paragraph".to_string()),
+                }),
+                author: Some(DriveCommentUser {
+                    display_name: Some("Ada".to_string()),
+                    email_address: Some("ada@example.com".to_string()),
+                    me: false,
+                }),
+                content: Some("Looks good.".to_string()),
+                html_content: None,
+                created_time: Some("2026-06-11T10:00:00.000Z".to_string()),
+                modified_time: Some("2026-06-11T10:01:00.000Z".to_string()),
+                resolved: false,
+                deleted: false,
+                replies: vec![DriveCommentReply {
+                    id: "reply-1".to_string(),
+                    author: Some(DriveCommentUser {
+                        display_name: Some("Grace".to_string()),
+                        email_address: None,
+                        me: false,
+                    }),
+                    content: Some("Agreed.".to_string()),
+                    html_content: None,
+                    created_time: Some("2026-06-11T10:05:00.000Z".to_string()),
+                    modified_time: None,
+                    deleted: false,
+                    action: None,
+                }],
+            }],
+            comments_unavailable: false,
+        };
+
+        let sidecar = crate::render::render_comments_sidecar(&bundle);
+
+        assert_eq!(
+            sidecar.as_deref(),
+            Some(concat!(
+                "# Comments\n\n",
+                "## Anchored comments\n\n",
+                "### comment-1\n\n",
+                "> Launch paragraph\n\n",
+                "- Ada, created 2026-06-11T10:00:00.000Z, edited 2026-06-11T10:01:00.000Z\n",
+                "  - anchor: kix.anchor\n",
+                "  - comment: comment-1\n",
+                "  - Looks good.\n",
+                "  - reply reply-1 by Grace, created 2026-06-11T10:05:00.000Z\n",
+                "    - Agreed.\n"
+            ))
+        );
+    }
+
+    #[test]
+    fn comment_permission_failure_sets_unavailable_flag_without_losing_body() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(doc_file("doc-1", "Launch Brief", "workspace"))
+                .with_comment_error(LocalityError::Guardrail(
+                    "google docs permission denied: missing comments scope".to_string(),
+                )),
+        );
+        let docs = Arc::new(FakeDocs::default().with_document(document(
+            "doc-1",
+            "Launch Brief",
+            "rev-1",
+            "Hello\n",
+        )));
+        let connector = GoogleDocsConnector::with_apis(GoogleDocsConfig::new("token"), drive, docs);
+
+        let native = connector
+            .fetch(FetchRequest {
+                remote_id: RemoteId::new("doc-1"),
+            })
+            .expect("fetch");
+        let bundle = serde_json::from_slice::<GoogleDocsNativeBundle>(&native.raw)
+            .expect("google docs bundle");
+        let rendered = crate::render::render_google_document(&bundle).expect("render body");
+
+        assert!(bundle.comments_unavailable);
+        assert_eq!(rendered.document.body, "Hello\n");
+        assert_eq!(
+            crate::render::render_comments_sidecar(&bundle).as_deref(),
+            Some("comments unavailable: Google Drive connection lacks read comment capability\n")
         );
     }
 
@@ -5746,6 +5939,8 @@ mod tests {
         files: Mutex<std::collections::BTreeMap<String, DriveFile>>,
         children: Mutex<std::collections::BTreeMap<String, Vec<DriveFile>>>,
         workspace_folders: Mutex<std::collections::BTreeMap<String, Vec<DriveFile>>>,
+        comments: Mutex<std::collections::BTreeMap<(String, Option<String>), DriveCommentList>>,
+        comment_error: Mutex<Option<LocalityError>>,
         last_created: Mutex<Option<DriveCreateFileRequest>>,
         last_update: Mutex<Option<(String, DriveUpdateFileRequest)>>,
     }
@@ -5781,6 +5976,24 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(name.to_string(), files);
+            self
+        }
+
+        fn with_comments(
+            self,
+            file_id: &str,
+            page_token: Option<&str>,
+            comments: DriveCommentList,
+        ) -> Self {
+            self.comments.lock().unwrap().insert(
+                (file_id.to_string(), page_token.map(str::to_string)),
+                comments,
+            );
+            self
+        }
+
+        fn with_comment_error(self, error: LocalityError) -> Self {
+            *self.comment_error.lock().unwrap() = Some(error);
             self
         }
     }
@@ -5827,6 +6040,23 @@ mod tests {
                     .unwrap_or_default(),
                 next_page_token: None,
             })
+        }
+
+        fn list_comments(
+            &self,
+            file_id: &str,
+            page_token: Option<&str>,
+        ) -> locality_core::LocalityResult<DriveCommentList> {
+            if let Some(error) = self.comment_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            Ok(self
+                .comments
+                .lock()
+                .unwrap()
+                .get(&(file_id.to_string(), page_token.map(str::to_string)))
+                .cloned()
+                .unwrap_or_default())
         }
 
         fn create_file(
@@ -5953,6 +6183,35 @@ mod tests {
             modified_time: Some("2026-06-25T10:00:00.000Z".to_string()),
             version: Some("7".to_string()),
             trashed: false,
+        }
+    }
+
+    fn drive_comment(
+        id: &str,
+        author: &str,
+        created_time: &str,
+        content: &str,
+        quote: Option<&str>,
+    ) -> DriveComment {
+        DriveComment {
+            id: id.to_string(),
+            anchor: quote.map(|_| format!("{id}-anchor")),
+            quoted_file_content: quote.map(|value| DriveCommentContent {
+                mime_type: Some("text/plain".to_string()),
+                value: Some(value.to_string()),
+            }),
+            author: Some(DriveCommentUser {
+                display_name: Some(author.to_string()),
+                email_address: None,
+                me: false,
+            }),
+            content: Some(content.to_string()),
+            html_content: None,
+            created_time: Some(created_time.to_string()),
+            modified_time: None,
+            resolved: false,
+            deleted: false,
+            replies: Vec::new(),
         }
     }
 

@@ -9,14 +9,17 @@ use locality_core::{LocalityError, LocalityResult};
 use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConfig, GoogleDocsConnector,
     HttpGoogleDocsOAuthBrokerClient, StoredGoogleDocsCredential,
-    render::{GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND},
+    render::{
+        GOOGLE_DOCS_INLINE_OBJECT_NATIVE_KIND, GOOGLE_DOCS_TABLE_NATIVE_KIND,
+        render_comments_sidecar,
+    },
 };
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
     CredentialStore, MountConfig,
 };
 
-use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::hydration::{HydratedAsset, HydratedEntity, HydrationSource};
 use crate::notion::ConnectorResolveError;
 use crate::source::{SourceAdapter, SourcePushValidator, SourceValidationContext};
 
@@ -387,6 +390,20 @@ impl HydrationSource for GoogleDocsConnector {
                 LocalityError::Io(format!("google docs native decode failed: {error}"))
             })?;
         let rendered = locality_google_docs::render::render_google_document(&bundle)?;
+        let assets = render_comments_sidecar(&bundle)
+            .map(|comments| {
+                let path = request
+                    .path
+                    .parent()
+                    .map(|parent| parent.join(".comments.md"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".comments.md"));
+                vec![HydratedAsset {
+                    path,
+                    bytes: comments.into_bytes(),
+                    media: None,
+                }]
+            })
+            .unwrap_or_default();
         Ok(HydratedEntity {
             document: rendered.document,
             shadow: rendered.shadow,
@@ -394,7 +411,7 @@ impl HydrationSource for GoogleDocsConnector {
                 &bundle.drive_file,
                 bundle.document.revision_id.as_deref(),
             )),
-            assets: Vec::new(),
+            assets,
         })
     }
 

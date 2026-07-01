@@ -15,6 +15,9 @@ The current implementation is a live-capable read, pull, and narrow write projec
 - child databases retrieve their data sources, write `_schema.yaml`, and enumerate row pages under the database directory.
 - database row stubs carry the row properties in YAML frontmatter before the body is hydrated.
 - `fetch` retrieves page metadata and recursively retrieves paginated block children.
+- `fetch` also retrieves unresolved Notion comments for the page and rendered
+  page-body block anchors, then hydration projects them into a generated
+  `.comments.md` sidecar next to `page.md`.
 - fetched pages are serialized into a versioned native JSON bundle inside `NativeEntity.raw`;
 - `render_native_entity` converts that native bundle into canonical Markdown plus a `ShadowDocument`;
 - rich text annotations, external links, date/page/database mentions, link previews, inline
@@ -209,3 +212,9 @@ roadmap/
 ```
 
 Row directories are normal page directories. Their `page.md` stubs include page identity plus supported property values in frontmatter, while the body remains the standard Locality stub marker until hydration. Creating a row accepts either the canonical page-directory shape (`database/new-row/page.md`) or the ergonomic shortcut (`database/new-row.md`) with YAML frontmatter and no `loc.id`; `loc push -y` creates the Notion page, reads it back, saves the durable entity/shadow rows, and replaces shortcut files with the canonical projected row directory. `_view.csv` remains future work.
+
+Hydrated pages may also contain `.comments.md`. This file is a read-only,
+regenerated view of unresolved Notion comments grouped by page and block anchor.
+If the Notion connection lacks read-comment capability, hydration still writes
+`page.md` and the sidecar contains a short unavailable notice. Comment sidecar
+changes are not part of page-content push planning.
