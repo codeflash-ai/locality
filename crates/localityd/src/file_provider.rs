@@ -5,7 +5,7 @@
 //! generic API instead of growing platform-specific daemon semantics.
 
 use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
-use locality_core::conflict::has_unresolved_conflict_markers;
+use locality_core::conflict::{has_unresolved_conflict_markers, render_inline_conflict_markdown};
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_core::{LocalityError, LocalityResult};
@@ -919,6 +919,14 @@ where
         return Ok(contents.as_bytes().to_vec());
     };
     if parsed.frontmatter.loc.is_some() {
+        let shadow = store
+            .load_shadow(&mount.mount_id, &entity.remote_id)
+            .map_err(LocalityError::from)?;
+        if visible_projection_base_is_stale(&parsed, &shadow) {
+            let remote_document =
+                CanonicalDocument::new(shadow.frontmatter.clone(), shadow.rendered_body.clone());
+            return Ok(render_inline_conflict_markdown(contents, &remote_document).into_bytes());
+        }
         return Ok(contents.as_bytes().to_vec());
     }
 
@@ -930,6 +938,34 @@ where
         render_canonical_markdown(&CanonicalDocument::new(frontmatter, parsed.document.body))
             .into_bytes(),
     )
+}
+
+fn visible_projection_base_is_stale(
+    parsed: &locality_core::canonical::ParsedCanonicalDocument,
+    shadow: &ShadowDocument,
+) -> bool {
+    let Some(visible_remote_edited_at) = parsed
+        .frontmatter
+        .loc
+        .as_ref()
+        .and_then(|loc| loc.remote_edited_at.as_deref())
+    else {
+        return false;
+    };
+    let Some(shadow_remote_edited_at) = shadow_remote_edited_at(shadow) else {
+        return false;
+    };
+
+    visible_remote_edited_at != shadow_remote_edited_at
+}
+
+fn shadow_remote_edited_at(shadow: &ShadowDocument) -> Option<String> {
+    parse_canonical_markdown(&render_canonical_markdown(&CanonicalDocument::new(
+        shadow.frontmatter.clone(),
+        "",
+    )))
+    .ok()
+    .and_then(|parsed| parsed.frontmatter.loc.and_then(|loc| loc.remote_edited_at))
 }
 
 fn merge_identity_frontmatter(
@@ -1182,16 +1218,18 @@ mod tests {
     use super::*;
     use crate::virtual_fs::virtual_projection_root;
     #[cfg(target_os = "macos")]
-    use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
-    #[cfg(target_os = "macos")]
+    use locality_core::canonical::parse_canonical_markdown;
+    use locality_core::canonical::render_canonical_markdown;
+    use locality_core::conflict::{
+        CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
+    };
     use locality_core::model::CanonicalDocument;
     use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-    #[cfg(target_os = "macos")]
     use locality_core::shadow::ShadowDocument;
-    use locality_store::EntityRecord;
-    #[cfg(target_os = "macos")]
-    use locality_store::{EntityRepository, ShadowRepository};
-    use locality_store::{InMemoryStateStore, MountRepository, ProjectionMode};
+    use locality_store::{
+        EntityRecord, EntityRepository, InMemoryStateStore, MountRepository, ProjectionMode,
+        ShadowRepository,
+    };
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(target_os = "macos")]
@@ -1525,6 +1563,93 @@ mod tests {
                 .contains("Pulled remote body.")
         );
         assert!(!obsolete_connector_child_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn reconcile_visible_projection_conflicts_stale_visible_edit_after_cache_fast_forward() {
+        let root = temp_root("loc-file-provider-stale-visible-root");
+        let state_root = temp_root("loc-file-provider-stale-visible-state");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let relative_path = PathBuf::from("roadmap/page.md");
+        let mount_root = root.join("notion");
+        let visible_path = mount_root.join(&relative_path);
+        let content_path =
+            crate::virtual_fs::virtual_fs_content_root(&state_root, &mount_id).join(&relative_path);
+        fs::create_dir_all(visible_path.parent().expect("visible parent")).expect("visible parent");
+        fs::create_dir_all(content_path.parent().expect("content parent")).expect("content parent");
+
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &mount_root)
+                    .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    relative_path.clone(),
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_remote_edited_at("remote-v2"),
+            )
+            .expect("save entity");
+        let current_shadow = ShadowDocument::from_synced_body(
+            remote_id.clone(),
+            "Intro.\n\n---\n\nFooter.\n",
+            8,
+            [
+                RemoteId::new("intro"),
+                RemoteId::new("divider"),
+                RemoteId::new("footer"),
+            ],
+        )
+        .expect("current shadow")
+        .with_frontmatter(versioned_frontmatter(&remote_id, "remote-v2"));
+        store
+            .save_shadow(&mount_id, current_shadow)
+            .expect("save shadow");
+        fs::write(
+            &content_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                versioned_frontmatter(&remote_id, "remote-v2"),
+                "Intro.\n\n---\n\nFooter.\n",
+            )),
+        )
+        .expect("write fast-forwarded cache");
+        fs::write(
+            &visible_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                versioned_frontmatter(&remote_id, "remote-v1"),
+                "Intro.\n\nFooter.\n\nLocal visible edit.\n",
+            )),
+        )
+        .expect("write stale visible edit");
+
+        let report = reconcile_visible_projection(&mut store, &state_root, Some(&visible_path))
+            .expect("reconcile visible projection");
+
+        assert_eq!(report.reconciled, 1);
+        let cached = fs::read_to_string(&content_path).expect("read cache");
+        assert!(cached.contains("Local visible edit."), "{cached}");
+        assert!(cached.contains("Intro.\n\n---\n\nFooter."), "{cached}");
+        assert!(cached.contains(CONFLICT_LOCAL_MARKER), "{cached}");
+        assert!(cached.contains(CONFLICT_SEPARATOR_MARKER), "{cached}");
+        assert!(cached.contains(CONFLICT_REMOTE_MARKER), "{cached}");
+        assert!(has_unresolved_conflict_markers(&cached), "{cached}");
+        let entity = store
+            .get_entity(&mount_id, &remote_id)
+            .expect("get entity")
+            .expect("entity");
+        assert_eq!(entity.hydration, HydrationState::Conflicted);
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(state_root);
@@ -1954,9 +2079,13 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn frontmatter(remote_id: &RemoteId) -> String {
+        versioned_frontmatter(remote_id, "remote-v1")
+    }
+
+    fn versioned_frontmatter(remote_id: &RemoteId, version: &str) -> String {
         format!(
-            "loc:\n  id: {}\n  type: page\n  synced_at: remote-v1\n  remote_edited_at: remote-v1\ntitle: \"Locality Launch\"\n",
-            remote_id.0
+            "loc:\n  id: {}\n  type: page\n  synced_at: {version}\n  remote_edited_at: {version}\ntitle: \"Locality Launch\"\n",
+            remote_id.0,
         )
     }
 

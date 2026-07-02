@@ -5,9 +5,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loc_cli::diff::{DiffError, run_diff, run_diff_with_state_root};
+use locality_core::canonical::render_canonical_markdown;
 use locality_core::conflict::{
     CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
 };
+use locality_core::model::CanonicalDocument;
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_notion::media::sha256_hex;
@@ -16,6 +18,8 @@ use locality_store::{
     ProjectionMode, ShadowRepository, SqliteStateStore, StoreError, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
 };
+use localityd::file_provider::reconcile_visible_projection;
+use localityd::virtual_fs::virtual_fs_content_path;
 use serde_json::json;
 
 #[test]
@@ -174,6 +178,86 @@ fn diff_virtual_projection_reads_daemon_content_cache() {
 
     assert!(report.ok);
     assert_eq!(report.action, "noop");
+}
+
+#[test]
+fn diff_rejects_stale_visible_projection_edit_instead_of_archiving_remote_fast_forward() {
+    let fixture = DiffFixture::new();
+    let state_root = fixture.root.join("state");
+    let projection_root = fixture.root.join("projection");
+    let relative_path = PathBuf::from("Roadmap/page.md");
+    let visible_path = projection_root.join(&relative_path);
+    let content_path = virtual_fs_content_path(&state_root, &fixture.mount_id, &relative_path)
+        .expect("cache path");
+    fs::create_dir_all(visible_path.parent().expect("visible parent")).expect("visible parent");
+    fs::create_dir_all(content_path.parent().expect("content parent")).expect("content parent");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &projection_root)
+                .projection(ProjectionMode::WindowsCloudFiles),
+        )
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                relative_path.clone(),
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_remote_edited_at("remote-v2"),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                "Intro.\n\n---\n\nFooter.\n",
+                9,
+                [
+                    RemoteId::new("intro"),
+                    RemoteId::new("divider"),
+                    RemoteId::new("footer"),
+                ],
+            )
+            .expect("shadow")
+            .with_frontmatter(frontmatter_with_version("page-1", "remote-v2")),
+        )
+        .expect("save shadow");
+    fs::write(
+        &content_path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            frontmatter_with_version("page-1", "remote-v2"),
+            "Intro.\n\n---\n\nFooter.\n",
+        )),
+    )
+    .expect("write fast-forwarded cache");
+    fs::write(
+        &visible_path,
+        render_canonical_markdown(&CanonicalDocument::new(
+            frontmatter_with_version("page-1", "remote-v1"),
+            "Intro.\n\nFooter.\n\nLocal visible edit.\n",
+        )),
+    )
+    .expect("write stale visible edit");
+
+    reconcile_visible_projection(&mut store, &state_root, Some(&visible_path))
+        .expect("reconcile visible projection");
+    let report =
+        run_diff_with_state_root(&store, &visible_path, Some(&state_root)).expect("diff report");
+
+    assert!(!report.ok);
+    assert_eq!(report.action, "fix_validation");
+    assert_eq!(report.validation[0].code, "unresolved_conflict_markers");
+    assert!(report.plan.is_none());
+    let cached = fs::read_to_string(content_path).expect("read cache");
+    assert!(cached.contains("Local visible edit."), "{cached}");
+    assert!(cached.contains(CONFLICT_LOCAL_MARKER), "{cached}");
+    assert!(cached.contains(CONFLICT_REMOTE_MARKER), "{cached}");
 }
 
 #[test]
@@ -868,8 +952,15 @@ impl Drop for DiffFixture {
 }
 
 fn canonical_markdown(remote_id: &str, body: &str) -> String {
+    render_canonical_markdown(&CanonicalDocument::new(
+        frontmatter_with_version(remote_id, "now"),
+        body,
+    ))
+}
+
+fn frontmatter_with_version(remote_id: &str, version: &str) -> String {
     format!(
-        "---\nloc:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\n{body}"
+        "loc:\n  id: {remote_id}\n  type: page\n  synced_at: {version}\n  remote_edited_at: {version}\ntitle: Roadmap\n"
     )
 }
 
