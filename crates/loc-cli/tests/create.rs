@@ -46,7 +46,7 @@ fn create_page_escapes_yaml_title() {
     let fixture = CreateFixture::new("loc-create-page-escaping");
     let store = fixture.store(false);
 
-    run_create_page(
+    let report = run_create_page(
         &store,
         CreatePageOptions {
             title: "Quote \"Plan\"".to_string(),
@@ -55,8 +55,10 @@ fn create_page_escapes_yaml_title() {
     )
     .expect("create page");
 
+    let page_path = fixture.root.join("Quote -Plan-/page.md");
+    assert_eq!(Path::new(&report.path), page_path);
     assert_eq!(
-        fs::read_to_string(fixture.root.join("Quote \"Plan\"/page.md")).expect("page"),
+        fs::read_to_string(page_path).expect("page"),
         "---\ntitle: \"Quote \\\"Plan\\\"\"\n---\n"
     );
 }

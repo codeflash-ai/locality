@@ -1021,7 +1021,7 @@ fn visible_projection_base_is_stale(
         return false;
     };
 
-    visible_remote_edited_at != shadow_remote_edited_at
+    remote_version_is_ordered_before(visible_remote_edited_at, &shadow_remote_edited_at)
 }
 
 fn shadow_remote_edited_at(shadow: &ShadowDocument) -> Option<String> {
@@ -1031,6 +1031,49 @@ fn shadow_remote_edited_at(shadow: &ShadowDocument) -> Option<String> {
     )))
     .ok()
     .and_then(|parsed| parsed.frontmatter.loc.and_then(|loc| loc.remote_edited_at))
+}
+
+fn remote_version_is_ordered_before(left: &str, right: &str) -> bool {
+    if left == right {
+        return false;
+    }
+
+    if looks_like_rfc3339_utc(left) && looks_like_rfc3339_utc(right) {
+        return left < right;
+    }
+
+    let Some((left_prefix, left_number)) = split_trailing_number(left) else {
+        return false;
+    };
+    let Some((right_prefix, right_number)) = split_trailing_number(right) else {
+        return false;
+    };
+
+    left_prefix == right_prefix && left_number < right_number
+}
+
+fn looks_like_rfc3339_utc(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= "0000-00-00T00:00:00".len()
+        && bytes
+            .get(0..4)
+            .is_some_and(|year| year.iter().all(u8::is_ascii_digit))
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes.get(10) == Some(&b'T')
+}
+
+fn split_trailing_number(value: &str) -> Option<(&str, u64)> {
+    let digit_start = value
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| (!character.is_ascii_digit()).then_some(index + 1))?;
+    if digit_start == value.len() {
+        return None;
+    }
+
+    let (prefix, digits) = value.split_at(digit_start);
+    digits.parse::<u64>().ok().map(|number| (prefix, number))
 }
 
 fn merge_identity_frontmatter(
@@ -1823,6 +1866,99 @@ mod tests {
         assert!(!has_unresolved_conflict_markers(&cached), "{cached}");
         let visible = fs::read_to_string(&visible_path).expect("read visible");
         assert_eq!(visible, cached);
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn reconcile_visible_projection_imports_newer_edit_with_unknown_version_metadata() {
+        let root = temp_root("loc-file-provider-unknown-visible-version-root");
+        let state_root = temp_root("loc-file-provider-unknown-visible-version-state");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let relative_path = PathBuf::from("roadmap/page.md");
+        let mount_root = root.join("notion");
+        let visible_path = mount_root.join(&relative_path);
+        let content_path =
+            crate::virtual_fs::virtual_fs_content_root(&state_root, &mount_id).join(&relative_path);
+        fs::create_dir_all(visible_path.parent().expect("visible parent")).expect("visible parent");
+        fs::create_dir_all(content_path.parent().expect("content parent")).expect("content parent");
+
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &mount_root)
+                    .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    relative_path.clone(),
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_remote_edited_at("2026-06-10T00:00:00.000Z"),
+            )
+            .expect("save entity");
+        let shadow = ShadowDocument::from_synced_body(
+            remote_id.clone(),
+            "Root body.\n",
+            8,
+            [RemoteId::new("block-1")],
+        )
+        .expect("shadow")
+        .with_frontmatter(versioned_frontmatter(
+            &remote_id,
+            "2026-06-10T00:00:00.000Z",
+        ));
+        store.save_shadow(&mount_id, shadow).expect("save shadow");
+        fs::write(
+            &content_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                versioned_frontmatter(&remote_id, "2026-06-10T00:00:00.000Z"),
+                "Root body.\n",
+            )),
+        )
+        .expect("write cache");
+        fs::write(
+            &visible_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                versioned_frontmatter(&remote_id, "now"),
+                "Local visible edit.\n",
+            )),
+        )
+        .expect("write visible edit");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            &visible_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                versioned_frontmatter(&remote_id, "now"),
+                "Local visible edit.\n",
+            )),
+        )
+        .expect("refresh visible mtime");
+
+        let report = reconcile_newer_macos_file_provider_projection(
+            &mut store,
+            &state_root,
+            Some(&visible_path),
+        )
+        .expect("reconcile visible projection");
+
+        assert_eq!(report.reconciled, 1);
+        let cached = fs::read_to_string(&content_path).expect("read cache");
+        assert!(cached.contains("Local visible edit."), "{cached}");
+        assert!(!has_unresolved_conflict_markers(&cached), "{cached}");
+        let entity = store
+            .get_entity(&mount_id, &remote_id)
+            .expect("get entity")
+            .expect("entity");
+        assert_eq!(entity.hydration, HydrationState::Dirty);
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(state_root);

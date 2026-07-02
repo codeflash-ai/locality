@@ -55,7 +55,8 @@ where
         });
     }
 
-    let page_dir = parent.join(&title);
+    let page_directory_name = page_directory_name_for_title(&title);
+    let page_dir = parent.join(&page_directory_name);
     let page_path = page_dir.join(PAGE_DOCUMENT_FILENAME);
     if page_dir.exists() {
         return Err(CreateError::TargetExists(page_dir));
@@ -173,6 +174,26 @@ fn normalized_title(title: &str) -> Result<String, CreateError> {
         _ => Err(CreateError::InvalidTitle(
             "page title must be a normal file name".to_string(),
         )),
+    }
+}
+
+fn page_directory_name_for_title(title: &str) -> String {
+    let sanitized = title
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            character if character.is_control() => '-',
+            character => character,
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+
+    if sanitized.is_empty() {
+        "Untitled".to_string()
+    } else {
+        sanitized
     }
 }
 
