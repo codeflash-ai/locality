@@ -45,6 +45,7 @@ import {
   type MountSummary,
   type ProviderRuntimeSummary,
 } from "./mounts";
+import { connectionMissing, connectionReady } from "./connection-state";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
@@ -1345,7 +1346,7 @@ function Onboarding({
     }
   }
 
-  const connectionReady = oauthReady || !connectionMissing(snapshot);
+  const connectionReadyNow = oauthReady || connectionReady(snapshot);
   const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
   const finalPrompt = agentGuidanceReport?.prompt || suggestedAgentPrompt(mountPath);
 
@@ -1390,32 +1391,32 @@ function Onboarding({
 
         {step === 3 && (
           <SetupContent
-            side={<ConnectorOptions connected={connectionReady} />}
+            side={<ConnectorOptions connected={connectionReadyNow} />}
           >
             <div>
               <div className="eyebrow">Connect app</div>
-              {(oauthInFlight || connectionReady) && (
-                <div className={`sync-note ${connectionReady ? "connected" : ""}`}>
-                  {connectionReady ? <Check /> : <Loader2 className="spin-icon" />}
-                  {connectionReady ? "Notion connected" : "Waiting for Notion"}
+              {(oauthInFlight || connectionReadyNow) && (
+                <div className={`sync-note ${connectionReadyNow ? "connected" : ""}`}>
+                  {connectionReadyNow ? <Check /> : <Loader2 className="spin-icon" />}
+                  {connectionReadyNow ? "Notion connected" : "Waiting for Notion"}
                 </div>
               )}
               <h1>
-                {connectionReady
+                {connectionReadyNow
                   ? "Your Notion workspace is connected"
                   : oauthInFlight
                     ? "Finish connecting in Notion."
                     : "Start with Notion."}
               </h1>
               <p>
-                {connectionReady
+                {connectionReadyNow
                   ? `${workspaceLabel} is ready. Next, choose where Locality should place the Notion mount point.`
                   : oauthInFlight
                     ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
                     : "Connect the workspace you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
               </p>
             </div>
-            {oauthInFlight && !connectionReady && (
+            {oauthInFlight && !connectionReadyNow && (
               <ProgressList
                 items={[
                   { label: "Browser opened", state: oauthError ? "idle" : "done" },
@@ -1426,10 +1427,10 @@ function Onboarding({
             )}
             <div className="button-row">
               <PrimaryButton
-                busy={oauthInFlight && !connectionReady}
-                onClick={connectionReady ? () => setStep(4) : startConnect}
+                busy={oauthInFlight && !connectionReadyNow}
+                onClick={connectionReadyNow ? () => setStep(4) : startConnect}
               >
-                {connectionReady ? "Continue" : oauthInFlight ? "Waiting for Notion" : "Connect Notion"}
+                {connectionReadyNow ? "Continue" : oauthInFlight ? "Waiting for Notion" : "Connect Notion"}
               </PrimaryButton>
               <SecondaryButton disabled={!oauthInFlight && !loginUrl} onClick={() => void copyLoginLink()}>
                 Copy login link
@@ -5173,10 +5174,6 @@ function Metric({ label, value }: { label: string; value: React.ReactNode }) {
       <span>{label}</span>
     </article>
   );
-}
-
-function connectionMissing(snapshot: DesktopSnapshot) {
-  return snapshot.connection.status === "missing";
 }
 
 function mountMissing(snapshot: DesktopSnapshot) {
