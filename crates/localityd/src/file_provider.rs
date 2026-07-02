@@ -298,8 +298,24 @@ where
         };
 
         let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
-        let entities = scoped_page_entities(store, &mount, Some(&target_match))?;
-        for entity in entities {
+        let target_remote_id = target_visible_remote_id(&target);
+        let entities = scoped_page_entities(
+            store,
+            &mount,
+            Some(&target_match),
+            target_remote_id.as_ref(),
+        )?;
+        for mut entity in entities {
+            if let Some(rehomed) = rehome_visible_entity_path_if_safe(
+                store,
+                &mount,
+                &entity,
+                &target,
+                &target_match.relative_path,
+                target_remote_id.as_ref(),
+            )? {
+                entity = rehomed;
+            }
             let Some(candidate) = reconcile_candidate_path(
                 &mount,
                 &entity,
@@ -530,7 +546,13 @@ where
         };
 
         let content_root = virtual_fs::virtual_fs_content_root(state_root, &mount.mount_id);
-        let entities = scoped_page_entities(store, &mount, Some(&target_match))?;
+        let target_remote_id = target_visible_remote_id(&target);
+        let entities = scoped_page_entities(
+            store,
+            &mount,
+            Some(&target_match),
+            target_remote_id.as_ref(),
+        )?;
         for entity in entities {
             let Some(candidate) =
                 refresh_candidate_path(&mount, &entity, Some(&target), Some(&target_match))
@@ -595,7 +617,13 @@ where
             continue;
         };
 
-        let entities = scoped_page_entities(store, &mount, Some(&target_match))?;
+        let target_remote_id = target_visible_remote_id(&target);
+        let entities = scoped_page_entities(
+            store,
+            &mount,
+            Some(&target_match),
+            target_remote_id.as_ref(),
+        )?;
         for entity in entities {
             if refresh_candidate_path(&mount, &entity, Some(&target), Some(&target_match)).is_none()
             {
@@ -641,12 +669,13 @@ fn scoped_page_entities<S>(
     store: &S,
     mount: &MountConfig,
     target_match: Option<&MountPathMatch>,
+    target_remote_id: Option<&RemoteId>,
 ) -> LocalityResult<Vec<EntityRecord>>
 where
     S: EntityRepository,
 {
     let target_relative = target_match.map(|matched| matched.relative_path.as_path());
-    Ok(store
+    let mut entities = store
         .list_entities(&mount.mount_id)
         .map_err(LocalityError::from)?
         .into_iter()
@@ -656,7 +685,81 @@ where
             Some(relative) if relative.as_os_str().is_empty() => true,
             Some(relative) => entity.path == relative || entity.path.starts_with(relative),
         })
-        .collect())
+        .collect::<Vec<_>>();
+
+    if let Some(remote_id) = target_remote_id
+        && !entities.iter().any(|entity| &entity.remote_id == remote_id)
+        && let Some(entity) = store
+            .get_entity(&mount.mount_id, remote_id)
+            .map_err(LocalityError::from)?
+            .filter(|entity| entity.kind == EntityKind::Page)
+    {
+        entities.push(entity);
+    }
+
+    Ok(entities)
+}
+
+fn target_visible_remote_id(target: &Path) -> Option<RemoteId> {
+    if !target.is_file() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(target).ok()?;
+    let parsed = parse_canonical_markdown(&contents).ok()?;
+    parsed.remote_id().cloned()
+}
+
+fn rehome_visible_entity_path_if_safe<S>(
+    store: &mut S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+    target: &Path,
+    target_relative_path: &Path,
+    target_remote_id: Option<&RemoteId>,
+) -> LocalityResult<Option<EntityRecord>>
+where
+    S: EntityRepository + ShadowRepository,
+{
+    if !target.is_file() || target_remote_id != Some(&entity.remote_id) {
+        return Ok(None);
+    }
+    if matches!(
+        entity.hydration,
+        HydrationState::Dirty | HydrationState::Conflicted
+    ) {
+        return Ok(None);
+    }
+    if entity.path != target_relative_path {
+        if let Some(colliding) = store
+            .find_entity_by_path(&mount.mount_id, target_relative_path)
+            .map_err(LocalityError::from)?
+            && colliding.remote_id != entity.remote_id
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut repaired = entity.clone();
+    if repaired.path != target_relative_path {
+        repaired.path = target_relative_path.to_path_buf();
+    }
+    if matches!(
+        repaired.hydration,
+        HydrationState::Stub | HydrationState::Virtual
+    ) {
+        match store.load_shadow(&mount.mount_id, &repaired.remote_id) {
+            Ok(_) => repaired.hydration = HydrationState::Hydrated,
+            Err(StoreError::ShadowMissing { .. }) => {}
+            Err(error) => return Err(LocalityError::from(error)),
+        }
+    }
+    if &repaired == entity {
+        return Ok(None);
+    }
+    store
+        .save_entity(repaired.clone())
+        .map_err(LocalityError::from)?;
+    Ok(Some(repaired))
 }
 
 fn reconcile_candidate_path(
@@ -1671,6 +1774,209 @@ mod tests {
                 .contains("Pulled remote body.")
         );
         assert!(!obsolete_connector_child_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn reconcile_visible_projection_rehomes_clean_entity_by_visible_identity() {
+        let root = temp_root("loc-file-provider-rehome-root");
+        let state_root = temp_root("loc-file-provider-rehome-state");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("standup-2026-07-02");
+        let stale_path = PathBuf::from("engineering-wiki/2026-07-02/page.md");
+        let correct_path =
+            PathBuf::from("engineering-wiki/standups-with-locality/2026-07-02/page.md");
+        let mount_root = root.join("notion");
+        let visible_path = mount_root.join(&correct_path);
+        let body = "ALI:\n\n- Synced standup notes.\n";
+        fs::create_dir_all(visible_path.parent().expect("visible parent")).expect("visible parent");
+        fs::write(
+            &visible_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                versioned_frontmatter(&remote_id, "remote-v1"),
+                body,
+            )),
+        )
+        .expect("write visible file");
+
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &mount_root)
+                    .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "2026-07-02",
+                    stale_path.clone(),
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save stale entity path");
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    remote_id.clone(),
+                    body,
+                    8,
+                    [RemoteId::new("block-1"), RemoteId::new("block-2")],
+                )
+                .expect("shadow")
+                .with_frontmatter(versioned_frontmatter(&remote_id, "remote-v1")),
+            )
+            .expect("save shadow");
+
+        let report = reconcile_visible_projection(&mut store, &state_root, Some(&visible_path))
+            .expect("reconcile visible projection");
+
+        assert_eq!(report.reconciled, 1);
+        let entity = store
+            .get_entity(&mount_id, &remote_id)
+            .expect("get entity")
+            .expect("entity");
+        assert_eq!(entity.path, correct_path);
+        assert_eq!(entity.hydration, HydrationState::Hydrated);
+        let content_path =
+            crate::virtual_fs::virtual_fs_content_root(&state_root, &mount_id).join(&entity.path);
+        assert!(
+            fs::read_to_string(content_path)
+                .expect("read repaired content cache")
+                .contains("Synced standup notes.")
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn reconcile_visible_projection_does_not_rehome_dirty_entity() {
+        let root = temp_root("loc-file-provider-rehome-dirty-root");
+        let state_root = temp_root("loc-file-provider-rehome-dirty-state");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("standup-2026-07-02");
+        let stale_path = PathBuf::from("engineering-wiki/2026-07-02/page.md");
+        let correct_path =
+            PathBuf::from("engineering-wiki/standups-with-locality/2026-07-02/page.md");
+        let mount_root = root.join("notion");
+        let visible_path = mount_root.join(&correct_path);
+        fs::create_dir_all(visible_path.parent().expect("visible parent")).expect("visible parent");
+        fs::write(
+            &visible_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                versioned_frontmatter(&remote_id, "remote-v1"),
+                "Local pending notes.\n",
+            )),
+        )
+        .expect("write visible file");
+
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &mount_root)
+                    .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "2026-07-02",
+                    stale_path.clone(),
+                )
+                .with_hydration(HydrationState::Dirty),
+            )
+            .expect("save dirty entity path");
+
+        let report = reconcile_visible_projection(&mut store, &state_root, Some(&visible_path))
+            .expect("reconcile visible projection");
+
+        assert_eq!(report.reconciled, 0);
+        let entity = store
+            .get_entity(&mount_id, &remote_id)
+            .expect("get entity")
+            .expect("entity");
+        assert_eq!(entity.path, stale_path);
+        assert_eq!(entity.hydration, HydrationState::Dirty);
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn reconcile_visible_projection_promotes_stub_with_shadow_at_visible_path() {
+        let root = temp_root("loc-file-provider-promote-stub-root");
+        let state_root = temp_root("loc-file-provider-promote-stub-state");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("standup-2026-07-02");
+        let relative_path =
+            PathBuf::from("engineering-wiki/standups-with-locality/2026-07-02/page.md");
+        let mount_root = root.join("notion");
+        let visible_path = mount_root.join(&relative_path);
+        let content_path =
+            crate::virtual_fs::virtual_fs_content_root(&state_root, &mount_id).join(&relative_path);
+        let body = "ALI:\n\n- Synced standup notes.\n";
+        let markdown = render_canonical_markdown(&CanonicalDocument::new(
+            versioned_frontmatter(&remote_id, "remote-v1"),
+            body,
+        ));
+        fs::create_dir_all(visible_path.parent().expect("visible parent")).expect("visible parent");
+        fs::create_dir_all(content_path.parent().expect("content parent")).expect("content parent");
+        fs::write(&visible_path, &markdown).expect("write visible file");
+        fs::write(&content_path, &markdown).expect("write cache file");
+
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &mount_root)
+                    .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "2026-07-02",
+                    relative_path.clone(),
+                )
+                .with_hydration(HydrationState::Stub),
+            )
+            .expect("save stub entity");
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    remote_id.clone(),
+                    body,
+                    8,
+                    [RemoteId::new("block-1"), RemoteId::new("block-2")],
+                )
+                .expect("shadow")
+                .with_frontmatter(versioned_frontmatter(&remote_id, "remote-v1")),
+            )
+            .expect("save shadow");
+
+        let report = reconcile_visible_projection(&mut store, &state_root, Some(&visible_path))
+            .expect("reconcile visible projection");
+
+        assert_eq!(report.skipped_unchanged, 1);
+        let entity = store
+            .get_entity(&mount_id, &remote_id)
+            .expect("get entity")
+            .expect("entity");
+        assert_eq!(entity.path, relative_path);
+        assert_eq!(entity.hydration, HydrationState::Hydrated);
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(state_root);
