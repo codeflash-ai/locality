@@ -129,6 +129,42 @@ fn status_hides_stale_disabled_live_mode_error_when_entries_are_clean() {
 }
 
 #[test]
+fn status_hides_stale_disabled_live_mode_pause_when_entries_are_clean() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nSame paragraph.");
+    store
+        .save_mount_live_mode(
+            MountLiveModeRecord::new(fixture.mount_id.clone(), true, "1").error(
+                "Live Mode paused for `Roadmap`: conflict.",
+                "2",
+                "2",
+            ),
+        )
+        .expect("save live mode");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(!report.mounts[0].live_mode.enabled);
+    assert_eq!(report.mounts[0].live_mode.state, "off");
+    assert_eq!(report.mounts[0].live_mode.label, "Live Mode off");
+    assert_eq!(report.mounts[0].live_mode.reason, None);
+}
+
+#[test]
 fn status_treats_materialized_stub_that_matches_shadow_as_clean() {
     let fixture = StatusFixture::new();
     let mut store = fixture.store();
@@ -1073,6 +1109,49 @@ fn status_reports_remote_update_available_for_clean_file() {
         Some("unix_ms:2")
     );
     assert_eq!(entry_issue(&report, "Roadmap.md"), "remote_changed");
+}
+
+#[test]
+fn status_ignores_stale_older_remote_observation_for_clean_file() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_remote_edited_at("2026-07-02T17:34:00.000Z"),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            shadow("page-1", "# Roadmap\n\nSame paragraph."),
+        )
+        .expect("save shadow");
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nSame paragraph.");
+    fixture.remote_observation(&mut store, "page-1", "2026-07-02T17:29:00.000Z", false);
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(report.clean, "{report:#?}");
+    assert_eq!(report.summary.remote_update_available, 0);
+    assert_eq!(
+        entry_sync_state(&report, "Roadmap.md"),
+        StatusSyncState::AllSynced
+    );
 }
 
 #[test]

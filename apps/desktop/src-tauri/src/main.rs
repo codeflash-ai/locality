@@ -2761,19 +2761,19 @@ impl MountLiveModeSummary {
                 ..Self::off()
             };
         };
-        if !record.enabled
-            && record.state == MountLiveModeState::Error
-            && !record
+        if !record.enabled && record.state == MountLiveModeState::Error {
+            let should_pause = record
                 .last_reason
                 .as_deref()
-                .is_some_and(live_mode_failure_should_pause)
-        {
-            return Self {
-                pending_count,
-                review_count,
-                covered_count,
-                ..Self::off()
-            };
+                .is_some_and(live_mode_failure_should_pause);
+            if pending_changes.is_empty() || !should_pause {
+                return Self {
+                    pending_count,
+                    review_count,
+                    covered_count,
+                    ..Self::off()
+                };
+            }
         }
         let state = mount_live_mode_state_label(record);
 
@@ -9585,6 +9585,22 @@ mod tests {
     fn live_mode_summary_hides_stale_disabled_error_without_pending_changes() {
         let record = MountLiveModeRecord::new(MountId::new("notion-main"), true, "1").error(
             "Live Mode could not inspect Notion changes: network unavailable",
+            "2",
+            "2",
+        );
+
+        let summary = super::MountLiveModeSummary::from_record(Some(&record), &[]);
+
+        assert!(!summary.enabled);
+        assert_eq!(summary.state, "off");
+        assert_eq!(summary.label, "Live Mode off");
+        assert_eq!(summary.reason, None);
+    }
+
+    #[test]
+    fn live_mode_summary_hides_stale_disabled_pause_without_pending_changes() {
+        let record = MountLiveModeRecord::new(MountId::new("notion-main"), true, "1").error(
+            "Live Mode paused for `Roadmap`: conflict.",
             "2",
             "2",
         );

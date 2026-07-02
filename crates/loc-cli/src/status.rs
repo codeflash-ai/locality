@@ -377,11 +377,17 @@ where
             summary.record(entry);
         }
 
+        let entries_need_live_mode_attention =
+            status_entries_need_live_mode_attention(&status_entries);
         mount_reports.push(StatusMountReport {
             mount_id: scope.mount.mount_id.0.clone(),
             connector: scope.mount.connector.clone(),
             root: scope.mount.root.display().to_string(),
-            live_mode: status_live_mode_for_mount(store, &scope.mount.mount_id),
+            live_mode: status_live_mode_for_mount(
+                store,
+                &scope.mount.mount_id,
+                entries_need_live_mode_attention,
+            ),
             entries: status_entries,
         });
     }
@@ -408,27 +414,49 @@ where
     })
 }
 
-fn status_live_mode_for_mount<S>(store: &S, mount_id: &MountId) -> StatusLiveMode
+fn status_live_mode_for_mount<S>(
+    store: &S,
+    mount_id: &MountId,
+    entries_need_attention: bool,
+) -> StatusLiveMode
 where
     S: MountLiveModeRepository,
 {
     let record = store.get_mount_live_mode(mount_id).ok().flatten();
-    StatusLiveMode::from_record(record.as_ref())
+    StatusLiveMode::from_record(record.as_ref(), entries_need_attention)
+}
+
+fn status_entries_need_live_mode_attention(entries: &[StatusEntry]) -> bool {
+    entries.iter().any(status_entry_needs_live_mode_attention)
+}
+
+fn status_entry_needs_live_mode_attention(entry: &StatusEntry) -> bool {
+    matches!(
+        entry.state,
+        StatusState::Dirty | StatusState::Conflicted | StatusState::Missing | StatusState::Error
+    ) || matches!(
+        entry.sync_state,
+        StatusSyncState::RemoteUpdateAvailable
+            | StatusSyncState::PendingLocalChanges
+            | StatusSyncState::ReviewNeeded
+            | StatusSyncState::Conflicted
+    ) || entry.pending_journal_count > 0
+        || entry.failed_journal_count > 0
 }
 
 impl StatusLiveMode {
-    fn from_record(record: Option<&MountLiveModeRecord>) -> Self {
+    fn from_record(record: Option<&MountLiveModeRecord>, entries_need_attention: bool) -> Self {
         let Some(record) = record else {
             return Self::off();
         };
-        if !record.enabled
-            && record.state == MountLiveModeState::Error
-            && !record
+        if !record.enabled && record.state == MountLiveModeState::Error {
+            let should_pause = record
                 .last_reason
                 .as_deref()
-                .is_some_and(status_live_mode_error_should_pause)
-        {
-            return Self::off();
+                .is_some_and(status_live_mode_error_should_pause);
+            if !entries_need_attention || !should_pause {
+                return Self::off();
+            }
         }
         let (state, label) = if !record.enabled && record.state != MountLiveModeState::Error {
             ("off", "Live Mode off")
@@ -978,9 +1006,23 @@ fn remote_tree_version_differs(
             .map(|remote_version| remote_version.as_str()),
     ) {
         (Some(synced_tree), Some(remote_tree)) => {
-            !remote_versions_equivalent(synced_tree, remote_tree)
+            remote_version_is_newer_than_synced(synced_tree, remote_tree)
         }
         _ => false,
+    }
+}
+
+fn remote_version_is_newer_than_synced(synced_tree: &str, remote_tree: &str) -> bool {
+    if remote_versions_equivalent(synced_tree, remote_tree) {
+        return false;
+    }
+
+    match (
+        rfc3339_utc_version_key(synced_tree),
+        rfc3339_utc_version_key(remote_tree),
+    ) {
+        (Some(synced), Some(remote)) => remote > synced,
+        _ => true,
     }
 }
 
@@ -992,6 +1034,51 @@ fn remote_versions_equivalent(synced_tree: &str, remote_tree: &str) -> bool {
         || remote_tree
             .split_once('|')
             .is_some_and(|(remote_drive, _)| remote_drive == synced_tree)
+}
+
+fn rfc3339_utc_version_key(value: &str) -> Option<(u32, u32, u32, u32, u32, u32, u32)> {
+    let value = value.strip_suffix('Z')?;
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<u32>().ok()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+
+    let (time, fraction) = time.split_once('.').unwrap_or((time, ""));
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<u32>().ok()?;
+    let minute = time_parts.next()?.parse::<u32>().ok()?;
+    let second = time_parts.next()?.parse::<u32>().ok()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        if fraction.len() > 9 || !fraction.chars().all(|character| character.is_ascii_digit()) {
+            return None;
+        }
+        let mut padded = fraction.to_string();
+        while padded.len() < 9 {
+            padded.push('0');
+        }
+        padded.parse::<u32>().ok()?
+    };
+
+    Some((year, month, day, hour, minute, second, nanos))
 }
 
 fn freshness_check_pending(
