@@ -6182,10 +6182,13 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    use locality_core::model::MountId;
-    use locality_store::{MountConfig, ProjectionMode};
+    use locality_core::model::{MountId, RemoteId};
+    use locality_google_docs::GOOGLE_DOCS_CONNECTOR_ID;
     #[cfg(target_os = "windows")]
-    use locality_store::{MountRepository, SqliteStateStore};
+    use locality_store::SqliteStateStore;
+    use locality_store::{
+        ConnectionId, InMemoryStateStore, MountConfig, MountRepository, ProjectionMode,
+    };
 
     use crate::diff::{DiffReport, GuardrailOutput};
     use crate::local_oauth::{local_redirect, parse_oauth_callback};
@@ -6195,9 +6198,10 @@ mod tests {
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, FileProviderCommandReport,
         VirtualProjectionRegistration, absolute_command_path,
-        auto_registration_for_mounted_projection, diff_report_exit_code, file_provider_list_lines,
-        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
-        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
+        auto_registration_for_mounted_projection, default_mount_id_for_source,
+        diff_report_exit_code, file_provider_list_lines, google_docs_oauth_broker_config,
+        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
+        guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
         projection_mode_for_target, projection_usage_options_for_target,
@@ -7113,6 +7117,65 @@ mod tests {
             auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux", true),
             None
         );
+    }
+
+    #[test]
+    fn google_docs_default_mount_id_derives_from_connection_when_default_is_other_workspace() {
+        let descriptor = crate::connector::source_descriptor(GOOGLE_DOCS_CONNECTOR_ID);
+        let connection_id = ConnectionId::new("google-docs-work");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("google-docs-main"),
+                    GOOGLE_DOCS_CONNECTOR_ID,
+                    "/tmp/Locality/google-docs-main",
+                )
+                .with_connection_id(connection_id.clone())
+                .with_remote_root_id(RemoteId::new("workspace-folder-a"))
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save existing Google Docs mount");
+
+        let mount_id = default_mount_id_for_source(
+            &store,
+            &descriptor,
+            Some(&connection_id),
+            Some(&RemoteId::new("workspace-folder-b")),
+        )
+        .expect("derive Google Docs mount id");
+
+        assert_eq!(mount_id, MountId::new("google-docs-work"));
+    }
+
+    #[test]
+    fn google_docs_default_mount_id_reuses_default_for_same_workspace() {
+        let descriptor = crate::connector::source_descriptor(GOOGLE_DOCS_CONNECTOR_ID);
+        let connection_id = ConnectionId::new("google-docs-work");
+        let remote_root_id = RemoteId::new("workspace-folder-a");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("google-docs-main"),
+                    GOOGLE_DOCS_CONNECTOR_ID,
+                    "/tmp/Locality/google-docs-main",
+                )
+                .with_connection_id(connection_id.clone())
+                .with_remote_root_id(remote_root_id.clone())
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save existing Google Docs mount");
+
+        let mount_id = default_mount_id_for_source(
+            &store,
+            &descriptor,
+            Some(&connection_id),
+            Some(&remote_root_id),
+        )
+        .expect("derive Google Docs mount id");
+
+        assert_eq!(mount_id, MountId::new("google-docs-main"));
     }
 
     #[test]
