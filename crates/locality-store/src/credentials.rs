@@ -439,7 +439,28 @@ fn decode_hex_string(value: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+const CREDENTIAL_STORE_ENV: &str = "LOCALITY_CREDENTIAL_STORE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CredentialStoreBackend {
+    File,
+    PlatformDefault,
+}
+
+fn credential_store_backend_for_override(value: Option<&str>) -> CredentialStoreBackend {
+    match value.map(str::trim) {
+        Some("file") => CredentialStoreBackend::File,
+        _ => CredentialStoreBackend::PlatformDefault,
+    }
+}
+
 pub fn open_credential_store(state_root: &Path) -> Box<dyn CredentialStore> {
+    if credential_store_backend_for_override(std::env::var(CREDENTIAL_STORE_ENV).ok().as_deref())
+        == CredentialStoreBackend::File
+    {
+        return Box::new(FileCredentialStore::new(state_root));
+    }
+
     #[cfg(target_os = "macos")]
     {
         let _ = state_root;
@@ -483,10 +504,19 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPAT_KEYCHAIN_SERVICES, PRIMARY_KEYCHAIN_SERVICE, decode_hex_encoded_password,
+        COMPAT_KEYCHAIN_SERVICES, CredentialStoreBackend, PRIMARY_KEYCHAIN_SERVICE,
+        credential_store_backend_for_override, decode_hex_encoded_password,
         keychain_hex_password_from_diagnostics, keychain_output_password,
         primary_windows_target_name, windows_target_names,
     };
+
+    #[test]
+    fn credential_store_backend_honors_file_override() {
+        assert_eq!(
+            credential_store_backend_for_override(Some("file")),
+            CredentialStoreBackend::File
+        );
+    }
 
     #[test]
     fn keychain_output_password_trims_security_newline() {

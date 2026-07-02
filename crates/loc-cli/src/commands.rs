@@ -334,7 +334,7 @@ struct MountNotionArgs {
     #[arg(
         long,
         value_name = "id",
-        help = "Mount id to save. Defaults to notion-main."
+        help = "Mount id to save. Defaults to notion-main, or a connection/root-derived id when needed."
     )]
     mount_id: Option<String>,
     #[arg(
@@ -368,7 +368,7 @@ struct MountGoogleDocsArgs {
     #[arg(
         long,
         value_name = "id",
-        help = "Mount id to save. Defaults to google-docs-main."
+        help = "Mount id to save. Defaults to google-docs-main, or a connection/root-derived id when needed."
     )]
     mount_id: Option<String>,
     #[arg(
@@ -1953,9 +1953,10 @@ fn mount(args: &[String], json: bool) -> i32 {
         Ok(connection_id) => connection_id,
         Err(error) => return command_error(json, error, EXIT_INTERNAL),
     };
-    let mount_id = MountId::new(
-        flag_value(args, "--mount-id")
-            .map(str::to_string)
+    let explicit_mount_id = flag_value(args, "--mount-id").map(str::to_string);
+    let mut mount_id = MountId::new(
+        explicit_mount_id
+            .clone()
             .unwrap_or_else(|| descriptor.default_mount_id().to_string()),
     );
     let read_only = has_flag(args, "--read-only");
@@ -1984,6 +1985,17 @@ fn mount(args: &[String], json: bool) -> i32 {
             return command_error(json, error, exit_code);
         }
     };
+    if explicit_mount_id.is_none() {
+        mount_id = match default_mount_id_for_source(
+            &store,
+            &descriptor,
+            connection_id.as_ref(),
+            remote_root_id.as_ref(),
+        ) {
+            Ok(mount_id) => mount_id,
+            Err(error) => return command_error(json, error, EXIT_INTERNAL),
+        };
+    }
 
     let options = MountOptions {
         mount_id,
@@ -2111,6 +2123,122 @@ fn mount_remote_root_error_exit_code(error: &CommandError) -> i32 {
     match error.code.as_str() {
         "usage" => EXIT_USAGE,
         _ => EXIT_INTERNAL,
+    }
+}
+
+fn default_mount_id_for_source<S>(
+    store: &S,
+    descriptor: &SourceDescriptor,
+    connection_id: Option<&ConnectionId>,
+    remote_root_id: Option<&RemoteId>,
+) -> Result<MountId, CommandError>
+where
+    S: MountRepository,
+{
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| CommandError::new("mount", "store_error", error.to_string()))?;
+    let default_mount_id = MountId::new(descriptor.default_mount_id().to_string());
+    if mount_id_available_for_source(
+        &mounts,
+        &default_mount_id,
+        descriptor,
+        connection_id,
+        remote_root_id,
+    ) {
+        return Ok(default_mount_id);
+    }
+
+    let base = source_mount_id_base(descriptor, connection_id, remote_root_id);
+    for suffix in 1.. {
+        let candidate = if suffix == 1 {
+            MountId::new(base.clone())
+        } else {
+            MountId::new(format!("{base}-{suffix}"))
+        };
+        if mount_id_available_for_source(
+            &mounts,
+            &candidate,
+            descriptor,
+            connection_id,
+            remote_root_id,
+        ) {
+            return Ok(candidate);
+        }
+    }
+
+    unreachable!("unbounded mount id suffix search should always find a candidate")
+}
+
+fn mount_id_available_for_source(
+    mounts: &[MountConfig],
+    mount_id: &MountId,
+    descriptor: &SourceDescriptor,
+    connection_id: Option<&ConnectionId>,
+    remote_root_id: Option<&RemoteId>,
+) -> bool {
+    mounts
+        .iter()
+        .find(|mount| mount.mount_id == *mount_id)
+        .is_none_or(|mount| {
+            mount.connector == descriptor.id()
+                && mount.connection_id.as_ref() == connection_id
+                && mount.remote_root_id.as_ref() == remote_root_id
+        })
+}
+
+fn source_mount_id_base(
+    descriptor: &SourceDescriptor,
+    connection_id: Option<&ConnectionId>,
+    remote_root_id: Option<&RemoteId>,
+) -> String {
+    if let Some(connection_id) = connection_id {
+        return mount_id_with_source_prefix(
+            descriptor.id(),
+            &mount_id_component(connection_id.as_str()),
+        );
+    }
+    if let Some(remote_root_id) = remote_root_id {
+        let component = mount_id_component(remote_root_id.as_str());
+        let short = component.chars().take(12).collect::<String>();
+        if !short.is_empty() {
+            return mount_id_with_source_prefix(descriptor.id(), &short);
+        }
+    }
+    descriptor.default_mount_id().to_string()
+}
+
+fn mount_id_with_source_prefix(connector: &str, component: &str) -> String {
+    let component = if component.is_empty() {
+        "mount"
+    } else {
+        component
+    };
+    let prefixed = format!("{connector}-");
+    if component == connector || component.starts_with(&prefixed) {
+        component.to_string()
+    } else {
+        format!("{connector}-{component}")
+    }
+}
+
+fn mount_id_component(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            normalized.push('-');
+            last_was_dash = true;
+        }
+    }
+    let normalized = normalized.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        "mount".to_string()
+    } else {
+        normalized
     }
 }
 
@@ -6054,10 +6182,13 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    use locality_core::model::MountId;
-    use locality_store::{MountConfig, ProjectionMode};
+    use locality_core::model::{MountId, RemoteId};
+    use locality_google_docs::GOOGLE_DOCS_CONNECTOR_ID;
     #[cfg(target_os = "windows")]
-    use locality_store::{MountRepository, SqliteStateStore};
+    use locality_store::SqliteStateStore;
+    use locality_store::{
+        ConnectionId, InMemoryStateStore, MountConfig, MountRepository, ProjectionMode,
+    };
 
     use crate::diff::{DiffReport, GuardrailOutput};
     use crate::local_oauth::{local_redirect, parse_oauth_callback};
@@ -6067,9 +6198,10 @@ mod tests {
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, FileProviderCommandReport,
         VirtualProjectionRegistration, absolute_command_path,
-        auto_registration_for_mounted_projection, diff_report_exit_code, file_provider_list_lines,
-        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
-        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
+        auto_registration_for_mounted_projection, default_mount_id_for_source,
+        diff_report_exit_code, file_provider_list_lines, google_docs_oauth_broker_config,
+        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
+        guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
         projection_mode_for_target, projection_usage_options_for_target,
@@ -6985,6 +7117,65 @@ mod tests {
             auto_registration_for_mounted_projection(ProjectionMode::LinuxFuse, "linux", true),
             None
         );
+    }
+
+    #[test]
+    fn google_docs_default_mount_id_derives_from_connection_when_default_is_other_workspace() {
+        let descriptor = crate::connector::source_descriptor(GOOGLE_DOCS_CONNECTOR_ID);
+        let connection_id = ConnectionId::new("google-docs-work");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("google-docs-main"),
+                    GOOGLE_DOCS_CONNECTOR_ID,
+                    "/tmp/Locality/google-docs-main",
+                )
+                .with_connection_id(connection_id.clone())
+                .with_remote_root_id(RemoteId::new("workspace-folder-a"))
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save existing Google Docs mount");
+
+        let mount_id = default_mount_id_for_source(
+            &store,
+            &descriptor,
+            Some(&connection_id),
+            Some(&RemoteId::new("workspace-folder-b")),
+        )
+        .expect("derive Google Docs mount id");
+
+        assert_eq!(mount_id, MountId::new("google-docs-work"));
+    }
+
+    #[test]
+    fn google_docs_default_mount_id_reuses_default_for_same_workspace() {
+        let descriptor = crate::connector::source_descriptor(GOOGLE_DOCS_CONNECTOR_ID);
+        let connection_id = ConnectionId::new("google-docs-work");
+        let remote_root_id = RemoteId::new("workspace-folder-a");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("google-docs-main"),
+                    GOOGLE_DOCS_CONNECTOR_ID,
+                    "/tmp/Locality/google-docs-main",
+                )
+                .with_connection_id(connection_id.clone())
+                .with_remote_root_id(remote_root_id.clone())
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save existing Google Docs mount");
+
+        let mount_id = default_mount_id_for_source(
+            &store,
+            &descriptor,
+            Some(&connection_id),
+            Some(&remote_root_id),
+        )
+        .expect("derive Google Docs mount id");
+
+        assert_eq!(mount_id, MountId::new("google-docs-main"));
     }
 
     #[test]
