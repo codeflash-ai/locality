@@ -2269,17 +2269,45 @@ fn seed_existing_child_directory_placeholders(
     directory: &Path,
     items: &[localityd::file_provider::FileProviderItem],
 ) -> Result<(), HelperError> {
+    let mut targets = Vec::new();
+    collect_existing_child_directory_seed_targets(
+        directory,
+        items,
+        &mut |identifier| context.children(identifier).map(|report| report.children),
+        &mut targets,
+    )?;
+    for (child_directory, children) in targets {
+        trace_cloud_files(format!(
+            "seed existing child directory placeholders directory=`{}` count={}",
+            child_directory.display(),
+            children.len()
+        ));
+        create_placeholders_in_directory(&child_directory, &children)?;
+        remember_placeholder_children(context, &child_directory, &children);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn collect_existing_child_directory_seed_targets<F>(
+    directory: &Path,
+    items: &[localityd::file_provider::FileProviderItem],
+    children_for: &mut F,
+    targets: &mut Vec<(PathBuf, Vec<localityd::file_provider::FileProviderItem>)>,
+) -> Result<(), HelperError>
+where
+    F: FnMut(&str) -> Result<Vec<localityd::file_provider::FileProviderItem>, HelperError>,
+{
     for item in existing_child_directory_items(directory, items)? {
         let child_directory = directory.join(&item.filename);
-        let children = context.children(&item.identifier)?;
-        trace_cloud_files(format!(
-            "seed existing child directory placeholders directory=`{}` identifier=`{}` count={}",
-            child_directory.display(),
-            item.identifier,
-            children.children.len()
-        ));
-        create_placeholders_in_directory(&child_directory, &children.children)?;
-        remember_placeholder_children(context, &child_directory, &children.children);
+        let children = children_for(&item.identifier)?;
+        targets.push((child_directory.clone(), children.clone()));
+        collect_existing_child_directory_seed_targets(
+            &child_directory,
+            &children,
+            children_for,
+            targets,
+        )?;
     }
     Ok(())
 }
@@ -4042,6 +4070,88 @@ mod tests {
         assert_eq!(existing[0].identifier, "mount:notion-main");
 
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn existing_child_directory_seed_targets_include_nested_existing_directories() {
+        let temp = unique_test_state_dir("nested-existing-child-dirs");
+        let sync_root = temp.join("Locality");
+        std::fs::create_dir_all(
+            sync_root
+                .join("notion-main")
+                .join("go-to-market")
+                .join("locality-launch"),
+        )
+        .expect("create nested existing directories");
+
+        let root_items = vec![folder_item("mount:notion-main", "notion-main")];
+        let mut child_map = std::collections::BTreeMap::from([
+            (
+                "mount:notion-main".to_string(),
+                vec![folder_item("children:go-to-market", "go-to-market")],
+            ),
+            (
+                "children:go-to-market".to_string(),
+                vec![
+                    folder_item("children:locality-launch", "locality-launch"),
+                    folder_item("children:missing", "missing"),
+                ],
+            ),
+            (
+                "children:locality-launch".to_string(),
+                vec![folder_item("children:launch-post", "launch-post")],
+            ),
+        ]);
+        let mut targets = Vec::new();
+
+        collect_existing_child_directory_seed_targets(
+            &sync_root,
+            &root_items,
+            &mut |identifier| {
+                Ok(child_map
+                    .remove(identifier)
+                    .unwrap_or_else(|| panic!("unexpected child listing for {identifier}")))
+            },
+            &mut targets,
+        )
+        .expect("collect seed targets");
+
+        let target_paths = targets
+            .iter()
+            .map(|(path, _)| path.strip_prefix(&sync_root).unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            target_paths,
+            vec![
+                PathBuf::from("notion-main"),
+                PathBuf::from("notion-main").join("go-to-market"),
+                PathBuf::from("notion-main")
+                    .join("go-to-market")
+                    .join("locality-launch"),
+            ]
+        );
+        assert_eq!(targets[2].1[0].identifier, "children:launch-post");
+
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn folder_item(identifier: &str, filename: &str) -> localityd::file_provider::FileProviderItem {
+        localityd::file_provider::FileProviderItem {
+            identifier: identifier.to_string(),
+            parent_identifier: None,
+            filename: filename.to_string(),
+            kind: localityd::file_provider::FileProviderItemKind::Folder,
+            entity_kind: None,
+            remote_id: None,
+            path: filename.to_string(),
+            hydration: None,
+            content_type: "public.folder".to_string(),
+            remote_edited_at: None,
+            materialized_path: None,
+            byte_size: None,
+        }
     }
 
     #[cfg(target_os = "windows")]
