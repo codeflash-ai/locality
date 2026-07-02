@@ -124,7 +124,7 @@ const TERMINAL_CLI_PATH_MANAGED_END: &str = "# <<< LOCALITY_TERMINAL_CLI_PATH <<
 const WINDOWS_TERMINAL_CLI_SHIM_MARKER: &str = "LOCALITY_TERMINAL_CLI_SHIM";
 #[cfg(windows)]
 const WINDOWS_RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-const DEFAULT_NOTION_MOUNT_POINT_DIRECTORY: &str = "notion-main";
+const DEFAULT_NOTION_MOUNT_POINT_DIRECTORY: &str = "notion";
 #[cfg(windows)]
 const WINDOWS_RUN_VALUE_NAME: &str = "Locality";
 #[cfg(windows)]
@@ -9948,7 +9948,7 @@ mod tests {
 
         assert_eq!(
             super::default_notion_mount_root(),
-            home.join("Locality").join("notion-main")
+            home.join("Locality").join("notion")
         );
     }
 
@@ -9998,7 +9998,7 @@ mod tests {
         assert_eq!(
             super::resolve_desktop_mount_root(&selected.display().to_string())
                 .expect("resolve mount root"),
-            home.join("Locality").join("notion-main")
+            home.join("Locality").join("notion")
         );
     }
 

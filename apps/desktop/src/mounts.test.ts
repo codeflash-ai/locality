@@ -17,7 +17,7 @@ function mount(overrides: Partial<MountSummary>): MountSummary {
     connectorName: "Notion",
     connectionId: "notion-default",
     workspaceName: "CodeFlash",
-    localPath: "/home/ada/Locality/notion-main",
+    localPath: "/home/ada/Locality/notion",
     notionUrl: "https://www.notion.so/example",
     accessScope: "Workspace",
     remoteRootId: "notion-root",
@@ -37,7 +37,7 @@ describe("mount display helpers", () => {
     const fallback = mount({
       mountId: "",
       workspaceName: "No mounted workspace",
-      localPath: "/home/ada/Locality/notion-main",
+      localPath: "/home/ada/Locality/notion",
       status: "not_mounted",
       entityCount: 0,
       pendingChangeCount: 0,
@@ -68,8 +68,8 @@ describe("mount display helpers", () => {
     expect(rows.map((row) => row.id)).toEqual(["notion-main", "google-docs-main"]);
     expect(rows[0]).toMatchObject({
       title: "Notion",
-      subtitle: "CodeFlash / notion-main",
-      localPath: "/home/ada/Locality/notion-main",
+      subtitle: "CodeFlash / notion",
+      localPath: "/home/ada/Locality/notion",
       projection: "Linux FUSE",
       access: "Edit enabled",
       content: "24 items, 3 pending",

@@ -240,7 +240,7 @@ const sampleMount: MountSummary = {
   connectorName: "Notion",
   connectionId: "notion-main",
   workspaceName: "CodeFlash",
-  localPath: "~/Library/CloudStorage/Locality/notion-main",
+  localPath: "~/Library/CloudStorage/Locality/notion",
   notionUrl: "https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972",
   accessScope: "Initial Idea",
   remoteRootId: "37b3ac0ebb88802cbcf4d53c9cfc4972",
@@ -337,13 +337,13 @@ const sampleSnapshot: DesktopSnapshot = {
     {
       title: "Standups with Locality",
       kind: "Page",
-      localPath: "~/Library/CloudStorage/Locality/notion-main/General/Standups with Locality/page.md",
+      localPath: "~/Library/CloudStorage/Locality/notion/General/Standups with Locality/page.md",
       state: "ready",
     },
     {
       title: "Roadmap 2026",
       kind: "Page",
-      localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
+      localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
       state: "pending_changes",
     },
   ],
@@ -455,7 +455,7 @@ const loadingSnapshot: DesktopSnapshot = {
   mount: {
     ...sampleSnapshot.mount,
     workspaceName: "Loading",
-    localPath: "~/Library/CloudStorage/Locality/notion-main",
+    localPath: "~/Library/CloudStorage/Locality/notion",
     notionUrl: null,
     accessScope: "Checking access",
     status: "loading",
@@ -509,13 +509,13 @@ const sampleSearchResults: LocatedItem[] = [
   {
     title: "Roadmap 2026",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
     state: "ready",
   },
   {
     title: "Launch Plan",
     kind: "Page",
-    localPath: "~/Library/CloudStorage/Locality/notion-main/Marketing/Launch Plan/page.md",
+    localPath: "~/Library/CloudStorage/Locality/notion/Marketing/Launch Plan/page.md",
     state: "online_only",
   },
 ];
@@ -1332,7 +1332,7 @@ function Onboarding({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1926,7 +1926,7 @@ function HomeView({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );
@@ -1967,7 +1967,7 @@ function HomeView({
           <BrandTile variant="folder" />
           <div>
             <h2>Create your Notion folder</h2>
-            <p>Use the default notion-main folder under the shared Locality CloudStorage root.</p>
+            <p>Use the default notion folder under the shared Locality CloudStorage root.</p>
           </div>
           <PrimaryButton
             icon={<FolderOpen />}
@@ -2167,7 +2167,7 @@ function MountsView({
           <BrandTile variant="folder" />
           <div>
             <h2>Create your Notion mount point</h2>
-            <p>Use the default notion-main mount point under the shared Locality folder.</p>
+            <p>Use the default notion mount point under the shared Locality folder.</p>
           </div>
           <PrimaryButton
             busy={creating}
@@ -3530,7 +3530,7 @@ function SettingsView({
             busy={busySetting === "show_menu_bar"}
             onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
           />
-          <SettingRow title="Default Notion mount point" value="~/Library/CloudStorage/Locality/notion-main" />
+          <SettingRow title="Default Notion mount point" value="~/Library/CloudStorage/Locality/notion" />
           {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
         </div>
 
@@ -3574,7 +3574,7 @@ function SettingsView({
         <div className="panel">
           <PanelTitle title="Agent Instructions" />
           <SettingRow title="Local agents" value="Claude, Codex, Warp, Cursor, Gemini, Cline/Roo" />
-          <SettingRow title="Notion guidance" value="Installed under /Locality/notion-main" />
+          <SettingRow title="Notion guidance" value="Installed under /Locality/notion" />
           <SecondaryButton
             compact
             icon={installingAgents ? <Loader2 className="spin-icon" /> : <Bot />}
@@ -3703,7 +3703,7 @@ function TrayPopover({
         {
           title: "Roadmap 2026",
           kind: "Page",
-          localPath: "~/Library/CloudStorage/Locality/notion-main/Engineering/Roadmap 2026/page.md",
+          localPath: "~/Library/CloudStorage/Locality/notion/Engineering/Roadmap 2026/page.md",
           state: "ready",
         },
       );

@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 const MANAGED_START: &str = "<!-- LOCALITY_AGENT_GUIDANCE_START -->";
 const MANAGED_END: &str = "<!-- LOCALITY_AGENT_GUIDANCE_END -->";
-const DEFAULT_NOTION_MOUNT: &str = "~/Library/CloudStorage/Locality/notion-main";
+const DEFAULT_NOTION_MOUNT: &str = "~/Library/CloudStorage/Locality/notion";
 const MCP_SERVER_NAME: &str = "loc";
 const SKILL_DIR_NAME: &str = "locality";
 
@@ -781,10 +781,10 @@ mod tests {
 
     #[test]
     fn skill_mentions_mount_and_review_workflow() {
-        let skill = skill_markdown("~/Library/CloudStorage/Locality/notion-main");
+        let skill = skill_markdown("~/Library/CloudStorage/Locality/notion");
 
         assert!(skill.contains("name: locality"));
-        assert!(skill.contains("~/Library/CloudStorage/Locality/notion-main"));
+        assert!(skill.contains("~/Library/CloudStorage/Locality/notion"));
         assert!(skill.contains("pending for Locality review"));
         assert!(skill.contains("If desktop Live Mode is on"));
         assert!(skill.contains("Do not run routine `loc pull` or `loc push`"));
@@ -813,8 +813,8 @@ mod tests {
     fn normalized_blank_mount_path_uses_default_notion_mount() {
         assert_eq!(normalized_mount_path(Some("  ")), DEFAULT_NOTION_MOUNT);
         assert_eq!(
-            normalized_mount_path(Some("~/Library/CloudStorage/Locality/notion-main/")),
-            "~/Library/CloudStorage/Locality/notion-main"
+            normalized_mount_path(Some("~/Library/CloudStorage/Locality/notion/")),
+            "~/Library/CloudStorage/Locality/notion"
         );
     }
 
@@ -833,7 +833,7 @@ mod tests {
             detected: true,
             detail: "Installed the Locality skill for Codex.",
         };
-        let target = install_target(&spec, "~/Library/CloudStorage/Locality/notion-main");
+        let target = install_target(&spec, "~/Library/CloudStorage/Locality/notion");
         let skill = fs::read_to_string(temp.join(".codex/skills/locality/SKILL.md"))
             .expect("read locality skill");
 

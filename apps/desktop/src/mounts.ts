@@ -138,10 +138,15 @@ function isRealMount(mount: MountSummary): boolean {
 
 function mountSubtitle(mount: MountSummary): string {
   const workspace = mount.workspaceName.trim();
+  const displayName = mountPathName(mount.localPath) || mount.mountId;
   if (workspace.length > 0) {
-    return `${workspace} / ${mount.mountId}`;
+    return `${workspace} / ${displayName}`;
   }
-  return mount.mountId;
+  return displayName;
+}
+
+function mountPathName(path: string): string {
+  return path.trim().replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).pop() ?? "";
 }
 
 function mountContentLabel(mount: MountSummary): string {
