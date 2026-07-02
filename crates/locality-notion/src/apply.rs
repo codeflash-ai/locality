@@ -33,6 +33,7 @@ use crate::media::{resolve_media_href_with_content_root, unescape_markdown_href}
 
 const NOTION_RICH_TEXT_CONTENT_LIMIT: usize = 2000;
 const NOTION_RICH_TEXT_SENTENCE_SPLIT_LOOKBACK: usize = 400;
+const NOTION_APPEND_CHILDREN_BATCH_LIMIT: usize = 100;
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
     let database_create_parent_ids = database_create_parent_ids(&request.plan.operations);
@@ -87,8 +88,12 @@ pub fn apply_plan(
     let mut effects = Vec::new();
     let mut append_chains: BTreeMap<(RemoteId, Option<RemoteId>), RemoteId> = BTreeMap::new();
     let mut preserved_append_archive_moves = BTreeSet::new();
+    let mut batched_append_operations = BTreeSet::new();
 
     for (operation_index, operation) in request.plan.operations.iter().enumerate() {
+        if batched_append_operations.contains(&operation_index) {
+            continue;
+        }
         match operation {
             PushOperation::UpdateBlock { block_id, content } => {
                 let current = current_block(&current_blocks, block_id)?;
@@ -193,6 +198,51 @@ pub fn apply_plan(
             } => {
                 let after = block_parents.normalize_after(parent_id, after.as_ref());
                 let chain_key = (parent_id.clone(), after.clone());
+                if let Some(batch) = collect_append_block_batch(
+                    api,
+                    &request.plan.operations,
+                    operation_index,
+                    parent_id,
+                    after.as_ref(),
+                    request.local_root,
+                    &current_blocks,
+                    &block_parents,
+                    &archived_block_ids,
+                    &preserved_append_archive_moves,
+                )? {
+                    let effective_after = append_chains.get(&chain_key).cloned().or(after);
+                    let result = api.append_block_children(
+                        parent_id.as_str(),
+                        append_body_many(batch.children, effective_after.as_ref()),
+                    )?;
+                    if result.results.len() < batch.operations.len() {
+                        return Err(LocalityError::InvalidState(format!(
+                            "notion append block children returned {} blocks for {} batched append operations",
+                            result.results.len(),
+                            batch.operations.len()
+                        )));
+                    }
+
+                    let mut previous_created = None;
+                    for (batch_item, created) in batch.operations.iter().zip(result.results.iter())
+                    {
+                        let created_id = RemoteId::new(created.id.clone());
+                        effects.push(JournalApplyEffect::CreatedBlock {
+                            operation_id: request.operation_ids[batch_item.operation_index].clone(),
+                            operation_index: batch_item.operation_index,
+                            parent_id: parent_id.clone(),
+                            block_id: created_id.clone(),
+                        });
+                        previous_created = Some(created_id);
+                    }
+                    if let Some(created_id) = previous_created {
+                        append_chains.insert(chain_key, created_id);
+                    }
+                    for batch_item in batch.operations.iter().skip(1) {
+                        batched_append_operations.insert(batch_item.operation_index);
+                    }
+                    continue;
+                }
                 let effective_after = append_chains.get(&chain_key).cloned().or(after);
                 let preserved = preserved_archived_block_append_child(
                     parent_id,
@@ -786,6 +836,87 @@ fn preserved_archived_block_append_child(
     }
 
     Ok(None)
+}
+
+struct AppendBlockBatch {
+    operations: Vec<AppendBlockBatchOperation>,
+    children: Vec<Value>,
+}
+
+struct AppendBlockBatchOperation {
+    operation_index: usize,
+}
+
+fn collect_append_block_batch(
+    api: &dyn NotionApi,
+    operations: &[PushOperation],
+    start_index: usize,
+    parent_id: &RemoteId,
+    normalized_after: Option<&RemoteId>,
+    local_root: Option<&Path>,
+    current_blocks: &BTreeMap<RemoteId, &BlockDto>,
+    block_parents: &BlockParentIndex,
+    archived_block_ids: &BTreeSet<RemoteId>,
+    preserved_append_archive_moves: &BTreeSet<RemoteId>,
+) -> LocalityResult<Option<AppendBlockBatch>> {
+    let mut batch_operations = Vec::new();
+    let mut batch_contents = Vec::new();
+
+    for (operation_index, operation) in operations.iter().enumerate().skip(start_index) {
+        if batch_operations.len() >= NOTION_APPEND_CHILDREN_BATCH_LIMIT {
+            break;
+        }
+        let PushOperation::AppendBlock {
+            parent_id: candidate_parent_id,
+            after: candidate_after,
+            content,
+        } = operation
+        else {
+            break;
+        };
+        if candidate_parent_id != parent_id {
+            break;
+        }
+        let candidate_after = block_parents.normalize_after(parent_id, candidate_after.as_ref());
+        if candidate_after.as_ref() != normalized_after {
+            break;
+        }
+        if parse_local_media_markdown(content.trim_end_matches('\n')).is_some() {
+            break;
+        }
+
+        let mut preserved_probe = preserved_append_archive_moves.clone();
+        if preserved_archived_block_append_child(
+            parent_id,
+            content,
+            current_blocks,
+            block_parents,
+            archived_block_ids,
+            &mut preserved_probe,
+        )?
+        .is_some()
+        {
+            break;
+        }
+
+        batch_operations.push(AppendBlockBatchOperation { operation_index });
+        batch_contents.push(content);
+    }
+
+    if batch_operations.len() <= 1 {
+        return Ok(None);
+    }
+
+    let mut children = Vec::with_capacity(batch_contents.len());
+    for content in batch_contents {
+        let patch = parse_append_block(api, content, local_root)?;
+        children.push(patch.append_child());
+    }
+
+    Ok(Some(AppendBlockBatch {
+        operations: batch_operations,
+        children,
+    }))
 }
 
 fn rendered_read_only_block_markdown(block: &BlockDto) -> LocalityResult<Option<String>> {
@@ -1807,9 +1938,13 @@ fn parse_append_block(
 }
 
 fn append_body(child: Value, after: Option<&RemoteId>) -> Value {
+    append_body_many(vec![child], after)
+}
+
+fn append_body_many(children: Vec<Value>, after: Option<&RemoteId>) -> Value {
     match after {
         Some(after) => json!({
-            "children": [child],
+            "children": children,
             "position": {
                 "type": "after_block",
                 "after_block": {
@@ -1818,7 +1953,7 @@ fn append_body(child: Value, after: Option<&RemoteId>) -> Value {
             },
         }),
         None => json!({
-            "children": [child],
+            "children": children,
             "position": {
                 "type": "start",
             },
