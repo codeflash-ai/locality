@@ -7177,23 +7177,49 @@ struct WindowsCloudFilesProviderSupervisor;
 #[cfg(target_os = "windows")]
 impl WindowsCloudFilesProviderSupervisor {
     fn ensure_running(&mut self, state_root: &Path, mount: &MountConfig) -> Result<(), String> {
+        self.ensure_running_with_hooks(
+            state_root,
+            mount,
+            wait_for_virtual_projection_mount_point_children,
+            |state_root, mount| {
+                run_windows_cloud_files_lifecycle(
+                    state_root,
+                    mount,
+                    &connector_label(&mount.connector),
+                    WindowsCloudFilesLifecycleAction::Start,
+                )
+                .map_err(|error| {
+                    format!(
+                        "Could not start Windows Cloud Files provider `{}`: {}",
+                        mount.mount_id.0,
+                        error.message()
+                    )
+                })
+            },
+        )
+    }
+
+    fn ensure_running_with_hooks<WaitForSource, StartProvider>(
+        &mut self,
+        state_root: &Path,
+        mount: &MountConfig,
+        wait_for_source: WaitForSource,
+        start_provider: StartProvider,
+    ) -> Result<(), String>
+    where
+        WaitForSource: FnOnce(&Path, &MountConfig) -> Result<(), String>,
+        StartProvider: FnOnce(
+            &Path,
+            &MountConfig,
+        )
+            -> Result<loc_cli::file_provider::FileProviderHelperReport, String>,
+    {
         if mount.projection != ProjectionMode::WindowsCloudFiles {
             return Ok(());
         }
 
-        let report = run_windows_cloud_files_lifecycle(
-            state_root,
-            mount,
-            &connector_label(&mount.connector),
-            WindowsCloudFilesLifecycleAction::Start,
-        )
-        .map_err(|error| {
-            format!(
-                "Could not start Windows Cloud Files provider `{}`: {}",
-                mount.mount_id.0,
-                error.message()
-            )
-        })?;
+        wait_for_source(state_root, mount)?;
+        let report = start_provider(state_root, mount)?;
         if let Some(message) = report
             .helper_report
             .get("message")
@@ -8900,7 +8926,8 @@ mod tests {
     };
     #[cfg(target_os = "windows")]
     use super::{
-        WindowsCloudFilesRuntimeProcess, windows_cloud_files_runtime_processes_from_state,
+        WindowsCloudFilesProviderSupervisor, WindowsCloudFilesRuntimeProcess,
+        windows_cloud_files_runtime_processes_from_state,
     };
 
     #[test]
@@ -11744,6 +11771,43 @@ mod tests {
                 ),
             }]
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cloud_files_supervisor_waits_for_source_ready_before_starting_provider() {
+        use std::cell::Cell;
+
+        let temp = TestTempDir::new("windows-supervisor-source-ready");
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", temp.path())
+            .projection(ProjectionMode::WindowsCloudFiles);
+        let source_checks = Cell::new(0);
+        let start_attempts = Cell::new(0);
+        let mut supervisor = WindowsCloudFilesProviderSupervisor::default();
+
+        let result = supervisor.ensure_running_with_hooks(
+            temp.path(),
+            &mount,
+            |state_root, checked_mount| {
+                assert_eq!(state_root, temp.path());
+                assert_eq!(checked_mount.mount_id, mount.mount_id);
+                source_checks.set(source_checks.get() + 1);
+                Err("source not ready".to_string())
+            },
+            |_state_root, _mount| {
+                start_attempts.set(start_attempts.get() + 1);
+                Ok(loc_cli::file_provider::FileProviderHelperReport {
+                    helper: PathBuf::from("locality-cloud-files.exe"),
+                    helper_report: serde_json::json!({
+                        "message": "provider should not have started"
+                    }),
+                })
+            },
+        );
+
+        assert_eq!(result, Err("source not ready".to_string()));
+        assert_eq!(source_checks.get(), 1);
+        assert_eq!(start_attempts.get(), 0);
     }
 
     #[test]

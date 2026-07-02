@@ -559,6 +559,16 @@ try {
     Wait-ForCondition -Name "Cloud Files source root" -Condition {
         Test-PathWithTimeout -Path $sourceRoot -Name "source root"
     }
+    Write-Step "waiting for connector child placeholders"
+    Wait-ForCondition -Name "connector child placeholders without restart" -Condition {
+        $children = Get-ChildItemWithTimeout -Path $sourceRoot -Name "source root"
+        $nonContentNames = @("AGENTS.md", "CLAUDE.md", "desktop.ini", ".loc")
+        $contentChildren = @($children | Where-Object {
+            $leaf = Split-Path -Leaf $_
+            -not $nonContentNames.Contains($leaf)
+        })
+        return $contentChildren.Count -gt 0
+    }
     Write-Step "waiting for scratch page placeholder"
     Wait-ForCondition -Name "scratch page placeholder" -Condition {
         Get-ChildItemWithTimeout -Path $sourceRoot -Name "source root" | Out-Null
