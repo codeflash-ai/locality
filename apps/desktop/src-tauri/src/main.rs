@@ -6814,13 +6814,19 @@ fn ensure_virtual_projection_runtimes_for_state(state_root: &Path) -> Result<(),
 }
 
 fn ensure_virtual_projection_domains_for_state(state_root: &Path) -> Result<(), String> {
-    let store = SqliteStateStore::open(state_root.to_path_buf())
+    let mut store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
-    for mount in store
+    let mounts = store
         .load_mounts()
-        .map_err(|error| format!("Could not load mounts: {error}"))?
-    {
+        .map_err(|error| format!("Could not load mounts: {error}"))?;
+    for mount in &mounts {
         ensure_virtual_projection_domain_available(&mount.projection)?;
+    }
+    if mounts
+        .iter()
+        .any(|mount| mount.projection == ProjectionMode::MacosFileProvider)
+    {
+        repair_macos_file_provider_mount_roots(&mut store)?;
     }
     Ok(())
 }
@@ -6859,6 +6865,50 @@ fn ensure_macos_file_provider_domain_available() -> Result<(), String> {
 
 #[cfg(not(target_os = "macos"))]
 fn ensure_macos_file_provider_domain_available() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn repair_macos_file_provider_mount_roots(store: &mut SqliteStateStore) -> Result<(), String> {
+    let domain_root =
+        macos_file_provider_domain_url(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+            .map_err(|error| {
+                format!(
+                    "Could not resolve macOS File Provider domain `{}`: {}",
+                    localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+                    error.message()
+                )
+            })?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts: {error}"))?;
+    for mut mount in mounts {
+        if mount.projection != ProjectionMode::MacosFileProvider {
+            continue;
+        }
+        let folder_name = mount
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                localityd::virtual_fs::source_root_directory_name(&mount.mount_id.0)
+            });
+        let expected_root = domain_root.join(folder_name);
+        if mount.root == expected_root {
+            continue;
+        }
+        mount.root = expected_root;
+        store
+            .save_mount(mount)
+            .map_err(|error| format!("Could not repair macOS File Provider mount root: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn repair_macos_file_provider_mount_roots(_store: &mut SqliteStateStore) -> Result<(), String> {
     Ok(())
 }
 
@@ -9888,37 +9938,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_file_provider_mount_root_repair_uses_visible_mount_point_name() {
-        let mount = MountConfig::new(
-            MountId::new("notion-main"),
-            "notion",
-            "/Users/test/Library/CloudStorage/Locality/notion",
-        )
-        .projection(ProjectionMode::MacosFileProvider);
-
-        assert_eq!(
-            super::macos_file_provider_repaired_mount_root(
-                &mount,
-                Path::new("/Users/test/Library/CloudStorage/Locality-Locality")
-            ),
-            PathBuf::from("/Users/test/Library/CloudStorage/Locality-Locality/notion")
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_file_provider_reset_targets_known_locality_roots() {
-        let roots = super::macos_locality_cloud_storage_reset_roots();
-
-        assert!(roots.iter().any(|root| root.ends_with("Locality")));
-        assert!(roots.iter().any(|root| root.ends_with("Locality-Locality")));
-    }
-
-=======
->>>>>>> a0d678b (Avoid mutating macOS File Provider storage)
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_mount_summary_without_mount_reports_linux_fuse_projection() {
