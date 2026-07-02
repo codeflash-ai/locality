@@ -17,6 +17,31 @@ use crate::client::NotionApi;
 use crate::dto::{BlockDto, DatabaseDto, PageDto, ParentDto};
 use crate::render::{page_frontmatter, page_title};
 
+pub const NOTION_PRIVATE_ROOT_ID: &str = "notion-root:private";
+pub const NOTION_WORKSPACE_ROOT_ID: &str = "notion-root:workspace";
+pub const NOTION_PRIVATE_ROOT_DIR: &str = "Private";
+pub const NOTION_WORKSPACE_ROOT_DIR: &str = "Workspace";
+
+pub fn is_notion_private_root_id(remote_id: &RemoteId) -> bool {
+    remote_id.as_str() == NOTION_PRIVATE_ROOT_ID
+}
+
+pub fn is_notion_workspace_root_id(remote_id: &RemoteId) -> bool {
+    remote_id.as_str() == NOTION_WORKSPACE_ROOT_ID
+}
+
+pub fn is_notion_synthetic_root_id(remote_id: &RemoteId) -> bool {
+    is_notion_private_root_id(remote_id) || is_notion_workspace_root_id(remote_id)
+}
+
+pub fn notion_private_root_remote_id() -> RemoteId {
+    RemoteId::new(NOTION_PRIVATE_ROOT_ID)
+}
+
+pub fn notion_workspace_root_remote_id() -> RemoteId {
+    RemoteId::new(NOTION_WORKSPACE_ROOT_ID)
+}
+
 pub fn enumerate_root_page_tree(
     api: &dyn NotionApi,
     mount_id: MountId,
@@ -53,56 +78,14 @@ pub fn enumerate_shared_pages(
     let mut used_paths = BTreeSet::new();
     let mut entries = Vec::new();
 
-    let pages = search_all_pages(api)?;
-    let databases = search_all_databases(api)?;
-    let accessible_page_ids = pages
-        .iter()
-        .map(|page| page.id.as_str())
-        .collect::<BTreeSet<_>>();
-
-    let mut root_children = Vec::new();
-    for page in pages
-        .iter()
-        .filter(|page| is_workspace_root_page(page, &accessible_page_ids))
-    {
-        let title = page_title(page);
-        root_children.push(ProjectedChild::Page {
-            page: page.clone(),
-            title,
-        });
-    }
-
-    for database in databases
-        .iter()
-        .filter(|database| is_workspace_root_parent(database.parent.as_ref(), &accessible_page_ids))
-    {
-        let title = database_title(database).unwrap_or_else(|| "Untitled database".to_string());
-        root_children.push(ProjectedChild::Database {
-            database: database.clone(),
-            title,
-        });
-    }
-
-    for projected in allocate_child_paths(Path::new(""), root_children, &mut used_paths) {
-        push_projected_tree_entry(api, &mount_id, projected, &mut used_paths, &mut entries)?;
-    }
-
-    let projected_page_ids = entries
-        .iter()
-        .filter(|entry| entry.kind == EntityKind::Page)
-        .map(|entry| entry.remote_id.0.clone())
-        .collect::<BTreeSet<_>>();
-    let fallback_pages = pages
-        .iter()
-        .filter(|page| !projected_page_ids.contains(&page.id))
-        .map(|page| ProjectedChild::Page {
-            page: page.clone(),
-            title: page_title(page),
-        })
-        .collect::<Vec<_>>();
-    for projected in allocate_child_paths(Path::new(""), fallback_pages, &mut used_paths) {
-        push_projected_listing_entry(&mount_id, projected, &mut entries);
-    }
+    entries.extend(synthetic_workspace_root_entries(&mount_id));
+    let workspace_projection = project_workspace_root(
+        api,
+        &mount_id,
+        Path::new(NOTION_WORKSPACE_ROOT_DIR),
+        &mut used_paths,
+    )?;
+    entries.extend(workspace_projection.tree_entries);
 
     Ok(entries)
 }
@@ -116,9 +99,22 @@ pub fn list_container_children(
 ) -> LocalityResult<Vec<TreeEntry>> {
     match container {
         ChildContainer::Root => list_root_children(api, mount_id, root_page_id, parent_path),
-        ChildContainer::SourceRoot(_) => Err(LocalityError::Unsupported(
-            "notion source-root child containers",
-        )),
+        ChildContainer::SourceRoot(remote_id) if root_page_id.is_some() => {
+            Err(LocalityError::InvalidState(format!(
+                "notion source roots are only available for workspace mounts; received `{}`",
+                remote_id.as_str()
+            )))
+        }
+        ChildContainer::SourceRoot(remote_id) if is_notion_private_root_id(&remote_id) => {
+            Ok(Vec::new())
+        }
+        ChildContainer::SourceRoot(remote_id) if is_notion_workspace_root_id(&remote_id) => {
+            list_workspace_root_children(api, mount_id, parent_path)
+        }
+        ChildContainer::SourceRoot(remote_id) => Err(LocalityError::InvalidState(format!(
+            "unknown Notion source root `{}`",
+            remote_id.as_str()
+        ))),
         ChildContainer::PageChildren(page_id) => {
             list_page_children(api, &mount_id, page_id.as_str(), parent_path)
         }
@@ -162,6 +158,37 @@ pub fn resolve_page_path_entries(
     };
     resolver.resolve_page(page_id.as_str())?;
     Ok(resolver.entries)
+}
+
+fn synthetic_workspace_root_entries(mount_id: &MountId) -> Vec<TreeEntry> {
+    vec![
+        synthetic_root_entry(
+            mount_id,
+            NOTION_PRIVATE_ROOT_ID,
+            NOTION_PRIVATE_ROOT_DIR,
+            NOTION_PRIVATE_ROOT_DIR,
+        ),
+        synthetic_root_entry(
+            mount_id,
+            NOTION_WORKSPACE_ROOT_ID,
+            NOTION_WORKSPACE_ROOT_DIR,
+            NOTION_WORKSPACE_ROOT_DIR,
+        ),
+    ]
+}
+
+fn synthetic_root_entry(mount_id: &MountId, remote_id: &str, title: &str, path: &str) -> TreeEntry {
+    TreeEntry {
+        mount_id: mount_id.clone(),
+        remote_id: RemoteId::new(remote_id),
+        kind: EntityKind::Directory,
+        title: title.to_string(),
+        path: PathBuf::from(path),
+        hydration: HydrationState::Virtual,
+        content_hash: None,
+        remote_edited_at: None,
+        stub_frontmatter: None,
+    }
 }
 
 struct ExactPathResolver<'a> {
@@ -235,10 +262,14 @@ impl ExactPathResolver<'_> {
 
     fn parent_listing(&mut self, parent: Option<&ParentDto>) -> LocalityResult<ParentListing> {
         let Some(parent) = parent else {
-            return Ok(ParentListing::Root(PathBuf::new()));
+            return Ok(ParentListing::Root(PathBuf::from(
+                NOTION_WORKSPACE_ROOT_DIR,
+            )));
         };
         if parent.workspace == Some(true) || parent.kind == "workspace" {
-            return Ok(ParentListing::Root(PathBuf::new()));
+            return Ok(ParentListing::Root(PathBuf::from(
+                NOTION_WORKSPACE_ROOT_DIR,
+            )));
         }
         if let Some(page_id) = parent.page_id.as_deref() {
             let parent_entry = self.resolve_page(page_id)?;
@@ -285,6 +316,12 @@ impl ExactPathResolver<'_> {
         kind: EntityKind,
     ) -> LocalityResult<TreeEntry> {
         let entries = match parent {
+            ParentListing::Root(parent_path)
+                if self.root_page_id.is_none()
+                    && parent_path == Path::new(NOTION_WORKSPACE_ROOT_DIR) =>
+            {
+                list_workspace_root_children(self.api, self.mount_id.clone(), &parent_path)?
+            }
             ParentListing::Root(parent_path) => list_root_children(
                 self.api,
                 self.mount_id.clone(),
@@ -417,14 +454,38 @@ fn list_root_children(
         return Ok(vec![page_entry(mount_id, &page, title, path)]);
     }
 
+    Ok(synthetic_workspace_root_entries(&mount_id))
+}
+
+fn list_workspace_root_children(
+    api: &dyn NotionApi,
+    mount_id: MountId,
+    parent_path: &Path,
+) -> LocalityResult<Vec<TreeEntry>> {
+    let mut used_paths = BTreeSet::new();
+    let projection = project_workspace_root(api, &mount_id, parent_path, &mut used_paths)?;
+    Ok(projection.listing_entries)
+}
+
+struct WorkspaceRootProjection {
+    tree_entries: Vec<TreeEntry>,
+    listing_entries: Vec<TreeEntry>,
+}
+
+fn project_workspace_root(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    parent_path: &Path,
+    used_paths: &mut BTreeSet<PathBuf>,
+) -> LocalityResult<WorkspaceRootProjection> {
     let pages = search_all_pages(api)?;
+    let databases = search_all_databases(api)?;
     let accessible_page_ids = pages
         .iter()
         .map(|page| page.id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut entries = Vec::new();
-
     let mut root_children = Vec::new();
+
     for page in pages
         .iter()
         .filter(|page| is_workspace_root_page(page, &accessible_page_ids))
@@ -436,7 +497,7 @@ fn list_root_children(
         });
     }
 
-    for database in search_all_databases(api)?
+    for database in databases
         .iter()
         .filter(|database| is_workspace_root_parent(database.parent.as_ref(), &accessible_page_ids))
     {
@@ -447,11 +508,38 @@ fn list_root_children(
         });
     }
 
-    for projected in allocate_child_paths(parent_path, root_children, &mut used_paths) {
-        push_projected_listing_entry(&mount_id, projected, &mut entries);
+    let mut tree_entries = Vec::new();
+    let mut listing_entries = Vec::new();
+    let projected_root_children = allocate_child_paths(parent_path, root_children, used_paths);
+    for projected in projected_root_children.iter().cloned() {
+        push_projected_listing_entry(mount_id, projected, &mut listing_entries);
+    }
+    for projected in projected_root_children {
+        push_projected_tree_entry(api, mount_id, projected, used_paths, &mut tree_entries)?;
     }
 
-    Ok(entries)
+    let projected_page_ids = tree_entries
+        .iter()
+        .filter(|entry| entry.kind == EntityKind::Page)
+        .map(|entry| entry.remote_id.0.clone())
+        .collect::<BTreeSet<_>>();
+    let fallback_pages = pages
+        .iter()
+        .filter(|page| !projected_page_ids.contains(&page.id))
+        .map(|page| ProjectedChild::Page {
+            page: page.clone(),
+            title: page_title(page),
+        })
+        .collect::<Vec<_>>();
+    for projected in allocate_child_paths(parent_path, fallback_pages, used_paths) {
+        push_projected_listing_entry(mount_id, projected.clone(), &mut listing_entries);
+        push_projected_listing_entry(mount_id, projected, &mut tree_entries);
+    }
+
+    Ok(WorkspaceRootProjection {
+        tree_entries,
+        listing_entries,
+    })
 }
 
 fn search_all_pages(api: &dyn NotionApi) -> LocalityResult<Vec<PageDto>> {
@@ -521,6 +609,7 @@ fn search_all_databases(api: &dyn NotionApi) -> LocalityResult<Vec<DatabaseDto>>
     Ok(databases)
 }
 
+#[derive(Clone)]
 enum ProjectedChild {
     Page {
         page: PageDto,
@@ -554,6 +643,7 @@ impl ProjectedChild {
     }
 }
 
+#[derive(Clone)]
 struct ProjectedChildWithPath {
     child: ProjectedChild,
     path: PathBuf,
@@ -1106,10 +1196,13 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ProjectedChild, allocate_child_paths, allocate_page_path, resolve_page_path_entries,
-        slugify_title,
+        NOTION_PRIVATE_ROOT_DIR, NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_DIR,
+        NOTION_WORKSPACE_ROOT_ID, ProjectedChild, allocate_child_paths, allocate_page_path,
+        enumerate_root_page_tree, enumerate_shared_pages, list_container_children,
+        resolve_page_path_entries, slugify_title,
     };
-    use locality_core::model::{MountId, RemoteId};
+    use locality_connector::ChildContainer;
+    use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
     use locality_core::path_projection::PAGE_DOCUMENT_FILENAME;
     use locality_core::{LocalityError, LocalityResult};
 
@@ -1316,17 +1409,264 @@ mod tests {
 
         assert_eq!(
             resolved.path,
-            Path::new("engineering-wiki")
+            Path::new(NOTION_WORKSPACE_ROOT_DIR)
+                .join("engineering-wiki")
                 .join("standups-with-locality")
                 .join("2026-06-26")
                 .join(PAGE_DOCUMENT_FILENAME)
         );
         assert_ne!(
             resolved.path,
-            Path::new("engineering-wiki")
+            Path::new(NOTION_WORKSPACE_ROOT_DIR)
+                .join("engineering-wiki")
                 .join("2026-06-26")
                 .join(PAGE_DOCUMENT_FILENAME)
         );
+    }
+
+    #[test]
+    fn workspace_enumeration_adds_synthetic_roots_and_places_workspace_objects_under_workspace() {
+        let api = FakeNotionApi::new()
+            .with_page(page_with_title(
+                "shared-launch",
+                "Shared Launch",
+                workspace_parent(),
+            ))
+            .with_page(page_with_title(
+                "title-private",
+                "Private",
+                workspace_parent(),
+            ))
+            .with_database(database_with_title(
+                "tasks-db",
+                "Tasks",
+                workspace_parent(),
+                Vec::new(),
+            ));
+
+        let entries = enumerate_shared_pages(&api, MountId::new("notion-main"))
+            .expect("enumerate shared pages");
+
+        assert_tree_entry(
+            &entries,
+            NOTION_PRIVATE_ROOT_ID,
+            EntityKind::Directory,
+            NOTION_PRIVATE_ROOT_DIR,
+            NOTION_PRIVATE_ROOT_DIR,
+            HydrationState::Virtual,
+        );
+        assert_tree_entry(
+            &entries,
+            NOTION_WORKSPACE_ROOT_ID,
+            EntityKind::Directory,
+            NOTION_WORKSPACE_ROOT_DIR,
+            NOTION_WORKSPACE_ROOT_DIR,
+            HydrationState::Virtual,
+        );
+        assert_tree_entry(
+            &entries,
+            "shared-launch",
+            EntityKind::Page,
+            "Shared Launch",
+            "Workspace/shared-launch/page.md",
+            HydrationState::Stub,
+        );
+        assert_tree_entry(
+            &entries,
+            "title-private",
+            EntityKind::Page,
+            "Private",
+            "Workspace/private/page.md",
+            HydrationState::Stub,
+        );
+        assert_tree_entry(
+            &entries,
+            "tasks-db",
+            EntityKind::Database,
+            "Tasks",
+            "Workspace/tasks",
+            HydrationState::Stub,
+        );
+    }
+
+    #[test]
+    fn root_page_enumeration_does_not_add_workspace_synthetic_roots() {
+        let api = FakeNotionApi::new().with_page(page_with_title(
+            "root-page",
+            "Root Page",
+            workspace_parent(),
+        ));
+
+        let entries = enumerate_root_page_tree(
+            &api,
+            MountId::new("notion-main"),
+            &RemoteId::new("root-page"),
+        )
+        .expect("enumerate root page tree");
+
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.remote_id.as_str() != NOTION_PRIVATE_ROOT_ID)
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.remote_id.as_str() != NOTION_WORKSPACE_ROOT_ID)
+        );
+        assert_tree_entry(
+            &entries,
+            "root-page",
+            EntityKind::Page,
+            "Root Page",
+            "root-page/page.md",
+            HydrationState::Stub,
+        );
+    }
+
+    #[test]
+    fn workspace_root_children_list_synthetic_roots_and_workspace_source_root_lists_remote_children()
+     {
+        let api = FakeNotionApi::new().with_page(page_with_title(
+            "team-page",
+            "Team Page",
+            workspace_parent(),
+        ));
+
+        let root_children = list_container_children(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            ChildContainer::Root,
+            Path::new(""),
+        )
+        .expect("list mount root children");
+
+        assert_tree_entry(
+            &root_children,
+            NOTION_PRIVATE_ROOT_ID,
+            EntityKind::Directory,
+            NOTION_PRIVATE_ROOT_DIR,
+            NOTION_PRIVATE_ROOT_DIR,
+            HydrationState::Virtual,
+        );
+        assert_tree_entry(
+            &root_children,
+            NOTION_WORKSPACE_ROOT_ID,
+            EntityKind::Directory,
+            NOTION_WORKSPACE_ROOT_DIR,
+            NOTION_WORKSPACE_ROOT_DIR,
+            HydrationState::Virtual,
+        );
+
+        let workspace_children = list_container_children(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            ChildContainer::SourceRoot(RemoteId::new(NOTION_WORKSPACE_ROOT_ID)),
+            Path::new(NOTION_WORKSPACE_ROOT_DIR),
+        )
+        .expect("list workspace synthetic root");
+
+        assert_tree_entry(
+            &workspace_children,
+            "team-page",
+            EntityKind::Page,
+            "Team Page",
+            "Workspace/team-page/page.md",
+            HydrationState::Stub,
+        );
+
+        let private_children = list_container_children(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            ChildContainer::SourceRoot(RemoteId::new(NOTION_PRIVATE_ROOT_ID)),
+            Path::new(NOTION_PRIVATE_ROOT_DIR),
+        )
+        .expect("list private synthetic root");
+
+        assert!(private_children.is_empty());
+    }
+
+    #[test]
+    fn workspace_source_root_lists_fallback_searchable_pages_under_workspace() {
+        let api = FakeNotionApi::new()
+            .with_page(page_with_title(
+                "root-page",
+                "Root Page",
+                workspace_parent(),
+            ))
+            .with_page(page_with_title(
+                "search-only-child",
+                "Search Only Child",
+                page_parent("root-page"),
+            ));
+
+        let workspace_children = list_container_children(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            ChildContainer::SourceRoot(RemoteId::new(NOTION_WORKSPACE_ROOT_ID)),
+            Path::new(NOTION_WORKSPACE_ROOT_DIR),
+        )
+        .expect("list workspace synthetic root");
+
+        assert_tree_entry(
+            &workspace_children,
+            "root-page",
+            EntityKind::Page,
+            "Root Page",
+            "Workspace/root-page/page.md",
+            HydrationState::Stub,
+        );
+        assert_tree_entry(
+            &workspace_children,
+            "search-only-child",
+            EntityKind::Page,
+            "Search Only Child",
+            "Workspace/search-only-child/page.md",
+            HydrationState::Stub,
+        );
+    }
+
+    #[test]
+    fn root_page_mount_rejects_notion_source_root_children() {
+        let api = FakeNotionApi::new();
+        let root_page_id = RemoteId::new("root-page");
+
+        let error = list_container_children(
+            &api,
+            MountId::new("notion-main"),
+            Some(&root_page_id),
+            ChildContainer::SourceRoot(RemoteId::new(NOTION_WORKSPACE_ROOT_ID)),
+            Path::new(NOTION_WORKSPACE_ROOT_DIR),
+        )
+        .expect_err("source roots are only valid for workspace mounts");
+
+        assert!(matches!(
+            error,
+            LocalityError::InvalidState(message)
+                if message.contains("source roots") && message.contains("workspace mounts")
+        ));
+    }
+
+    fn assert_tree_entry(
+        entries: &[TreeEntry],
+        remote_id: &str,
+        kind: EntityKind,
+        title: &str,
+        path: &str,
+        hydration: HydrationState,
+    ) {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.remote_id.as_str() == remote_id)
+            .unwrap_or_else(|| panic!("missing entry `{remote_id}`"));
+        assert_eq!(entry.kind, kind, "{remote_id}");
+        assert_eq!(entry.title, title, "{remote_id}");
+        assert_eq!(entry.path, Path::new(path), "{remote_id}");
+        assert_eq!(entry.hydration, hydration, "{remote_id}");
     }
 
     #[test]
@@ -1553,7 +1893,11 @@ mod tests {
         }
 
         fn search_pages(&self, _start_cursor: Option<&str>) -> LocalityResult<PageListDto> {
-            Ok(PageListDto::default())
+            Ok(PageListDto {
+                results: self.pages.values().cloned().collect(),
+                next_cursor: None,
+                has_more: false,
+            })
         }
 
         fn search_databases(&self, _start_cursor: Option<&str>) -> LocalityResult<DatabaseListDto> {
