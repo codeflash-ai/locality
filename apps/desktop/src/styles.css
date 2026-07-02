@@ -1474,19 +1474,44 @@ p {
   font-size: 20px;
 }
 
-.workspace-card > div:first-child,
+.workspace-card {
+  align-items: start;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(300px, 420px);
+}
+
+.workspace-summary,
 .mount-hero > div:nth-child(2) {
   min-width: 0;
 }
 
-.workspace-card .button-row {
-  flex: 0 0 auto;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+.workspace-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+}
+
+.workspace-actions .secondary-button,
+.workspace-actions .live-mode-control {
+  justify-content: center;
+  width: 100%;
 }
 
 .workspace-card .path-line {
   margin-top: 4px;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+@media (max-width: 920px) {
+  .workspace-card {
+    grid-template-columns: 1fr;
+  }
+
+  .workspace-actions {
+    grid-template-columns: 1fr;
+  }
 }
 
 .panel {

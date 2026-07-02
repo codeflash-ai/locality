@@ -1981,12 +1981,12 @@ function HomeView({
       ) : (
         <>
           <section className="workspace-card">
-            <div>
+            <div className="workspace-summary">
               <p className="label">Connected workspace</p>
               <h2>{snapshot.mount.workspaceName}</h2>
               <p className="path-line">{snapshot.mount.localPath}</p>
             </div>
-            <div className="button-row">
+            <div className="workspace-actions">
               <button
                 className={`live-mode-control has-tooltip ${liveModeEnabled ? "active" : ""}`}
                 aria-pressed={liveModeEnabled}
