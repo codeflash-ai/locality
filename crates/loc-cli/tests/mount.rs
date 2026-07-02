@@ -604,6 +604,7 @@ fn loc_command(loc: &str, state_root: &Path) -> Command {
     command
         .env("LOCALITY_STATE_DIR", state_root)
         .env("LOCALITY_DAEMON_DISABLE", "1")
+        .env("LOCALITY_CREDENTIAL_STORE", "file")
         .env_remove(TOKEN_ENV);
     command
 }

@@ -308,7 +308,7 @@ renamed_dir="$child_dir/locality-fuse-smoke-dir-renamed-$$"
 mkdir "$draft_dir"
 mv "$draft_dir" "$renamed_dir"
 assert_status_contains "$renamed_dir" '"pending_virtual_create"'
-rm -r "$renamed_dir"
+rm -rf "$renamed_dir"
 assert_status_contains "$child_dir" '"clean": true'
 
 echo "ok: Linux FUSE smoke test completed"
