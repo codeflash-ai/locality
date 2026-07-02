@@ -10537,18 +10537,26 @@ mod tests {
 
     #[test]
     fn virtual_projection_source_ready_wait_runs_before_provider_registration() {
-        assert!(virtual_projection_waits_for_mount_point_children_before_registration(
-            &ProjectionMode::MacosFileProvider
-        ));
-        assert!(virtual_projection_waits_for_mount_point_children_before_registration(
-            &ProjectionMode::WindowsCloudFiles
-        ));
-        assert!(!virtual_projection_waits_for_mount_point_children_before_registration(
-            &ProjectionMode::LinuxFuse
-        ));
-        assert!(!virtual_projection_waits_for_mount_point_children_before_registration(
-            &ProjectionMode::PlainFiles
-        ));
+        assert!(
+            virtual_projection_waits_for_mount_point_children_before_registration(
+                &ProjectionMode::MacosFileProvider
+            )
+        );
+        assert!(
+            virtual_projection_waits_for_mount_point_children_before_registration(
+                &ProjectionMode::WindowsCloudFiles
+            )
+        );
+        assert!(
+            !virtual_projection_waits_for_mount_point_children_before_registration(
+                &ProjectionMode::LinuxFuse
+            )
+        );
+        assert!(
+            !virtual_projection_waits_for_mount_point_children_before_registration(
+                &ProjectionMode::PlainFiles
+            )
+        );
     }
 
     #[test]
