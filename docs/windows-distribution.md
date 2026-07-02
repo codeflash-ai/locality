@@ -59,6 +59,11 @@ The NSIS uninstall hook removes the installed sidecars, the per-user Windows
 login item, and Locality-managed terminal command shims. It does not delete
 user-visible mount folders.
 
+Because the current-user install directory is also the default Locality state
+root, **Reset Local State** removes metadata, caches, provider state, logs, and
+SQLite state from this folder while preserving the installed desktop executable,
+sidecars, uninstaller, and terminal command shim directory.
+
 ## Code Signing
 
 Release builds Authenticode-sign the sidecars before NSIS packaging and sign the

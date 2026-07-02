@@ -4151,9 +4151,37 @@ fn clear_state_root_contents(state_root: &Path) -> Result<(), String> {
     {
         let entry =
             entry.map_err(|error| format!("Could not inspect Locality state entry: {error}"))?;
+        if should_preserve_state_reset_entry(&entry.path()) {
+            continue;
+        }
         remove_path_if_exists(&entry.path())?;
     }
     Ok(())
+}
+
+fn should_preserve_state_reset_entry(path: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "locality.exe"
+                | "locality-desktop.exe"
+                | "loc.exe"
+                | "localityd.exe"
+                | "locality-cloud-files.exe"
+                | "uninstall.exe"
+                | "bin"
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 fn connection_secret_refs(state_root: &Path) -> Vec<String> {
@@ -11298,6 +11326,57 @@ mod tests {
                 .expect("read state root")
                 .next()
                 .is_none()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn state_clear_preserves_windows_installed_app_files() {
+        let temp = TestTempDir::new("clear-state-root-windows-install");
+        let state_root = temp.path().join("Locality");
+        fs::create_dir_all(state_root.join("content/notion-main")).expect("create content");
+        fs::write(state_root.join("state.sqlite3"), b"db").expect("write db");
+        fs::write(state_root.join("Locality.exe"), b"app").expect("write app exe");
+        fs::write(state_root.join("locality-desktop.exe"), b"desktop").expect("write desktop exe");
+        fs::write(state_root.join("localityd.exe"), b"daemon").expect("write daemon exe");
+        fs::write(state_root.join("locality-cloud-files.exe"), b"provider")
+            .expect("write provider exe");
+        fs::write(state_root.join("loc.exe"), b"cli").expect("write cli exe");
+        fs::write(state_root.join("uninstall.exe"), b"uninstall").expect("write uninstaller");
+        fs::create_dir_all(state_root.join("bin")).expect("create bin");
+        fs::write(state_root.join("bin/loc.cmd"), b"shim").expect("write terminal shim");
+
+        clear_state_root_contents(&state_root).expect("clear state");
+
+        assert!(!state_root.join("state.sqlite3").exists());
+        assert!(!state_root.join("content").exists());
+        assert_eq!(
+            fs::read(state_root.join("Locality.exe")).expect("read app exe"),
+            b"app"
+        );
+        assert_eq!(
+            fs::read(state_root.join("locality-desktop.exe")).expect("read desktop exe"),
+            b"desktop"
+        );
+        assert_eq!(
+            fs::read(state_root.join("localityd.exe")).expect("read daemon exe"),
+            b"daemon"
+        );
+        assert_eq!(
+            fs::read(state_root.join("locality-cloud-files.exe")).expect("read provider exe"),
+            b"provider"
+        );
+        assert_eq!(
+            fs::read(state_root.join("loc.exe")).expect("read cli exe"),
+            b"cli"
+        );
+        assert_eq!(
+            fs::read(state_root.join("uninstall.exe")).expect("read uninstaller"),
+            b"uninstall"
+        );
+        assert_eq!(
+            fs::read(state_root.join("bin/loc.cmd")).expect("read terminal shim"),
+            b"shim"
         );
     }
 
