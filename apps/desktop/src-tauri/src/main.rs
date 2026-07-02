@@ -401,6 +401,7 @@ static LIVE_MODE_REMOTE_PULL_SCAN_TIMES: OnceLock<Mutex<BTreeMap<MountId, Instan
 static LIVE_MODE_LOCAL_RECONCILE_TIMES: OnceLock<Mutex<BTreeMap<PathBuf, Instant>>> =
     OnceLock::new();
 static LIVE_MODE_TICK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static LOCAL_STATE_RESET_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR: OnceLock<
     Mutex<WindowsCloudFilesProviderSupervisor>,
@@ -2403,7 +2404,7 @@ fn set_auto_save_for_file(change: LiveModeFileChange) -> ActionReport {
 
 #[tauri::command]
 fn quit_completely(app: AppHandle) -> ActionReport {
-    stop_windows_cloud_files_provider_supervisor();
+    stop_windows_cloud_files_provider_supervisor_for_shutdown();
     app.exit(0);
     ActionReport {
         ok: true,
@@ -2761,19 +2762,19 @@ impl MountLiveModeSummary {
                 ..Self::off()
             };
         };
-        if !record.enabled
-            && record.state == MountLiveModeState::Error
-            && !record
+        if !record.enabled && record.state == MountLiveModeState::Error {
+            let should_pause = record
                 .last_reason
                 .as_deref()
-                .is_some_and(live_mode_failure_should_pause)
-        {
-            return Self {
-                pending_count,
-                review_count,
-                covered_count,
-                ..Self::off()
-            };
+                .is_some_and(live_mode_failure_should_pause);
+            if pending_changes.is_empty() || !should_pause {
+                return Self {
+                    pending_count,
+                    review_count,
+                    covered_count,
+                    ..Self::off()
+                };
+            }
         }
         let state = mount_live_mode_state_label(record);
 
@@ -4130,13 +4131,18 @@ fn install_marker_path(state_root: &Path) -> PathBuf {
 }
 
 fn reset_locality_state_at(state_root: &Path) -> Result<(), String> {
+    LOCAL_STATE_RESET_IN_PROGRESS.store(true, Ordering::Release);
     let secret_refs = connection_secret_refs(state_root);
-    stop_daemon_for_reset(state_root);
-    reset_platform_projection_state();
-    remove_connection_secrets(state_root, secret_refs);
-    remove_desktop_support_state()?;
-    clear_state_root_contents(state_root)?;
-    Ok(())
+    let result = (|| {
+        stop_daemon_for_reset(state_root);
+        reset_platform_projection_state(state_root)?;
+        remove_connection_secrets(state_root, secret_refs);
+        remove_desktop_support_state()?;
+        clear_state_root_contents(state_root)?;
+        Ok(())
+    })();
+    LOCAL_STATE_RESET_IN_PROGRESS.store(false, Ordering::Release);
+    result
 }
 
 fn clear_state_root_contents(state_root: &Path) -> Result<(), String> {
@@ -4219,7 +4225,7 @@ fn stop_daemon_for_reset(state_root: &Path) {
     }
 }
 
-fn reset_platform_projection_state() {
+fn reset_platform_projection_state(state_root: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         if let Err(error) = run_macos_file_provider_helper("reset", Vec::new()) {
@@ -4233,7 +4239,7 @@ fn reset_platform_projection_state() {
             );
         }
     }
-    stop_windows_cloud_files_provider_supervisor();
+    stop_windows_cloud_files_provider_supervisor(state_root)
 }
 
 fn remove_connection_secrets(state_root: &Path, secret_refs: Vec<String>) {
@@ -4510,6 +4516,10 @@ fn schedule_tray_icon_refresh(app: AppHandle) {
 }
 
 fn schedule_desktop_surface_refresh(app: AppHandle) {
+    if LOCAL_STATE_RESET_IN_PROGRESS.load(Ordering::Acquire) {
+        return;
+    }
+
     let delay = {
         let mut state = SURFACE_REFRESH_STATE
             .get_or_init(|| Mutex::new(SurfaceRefreshState::default()))
@@ -6541,12 +6551,16 @@ fn activate_virtual_projection_mount(
             mount.mount_id.0, mount.projection
         ),
     );
-    if wait_for_entities && mount.projection == ProjectionMode::MacosFileProvider {
+    if wait_for_entities
+        && virtual_projection_waits_for_mount_point_children_before_registration(&mount.projection)
+    {
         wait_for_virtual_projection_mount_point_children(state_root, mount)?;
     }
     register_virtual_projection(state_root, mount)?;
     prefetch_virtual_projection_root(state_root, mount)?;
-    if wait_for_entities && mount.projection != ProjectionMode::MacosFileProvider {
+    if wait_for_entities
+        && !virtual_projection_waits_for_mount_point_children_before_registration(&mount.projection)
+    {
         wait_for_mount_entities(state_root, &mount.mount_id)?;
     }
     ensure_virtual_projection_runtime(state_root, mount)?;
@@ -6570,6 +6584,15 @@ fn verify_virtual_projection_mount_root(mount: &MountConfig) -> Result<(), Strin
         | ProjectionMode::PlainFiles
         | ProjectionMode::WindowsCloudFiles => Ok(()),
     }
+}
+
+fn virtual_projection_waits_for_mount_point_children_before_registration(
+    projection: &ProjectionMode,
+) -> bool {
+    matches!(
+        projection,
+        ProjectionMode::MacosFileProvider | ProjectionMode::WindowsCloudFiles
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -6768,7 +6791,7 @@ fn wait_for_virtual_projection_mount_point_children(
         "info",
         "file_provider.source_ready.wait_started",
         format!(
-            "waiting up to {}s for `{mount_id}:{mount_point_container_identifier}` to expose mount-point children before registering macOS File Provider",
+            "waiting up to {}s for `{mount_id}:{mount_point_container_identifier}` to expose mount-point children before registering virtual projection provider",
             VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT.as_secs()
         ),
     );
@@ -7001,6 +7024,153 @@ fn repair_macos_file_provider_mount_roots(_store: &mut SqliteStateStore) -> Resu
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct WindowsCloudFilesRuntimeProcess {
+    pid: u32,
+    helper: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+fn windows_cloud_files_runtime_processes_from_state(
+    state_root: &Path,
+) -> Result<Vec<WindowsCloudFilesRuntimeProcess>, String> {
+    let lifecycle_dir = state_root.join("cloud-files-lifecycle");
+    if !lifecycle_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut processes = Vec::new();
+    for entry in fs::read_dir(&lifecycle_dir).map_err(|error| {
+        format!(
+            "Could not inspect Windows Cloud Files lifecycle directory `{}`: {error}",
+            lifecycle_dir.display()
+        )
+    })? {
+        let entry = entry
+            .map_err(|error| format!("Could not inspect Windows Cloud Files metadata: {error}"))?;
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let bytes = fs::read(entry.path()).map_err(|error| {
+            format!(
+                "Could not read Windows Cloud Files metadata `{}`: {error}",
+                entry.path().display()
+            )
+        })?;
+        let Ok(process) = serde_json::from_slice::<WindowsCloudFilesRuntimeProcess>(&bytes) else {
+            continue;
+        };
+        if process.pid == 0 || process.helper.as_os_str().is_empty() {
+            continue;
+        }
+        processes.push(process);
+    }
+
+    processes.sort_by(|left, right| {
+        left.pid
+            .cmp(&right.pid)
+            .then_with(|| left.helper.cmp(&right.helper))
+    });
+    processes.dedup();
+    Ok(processes)
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_cloud_files_runtime_processes_from_state(state_root: &Path) -> Result<(), String> {
+    for process in windows_cloud_files_runtime_processes_from_state(state_root)? {
+        if !windows_process_is_running(process.pid, &process.helper) {
+            continue;
+        }
+        stop_windows_process(process.pid).map_err(|error| {
+            format!(
+                "Could not stop Windows Cloud Files provider `{}` (pid {}): {}",
+                process.helper.display(),
+                process.pid,
+                error
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_is_running(pid: u32, helper: &Path) -> bool {
+    let filter = format!("PID eq {pid}");
+    let mut command = Command::new("tasklist");
+    command.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
+    configure_hidden_windows_command(&mut command);
+    let Ok(output) = command.output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = helper
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("locality-cloud-files.exe");
+    let pid = pid.to_string();
+    stdout.lines().any(|line| {
+        let columns = parse_tasklist_csv_line(line);
+        let image = columns.first().map(String::as_str).unwrap_or_default();
+        let task_pid = columns.get(1).map(String::as_str).unwrap_or_default();
+        task_pid == pid
+            && (image.eq_ignore_ascii_case(expected)
+                || image.eq_ignore_ascii_case("locality-cloud-files.exe"))
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn parse_tasklist_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+    while let Some(character) = chars.next() {
+        match character {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                current.push('"');
+                let _ = chars.next();
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                fields.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+    fields.push(current.trim().to_string());
+    fields
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_process(pid: u32) -> Result<(), String> {
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+    configure_hidden_windows_command(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("Could not stop pid {pid}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    Err(if message.is_empty() {
+        format!("taskkill exited with {}", output.status)
+    } else {
+        message
+    })
+}
+
+#[cfg(target_os = "windows")]
 #[derive(Default)]
 struct WindowsCloudFilesProviderSupervisor;
 
@@ -7131,6 +7301,10 @@ fn start_windows_cloud_files_provider_supervisor() {
         std::thread::spawn(|| {
             let state_root = default_state_root();
             loop {
+                if LOCAL_STATE_RESET_IN_PROGRESS.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    continue;
+                }
                 if let Err(error) = ensure_virtual_projection_runtimes_for_state(&state_root) {
                     eprintln!(
                         "loc desktop could not supervise Windows Cloud Files provider: {error}"
@@ -7142,20 +7316,38 @@ fn start_windows_cloud_files_provider_supervisor() {
     }
 }
 
-fn stop_windows_cloud_files_provider_supervisor() {
+fn stop_windows_cloud_files_provider_supervisor(state_root: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        let Some(supervisor) = WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR.get() else {
-            return;
-        };
-        match supervisor.lock() {
-            Ok(mut supervisor) => supervisor.stop_all(&default_state_root()),
-            Err(_) => {
-                eprintln!("loc desktop could not stop Windows Cloud Files providers: lock poisoned")
+        if let Some(supervisor) = WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR.get() {
+            match supervisor.lock() {
+                Ok(mut supervisor) => supervisor.stop_all(state_root),
+                Err(_) => {
+                    return Err(
+                        "Could not stop Windows Cloud Files providers: lock poisoned".to_string(),
+                    );
+                }
             }
         }
+        stop_windows_cloud_files_runtime_processes_from_state(state_root)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = state_root;
+        Ok(())
     }
 }
+
+#[cfg(target_os = "windows")]
+fn stop_windows_cloud_files_provider_supervisor_for_shutdown() {
+    if let Err(error) = stop_windows_cloud_files_provider_supervisor(&default_state_root()) {
+        eprintln!("loc desktop could not stop Windows Cloud Files providers: {error}");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stop_windows_cloud_files_provider_supervisor_for_shutdown() {}
 
 fn daemon_is_ready(state_root: &Path) -> bool {
     matches!(
@@ -8695,8 +8887,9 @@ mod tests {
         summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
         tray_popover_anchor, tray_popover_position, unsupported_notion_locator_url_message,
         validate_mount_root, virtual_projection_prefetch_container_identifiers,
-        virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
-        wake_live_mode_runner, write_terminal_cli_path_section,
+        virtual_projection_refresh_signal_identifiers,
+        virtual_projection_waits_for_mount_point_children_before_registration,
+        wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -8704,6 +8897,10 @@ mod tests {
         live_mode_e2e_notion_api, live_mode_e2e_page_id, live_mode_e2e_page_path,
         live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_tick_blocking,
         unique_suffix,
+    };
+    #[cfg(target_os = "windows")]
+    use super::{
+        WindowsCloudFilesRuntimeProcess, windows_cloud_files_runtime_processes_from_state,
     };
 
     #[test]
@@ -9598,6 +9795,22 @@ mod tests {
     }
 
     #[test]
+    fn live_mode_summary_hides_stale_disabled_pause_without_pending_changes() {
+        let record = MountLiveModeRecord::new(MountId::new("notion-main"), true, "1").error(
+            "Live Mode paused for `Roadmap`: conflict.",
+            "2",
+            "2",
+        );
+
+        let summary = super::MountLiveModeSummary::from_record(Some(&record), &[]);
+
+        assert!(!summary.enabled);
+        assert_eq!(summary.state, "off");
+        assert_eq!(summary.label, "Live Mode off");
+        assert_eq!(summary.reason, None);
+    }
+
+    #[test]
     fn live_mode_transient_failures_remain_enabled_for_retry() {
         let temp = TestTempDir::new("live-mode-transient-failure");
         let mount_id = MountId::new("notion-main");
@@ -10320,6 +10533,22 @@ mod tests {
             virtual_projection_prefetch_container_identifiers(&mount),
             vec!["root".to_string(), "mount:notion-main".to_string()]
         );
+    }
+
+    #[test]
+    fn virtual_projection_source_ready_wait_runs_before_provider_registration() {
+        assert!(virtual_projection_waits_for_mount_point_children_before_registration(
+            &ProjectionMode::MacosFileProvider
+        ));
+        assert!(virtual_projection_waits_for_mount_point_children_before_registration(
+            &ProjectionMode::WindowsCloudFiles
+        ));
+        assert!(!virtual_projection_waits_for_mount_point_children_before_registration(
+            &ProjectionMode::LinuxFuse
+        ));
+        assert!(!virtual_projection_waits_for_mount_point_children_before_registration(
+            &ProjectionMode::PlainFiles
+        ));
     }
 
     #[test]
@@ -11478,6 +11707,45 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_reset_runtime_metadata_loads_provider_processes_without_sqlite_state() {
+        let temp = TestTempDir::new("windows-reset-runtime-metadata");
+        let state_root = temp.path().join("Locality");
+        fs::create_dir_all(state_root.join("cloud-files-lifecycle")).expect("create lifecycle dir");
+        fs::write(
+            state_root.join("cloud-files-lifecycle/provider-a.json"),
+            r#"{
+  "root_id": "root-a",
+  "pid": 1200,
+  "helper": "C:\\Users\\vm-user\\AppData\\Local\\Locality\\locality-cloud-files.exe",
+  "sync_root": "C:\\Users\\vm-user\\Locality",
+  "state_dir": "C:\\Users\\vm-user\\AppData\\Local\\Locality",
+  "stdout_log": "C:\\Users\\vm-user\\AppData\\Local\\Locality\\logs\\a.out.log",
+  "stderr_log": "C:\\Users\\vm-user\\AppData\\Local\\Locality\\logs\\a.err.log"
+}"#,
+        )
+        .expect("write lifecycle metadata");
+        fs::write(
+            state_root.join("cloud-files-lifecycle/invalid.json"),
+            b"{not-json",
+        )
+        .expect("write invalid metadata");
+
+        let runtimes =
+            windows_cloud_files_runtime_processes_from_state(&state_root).expect("load runtimes");
+
+        assert_eq!(
+            runtimes,
+            vec![WindowsCloudFilesRuntimeProcess {
+                pid: 1200,
+                helper: PathBuf::from(
+                    r"C:\Users\vm-user\AppData\Local\Locality\locality-cloud-files.exe"
+                ),
+            }]
+        );
+    }
+
     #[test]
     fn state_watcher_ignores_sqlite_and_settings_churn() {
         let temp = TestTempDir::new("state-watch-ignore");
@@ -12400,7 +12668,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
                 let _ = set_menu_bar_visible(app, false);
             }
             "quit_completely" => {
-                stop_windows_cloud_files_provider_supervisor();
+                stop_windows_cloud_files_provider_supervisor_for_shutdown();
                 app.exit(0);
             }
             _ => {}

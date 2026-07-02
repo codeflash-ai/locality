@@ -62,7 +62,11 @@ user-visible mount folders.
 Because the current-user install directory is also the default Locality state
 root, **Reset Local State** removes metadata, caches, provider state, logs, and
 SQLite state from this folder while preserving the installed desktop executable,
-sidecars, uninstaller, and terminal command shim directory.
+sidecars, uninstaller, and terminal command shim directory. On Windows the
+desktop app pauses Cloud Files supervision and stops any persisted
+`locality-cloud-files.exe` runtimes recorded under `cloud-files-lifecycle/`
+before clearing `state.sqlite3`, so the reset path does not race a still-running
+provider against SQLite deletion.
 
 ## Code Signing
 

@@ -31,6 +31,9 @@ use crate::markdown_table::{
 };
 use crate::media::{resolve_media_href_with_content_root, unescape_markdown_href};
 
+const NOTION_RICH_TEXT_CONTENT_LIMIT: usize = 2000;
+const NOTION_RICH_TEXT_SENTENCE_SPLIT_LOOKBACK: usize = 400;
+
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
     let database_create_parent_ids = database_create_parent_ids(&request.plan.operations);
     for precondition in request.remote_preconditions {
@@ -1869,14 +1872,19 @@ fn parse_new_table_append_child(markdown: &str) -> LocalityResult<Value> {
 }
 
 fn rich_text(content: &str) -> Value {
-    json!([
-        {
-            "type": "text",
-            "text": {
-                "content": content,
-            },
-        }
-    ])
+    Value::Array(
+        split_notion_text_content(content)
+            .into_iter()
+            .map(|content| {
+                json!({
+                    "type": "text",
+                    "text": {
+                        "content": content,
+                    },
+                })
+            })
+            .collect(),
+    )
 }
 
 fn rich_text_payload(content: &str, preimage: Option<&[RichTextDto]>) -> LocalityResult<Value> {
@@ -1884,8 +1892,11 @@ fn rich_text_payload(content: &str, preimage: Option<&[RichTextDto]>) -> Localit
     Ok(Value::Array(
         parts
             .iter()
-            .map(RichTextWritePart::to_request_value)
-            .collect::<LocalityResult<Vec<_>>>()?,
+            .map(RichTextWritePart::to_request_values)
+            .collect::<LocalityResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect(),
     ))
 }
 
@@ -1967,24 +1978,13 @@ impl RichTextWritePart {
         }
     }
 
-    fn to_request_value(&self) -> LocalityResult<Value> {
+    fn to_request_values(&self) -> LocalityResult<Vec<Value>> {
         match self {
             Self::Text {
                 content,
                 link,
                 annotations,
-            } => {
-                let mut text = json!({ "content": content });
-                if let Some(link) = link {
-                    text["link"] = json!({ "url": link });
-                }
-                let mut value = json!({
-                    "type": "text",
-                    "text": text,
-                });
-                insert_annotations(&mut value, annotations);
-                Ok(value)
-            }
+            } => text_rich_text_request_value(content, link.as_deref(), annotations),
             Self::Equation {
                 expression,
                 annotations,
@@ -1996,7 +1996,7 @@ impl RichTextWritePart {
                     },
                 });
                 insert_annotations(&mut value, annotations);
-                Ok(value)
+                Ok(vec![value])
             }
             Self::PageMention { id, annotations } => {
                 let mut value = json!({
@@ -2009,7 +2009,7 @@ impl RichTextWritePart {
                     },
                 });
                 insert_annotations(&mut value, annotations);
-                Ok(value)
+                Ok(vec![value])
             }
             Self::DatabaseMention { id, annotations } => {
                 let mut value = json!({
@@ -2022,7 +2022,7 @@ impl RichTextWritePart {
                     },
                 });
                 insert_annotations(&mut value, annotations);
-                Ok(value)
+                Ok(vec![value])
             }
             Self::DateMention {
                 start,
@@ -2046,7 +2046,7 @@ impl RichTextWritePart {
                     value["mention"]["date"]["time_zone"] = json!(time_zone);
                 }
                 insert_annotations(&mut value, annotations);
-                Ok(value)
+                Ok(vec![value])
             }
             Self::UserMention { id, annotations } => {
                 let mut value = json!({
@@ -2059,9 +2059,9 @@ impl RichTextWritePart {
                     },
                 });
                 insert_annotations(&mut value, annotations);
-                Ok(value)
+                Ok(vec![value])
             }
-            Self::Preimage(part) => preimage_part_to_request_value(part),
+            Self::Preimage(part) => preimage_part_to_request_values(part),
         }
     }
 }
@@ -2923,7 +2923,7 @@ fn unescape_markdown_text(value: &str) -> String {
     unescaped
 }
 
-fn preimage_part_to_request_value(part: &RichTextDto) -> LocalityResult<Value> {
+fn preimage_part_to_request_values(part: &RichTextDto) -> LocalityResult<Vec<Value>> {
     let mut value = match part.kind.as_str() {
         "equation" => json!({
             "type": "equation",
@@ -2953,18 +2953,92 @@ fn preimage_part_to_request_value(part: &RichTextDto) -> LocalityResult<Value> {
                 .map(|text| text.content.as_str())
                 .filter(|content| !content.is_empty())
                 .unwrap_or(part.plain_text.as_str());
-            let mut text = json!({ "content": content });
-            if let Some(href) = rich_text_href(part) {
-                text["link"] = json!({ "url": href });
-            }
-            json!({
-                "type": "text",
-                "text": text,
-            })
+            return text_rich_text_request_value(
+                content,
+                rich_text_href(part),
+                &InlineAnnotations::from(&part.annotations),
+            );
         }
     };
     insert_annotations(&mut value, &InlineAnnotations::from(&part.annotations));
-    Ok(value)
+    Ok(vec![value])
+}
+
+fn text_rich_text_request_value(
+    content: &str,
+    link: Option<&str>,
+    annotations: &InlineAnnotations,
+) -> LocalityResult<Vec<Value>> {
+    Ok(split_notion_text_content(content)
+        .into_iter()
+        .map(|content| {
+            let mut text = json!({ "content": content });
+            if let Some(link) = link {
+                text["link"] = json!({ "url": link });
+            }
+            let mut value = json!({
+                "type": "text",
+                "text": text,
+            });
+            insert_annotations(&mut value, annotations);
+            value
+        })
+        .collect())
+}
+
+fn split_notion_text_content(content: &str) -> Vec<String> {
+    if content.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = content;
+    while !remaining.is_empty() {
+        if remaining.chars().count() <= NOTION_RICH_TEXT_CONTENT_LIMIT {
+            chunks.push(remaining.to_string());
+            break;
+        }
+
+        let split_at = preferred_notion_text_split_byte(remaining)
+            .unwrap_or_else(|| char_limit_byte_index(remaining, NOTION_RICH_TEXT_CONTENT_LIMIT));
+        let (chunk, rest) = remaining.split_at(split_at);
+        chunks.push(chunk.to_string());
+        remaining = rest;
+    }
+
+    chunks
+}
+
+fn preferred_notion_text_split_byte(content: &str) -> Option<usize> {
+    let limit_byte = char_limit_byte_index(content, NOTION_RICH_TEXT_CONTENT_LIMIT);
+    let prefix = &content[..limit_byte];
+    let lookback_byte = char_limit_byte_index(
+        prefix,
+        prefix
+            .chars()
+            .count()
+            .saturating_sub(NOTION_RICH_TEXT_SENTENCE_SPLIT_LOOKBACK),
+    );
+    let lookback = &prefix[lookback_byte..];
+    if let Some(index) = lookback.rfind(". ") {
+        return Some(lookback_byte + index + ". ".len());
+    }
+
+    prefix.char_indices().rev().find_map(|(index, ch)| {
+        if ch.is_whitespace() && index > 0 {
+            Some(index + ch.len_utf8())
+        } else {
+            None
+        }
+    })
+}
+
+fn char_limit_byte_index(content: &str, limit: usize) -> usize {
+    content
+        .char_indices()
+        .nth(limit)
+        .map(|(index, _)| index)
+        .unwrap_or(content.len())
 }
 
 fn mention_to_request_value(mention: &crate::dto::MentionRichTextDto) -> LocalityResult<Value> {
@@ -3552,5 +3626,127 @@ fn unsupported_undo_name(operation: &UndoOperation) -> &'static str {
         UndoOperation::RestoreBlockContent { .. }
         | UndoOperation::ArchiveCreatedBlock { .. }
         | UndoOperation::ArchiveCreatedEntity { .. } => "unsupported Notion undo operation",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dto::{LinkDto, TextRichTextDto};
+
+    #[test]
+    fn rich_text_payload_splits_text_content_at_notion_limit() {
+        let content = "a".repeat(NOTION_RICH_TEXT_CONTENT_LIMIT * 2 + 33);
+
+        let payload = rich_text_payload(&content, None).expect("rich text payload");
+        let parts = payload.as_array().expect("payload array");
+
+        assert_eq!(parts.len(), 3);
+        assert_eq!(
+            parts[0]["text"]["content"]
+                .as_str()
+                .expect("first content")
+                .chars()
+                .count(),
+            NOTION_RICH_TEXT_CONTENT_LIMIT
+        );
+        assert_eq!(
+            parts[1]["text"]["content"]
+                .as_str()
+                .expect("second content")
+                .chars()
+                .count(),
+            NOTION_RICH_TEXT_CONTENT_LIMIT
+        );
+        assert_eq!(parts[2]["text"]["content"], "a".repeat(33));
+    }
+
+    #[test]
+    fn split_notion_text_content_prefers_sentence_boundary_near_limit() {
+        let content = format!(
+            "{}. {}",
+            "a".repeat(NOTION_RICH_TEXT_CONTENT_LIMIT - 100),
+            "b".repeat(200)
+        );
+
+        let parts = split_notion_text_content(&content);
+
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].ends_with(". "));
+        assert_eq!(
+            parts[0].chars().count(),
+            NOTION_RICH_TEXT_CONTENT_LIMIT - 98
+        );
+    }
+
+    #[test]
+    fn split_notion_text_content_falls_back_to_space_before_hard_split() {
+        let content = format!(
+            "{} {}",
+            "a".repeat(NOTION_RICH_TEXT_CONTENT_LIMIT - 50),
+            "b".repeat(100)
+        );
+
+        let parts = split_notion_text_content(&content);
+
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].ends_with(' '));
+        assert_eq!(
+            parts[0].chars().count(),
+            NOTION_RICH_TEXT_CONTENT_LIMIT - 49
+        );
+    }
+
+    #[test]
+    fn rich_text_payload_preserves_link_and_annotations_when_splitting() {
+        let content = format!("[{}](https://example.com)", "b".repeat(2050));
+
+        let payload = rich_text_payload(&content, None).expect("rich text payload");
+        let parts = payload.as_array().expect("payload array");
+
+        assert_eq!(parts.len(), 2);
+        for part in parts {
+            assert_eq!(part["text"]["link"]["url"], "https://example.com");
+        }
+    }
+
+    #[test]
+    fn rich_text_payload_splits_preserved_preimage_text() {
+        let preimage = RichTextDto {
+            kind: "text".to_string(),
+            text: Some(TextRichTextDto {
+                content: "c".repeat(2100),
+                link: Some(LinkDto {
+                    url: "https://example.com/preimage".to_string(),
+                }),
+            }),
+            mention: None,
+            equation: None,
+            plain_text: "c".repeat(2100),
+            href: Some("https://example.com/preimage".to_string()),
+            annotations: RichTextAnnotationsDto::default(),
+        };
+        let parts = preimage_part_to_request_values(&preimage).expect("preimage request values");
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0]["text"]["link"]["url"],
+            "https://example.com/preimage"
+        );
+        assert_eq!(
+            parts[1]["text"]["link"]["url"],
+            "https://example.com/preimage"
+        );
+    }
+
+    #[test]
+    fn split_notion_text_content_is_unicode_safe() {
+        let content = "😀".repeat(NOTION_RICH_TEXT_CONTENT_LIMIT + 1);
+
+        let parts = split_notion_text_content(&content);
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].chars().count(), NOTION_RICH_TEXT_CONTENT_LIMIT);
+        assert_eq!(parts[1], "😀");
     }
 }
