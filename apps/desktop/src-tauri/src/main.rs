@@ -7283,22 +7283,77 @@ fn ensure_windows_cloud_files_provider_running(
 fn ensure_windows_cloud_files_providers_for_state(state_root: &Path) -> Result<(), String> {
     let cloud_mounts = load_windows_cloud_files_mounts(state_root)?;
 
+    ensure_windows_cloud_files_providers_for_mounts_with_hooks(
+        state_root,
+        cloud_mounts,
+        ensure_daemon_running,
+        reload_daemon_mounts,
+        ensure_windows_cloud_files_provider_running,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_cloud_files_providers_for_mounts_with_hooks<
+    EnsureDaemon,
+    ReloadDaemon,
+    EnsureProvider,
+>(
+    state_root: &Path,
+    cloud_mounts: Vec<MountConfig>,
+    ensure_daemon: EnsureDaemon,
+    reload_mounts: ReloadDaemon,
+    mut ensure_provider: EnsureProvider,
+) -> Result<(), String>
+where
+    EnsureDaemon: FnOnce(&Path) -> Result<(), String>,
+    ReloadDaemon: FnOnce(&Path) -> Result<(), String>,
+    EnsureProvider: FnMut(&Path, &MountConfig) -> Result<(), String>,
+{
     if cloud_mounts.is_empty() {
         return Ok(());
     }
 
-    ensure_daemon_running(state_root)?;
-    reload_daemon_mounts(state_root)?;
-    let mut mounts_by_root = BTreeMap::new();
+    ensure_daemon(state_root)?;
+    reload_mounts(state_root)?;
+    let mut mounts_by_root: BTreeMap<PathBuf, Vec<MountConfig>> = BTreeMap::new();
     for mount in cloud_mounts {
         mounts_by_root
             .entry(localityd::virtual_fs::virtual_projection_root(&mount))
-            .or_insert(mount);
+            .or_default()
+            .push(mount);
     }
-    for mount in mounts_by_root.values() {
-        ensure_windows_cloud_files_provider_running(state_root, mount)?;
+    let mut failures = Vec::new();
+    for (root, mounts) in mounts_by_root {
+        let mut root_failures = Vec::new();
+        let mut root_started = false;
+        for mount in mounts {
+            match ensure_provider(state_root, &mount) {
+                Ok(()) => {
+                    root_started = true;
+                    break;
+                }
+                Err(error) => {
+                    root_failures.push(format!("{}: {error}", mount.mount_id.0));
+                }
+            }
+        }
+        if !root_started {
+            failures.push(format!(
+                "{} ({})",
+                root.display(),
+                root_failures.join("; ")
+            ));
+        }
     }
-    Ok(())
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Could not start {} Windows Cloud Files provider{}: {}",
+        failures.len(),
+        if failures.len() == 1 { "" } else { "s" },
+        failures.join("; ")
+    ))
 }
 
 #[cfg(target_os = "windows")]
@@ -8927,6 +8982,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::{
         WindowsCloudFilesProviderSupervisor, WindowsCloudFilesRuntimeProcess,
+        ensure_windows_cloud_files_providers_for_mounts_with_hooks,
         windows_cloud_files_runtime_processes_from_state,
     };
 
@@ -11808,6 +11864,115 @@ mod tests {
         assert_eq!(result, Err("source not ready".to_string()));
         assert_eq!(source_checks.get(), 1);
         assert_eq!(start_attempts.get(), 0);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cloud_files_state_supervisor_continues_after_mount_readiness_failure() {
+        use std::cell::{Cell, RefCell};
+
+        let temp = TestTempDir::new("windows-supervisor-sibling-ready");
+        let bad_mount = MountConfig::new(
+            MountId::new("notion-bad"),
+            "notion",
+            temp.path().join("bad-root").join("notion-bad"),
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let good_mount = MountConfig::new(
+            MountId::new("notion-good"),
+            "notion",
+            temp.path().join("good-root").join("notion-good"),
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let daemon_checks = Cell::new(0);
+        let reloads = Cell::new(0);
+        let attempts = RefCell::new(Vec::new());
+
+        let result = ensure_windows_cloud_files_providers_for_mounts_with_hooks(
+            temp.path(),
+            vec![bad_mount.clone(), good_mount.clone()],
+            |state_root| {
+                assert_eq!(state_root, temp.path());
+                daemon_checks.set(daemon_checks.get() + 1);
+                Ok(())
+            },
+            |state_root| {
+                assert_eq!(state_root, temp.path());
+                reloads.set(reloads.get() + 1);
+                Ok(())
+            },
+            |_state_root, mount| {
+                attempts.borrow_mut().push(mount.mount_id.0.clone());
+                if mount.mount_id == bad_mount.mount_id {
+                    Err("source not ready".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(daemon_checks.get(), 1);
+        assert_eq!(reloads.get(), 1);
+        assert_eq!(
+            attempts.into_inner(),
+            vec!["notion-bad".to_string(), "notion-good".to_string()]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cloud_files_state_supervisor_uses_ready_mount_in_same_provider_root() {
+        use std::cell::{Cell, RefCell};
+
+        let temp = TestTempDir::new("windows-supervisor-shared-root-ready");
+        let shared_root = temp.path().join("Locality");
+        let bad_mount = MountConfig::new(
+            MountId::new("notion-bad"),
+            "notion",
+            shared_root.join("notion-bad"),
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let good_mount = MountConfig::new(
+            MountId::new("notion-good"),
+            "notion",
+            shared_root.join("notion-good"),
+        )
+        .projection(ProjectionMode::WindowsCloudFiles);
+        let daemon_checks = Cell::new(0);
+        let reloads = Cell::new(0);
+        let attempts = RefCell::new(Vec::new());
+
+        let result = ensure_windows_cloud_files_providers_for_mounts_with_hooks(
+            temp.path(),
+            vec![bad_mount.clone(), good_mount.clone()],
+            |state_root| {
+                assert_eq!(state_root, temp.path());
+                daemon_checks.set(daemon_checks.get() + 1);
+                Ok(())
+            },
+            |state_root| {
+                assert_eq!(state_root, temp.path());
+                reloads.set(reloads.get() + 1);
+                Ok(())
+            },
+            |_state_root, mount| {
+                attempts.borrow_mut().push(mount.mount_id.0.clone());
+                if mount.mount_id == bad_mount.mount_id {
+                    Err("source not ready".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(daemon_checks.get(), 1);
+        assert_eq!(reloads.get(), 1);
+        assert_eq!(
+            attempts.into_inner(),
+            vec!["notion-bad".to_string(), "notion-good".to_string()]
+        );
     }
 
     #[test]
