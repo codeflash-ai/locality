@@ -112,7 +112,6 @@ fn changing_rendered_line_break_checklist_to_bullet_produces_block_replace() {
         "",
         "- Safety: diff, push confirmation, undo, and prompt-injection guidance",
     );
-
     let plan = BlockDiffEngine::new()
         .plan_push(&shadow, &edited)
         .expect("plan");
@@ -194,6 +193,168 @@ fn inserting_paragraph_before_equivalent_local_media_keeps_media_block_identity(
             content: "faaah".to_string(),
         }]
     );
+}
+
+#[test]
+fn inserting_paragraph_before_code_fence_keeps_following_blocks_anchored() {
+    let shadow = shadow(
+        concat!(
+            "Intro before code fence.\n\n",
+            "```markdown\n",
+            "Generated answer.\n\n",
+            "---\n\n",
+            "### Nested heading\n\n",
+            "* Bullet from fenced markdown\n",
+            "```\n\n",
+            "# Focus on one thing:\n\n",
+            "### Option 1\n\n",
+            "> One inbox for all your dev alerts.\n\n",
+            "- Mobile-friendly summary view.\n\n",
+            "- What happened while you were offline.\n\n",
+            "- Snooze or batch actions.\n\n",
+            "**Why this might work:** Real productivity pain.\n\n",
+            "---\n\n",
+            "### Option 2\n\n",
+            "More text.\n\n",
+            "---",
+        ),
+        [
+            "intro",
+            "code",
+            "focus",
+            "option-1",
+            "quote",
+            "mobile",
+            "offline",
+            "snooze",
+            "why",
+            "divider-1",
+            "option-2",
+            "more",
+            "divider-2",
+        ],
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        concat!(
+            "Intro before code fence.\n\n",
+            "temp\n\n",
+            "```markdown\n",
+            "Generated answer.\n\n",
+            "---\n\n",
+            "### Nested heading\n\n",
+            "* Bullet from fenced markdown\n",
+            "```\n\n",
+            "# Focus on one thing:\n\n",
+            "### Option 1\n\n",
+            "> One inbox for all your dev alerts.\n\n",
+            "- Mobile-friendly summary view.\n\n",
+            "- What happened while you were offline.\n\n",
+            "- Snooze or batch actions.\n\n",
+            "**Why this might work:** Real productivity pain.\n\n",
+            "---\n\n",
+            "### Option 2\n\n",
+            "More text.\n\n",
+            "---",
+        ),
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("intro")),
+            content: "temp".to_string(),
+        }]
+    );
+    assert_eq!(plan.summary.blocks_created, 1);
+    assert_eq!(plan.summary.blocks_replaced, 0);
+    assert_eq!(plan.summary.blocks_archived, 0);
+}
+
+#[test]
+fn moving_inserted_paragraph_out_of_duplicate_divider_gap_keeps_later_divider_anchored() {
+    let shadow = shadow(
+        concat!(
+            "Intro before code fence.\n\n",
+            "```markdown\n",
+            "Generated answer.\n\n",
+            "---\n\n",
+            "### Nested heading\n\n",
+            "* Bullet from fenced markdown\n",
+            "```\n\n",
+            "# Focus on one thing:\n\n",
+            "### Option 1\n\n",
+            "**Why this might work:** Real productivity pain.\n\n",
+            "temp\n\n",
+            "### Option 2\n\n",
+            "**Why this might work:** Solves content overload.\n\n",
+            "---\n\n",
+            "### Option 3",
+        ),
+        [
+            "intro",
+            "code",
+            "focus",
+            "option-1",
+            "why-1",
+            "remote-temp",
+            "option-2",
+            "why-2",
+            "divider-2",
+            "option-3",
+        ],
+    );
+    let edited = CanonicalDocument::new(
+        "",
+        concat!(
+            "Intro before code fence.\n\n",
+            "temp\n\n",
+            "```markdown\n",
+            "Generated answer.\n\n",
+            "---\n\n",
+            "### Nested heading\n\n",
+            "* Bullet from fenced markdown\n",
+            "```\n\n",
+            "# Focus on one thing:\n\n",
+            "### Option 1\n\n",
+            "**Why this might work:** Real productivity pain.\n\n",
+            "---\n\n",
+            "### Option 2\n\n",
+            "**Why this might work:** Solves content overload.\n\n",
+            "---\n\n",
+            "### Option 3",
+        ),
+    );
+
+    let plan = BlockDiffEngine::new()
+        .plan_push(&shadow, &edited)
+        .expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("intro")),
+                content: "temp".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("why-1")),
+                content: "---".to_string(),
+            },
+            PushOperation::ArchiveBlock {
+                block_id: RemoteId::new("remote-temp"),
+            },
+        ]
+    );
+    assert_eq!(plan.summary.blocks_created, 2);
+    assert_eq!(plan.summary.blocks_archived, 1);
 }
 
 #[test]

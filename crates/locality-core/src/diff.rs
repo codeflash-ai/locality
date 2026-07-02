@@ -406,9 +406,20 @@ fn align_exact_hashes(
     used_shadow: &mut BTreeSet<usize>,
 ) {
     let hash_index = unique_native_shadow_hashes(shadow, used_shadow);
+    let edited_hash_counts = edited_blocks
+        .iter()
+        .enumerate()
+        .filter(|(index, block)| matches[*index].is_none() && !block.is_directive())
+        .fold(BTreeMap::<&str, usize>::new(), |mut counts, (_, block)| {
+            *counts.entry(block.content_hash.as_str()).or_default() += 1;
+            counts
+        });
 
     for (edited_index, block) in edited_blocks.iter().enumerate() {
         if matches[edited_index].is_some() || block.is_directive() {
+            continue;
+        }
+        if edited_hash_counts.get(block.content_hash.as_str()) != Some(&1) {
             continue;
         }
 
@@ -587,6 +598,9 @@ fn align_residual_by_order(
     matches: &mut [Option<usize>],
     used_shadow: &mut BTreeSet<usize>,
 ) -> Option<PlanDegradation> {
+    align_residual_equivalent_gaps(shadow, edited_blocks, matches, used_shadow);
+    align_residual_equivalent_subsequence(shadow, edited_blocks, matches, used_shadow);
+
     let residual_edited: Vec<_> = edited_blocks
         .iter()
         .enumerate()
@@ -622,6 +636,157 @@ fn align_residual_by_order(
     }
 
     None
+}
+
+fn align_residual_equivalent_gaps(
+    shadow: &ShadowDocument,
+    edited_blocks: &[SegmentedBlock],
+    matches: &mut [Option<usize>],
+    used_shadow: &mut BTreeSet<usize>,
+) {
+    let ordered_anchors = ordered_alignment_anchors(matches);
+    if ordered_anchors.is_empty() {
+        return;
+    }
+
+    let mut previous_anchor: Option<(usize, usize)> = None;
+    for next_anchor in ordered_anchors.iter().copied() {
+        align_residual_equivalent_gap(
+            shadow,
+            edited_blocks,
+            matches,
+            used_shadow,
+            previous_anchor,
+            Some(next_anchor),
+        );
+        previous_anchor = Some(next_anchor);
+    }
+
+    align_residual_equivalent_gap(
+        shadow,
+        edited_blocks,
+        matches,
+        used_shadow,
+        previous_anchor,
+        None,
+    );
+}
+
+fn align_residual_equivalent_gap(
+    shadow: &ShadowDocument,
+    edited_blocks: &[SegmentedBlock],
+    matches: &mut [Option<usize>],
+    used_shadow: &mut BTreeSet<usize>,
+    previous_anchor: Option<(usize, usize)>,
+    next_anchor: Option<(usize, usize)>,
+) {
+    let edited_start = previous_anchor.map_or(0, |(edited_index, _)| edited_index + 1);
+    let edited_end = next_anchor.map_or(edited_blocks.len(), |(edited_index, _)| edited_index);
+    let shadow_start = previous_anchor.map_or(0, |(_, shadow_index)| shadow_index + 1);
+    let shadow_end = next_anchor.map_or(shadow.blocks.len(), |(_, shadow_index)| shadow_index);
+
+    let residual_edited = (edited_start..edited_end)
+        .filter(|index| matches[*index].is_none() && !edited_blocks[*index].is_directive())
+        .collect::<Vec<_>>();
+    let residual_shadow = (shadow_start..shadow_end)
+        .filter(|index| !used_shadow.contains(index) && !shadow.blocks[*index].kind.is_directive())
+        .collect::<Vec<_>>();
+
+    align_equivalent_subsequence_indexes(
+        shadow,
+        edited_blocks,
+        matches,
+        used_shadow,
+        &residual_edited,
+        &residual_shadow,
+    );
+}
+
+fn align_residual_equivalent_subsequence(
+    shadow: &ShadowDocument,
+    edited_blocks: &[SegmentedBlock],
+    matches: &mut [Option<usize>],
+    used_shadow: &mut BTreeSet<usize>,
+) {
+    let residual_edited: Vec<_> = edited_blocks
+        .iter()
+        .enumerate()
+        .filter(|(index, block)| matches[*index].is_none() && !block.is_directive())
+        .map(|(index, _)| index)
+        .collect();
+    let residual_shadow: Vec<_> = shadow
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(index, block)| !used_shadow.contains(index) && !block.kind.is_directive())
+        .map(|(index, _)| index)
+        .collect();
+
+    align_equivalent_subsequence_indexes(
+        shadow,
+        edited_blocks,
+        matches,
+        used_shadow,
+        &residual_edited,
+        &residual_shadow,
+    );
+}
+
+fn align_equivalent_subsequence_indexes(
+    shadow: &ShadowDocument,
+    edited_blocks: &[SegmentedBlock],
+    matches: &mut [Option<usize>],
+    used_shadow: &mut BTreeSet<usize>,
+    residual_edited: &[usize],
+    residual_shadow: &[usize],
+) {
+    if residual_edited.is_empty() || residual_shadow.is_empty() {
+        return;
+    }
+
+    let edited_len = residual_edited.len();
+    let shadow_len = residual_shadow.len();
+    let mut lengths = vec![vec![0usize; shadow_len + 1]; edited_len + 1];
+
+    for edited_offset in (0..edited_len).rev() {
+        for shadow_offset in (0..shadow_len).rev() {
+            let edited_index = residual_edited[edited_offset];
+            let shadow_index = residual_shadow[shadow_offset];
+            lengths[edited_offset][shadow_offset] = if equivalent_alignment_blocks(
+                &shadow.blocks[shadow_index],
+                &edited_blocks[edited_index],
+            ) {
+                1 + lengths[edited_offset + 1][shadow_offset + 1]
+            } else {
+                lengths[edited_offset + 1][shadow_offset]
+                    .max(lengths[edited_offset][shadow_offset + 1])
+            };
+        }
+    }
+
+    let mut edited_offset = 0;
+    let mut shadow_offset = 0;
+    while edited_offset < edited_len && shadow_offset < shadow_len {
+        let edited_index = residual_edited[edited_offset];
+        let shadow_index = residual_shadow[shadow_offset];
+        if equivalent_alignment_blocks(&shadow.blocks[shadow_index], &edited_blocks[edited_index]) {
+            matches[edited_index] = Some(shadow_index);
+            used_shadow.insert(shadow_index);
+            edited_offset += 1;
+            shadow_offset += 1;
+        } else if lengths[edited_offset + 1][shadow_offset]
+            >= lengths[edited_offset][shadow_offset + 1]
+        {
+            edited_offset += 1;
+        } else {
+            shadow_offset += 1;
+        }
+    }
+}
+
+fn equivalent_alignment_blocks(shadow_block: &ShadowBlock, edited_block: &SegmentedBlock) -> bool {
+    same_alignment_kind(&shadow_block.kind, &edited_block.kind)
+        && rendered_bodies_equivalent(&shadow_block.text, &edited_block.text)
 }
 
 fn residual_kinds_match_common_prefix(
