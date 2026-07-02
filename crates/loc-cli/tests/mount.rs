@@ -1,11 +1,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loc_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
+use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
-use locality_store::{ConnectionId, InMemoryStateStore, MountRepository, ProjectionMode};
+use locality_store::{
+    ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
+    ConnectorProfileRecord, ConnectorProfileRepository, CredentialStore, FileCredentialStore,
+    InMemoryStateStore, MountRepository, ProjectionMode, SqliteStateStore,
+};
+use serde_json::Value;
+
+const TOKEN_ENV: &str = "NOTION_TOKEN";
+const DEFAULT_NOTION_PROFILE_ID: &str = "notion-token";
 
 #[test]
 fn mount_writes_agent_guidance_and_claude_alias() {
@@ -338,6 +348,88 @@ fn mount_options_preserve_google_docs_workspace_folder_id_from_resolver() {
 }
 
 #[test]
+fn cli_keeps_multiple_default_notion_workspace_mounts_with_distinct_connections() {
+    let fixture = MountFixture::new("loc-cli-multiple-notion-workspace-mounts");
+    fs::create_dir_all(&fixture.root).expect("create shared virtual root");
+    let state_root = fixture.root.join("state");
+    seed_cli_notion_connection(&state_root, "notion-personal-c", "Personal");
+    seed_cli_notion_connection(&state_root, "notion-codeflash", "Codeflash");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let personal_root = fixture.root.join("personal-notion");
+    let codeflash_root = fixture.root.join("codeflash-notion");
+    let personal_root_arg = personal_root.display().to_string();
+    let codeflash_root_arg = codeflash_root.display().to_string();
+
+    let personal = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "notion",
+        personal_root_arg.as_str(),
+        "--connection",
+        "notion-personal-c",
+        "--workspace",
+        "--projection",
+        "linux-fuse",
+        "--json",
+    ]));
+    let codeflash = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "notion",
+        codeflash_root_arg.as_str(),
+        "--connection",
+        "notion-codeflash",
+        "--workspace",
+        "--projection",
+        "linux-fuse",
+        "--json",
+    ]));
+
+    assert_eq!(personal["mount_id"], "notion-main", "{personal:#?}");
+    assert_eq!(codeflash["mount_id"], "notion-codeflash", "{codeflash:#?}");
+
+    let store = SqliteStateStore::open(state_root.clone()).expect("open state");
+    let mut mounts = store.load_mounts().expect("load mounts");
+    mounts.sort_by(|left, right| left.mount_id.cmp(&right.mount_id));
+    assert_eq!(mounts.len(), 2, "{mounts:#?}");
+    assert!(
+        mounts
+            .iter()
+            .any(|mount| mount.mount_id == MountId::new("notion-main")
+                && mount.connection_id == Some(ConnectionId::new("notion-personal-c"))
+                && mount.root == personal_root),
+        "{mounts:#?}"
+    );
+    assert!(
+        mounts
+            .iter()
+            .any(|mount| mount.mount_id == MountId::new("notion-codeflash")
+                && mount.connection_id == Some(ConnectionId::new("notion-codeflash"))
+                && mount.root == codeflash_root),
+        "{mounts:#?}"
+    );
+
+    let doctor = loc_json_with_exit(loc_command(loc, &state_root).args(["doctor", "--json"]), 3);
+    let doctor_mounts = doctor["mounts"].as_array().expect("doctor mounts");
+    assert_eq!(doctor_mounts.len(), 2, "{doctor:#?}");
+    assert!(
+        doctor_mounts
+            .iter()
+            .any(|mount| mount["mount_id"] == "notion-main"
+                && mount["connection_id"] == "notion-personal-c"
+                && mount["mount_point"] == personal_root_arg),
+        "{doctor:#?}"
+    );
+    assert!(
+        doctor_mounts
+            .iter()
+            .any(|mount| mount["mount_id"] == "notion-codeflash"
+                && mount["connection_id"] == "notion-codeflash"
+                && mount["mount_point"] == codeflash_root_arg),
+        "{doctor:#?}"
+    );
+}
+
+#[test]
 fn virtual_mount_rejects_duplicate_mount_point_under_same_root() {
     let fixture = MountFixture::new("loc-cli-duplicate-mount-point");
     let mut store = InMemoryStateStore::new();
@@ -439,4 +531,91 @@ impl Drop for MountFixture {
 
 fn read_to_string(path: impl AsRef<Path>) -> String {
     fs::read_to_string(path).expect("read guidance file")
+}
+
+fn seed_cli_notion_connection(state_root: &Path, connection_id: &str, workspace_name: &str) {
+    fs::create_dir_all(state_root).expect("create state root");
+    let profile_id = ConnectorProfileId::new(DEFAULT_NOTION_PROFILE_ID);
+    let secret_ref = format!("connection:{connection_id}");
+    let credentials = FileCredentialStore::new(state_root);
+    credentials
+        .put(&secret_ref, &format!("ntn_dummy_{connection_id}"))
+        .expect("seed credential");
+
+    let now = "2026-07-03T00:00:00Z".to_string();
+    let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open state");
+    store
+        .save_connector_profile(ConnectorProfileRecord {
+            profile_id: profile_id.clone(),
+            connector: "notion".to_string(),
+            display_name: "Notion token auth".to_string(),
+            auth_kind: "token".to_string(),
+            scopes: vec![],
+            capabilities_json: notion_capabilities_json(),
+            enabled_actions_json: "[\"read\",\"write\"]".to_string(),
+            connector_version: "notion.v1".to_string(),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+        .expect("seed profile");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: ConnectionId::new(connection_id),
+            profile_id: Some(profile_id),
+            connector: "notion".to_string(),
+            display_name: workspace_name.to_string(),
+            account_label: Some(format!("{connection_id}@example.com")),
+            workspace_id: Some(format!("{connection_id}-workspace")),
+            workspace_name: Some(workspace_name.to_string()),
+            auth_kind: "token".to_string(),
+            secret_ref,
+            scopes: vec![],
+            capabilities_json: notion_capabilities_json(),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .expect("seed connection");
+}
+
+fn notion_capabilities_json() -> String {
+    serde_json::to_string(&ConnectorCapabilities {
+        supports_block_updates: true,
+        supports_databases: true,
+        supports_oauth: true,
+        supports_remote_observation: true,
+        supports_lazy_child_enumeration: true,
+        supports_media_download: true,
+        supports_undo: true,
+        supports_batch_observation: false,
+    })
+    .expect("serialize Notion capabilities")
+}
+
+fn loc_command(loc: &str, state_root: &Path) -> Command {
+    let mut command = Command::new(loc);
+    command
+        .env("LOCALITY_STATE_DIR", state_root)
+        .env("LOCALITY_DAEMON_DISABLE", "1")
+        .env_remove(TOKEN_ENV);
+    command
+}
+
+fn loc_json_ok(command: &mut Command) -> Value {
+    loc_json_with_exit(command, 0)
+}
+
+fn loc_json_with_exit(command: &mut Command, expected_code: i32) -> Value {
+    let output = command.output().expect("run loc command");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let code = output.status.code().unwrap_or(-1);
+    assert!(
+        code == expected_code,
+        "loc command exited with {code}, expected {expected_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("failed to parse loc JSON: {error}\n{stdout}\n{stderr}"))
 }

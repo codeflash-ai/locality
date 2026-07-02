@@ -291,7 +291,7 @@ path into Notion creation without bypassing the explicit push model.
 
 ## Initial `loc mount` and `loc pull`
 
-`loc mount notion <path> --root-page <page-id> [--connection <id>]` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. In virtual projections, the shared Locality root lists mount-point folders named from the mount path, and the guidance appears inside that mount-point folder, for example `/Locality/notion-main/AGENTS.md` and `/Locality/notion-main/CLAUDE.md`. With one active Notion connection, mount auto-assigns it. With multiple active Notion connections, pass `--connection <id>`. Existing mounts without `connection_id` continue to work through the legacy `NOTION_TOKEN` fallback.
+`loc mount notion <path> --root-page <page-id> [--connection <id>]` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. In virtual projections, the shared Locality root lists mount-point folders named from the mount path, and the guidance appears inside that mount-point folder, for example `/Locality/notion-main/AGENTS.md` and `/Locality/notion-main/CLAUDE.md`. With one active Notion connection, mount auto-assigns it. With multiple active Notion connections, pass `--connection <id>`. When `--mount-id` is omitted, Locality uses the default `notion-main` only if it is unused or already belongs to the same source; otherwise it derives a stable mount id from the connection or remote root so another workspace mount is added instead of replacing the existing one. Existing mounts without `connection_id` continue to work through the legacy `NOTION_TOKEN` fallback.
 
 Workspace Notion mounts use the access granted to the connected integration. If the integration is granted pages from multiple Notion teamspaces, Locality enumerates those accessible top-level pages and databases together under the mount-point root. Locality does not currently create separate teamspace grouping folders.
 
@@ -310,7 +310,7 @@ Concrete shared-root examples:
 
 ```bash
 loc mount notion ~/Locality/notion-main --workspace --projection linux-fuse
-loc mount notion ~/Locality/notion-my-company --workspace --mount-id notion-my-company --connection notion-company --projection linux-fuse
+loc mount notion ~/Locality/notion-my-company --workspace --connection notion-company --projection linux-fuse
 loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection linux-fuse
 loc file-provider register ~/Locality/notion-main
 loc file-provider open notion-main
