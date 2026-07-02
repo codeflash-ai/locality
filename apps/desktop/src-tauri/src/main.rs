@@ -6551,12 +6551,16 @@ fn activate_virtual_projection_mount(
             mount.mount_id.0, mount.projection
         ),
     );
-    if wait_for_entities && mount.projection == ProjectionMode::MacosFileProvider {
+    if wait_for_entities
+        && virtual_projection_waits_for_mount_point_children_before_registration(&mount.projection)
+    {
         wait_for_virtual_projection_mount_point_children(state_root, mount)?;
     }
     register_virtual_projection(state_root, mount)?;
     prefetch_virtual_projection_root(state_root, mount)?;
-    if wait_for_entities && mount.projection != ProjectionMode::MacosFileProvider {
+    if wait_for_entities
+        && !virtual_projection_waits_for_mount_point_children_before_registration(&mount.projection)
+    {
         wait_for_mount_entities(state_root, &mount.mount_id)?;
     }
     ensure_virtual_projection_runtime(state_root, mount)?;
@@ -6580,6 +6584,15 @@ fn verify_virtual_projection_mount_root(mount: &MountConfig) -> Result<(), Strin
         | ProjectionMode::PlainFiles
         | ProjectionMode::WindowsCloudFiles => Ok(()),
     }
+}
+
+fn virtual_projection_waits_for_mount_point_children_before_registration(
+    projection: &ProjectionMode,
+) -> bool {
+    matches!(
+        projection,
+        ProjectionMode::MacosFileProvider | ProjectionMode::WindowsCloudFiles
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -6778,7 +6791,7 @@ fn wait_for_virtual_projection_mount_point_children(
         "info",
         "file_provider.source_ready.wait_started",
         format!(
-            "waiting up to {}s for `{mount_id}:{mount_point_container_identifier}` to expose mount-point children before registering macOS File Provider",
+            "waiting up to {}s for `{mount_id}:{mount_point_container_identifier}` to expose mount-point children before registering virtual projection provider",
             VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT.as_secs()
         ),
     );
@@ -8874,8 +8887,9 @@ mod tests {
         summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
         tray_popover_anchor, tray_popover_position, unsupported_notion_locator_url_message,
         validate_mount_root, virtual_projection_prefetch_container_identifiers,
-        virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
-        wake_live_mode_runner, write_terminal_cli_path_section,
+        virtual_projection_refresh_signal_identifiers,
+        virtual_projection_waits_for_mount_point_children_before_registration,
+        wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
     };
     #[cfg(target_os = "macos")]
     use super::{
@@ -10519,6 +10533,22 @@ mod tests {
             virtual_projection_prefetch_container_identifiers(&mount),
             vec!["root".to_string(), "mount:notion-main".to_string()]
         );
+    }
+
+    #[test]
+    fn virtual_projection_source_ready_wait_runs_before_provider_registration() {
+        assert!(virtual_projection_waits_for_mount_point_children_before_registration(
+            &ProjectionMode::MacosFileProvider
+        ));
+        assert!(virtual_projection_waits_for_mount_point_children_before_registration(
+            &ProjectionMode::WindowsCloudFiles
+        ));
+        assert!(!virtual_projection_waits_for_mount_point_children_before_registration(
+            &ProjectionMode::LinuxFuse
+        ));
+        assert!(!virtual_projection_waits_for_mount_point_children_before_registration(
+            &ProjectionMode::PlainFiles
+        ));
     }
 
     #[test]
