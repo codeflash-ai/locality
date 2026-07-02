@@ -3,6 +3,15 @@ SHELL := /usr/bin/env bash
 CARGO ?= cargo
 NPM ?= npm
 
+EXE_SUFFIX :=
+ifeq ($(OS),Windows_NT)
+EXE_SUFFIX := .exe
+endif
+
+LOC_DEBUG := target/debug/loc$(EXE_SUFFIX)
+LOC_RELEASE := target/release/loc$(EXE_SUFFIX)
+LOCALITY_FILE_PROVIDER_TARGET ?= notion-main
+
 DESKTOP_DIR := apps/desktop
 DESKTOP_NPM := $(NPM) --prefix $(DESKTOP_DIR)
 DESKTOP_NODE_MODULES_STAMP := $(DESKTOP_DIR)/node_modules/.package-lock.json
@@ -31,9 +40,26 @@ build-all: build-release build-tauri ## Build all deliverables in release mode.
 .PHONY: build
 build: build-rust build-desktop ## Build the Rust workspace and desktop frontend.
 
+.PHONY: build-crates
+build-crates: stop-locality-dev-runtimes ## Build all non-desktop Rust workspace crates.
+	$(CARGO) build --workspace --exclude locality-desktop
+
 .PHONY: build-rust
 build-rust: ## Build all Rust workspace packages.
 	$(CARGO) build --workspace
+
+.PHONY: stop-locality-dev-runtimes
+stop-locality-dev-runtimes: ## Stop local daemon/provider processes that can lock Windows build outputs.
+ifeq ($(OS),Windows_NT)
+	@if [ -x "$(LOC_DEBUG)" ]; then loc="$(LOC_DEBUG)"; elif [ -x "$(LOC_RELEASE)" ]; then loc="$(LOC_RELEASE)"; else loc=""; fi; \
+	if [ -n "$$loc" ]; then \
+		"$$loc" file-provider stop "$(LOCALITY_FILE_PROVIDER_TARGET)" --json >/dev/null 2>&1 || true; \
+		"$$loc" daemon stop >/dev/null 2>&1 || true; \
+	fi
+	@pwsh -NoProfile -ExecutionPolicy Bypass -Command '$$root = (Resolve-Path ".").Path; Get-Process locality-cloud-files,localityd -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and $$_.Path.StartsWith($$root, [System.StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force'
+else
+	@true
+endif
 
 .PHONY: build-release
 build-release: build-desktop ## Build all Rust workspace packages in release mode.

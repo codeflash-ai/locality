@@ -452,8 +452,13 @@ fn executor_leaves_inline_conflict_unchanged_when_remote_changes_again() {
     let conflicted_contents =
         fs::read_to_string(fixture.page_path()).expect("conflict file contents");
 
-    let changed_source =
-        FakeHydrationSource::with_entity("page-1", rendered_entity("Remote body v2."));
+    let mut changed = rendered_entity_with_sync(
+        "Remote body v2.",
+        "2026-06-12T00:00:00Z",
+        "2026-06-12T00:00:00Z",
+    );
+    changed.remote_edited_at = Some("2026-06-12T00:00:00Z".to_string());
+    let changed_source = FakeHydrationSource::with_entity("page-1", changed);
     let mut executor = HydrationExecutor::new(&mut store, &changed_source);
     let outcome = executor
         .hydrate_request(fixture.request())
@@ -469,6 +474,245 @@ fn executor_leaves_inline_conflict_unchanged_when_remote_changes_again() {
         .expect("get entity")
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Conflicted);
+}
+
+#[test]
+fn executor_refreshes_inline_conflict_when_same_remote_version_shadow_drifted() {
+    let fixture = HydrationFixture::new();
+    let version = "2026-06-11T00:00:00Z";
+    let mut store = fixture.store(HydrationState::Conflicted);
+    let mut stale = rendered_entity_with_sync("Old body.", version, version);
+    stale.remote_edited_at = Some(version.to_string());
+    store
+        .save_shadow(&fixture.mount_id, stale.shadow.clone())
+        .expect("save stale shadow");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    entity.remote_edited_at = Some(version.to_string());
+    entity.content_hash = Some(stale.shadow.body_hash.clone());
+    store.save_entity(entity).expect("save entity");
+    fixture.write_raw(concat!(
+        "---\n",
+        "loc:\n",
+        "  id: page-1\n",
+        "  type: page\n",
+        "  synced_at: \"2026-06-11T00:00:00Z\"\n",
+        "  remote_edited_at: \"2026-06-11T00:00:00Z\"\n",
+        "title: Roadmap\n",
+        "---\n",
+        "<<<<<<< LOCAL\n",
+        "# Roadmap\n\n",
+        "Local edit.\n",
+        "=======\n",
+        "# Roadmap\n\n",
+        "Old body.\n",
+        ">>>>>>> REMOTE\n",
+    ));
+    let mut fresh = rendered_entity_with_sync("Remote body.\n\n---", version, version);
+    fresh.remote_edited_at = Some(version.to_string());
+    let source = FakeHydrationSource::with_entity("page-1", fresh.clone());
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("refresh stale conflict");
+
+    assert_eq!(outcome, HydrationOutcome::SkippedDirty);
+    let contents = fs::read_to_string(fixture.page_path()).expect("conflict file contents");
+    assert!(contents.contains("Local edit."), "{contents}");
+    assert!(contents.contains("Remote body.\n\n---"), "{contents}");
+    assert!(has_unresolved_conflict_markers(&contents), "{contents}");
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Conflicted);
+    assert_eq!(entity.remote_edited_at.as_deref(), Some(version));
+    let shadow = store
+        .load_shadow(&fixture.mount_id, &fixture.remote_id)
+        .expect("load shadow");
+    assert_eq!(shadow.body_hash, fresh.shadow.body_hash);
+}
+
+#[test]
+fn executor_compacts_same_version_inline_conflict_when_shadow_is_current() {
+    let fixture = HydrationFixture::new();
+    let version = "2026-06-11T00:00:00Z";
+    let mut store = fixture.store(HydrationState::Conflicted);
+    let mut fresh =
+        rendered_entity_with_sync("Shared before.\n\n---\n\nShared after.", version, version);
+    fresh.remote_edited_at = Some(version.to_string());
+    store
+        .save_shadow(&fixture.mount_id, fresh.shadow.clone())
+        .expect("save current shadow");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    entity.remote_edited_at = Some(version.to_string());
+    entity.content_hash = Some(fresh.shadow.body_hash.clone());
+    store.save_entity(entity).expect("save entity");
+    fixture.write_raw(concat!(
+        "---\n",
+        "loc:\n",
+        "  id: page-1\n",
+        "  type: page\n",
+        "  synced_at: \"2026-06-11T00:00:00Z\"\n",
+        "  remote_edited_at: \"2026-06-11T00:00:00Z\"\n",
+        "title: Roadmap\n",
+        "---\n",
+        "<<<<<<< LOCAL\n",
+        "# Roadmap\n\n",
+        "Shared before.\n\n",
+        "Shared after.\n",
+        "=======\n",
+        "# Roadmap\n\n",
+        "Shared before.\n\n",
+        "---\n\n",
+        "Shared after.\n",
+        ">>>>>>> REMOTE\n",
+    ));
+    let source = FakeHydrationSource::with_entity("page-1", fresh);
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("compact same-version conflict");
+
+    assert_eq!(outcome, HydrationOutcome::SkippedDirty);
+    let contents = fs::read_to_string(fixture.page_path()).expect("conflict file contents");
+    assert_eq!(
+        contents.matches(CONFLICT_LOCAL_MARKER).count(),
+        1,
+        "{contents}"
+    );
+    assert!(
+        contents.contains(concat!(
+            "# Roadmap\n\n",
+            "Shared before.\n\n",
+            "<<<<<<< LOCAL\n",
+            "=======\n",
+            "---\n\n",
+            ">>>>>>> REMOTE\n",
+            "Shared after.\n",
+        )),
+        "{contents}"
+    );
+    assert!(!contents.contains("<<<<<<< LOCAL\n# Roadmap"), "{contents}");
+}
+
+#[test]
+fn executor_cleans_same_version_conflict_when_local_side_retains_current_blocks() {
+    let fixture = HydrationFixture::new();
+    let version = "2026-06-11T00:00:00Z";
+    let mut store = fixture.store(HydrationState::Conflicted);
+    let mut fresh = rendered_entity_with_sync("---<br>---", version, version);
+    fresh.remote_edited_at = Some(version.to_string());
+    store
+        .save_shadow(&fixture.mount_id, fresh.shadow.clone())
+        .expect("save current shadow");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    entity.remote_edited_at = Some(version.to_string());
+    entity.content_hash = Some(fresh.shadow.body_hash.clone());
+    store.save_entity(entity).expect("save entity");
+    fixture.write_raw(concat!(
+        "---\n",
+        "loc:\n",
+        "  id: page-1\n",
+        "  type: page\n",
+        "  synced_at: \"2026-06-11T00:00:00Z\"\n",
+        "  remote_edited_at: \"2026-06-11T00:00:00Z\"\n",
+        "title: Roadmap\n",
+        "---\n",
+        "<<<<<<< LOCAL\n",
+        "# Roadmap\n\n",
+        "---\n\n",
+        "---\n",
+        "=======\n",
+        "# Roadmap\n\n",
+        "---<br>---\n",
+        ">>>>>>> REMOTE\n",
+    ));
+    let source = FakeHydrationSource::with_entity("page-1", fresh);
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("clean same-version local-only conflict");
+
+    assert_eq!(outcome, HydrationOutcome::SkippedDirty);
+    let contents = fs::read_to_string(fixture.page_path()).expect("conflict file contents");
+    assert!(!has_unresolved_conflict_markers(&contents), "{contents}");
+    assert!(contents.contains("# Roadmap\n\n---\n\n---\n"), "{contents}");
+    assert!(!contents.contains("---<br>---"), "{contents}");
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Dirty);
+}
+
+#[test]
+fn executor_refreshes_nested_inline_conflict_when_shadow_is_current() {
+    let fixture = HydrationFixture::new();
+    let version = "2026-06-11T00:00:00Z";
+    let mut store = fixture.store(HydrationState::Conflicted);
+    let mut fresh = rendered_entity_with_sync("Remote body.\n\n---", version, version);
+    fresh.remote_edited_at = Some(version.to_string());
+    store
+        .save_shadow(&fixture.mount_id, fresh.shadow.clone())
+        .expect("save current shadow");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    entity.remote_edited_at = Some(version.to_string());
+    entity.content_hash = Some(fresh.shadow.body_hash.clone());
+    store.save_entity(entity).expect("save entity");
+    fixture.write_raw(concat!(
+        "---\n",
+        "loc:\n",
+        "  id: page-1\n",
+        "  type: page\n",
+        "  synced_at: \"2026-06-11T00:00:00Z\"\n",
+        "  remote_edited_at: \"2026-06-11T00:00:00Z\"\n",
+        "title: Roadmap\n",
+        "---\n",
+        "<<<<<<< LOCAL\n",
+        "<<<<<<< LOCAL\n",
+        "# Roadmap\n\n",
+        "Local edit.\n",
+        "=======\n",
+        "# Roadmap\n\n",
+        "Old body.\n",
+        ">>>>>>> REMOTE\n",
+        "=======\n",
+        "# Roadmap\n\n",
+        "Old body.\n",
+        ">>>>>>> REMOTE\n",
+    ));
+    let source = FakeHydrationSource::with_entity("page-1", fresh.clone());
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(fixture.request())
+        .expect("refresh nested stale conflict");
+
+    assert_eq!(outcome, HydrationOutcome::SkippedDirty);
+    let contents = fs::read_to_string(fixture.page_path()).expect("conflict file contents");
+    assert_eq!(
+        contents.matches(CONFLICT_LOCAL_MARKER).count(),
+        1,
+        "{contents}"
+    );
+    assert!(contents.contains("Local edit."), "{contents}");
+    assert!(contents.contains("Remote body.\n\n---"), "{contents}");
+    assert!(has_unresolved_conflict_markers(&contents), "{contents}");
 }
 
 #[test]

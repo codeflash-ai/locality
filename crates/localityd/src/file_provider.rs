@@ -5,7 +5,10 @@
 //! generic API instead of growing platform-specific daemon semantics.
 
 use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
-use locality_core::conflict::{has_unresolved_conflict_markers, render_inline_conflict_markdown};
+use locality_core::conflict::{
+    has_unresolved_conflict_markers, local_version_from_conflict_markers,
+    render_inline_conflict_markdown,
+};
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_core::{LocalityError, LocalityResult};
@@ -19,7 +22,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::hydration::HydrationSource;
-use crate::shadow_match::parsed_matches_shadow;
+use crate::shadow_match::{
+    parsed_changes_retain_current_shadow_blocks, parsed_documents_match_ignoring_sync_metadata,
+    parsed_matches_shadow,
+};
 use crate::virtual_fs;
 use crate::virtual_fs::{
     mount_point_directory_name, mount_point_identifier, virtual_projection_mount_point,
@@ -773,10 +779,23 @@ where
 
     let projection_contents =
         std::fs::read_to_string(&candidate.path).map_err(LocalityError::from)?;
+    if has_unresolved_conflict_markers(&projection_contents)
+        && let Ok(cache_contents) = std::fs::read(&content_path)
+        && cache_contents != projection_contents.as_bytes()
+        && projection_is_not_newer_than_cache(&candidate.path, &content_path) == Some(true)
+    {
+        write_binary_atomic(&candidate.path, &cache_contents).map_err(LocalityError::from)?;
+        return Ok(ProjectionCandidateOutcome::Reconciled);
+    }
+
     let commit_contents =
         projection_contents_for_existing_page(store, mount, entity, &projection_contents)?;
 
     if std::fs::read(&content_path).is_ok_and(|existing| existing == commit_contents) {
+        if projection_contents.as_bytes() != commit_contents {
+            write_binary_atomic(&candidate.path, &commit_contents).map_err(LocalityError::from)?;
+            return Ok(ProjectionCandidateOutcome::Reconciled);
+        }
         return Ok(ProjectionCandidateOutcome::Unchanged);
     }
 
@@ -787,6 +806,9 @@ where
         &entity.remote_id.0,
         &commit_contents,
     )?;
+    if projection_contents.as_bytes() != commit_contents {
+        write_binary_atomic(&candidate.path, &commit_contents).map_err(LocalityError::from)?;
+    }
     Ok(ProjectionCandidateOutcome::Reconciled)
 }
 
@@ -825,6 +847,11 @@ fn refresh_projection_candidate_if_clean(
 
     if projection_contents == cache_contents {
         return Ok(ProjectionRefreshOutcome::Unchanged);
+    }
+
+    if projection_conflict_local_matches_cache(&projection_contents, &cache_contents) {
+        write_binary_atomic(&projection_path, &cache_contents).map_err(LocalityError::from)?;
+        return Ok(ProjectionRefreshOutcome::Refreshed);
     }
 
     if entity.hydration == HydrationState::Conflicted
@@ -868,6 +895,37 @@ fn projection_contents_are_replaceable(
 
     std::str::from_utf8(contents)
         .is_ok_and(|contents| contents.contains(CanonicalDocument::STUB_MARKER))
+}
+
+fn projection_conflict_local_matches_cache(
+    projection_contents: &[u8],
+    cache_contents: &[u8],
+) -> bool {
+    let Ok(projection_contents) = std::str::from_utf8(projection_contents) else {
+        return false;
+    };
+    if !has_unresolved_conflict_markers(projection_contents) {
+        return false;
+    }
+
+    let Some(local_contents) = local_version_from_conflict_markers(projection_contents) else {
+        return false;
+    };
+    if local_contents.as_bytes() == cache_contents {
+        return true;
+    }
+
+    let Ok(cache_contents) = std::str::from_utf8(cache_contents) else {
+        return false;
+    };
+    let Ok(local_parsed) = parse_canonical_markdown(&local_contents) else {
+        return false;
+    };
+    let Ok(cache_parsed) = parse_canonical_markdown(cache_contents) else {
+        return false;
+    };
+
+    parsed_documents_match_ignoring_sync_metadata(&local_parsed, &cache_parsed)
 }
 
 fn projection_is_not_newer_than_cache(projection_path: &Path, content_path: &Path) -> Option<bool> {
@@ -915,6 +973,10 @@ fn projection_contents_for_existing_page<S>(
 where
     S: ShadowRepository,
 {
+    if has_unresolved_conflict_markers(contents) {
+        return Ok(contents.as_bytes().to_vec());
+    }
+
     let Ok(parsed) = parse_canonical_markdown(contents) else {
         return Ok(contents.as_bytes().to_vec());
     };
@@ -923,6 +985,9 @@ where
             .load_shadow(&mount.mount_id, &entity.remote_id)
             .map_err(LocalityError::from)?;
         if visible_projection_base_is_stale(&parsed, &shadow) {
+            if parsed_changes_retain_current_shadow_blocks(&parsed, &shadow) {
+                return Ok(contents.as_bytes().to_vec());
+            }
             let remote_document =
                 CanonicalDocument::new(shadow.frontmatter.clone(), shadow.rendered_body.clone());
             return Ok(render_inline_conflict_markdown(contents, &remote_document).into_bytes());
@@ -1625,14 +1690,11 @@ mod tests {
             )),
         )
         .expect("write fast-forwarded cache");
-        fs::write(
-            &visible_path,
-            render_canonical_markdown(&CanonicalDocument::new(
-                versioned_frontmatter(&remote_id, "remote-v1"),
-                "Intro.\n\nFooter.\n\nLocal visible edit.\n",
-            )),
-        )
-        .expect("write stale visible edit");
+        let stale_visible = render_canonical_markdown(&CanonicalDocument::new(
+            versioned_frontmatter(&remote_id, "remote-v1"),
+            "Intro.\n\nFooter.\n\nLocal visible edit.\n",
+        ));
+        fs::write(&visible_path, &stale_visible).expect("write stale visible edit");
 
         let report = reconcile_visible_projection(&mut store, &state_root, Some(&visible_path))
             .expect("reconcile visible projection");
@@ -1640,16 +1702,127 @@ mod tests {
         assert_eq!(report.reconciled, 1);
         let cached = fs::read_to_string(&content_path).expect("read cache");
         assert!(cached.contains("Local visible edit."), "{cached}");
-        assert!(cached.contains("Intro.\n\n---\n\nFooter."), "{cached}");
+        assert!(cached.contains("Intro."), "{cached}");
+        assert!(cached.contains("---\n\nFooter."), "{cached}");
         assert!(cached.contains(CONFLICT_LOCAL_MARKER), "{cached}");
         assert!(cached.contains(CONFLICT_SEPARATOR_MARKER), "{cached}");
         assert!(cached.contains(CONFLICT_REMOTE_MARKER), "{cached}");
         assert!(has_unresolved_conflict_markers(&cached), "{cached}");
+        let visible = fs::read_to_string(&visible_path).expect("read visible");
+        assert_eq!(visible, cached);
+        fs::write(&visible_path, &stale_visible).expect("restore stale visible replica");
+        let report = reconcile_visible_projection(&mut store, &state_root, Some(&visible_path))
+            .expect("reconcile already-conflicted cache projection");
+        assert_eq!(report.reconciled, 1);
+        let visible = fs::read_to_string(&visible_path).expect("read visible after repair");
+        assert_eq!(visible, cached);
+        let report = reconcile_visible_projection(&mut store, &state_root, Some(&visible_path))
+            .expect("reconcile existing conflict markers");
+        assert_eq!(report.skipped_unchanged, 1);
+        let cached = fs::read_to_string(&content_path).expect("read cache after marker no-op");
+        assert_eq!(cached.matches(CONFLICT_LOCAL_MARKER).count(), 1, "{cached}");
+        fs::write(&visible_path, &cached).expect("write older conflicted visible replica");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let clean_remote = render_canonical_markdown(&CanonicalDocument::new(
+            versioned_frontmatter(&remote_id, "remote-v2"),
+            "Intro.\n\n---\n\nFooter.\n",
+        ));
+        fs::write(&content_path, &clean_remote).expect("write newer clean cache");
+        let report = reconcile_visible_projection(&mut store, &state_root, Some(&visible_path))
+            .expect("refresh stale visible conflict from cache");
+        assert_eq!(report.reconciled, 1);
+        let visible = fs::read_to_string(&visible_path).expect("read refreshed visible");
+        assert_eq!(visible, clean_remote);
+        let cached = fs::read_to_string(&content_path).expect("read clean cache");
+        assert_eq!(cached, clean_remote);
         let entity = store
             .get_entity(&mount_id, &remote_id)
             .expect("get entity")
             .expect("entity");
         assert_eq!(entity.hydration, HydrationState::Conflicted);
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn reconcile_visible_projection_imports_stale_metadata_edit_when_current_blocks_are_retained() {
+        let root = temp_root("loc-file-provider-stale-visible-retained-root");
+        let state_root = temp_root("loc-file-provider-stale-visible-retained-state");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let relative_path = PathBuf::from("roadmap/page.md");
+        let mount_root = root.join("notion");
+        let visible_path = mount_root.join(&relative_path);
+        let content_path =
+            crate::virtual_fs::virtual_fs_content_root(&state_root, &mount_id).join(&relative_path);
+        fs::create_dir_all(visible_path.parent().expect("visible parent")).expect("visible parent");
+        fs::create_dir_all(content_path.parent().expect("content parent")).expect("content parent");
+
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &mount_root)
+                    .projection(ProjectionMode::WindowsCloudFiles),
+            )
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    relative_path.clone(),
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_remote_edited_at("remote-v2"),
+            )
+            .expect("save entity");
+        let current_shadow = ShadowDocument::from_synced_body(
+            remote_id.clone(),
+            "Intro.\n\n---<br>---\n\nFooter.\n",
+            8,
+            [
+                RemoteId::new("intro"),
+                RemoteId::new("plain-divider-text"),
+                RemoteId::new("footer"),
+            ],
+        )
+        .expect("current shadow")
+        .with_frontmatter(versioned_frontmatter(&remote_id, "remote-v2"));
+        store
+            .save_shadow(&mount_id, current_shadow)
+            .expect("save shadow");
+        fs::write(
+            &content_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                versioned_frontmatter(&remote_id, "remote-v2"),
+                "Intro.\n\n---<br>---\n\nFooter.\n",
+            )),
+        )
+        .expect("write current cache");
+        fs::write(
+            &visible_path,
+            render_canonical_markdown(&CanonicalDocument::new(
+                versioned_frontmatter(&remote_id, "remote-v1"),
+                "Intro.\n\n---\n\n---\n\nFooter.\n",
+            )),
+        )
+        .expect("write stale metadata visible edit");
+
+        let report = reconcile_visible_projection(&mut store, &state_root, Some(&visible_path))
+            .expect("reconcile visible projection");
+
+        assert_eq!(report.reconciled, 1);
+        let cached = fs::read_to_string(&content_path).expect("read cache");
+        assert!(
+            cached.contains("Intro.\n\n---\n\n---\n\nFooter."),
+            "{cached}"
+        );
+        assert!(!has_unresolved_conflict_markers(&cached), "{cached}");
+        let visible = fs::read_to_string(&visible_path).expect("read visible");
+        assert_eq!(visible, cached);
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(state_root);
@@ -1862,6 +2035,62 @@ mod tests {
         let visible = fs::read_to_string(fixture.projection_path()).expect("read visible");
         assert!(visible.contains("Local visible edit."));
         assert!(!visible.contains("Pulled remote body."));
+    }
+
+    #[test]
+    fn refresh_projection_replaces_empty_conflict_when_local_matches_cache_ignoring_sync_metadata()
+    {
+        let root = temp_root("refresh-empty-conflict");
+        let content_root = root.join("content");
+        let projection_path = root.join("visible/page/page.md");
+        let entity = EntityRecord::new(
+            MountId::new("notion-main"),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Locality Launch",
+            "page/page.md",
+        )
+        .with_hydration(HydrationState::Dirty);
+        fs::create_dir_all(content_root.join("page")).expect("content parent");
+        fs::create_dir_all(projection_path.parent().expect("projection parent"))
+            .expect("projection parent");
+        let body = "Shared body.\n";
+        let cache = render_canonical_markdown(&CanonicalDocument::new(
+            versioned_frontmatter(&entity.remote_id, "remote-v2"),
+            body,
+        ));
+        fs::write(content_root.join("page/page.md"), &cache).expect("write cache");
+        let visible = render_canonical_markdown(&CanonicalDocument::new(
+            versioned_frontmatter(&entity.remote_id, "remote-v1"),
+            format!(
+                "{body}{CONFLICT_LOCAL_MARKER}\n{CONFLICT_SEPARATOR_MARKER}\n{CONFLICT_REMOTE_MARKER}\n"
+            ),
+        ));
+        fs::write(&projection_path, visible).expect("write visible conflict");
+        let previous_shadow = ShadowDocument::from_synced_body(
+            entity.remote_id.clone(),
+            body.to_string(),
+            8,
+            [RemoteId::new("block-1")],
+        )
+        .expect("shadow")
+        .with_frontmatter(versioned_frontmatter(&entity.remote_id, "remote-v1"));
+
+        let outcome = refresh_projection_candidate_if_clean(
+            &entity,
+            &content_root,
+            projection_path.clone(),
+            Some(&previous_shadow),
+        )
+        .expect("refresh projection");
+
+        assert_eq!(outcome, ProjectionRefreshOutcome::Refreshed);
+        assert_eq!(
+            fs::read_to_string(projection_path).expect("read visible"),
+            cache
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "macos")]

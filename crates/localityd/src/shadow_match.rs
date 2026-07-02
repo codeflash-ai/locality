@@ -4,6 +4,7 @@ use locality_core::canonical::{
 };
 use locality_core::diff::{BlockDiffEngine, DiffEngine};
 use locality_core::model::CanonicalDocument;
+use locality_core::planner::PushOperation;
 use locality_core::shadow::{ShadowDocument, rendered_bodies_equivalent};
 
 pub(crate) fn parsed_matches_shadow(
@@ -19,6 +20,72 @@ pub(crate) fn parsed_matches_shadow(
     };
 
     frontmatter_matches_ignoring_sync_metadata(&parsed.frontmatter, &shadow_parsed.frontmatter)
+}
+
+pub(crate) fn parsed_documents_match_ignoring_sync_metadata(
+    left: &ParsedCanonicalDocument,
+    right: &ParsedCanonicalDocument,
+) -> bool {
+    rendered_bodies_equivalent(&left.document.body, &right.document.body)
+        && frontmatter_matches_ignoring_sync_metadata(&left.frontmatter, &right.frontmatter)
+}
+
+pub(crate) fn parsed_changes_retain_current_shadow_blocks(
+    parsed: &ParsedCanonicalDocument,
+    shadow: &ShadowDocument,
+) -> bool {
+    let Ok(plan) = BlockDiffEngine::new()
+        .with_edited_body_start_line(parsed.body_start_line)
+        .plan_push(shadow, &parsed.document)
+    else {
+        return false;
+    };
+
+    plan.degradations.is_empty()
+        && !plan.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                PushOperation::ArchiveBlock { .. } | PushOperation::ArchiveEntity { .. }
+            )
+        })
+        && current_shadow_blocks_appear_in_edited_body(parsed, shadow)
+}
+
+pub(crate) fn contents_changes_retain_current_shadow_blocks(
+    contents: &str,
+    shadow: &ShadowDocument,
+) -> bool {
+    parse_canonical_markdown(contents)
+        .ok()
+        .is_some_and(|parsed| parsed_changes_retain_current_shadow_blocks(&parsed, shadow))
+}
+
+fn current_shadow_blocks_appear_in_edited_body(
+    parsed: &ParsedCanonicalDocument,
+    shadow: &ShadowDocument,
+) -> bool {
+    let edited_body = normalize_plain_divider_projection(&parsed.document.body);
+    shadow.blocks.iter().all(|block| {
+        let block_text = normalize_plain_divider_projection(&block.text);
+        edited_body.contains(&block_text)
+    })
+}
+
+fn normalize_plain_divider_projection(markdown: &str) -> String {
+    let mut normalized = String::with_capacity(markdown.len());
+    for segment in markdown.split_inclusive('\n') {
+        let (line, line_ending) = segment
+            .strip_suffix('\n')
+            .map(|line| (line, "\n"))
+            .unwrap_or((segment, ""));
+        if matches!(line, "---<br>---" | "---<br/>---" | "---<br />---") {
+            normalized.push_str("---\n\n---");
+        } else {
+            normalized.push_str(line);
+        }
+        normalized.push_str(line_ending);
+    }
+    normalized
 }
 
 fn parsed_body_matches_shadow(parsed: &ParsedCanonicalDocument, shadow: &ShadowDocument) -> bool {

@@ -607,6 +607,60 @@ fn pull_windows_cloud_files_refreshes_clean_visible_replica_after_pull() {
 }
 
 #[test]
+fn pull_windows_cloud_files_refreshes_visible_empty_conflict_after_clean_merge() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("afs-cli-pull-windows-empty-conflict-refresh-state");
+    let mut store = InMemoryStateStore::new();
+    let version = "2026-06-11T00:00:00.000Z";
+    fixture.mount_with_projection(&mut store, ProjectionMode::WindowsCloudFiles);
+    run_pull_with_state_root(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Shared body.", version),
+        &fixture.root,
+        Some(&state_root),
+    )
+    .expect("initial pull");
+
+    let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
+        .join("roadmap")
+        .join("page.md");
+    let visible_path = fixture.mount_point_root().join("roadmap").join("page.md");
+    fs::create_dir_all(visible_path.parent().expect("visible parent"))
+        .expect("create visible parent");
+    fs::copy(&content_path, &visible_path).expect("seed visible replica");
+    let clean = fs::read_to_string(&visible_path)
+        .expect("read clean visible replica")
+        .replace(version, "2026-06-10T00:00:00.000Z");
+    fs::write(&visible_path, &clean).expect("write visible with stale sync metadata");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(
+        &visible_path,
+        format!(
+            "{clean}{CONFLICT_LOCAL_MARKER}\n{CONFLICT_SEPARATOR_MARKER}\n{CONFLICT_REMOTE_MARKER}\n"
+        ),
+    )
+    .expect("write visible empty conflict");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Shared body.", version),
+        &visible_path,
+        Some(&state_root),
+    )
+    .expect("pull visible empty conflict");
+
+    assert!(report.ok);
+    assert_eq!(report.conflicts.len(), 0);
+    let cached = fs::read_to_string(&content_path).expect("read daemon cache");
+    let visible = fs::read_to_string(&visible_path).expect("read visible replica");
+    assert_eq!(visible, cached);
+    assert_eq!(visible, clean);
+    assert!(!has_unresolved_conflict_markers(&visible), "{visible}");
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
 fn pull_virtual_mount_accepts_mount_point_directory_as_root_target() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("loc-cli-pull-state");
@@ -1266,6 +1320,254 @@ fn pull_file_leaves_inline_conflict_unchanged_when_remote_changes_again() {
         .expect("get entity")
         .expect("entity");
     assert_eq!(entity.hydration, HydrationState::Conflicted);
+}
+
+#[test]
+fn pull_file_refreshes_inline_conflict_when_same_remote_version_shadow_drifted() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let version = "2026-06-11T00:00:00.000Z";
+    fixture.mount(&mut store);
+    run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Old body.", version),
+        &fixture.root,
+    )
+    .expect("initial pull");
+    fs::write(
+        fixture.root_file("roadmap"),
+        concat!(
+            "---\n",
+            "loc:\n",
+            "  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n",
+            "  type: page\n",
+            "  synced_at: \"2026-06-11T00:00:00.000Z\"\n",
+            "  remote_edited_at: \"2026-06-11T00:00:00.000Z\"\n",
+            "title: Roadmap\n",
+            "---\n",
+            "<<<<<<< LOCAL\n",
+            "# Roadmap\n\n",
+            "Local edit.\n",
+            "=======\n",
+            "# Roadmap\n\n",
+            "Old body.\n",
+            ">>>>>>> REMOTE\n",
+        ),
+    )
+    .expect("stale conflict file");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get entity")
+        .expect("entity");
+    entity.hydration = HydrationState::Conflicted;
+    entity.remote_edited_at = Some(version.to_string());
+    store.save_entity(entity).expect("save conflicted entity");
+
+    let report = run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Remote body.\n\n---", version),
+        fixture.root_file("roadmap"),
+    )
+    .expect("pull unresolved stale conflict");
+
+    assert!(!report.ok);
+    assert_eq!(report.hydrated, 0);
+    assert_eq!(report.skipped_dirty, 1);
+    assert_eq!(report.conflicts.len(), 1);
+    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
+    assert!(contents.contains("Local edit."), "{contents}");
+    assert!(contents.contains("Remote body.<br><br>---"), "{contents}");
+    assert!(has_unresolved_conflict_markers(&contents), "{contents}");
+    let entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.hydration, HydrationState::Conflicted);
+    assert_eq!(entity.remote_edited_at.as_deref(), Some(version));
+    let shadow = store
+        .load_shadow(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("load shadow");
+    assert!(shadow.rendered_body.contains("Remote body.<br><br>---"));
+}
+
+#[test]
+fn pull_file_compacts_same_version_inline_conflict_when_shadow_is_current() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let version = "2026-06-11T00:00:00.000Z";
+    fixture.mount(&mut store);
+    run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Shared before.\n\n---\n\nShared after.", version),
+        &fixture.root,
+    )
+    .expect("initial pull");
+    let current = fs::read_to_string(fixture.root_file("roadmap")).expect("initial file");
+    let body_start = current
+        .match_indices("---\n")
+        .nth(1)
+        .expect("frontmatter end")
+        .0
+        + "---\n".len();
+    let frontmatter = &current[..body_start];
+    let remote_body = &current[body_start..];
+    let local_body = remote_body.replace(
+        "Shared before.<br><br>---<br><br>Shared after.",
+        "Shared before.<br><br>Shared after.",
+    );
+    fs::write(
+        fixture.root_file("roadmap"),
+        format!(
+            "{frontmatter}{CONFLICT_LOCAL_MARKER}\n{local_body}{CONFLICT_SEPARATOR_MARKER}\n{remote_body}{CONFLICT_REMOTE_MARKER}\n"
+        ),
+    )
+    .expect("wide conflict file");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get entity")
+        .expect("entity");
+    entity.hydration = HydrationState::Conflicted;
+    entity.remote_edited_at = Some(version.to_string());
+    store.save_entity(entity).expect("save conflicted entity");
+
+    let report = run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Shared before.\n\n---\n\nShared after.", version),
+        fixture.root_file("roadmap"),
+    )
+    .expect("pull same-version conflict");
+
+    assert!(!report.ok);
+    assert_eq!(report.conflicts.len(), 1);
+    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
+    assert_eq!(
+        contents.matches(CONFLICT_LOCAL_MARKER).count(),
+        1,
+        "{contents}"
+    );
+    assert!(
+        contents.contains(concat!(
+            "<<<<<<< LOCAL\n",
+            "Shared before.<br><br>Shared after.\n",
+            "=======\n",
+            "Shared before.<br><br>---<br><br>Shared after.\n",
+            ">>>>>>> REMOTE\n",
+            "\n[Design Notes]",
+        )),
+        "{contents}"
+    );
+    assert!(
+        !contents.contains("[Design Notes](https://www.notion.so/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)\n\n::loc{id=cccccccccccccccccccccccccccccccc type=child_database title=\"Tasks\"}\n>>>>>>> REMOTE"),
+        "{contents}"
+    );
+}
+
+#[test]
+fn pull_file_cleans_same_version_empty_conflict_when_content_matches_remote() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let version = "2026-06-11T00:00:00.000Z";
+    fixture.mount(&mut store);
+    run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Shared body.", version),
+        &fixture.root,
+    )
+    .expect("initial pull");
+    let current = fs::read_to_string(fixture.root_file("roadmap")).expect("initial file");
+    fs::write(
+        fixture.root_file("roadmap"),
+        format!("{current}{CONFLICT_LOCAL_MARKER}\n{CONFLICT_SEPARATOR_MARKER}\n{CONFLICT_REMOTE_MARKER}\n"),
+    )
+    .expect("empty conflict file");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get entity")
+        .expect("entity");
+    entity.hydration = HydrationState::Conflicted;
+    entity.remote_edited_at = Some(version.to_string());
+    store.save_entity(entity).expect("save conflicted entity");
+
+    let report = run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Shared body.", version),
+        fixture.root_file("roadmap"),
+    )
+    .expect("pull same-version empty conflict");
+
+    assert!(report.ok);
+    assert_eq!(report.conflicts.len(), 0);
+    assert_eq!(report.hydrated, 1);
+    assert_eq!(report.skipped_dirty, 0);
+    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
+    assert_eq!(contents, current);
+    assert!(!has_unresolved_conflict_markers(&contents), "{contents}");
+}
+
+#[test]
+fn pull_file_refreshes_nested_inline_conflict_when_shadow_is_current() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let version = "2026-06-11T00:00:00.000Z";
+    fixture.mount(&mut store);
+    run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Remote body.\n\n---", version),
+        &fixture.root,
+    )
+    .expect("initial pull");
+    fs::write(
+        fixture.root_file("roadmap"),
+        concat!(
+            "---\n",
+            "loc:\n",
+            "  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n",
+            "  type: page\n",
+            "  synced_at: \"2026-06-11T00:00:00.000Z\"\n",
+            "  remote_edited_at: \"2026-06-11T00:00:00.000Z\"\n",
+            "title: Roadmap\n",
+            "---\n",
+            "<<<<<<< LOCAL\n",
+            "<<<<<<< LOCAL\n",
+            "# Roadmap\n\n",
+            "Local edit.\n",
+            "=======\n",
+            "# Roadmap\n\n",
+            "Old body.\n",
+            ">>>>>>> REMOTE\n",
+            "=======\n",
+            "# Roadmap\n\n",
+            "Old body.\n",
+            ">>>>>>> REMOTE\n",
+        ),
+    )
+    .expect("nested conflict file");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get entity")
+        .expect("entity");
+    entity.hydration = HydrationState::Conflicted;
+    entity.remote_edited_at = Some(version.to_string());
+    store.save_entity(entity).expect("save conflicted entity");
+
+    let report = run_pull(
+        &mut store,
+        &fixture.connector_with("Roadmap", "Remote body.\n\n---", version),
+        fixture.root_file("roadmap"),
+    )
+    .expect("pull nested stale conflict");
+
+    assert!(!report.ok);
+    assert_eq!(report.conflicts.len(), 1);
+    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
+    assert_eq!(
+        contents.matches(CONFLICT_LOCAL_MARKER).count(),
+        1,
+        "{contents}"
+    );
+    assert!(contents.contains("Local edit."), "{contents}");
+    assert!(contents.contains("Remote body.<br><br>---"), "{contents}");
+    assert!(has_unresolved_conflict_markers(&contents), "{contents}");
 }
 
 struct PullFixture {

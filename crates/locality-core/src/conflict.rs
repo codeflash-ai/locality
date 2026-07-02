@@ -181,15 +181,41 @@ fn render_changed_region(
 }
 
 fn render_conflict_hunk(local_body: &str, remote_body: &str) -> String {
+    if local_body == remote_body {
+        return local_body.to_string();
+    }
+
+    let local_lines = split_lines(local_body);
+    let remote_lines = split_lines(remote_body);
+    let mut prefix_len = 0usize;
+    while prefix_len < local_lines.len()
+        && prefix_len < remote_lines.len()
+        && local_lines[prefix_len] == remote_lines[prefix_len]
+    {
+        prefix_len += 1;
+    }
+
+    let mut local_suffix_start = local_lines.len();
+    let mut remote_suffix_start = remote_lines.len();
+    while local_suffix_start > prefix_len
+        && remote_suffix_start > prefix_len
+        && local_lines[local_suffix_start - 1] == remote_lines[remote_suffix_start - 1]
+    {
+        local_suffix_start -= 1;
+        remote_suffix_start -= 1;
+    }
+
     let mut body = String::new();
+    push_lines(&mut body, &local_lines[..prefix_len]);
     body.push_str(CONFLICT_LOCAL_MARKER);
     body.push('\n');
-    push_marker_section(&mut body, local_body);
+    push_marker_lines(&mut body, &local_lines[prefix_len..local_suffix_start]);
     body.push_str(CONFLICT_SEPARATOR_MARKER);
     body.push('\n');
-    push_marker_section(&mut body, remote_body);
+    push_marker_lines(&mut body, &remote_lines[prefix_len..remote_suffix_start]);
     body.push_str(CONFLICT_REMOTE_MARKER);
     body.push('\n');
+    push_lines(&mut body, &local_lines[local_suffix_start..]);
     body
 }
 
@@ -216,11 +242,117 @@ pub fn has_unresolved_conflict_markers(contents: &str) -> bool {
     unresolved_conflict_marker_line(contents).is_some()
 }
 
+pub fn has_nested_conflict_markers(contents: &str) -> bool {
+    let mut depth = 0usize;
+    for line in contents.lines() {
+        match conflict_marker_kind(line) {
+            Some(ConflictMarkerKind::LocalStart) => {
+                if depth > 0 {
+                    return true;
+                }
+                depth += 1;
+            }
+            Some(ConflictMarkerKind::Separator) => {}
+            Some(ConflictMarkerKind::RemoteEnd) => {
+                depth = depth.saturating_sub(1);
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+pub fn local_version_from_conflict_markers(contents: &str) -> Option<String> {
+    let parsed = parse_canonical_markdown(contents).ok()?;
+    let body = local_body_from_conflict_markers(&parsed.document.body)?;
+    Some(render_canonical_markdown(&CanonicalDocument::new(
+        parsed.document.frontmatter,
+        body,
+    )))
+}
+
+pub fn local_body_from_conflict_markers(body: &str) -> Option<String> {
+    let mut output = String::new();
+    let mut saw_conflict = false;
+    let mut stack = Vec::<ConflictMarkerParseState>::new();
+
+    for line in body.split_inclusive('\n') {
+        match conflict_marker_kind(line) {
+            Some(ConflictMarkerKind::LocalStart) => {
+                saw_conflict = true;
+                stack.push(ConflictMarkerParseState::Local);
+            }
+            Some(ConflictMarkerKind::Separator) => {
+                let Some(state) = stack.last_mut() else {
+                    return None;
+                };
+                if *state != ConflictMarkerParseState::Local {
+                    return None;
+                }
+                *state = ConflictMarkerParseState::Remote;
+            }
+            Some(ConflictMarkerKind::RemoteEnd) => {
+                if stack.pop() != Some(ConflictMarkerParseState::Remote) {
+                    return None;
+                }
+            }
+            None if stack
+                .iter()
+                .all(|state| *state == ConflictMarkerParseState::Local) =>
+            {
+                output.push_str(line);
+            }
+            None => {}
+        }
+    }
+
+    if !stack.is_empty() || !saw_conflict {
+        return None;
+    }
+
+    Some(output)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConflictMarkerParseState {
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConflictMarkerKind {
+    LocalStart,
+    Separator,
+    RemoteEnd,
+}
+
+fn conflict_marker_kind(line: &str) -> Option<ConflictMarkerKind> {
+    let line = line
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .trim_start();
+    if line.starts_with("<<<<<<<") {
+        return Some(ConflictMarkerKind::LocalStart);
+    }
+    if line.trim_end() == CONFLICT_SEPARATOR_MARKER {
+        return Some(ConflictMarkerKind::Separator);
+    }
+    if line.starts_with(">>>>>>>") {
+        return Some(ConflictMarkerKind::RemoteEnd);
+    }
+    None
+}
+
 fn push_marker_section(output: &mut String, section: &str) {
     output.push_str(section);
-    if !section.ends_with('\n') {
+    if !section.is_empty() && !section.ends_with('\n') {
         output.push('\n');
     }
+}
+
+fn push_marker_lines(output: &mut String, lines: &[String]) {
+    let section = lines.concat();
+    push_marker_section(output, &section);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -387,7 +519,9 @@ impl BlockChangeSet {
 mod tests {
     use super::{
         CONFLICT_LOCAL_MARKER, CONFLICT_REMOTE_MARKER, CONFLICT_SEPARATOR_MARKER,
-        has_unresolved_conflict_markers, render_conflict_marker_body_with_base,
+        has_nested_conflict_markers, has_unresolved_conflict_markers,
+        local_body_from_conflict_markers, local_version_from_conflict_markers,
+        render_conflict_marker_body, render_conflict_marker_body_with_base,
         unresolved_conflict_marker_line,
     };
 
@@ -446,11 +580,118 @@ mod tests {
     }
 
     #[test]
+    fn conflict_hunks_trim_common_prefix_and_suffix_lines() {
+        let local = "Intro.\n\nShared before.\n\nShared after.\n";
+        let remote = "Intro.\n\nShared before.\n\n---\n\nShared after.\n";
+
+        let merged = render_conflict_marker_body(local, remote);
+
+        assert_eq!(
+            merged,
+            concat!(
+                "Intro.\n\nShared before.\n\n",
+                "<<<<<<< LOCAL\n",
+                "=======\n",
+                "---\n\n",
+                ">>>>>>> REMOTE\n",
+                "Shared after.\n",
+            )
+        );
+    }
+
+    #[test]
+    fn conflict_hunks_do_not_emit_empty_markers_for_identical_bodies() {
+        let body = "Intro.\n\nShared body.\n";
+
+        let merged = render_conflict_marker_body(body, body);
+
+        assert_eq!(merged, body);
+        assert!(!merged.contains(CONFLICT_LOCAL_MARKER));
+        assert!(!merged.contains(CONFLICT_SEPARATOR_MARKER));
+        assert!(!merged.contains(CONFLICT_REMOTE_MARKER));
+    }
+
+    #[test]
     fn unresolved_conflict_markers_tolerate_whitespace_and_labels() {
         let contents =
             "intro\n  <<<<<<< ours\nlocal\n  =======  \nremote\n  >>>>>>> theirs\nafter\n";
 
         assert!(has_unresolved_conflict_markers(contents));
         assert_eq!(unresolved_conflict_marker_line(contents), Some(2));
+    }
+
+    #[test]
+    fn local_body_from_conflict_markers_takes_local_sections() {
+        let contents = concat!(
+            "Intro.\n",
+            "<<<<<<< LOCAL\n",
+            "Local middle.\n",
+            "=======\n",
+            "Remote middle.\n",
+            ">>>>>>> REMOTE\n",
+            "Keep.\n",
+            "<<<<<<< LOCAL\n",
+            "Local outro.\n",
+            "=======\n",
+            "Remote outro.\n",
+            ">>>>>>> REMOTE\n",
+        );
+
+        assert_eq!(
+            local_body_from_conflict_markers(contents).as_deref(),
+            Some("Intro.\nLocal middle.\nKeep.\nLocal outro.\n")
+        );
+    }
+
+    #[test]
+    fn local_version_from_conflict_markers_preserves_frontmatter() {
+        let contents = concat!(
+            "---\n",
+            "title: Roadmap\n",
+            "---\n",
+            "Intro.\n",
+            "<<<<<<< LOCAL\n",
+            "Local middle.\n",
+            "=======\n",
+            "Remote middle.\n",
+            ">>>>>>> REMOTE\n",
+        );
+
+        assert_eq!(
+            local_version_from_conflict_markers(contents).as_deref(),
+            Some("---\ntitle: Roadmap\n---\nIntro.\nLocal middle.\n")
+        );
+    }
+
+    #[test]
+    fn local_body_from_conflict_markers_rejects_malformed_markers() {
+        assert_eq!(
+            local_body_from_conflict_markers("<<<<<<< LOCAL\nlocal\n>>>>>>> REMOTE\n"),
+            None
+        );
+        assert_eq!(local_body_from_conflict_markers("no conflict\n"), None);
+    }
+
+    #[test]
+    fn local_body_from_conflict_markers_takes_local_from_nested_markers() {
+        let contents = concat!(
+            "<<<<<<< LOCAL\n",
+            "before\n",
+            "<<<<<<< LOCAL\n",
+            "nested local\n",
+            "=======\n",
+            "nested remote\n",
+            ">>>>>>> REMOTE\n",
+            "after\n",
+            "=======\n",
+            "outer remote\n",
+            ">>>>>>> REMOTE\n",
+        );
+
+        assert_eq!(
+            local_body_from_conflict_markers(contents).as_deref(),
+            Some("before\nnested local\nafter\n")
+        );
+        assert!(has_nested_conflict_markers(contents));
     }
 }

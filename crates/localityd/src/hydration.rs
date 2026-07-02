@@ -3,7 +3,8 @@ use std::path::{Component, Path, PathBuf};
 
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::conflict::{
-    has_unresolved_conflict_markers, render_inline_conflict_markdown_with_base,
+    has_unresolved_conflict_markers, local_version_from_conflict_markers,
+    render_inline_conflict_markdown_with_base,
 };
 use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::model::{CanonicalDocument, HydrationState, MountId, RemoteId};
@@ -19,7 +20,9 @@ use crate::media::{
     document_with_absolute_media_hrefs, render_document_with_absolute_media_hrefs,
     replace_hydrated_media_manifest, update_hydrated_media_manifest,
 };
-use crate::shadow_match::{parsed_matches_shadow, shadows_match};
+use crate::shadow_match::{
+    contents_changes_retain_current_shadow_blocks, parsed_matches_shadow, shadows_match,
+};
 
 pub trait HydrationEngine {
     fn queue(&mut self, request: HydrationRequest) -> LocalityResult<()>;
@@ -158,7 +161,27 @@ where
 
         if !can_replace {
             if file_has_unresolved_conflict_markers(&path)? {
-                self.mark_conflicted_if_allowed(entity)?;
+                if self.same_version_shadow_drifted(&mount, &entity, &rendered)? {
+                    self.refresh_existing_conflict(
+                        &mount,
+                        &output_root,
+                        entity,
+                        &path,
+                        rendered,
+                        true,
+                    )?;
+                } else if same_remote_version(&entity, &rendered) {
+                    self.refresh_existing_conflict(
+                        &mount,
+                        &output_root,
+                        entity,
+                        &path,
+                        rendered,
+                        false,
+                    )?;
+                } else {
+                    self.mark_conflicted_if_allowed(entity)?;
+                }
             } else if !self.remote_matches_shadow(&mount, &entity, &rendered.shadow)? {
                 self.materialize_conflict(&mount, &output_root, entity, &path, rendered)?;
             } else {
@@ -273,34 +296,103 @@ where
         Ok(())
     }
 
+    fn same_version_shadow_drifted(
+        &mut self,
+        mount: &MountConfig,
+        entity: &EntityRecord,
+        rendered: &HydratedEntity,
+    ) -> LocalityResult<bool> {
+        if !same_remote_version(entity, rendered) {
+            return Ok(false);
+        }
+
+        Ok(!self.remote_matches_shadow(mount, entity, &rendered.shadow)?)
+    }
+
+    fn refresh_existing_conflict(
+        &mut self,
+        mount: &MountConfig,
+        output_root: &Path,
+        entity: EntityRecord,
+        path: &Path,
+        rendered: HydratedEntity,
+        use_base_shadow: bool,
+    ) -> LocalityResult<DirtyRemoteDriftOutcome> {
+        let contents = read_to_string(path)?;
+        let Some(local_contents) = local_version_from_conflict_markers(&contents) else {
+            self.mark_conflicted_if_allowed(entity)?;
+            return Ok(DirtyRemoteDriftOutcome::Conflicted);
+        };
+        self.materialize_conflict_from_contents(
+            mount,
+            output_root,
+            entity,
+            path,
+            rendered,
+            local_contents,
+            use_base_shadow,
+        )
+    }
+
     fn materialize_conflict(
+        &mut self,
+        mount: &MountConfig,
+        output_root: &Path,
+        entity: EntityRecord,
+        path: &Path,
+        rendered: HydratedEntity,
+    ) -> LocalityResult<DirtyRemoteDriftOutcome> {
+        let local_contents = read_to_string(path)?;
+        self.materialize_conflict_from_contents(
+            mount,
+            output_root,
+            entity,
+            path,
+            rendered,
+            local_contents,
+            true,
+        )
+    }
+
+    fn materialize_conflict_from_contents(
         &mut self,
         mount: &MountConfig,
         output_root: &Path,
         mut entity: EntityRecord,
         path: &Path,
         rendered: HydratedEntity,
+        local_contents: String,
+        use_base_shadow: bool,
     ) -> LocalityResult<DirtyRemoteDriftOutcome> {
         for asset in &rendered.assets {
             let path = mount_relative_path(output_root, &asset.path)?;
             write_binary_atomic(&path, &asset.bytes)?;
         }
         update_hydrated_media_manifest(output_root, &rendered.assets)?;
-        let local_contents = read_to_string(path)?;
-        let base_shadow = match self.store.load_shadow(&mount.mount_id, &entity.remote_id) {
-            Ok(shadow) => Some(shadow),
-            Err(StoreError::ShadowMissing { .. }) => None,
-            Err(error) => return Err(LocalityError::from(error)),
+        let base_shadow = if use_base_shadow {
+            match self.store.load_shadow(&mount.mount_id, &entity.remote_id) {
+                Ok(shadow) => Some(shadow),
+                Err(StoreError::ShadowMissing { .. }) => None,
+                Err(error) => return Err(LocalityError::from(error)),
+            }
+        } else {
+            None
         };
         let remote_document =
             document_with_absolute_media_hrefs(&rendered.document, &entity.path, output_root);
-        let conflict_markdown = render_inline_conflict_markdown_with_base(
-            &local_contents,
-            base_shadow
-                .as_ref()
-                .map(|shadow| shadow.rendered_body.as_str()),
-            &remote_document,
-        );
+        let conflict_markdown = if !use_base_shadow
+            && contents_changes_retain_current_shadow_blocks(&local_contents, &rendered.shadow)
+        {
+            local_contents
+        } else {
+            render_inline_conflict_markdown_with_base(
+                &local_contents,
+                base_shadow
+                    .as_ref()
+                    .map(|shadow| shadow.rendered_body.as_str()),
+                &remote_document,
+            )
+        };
         let has_conflict_markers = has_unresolved_conflict_markers(&conflict_markdown);
         write_atomic(path, conflict_markdown)?;
         self.store
@@ -754,6 +846,11 @@ where
 fn file_has_unresolved_conflict_markers(path: &Path) -> LocalityResult<bool> {
     let contents = read_to_string(path)?;
     Ok(has_unresolved_conflict_markers(&contents))
+}
+
+fn same_remote_version(entity: &EntityRecord, rendered: &HydratedEntity) -> bool {
+    rendered.remote_edited_at.is_some()
+        && rendered.remote_edited_at.as_deref() == entity.remote_edited_at.as_deref()
 }
 
 fn write_atomic(path: &Path, contents: String) -> LocalityResult<()> {
