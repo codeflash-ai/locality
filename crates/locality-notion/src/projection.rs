@@ -116,6 +116,9 @@ pub fn list_container_children(
 ) -> LocalityResult<Vec<TreeEntry>> {
     match container {
         ChildContainer::Root => list_root_children(api, mount_id, root_page_id, parent_path),
+        ChildContainer::SourceRoot(_) => Err(LocalityError::Unsupported(
+            "notion source-root child containers",
+        )),
         ChildContainer::PageChildren(page_id) => {
             list_page_children(api, &mount_id, page_id.as_str(), parent_path)
         }

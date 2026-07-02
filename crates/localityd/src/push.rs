@@ -25,7 +25,7 @@ use locality_core::path_projection::{
     is_page_document_path, page_container_path, page_document_path,
 };
 use locality_core::planner::GuardrailDecision;
-use locality_core::planner::{GuardrailPolicy, PushOperation, PushPlan};
+use locality_core::planner::{CreateParentScope, GuardrailPolicy, PushOperation, PushPlan};
 use locality_core::push::{
     PushApplier, PushApplyRequest, PushApplyResult, PushApproval, PushConcurrencyCheck,
     PushConcurrencyRequest, PushExecutionRequest, PushExecutionResult, PushPipelineAction,
@@ -2136,6 +2136,7 @@ fn create_entity_pipeline(
         vec![PushOperation::CreateEntity {
             parent_id: parent.remote_id.clone(),
             parent_kind: Some(parent.kind.clone()),
+            parent_scope: CreateParentScope::Remote,
             title: parsed.frontmatter.title.clone().unwrap_or_default(),
             properties,
             body: parsed.document.body.clone(),

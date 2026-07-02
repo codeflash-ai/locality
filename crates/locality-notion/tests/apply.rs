@@ -7,7 +7,9 @@ use std::sync::Mutex;
 use locality_connector::{ApplyPlanRequest, ApplyUndoRequest, Connector};
 use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::{EntityKind, MountId, RemoteId};
-use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
+use locality_core::planner::{
+    CreateParentScope, PropertyValue, PushOperation, PushOperationKind, PushPlan,
+};
 use locality_core::push::RemotePrecondition;
 use locality_core::undo::{UndoOperation, UndoPlan, UndoPlanStatus};
 use locality_core::{LocalityError, LocalityResult};
@@ -1343,6 +1345,7 @@ fn check_concurrency_uses_database_metadata_for_row_create_parent() {
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("database-1"),
             parent_kind: Some(EntityKind::Database),
+            parent_scope: CreateParentScope::Remote,
             title: "New row".to_string(),
             properties: BTreeMap::new(),
             body: String::new(),
@@ -3505,6 +3508,7 @@ fn apply_creates_child_page_and_marks_parent_changed() {
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("page-parent"),
             parent_kind: Some(EntityKind::Page),
+            parent_scope: CreateParentScope::Remote,
             title: "New child".to_string(),
             properties: BTreeMap::new(),
             body: "# Child body\n\nCreated from Locality.".to_string(),
@@ -3583,6 +3587,7 @@ fn apply_creates_child_page_with_consecutive_markdown_list_items_as_separate_blo
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("page-parent"),
             parent_kind: Some(EntityKind::Page),
+            parent_scope: CreateParentScope::Remote,
             title: "New child".to_string(),
             properties: BTreeMap::new(),
             body: "# Child body\n\n- First\n- Second\n- [ ] Third".to_string(),
@@ -3658,6 +3663,7 @@ fn apply_creates_child_page_with_emoji_shortcodes_and_new_tables() {
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("page-parent"),
             parent_kind: Some(EntityKind::Page),
+            parent_scope: CreateParentScope::Remote,
             title: "Fitness Log".to_string(),
             properties: BTreeMap::new(),
             body: "# Fitness Log\n\n## 😴 Sleep Data\n\n| \u{00a0} | \u{00a0} |\n| --- | --- |\n| :sleeping: Poor | :sparkles: Excellent |\n\n**Sleep Quality Scale:** :sleeping: Poor".to_string(),
@@ -3729,6 +3735,7 @@ fn apply_creates_database_row_with_properties_and_children() {
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("database-1"),
             parent_kind: Some(locality_core::model::EntityKind::Database),
+            parent_scope: CreateParentScope::Remote,
             title: "New task".to_string(),
             properties: [
                 (
