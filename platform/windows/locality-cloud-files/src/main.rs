@@ -2283,12 +2283,21 @@ fn seed_child_directory_placeholders(
     items: &[localityd::file_provider::FileProviderItem],
 ) -> Result<(), HelperError> {
     let mut targets = Vec::new();
-    collect_seeded_child_directory_seed_targets(
-        directory,
-        items,
-        &mut |identifier| context.children(identifier).map(|report| report.children),
-        &mut targets,
-    )?;
+    if context.legacy_mount_id.is_none() {
+        collect_seeded_child_directory_seed_targets(
+            directory,
+            items,
+            &mut |identifier| context.children(identifier).map(|report| report.children),
+            &mut targets,
+        )?;
+    } else {
+        collect_existing_child_directory_seed_targets(
+            directory,
+            items,
+            &mut |identifier| context.children(identifier).map(|report| report.children),
+            &mut targets,
+        )?;
+    }
     for (child_directory, children) in targets {
         trace_cloud_files(format!(
             "seed child directory placeholders directory=`{}` count={}",
@@ -4243,6 +4252,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["company", "tech"]
         );
+
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn existing_child_directory_seed_targets_skip_missing_root_folders_for_legacy_roots() {
+        let temp = unique_test_state_dir("legacy-missing-root-child-dirs");
+        let sync_root = temp.join("Locality");
+        let state_dir = temp.join("state");
+        std::fs::create_dir_all(&sync_root).expect("create sync root");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+
+        let context = ProviderContext {
+            legacy_mount_id: Some("notion-main".to_string()),
+            sync_root: sync_root.clone(),
+            projection_root: sync_root.clone(),
+            state_dir,
+            identity_index: Default::default(),
+            local_file_index: Default::default(),
+        };
+        let root_items = vec![folder_item("children:company", "company")];
+
+        seed_child_directory_placeholders(&context, &sync_root, &root_items)
+            .expect("legacy missing root directories should not enumerate children");
+
+        let mut targets = Vec::new();
+        collect_existing_child_directory_seed_targets(
+            &sync_root,
+            &root_items,
+            &mut |_identifier| -> Result<
+                Vec<localityd::file_provider::FileProviderItem>,
+                HelperError,
+            > { panic!("legacy missing root directory should not enumerate children") },
+            &mut targets,
+        )
+        .expect("collect existing-only targets");
+
+        assert!(targets.is_empty());
 
         let _ = std::fs::remove_dir_all(temp);
     }
