@@ -16,6 +16,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc info [path] [--json]`
 - `loc status [path] [--json]`
 - `loc search <query> [--connector <connector>] [--limit <n>] [--json]`
+- `loc create page --title <title> [--parent <dir>] [--json]`
 - `loc templates list|validate|new|apply [args] [--json]`
 - `loc inspect <path> [--json]`
 - `loc pull <path> [--json]`
@@ -197,6 +198,61 @@ when you need the newest remote facts.
 dirty, conflicted, stale, or remotely deleted results are still returned for
 navigation, but future agent/MCP readers should treat their `safety.labels` as
 review or hydration requirements before reading file content.
+
+## Local Draft Creation
+
+`loc create page --title <title> [--parent <dir>]` creates the local filesystem
+shape for a new page and does not call a remote connector. The parent directory
+must be inside a registered Locality mount and must be writable. When `--parent`
+is omitted, the current directory is used.
+
+For Notion mounts, the title determines the page directory name and the
+containing directory determines the remote parent:
+
+```bash
+loc create page --title "Launch Plan" --parent ~/Library/CloudStorage/Locality/notion/go-to-market
+```
+
+creates:
+
+```text
+~/Library/CloudStorage/Locality/notion/go-to-market/Launch Plan/page.md
+```
+
+with only new-page frontmatter:
+
+```md
+---
+title: "Launch Plan"
+---
+```
+
+The draft intentionally has no `loc:` identity block and no duplicate Markdown
+heading. Locality adds identity metadata after the page is pushed or synced.
+
+Human output includes the created `page.md` path and suggested next commands.
+JSON output is stable enough for agents:
+
+```json
+{
+  "ok": true,
+  "command": "create_page",
+  "kind": "page",
+  "title": "Launch Plan",
+  "parent": "/Users/alice/Library/CloudStorage/Locality/notion/go-to-market",
+  "directory": "/Users/alice/Library/CloudStorage/Locality/notion/go-to-market/Launch Plan",
+  "path": "/Users/alice/Library/CloudStorage/Locality/notion/go-to-market/Launch Plan/page.md",
+  "mount_id": "notion-main",
+  "connector": "notion",
+  "next": [
+    "loc diff '/Users/alice/Library/CloudStorage/Locality/notion/go-to-market/Launch Plan/page.md'",
+    "loc push '/Users/alice/Library/CloudStorage/Locality/notion/go-to-market/Launch Plan/page.md' -y"
+  ]
+}
+```
+
+With Live Mode enabled, the same pending local create can sync automatically
+unless Locality requires review.
 
 ## Template Packs
 

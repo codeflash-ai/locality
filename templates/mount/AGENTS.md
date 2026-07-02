@@ -17,6 +17,7 @@ Working rules:
 
 Notion facts:
 - Pages are directories. Edit `page.md` for the page body; sibling entries in that directory are child Notion content.
+- Prefer `loc create page --title "New Page" --parent <parent-directory>` for new pages.
 - To create a child page, make a new directory under the parent page directory and write that directory's `page.md`. Example: `parent-page/new-page/page.md`.
 - New page files must start with YAML frontmatter containing `title: "..."` and must not include an `loc:` identity block. Locality adds `loc.id` after the first push.
 - Existing `page.md` files already have an `loc:` block. Preserve it; edit only the body, `title`, and supported property frontmatter.
@@ -31,5 +32,4 @@ New child page example:
 ---
 title: "Target Companies & CTOs"
 ---
-# Target Companies & CTOs
 ```

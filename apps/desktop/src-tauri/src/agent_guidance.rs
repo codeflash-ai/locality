@@ -352,6 +352,7 @@ Locality projects connected company sources, including Notion, into the local fi
 ## Creating Notion Content
 
 - Read `{mount_path}/AGENTS.md` for connector-specific creation rules.
+- Prefer `loc create page --title "New Page" --parent <parent-directory>` for new pages.
 - Pages are directories; edit or create the `page.md` inside the page directory.
 - To create a child page, create `parent-page/new-page/page.md`.
 - New `page.md` files need YAML frontmatter with `title: "..."` and no `loc:` identity block.
@@ -790,6 +791,7 @@ mod tests {
         assert!(skill.contains("Do not run routine `loc pull` or `loc push`"));
         assert!(skill.contains("loc diff <file>"));
         assert!(skill.contains("Creating Notion Content"));
+        assert!(skill.contains("loc create page --title"));
         assert!(skill.contains("parent-page/new-page/page.md"));
         assert!(skill.contains("no `loc:` identity block"));
         assert!(skill.contains("remote changed since last sync"));

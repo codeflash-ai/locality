@@ -39,6 +39,7 @@ fn mount_writes_agent_guidance_and_claude_alias() {
     assert!(agents.contains("Notion facts:"));
     assert!(agents.contains("Pages are directories"));
     assert!(agents.contains("Edit `page.md` for the page body"));
+    assert!(agents.contains("loc create page --title"));
     assert!(agents.contains("parent-page/new-page/page.md"));
     assert!(agents.contains("must not include an `loc:` identity block"));
     assert!(agents.contains("Locality adds `loc.id` after the first push"));

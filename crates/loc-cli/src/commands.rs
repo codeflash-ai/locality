@@ -52,6 +52,7 @@ use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
     resolve_source_for_mount_id, resolve_source_for_path, source_descriptor,
 };
+use crate::create::{CreateError, CreatePageOptions, CreatePageReport, run_create_page};
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
 use crate::diff::{DiffError, run_diff_with_state_root};
 use crate::doctor::{DoctorOptions, doctor_exit_code, print_doctor_report, run_doctor};
@@ -143,6 +144,11 @@ enum LocalityCommand {
     Doctor,
     #[command(about = "Search local mount metadata without contacting remote sources")]
     Search(SearchArgs),
+    #[command(about = "Create local draft content in a mounted Locality folder")]
+    Create {
+        #[command(subcommand)]
+        command: CreateCommand,
+    },
     #[command(about = "List, validate, and create local template pack workspaces")]
     Templates {
         #[command(subcommand)]
@@ -450,6 +456,24 @@ struct SearchArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum CreateCommand {
+    #[command(about = "Create a page directory with page.md")]
+    Page(CreatePageArgs),
+}
+
+#[derive(Debug, Args)]
+struct CreatePageArgs {
+    #[arg(long, value_name = "title", help = "Title for the new page.")]
+    title: String,
+    #[arg(
+        long,
+        value_name = "dir",
+        help = "Existing parent directory where the page should be created. Defaults to the current directory."
+    )]
+    parent: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
 enum TemplatesCommand {
     #[command(about = "List bundled template packs")]
     List,
@@ -646,6 +670,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Status(_) => status(&legacy_args[1..], json),
         LocalityCommand::Doctor => doctor(json),
         LocalityCommand::Search(_) => search(&legacy_args[1..], json),
+        LocalityCommand::Create { .. } => create(&legacy_args[1..], json),
         LocalityCommand::Templates { .. } => templates(&legacy_args[1..], json),
         LocalityCommand::Inspect(_) => inspect(&legacy_args[1..], json),
         LocalityCommand::Pull(_) => pull(&legacy_args[1..], json),
@@ -810,6 +835,16 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
             push_optional_flag_value(&mut args, "--connector", options.connector.as_deref());
             push_flag_value(&mut args, "--limit", &options.limit.to_string());
             push_flag(&mut args, "--all", options.all);
+        }
+        LocalityCommand::Create { command } => {
+            args.push("create".to_string());
+            match command {
+                CreateCommand::Page(options) => {
+                    args.push("page".to_string());
+                    push_flag_value(&mut args, "--title", &options.title);
+                    push_optional_flag_value(&mut args, "--parent", options.parent.as_deref());
+                }
+            }
         }
         LocalityCommand::Templates { command } => {
             args.push("templates".to_string());
@@ -2265,6 +2300,57 @@ fn search(args: &[String], json: bool) -> i32 {
     }
 }
 
+fn create(args: &[String], json: bool) -> i32 {
+    match first_positional(args) {
+        Some("page") => create_page(args, json),
+        _ => command_error(
+            json,
+            CommandError::new(
+                "create",
+                "usage",
+                "usage: loc create <page> [options] [--json]",
+            ),
+            EXIT_USAGE,
+        ),
+    }
+}
+
+fn create_page(args: &[String], json: bool) -> i32 {
+    let Some(title) = flag_value(args, "--title").map(str::to_string) else {
+        return command_error(
+            json,
+            CommandError::new("create_page", "missing_title", "--title is required"),
+            EXIT_USAGE,
+        );
+    };
+    let state_root = default_state_root();
+    let store = match SqliteStateStore::open(state_root) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("create_page", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let options = CreatePageOptions {
+        title,
+        parent: flag_value(args, "--parent").map(PathBuf::from),
+    };
+    match run_create_page(&store, options) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_create_page_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => create_command_error(json, error),
+    }
+}
+
 fn refresh_notion_url_search_on_miss(
     state_root: &Path,
     store: &mut SqliteStateStore,
@@ -3581,6 +3667,16 @@ fn print_search_report(report: &SearchReport) {
             };
             println!("  remote: {state}");
         }
+    }
+}
+
+fn print_create_page_report(report: &CreatePageReport) {
+    println!("created {}", report.path);
+    println!("  title: {}", report.title);
+    println!("  mount: {}", report.mount_id);
+    println!("  next:");
+    for next in &report.next {
+        println!("    {next}");
     }
 }
 
@@ -5252,6 +5348,22 @@ fn history_command_error(command: &'static str, json: bool, error: HistoryError)
     )
 }
 
+fn create_command_error(json: bool, error: CreateError) -> i32 {
+    let exit_code = match &error {
+        CreateError::CurrentDir { .. }
+        | CreateError::InvalidTitle(_)
+        | CreateError::MountNotFound(_)
+        | CreateError::ReadOnlyMount { .. }
+        | CreateError::TargetExists(_) => EXIT_USAGE,
+        CreateError::Store(_) | CreateError::WriteFile { .. } => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("create_page", error.code(), error.message()),
+        exit_code,
+    )
+}
+
 fn daemon_command_error(json: bool, error: DaemonControlError) -> i32 {
     let exit_code = match error.code() {
         "usage" => EXIT_USAGE,
@@ -5763,6 +5875,8 @@ fn takes_value(arg: &str) -> bool {
             | "--broker-url"
             | "--connector"
             | "--limit"
+            | "--title"
+            | "--parent"
     )
 }
 
@@ -6115,6 +6229,19 @@ mod tests {
                 ],
             ),
             (
+                vec!["create", "--help"],
+                vec!["Usage: loc create", "Commands:", "page", "--json"],
+            ),
+            (
+                vec!["create", "page", "--help"],
+                vec![
+                    "Usage: loc create page",
+                    "Create a page directory",
+                    "--title",
+                    "--parent",
+                ],
+            ),
+            (
                 vec!["templates", "--help"],
                 vec![
                     "Usage: loc templates",
@@ -6357,6 +6484,26 @@ mod tests {
                 "notion",
                 "--limit",
                 "5"
+            ]
+        );
+
+        let cli = parse_cli([
+            "create",
+            "page",
+            "--title",
+            "Launch Plan",
+            "--parent",
+            "/tmp/locality/notion",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "create",
+                "page",
+                "--title",
+                "Launch Plan",
+                "--parent",
+                "/tmp/locality/notion"
             ]
         );
 

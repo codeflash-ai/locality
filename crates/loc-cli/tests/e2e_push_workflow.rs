@@ -218,6 +218,7 @@ fn mount_agent_guidance_matches_filesystem_workflow_and_does_not_dirty_status() 
     for expected in [
         "Browse directories normally",
         "Edit `page.md` for the page body",
+        "loc create page --title",
         "parent-page/new-page/page.md",
         "database/new-row.md",
         "`_schema.yaml` files are read-only references",

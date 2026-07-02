@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod connect;
 pub mod connector;
+pub mod create;
 pub mod daemon;
 pub mod diff;
 pub mod doctor;
