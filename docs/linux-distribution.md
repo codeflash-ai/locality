@@ -98,6 +98,16 @@ behavior:
 LOCALITY_FUSE_SMOKE=1 LOCALITY_FUSE_SMOKE_REQUIRED=1 make test-linux-fuse
 ```
 
+## Uninstall Cleanup
+
+The Debian and RPM packages install a pre-remove hook. On actual package
+removal, not package upgrade, the hook runs the desktop binary's
+`--prepare-uninstall` cleanup entry point when available and then runs
+`loc daemon stop` as a fallback. The cleanup stops Locality runtime processes
+owned by the user, clears Locality local state and credentials, and removes
+Locality-managed agent guidance and MCP `loc` entries. User-visible mount
+folders are left in place.
+
 ## GitHub Release Workflow
 
 The GitHub workflow in `.github/workflows/release-linux.yml` publishes Linux

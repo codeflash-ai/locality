@@ -3377,6 +3377,7 @@ function SettingsView({
   const [agentMessage, setAgentMessage] = useState("");
   const [installingAgents, setInstallingAgents] = useState(false);
   const [resettingState, setResettingState] = useState(false);
+  const [preparingUninstall, setPreparingUninstall] = useState(false);
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const daemonStopped = snapshot.health.state === "stopped";
@@ -3478,13 +3479,45 @@ function SettingsView({
       );
       setResetMessage(report.message);
       if (report.ok) {
+        window.alert(report.message);
+        await callCommand<ActionReport>(
+          "quit_completely",
+          undefined,
+          { ok: true, message: "Locality is quitting." },
+        );
+      }
+    } catch (error) {
+      setResetMessage(errorMessage(error));
+    } finally {
+      setResettingState(false);
+    }
+  }
+
+  async function prepareUninstall() {
+    const confirmed = window.confirm(
+      "Prepare Locality for uninstall? This stops Locality, removes Locality agent integrations and MCP config, clears Locality local state, and leaves your local files in place.",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setResetMessage("");
+    setPreparingUninstall(true);
+    try {
+      const report = await callCommand<ActionReport>(
+        "prepare_locality_uninstall",
+        undefined,
+        { ok: true, message: "Locality is ready to uninstall." },
+      );
+      setResetMessage(report.message);
+      if (report.ok) {
         await onRefresh().catch(() => undefined);
         onResetComplete();
       }
     } catch (error) {
       setResetMessage(errorMessage(error));
     } finally {
-      setResettingState(false);
+      setPreparingUninstall(false);
     }
   }
 
@@ -3616,10 +3649,18 @@ function SettingsView({
           <SecondaryButton
             compact
             icon={resettingState ? <Loader2 className="spin-icon" /> : <RotateCcw />}
-            disabled={resettingState}
+            disabled={resettingState || preparingUninstall}
             onClick={() => void resetLocalState()}
           >
             {resettingState ? "Resetting" : "Reset Local State"}
+          </SecondaryButton>
+          <SecondaryButton
+            compact
+            icon={preparingUninstall ? <Loader2 className="spin-icon" /> : <Trash2 />}
+            disabled={resettingState || preparingUninstall}
+            onClick={() => void prepareUninstall()}
+          >
+            {preparingUninstall ? "Preparing" : "Prepare for Uninstall"}
           </SecondaryButton>
           {resetMessage && <p className="quiet-note inline-note">{resetMessage}</p>}
         </div>

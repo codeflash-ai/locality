@@ -55,8 +55,11 @@ localityd.exe
 locality-cloud-files.exe
 ```
 
-The NSIS uninstall hook removes the installed sidecars, the per-user Windows
-login item, and Locality-managed terminal command shims. It does not delete
+The NSIS uninstall hook stops the desktop app, `localityd.exe`, `loc.exe`, and
+Cloud Files provider runtimes; runs the desktop binary's `--prepare-uninstall`
+cleanup entry point; removes installed sidecars; removes the per-user Windows
+login item; removes Locality-managed terminal command shims; and removes
+Locality-managed agent guidance and MCP `loc` entries. It does not delete
 user-visible mount folders.
 
 Because the current-user install directory is also the default Locality state

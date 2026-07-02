@@ -105,6 +105,38 @@ pub fn install_agent_guidance(mount_path: Option<&str>) -> AgentGuidanceInstallR
     }
 }
 
+pub fn uninstall_agent_guidance() -> AgentGuidanceInstallReport {
+    let Some(home) = home_dir() else {
+        return AgentGuidanceInstallReport {
+            ok: false,
+            command: "uninstall_agent_guidance",
+            targets: vec![AgentGuidanceTarget {
+                agent: "Local agents".to_string(),
+                status: "failed".to_string(),
+                path: None,
+                detail: "Could not find the home directory for agent instruction removal."
+                    .to_string(),
+            }],
+            prompt: String::new(),
+        };
+    };
+
+    let mut targets = Vec::new();
+    for spec in agent_target_specs(&home) {
+        targets.push(uninstall_target(&spec));
+    }
+    for spec in mcp_target_specs(&home) {
+        targets.push(uninstall_mcp_target(&spec));
+    }
+
+    AgentGuidanceInstallReport {
+        ok: targets.iter().all(|target| target.status != "failed"),
+        command: "uninstall_agent_guidance",
+        targets,
+        prompt: String::new(),
+    }
+}
+
 fn install_mcp_targets(home: &Path) -> Vec<AgentGuidanceTarget> {
     let specs = mcp_target_specs(home)
         .into_iter()
@@ -291,6 +323,28 @@ fn install_target(spec: &AgentTargetSpec, mount_path: &str) -> AgentGuidanceTarg
     }
 }
 
+fn uninstall_target(spec: &AgentTargetSpec) -> AgentGuidanceTarget {
+    let result = match spec.kind {
+        InstallKind::Skill => remove_locality_skill(&spec.path),
+        InstallKind::ManagedInstructions => remove_managed_section_file(&spec.path),
+    };
+
+    match result {
+        Ok(action) => AgentGuidanceTarget {
+            agent: spec.agent.to_string(),
+            status: action.to_string(),
+            path: Some(display_path(&spec.path)),
+            detail: "Removed Locality-managed agent guidance when present.".to_string(),
+        },
+        Err(error) => AgentGuidanceTarget {
+            agent: spec.agent.to_string(),
+            status: "failed".to_string(),
+            path: Some(display_path(&spec.path)),
+            detail: error,
+        },
+    }
+}
+
 fn skill_path(home: &Path, skills_root: &str) -> PathBuf {
     home.join(skills_root).join(SKILL_DIR_NAME).join("SKILL.md")
 }
@@ -311,6 +365,31 @@ fn install_mcp_target(spec: &McpTargetSpec, token: &str) -> AgentGuidanceTarget 
             status: action.to_string(),
             path: Some(display_path(&spec.path)),
             detail: spec.detail.to_string(),
+        },
+        Err(error) => AgentGuidanceTarget {
+            agent: spec.agent.to_string(),
+            status: "failed".to_string(),
+            path: Some(display_path(&spec.path)),
+            detail: error,
+        },
+    }
+}
+
+fn uninstall_mcp_target(spec: &McpTargetSpec) -> AgentGuidanceTarget {
+    let result = match spec.kind {
+        McpInstallKind::ClaudeDesktopJson | McpInstallKind::McpServersJson => {
+            remove_mcp_servers_json_config(&spec.path)
+        }
+        McpInstallKind::CodexToml => remove_codex_mcp_config(&spec.path),
+        McpInstallKind::CopilotServersJson => remove_copilot_servers_json_config(&spec.path),
+    };
+
+    match result {
+        Ok(action) => AgentGuidanceTarget {
+            agent: spec.agent.to_string(),
+            status: action.to_string(),
+            path: Some(display_path(&spec.path)),
+            detail: "Removed the Locality MCP fallback entry when present.".to_string(),
         },
         Err(error) => AgentGuidanceTarget {
             agent: spec.agent.to_string(),
@@ -425,6 +504,49 @@ fn write_managed_section(path: &Path, block: &str) -> Result<&'static str, Strin
     Ok("installed")
 }
 
+fn remove_locality_skill(path: &Path) -> Result<&'static str, String> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("unchanged"),
+        Err(error) => return Err(format!("Could not read `{}`: {error}", path.display())),
+    };
+    if !contents.contains("name: locality") {
+        return Ok("unchanged");
+    }
+    fs::remove_file(path)
+        .map_err(|error| format!("Could not remove `{}`: {error}", path.display()))?;
+    Ok("removed")
+}
+
+fn remove_managed_section_file(path: &Path) -> Result<&'static str, String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("unchanged"),
+        Err(error) => return Err(format!("Could not read `{}`: {error}", path.display())),
+    };
+    let next = remove_managed_section(&existing);
+    if existing == next {
+        return Ok("unchanged");
+    }
+    fs::write(path, next)
+        .map_err(|error| format!("Could not write `{}`: {error}", path.display()))?;
+    Ok("removed")
+}
+
+fn remove_codex_mcp_config(path: &Path) -> Result<&'static str, String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("unchanged"),
+        Err(error) => return Err(format!("Could not read `{}`: {error}", path.display())),
+    };
+    let next = remove_toml_table(&existing, "mcp_servers.loc");
+    if existing == next {
+        return Ok("unchanged");
+    }
+    write_private_if_changed(path, &next)?;
+    Ok("removed")
+}
+
 fn install_codex_mcp_config(path: &Path, token: &str) -> Result<&'static str, String> {
     let existing = fs::read_to_string(path).unwrap_or_default();
     let stripped = remove_toml_table(&existing, "mcp_servers.loc");
@@ -489,6 +611,10 @@ fn install_mcp_servers_json_config(path: &Path, token: &str) -> Result<&'static 
     write_json_config(path, &root)
 }
 
+fn remove_mcp_servers_json_config(path: &Path) -> Result<&'static str, String> {
+    remove_json_mcp_server(path, "mcpServers")
+}
+
 fn install_claude_desktop_mcp_config(path: &Path) -> Result<&'static str, String> {
     let mut root = read_json_config(path)?;
     let object = ensure_object(&mut root);
@@ -522,6 +648,28 @@ fn install_copilot_servers_json_config(path: &Path, token: &str) -> Result<&'sta
         }),
     );
     write_json_config(path, &root)
+}
+
+fn remove_copilot_servers_json_config(path: &Path) -> Result<&'static str, String> {
+    remove_json_mcp_server(path, "servers")
+}
+
+fn remove_json_mcp_server(path: &Path, container_key: &str) -> Result<&'static str, String> {
+    if !path.exists() {
+        return Ok("unchanged");
+    }
+    let mut root = read_json_config(path)?;
+    let Some(object) = root.as_object_mut() else {
+        return Ok("unchanged");
+    };
+    let Some(servers) = object.get_mut(container_key).and_then(Value::as_object_mut) else {
+        return Ok("unchanged");
+    };
+    if servers.remove(MCP_SERVER_NAME).is_none() {
+        return Ok("unchanged");
+    }
+    write_json_config(path, &root)?;
+    Ok("removed")
 }
 
 fn mcp_server_json(token: &str) -> Value {
@@ -657,6 +805,24 @@ fn replace_managed_section(existing: &str, block: &str) -> String {
         next.push('\n');
         next.push_str(suffix);
     }
+    next
+}
+
+fn remove_managed_section(existing: &str) -> String {
+    let Some(start) = existing.find(MANAGED_START) else {
+        return existing.to_string();
+    };
+    let Some(relative_end) = existing[start..].find(MANAGED_END) else {
+        return existing.to_string();
+    };
+    let end = start + relative_end + MANAGED_END.len();
+    let mut next = String::new();
+    next.push_str(existing[..start].trim_end());
+    let suffix = existing[end..].trim_start_matches(['\r', '\n']);
+    if !next.is_empty() && !suffix.is_empty() {
+        next.push_str("\n\n");
+    }
+    next.push_str(suffix);
     next
 }
 
@@ -812,6 +978,14 @@ mod tests {
     }
 
     #[test]
+    fn managed_section_remove_preserves_user_content() {
+        let existing = "Before\n\n<!-- LOCALITY_AGENT_GUIDANCE_START -->\nold\n<!-- LOCALITY_AGENT_GUIDANCE_END -->\n\nAfter\n";
+        let next = remove_managed_section(existing);
+
+        assert_eq!(next, "Before\n\nAfter\n");
+    }
+
+    #[test]
     fn normalized_blank_mount_path_uses_default_notion_mount() {
         assert_eq!(normalized_mount_path(Some("  ")), DEFAULT_NOTION_MOUNT);
         assert_eq!(
@@ -962,6 +1136,90 @@ mod tests {
             json["servers"]["loc"]["requestInit"]["headers"]["Authorization"],
             "Bearer secret-token"
         );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn remove_codex_mcp_config_preserves_other_tables() {
+        let temp = temp_root("loc-agent-guidance-remove-codex-mcp");
+        let config = temp.join("config.toml");
+        fs::write(
+            &config,
+            "model = \"gpt\"\n\n[mcp_servers.loc]\nurl = \"old\"\n\n[mcp_servers.other]\nurl = \"keep\"\n",
+        )
+        .expect("write config");
+
+        let action = remove_codex_mcp_config(&config).expect("remove loc MCP");
+        let contents = fs::read_to_string(&config).expect("read config");
+
+        assert_eq!(action, "removed");
+        assert!(contents.contains("model = \"gpt\""));
+        assert!(contents.contains("[mcp_servers.other]"));
+        assert!(!contents.contains("[mcp_servers.loc]"));
+        assert!(!contents.contains("url = \"old\""));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn remove_json_mcp_config_preserves_other_servers() {
+        let temp = temp_root("loc-agent-guidance-remove-json-mcp");
+        let config = temp.join("mcp.json");
+        fs::write(
+            &config,
+            r#"{"mcpServers":{"other":{"url":"https://example.test/mcp"},"loc":{"url":"http://127.0.0.1:38568/mcp"}}}"#,
+        )
+        .expect("write config");
+
+        let action = remove_mcp_servers_json_config(&config).expect("remove loc MCP");
+        let contents = fs::read_to_string(&config).expect("read config");
+        let json: Value = serde_json::from_str(&contents).expect("json");
+
+        assert_eq!(action, "removed");
+        assert_eq!(
+            json["mcpServers"]["other"]["url"],
+            "https://example.test/mcp"
+        );
+        assert!(json["mcpServers"]["loc"].is_null());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn remove_copilot_mcp_config_preserves_other_servers() {
+        let temp = temp_root("loc-agent-guidance-remove-copilot-mcp");
+        let config = temp.join("mcp.json");
+        fs::write(
+            &config,
+            r#"{"servers":{"other":{"url":"https://example.test/mcp"},"loc":{"url":"http://127.0.0.1:38568/mcp"}}}"#,
+        )
+        .expect("write config");
+
+        let action = remove_copilot_servers_json_config(&config).expect("remove loc MCP");
+        let contents = fs::read_to_string(&config).expect("read config");
+        let json: Value = serde_json::from_str(&contents).expect("json");
+
+        assert_eq!(action, "removed");
+        assert_eq!(json["servers"]["other"]["url"], "https://example.test/mcp");
+        assert!(json["servers"]["loc"].is_null());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn remove_locality_skill_deletes_only_locality_skill() {
+        let temp = temp_root("loc-agent-guidance-remove-skill");
+        let skill = temp.join("SKILL.md");
+        fs::write(&skill, "---\nname: locality\n---\n# Locality\n").expect("write skill");
+
+        let action = remove_locality_skill(&skill).expect("remove skill");
+
+        assert_eq!(action, "removed");
+        assert!(!skill.exists());
+
+        let other = temp.join("OTHER.md");
+        fs::write(&other, "---\nname: other\n---\n# Other\n").expect("write other skill");
+        let action = remove_locality_skill(&other).expect("skip other skill");
+
+        assert_eq!(action, "unchanged");
+        assert!(other.exists());
         let _ = fs::remove_dir_all(temp);
     }
 

@@ -78,6 +78,11 @@ cask "loc" do
   app "Locality.app"
   binary "#{appdir}/Locality.app/Contents/MacOS/loc"
 
+  uninstall script: {
+    executable: "#{appdir}/Locality.app/Contents/MacOS/Locality",
+    args: ["--prepare-uninstall"],
+  }
+
   zap trash: [
     "~/.loc",
     "~/Library/Application Support/ai.codeflash.locality",
