@@ -2272,18 +2272,18 @@ fn seed_root_placeholders(context: &ProviderContext) -> Result<usize, HelperErro
     let children = context.children(&context.root_identifier())?;
     create_placeholders_in_directory(&context.sync_root, &children.children)?;
     remember_placeholder_children(context, &context.sync_root, &children.children);
-    seed_existing_child_directory_placeholders(context, &context.sync_root, &children.children)?;
+    seed_child_directory_placeholders(context, &context.sync_root, &children.children)?;
     Ok(children.children.len())
 }
 
 #[cfg(target_os = "windows")]
-fn seed_existing_child_directory_placeholders(
+fn seed_child_directory_placeholders(
     context: &ProviderContext,
     directory: &Path,
     items: &[localityd::file_provider::FileProviderItem],
 ) -> Result<(), HelperError> {
     let mut targets = Vec::new();
-    collect_existing_child_directory_seed_targets(
+    collect_seeded_child_directory_seed_targets(
         directory,
         items,
         &mut |identifier| context.children(identifier).map(|report| report.children),
@@ -2291,12 +2291,36 @@ fn seed_existing_child_directory_placeholders(
     )?;
     for (child_directory, children) in targets {
         trace_cloud_files(format!(
-            "seed existing child directory placeholders directory=`{}` count={}",
+            "seed child directory placeholders directory=`{}` count={}",
             child_directory.display(),
             children.len()
         ));
         create_placeholders_in_directory(&child_directory, &children)?;
         remember_placeholder_children(context, &child_directory, &children);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn collect_seeded_child_directory_seed_targets<F>(
+    directory: &Path,
+    items: &[localityd::file_provider::FileProviderItem],
+    children_for: &mut F,
+    targets: &mut Vec<(PathBuf, Vec<localityd::file_provider::FileProviderItem>)>,
+) -> Result<(), HelperError>
+where
+    F: FnMut(&str) -> Result<Vec<localityd::file_provider::FileProviderItem>, HelperError>,
+{
+    for item in child_directory_items(items) {
+        let child_directory = directory.join(&item.filename);
+        let children = children_for(&item.identifier)?;
+        targets.push((child_directory.clone(), children.clone()));
+        collect_existing_child_directory_seed_targets(
+            &child_directory,
+            &children,
+            children_for,
+            targets,
+        )?;
     }
     Ok(())
 }
@@ -2326,21 +2350,29 @@ where
 }
 
 #[cfg(target_os = "windows")]
+fn child_directory_items(
+    items: &[localityd::file_provider::FileProviderItem],
+) -> Vec<localityd::file_provider::FileProviderItem> {
+    items
+        .iter()
+        .filter(|item| item.kind == localityd::file_provider::FileProviderItemKind::Folder)
+        .cloned()
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
 fn existing_child_directory_items(
     directory: &Path,
     items: &[localityd::file_provider::FileProviderItem],
 ) -> Result<Vec<localityd::file_provider::FileProviderItem>, HelperError> {
     let mut existing_directories = Vec::new();
-    for item in items {
-        if item.kind != localityd::file_provider::FileProviderItemKind::Folder {
-            continue;
-        }
+    for item in child_directory_items(items) {
         let child_path = directory.join(&item.filename);
         match child_path.try_exists() {
             Ok(false) => continue,
             Ok(true) => {
                 if child_path.is_dir() {
-                    existing_directories.push(item.clone());
+                    existing_directories.push(item);
                 }
             }
             Err(error) => {
@@ -4165,6 +4197,52 @@ mod tests {
             ]
         );
         assert_eq!(targets[2].1[0].identifier, "children:launch-post");
+
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn seeded_child_directory_targets_include_root_folder_items_without_preexisting_directory() {
+        let temp = unique_test_state_dir("seeded-root-child-dirs");
+        let sync_root = temp.join("Locality");
+        std::fs::create_dir_all(&sync_root).expect("create sync root");
+
+        let root_items = vec![folder_item("mount:notion-main", "notion-main")];
+        let mut child_map = std::collections::BTreeMap::from([(
+            "mount:notion-main".to_string(),
+            vec![
+                folder_item("children:company", "company"),
+                folder_item("children:tech", "tech"),
+            ],
+        )]);
+        let mut targets = Vec::new();
+
+        collect_seeded_child_directory_seed_targets(
+            &sync_root,
+            &root_items,
+            &mut |identifier| {
+                Ok(child_map
+                    .remove(identifier)
+                    .unwrap_or_else(|| panic!("unexpected child listing for {identifier}")))
+            },
+            &mut targets,
+        )
+        .expect("collect seeded root targets");
+
+        let target_paths = targets
+            .iter()
+            .map(|(path, _)| path.strip_prefix(&sync_root).unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(target_paths, vec![PathBuf::from("notion-main")]);
+        assert_eq!(
+            targets[0]
+                .1
+                .iter()
+                .map(|item| item.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["company", "tech"]
+        );
 
         let _ = std::fs::remove_dir_all(temp);
     }
