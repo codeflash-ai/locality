@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use loc_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
 use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
+use locality_platform::{capabilities::projection_cli_value, mount_cli_capabilities};
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
     ConnectorProfileRecord, ConnectorProfileRepository, CredentialStore, FileCredentialStore,
@@ -349,6 +350,10 @@ fn mount_options_preserve_google_docs_workspace_folder_id_from_resolver() {
 
 #[test]
 fn cli_keeps_multiple_default_notion_workspace_mounts_with_distinct_connections() {
+    let Some(virtual_projection) = mount_cli_capabilities().virtual_registration else {
+        return;
+    };
+    let virtual_projection_arg = projection_cli_value(&virtual_projection);
     let fixture = MountFixture::new("loc-cli-multiple-notion-workspace-mounts");
     fs::create_dir_all(&fixture.root).expect("create shared virtual root");
     let state_root = fixture.root.join("state");
@@ -369,7 +374,7 @@ fn cli_keeps_multiple_default_notion_workspace_mounts_with_distinct_connections(
         "notion-personal-c",
         "--workspace",
         "--projection",
-        "linux-fuse",
+        virtual_projection_arg,
         "--json",
     ]));
     let codeflash = loc_json_ok(loc_command(loc, &state_root).args([
@@ -380,7 +385,7 @@ fn cli_keeps_multiple_default_notion_workspace_mounts_with_distinct_connections(
         "notion-codeflash",
         "--workspace",
         "--projection",
-        "linux-fuse",
+        virtual_projection_arg,
         "--json",
     ]));
 
