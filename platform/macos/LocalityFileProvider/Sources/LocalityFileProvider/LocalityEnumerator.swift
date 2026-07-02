@@ -8,7 +8,6 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
     private let domainId: String?
     private let namespaceMountId: String?
     private let includeMountRootChildren: Bool
-    private let expireChangeAnchor: Bool
 
     init(
         client: LocalityDaemonClient,
@@ -22,15 +21,13 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         self.domainId = nil
         self.namespaceMountId = namespaceMountId
         self.includeMountRootChildren = false
-        self.expireChangeAnchor = false
         super.init()
     }
 
     init(
         client: LocalityDaemonClient,
         domainId: String,
-        includeMountRootChildren: Bool = false,
-        expireChangeAnchor: Bool = false
+        includeMountRootChildren: Bool = false
     ) {
         self.client = client
         self.mountId = nil
@@ -38,7 +35,6 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         self.domainId = domainId
         self.namespaceMountId = nil
         self.includeMountRootChildren = includeMountRootChildren
-        self.expireChangeAnchor = expireChangeAnchor
         super.init()
     }
 
@@ -49,7 +45,6 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         self.domainId = nil
         self.namespaceMountId = nil
         self.includeMountRootChildren = false
-        self.expireChangeAnchor = false
         super.init()
     }
 
@@ -77,10 +72,6 @@ final class LocalityEnumerator: NSObject, NSFileProviderEnumerator {
         for observer: NSFileProviderChangeObserver,
         from syncAnchor: NSFileProviderSyncAnchor
     ) {
-        if expireChangeAnchor {
-            observer.finishEnumeratingWithError(syncAnchorExpiredError())
-            return
-        }
         do {
             observer.didUpdate(try currentItems())
             observer.finishEnumeratingChanges(upTo: currentSyncAnchor(), moreComing: false)
@@ -139,13 +130,5 @@ func agentFSFileProviderError(_ error: Error) -> NSError {
         domain: NSFileProviderErrorDomain,
         code: NSFileProviderError.serverUnreachable.rawValue,
         userInfo: [NSLocalizedDescriptionKey: nsError.localizedDescription]
-    )
-}
-
-private func syncAnchorExpiredError() -> NSError {
-    NSError(
-        domain: NSFileProviderErrorDomain,
-        code: NSFileProviderError.syncAnchorExpired.rawValue,
-        userInfo: [NSLocalizedDescriptionKey: "Locality File Provider change anchor expired"]
     )
 }

@@ -6551,6 +6551,7 @@ fn activate_virtual_projection_mount(
     }
     ensure_virtual_projection_runtime(state_root, mount)?;
     signal_virtual_projection_refresh(mount);
+    verify_virtual_projection_mount_root(mount)?;
     desktop_log(
         "info",
         "file_provider.activate_finished",
@@ -6559,6 +6560,65 @@ fn activate_virtual_projection_mount(
             mount.mount_id.0, mount.projection
         ),
     );
+    Ok(())
+}
+
+fn verify_virtual_projection_mount_root(mount: &MountConfig) -> Result<(), String> {
+    match mount.projection {
+        ProjectionMode::MacosFileProvider => verify_macos_file_provider_mount_root(mount),
+        ProjectionMode::LinuxFuse
+        | ProjectionMode::PlainFiles
+        | ProjectionMode::WindowsCloudFiles => Ok(()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_file_provider_mount_root(mount: &MountConfig) -> Result<(), String> {
+    let root = mount_access_root(mount);
+    let output = Command::new("/usr/bin/fileproviderctl")
+        .arg("evaluate")
+        .arg(&root)
+        .output()
+        .map_err(|error| {
+            format!(
+                "Could not inspect macOS File Provider mount root `{}`: {error}",
+                root.display()
+            )
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let details = format!("{stdout}{stderr}");
+    if !output.status.success() {
+        return Err(format!(
+            "Could not inspect macOS File Provider mount root `{}`: {}",
+            root.display(),
+            details.trim()
+        ));
+    }
+    if let Some(error) = macos_file_provider_mount_root_health_error(&root, &details) {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn macos_file_provider_mount_root_health_error(root: &Path, details: &str) -> Option<String> {
+    if details.contains("uploadingError") || details.contains("NSCocoaErrorDomain Code=3328") {
+        return Some(format!(
+            "The macOS File Provider mount root `{}` is in a local-upload error state. Run clean-start or reset the Locality File Provider domain, then reconnect Notion.",
+            root.display()
+        ));
+    }
+    if !details.contains("itemIdentifier") {
+        return Some(format!(
+            "The macOS File Provider mount root `{}` is not provider-owned yet. Open Locality in Finder once the File Provider domain is ready, then reconnect Notion.",
+            root.display()
+        ));
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_macos_file_provider_mount_root(_mount: &MountConfig) -> Result<(), String> {
     Ok(())
 }
 
@@ -7161,27 +7221,13 @@ fn signal_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(
     } else {
         macos_file_provider_item_identifier(mount_id, identifier)
     };
-    if identifier == "working-set" {
-        return run_macos_file_provider_refresh_action("signal", &provider_identifier).map_err(
-            |signal_error| {
-                format!(
-                    "Could not refresh macOS File Provider working set: signal failed: {signal_error}"
-                )
-            },
-        );
-    }
-    match run_macos_file_provider_refresh_action("reimport", &provider_identifier) {
-        Ok(()) => Ok(()),
-        Err(reimport_error) => {
-            run_macos_file_provider_refresh_action("signal", &provider_identifier).map_err(
-                |signal_error| {
-                    format!(
-                        "Could not refresh macOS File Provider for `{identifier}`: reimport failed: {reimport_error}; signal failed: {signal_error}"
-                    )
-                },
+    run_macos_file_provider_refresh_action("signal", &provider_identifier).map_err(
+        |signal_error| {
+            format!(
+                "Could not refresh macOS File Provider for `{identifier}`: signal failed: {signal_error}"
             )
-        }
-    }
+        },
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -8636,19 +8682,19 @@ mod tests {
         live_mode_remote_pull_candidates, live_mode_remote_pull_scan_is_due_for_key,
         live_mode_should_reconcile_local_target_for_key, live_mode_target,
         live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
-        mark_mount_live_mode_syncing, mount_has_pending_local_changes,
-        mount_has_unfinished_journals, notion_id_from_url, parse_daemon_build_info_json,
-        pending_changes_from_status, prepare_existing_workspace_mount_for_remount,
-        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
-        push_action_message, record_current_install_marker, record_desktop_activity,
-        record_mount_live_mode_tick_result, refresh_visible_target_from_cache,
-        reset_to_remote_message, sample_live_mode_status, sample_snapshot,
-        screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
-        should_prioritize_located_result, state_event_path_requires_refresh,
-        state_event_path_wakes_live_mode, summarize_virtual_projection_children,
-        terminal_cli_link_state, tray_icon_image, tray_popover_anchor, tray_popover_position,
-        unsupported_notion_locator_url_message, validate_mount_root,
-        virtual_projection_prefetch_container_identifiers,
+        macos_file_provider_mount_root_health_error, mark_mount_live_mode_syncing,
+        mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
+        parse_daemon_build_info_json, pending_changes_from_status,
+        prepare_existing_workspace_mount_for_remount, preserve_mount_pending_local_changes,
+        pull_error_message, pull_report_message, push_action_message,
+        record_current_install_marker, record_desktop_activity, record_mount_live_mode_tick_result,
+        refresh_visible_target_from_cache, reset_to_remote_message, sample_live_mode_status,
+        sample_snapshot, screen_bounds_for_anchor_from_monitors, shell_single_quote,
+        should_hide_tray_popover, should_prioritize_located_result,
+        state_event_path_requires_refresh, state_event_path_wakes_live_mode,
+        summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
+        tray_popover_anchor, tray_popover_position, unsupported_notion_locator_url_message,
+        validate_mount_root, virtual_projection_prefetch_container_identifiers,
         virtual_projection_refresh_signal_identifiers, wait_for_live_mode_state_change,
         wake_live_mode_runner, write_terminal_cli_path_section,
     };
@@ -10274,6 +10320,42 @@ mod tests {
             virtual_projection_prefetch_container_identifiers(&mount),
             vec!["root".to_string(), "mount:notion-main".to_string()]
         );
+    }
+
+    #[test]
+    fn macos_file_provider_mount_root_health_accepts_provider_item() {
+        let details = r#"
+            fileproviderItems = (
+              {
+                displayName = notion;
+                isUploaded = 1;
+                itemIdentifier = "m:bm90aW9uLW1haW4:bW91bnQ6bm90aW9uLW1haW4";
+              }
+            );
+        "#;
+
+        assert_eq!(
+            macos_file_provider_mount_root_health_error(Path::new("/tmp/Locality/notion"), details),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_mount_root_health_rejects_local_upload_error() {
+        let details = r#"
+            fileproviderItems = (
+              {
+                displayName = notion;
+                uploadingError = "Error Domain=NSCocoaErrorDomain Code=3328";
+              }
+            );
+        "#;
+
+        let error =
+            macos_file_provider_mount_root_health_error(Path::new("/tmp/Locality/notion"), details)
+                .expect("local upload error should be rejected");
+
+        assert!(error.contains("local-upload error state"));
     }
 
     #[test]
