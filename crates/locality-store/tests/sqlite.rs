@@ -1452,6 +1452,18 @@ fn sqlite_store_repairs_page_shaped_notion_workspace_root_name_collisions() {
                 Some("Workspace/Private/Child/page.md".to_string()),
             ),
             (
+                "local:private-page-create".to_string(),
+                None,
+                "Workspace/Private/New/page.md".to_string(),
+                Some("Workspace/Private/New/page.md".to_string()),
+            ),
+            (
+                "local:unknown-create".to_string(),
+                None,
+                "Private/No Evidence/page.md".to_string(),
+                Some("Private/No Evidence/page.md".to_string()),
+            ),
+            (
                 "local:workspace-page".to_string(),
                 Some("Workspace/Workspace/page.md".to_string()),
                 "Workspace/Workspace/page.md".to_string(),
@@ -1462,6 +1474,12 @@ fn sqlite_store_repairs_page_shaped_notion_workspace_root_name_collisions() {
                 Some("Workspace/Workspace/Child/page.md".to_string()),
                 "Workspace/Workspace/Child/page.md".to_string(),
                 Some("Workspace/Workspace/Child/page.md".to_string()),
+            ),
+            (
+                "local:workspace-page-create".to_string(),
+                None,
+                "Workspace/Workspace/New/page.md".to_string(),
+                Some("Workspace/Workspace/New/page.md".to_string()),
             ),
         ]
     );
@@ -3621,6 +3639,42 @@ fn seed_notion_workspace_root_page_name_collision_state(fixture: &SqliteFixture)
         store
             .save_auto_save_enrollment(enrollment)
             .expect("save workspace auto-save");
+    }
+    for (local_id, parent_remote_id, path, title) in [
+        (
+            "local:private-page-create",
+            Some("private-page"),
+            "Private/New/page.md",
+            "New Private",
+        ),
+        (
+            "local:workspace-page-create",
+            Some("workspace-page"),
+            "Workspace/New/page.md",
+            "New Workspace",
+        ),
+        (
+            "local:unknown-create",
+            None,
+            "Private/No Evidence/page.md",
+            "No Evidence",
+        ),
+    ] {
+        store
+            .save_virtual_mutation(VirtualMutationRecord {
+                mount_id: fixture.mount_id.clone(),
+                local_id: local_id.to_string(),
+                mutation_kind: VirtualMutationKind::Create,
+                target_remote_id: None,
+                parent_remote_id: parent_remote_id.map(RemoteId::new),
+                original_path: None,
+                projected_path: PathBuf::from(path),
+                title: title.to_string(),
+                content_path: Some(PathBuf::from(path)),
+                created_at: "2026-07-03T00:00:00Z".to_string(),
+                updated_at: "2026-07-03T00:00:00Z".to_string(),
+            })
+            .expect("save create virtual mutation");
     }
 
     store.db_path.clone()
