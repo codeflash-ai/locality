@@ -1573,7 +1573,7 @@ fn write_assets(root: &Path, assets: &[HydratedAsset]) -> Result<(), PullError> 
 
 fn should_pull_mount_root(mount: &MountConfig, relative_path: &Path, target_path: &Path) -> bool {
     if relative_path.as_os_str().is_empty() {
-        return !mount.projection.uses_virtual_filesystem();
+        return !mount.projection.uses_virtual_filesystem() || mount.remote_root_id.is_some();
     }
     if mount.projection.uses_virtual_filesystem() {
         return false;
@@ -3229,6 +3229,59 @@ mod tests {
             store
                 .get_entity(&fixture.mount_id, &RemoteId::new("notion-root:workspace"))
                 .expect("read workspace root")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn virtual_root_page_mount_pull_uses_full_enumeration() {
+        let fixture = PullFixture::new();
+        let state_root = fixture.root.join("state");
+        let mut store = InMemoryStateStore::new();
+        let root_id = RemoteId::new("root-page");
+        let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+            .with_remote_root_id(root_id.clone())
+            .projection(ProjectionMode::LinuxFuse);
+        store.save_mount(mount).expect("save mount");
+        let source = FakePullSource::new(
+            vec![tree_entry(
+                &fixture.mount_id,
+                &root_id,
+                "Roadmap",
+                "Roadmap/page.md",
+                HydrationState::Stub,
+            )],
+            vec![hydrated_entity(
+                &root_id,
+                "Roadmap",
+                "# Roadmap\n\nRoot body.\n",
+                Vec::new(),
+            )],
+        )
+        .with_child_entries(vec![tree_entry(
+            &fixture.mount_id,
+            &RemoteId::new("lazy-root"),
+            "Lazy Root",
+            "lazy-root/page.md",
+            HydrationState::Stub,
+        )]);
+
+        let report = super::run_pull_with_state_root(
+            &mut store,
+            &source,
+            fixture.root.clone(),
+            Some(&state_root),
+        )
+        .expect("pull virtual root-page mount root");
+
+        assert_eq!(source.enumerate_calls(), 1);
+        assert_eq!(source.list_children_calls(), 0);
+        assert_eq!(report.enumerated, 1);
+        assert_eq!(report.hydrated, 1);
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &root_id)
+                .expect("read root page")
                 .is_some()
         );
     }
