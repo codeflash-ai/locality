@@ -43,10 +43,34 @@ export function mountOnboardingPrimaryLabel(
   }
 }
 
+export function mountOnboardingHeadline(
+  report: WorkspaceMountOnboardingReport | null,
+) {
+  switch (report?.state) {
+    case "approval_required":
+      return "Allow Locality in Finder.";
+    case "waiting_for_cloudstorage_root":
+      return "Waiting for the Locality folder to appear.";
+    case "failed":
+      return "Folder setup needs attention.";
+    default:
+      return "Creating your local folder.";
+  }
+}
+
 export function mountOnboardingNeedsInstructions(
   report: WorkspaceMountOnboardingReport | null,
 ) {
   return report?.state === "approval_required" && report.launchStrategy === "instructions_only";
+}
+
+export function mountOnboardingSupplementaryNote(
+  report: WorkspaceMountOnboardingReport | null,
+) {
+  if (report?.state !== "waiting_for_cloudstorage_root") {
+    return null;
+  }
+  return "Locality is waiting for macOS to create the CloudStorage folder before the final onboarding step can continue.";
 }
 
 export function mountOnboardingNextAction(

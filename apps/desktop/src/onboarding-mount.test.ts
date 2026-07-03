@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   failedMountOnboardingReport,
+  mountOnboardingHeadline,
   mountOnboardingNeedsInstructions,
   mountOnboardingNextAction,
   mountOnboardingPrimaryLabel,
+  mountOnboardingSupplementaryNote,
   type WorkspaceMountOnboardingReport,
 } from "./onboarding-mount";
 
@@ -57,6 +59,27 @@ describe("mount onboarding helpers", () => {
         }),
       ),
     ).toBe(false);
+  });
+
+  it("maps backend states to the step 4 headline", () => {
+    expect(mountOnboardingHeadline(report({ state: "approval_required" }))).toBe(
+      "Allow Locality in Finder.",
+    );
+    expect(mountOnboardingHeadline(report({ state: "waiting_for_cloudstorage_root" }))).toBe(
+      "Waiting for the Locality folder to appear.",
+    );
+    expect(mountOnboardingHeadline(report({ state: "failed" }))).toBe(
+      "Folder setup needs attention.",
+    );
+    expect(mountOnboardingHeadline(null)).toBe("Creating your local folder.");
+  });
+
+  it("shows the CloudStorage waiting note only for the waiting-root state", () => {
+    expect(
+      mountOnboardingSupplementaryNote(report({ state: "waiting_for_cloudstorage_root" })),
+    ).toContain("CloudStorage");
+    expect(mountOnboardingSupplementaryNote(report({ state: "approval_required" }))).toBeNull();
+    expect(mountOnboardingSupplementaryNote(null)).toBeNull();
   });
 
   it("maps the backend report to the next onboarding command action", () => {

@@ -51,9 +51,11 @@ import { connectionMissing, connectionReady } from "./connection-state";
 import { shouldAutoCreateMount } from "./onboarding-flow";
 import {
   failedMountOnboardingReport,
+  mountOnboardingHeadline,
   mountOnboardingNeedsInstructions,
   mountOnboardingNextAction,
   mountOnboardingPrimaryLabel,
+  mountOnboardingSupplementaryNote,
   type WorkspaceMountOnboardingReport,
 } from "./onboarding-mount";
 
@@ -1517,18 +1519,29 @@ function Onboarding({
         )}
 
         {step === 4 && (
-          <SetupContent mark={<BrandTile variant="progress" />} variant="wide">
+          <SetupContent
+            mark={<BrandTile variant={mountOnboarding?.state === "failed" ? "folder" : "progress"} />}
+            variant="wide"
+          >
             <div>
               <div className="eyebrow">Local folder</div>
-              <h1>Creating your local folder.</h1>
+              <h1>{mountOnboardingHeadline(mountOnboarding)}</h1>
               <p>
-                Locality is creating your Notion folder under the default CloudStorage root and
-                preparing agent guidance.
+                {mountOnboarding?.message ??
+                  "Locality is creating your Notion folder under the default CloudStorage root and preparing agent guidance."}
               </p>
             </div>
             <div className="sync-note">
-              {mountOnboarding ? <AlertTriangle /> : <Loader2 className="spin-icon" />}
-              {mountOnboarding ? "Folder setup needs attention" : "Creating folder and preparing Notion files"}
+              {mounting ? (
+                <Loader2 className="spin-icon" />
+              ) : mountOnboarding?.state === "failed" ? (
+                <AlertTriangle />
+              ) : (
+                <FolderOpen />
+              )}
+              {mounting
+                ? "Checking File Provider approval"
+                : mountOnboarding?.message ?? "Creating folder and preparing Notion files"}
             </div>
             <div className="path-field ready-path-field">
               <span>{mountPath}</span>
@@ -1540,13 +1553,14 @@ function Onboarding({
             >
               {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
             </PrimaryButton>
-            {mountOnboarding && (
-              <MountOnboardingCallout
-                report={mountOnboarding}
-                onPrimaryAction={() => void runMountOnboarding(mountOnboardingNextAction(mountOnboarding))}
-                showInstructions={mountOnboardingNeedsInstructions(mountOnboarding)}
-                busy={mounting}
-              />
+            {mountOnboardingNeedsInstructions(mountOnboarding) && (
+              <p className="quiet-note">
+                Open Finder, choose Locality under Locations, enable the File Provider, then
+                return here and click Check again.
+              </p>
+            )}
+            {mountOnboardingSupplementaryNote(mountOnboarding) && (
+              <p className="quiet-note">{mountOnboardingSupplementaryNote(mountOnboarding)}</p>
             )}
             <p className="quiet-note">
               Locality uses the default CloudStorage location so Finder and your agents see the
@@ -5060,37 +5074,6 @@ function SetupContent({
     >
       {mark ? mark : null}
       {children}
-    </div>
-  );
-}
-
-function MountOnboardingCallout({
-  report,
-  onPrimaryAction,
-  showInstructions,
-  busy,
-}: {
-  report: WorkspaceMountOnboardingReport;
-  onPrimaryAction: () => void;
-  showInstructions: boolean;
-  busy: boolean;
-}) {
-  if (!showInstructions) {
-    return <p className="field-error">{report.message}</p>;
-  }
-
-  return (
-    <div className="setup-permission-callout">
-      <div className="setup-permission-icon">
-        <FolderOpen />
-      </div>
-      <div className="setup-permission-copy">
-        <strong>Enable Locality in Finder</strong>
-        <p>{report.message}</p>
-        <PrimaryButton compact busy={busy} onClick={onPrimaryAction}>
-          {mountOnboardingPrimaryLabel(report, busy)}
-        </PrimaryButton>
-      </div>
     </div>
   );
 }
