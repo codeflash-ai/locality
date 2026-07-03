@@ -22,6 +22,7 @@ use locality_notion::dto::{
     SelectOptionDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto, ToDoBlockDto,
     UrlBlockDto,
 };
+use locality_notion::projection::{NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_ID};
 use locality_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -3497,6 +3498,192 @@ fn apply_updates_supported_page_properties() {
             }),
         }]
     );
+}
+
+#[test]
+fn apply_creates_private_workspace_page_without_parent_payload() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new(NOTION_PRIVATE_ROOT_ID)],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "Private Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: "# Private body\n\nCreated from Locality.".to_string(),
+            source_path: "Private/Private Draft/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply private workspace create");
+
+    assert_eq!(
+        result.changed_remote_ids,
+        vec![RemoteId::new("created-page-1")]
+    );
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::CreatedEntity {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            parent_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+            entity_id: RemoteId::new("created-page-1"),
+        }]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::CreatePage {
+            body: json!({
+                "properties": {
+                    "title": {
+                        "title": rich_text_json("Private Draft"),
+                    },
+                },
+                "children": [{
+                    "object": "block",
+                    "type": "heading_1",
+                    "heading_1": {
+                        "rich_text": rich_text_json("Private body"),
+                    },
+                }, {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": rich_text_json("Created from Locality."),
+                    },
+                }],
+            }),
+        }]
+    );
+}
+
+#[test]
+fn apply_rejects_workspace_root_create_before_prior_writes() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![
+            RemoteId::new("page-1"),
+            RemoteId::new(NOTION_WORKSPACE_ROOT_ID),
+        ],
+        vec![
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("paragraph-1"),
+                content: "Changed before unsupported create.".to_string(),
+            },
+            PushOperation::CreateEntity {
+                parent_id: RemoteId::new(NOTION_WORKSPACE_ROOT_ID),
+                parent_kind: Some(EntityKind::Directory),
+                parent_scope: CreateParentScope::WorkspaceRoot,
+                title: "Workspace Draft".to_string(),
+                properties: BTreeMap::new(),
+                body: String::new(),
+                source_path: "Workspace/Workspace Draft/page.md".into(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect_err("workspace root create is rejected before writes");
+
+    assert!(matches!(error, LocalityError::Unsupported(_)));
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
+fn apply_rejects_private_workspace_create_with_non_private_root_parent() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("wrong-private-root")],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new("wrong-private-root"),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "Private Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: String::new(),
+            source_path: "Private/Private Draft/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect_err("private workspace create requires private root parent");
+
+    assert!(matches!(error, LocalityError::InvalidState(_)));
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
+fn check_concurrency_skips_private_workspace_synthetic_create_parent() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new(NOTION_PRIVATE_ROOT_ID)],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "Private Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: String::new(),
+            source_path: "Private/Private Draft/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let preconditions = vec![RemotePrecondition {
+        remote_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+        remote_edited_at: Some("synthetic".to_string()),
+    }];
+
+    connector
+        .check_concurrency(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &[],
+            remote_preconditions: &preconditions,
+            local_root: None,
+        })
+        .expect("synthetic root precondition is skipped");
 }
 
 #[test]

@@ -13,7 +13,7 @@ use locality_connector::{ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, Ap
 use locality_core::canonical::{Directive, parse_directive_line};
 use locality_core::journal::JournalApplyEffect;
 use locality_core::model::RemoteId;
-use locality_core::planner::{PropertyValue, PushOperation};
+use locality_core::planner::{CreateParentScope, PropertyValue, PushOperation};
 use locality_core::shadow::{rendered_bodies_equivalent, segment_markdown_body};
 use locality_core::undo::{UndoOperation, UndoPlanStatus};
 use locality_core::{LocalityError, LocalityResult};
@@ -30,13 +30,19 @@ use crate::markdown_table::{
     parse_markdown_table_row, parse_markdown_table_shape, validate_markdown_table_separator,
 };
 use crate::media::{resolve_media_href_with_content_root, unescape_markdown_href};
+use crate::projection::{NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_ID};
 
 const NOTION_RICH_TEXT_CONTENT_LIMIT: usize = 2000;
 const NOTION_RICH_TEXT_SENTENCE_SPLIT_LOOKBACK: usize = 400;
+const WORKSPACE_ROOT_CREATE_UNSUPPORTED: &str = "creating a Notion page directly under Workspace/ is ambiguous; create under Private/ or below an existing page";
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
     let database_create_parent_ids = database_create_parent_ids(&request.plan.operations);
+    let source_root_create_parent_ids = source_root_create_parent_ids(&request.plan.operations);
     for precondition in request.remote_preconditions {
+        if source_root_create_parent_ids.contains(&precondition.remote_id) {
+            continue;
+        }
         let Some(expected) = &precondition.remote_edited_at else {
             continue;
         };
@@ -67,6 +73,7 @@ pub fn apply_plan(
     request: ApplyPlanRequest<'_>,
 ) -> LocalityResult<ApplyPlanResult> {
     validate_operation_ids(&request)?;
+    validate_create_parent_scopes(&request.plan.operations)?;
     check_concurrency(
         api,
         ApplyPlanRequest {
@@ -302,6 +309,7 @@ pub fn apply_plan(
             PushOperation::CreateEntity {
                 parent_id,
                 parent_kind,
+                parent_scope,
                 title,
                 properties,
                 body,
@@ -311,6 +319,7 @@ pub fn apply_plan(
                     api,
                     parent_id,
                     parent_kind.as_ref(),
+                    parent_scope,
                     title,
                     properties,
                     body,
@@ -320,7 +329,8 @@ pub fn apply_plan(
                 if !changed_remote_ids.contains(&created_id) {
                     changed_remote_ids.push(created_id.clone());
                 }
-                if matches!(parent_kind, Some(locality_core::model::EntityKind::Page))
+                if *parent_scope == CreateParentScope::Remote
+                    && matches!(parent_kind, Some(locality_core::model::EntityKind::Page))
                     && !changed_remote_ids.contains(parent_id)
                 {
                     changed_remote_ids.push(parent_id.clone());
@@ -499,11 +509,63 @@ fn validate_operation_ids(request: &ApplyPlanRequest<'_>) -> LocalityResult<()> 
     Ok(())
 }
 
+fn validate_create_parent_scopes(operations: &[PushOperation]) -> LocalityResult<()> {
+    for operation in operations {
+        let PushOperation::CreateEntity {
+            parent_id,
+            parent_scope,
+            ..
+        } = operation
+        else {
+            continue;
+        };
+
+        match parent_scope {
+            CreateParentScope::Remote => {}
+            CreateParentScope::PrivateWorkspace => {
+                if parent_id.as_str() != NOTION_PRIVATE_ROOT_ID {
+                    return Err(LocalityError::InvalidState(format!(
+                        "private workspace Notion create parent `{}` must be synthetic root `{}`",
+                        parent_id.0, NOTION_PRIVATE_ROOT_ID
+                    )));
+                }
+            }
+            CreateParentScope::WorkspaceRoot => {
+                if parent_id.as_str() != NOTION_WORKSPACE_ROOT_ID {
+                    return Err(LocalityError::InvalidState(format!(
+                        "workspace root Notion create parent `{}` must be synthetic root `{}`",
+                        parent_id.0, NOTION_WORKSPACE_ROOT_ID
+                    )));
+                }
+                return Err(LocalityError::Unsupported(
+                    WORKSPACE_ROOT_CREATE_UNSUPPORTED,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
     operations
         .iter()
         .filter_map(|operation| match operation {
             PushOperation::CreateEntity { parent_id, .. } => Some(parent_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn source_root_create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
+    operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::CreateEntity {
+                parent_id,
+                parent_scope,
+                ..
+            } if *parent_scope != CreateParentScope::Remote => Some(parent_id.clone()),
             _ => None,
         })
         .collect()
@@ -526,8 +588,11 @@ fn database_create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId
             PushOperation::CreateEntity {
                 parent_id,
                 parent_kind,
+                parent_scope,
                 ..
-            } if !matches!(parent_kind, Some(locality_core::model::EntityKind::Page)) => {
+            } if *parent_scope == CreateParentScope::Remote
+                && !matches!(parent_kind, Some(locality_core::model::EntityKind::Page)) =>
+            {
                 Some(parent_id.clone())
             }
             _ => None,
@@ -1004,10 +1069,32 @@ fn create_page_body(
     api: &dyn NotionApi,
     parent_id: &RemoteId,
     parent_kind: Option<&locality_core::model::EntityKind>,
+    parent_scope: &CreateParentScope,
     title: &str,
     properties: &BTreeMap<String, PropertyValue>,
     body: &str,
 ) -> LocalityResult<Value> {
+    if *parent_scope == CreateParentScope::PrivateWorkspace {
+        let mut request = json!({
+            "properties": {
+                "title": {
+                    "title": rich_text(title),
+                }
+            },
+        });
+        let children = create_page_children(body)?;
+        if !children.is_empty() {
+            request["children"] = Value::Array(children);
+        }
+        return Ok(request);
+    }
+
+    if *parent_scope == CreateParentScope::WorkspaceRoot {
+        return Err(LocalityError::Unsupported(
+            WORKSPACE_ROOT_CREATE_UNSUPPORTED,
+        ));
+    }
+
     if matches!(parent_kind, Some(locality_core::model::EntityKind::Page)) {
         let mut request = json!({
             "parent": {
