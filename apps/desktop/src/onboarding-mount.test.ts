@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import * as onboardingMount from "./onboarding-mount";
 import {
   failedMountOnboardingReport,
   mountOnboardingHeadline,
@@ -8,6 +9,14 @@ import {
   mountOnboardingSupplementaryNote,
   type WorkspaceMountOnboardingReport,
 } from "./onboarding-mount";
+
+const mountOnboardingInstructions = (
+  onboardingMount as {
+    mountOnboardingInstructions?: (
+      report: WorkspaceMountOnboardingReport | null,
+    ) => string | null;
+  }
+).mountOnboardingInstructions;
 
 function report(
   overrides: Partial<WorkspaceMountOnboardingReport>,
@@ -59,6 +68,16 @@ describe("mount onboarding helpers", () => {
         }),
       ),
     ).toBe(false);
+  });
+
+  it("keeps the System Settings fallback in the approval instructions", () => {
+    expect(
+      mountOnboardingInstructions?.(report({ launchStrategy: "instructions_only" })) ?? null,
+    ).toBe(
+      "Open Finder, choose Locality under Locations, enable the File Provider, then return here " +
+        "and click Check again. If Finder does not show Locality, open System Settings, go to " +
+        "Privacy & Security, then enable Locality under Extensions or File Providers.",
+    );
   });
 
   it("maps backend states to the step 4 headline", () => {

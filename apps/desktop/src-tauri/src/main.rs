@@ -1122,17 +1122,18 @@ async fn run_workspace_mount_onboarding(
     app: AppHandle,
     request: WorkspaceMountOnboardingRequest,
 ) -> WorkspaceMountOnboardingReport {
-    let report =
-        tauri::async_runtime::spawn_blocking(move || run_workspace_mount_onboarding_blocking(request))
-        .await
-        .unwrap_or_else(|error| {
-            workspace_mount_onboarding_report(
-                MacosWorkspaceMountOnboardingState::Failed,
-                format!("Mount onboarding worker failed: {error}"),
-                WorkspaceMountOnboardingPrimaryAction::RetrySetup,
-                WorkspaceMountOnboardingLaunchStrategy::None,
-            )
-        });
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        run_workspace_mount_onboarding_blocking(request)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        workspace_mount_onboarding_report(
+            MacosWorkspaceMountOnboardingState::Failed,
+            format!("Mount onboarding worker failed: {error}"),
+            WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+            WorkspaceMountOnboardingLaunchStrategy::None,
+        )
+    });
     if workspace_mount_onboarding_should_refresh_surfaces(&report) {
         refresh_desktop_surfaces(&app);
     }
@@ -8358,6 +8359,8 @@ fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
     message.contains("The application cannot be used right now")
         || message.contains("locality-file-providerctl was not found")
         || message.contains("registered but not enabled")
+        || message.contains("did not return a CloudStorage URL")
+        || message.contains("macOS has not created")
 }
 
 fn workspace_mount_onboarding_report(
@@ -8399,9 +8402,7 @@ fn macos_workspace_mount_onboarding_state(
     message: &str,
     user_enabled: bool,
 ) -> Option<MacosWorkspaceMountOnboardingState> {
-    if message.contains("registered but not enabled")
-        || message.contains("The application cannot be used right now")
-    {
+    if message.contains("registered but not enabled") {
         return Some(MacosWorkspaceMountOnboardingState::ApprovalRequired);
     }
     if user_enabled
@@ -11030,6 +11031,16 @@ mod tests {
     }
 
     #[test]
+    fn workspace_mount_onboarding_treats_cloudstorage_delay_as_recoverable_after_approval() {
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            "Could not open macOS File Provider domain `loc`: locality-file-providerctl did not return a CloudStorage URL"
+        ));
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            "Could not open macOS File Provider domain `loc`: File Provider domain loc exists but macOS has not created /Users/test/Library/CloudStorage/Locality"
+        ));
+    }
+
+    #[test]
     fn macos_file_provider_approval_surface_path_uses_first_existing_candidate() {
         let temp = TestTempDir::new("approval-surface");
         let missing = temp.path().join("Library/CloudStorage/Locality");
@@ -11083,27 +11094,18 @@ mod tests {
     }
 
     #[test]
-    fn workspace_mount_onboarding_classifier_keeps_application_cannot_be_used_right_now_recoverable() {
-        let message =
-            "Could not register macOS File Provider: The application cannot be used right now.";
+    fn workspace_mount_onboarding_preserves_application_unavailable_guidance() {
+        let message = "Could not register macOS File Provider: The application cannot be used right now. The Locality macOS File Provider app or extension is not available to macOS. For local development, run `make install-macos-file-provider`, then reopen Locality and enable the File Provider if macOS asks.";
 
-        assert!(super::recoverable_macos_file_provider_activation_error(message));
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            message
+        ));
 
         let report = super::classify_workspace_mount_onboarding_failure(message);
-        if cfg!(target_os = "macos") {
-            assert_eq!(report.state, "approval_required");
-            assert_eq!(report.primary_action, "allow_in_macos");
-            assert_eq!(report.launch_strategy, "instructions_only");
-            assert_eq!(
-                report.message,
-                "Enable Locality in Finder, then return here and click Check again."
-            );
-        } else {
-            assert_eq!(report.state, "failed");
-            assert_eq!(report.primary_action, "retry_setup");
-            assert_eq!(report.launch_strategy, "none");
-            assert_eq!(report.message, message);
-        }
+        assert_eq!(report.state, "failed");
+        assert_eq!(report.primary_action, "retry_setup");
+        assert_eq!(report.launch_strategy, "none");
+        assert_eq!(report.message, message);
     }
 
     #[test]
@@ -11172,7 +11174,10 @@ mod tests {
         assert_eq!(report.state, "failed");
         assert_eq!(report.primary_action, "retry_setup");
         assert_eq!(report.launch_strategy, "none");
-        assert_eq!(report.message, "Could not load the top-level Notion folder.");
+        assert_eq!(
+            report.message,
+            "Could not load the top-level Notion folder."
+        );
     }
 
     #[test]

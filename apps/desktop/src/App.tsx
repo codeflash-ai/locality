@@ -53,6 +53,7 @@ import { classifyMountSetupError } from "./onboarding-errors";
 import {
   failedMountOnboardingReport,
   mountOnboardingHeadline,
+  mountOnboardingInstructions,
   mountOnboardingNeedsInstructions,
   mountOnboardingNextAction,
   mountOnboardingPrimaryLabel,
@@ -1603,10 +1604,7 @@ function Onboarding({
               </PrimaryButton>
             )}
             {mountOnboardingNeedsInstructions(mountOnboarding) && (
-              <p className="quiet-note">
-                Open Finder, choose Locality under Locations, enable the File Provider, then
-                return here and click Check again.
-              </p>
+              <p className="quiet-note">{mountOnboardingInstructions(mountOnboarding)}</p>
             )}
             {mountOnboardingSupplementaryNote(mountOnboarding) && (
               <p className="quiet-note">{mountOnboardingSupplementaryNote(mountOnboarding)}</p>

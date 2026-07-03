@@ -61,7 +61,20 @@ export function mountOnboardingHeadline(
 export function mountOnboardingNeedsInstructions(
   report: WorkspaceMountOnboardingReport | null,
 ) {
-  return report?.state === "approval_required" && report.launchStrategy === "instructions_only";
+  return mountOnboardingInstructions(report) !== null;
+}
+
+export function mountOnboardingInstructions(
+  report: WorkspaceMountOnboardingReport | null,
+) {
+  if (report?.state !== "approval_required" || report.launchStrategy !== "instructions_only") {
+    return null;
+  }
+  return (
+    "Open Finder, choose Locality under Locations, enable the File Provider, then return here " +
+    "and click Check again. If Finder does not show Locality, open System Settings, go to " +
+    "Privacy & Security, then enable Locality under Extensions or File Providers."
+  );
 }
 
 export function mountOnboardingSupplementaryNote(
