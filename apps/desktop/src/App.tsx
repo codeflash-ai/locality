@@ -1383,6 +1383,7 @@ function Onboarding({
       setMountOnboarding(failedMountOnboardingReport(report.message));
       return;
     }
+    setMountOnboarding(null);
   }
 
   function finishOnboarding() {

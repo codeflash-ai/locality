@@ -46,7 +46,7 @@ export function mountOnboardingPrimaryLabel(
 export function mountOnboardingNeedsInstructions(
   report: WorkspaceMountOnboardingReport | null,
 ) {
-  return report?.launchStrategy === "instructions_only";
+  return report?.state === "approval_required" && report.launchStrategy === "instructions_only";
 }
 
 export function mountOnboardingNextAction(

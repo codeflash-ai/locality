@@ -47,6 +47,18 @@ describe("mount onboarding helpers", () => {
     );
   });
 
+  it("does not show approval instructions while waiting for the CloudStorage root", () => {
+    expect(
+      mountOnboardingNeedsInstructions(
+        report({
+          state: "waiting_for_cloudstorage_root",
+          primaryAction: "check_again",
+          launchStrategy: "instructions_only",
+        }),
+      ),
+    ).toBe(false);
+  });
+
   it("maps the backend report to the next onboarding command action", () => {
     expect(mountOnboardingNextAction(report({ primaryAction: "allow_in_macos" }))).toBe(
       "allow_in_macos",
