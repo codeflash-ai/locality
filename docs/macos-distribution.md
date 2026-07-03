@@ -79,6 +79,26 @@ mounted DMG volume, onboarding asks the user to move Locality to Applications be
 installing the terminal command so the symlink does not point at a temporary
 volume.
 
+## Uninstall Cleanup
+
+macOS does not run an uninstall hook when a user deletes a DMG-installed
+`Locality.app`; dragging the app to Trash is only a filesystem delete. Before
+deleting a direct-download app, users should open **Settings > Developer >
+Prepare for Uninstall**. That action stops `localityd`, unregisters File
+Provider state, clears Locality local state and credentials, removes
+Locality-managed agent guidance and MCP `loc` entries, removes the LaunchAgent,
+and removes the terminal `loc` symlink when it points at the app bundle.
+
+The desktop binary also supports a hidden non-UI cleanup entry point:
+
+```sh
+/Applications/Locality.app/Contents/MacOS/Locality --prepare-uninstall
+```
+
+The generated Homebrew cask runs that same entry point in its `uninstall`
+stanza before removing the app. The `zap` stanza remains available for users who
+want Homebrew to remove residual Locality state paths.
+
 ## Release Signing
 
 For public direct download, the release build should be signed with a Developer

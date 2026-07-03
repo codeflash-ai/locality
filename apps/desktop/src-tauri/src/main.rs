@@ -114,6 +114,7 @@ mod agent_guidance;
 
 use agent_guidance::{
     AgentGuidanceInstallReport, install_agent_guidance as install_guidance_files,
+    uninstall_agent_guidance as uninstall_guidance_files,
 };
 
 #[cfg(any(not(windows), test))]
@@ -700,6 +701,28 @@ async fn reset_locality_state(app: AppHandle) -> ActionReport {
             ActionReport {
                 ok: true,
                 message: "Locality local state was reset. Local files were left in place."
+                    .to_string(),
+            }
+        }
+        Err(message) => ActionReport { ok: false, message },
+    }
+}
+
+#[tauri::command]
+async fn prepare_locality_uninstall(app: AppHandle) -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(|| {
+        let state_root = default_state_root();
+        prepare_locality_uninstall_at(&state_root)
+    })
+    .await
+    .map_err(|error| format!("Uninstall preparation worker failed: {error}"))
+    .and_then(|result| result)
+    {
+        Ok(()) => {
+            refresh_desktop_surfaces(&app);
+            ActionReport {
+                ok: true,
+                message: "Locality is ready to uninstall. The app will quit; you can move Locality.app to the Trash."
                     .to_string(),
             }
         }
@@ -4145,6 +4168,33 @@ fn reset_locality_state_at(state_root: &Path) -> Result<(), String> {
     result
 }
 
+fn prepare_locality_uninstall_at(state_root: &Path) -> Result<(), String> {
+    reset_locality_state_at(state_root)?;
+    let guidance = uninstall_guidance_files();
+    if !guidance.ok {
+        let details = guidance
+            .targets
+            .iter()
+            .filter(|target| target.status == "failed")
+            .map(|target| {
+                format!(
+                    "{}: {}",
+                    target.path.as_deref().unwrap_or(target.agent.as_str()),
+                    target.detail
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(if details.is_empty() {
+            "Could not remove Locality agent integrations.".to_string()
+        } else {
+            format!("Could not remove some Locality agent integrations: {details}")
+        });
+    }
+    remove_terminal_cli_links_for_uninstall()?;
+    Ok(())
+}
+
 fn clear_state_root_contents(state_root: &Path) -> Result<(), String> {
     if !state_root.exists() {
         fs::create_dir_all(state_root)
@@ -5983,6 +6033,53 @@ fn install_terminal_cli_link_in_sorted_path_dirs(
     Err(format!(
         "Could not install the Locality terminal command without administrator privileges. Add a user-writable directory such as ~/.local/bin to PATH, then try again. Checked PATH directories: {checked}.{detail}"
     ))
+}
+
+fn remove_terminal_cli_links_for_uninstall() -> Result<(), String> {
+    let Some(cli_path) = bundled_loc_cli_binary() else {
+        return Ok(());
+    };
+    let mut dirs = terminal_cli_path_dirs();
+    if let Some(directory) = default_user_terminal_cli_dir() {
+        dirs.push(directory);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    }
+    dirs.sort();
+    dirs.dedup();
+
+    let mut errors = Vec::new();
+    for directory in dirs {
+        let link_path = directory.join(terminal_cli_command_filename());
+        if let Err(error) = remove_terminal_cli_link_at(&cli_path, &link_path) {
+            errors.push(error);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn remove_terminal_cli_link_at(cli_path: &Path, link_path: &Path) -> Result<bool, String> {
+    match terminal_cli_link_state(link_path, cli_path) {
+        Ok(TerminalCliLinkState::Current) => {}
+        Ok(TerminalCliLinkState::NeedsInstall) => return Ok(false),
+        Err(_error) => return Ok(false),
+    }
+
+    fs::remove_file(link_path).map_err(|error| {
+        format!(
+            "Could not remove Locality terminal command {}: {error}",
+            link_path.display()
+        )
+    })?;
+    Ok(true)
 }
 
 #[cfg(not(windows))]
@@ -11650,6 +11747,32 @@ mod tests {
         assert_eq!(shell_single_quote("/tmp/it's/loc"), "'/tmp/it'\"'\"'s/loc'");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn terminal_cli_link_removal_deletes_only_current_link() {
+        let temp = TestTempDir::new("terminal-cli-remove-link");
+        let cli = temp.path().join("Locality.app/Contents/MacOS/loc");
+        let other_cli = temp.path().join("other/bin/loc");
+        let link = temp.path().join("bin/loc");
+        fs::create_dir_all(cli.parent().expect("cli parent")).expect("create cli parent");
+        fs::create_dir_all(other_cli.parent().expect("other parent")).expect("create other parent");
+        fs::create_dir_all(link.parent().expect("link parent")).expect("create link parent");
+        fs::write(&cli, b"loc").expect("write cli");
+        fs::write(&other_cli, b"other").expect("write other cli");
+        std::os::unix::fs::symlink(&cli, &link).expect("link cli");
+
+        let removed = super::remove_terminal_cli_link_at(&cli, &link).expect("remove current link");
+
+        assert!(removed);
+        assert!(!link.exists());
+
+        std::os::unix::fs::symlink(&other_cli, &link).expect("link other cli");
+        let removed = super::remove_terminal_cli_link_at(&cli, &link).expect("preserve other link");
+
+        assert!(!removed);
+        assert_eq!(fs::read_link(&link).expect("read other link"), other_cli);
+    }
+
     #[test]
     fn state_clear_removes_metadata_but_preserves_state_root() {
         let temp = TestTempDir::new("clear-state-root");
@@ -12434,6 +12557,15 @@ fn windows_wide_null(value: &str) -> Vec<u16> {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--prepare-uninstall") {
+        let state_root = default_state_root();
+        if let Err(error) = prepare_locality_uninstall_at(&state_root) {
+            eprintln!("Locality uninstall preparation failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     desktop_log("info", "app.start", "Locality desktop starting");
     let Some(single_instance_guard) = acquire_desktop_single_instance() else {
         return;
@@ -12490,6 +12622,7 @@ fn main() {
             install_state_review,
             acknowledge_install_state,
             reset_locality_state,
+            prepare_locality_uninstall,
             choose_mount_folder,
             ensure_runtime_ready,
             ensure_terminal_cli_available,
