@@ -13,6 +13,7 @@ use locality_core::path_projection::{
     is_page_document_path, page_container_path, page_document_path, page_listing_parent_path,
 };
 use locality_core::{LocalityError, LocalityResult};
+use locality_notion::projection::{is_notion_private_root_id, is_notion_workspace_root_id};
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRepository, MountConfig, MountRepository,
     ProjectionMode, ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
@@ -1453,6 +1454,10 @@ fn create_parent_remote_id(
         .ok_or_else(|| missing_identifier(parent_identifier))?;
     match entity.kind {
         EntityKind::Page | EntityKind::Database => Ok(remote_id),
+        EntityKind::Directory if is_notion_private_root_entity(mount, entity) => Ok(remote_id),
+        EntityKind::Directory if is_notion_workspace_root_entity(mount, entity) => {
+            Err(notion_workspace_root_create_error())
+        }
         EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => {
             Err(LocalityError::Unsupported(
                 "new virtual filesystem files must be created inside a page or database directory",
@@ -2339,8 +2344,28 @@ fn child_container_for_identifier(
     Ok(match entity.kind {
         EntityKind::Page => Some(ChildContainer::PageChildren(remote_id)),
         EntityKind::Database => Some(ChildContainer::DatabaseRows(remote_id)),
+        EntityKind::Directory
+            if is_notion_private_root_entity(mount, entity)
+                || is_notion_workspace_root_entity(mount, entity) =>
+        {
+            Some(ChildContainer::SourceRoot(remote_id))
+        }
         EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => None,
     })
+}
+
+fn is_notion_private_root_entity(mount: &MountConfig, entity: &EntityRecord) -> bool {
+    mount.connector == "notion" && is_notion_private_root_id(&entity.remote_id)
+}
+
+fn is_notion_workspace_root_entity(mount: &MountConfig, entity: &EntityRecord) -> bool {
+    mount.connector == "notion" && is_notion_workspace_root_id(&entity.remote_id)
+}
+
+fn notion_workspace_root_create_error() -> LocalityError {
+    LocalityError::Unsupported(
+        "New root workspace pages are ambiguous because Notion does not expose a stable teamspace parent through this API. Create under Private/ for a private page, or create below an existing page that Locality can use as the parent.",
+    )
 }
 
 fn refreshed_entity_record(
@@ -2577,7 +2602,7 @@ impl ProviderIndex {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use locality_connector::{
         ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
@@ -2589,6 +2614,10 @@ mod tests {
         freshness::FreshnessTier,
         hydration::HydrationRequest,
         model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry},
+    };
+    use locality_notion::projection::{
+        NOTION_PRIVATE_ROOT_DIR, NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_DIR,
+        NOTION_WORKSPACE_ROOT_ID,
     };
     use locality_store::{
         EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
@@ -3619,6 +3648,110 @@ mod tests {
     }
 
     #[test]
+    fn notion_private_synthetic_root_accepts_pending_page_directory_create() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-notion-private-root-create");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", "/tmp/loc/notion")
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        store
+            .save_entity(notion_synthetic_root_entity(
+                &mount_id,
+                NOTION_PRIVATE_ROOT_ID,
+                NOTION_PRIVATE_ROOT_DIR,
+                NOTION_PRIVATE_ROOT_DIR,
+            ))
+            .expect("save private root");
+
+        let created = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            NOTION_PRIVATE_ROOT_ID,
+            "Scratch Idea",
+        )
+        .expect("create under private root");
+
+        assert!(created.identifier.starts_with("children:local:"));
+        assert_eq!(created.item.path, "Private/Scratch Idea");
+        assert_eq!(
+            std::fs::read(content_root.join("Private/Scratch Idea/page.md"))
+                .expect("read pending private page cache"),
+            b""
+        );
+        let mutation = store
+            .list_virtual_mutations(&mount_id)
+            .expect("list mutations")
+            .pop()
+            .expect("pending create");
+        assert_eq!(
+            mutation.projected_path,
+            Path::new("Private/Scratch Idea/page.md")
+        );
+        assert_eq!(
+            mutation.parent_remote_id.as_ref().map(|id| id.as_str()),
+            Some(NOTION_PRIVATE_ROOT_ID)
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn notion_workspace_synthetic_root_rejects_pending_page_directory_create() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-notion-workspace-root-create");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", "/tmp/loc/notion")
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        store
+            .save_entity(notion_synthetic_root_entity(
+                &mount_id,
+                NOTION_WORKSPACE_ROOT_ID,
+                NOTION_WORKSPACE_ROOT_DIR,
+                NOTION_WORKSPACE_ROOT_DIR,
+            ))
+            .expect("save workspace root");
+
+        let error = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            NOTION_WORKSPACE_ROOT_ID,
+            "New Team Page",
+        )
+        .expect_err("workspace root create must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("New root workspace pages are ambiguous")
+        );
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
+        assert!(
+            !content_root
+                .join("Workspace/New Team Page/page.md")
+                .exists()
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
     fn create_directory_under_google_docs_source_root_uses_workspace_folder_parent() {
         let mount_id = MountId::new("google-docs-main");
         let state_root = temp_root("loc-virtual-fs-google-docs-root-create-dir");
@@ -4123,6 +4256,22 @@ mod tests {
     fn virtual_mount(mount_id: &MountId) -> MountConfig {
         MountConfig::new(mount_id.clone(), "notion", "/tmp/loc/notion")
             .projection(ProjectionMode::LinuxFuse)
+    }
+
+    fn notion_synthetic_root_entity(
+        mount_id: &MountId,
+        remote_id: &str,
+        title: &str,
+        path: &str,
+    ) -> EntityRecord {
+        EntityRecord::new(
+            mount_id.clone(),
+            RemoteId::new(remote_id),
+            EntityKind::Directory,
+            title,
+            path,
+        )
+        .with_hydration(HydrationState::Virtual)
     }
 
     fn temp_root(prefix: &str) -> PathBuf {
