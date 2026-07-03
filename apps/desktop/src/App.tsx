@@ -48,6 +48,7 @@ import {
   type ProviderRuntimeSummary,
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
+import { shouldAutoCreateMount } from "./onboarding-flow";
 import { classifyMountSetupError, type MountSetupError } from "./onboarding-errors";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
@@ -1152,7 +1153,6 @@ function Onboarding({
   const [loginCopyMessage, setLoginCopyMessage] = useState("");
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
-  const [mountPathDirty, setMountPathDirty] = useState(false);
   const [locateUrl, setLocateUrl] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
@@ -1161,6 +1161,7 @@ function Onboarding({
   const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
+  const connectionReadyNow = oauthReady || connectionReady(snapshot);
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -1195,10 +1196,8 @@ function Onboarding({
   }, [snapshot.connection.workspaceName]);
 
   useEffect(() => {
-    if (!mountPathDirty) {
-      setMountPath(snapshot.mount.localPath);
-    }
-  }, [mountPathDirty, snapshot.mount.localPath]);
+    setMountPath(snapshot.mount.localPath);
+  }, [snapshot.mount.localPath]);
 
   useEffect(() => {
     if (step !== 3 || !oauthInFlight || oauthReady) {
@@ -1239,6 +1238,22 @@ function Onboarding({
       return current < 5 ? 5 : current;
     });
   }, [snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
+
+  useEffect(() => {
+    if (
+      !shouldAutoCreateMount({
+        step,
+        connectionReady: connectionReadyNow,
+        mountMissing: mountMissing(snapshot),
+        mounting,
+        hasMountError: mountError !== null,
+        mountPath,
+      })
+    ) {
+      return;
+    }
+    void startMount();
+  }, [connectionReadyNow, mountError, mountPath, mounting, snapshot.mount.status, step]);
 
   useEffect(() => {
     if (step !== 5 || mountMissing(snapshot) || agentGuidanceState !== "idle") {
@@ -1319,7 +1334,6 @@ function Onboarding({
         undefined,
         sampleSnapshot,
       );
-      setMountPathDirty(false);
       setMountPath(nextSnapshot.mount.localPath);
       await installAgentGuidance(nextSnapshot.mount.localPath);
       setStep(5);
@@ -1346,23 +1360,6 @@ function Onboarding({
     }
     setMountError(null);
     return true;
-  }
-
-  async function chooseFolder() {
-    setMountError(null);
-    try {
-      const selected = await callCommand<string | null>(
-        "choose_mount_folder",
-        { current: mountPath },
-        null,
-      );
-      if (selected) {
-        setMountPathDirty(true);
-        setMountPath(selected.replace(/\/$/, ""));
-      }
-    } catch (error) {
-      setMountError(classifyMountSetupError(errorMessage(error)));
-    }
   }
 
   async function openMountFolder() {
@@ -1409,7 +1406,6 @@ function Onboarding({
     }
   }
 
-  const connectionReadyNow = oauthReady || connectionReady(snapshot);
   const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
   const finalPrompt = agentGuidanceReport?.prompt || suggestedAgentPrompt(mountPath);
 
@@ -1473,7 +1469,7 @@ function Onboarding({
               </h1>
               <p>
                 {connectionReadyNow
-                  ? `${workspaceLabel} is ready. Next, choose where Locality should place the Notion mount point.`
+                  ? `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare agent guidance.`
                   : oauthInFlight
                     ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
                     : "Connect the workspace you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
@@ -1510,37 +1506,33 @@ function Onboarding({
         )}
 
         {step === 4 && (
-          <SetupContent variant="wide">
+          <SetupContent mark={<BrandTile variant="progress" />} variant="wide">
             <div>
               <div className="eyebrow">Local folder</div>
-              <h1>Choose where your files appear.</h1>
+              <h1>Creating your local folder.</h1>
               <p>
-                Locality keeps your connected apps under one CloudStorage root. Agents and Finder
-                will use this folder.
+                Locality is creating your Notion folder under the default CloudStorage root and
+                preparing agent guidance.
               </p>
             </div>
-            <div className="path-field setup-path-field">
-              <input
-                value={mountPath}
-                disabled={mounting}
-                onChange={(event) => {
-                  setMountPathDirty(true);
-                  setMountPath(event.target.value);
-                }}
-              />
-              <SecondaryButton disabled={mounting} onClick={chooseFolder}>
-                Choose
-              </SecondaryButton>
+            <div className="sync-note">
+              {mountError ? <AlertTriangle /> : <Loader2 className="spin-icon" />}
+              {mountError ? "Folder setup needs attention" : "Creating folder and preparing Notion files"}
             </div>
-            <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
-              {mounting ? "Mounting Notion" : "Create Local Folder"}
-            </PrimaryButton>
+            <div className="path-field ready-path-field">
+              <span>{mountPath}</span>
+            </div>
+            {mountError?.kind !== "file-provider-disabled" && (
+              <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
+                {mounting ? "Creating Local Folder" : mountError ? "Try Again" : "Preparing Local Folder"}
+              </PrimaryButton>
+            )}
             {mountError && (
               <MountSetupErrorCallout error={mountError} onRetry={startMount} retrying={mounting} />
             )}
             <p className="quiet-note">
-              The Notion mount point will include AGENTS.md and CLAUDE.md to help your agents edit
-              files natively.
+              Locality uses the default CloudStorage location so Finder and your agents see the
+              same Notion folder automatically.
             </p>
           </SetupContent>
         )}
