@@ -6195,6 +6195,8 @@ mod tests {
     use crate::push::PushReport;
     use crate::search::{SearchOptions, SearchReport};
 
+    #[cfg(target_os = "windows")]
+    use super::resolve_mount_target;
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, FileProviderCommandReport,
         VirtualProjectionRegistration, absolute_command_path,
@@ -6205,7 +6207,7 @@ mod tests {
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
         projection_mode_for_target, projection_usage_options_for_target,
-        prompt_for_push_confirmation, pull_direct_fallback_error, resolve_mount_target,
+        prompt_for_push_confirmation, pull_direct_fallback_error,
         should_prompt_for_push_confirmation, should_refresh_notion_url_search,
         spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
     };

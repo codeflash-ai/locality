@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -413,7 +415,24 @@ fn cli_keeps_multiple_default_notion_workspace_mounts_with_distinct_connections(
         "{mounts:#?}"
     );
 
-    let doctor = loc_json_with_exit(loc_command(loc, &state_root).args(["doctor", "--json"]), 3);
+    let mut doctor_command = loc_command(loc, &state_root);
+    #[cfg(target_os = "macos")]
+    {
+        let helper = fixture.root.join("fake-locality-file-providerctl");
+        fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true,\"action\":\"list\",\"domains\":[],\"message\":\"listed 0 domain(s)\"}'\n",
+        )
+        .expect("write fake file provider helper");
+        let mut permissions = fs::metadata(&helper)
+            .expect("stat fake file provider helper")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper, permissions)
+            .expect("make fake file provider helper executable");
+        doctor_command.env("LOCALITY_FILE_PROVIDERCTL", helper);
+    }
+    let doctor = loc_json_with_exit(doctor_command.args(["doctor", "--json"]), 3);
     let doctor_mounts = doctor["mounts"].as_array().expect("doctor mounts");
     assert_eq!(doctor_mounts.len(), 2, "{doctor:#?}");
     assert!(
