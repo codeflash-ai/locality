@@ -48,7 +48,7 @@ import {
   type ProviderRuntimeSummary,
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
-import { shouldAutoCreateMount } from "./onboarding-flow";
+import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
 import { classifyMountSetupError, type MountSetupError } from "./onboarding-errors";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
@@ -1153,6 +1153,7 @@ function Onboarding({
   const [loginCopyMessage, setLoginCopyMessage] = useState("");
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
+  const [mountPathDirty, setMountPathDirty] = useState(false);
   const [locateUrl, setLocateUrl] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
@@ -1161,6 +1162,7 @@ function Onboarding({
   const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
+  const mountStartRequestedRef = useRef(false);
   const connectionReadyNow = oauthReady || connectionReady(snapshot);
 
   async function installAgentGuidance(path: string) {
@@ -1196,8 +1198,10 @@ function Onboarding({
   }, [snapshot.connection.workspaceName]);
 
   useEffect(() => {
-    setMountPath(snapshot.mount.localPath);
-  }, [snapshot.mount.localPath]);
+    if (!mountPathDirty) {
+      setMountPath(snapshot.mount.localPath);
+    }
+  }, [mountPathDirty, snapshot.mount.localPath]);
 
   useEffect(() => {
     if (step !== 3 || !oauthInFlight || oauthReady) {
@@ -1248,6 +1252,7 @@ function Onboarding({
         mounting,
         hasMountError: mountError !== null,
         mountPath,
+        startRequested: mountStartRequestedRef.current,
       })
     ) {
       return;
@@ -1309,10 +1314,11 @@ function Onboarding({
   }
 
   async function startMount() {
-    if (mounting) {
+    if (mountStartRequestedRef.current) {
       return;
     }
 
+    mountStartRequestedRef.current = true;
     setMountError(null);
     setMounting(true);
     try {
@@ -1334,12 +1340,14 @@ function Onboarding({
         undefined,
         sampleSnapshot,
       );
+      setMountPathDirty(false);
       setMountPath(nextSnapshot.mount.localPath);
       await installAgentGuidance(nextSnapshot.mount.localPath);
       setStep(5);
     } catch (error) {
       setMountError(classifyMountSetupError(errorMessage(error)));
     } finally {
+      mountStartRequestedRef.current = false;
       setMounting(false);
     }
   }
@@ -1360,6 +1368,26 @@ function Onboarding({
     }
     setMountError(null);
     return true;
+  }
+
+  async function chooseFolder() {
+    if (mountStartRequestedRef.current || mounting) {
+      return;
+    }
+
+    try {
+      const selected = await callCommand<string | null>(
+        "choose_mount_folder",
+        { current: mountPath },
+        null,
+      );
+      if (selected) {
+        setMountPathDirty(true);
+        setMountPath(selected.replace(/\/$/, ""));
+      }
+    } catch (error) {
+      setMountError(classifyMountSetupError(errorMessage(error)));
+    }
   }
 
   async function openMountFolder() {
@@ -1408,6 +1436,7 @@ function Onboarding({
 
   const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
   const finalPrompt = agentGuidanceReport?.prompt || suggestedAgentPrompt(mountPath);
+  const showRecoveryChooser = mountRecoveryEnabled(mountError);
 
   return (
     <main className="setup-shell">
@@ -1523,9 +1552,16 @@ function Onboarding({
               <span>{mountPath}</span>
             </div>
             {mountError?.kind !== "file-provider-disabled" && (
-              <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
-                {mounting ? "Creating Local Folder" : mountError ? "Try Again" : "Preparing Local Folder"}
-              </PrimaryButton>
+              <div className="button-row">
+                <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
+                  {mounting ? "Creating Local Folder" : mountError ? "Try Again" : "Preparing Local Folder"}
+                </PrimaryButton>
+                {showRecoveryChooser && (
+                  <SecondaryButton disabled={mounting} onClick={() => void chooseFolder()}>
+                    Choose Folder
+                  </SecondaryButton>
+                )}
+              </div>
             )}
             {mountError && (
               <MountSetupErrorCallout error={mountError} onRetry={startMount} retrying={mounting} />

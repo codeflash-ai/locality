@@ -145,11 +145,8 @@ fn executor_replaces_clean_hydrated_file() {
 fn live_mode_fast_forward_keeps_remote_hint_when_new_version_renders_same_tree() {
     let fixture = HydrationFixture::new();
     let mut store = fixture.store(HydrationState::Hydrated);
-    let old = rendered_entity_with_sync(
-        "Old body.",
-        "2026-06-11T00:00:00Z",
-        "2026-06-11T00:00:00Z",
-    );
+    let old =
+        rendered_entity_with_sync("Old body.", "2026-06-11T00:00:00Z", "2026-06-11T00:00:00Z");
     store
         .save_shadow(&fixture.mount_id, old.shadow.clone())
         .expect("save old shadow");
