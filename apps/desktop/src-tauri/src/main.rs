@@ -385,6 +385,31 @@ struct CreateDesktopMountRequest {
     google_docs_workspace_folder: Option<String>,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceMountOnboardingRequest {
+    path: String,
+    action: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceMountOnboardingAction {
+    Start,
+    AllowInMacos,
+    CheckAgain,
+}
+
+impl WorkspaceMountOnboardingAction {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "start" => Ok(Self::Start),
+            "allow_in_macos" => Ok(Self::AllowInMacos),
+            "check_again" => Ok(Self::CheckAgain),
+            other => Err(format!("Unsupported onboarding mount action `{other}`.")),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LiveModeRemoteTarget {
     mount_id: MountId,
@@ -1091,6 +1116,22 @@ async fn create_desktop_mount(app: AppHandle, request: CreateDesktopMountRequest
     create_desktop_mount_command(app, request).await
 }
 
+#[tauri::command]
+async fn run_workspace_mount_onboarding(
+    request: WorkspaceMountOnboardingRequest,
+) -> WorkspaceMountOnboardingReport {
+    tauri::async_runtime::spawn_blocking(move || run_workspace_mount_onboarding_blocking(request))
+        .await
+        .unwrap_or_else(|error| {
+            workspace_mount_onboarding_report(
+                MacosWorkspaceMountOnboardingState::Failed,
+                format!("Mount onboarding worker failed: {error}"),
+                WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+                WorkspaceMountOnboardingLaunchStrategy::None,
+            )
+        })
+}
+
 async fn create_desktop_mount_command(
     app: AppHandle,
     request: CreateDesktopMountRequest,
@@ -1108,6 +1149,62 @@ async fn create_desktop_mount_command(
         refresh_desktop_surfaces(&app);
     }
     report
+}
+
+fn run_workspace_mount_onboarding_blocking(
+    request: WorkspaceMountOnboardingRequest,
+) -> WorkspaceMountOnboardingReport {
+    let action = match WorkspaceMountOnboardingAction::parse(request.action.trim()) {
+        Ok(action) => action,
+        Err(message) => {
+            return workspace_mount_onboarding_report(
+                MacosWorkspaceMountOnboardingState::Failed,
+                message,
+                WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+                WorkspaceMountOnboardingLaunchStrategy::None,
+            );
+        }
+    };
+
+    if matches!(action, WorkspaceMountOnboardingAction::AllowInMacos) {
+        #[cfg(target_os = "macos")]
+        {
+            let launch_strategy = launch_macos_file_provider_approval_surface();
+            return workspace_mount_onboarding_report(
+                MacosWorkspaceMountOnboardingState::ApprovalRequired,
+                "Enable Locality in Finder, then return here and click Check again.",
+                WorkspaceMountOnboardingPrimaryAction::CheckAgain,
+                launch_strategy,
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return workspace_mount_onboarding_report(
+                MacosWorkspaceMountOnboardingState::Failed,
+                "macOS File Provider approval is only available on macOS.",
+                WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+                WorkspaceMountOnboardingLaunchStrategy::None,
+            );
+        }
+    }
+
+    match create_desktop_mount_blocking(CreateDesktopMountRequest {
+        connector: "notion".to_string(),
+        path: request.path,
+        mount_id: "notion-main".to_string(),
+        connection_id: None,
+        read_only: false,
+        notion_root_page: None,
+        google_docs_workspace_folder: None,
+    }) {
+        Ok(message) => workspace_mount_onboarding_report(
+            MacosWorkspaceMountOnboardingState::Created,
+            message,
+            WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+            WorkspaceMountOnboardingLaunchStrategy::None,
+        ),
+        Err(message) => classify_workspace_mount_onboarding_failure(&message),
+    }
 }
 
 #[tauri::command]
@@ -8272,7 +8369,9 @@ fn macos_workspace_mount_onboarding_state(
     message: &str,
     user_enabled: bool,
 ) -> Option<MacosWorkspaceMountOnboardingState> {
-    if message.contains("registered but not enabled") {
+    if message.contains("registered but not enabled")
+        || message.contains("The application cannot be used right now")
+    {
         return Some(MacosWorkspaceMountOnboardingState::ApprovalRequired);
     }
     if user_enabled
@@ -8290,6 +8389,90 @@ fn macos_workspace_mount_onboarding_state(
     _user_enabled: bool,
 ) -> Option<MacosWorkspaceMountOnboardingState> {
     None
+}
+
+fn classify_workspace_mount_onboarding_failure(message: &str) -> WorkspaceMountOnboardingReport {
+    #[cfg(target_os = "macos")]
+    {
+        if recoverable_macos_file_provider_activation_error(message) {
+            let user_enabled = macos_workspace_mount_domain_user_enabled().unwrap_or(false);
+            if let Some(state) = macos_workspace_mount_onboarding_state(message, user_enabled) {
+                let primary_action = match state {
+                    MacosWorkspaceMountOnboardingState::ApprovalRequired => {
+                        WorkspaceMountOnboardingPrimaryAction::AllowInMacos
+                    }
+                    MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot => {
+                        WorkspaceMountOnboardingPrimaryAction::CheckAgain
+                    }
+                    _ => WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+                };
+                return workspace_mount_onboarding_report(
+                    state,
+                    message,
+                    primary_action,
+                    WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+                );
+            }
+        }
+    }
+
+    workspace_mount_onboarding_report(
+        MacosWorkspaceMountOnboardingState::Failed,
+        message,
+        WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+        WorkspaceMountOnboardingLaunchStrategy::None,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
+    let report =
+        run_macos_file_provider_helper("list", Vec::new()).map_err(|error| error.message())?;
+    Ok(report
+        .helper_report
+        .get("domains")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|domains| {
+            domains.iter().find(|domain| {
+                domain.get("identifier").and_then(serde_json::Value::as_str)
+                    == Some(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+            })
+        })
+        .and_then(|domain| domain.get("userEnabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_approval_surface_path(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|path| path.exists()).cloned()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_file_provider_approval_surface_path(_candidates: &[PathBuf]) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn launch_macos_file_provider_approval_surface() -> WorkspaceMountOnboardingLaunchStrategy {
+    if let Some(path) =
+        macos_file_provider_approval_surface_path(&macos_file_provider_cloud_storage_roots())
+    {
+        if open_in_file_manager(&path).is_ok() {
+            return WorkspaceMountOnboardingLaunchStrategy::OpenFinder;
+        }
+    }
+    WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch_macos_file_provider_approval_surface() -> WorkspaceMountOnboardingLaunchStrategy {
+    WorkspaceMountOnboardingLaunchStrategy::None
 }
 
 fn connection_metadata_key(
@@ -10817,6 +11000,25 @@ mod tests {
     }
 
     #[test]
+    fn macos_file_provider_approval_surface_path_uses_first_existing_candidate() {
+        let temp = TestTempDir::new("approval-surface");
+        let missing = temp.path().join("Library/CloudStorage/Locality");
+        let existing = temp.path().join("Library/CloudStorage/Locality-Locality");
+        fs::create_dir_all(&existing).expect("create fallback root");
+
+        let expected = if cfg!(target_os = "macos") {
+            Some(existing.clone())
+        } else {
+            None
+        };
+
+        assert_eq!(
+            super::macos_file_provider_approval_surface_path(&[missing, existing]),
+            expected
+        );
+    }
+
+    #[test]
     fn macos_workspace_mount_onboarding_state_requires_approval_when_domain_is_disabled() {
         let expected = if cfg!(target_os = "macos") {
             Some(super::MacosWorkspaceMountOnboardingState::ApprovalRequired)
@@ -10851,6 +11053,26 @@ mod tests {
     }
 
     #[test]
+    fn workspace_mount_onboarding_classifier_keeps_application_cannot_be_used_right_now_recoverable() {
+        let message =
+            "Could not register macOS File Provider: The application cannot be used right now.";
+
+        assert!(super::recoverable_macos_file_provider_activation_error(message));
+
+        let report = super::classify_workspace_mount_onboarding_failure(message);
+        if cfg!(target_os = "macos") {
+            assert_eq!(report.state, "approval_required");
+            assert_eq!(report.primary_action, "allow_in_macos");
+            assert_eq!(report.launch_strategy, "instructions_only");
+        } else {
+            assert_eq!(report.state, "failed");
+            assert_eq!(report.primary_action, "retry_setup");
+            assert_eq!(report.launch_strategy, "none");
+        }
+        assert_eq!(report.message, message);
+    }
+
+    #[test]
     fn workspace_mount_onboarding_report_uses_retry_setup_for_failed_state() {
         let report = super::workspace_mount_onboarding_report(
             super::MacosWorkspaceMountOnboardingState::Failed,
@@ -10863,6 +11085,20 @@ mod tests {
         assert_eq!(report.primary_action, "retry_setup");
         assert_eq!(report.launch_strategy, "none");
         assert_eq!(report.message, "Could not load the top-level Notion folder.");
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_report_uses_check_again_for_waiting_root() {
+        let report = super::workspace_mount_onboarding_report(
+            super::MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot,
+            "Locality is still waiting for the CloudStorage folder to appear.",
+            super::WorkspaceMountOnboardingPrimaryAction::CheckAgain,
+            super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+        );
+
+        assert_eq!(report.state, "waiting_for_cloudstorage_root");
+        assert_eq!(report.primary_action, "check_again");
+        assert_eq!(report.launch_strategy, "instructions_only");
     }
 
     #[test]
@@ -13096,6 +13332,7 @@ fn main() {
             ensure_terminal_cli_available,
             create_workspace_mount,
             create_desktop_mount,
+            run_workspace_mount_onboarding,
             install_agent_guidance,
             locate_notion_page,
             search_notion_pages,
