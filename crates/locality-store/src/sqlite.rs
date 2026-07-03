@@ -2703,21 +2703,6 @@ fn migrate_notion_workspace_roots_projection_layout_to_v1(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    for mount_id in &workspace_mounts {
-        upsert_notion_workspace_synthetic_root(
-            &transaction,
-            mount_id,
-            NOTION_PRIVATE_ROOT_ID,
-            NOTION_PRIVATE_ROOT_DIR,
-        )?;
-        upsert_notion_workspace_synthetic_root(
-            &transaction,
-            mount_id,
-            NOTION_WORKSPACE_ROOT_ID,
-            NOTION_WORKSPACE_ROOT_DIR,
-        )?;
-    }
-
     let mut rewritten_paths = 0;
     rewritten_paths += rewrite_notion_workspace_root_paths(
         &transaction,
@@ -2763,6 +2748,21 @@ fn migrate_notion_workspace_roots_projection_layout_to_v1(
         "",
         false,
     )?;
+
+    for mount_id in &workspace_mounts {
+        upsert_notion_workspace_synthetic_root(
+            &transaction,
+            mount_id,
+            NOTION_PRIVATE_ROOT_ID,
+            NOTION_PRIVATE_ROOT_DIR,
+        )?;
+        upsert_notion_workspace_synthetic_root(
+            &transaction,
+            mount_id,
+            NOTION_WORKSPACE_ROOT_ID,
+            NOTION_WORKSPACE_ROOT_DIR,
+        )?;
+    }
 
     if !workspace_mounts.is_empty() || rewritten_paths > 0 {
         rebuild_entity_search_index(&transaction)?;
@@ -2861,8 +2861,6 @@ fn rewrite_notion_workspace_root_paths(
 
 fn notion_workspace_root_repaired_path(path: &str, skip_absolute: bool) -> Option<String> {
     if path.is_empty()
-        || path == NOTION_PRIVATE_ROOT_DIR
-        || path == NOTION_WORKSPACE_ROOT_DIR
         || path.starts_with("Private/")
         || path.starts_with("Private\\")
         || path.starts_with("Workspace/")

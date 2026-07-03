@@ -1198,6 +1198,58 @@ fn sqlite_store_repairs_missing_notion_workspace_roots_component() {
 }
 
 #[test]
+fn sqlite_store_repairs_exact_notion_workspace_root_name_collisions() {
+    let fixture = SqliteFixture::new();
+    let db_path = seed_notion_workspace_root_name_collision_state(&fixture);
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute(
+            "DELETE FROM state_components
+             WHERE component_id = 'projection:notion_workspace_roots'",
+            [],
+        )
+        .expect("delete notion workspace roots component");
+    drop(connection);
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+
+    assert_eq!(
+        query_entities_for_mount(&connection, &fixture.mount_id),
+        vec![
+            (
+                "notion-root:private".to_string(),
+                "directory".to_string(),
+                "Private".to_string(),
+                "Private".to_string(),
+                "virtual".to_string(),
+            ),
+            (
+                "notion-root:workspace".to_string(),
+                "directory".to_string(),
+                "Workspace".to_string(),
+                "Workspace".to_string(),
+                "virtual".to_string(),
+            ),
+            (
+                "private-database".to_string(),
+                "database".to_string(),
+                "Private Database".to_string(),
+                "Workspace/Private".to_string(),
+                "stub".to_string(),
+            ),
+            (
+                "workspace-database".to_string(),
+                "database".to_string(),
+                "Workspace Database".to_string(),
+                "Workspace/Workspace".to_string(),
+                "stub".to_string(),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn sqlite_store_blocks_newer_notion_workspace_roots_component_without_rewriting() {
     let fixture = SqliteFixture::new();
     let db_path = seed_notion_workspace_roots_legacy_state(&fixture);
@@ -3220,6 +3272,37 @@ fn seed_notion_workspace_roots_legacy_state(fixture: &SqliteFixture) -> PathBuf 
     store
         .save_auto_save_enrollment(enrollment)
         .expect("save workspace auto-save");
+
+    store.db_path.clone()
+}
+
+fn seed_notion_workspace_root_name_collision_state(fixture: &SqliteFixture) -> PathBuf {
+    let mut store = fixture.open();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.mount_root.join("workspace"),
+        ))
+        .expect("save workspace notion mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("private-database"),
+            EntityKind::Database,
+            "Private Database",
+            "Private",
+        ))
+        .expect("save private-named database");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("workspace-database"),
+            EntityKind::Database,
+            "Workspace Database",
+            "Workspace",
+        ))
+        .expect("save workspace-named database");
 
     store.db_path.clone()
 }
