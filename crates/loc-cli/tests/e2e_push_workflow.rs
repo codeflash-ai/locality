@@ -11037,7 +11037,7 @@ fn live_locate_pretty_url_resolves_existing_and_new_block_parent_pages() {
         &format!("Locality live nested locate section {}", unique_suffix()),
     );
     let existing_title = format!("Locality live existing nested page {}", unique_suffix());
-    let existing_child = cleanup.append_child_page_block(&section.id, &existing_title);
+    let existing_child = cleanup.create_page_with_block_parent(&section.id, &existing_title);
 
     let connector = NotionConnector::new(
         live_notion_config().with_root_page_id(RemoteId::new(scratch.id.clone())),
@@ -11065,7 +11065,7 @@ fn live_locate_pretty_url_resolves_existing_and_new_block_parent_pages() {
     );
 
     let fresh_title = format!("Locality live fresh nested page {}", unique_suffix());
-    let fresh_child = cleanup.append_child_page_block(&section.id, &fresh_title);
+    let fresh_child = cleanup.create_page_with_block_parent(&section.id, &fresh_title);
     let fresh_url = notion_pretty_workspace_url("codeflash", &fresh_title, &fresh_child.id);
     let fresh_path =
         desktop_style_locate_notion_url_path(&mut store, &connector, &fixture.mount_id, &fresh_url);
@@ -13195,29 +13195,30 @@ impl LiveCleanup {
         block
     }
 
-    fn append_child_page_block(&mut self, parent_block_id: &str, title: &str) -> BlockDto {
-        let blocks = self
+    fn create_page_with_block_parent(&mut self, parent_block_id: &str, title: &str) -> PageDto {
+        let page = self
             .api
-            .append_block_children(
-                parent_block_id,
-                json!({
-                    "children": [{
-                        "object": "block",
-                        "type": "child_page",
-                        "child_page": {
-                            "title": title,
-                        }
-                    }]
-                }),
-            )
-            .expect("append live child page block");
-        let block = blocks
-            .results
-            .into_iter()
-            .next()
-            .expect("appended live child page block");
-        self.block_ids.push(block.id.clone());
-        block
+            .create_page(json!({
+                "parent": {
+                    "type": "block_id",
+                    "block_id": parent_block_id,
+                },
+                "properties": {
+                    "title": {
+                        "title": [
+                            {
+                                "type": "text",
+                                "text": {
+                                    "content": title,
+                                }
+                            }
+                        ]
+                    },
+                },
+            }))
+            .expect("create live block-parent page");
+        self.block_ids.push(page.id.clone());
+        page
     }
 
     fn current_user_id(&self) -> String {
