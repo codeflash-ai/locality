@@ -89,6 +89,9 @@ pub fn run_foreground(config: &DaemonConfig) -> LocalityResult<()> {
         while !server.shutdown_requested() {
             match listener.accept() {
                 Ok((stream, _addr)) => {
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        eprintln!("localityd could not configure accepted socket: {error}");
+                    }
                     let server = server.clone();
                     thread::spawn(move || handle_connection(stream, server));
                 }
@@ -195,6 +198,9 @@ fn accept_tcp_connections(listener: TcpListener, server: DaemonServerHandle) {
     while !server.shutdown_requested() {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                if let Err(error) = stream.set_nonblocking(false) {
+                    eprintln!("localityd could not configure accepted TCP socket: {error}");
+                }
                 let server = server.clone();
                 thread::spawn(move || handle_connection(stream, server));
             }

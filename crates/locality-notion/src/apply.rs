@@ -35,6 +35,7 @@ use crate::projection::{NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_ID};
 
 const NOTION_RICH_TEXT_CONTENT_LIMIT: usize = 2000;
 const NOTION_RICH_TEXT_SENTENCE_SPLIT_LOOKBACK: usize = 400;
+const NOTION_APPEND_CHILDREN_BATCH_LIMIT: usize = 100;
 const WORKSPACE_ROOT_CREATE_UNSUPPORTED: &str = "creating a Notion page directly under Workspace/ is ambiguous; create under Private/ or below an existing page";
 const PRIVATE_WORKSPACE_CREATE_BOT_UNSUPPORTED: &str = "creating a Notion page under Private/ requires a public OAuth connection or personal access token; internal integration tokens cannot create parentless pages";
 
@@ -98,264 +99,306 @@ pub fn apply_plan(
     let mut append_chains: BTreeMap<(RemoteId, Option<RemoteId>), RemoteId> = BTreeMap::new();
     let mut preserved_append_archive_moves = BTreeSet::new();
 
-    for (operation_index, operation) in request.plan.operations.iter().enumerate() {
-        match operation {
-            PushOperation::UpdateBlock { block_id, content } => {
-                let current = current_block(&current_blocks, block_id)?;
-                if current.kind == "table" && looks_like_markdown_table(content) {
-                    apply_table_update(api, &bundles, block_id, current, content)?;
-                    effects.push(JournalApplyEffect::UpdatedBlock {
-                        operation_id: request.operation_ids[operation_index].clone(),
-                        operation_index,
-                        block_id: block_id.clone(),
-                    });
-                    continue;
+    let mut operation_index = 0usize;
+    while operation_index < request.plan.operations.len() {
+        let step = lower_notion_apply_step(
+            &request.plan.operations,
+            operation_index,
+            &current_blocks,
+            &block_parents,
+            &archived_block_ids,
+            &preserved_append_archive_moves,
+        )?;
+        operation_index += step.operation_count();
+
+        match step {
+            NotionApplyStep::Operation { operation_index } => {
+                let operation = &request.plan.operations[operation_index];
+                match operation {
+                    PushOperation::UpdateBlock { block_id, content } => {
+                        let current = current_block(&current_blocks, block_id)?;
+                        if current.kind == "table" && looks_like_markdown_table(content) {
+                            apply_table_update(api, &bundles, block_id, current, content)?;
+                            effects.push(JournalApplyEffect::UpdatedBlock {
+                                operation_id: request.operation_ids[operation_index].clone(),
+                                operation_index,
+                                block_id: block_id.clone(),
+                            });
+                            continue;
+                        }
+                        let patch = parse_supported_block(
+                            content,
+                            Some(current.kind.as_str()),
+                            current_block_rich_text(current)?,
+                        )?;
+                        ensure_update_supported(current, &patch)?;
+                        api.update_block(block_id.as_str(), patch.update_body())?;
+                        effects.push(JournalApplyEffect::UpdatedBlock {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            block_id: block_id.clone(),
+                        });
+                    }
+                    PushOperation::ReplaceBlock { block_id, content } => {
+                        current_block(&current_blocks, block_id)?;
+                        let parent_id = block_parents
+                            .direct_parents
+                            .get(block_id)
+                            .or_else(|| block_parents.containing_pages.get(block_id))
+                            .ok_or_else(|| {
+                                LocalityError::InvalidState(format!(
+                                    "push referenced block `{}` without a containing Notion parent",
+                                    block_id.0
+                                ))
+                            })?
+                            .clone();
+                        let patch = parse_supported_block(content, None, None)?;
+                        let body = append_body(patch.append_child(), Some(block_id));
+                        let result = api.append_block_children(parent_id.as_str(), body)?;
+                        let created = result.results.first().ok_or_else(|| {
+                            LocalityError::InvalidState(
+                                "notion append block children returned no replacement block"
+                                    .to_string(),
+                            )
+                        })?;
+                        let created_id = RemoteId::new(created.id.clone());
+                        append_chains.insert(
+                            (parent_id.clone(), Some(block_id.clone())),
+                            created_id.clone(),
+                        );
+                        effects.push(JournalApplyEffect::CreatedBlock {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            parent_id,
+                            block_id: created_id,
+                        });
+                        api.delete_block(block_id.as_str())?;
+                        effects.push(JournalApplyEffect::ArchivedBlock {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            block_id: block_id.clone(),
+                        });
+                    }
+                    PushOperation::UpdateMedia {
+                        block_id,
+                        local_path,
+                        caption,
+                    } => {
+                        let current = current_block(&current_blocks, block_id)?;
+                        if !is_file_like_media_kind(&current.kind) {
+                            return Err(LocalityError::Unsupported(
+                                "local media uploads are supported for file-like media blocks only",
+                            ));
+                        }
+                        let local_root = request.local_root.ok_or_else(|| {
+                            LocalityError::InvalidState(
+                                "local media upload requires an apply local root".to_string(),
+                            )
+                        })?;
+                        let upload_id = upload_local_media(api, local_root, local_path)?;
+                        let patch = NotionBlockPatch::new(
+                            media_kind(current.kind.as_str())?,
+                            json!({
+                                "file_upload": {
+                                    "id": upload_id,
+                                },
+                                "caption": rich_text_payload(caption, current_block_rich_text(current)?)?,
+                            }),
+                        );
+                        api.update_block(block_id.as_str(), patch.update_body())?;
+                        effects.push(JournalApplyEffect::UpdatedBlock {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            block_id: block_id.clone(),
+                        });
+                    }
+                    PushOperation::AppendBlock { .. } => {
+                        return Err(LocalityError::InvalidState(
+                            "append block operation reached non-append Notion apply step"
+                                .to_string(),
+                        ));
+                    }
+                    PushOperation::MoveBlock { block_id, after } => {
+                        let current = current_block(&current_blocks, block_id)?;
+                        let parent_id = block_parents
+                            .direct_parents
+                            .get(block_id)
+                            .or_else(|| block_parents.containing_pages.get(block_id))
+                            .ok_or_else(|| {
+                                LocalityError::InvalidState(format!(
+                                    "push referenced block `{}` without a containing Notion parent",
+                                    block_id.0
+                                ))
+                            })?
+                            .clone();
+                        let after = block_parents.normalize_after(&parent_id, after.as_ref());
+                        let chain_key = (parent_id.clone(), after.clone());
+                        let effective_after = append_chains.get(&chain_key).cloned().or(after);
+                        let body = append_body(
+                            existing_block_append_child(current)?,
+                            effective_after.as_ref(),
+                        );
+                        let result = api.append_block_children(parent_id.as_str(), body)?;
+                        let created = result.results.first().ok_or_else(|| {
+                            LocalityError::InvalidState(
+                                "notion append block children returned no moved block copy"
+                                    .to_string(),
+                            )
+                        })?;
+                        let created_id = RemoteId::new(created.id.clone());
+                        append_chains.insert(chain_key, created_id.clone());
+                        append_chains.insert(
+                            (parent_id.clone(), Some(block_id.clone())),
+                            created_id.clone(),
+                        );
+                        effects.push(JournalApplyEffect::CreatedBlock {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            parent_id,
+                            block_id: created_id,
+                        });
+                        api.delete_block(block_id.as_str())?;
+                        effects.push(JournalApplyEffect::ArchivedBlock {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            block_id: block_id.clone(),
+                        });
+                    }
+                    PushOperation::ArchiveBlock { block_id } => {
+                        api.delete_block(block_id.as_str())?;
+                        effects.push(JournalApplyEffect::ArchivedBlock {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            block_id: block_id.clone(),
+                        });
+                    }
+                    PushOperation::UpdateProperties {
+                        entity_id,
+                        properties,
+                    } => {
+                        let page = current_page(&bundles, entity_id)?;
+                        let body = update_properties_body(page, properties)?;
+                        api.update_page(entity_id.as_str(), body)?;
+                        effects.push(JournalApplyEffect::UpdatedProperties {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            entity_id: entity_id.clone(),
+                            keys: properties.keys().cloned().collect(),
+                        });
+                    }
+                    PushOperation::CreateEntity {
+                        parent_id,
+                        parent_kind,
+                        parent_scope,
+                        title,
+                        properties,
+                        body,
+                        ..
+                    } => {
+                        let request_body = create_page_body(
+                            api,
+                            private_workspace_create_auth_mode,
+                            parent_id,
+                            parent_kind.as_ref(),
+                            parent_scope,
+                            title,
+                            properties,
+                            body,
+                        )?;
+                        let created = api.create_page(request_body)?;
+                        let created_id = RemoteId::new(created.id);
+                        if !changed_remote_ids.contains(&created_id) {
+                            changed_remote_ids.push(created_id.clone());
+                        }
+                        if *parent_scope == CreateParentScope::Remote
+                            && matches!(parent_kind, Some(locality_core::model::EntityKind::Page))
+                            && !changed_remote_ids.contains(parent_id)
+                        {
+                            changed_remote_ids.push(parent_id.clone());
+                        }
+                        effects.push(JournalApplyEffect::CreatedEntity {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            parent_id: parent_id.clone(),
+                            entity_id: created_id,
+                        });
+                    }
+                    PushOperation::ArchiveEntity { entity_id } => {
+                        api.delete_block(entity_id.as_str())?;
+                        if !changed_remote_ids.contains(entity_id) {
+                            changed_remote_ids.push(entity_id.clone());
+                        }
+                        effects.push(JournalApplyEffect::ArchivedEntity {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            entity_id: entity_id.clone(),
+                        });
+                    }
                 }
-                let patch = parse_supported_block(
-                    content,
-                    Some(current.kind.as_str()),
-                    current_block_rich_text(current)?,
-                )?;
-                ensure_update_supported(current, &patch)?;
-                api.update_block(block_id.as_str(), patch.update_body())?;
-                effects.push(JournalApplyEffect::UpdatedBlock {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    block_id: block_id.clone(),
-                });
             }
-            PushOperation::ReplaceBlock { block_id, content } => {
-                current_block(&current_blocks, block_id)?;
-                let parent_id = block_parents
-                    .direct_parents
-                    .get(block_id)
-                    .or_else(|| block_parents.containing_pages.get(block_id))
-                    .ok_or_else(|| {
-                        LocalityError::InvalidState(format!(
-                            "push referenced block `{}` without a containing Notion parent",
-                            block_id.0
-                        ))
-                    })?
-                    .clone();
-                let patch = parse_supported_block(content, None, None)?;
-                let body = append_body(patch.append_child(), Some(block_id));
-                let result = api.append_block_children(parent_id.as_str(), body)?;
-                let created = result.results.first().ok_or_else(|| {
-                    LocalityError::InvalidState(
-                        "notion append block children returned no replacement block".to_string(),
-                    )
-                })?;
-                let created_id = RemoteId::new(created.id.clone());
-                append_chains.insert(
-                    (parent_id.clone(), Some(block_id.clone())),
-                    created_id.clone(),
-                );
-                effects.push(JournalApplyEffect::CreatedBlock {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    parent_id,
-                    block_id: created_id,
-                });
-                api.delete_block(block_id.as_str())?;
-                effects.push(JournalApplyEffect::ArchivedBlock {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    block_id: block_id.clone(),
-                });
-            }
-            PushOperation::UpdateMedia {
-                block_id,
-                local_path,
-                caption,
-            } => {
-                let current = current_block(&current_blocks, block_id)?;
-                if !is_file_like_media_kind(&current.kind) {
-                    return Err(LocalityError::Unsupported(
-                        "local media uploads are supported for file-like media blocks only",
-                    ));
-                }
-                let local_root = request.local_root.ok_or_else(|| {
-                    LocalityError::InvalidState(
-                        "local media upload requires an apply local root".to_string(),
-                    )
-                })?;
-                let upload_id = upload_local_media(api, local_root, local_path)?;
-                let patch = NotionBlockPatch::new(
-                    media_kind(current.kind.as_str())?,
-                    json!({
-                        "file_upload": {
-                            "id": upload_id,
-                        },
-                        "caption": rich_text_payload(caption, current_block_rich_text(current)?)?,
-                    }),
-                );
-                api.update_block(block_id.as_str(), patch.update_body())?;
-                effects.push(JournalApplyEffect::UpdatedBlock {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    block_id: block_id.clone(),
-                });
-            }
-            PushOperation::AppendBlock {
+            NotionApplyStep::AppendChildren {
                 parent_id,
                 after,
-                content,
+                children,
             } => {
-                let after = block_parents.normalize_after(parent_id, after.as_ref());
                 let chain_key = (parent_id.clone(), after.clone());
                 let effective_after = append_chains.get(&chain_key).cloned().or(after);
-                let preserved = preserved_archived_block_append_child(
-                    parent_id,
-                    content,
-                    &current_blocks,
-                    &block_parents,
-                    &archived_block_ids,
-                    &mut preserved_append_archive_moves,
-                )?;
-                let (body, preserved_source_id) = if let Some((source_id, child)) = preserved {
-                    (
-                        append_body(child, effective_after.as_ref()),
-                        Some(source_id),
-                    )
-                } else {
-                    let patch = parse_append_block(api, content, request.local_root)?;
-                    (
-                        append_body(patch.append_child(), effective_after.as_ref()),
-                        None,
-                    )
-                };
-                let result = api.append_block_children(parent_id.as_str(), body)?;
-                let created = result.results.first().ok_or_else(|| {
-                    LocalityError::InvalidState(
-                        "notion append block children returned no created block".to_string(),
-                    )
-                })?;
-                let created_id = RemoteId::new(created.id.clone());
-                append_chains.insert(chain_key, created_id.clone());
-                if let Some(source_id) = preserved_source_id {
-                    append_chains.insert((parent_id.clone(), Some(source_id)), created_id.clone());
+                let mut append_children = Vec::with_capacity(children.len());
+                let mut preserved_source_ids = Vec::with_capacity(children.len());
+
+                for child in &children {
+                    let preserved = preserved_archived_block_append_child(
+                        &parent_id,
+                        &child.content,
+                        &current_blocks,
+                        &block_parents,
+                        &archived_block_ids,
+                        &mut preserved_append_archive_moves,
+                    )?;
+                    if let Some((source_id, append_child)) = preserved {
+                        preserved_source_ids.push(Some(source_id));
+                        append_children.push(append_child);
+                    } else {
+                        let patch = parse_append_block(api, &child.content, request.local_root)?;
+                        preserved_source_ids.push(None);
+                        append_children.push(patch.append_child());
+                    }
                 }
-                effects.push(JournalApplyEffect::CreatedBlock {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    parent_id: parent_id.clone(),
-                    block_id: created_id,
-                });
-            }
-            PushOperation::MoveBlock { block_id, after } => {
-                let current = current_block(&current_blocks, block_id)?;
-                let parent_id = block_parents
-                    .direct_parents
-                    .get(block_id)
-                    .or_else(|| block_parents.containing_pages.get(block_id))
-                    .ok_or_else(|| {
-                        LocalityError::InvalidState(format!(
-                            "push referenced block `{}` without a containing Notion parent",
-                            block_id.0
-                        ))
-                    })?
-                    .clone();
-                let after = block_parents.normalize_after(&parent_id, after.as_ref());
-                let chain_key = (parent_id.clone(), after.clone());
-                let effective_after = append_chains.get(&chain_key).cloned().or(after);
-                let body = append_body(
-                    existing_block_append_child(current)?,
-                    effective_after.as_ref(),
-                );
-                let result = api.append_block_children(parent_id.as_str(), body)?;
-                let created = result.results.first().ok_or_else(|| {
-                    LocalityError::InvalidState(
-                        "notion append block children returned no moved block copy".to_string(),
-                    )
-                })?;
-                let created_id = RemoteId::new(created.id.clone());
-                append_chains.insert(chain_key, created_id.clone());
-                append_chains.insert(
-                    (parent_id.clone(), Some(block_id.clone())),
-                    created_id.clone(),
-                );
-                effects.push(JournalApplyEffect::CreatedBlock {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    parent_id,
-                    block_id: created_id,
-                });
-                api.delete_block(block_id.as_str())?;
-                effects.push(JournalApplyEffect::ArchivedBlock {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    block_id: block_id.clone(),
-                });
-            }
-            PushOperation::ArchiveBlock { block_id } => {
-                api.delete_block(block_id.as_str())?;
-                effects.push(JournalApplyEffect::ArchivedBlock {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    block_id: block_id.clone(),
-                });
-            }
-            PushOperation::UpdateProperties {
-                entity_id,
-                properties,
-            } => {
-                let page = current_page(&bundles, entity_id)?;
-                let body = update_properties_body(page, properties)?;
-                api.update_page(entity_id.as_str(), body)?;
-                effects.push(JournalApplyEffect::UpdatedProperties {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    entity_id: entity_id.clone(),
-                    keys: properties.keys().cloned().collect(),
-                });
-            }
-            PushOperation::CreateEntity {
-                parent_id,
-                parent_kind,
-                parent_scope,
-                title,
-                properties,
-                body,
-                ..
-            } => {
-                let request_body = create_page_body(
-                    api,
-                    private_workspace_create_auth_mode,
-                    parent_id,
-                    parent_kind.as_ref(),
-                    parent_scope,
-                    title,
-                    properties,
-                    body,
+
+                let result = api.append_block_children(
+                    parent_id.as_str(),
+                    append_body_many(append_children, effective_after.as_ref()),
                 )?;
-                let created = api.create_page(request_body)?;
-                let created_id = RemoteId::new(created.id);
-                if !changed_remote_ids.contains(&created_id) {
-                    changed_remote_ids.push(created_id.clone());
+                if result.results.len() < children.len() {
+                    return Err(LocalityError::InvalidState(format!(
+                        "notion append block children returned {} blocks for {} append operations",
+                        result.results.len(),
+                        children.len()
+                    )));
                 }
-                if *parent_scope == CreateParentScope::Remote
-                    && matches!(parent_kind, Some(locality_core::model::EntityKind::Page))
-                    && !changed_remote_ids.contains(parent_id)
+
+                let mut previous_created = None;
+                for ((child, preserved_source_id), created) in children
+                    .iter()
+                    .zip(preserved_source_ids.iter())
+                    .zip(result.results.iter())
                 {
-                    changed_remote_ids.push(parent_id.clone());
+                    let created_id = RemoteId::new(created.id.clone());
+                    effects.push(JournalApplyEffect::CreatedBlock {
+                        operation_id: request.operation_ids[child.operation_index].clone(),
+                        operation_index: child.operation_index,
+                        parent_id: parent_id.clone(),
+                        block_id: created_id.clone(),
+                    });
+                    previous_created = Some(created_id.clone());
+                    if let Some(source_id) = preserved_source_id {
+                        append_chains
+                            .insert((parent_id.clone(), Some(source_id.clone())), created_id);
+                    }
                 }
-                effects.push(JournalApplyEffect::CreatedEntity {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    parent_id: parent_id.clone(),
-                    entity_id: created_id,
-                });
-            }
-            PushOperation::ArchiveEntity { entity_id } => {
-                api.delete_block(entity_id.as_str())?;
-                if !changed_remote_ids.contains(entity_id) {
-                    changed_remote_ids.push(entity_id.clone());
+                if let Some(created_id) = previous_created {
+                    append_chains.insert(chain_key, created_id);
                 }
-                effects.push(JournalApplyEffect::ArchivedEntity {
-                    operation_id: request.operation_ids[operation_index].clone(),
-                    operation_index,
-                    entity_id: entity_id.clone(),
-                });
             }
         }
     }
@@ -855,6 +898,137 @@ fn preserved_archived_block_append_child(
     }
 
     Ok(None)
+}
+
+struct NotionAppendChildStep {
+    operation_index: usize,
+    content: String,
+}
+
+enum NotionApplyStep {
+    Operation {
+        operation_index: usize,
+    },
+    AppendChildren {
+        parent_id: RemoteId,
+        after: Option<RemoteId>,
+        children: Vec<NotionAppendChildStep>,
+    },
+}
+
+impl NotionApplyStep {
+    fn operation_count(&self) -> usize {
+        match self {
+            Self::Operation { .. } => 1,
+            Self::AppendChildren { children, .. } => children.len(),
+        }
+    }
+}
+
+fn lower_notion_apply_step(
+    operations: &[PushOperation],
+    start_index: usize,
+    current_blocks: &BTreeMap<RemoteId, &BlockDto>,
+    block_parents: &BlockParentIndex,
+    archived_block_ids: &BTreeSet<RemoteId>,
+    preserved_append_archive_moves: &BTreeSet<RemoteId>,
+) -> LocalityResult<NotionApplyStep> {
+    let Some(operation) = operations.get(start_index) else {
+        return Err(LocalityError::InvalidState(format!(
+            "missing push operation at index {start_index}"
+        )));
+    };
+    let PushOperation::AppendBlock {
+        parent_id, after, ..
+    } = operation
+    else {
+        return Ok(NotionApplyStep::Operation {
+            operation_index: start_index,
+        });
+    };
+    let after = block_parents.normalize_after(parent_id, after.as_ref());
+    let children = collect_append_children_step(
+        operations,
+        start_index,
+        parent_id,
+        after.as_ref(),
+        current_blocks,
+        block_parents,
+        archived_block_ids,
+        preserved_append_archive_moves,
+    )?;
+
+    Ok(NotionApplyStep::AppendChildren {
+        parent_id: parent_id.clone(),
+        after,
+        children,
+    })
+}
+
+fn collect_append_children_step(
+    operations: &[PushOperation],
+    start_index: usize,
+    parent_id: &RemoteId,
+    normalized_after: Option<&RemoteId>,
+    current_blocks: &BTreeMap<RemoteId, &BlockDto>,
+    block_parents: &BlockParentIndex,
+    archived_block_ids: &BTreeSet<RemoteId>,
+    preserved_append_archive_moves: &BTreeSet<RemoteId>,
+) -> LocalityResult<Vec<NotionAppendChildStep>> {
+    let mut children = Vec::new();
+
+    for (operation_index, operation) in operations.iter().enumerate().skip(start_index) {
+        if children.len() >= NOTION_APPEND_CHILDREN_BATCH_LIMIT {
+            break;
+        }
+        let PushOperation::AppendBlock {
+            parent_id: candidate_parent_id,
+            after: candidate_after,
+            content,
+        } = operation
+        else {
+            break;
+        };
+        if candidate_parent_id != parent_id {
+            break;
+        }
+        let candidate_after = block_parents.normalize_after(parent_id, candidate_after.as_ref());
+        if candidate_after.as_ref() != normalized_after {
+            break;
+        }
+        let batch_incompatible =
+            parse_local_media_markdown(content.trim_end_matches('\n')).is_some() || {
+                let mut preserved_probe = preserved_append_archive_moves.clone();
+                preserved_archived_block_append_child(
+                    parent_id,
+                    content,
+                    current_blocks,
+                    block_parents,
+                    archived_block_ids,
+                    &mut preserved_probe,
+                )?
+                .is_some()
+            };
+        if batch_incompatible && !children.is_empty() {
+            break;
+        }
+
+        children.push(NotionAppendChildStep {
+            operation_index,
+            content: content.clone(),
+        });
+        if batch_incompatible {
+            break;
+        }
+    }
+
+    if children.is_empty() {
+        return Err(LocalityError::InvalidState(format!(
+            "append push operation at index {start_index} did not lower to a Notion append step"
+        )));
+    }
+
+    Ok(children)
 }
 
 fn rendered_read_only_block_markdown(block: &BlockDto) -> LocalityResult<Option<String>> {
@@ -1921,9 +2095,13 @@ fn parse_append_block(
 }
 
 fn append_body(child: Value, after: Option<&RemoteId>) -> Value {
+    append_body_many(vec![child], after)
+}
+
+fn append_body_many(children: Vec<Value>, after: Option<&RemoteId>) -> Value {
     match after {
         Some(after) => json!({
-            "children": [child],
+            "children": children,
             "position": {
                 "type": "after_block",
                 "after_block": {
@@ -1932,7 +2110,7 @@ fn append_body(child: Value, after: Option<&RemoteId>) -> Value {
             },
         }),
         None => json!({
-            "children": [child],
+            "children": children,
             "position": {
                 "type": "start",
             },
@@ -2386,7 +2564,7 @@ impl InlineParser<'_> {
         }
 
         if rest.starts_with('$')
-            && let Some(end) = find_closing(rest, 1, "$")
+            && let Some(end) = find_inline_equation_closing(rest)
         {
             return Ok(Some((
                 vec![RichTextWritePart::Equation {
@@ -2563,6 +2741,28 @@ fn parse_nested(
 
 fn find_closing(input: &str, start: usize, marker: &str) -> Option<usize> {
     find_unescaped_marker(input, start, marker)
+}
+
+fn find_inline_equation_closing(input: &str) -> Option<usize> {
+    if !input.starts_with('$') {
+        return None;
+    }
+
+    let first = input[1..].chars().next()?;
+    if first.is_whitespace() || first == '$' {
+        return None;
+    }
+
+    let end = find_unescaped_marker(input, 1, "$")?;
+    let expression = &input[1..end];
+    if expression.is_empty()
+        || expression.contains('\n')
+        || expression.chars().count() > NOTION_RICH_TEXT_CONTENT_LIMIT
+    {
+        return None;
+    }
+
+    Some(end)
 }
 
 fn find_unescaped_marker(input: &str, start: usize, marker: &str) -> Option<usize> {
@@ -3773,6 +3973,42 @@ mod tests {
             NOTION_RICH_TEXT_CONTENT_LIMIT
         );
         assert_eq!(parts[2]["text"]["content"], "a".repeat(33));
+    }
+
+    #[test]
+    fn rich_text_payload_keeps_oversized_inline_equation_span_as_text() {
+        let content = format!(
+            "Contract proposal was $1.55 k. {} Then the cap was $16,000,000.",
+            "ordinary transcript text ".repeat(1800)
+        );
+
+        let payload = rich_text_payload(&content, None).expect("rich text payload");
+        let parts = payload.as_array().expect("payload array");
+
+        assert!(parts.len() > 1, "{parts:#?}");
+        assert!(
+            parts.iter().all(|part| part["type"] == "text"),
+            "{parts:#?}"
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part["text"]["content"].as_str().unwrap_or_default())
+                .collect::<String>(),
+            content
+        );
+    }
+
+    #[test]
+    fn rich_text_payload_keeps_multiline_inline_equation_span_as_text() {
+        let content = "First amount $1.55 k.\n\nMore prose.\n\nAnother amount $16,000,000.";
+
+        let payload = rich_text_payload(content, None).expect("rich text payload");
+        let parts = payload.as_array().expect("payload array");
+
+        assert_eq!(parts.len(), 1, "{parts:#?}");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"]["content"], content);
     }
 
     #[test]

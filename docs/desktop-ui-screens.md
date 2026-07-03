@@ -104,17 +104,20 @@ The sidebar label is `Mounts`. The first screen lists every registered mount poi
 from the desktop snapshot instead of immediately showing the preferred Notion
 mount.
 
-The list uses a compact table with these columns:
+The list uses compact mount cards so long filesystem paths do not dominate the
+screen. The header includes a `+ Add Mount` action for adding future connector
+mounts from the same place. Each card shows:
 
 - Mount: connector name, workspace label, mount id, and a `Primary` marker for
   the preferred mount used by Home, tray, and Pending Changes.
-- Local path: the local mount-point folder.
+- Local path: a compact middle-truncated path with the full path available on
+  hover.
 - Projection: plain files, macOS File Provider, Linux FUSE, or Windows Cloud
   Files.
 - Access: read-only or edit-enabled.
 - Content: indexed item count and pending-change count.
 - Status: mount/provider status label.
-- Actions: open folder, copy path, and open details.
+- Actions: copy path, open folder, and open details.
 
 Clicking the mount name or Details opens Mount Detail for that mount. The detail
 screen keeps the existing mount controls, but all path-based actions use the
@@ -580,11 +583,6 @@ Recent Files
 General / Engineering Wiki / Standups with Locality
 ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/standups-with-locality/last-friday/page.md
 [ Copy Path ] [ Reveal ]
-
-Workspaces
-Engineering Wiki
-~/Library/CloudStorage/Locality/notion-main/engineering-wiki
-[ Open ]
 ```
 
 Recent files should come from current active workspace state, such as opened
@@ -592,11 +590,11 @@ files, local changes, or files needing review. If the workspace is tied to a
 revoked or inactive connection, recent files should be hidden and the user
 should be routed to reconnect or change access.
 
-The current workspace section owns the old mount-detail controls. `Mount` should
-not be a top-level sidebar item; it is an implementation term. Keep path actions
+The current workspace section owns the everyday file controls. Keep path actions
 next to the path itself as compact icon buttons: copy path, reveal in Finder, and
-open in editor. Advanced diagnostics can live behind disclosure inside Files or
-Settings.
+open in editor. Do not repeat the full mount list in Files; the Mounts screen is
+the management place for all registered local folders. Advanced diagnostics can
+live behind disclosure inside Files or Settings.
 
 Search results should label safety states clearly:
 

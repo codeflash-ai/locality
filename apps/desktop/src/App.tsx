@@ -20,6 +20,7 @@ import {
   ListChecks,
   Loader2,
   Minus,
+  Plus,
   Power,
   RefreshCw,
   RotateCcw,
@@ -34,6 +35,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  compactPath,
   mountAccessLabel,
   mountRows,
   mountStatusLabel,
@@ -46,6 +48,7 @@ import {
   type ProviderRuntimeSummary,
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
+import { classifyMountSetupError, type MountSetupError } from "./onboarding-errors";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
@@ -1094,7 +1097,7 @@ function Onboarding({
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
-  const [mountError, setMountError] = useState("");
+  const [mountError, setMountError] = useState<MountSetupError | null>(null);
   const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
@@ -1235,7 +1238,7 @@ function Onboarding({
       return;
     }
 
-    setMountError("");
+    setMountError(null);
     setMounting(true);
     try {
       const report = await callCommand<ActionReport>(
@@ -1244,7 +1247,7 @@ function Onboarding({
         { ok: true, message: "Created demo mount." },
       );
       if (!report.ok) {
-        setMountError(report.message);
+        setMountError(classifyMountSetupError(report.message));
         return;
       }
       const cliReady = await ensureCliAvailable();
@@ -1261,7 +1264,7 @@ function Onboarding({
       await installAgentGuidance(nextSnapshot.mount.localPath);
       setStep(5);
     } catch (error) {
-      setMountError(errorMessage(error));
+      setMountError(classifyMountSetupError(errorMessage(error)));
     } finally {
       setMounting(false);
     }
@@ -1278,15 +1281,15 @@ function Onboarding({
       { ok: true, message: "Locality terminal command is ready." },
     );
     if (!report.ok) {
-      setMountError(report.message);
+      setMountError(classifyMountSetupError(report.message));
       return false;
     }
-    setMountError("");
+    setMountError(null);
     return true;
   }
 
   async function chooseFolder() {
-    setMountError("");
+    setMountError(null);
     try {
       const selected = await callCommand<string | null>(
         "choose_mount_folder",
@@ -1298,19 +1301,19 @@ function Onboarding({
         setMountPath(selected.replace(/\/$/, ""));
       }
     } catch (error) {
-      setMountError(errorMessage(error));
+      setMountError(classifyMountSetupError(errorMessage(error)));
     }
   }
 
   async function openMountFolder() {
-    setMountError("");
+    setMountError(null);
     const report = await callCommand<ActionReport>(
       "open_path",
       { path: mountPath },
       { ok: true, message: "Opened demo folder." },
     );
     if (!report.ok) {
-      setMountError(report.message);
+      setMountError(classifyMountSetupError(report.message));
       return;
     }
   }
@@ -1472,7 +1475,9 @@ function Onboarding({
             <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
               {mounting ? "Mounting Notion" : "Create Local Folder"}
             </PrimaryButton>
-            {mountError && <p className="field-error">{mountError}</p>}
+            {mountError && (
+              <MountSetupErrorCallout error={mountError} onRetry={startMount} retrying={mounting} />
+            )}
             <p className="quiet-note">
               The Notion mount point will include AGENTS.md and CLAUDE.md to help your agents edit
               files natively.
@@ -1491,7 +1496,7 @@ function Onboarding({
                 new Notion changes to appear locally.
               </p>
             </div>
-            {mountError && <p className="field-error">{mountError}</p>}
+            {mountError && <p className="field-error">{mountError.message}</p>}
             <div className="final-actions">
               <PrimaryButton onClick={finishOnboarding}>
                 Open Locality
@@ -1981,12 +1986,12 @@ function HomeView({
       ) : (
         <>
           <section className="workspace-card">
-            <div>
+            <div className="workspace-summary">
               <p className="label">Connected workspace</p>
               <h2>{snapshot.mount.workspaceName}</h2>
               <p className="path-line">{snapshot.mount.localPath}</p>
             </div>
-            <div className="button-row">
+            <div className="workspace-actions">
               <button
                 className={`live-mode-control has-tooltip ${liveModeEnabled ? "active" : ""}`}
                 aria-pressed={liveModeEnabled}
@@ -2152,7 +2157,16 @@ function MountsView({
   return (
     <div className="view-stack mounts-view">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Mounts" }]} />
-      <ViewHeader title="Mounts">
+      <ViewHeader title="Mounted folders">
+        <SecondaryButton
+          compact
+          busy={creating}
+          disabled={connectionMissing(snapshot)}
+          icon={<Plus />}
+          onClick={() => void createMount()}
+        >
+          Add Mount
+        </SecondaryButton>
         <SecondaryButton
           compact
           busy={refreshing}
@@ -2167,8 +2181,8 @@ function MountsView({
         <section className="empty-action-panel">
           <BrandTile variant="folder" />
           <div>
-            <h2>Create your Notion mount point</h2>
-            <p>Use the default notion mount point under the shared Locality folder.</p>
+            <h2>Add a Notion mounted folder</h2>
+            <p>Use the default Notion folder under the shared Locality location.</p>
           </div>
           <PrimaryButton
             busy={creating}
@@ -2176,87 +2190,68 @@ function MountsView({
             icon={<FolderOpen />}
             onClick={() => void createMount()}
           >
-            Create Notion Mount Point
+            Add Notion Mount
           </PrimaryButton>
         </section>
       ) : (
         <>
           <p className="view-copy">
-            {rows.length} mount {rows.length === 1 ? "point" : "points"} registered for this Locality state.
+            {rows.length} mounted {rows.length === 1 ? "folder" : "folders"} registered for this Locality state.
           </p>
-          <section className="mounts-table-panel" aria-label="Registered mount points">
-            <table className="mounts-table">
-              <thead>
-                <tr>
-                  <th scope="col">Mount</th>
-                  <th scope="col">Local path</th>
-                  <th scope="col">Projection</th>
-                  <th scope="col">Access</th>
-                  <th scope="col">Content</th>
-                  <th scope="col">Status</th>
-                  <th scope="col">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row) => (
-                  <tr key={row.id}>
-                    <td>
-                      <button
-                        className="mount-name-button"
-                        type="button"
-                        onClick={() => onSelectMount(row.id)}
-                      >
-                        <strong>{row.title}</strong>
-                        <span>{row.subtitle}</span>
-                      </button>
-                      {row.active && <span className="mount-primary-tag">Primary</span>}
-                    </td>
-                    <td>
-                      <code className="mount-path-cell">{row.localPath}</code>
-                    </td>
-                    <td>{row.projection}</td>
-                    <td>{row.access}</td>
-                    <td>{row.content}</td>
-                    <td>
-                      <StatusPill tone={row.tone} title={row.status}>
-                        <span className="mount-status-text">{row.status}</span>
-                      </StatusPill>
-                    </td>
-                    <td>
-                      <div className="mount-row-actions">
-                        <button
-                          className="mount-table-action"
-                          type="button"
-                          onClick={() => void openMountFolder(row.localPath)}
-                        >
-                          <FolderOpen />
-                          <span>Open</span>
-                        </button>
-                        <button
-                          className="mount-table-action"
-                          type="button"
-                          onClick={() => {
-                            setActionError("");
-                            copyText(row.localPath);
-                          }}
-                        >
-                          <Copy />
-                          <span>Copy</span>
-                        </button>
-                        <button
-                          className="mount-table-action"
-                          type="button"
-                          onClick={() => onSelectMount(row.id)}
-                        >
-                          <ChevronRight />
-                          <span>Details</span>
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <section className="mounts-grid" aria-label="Registered mounted folders">
+            {rows.map((row) => (
+              <article className={`mount-card ${row.active ? "active" : ""}`} key={row.id}>
+                <div className="mount-card-top">
+                  <button className="mount-card-title" type="button" onClick={() => onSelectMount(row.id)}>
+                    <span className="mount-card-icon">
+                      <FolderOpen />
+                    </span>
+                    <span>
+                      <strong>{row.title}</strong>
+                      <span>{row.subtitle}</span>
+                    </span>
+                  </button>
+                  <StatusPill tone={row.tone} title={row.status}>
+                    <span className="mount-status-text">{row.status}</span>
+                  </StatusPill>
+                </div>
+                <div className="mount-card-path">
+                  <code title={row.localPath}>{row.displayPath}</code>
+                  <button
+                    className="icon-button has-tooltip"
+                    data-tooltip="Copy path"
+                    type="button"
+                    onClick={() => {
+                      setActionError("");
+                      copyText(row.localPath);
+                    }}
+                  >
+                    <Copy />
+                  </button>
+                  <button
+                    className="icon-button has-tooltip"
+                    data-tooltip="Open folder"
+                    type="button"
+                    onClick={() => void openMountFolder(row.localPath)}
+                  >
+                    <FolderOpen />
+                  </button>
+                </div>
+                <div className="mount-card-meta">
+                  {row.active && <span className="primary">Primary</span>}
+                  <span>{row.projection}</span>
+                  <span>{row.access}</span>
+                  <span>{row.content}</span>
+                </div>
+                <div className="mount-card-footer">
+                  <span>{row.mount.mountId}</span>
+                  <button className="mount-details-button" type="button" onClick={() => onSelectMount(row.id)}>
+                    Details
+                    <ChevronRight />
+                  </button>
+                </div>
+              </article>
+            ))}
           </section>
         </>
       )}
@@ -2320,7 +2315,6 @@ function FilesView({
       </section>
 
       <RecentFilesPanel items={snapshot.recentFiles} />
-      <MountedWorkspacesPanel mounts={snapshot.mounts} />
     </div>
   );
 }
@@ -2431,7 +2425,7 @@ function CurrentWorkspacePanel({
 
       <div className="workspace-path-row">
         <FolderOpen />
-        <code>{snapshot.mount.localPath}</code>
+        <code title={snapshot.mount.localPath}>{compactPath(snapshot.mount.localPath, 76)}</code>
         <button className="icon-button has-tooltip" data-tooltip="Copy path" onClick={() => copyText(snapshot.mount.localPath)}>
           <Copy />
         </button>
@@ -2616,8 +2610,8 @@ function MountDetailView({
           <FolderOpen />
         </div>
         <div>
-          <p className="label">{mount.connectorName} mount point</p>
-          <h2>{mount.localPath}</h2>
+          <p className="label">{mount.connectorName} mounted folder</p>
+          <h2 title={mount.localPath}>{compactPath(mount.localPath, 78)}</h2>
           <p>
             Locality exposes this connected workspace as local files at the registered mount point.
           </p>
@@ -2759,46 +2753,6 @@ function RecentFilesPanel({
   );
 }
 
-function MountedWorkspacesPanel({ mounts }: { mounts: MountSummary[] }) {
-  return (
-    <section className="panel discovery-panel">
-      <div>
-        <p className="label">Workspaces</p>
-        <h2>{mounts.length ? "Local folders" : "No workspaces yet"}</h2>
-        <p>These are the roots Locality exposes as local folders.</p>
-      </div>
-      {mounts.length ? (
-        <div className="workspace-discovery-list">
-          {mounts.map((mount) => (
-            <div className="workspace-discovery-row" key={mount.mountId}>
-              <FolderOpen />
-              <div>
-                <strong>{mount.workspaceName}</strong>
-                <div className="workspace-row-path">
-                  <code>{mount.localPath}</code>
-                  <button className="icon-button has-tooltip" data-tooltip="Copy path" onClick={() => copyText(mount.localPath)}>
-                    <Copy />
-                  </button>
-                </div>
-                <span>{mount.connectorName} · {mount.accessScope}</span>
-              </div>
-              <SecondaryButton
-                compact
-                icon={<FolderOpen />}
-                onClick={() => void callCommand("open_path", { path: mount.localPath }, { ok: true })}
-              >
-                Open
-              </SecondaryButton>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <EmptyDiscoveryState text="Connect a workspace to make files available locally." />
-      )}
-    </section>
-  );
-}
-
 function FileDiscoveryRow({ item }: { item: LocatedItem }) {
   const [error, setError] = useState("");
   const stateIcon =
@@ -2827,7 +2781,7 @@ function FileDiscoveryRow({ item }: { item: LocatedItem }) {
       <div className="file-state">{stateIcon}</div>
       <div>
         <strong>{item.title}</strong>
-        <code>{item.localPath}</code>
+        <code title={item.localPath}>{compactPath(item.localPath, 68)}</code>
         <span>{item.kind} · {locatedStateLabel(item.state)}</span>
         {error && <p className="field-error">{error}</p>}
       </div>
@@ -3377,6 +3331,7 @@ function SettingsView({
   const [agentMessage, setAgentMessage] = useState("");
   const [installingAgents, setInstallingAgents] = useState(false);
   const [resettingState, setResettingState] = useState(false);
+  const [preparingUninstall, setPreparingUninstall] = useState(false);
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const daemonStopped = snapshot.health.state === "stopped";
@@ -3478,13 +3433,45 @@ function SettingsView({
       );
       setResetMessage(report.message);
       if (report.ok) {
+        window.alert(report.message);
+        await callCommand<ActionReport>(
+          "quit_completely",
+          undefined,
+          { ok: true, message: "Locality is quitting." },
+        );
+      }
+    } catch (error) {
+      setResetMessage(errorMessage(error));
+    } finally {
+      setResettingState(false);
+    }
+  }
+
+  async function prepareUninstall() {
+    const confirmed = window.confirm(
+      "Prepare Locality for uninstall? This stops Locality, removes Locality agent integrations and MCP config, clears Locality local state, and leaves your local files in place.",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setResetMessage("");
+    setPreparingUninstall(true);
+    try {
+      const report = await callCommand<ActionReport>(
+        "prepare_locality_uninstall",
+        undefined,
+        { ok: true, message: "Locality is ready to uninstall." },
+      );
+      setResetMessage(report.message);
+      if (report.ok) {
         await onRefresh().catch(() => undefined);
         onResetComplete();
       }
     } catch (error) {
       setResetMessage(errorMessage(error));
     } finally {
-      setResettingState(false);
+      setPreparingUninstall(false);
     }
   }
 
@@ -3616,10 +3603,18 @@ function SettingsView({
           <SecondaryButton
             compact
             icon={resettingState ? <Loader2 className="spin-icon" /> : <RotateCcw />}
-            disabled={resettingState}
+            disabled={resettingState || preparingUninstall}
             onClick={() => void resetLocalState()}
           >
             {resettingState ? "Resetting" : "Reset Local State"}
+          </SecondaryButton>
+          <SecondaryButton
+            compact
+            icon={preparingUninstall ? <Loader2 className="spin-icon" /> : <Trash2 />}
+            disabled={resettingState || preparingUninstall}
+            onClick={() => void prepareUninstall()}
+          >
+            {preparingUninstall ? "Preparing" : "Prepare for Uninstall"}
           </SecondaryButton>
           {resetMessage && <p className="quiet-note inline-note">{resetMessage}</p>}
         </div>
@@ -4940,6 +4935,40 @@ function SetupContent({
     >
       {mark ? mark : null}
       {children}
+    </div>
+  );
+}
+
+function MountSetupErrorCallout({
+  error,
+  onRetry,
+  retrying,
+}: {
+  error: MountSetupError;
+  onRetry: () => void;
+  retrying: boolean;
+}) {
+  if (error.kind !== "file-provider-disabled") {
+    return <p className="field-error">{error.message}</p>;
+  }
+
+  return (
+    <div className="setup-permission-callout">
+      <div className="setup-permission-icon">
+        <FolderOpen />
+      </div>
+      <div className="setup-permission-copy">
+        <strong>Enable Locality in Finder</strong>
+        <p>
+          Locality is installed, but macOS has not enabled its File Provider yet. In Finder, look
+          for Locality under Locations and choose Enable. If Finder does not show it, open System
+          Settings, go to Privacy &amp; Security, then enable Locality under Extensions or File
+          Providers.
+        </p>
+        <PrimaryButton compact busy={retrying} onClick={onRetry}>
+          Retry
+        </PrimaryButton>
+      </div>
     </div>
   );
 }

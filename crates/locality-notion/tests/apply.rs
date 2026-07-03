@@ -242,6 +242,186 @@ fn apply_replaces_block_by_appending_after_old_block_then_archiving_old_block() 
 }
 
 #[test]
+fn apply_batches_contiguous_append_blocks_with_same_parent_and_anchor() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: "First paragraph.".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: "- Second bullet".to_string(),
+            },
+            PushOperation::AppendBlock {
+                parent_id: RemoteId::new("page-1"),
+                after: Some(RemoteId::new("paragraph-1")),
+                content: "1. Third number".to_string(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    assert_eq!(
+        result.effects,
+        vec![
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[0].clone(),
+                operation_index: 0,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-1"),
+            },
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[1].clone(),
+                operation_index: 1,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-2"),
+            },
+            JournalApplyEffect::CreatedBlock {
+                operation_id: operation_ids[2].clone(),
+                operation_index: 2,
+                parent_id: RemoteId::new("page-1"),
+                block_id: RemoteId::new("created-3"),
+            },
+        ]
+    );
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Append {
+            block_id: "page-1".to_string(),
+            body: json!({
+                "children": [
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": rich_text_json("First paragraph."),
+                        },
+                    },
+                    {
+                        "object": "block",
+                        "type": "bulleted_list_item",
+                        "bulleted_list_item": {
+                            "rich_text": rich_text_json("Second bullet"),
+                        },
+                    },
+                    {
+                        "object": "block",
+                        "type": "numbered_list_item",
+                        "numbered_list_item": {
+                            "rich_text": rich_text_json("Third number"),
+                        },
+                    },
+                ],
+                "position": {
+                    "type": "after_block",
+                    "after_block": {
+                        "id": "paragraph-1",
+                    },
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
+fn apply_splits_batched_append_blocks_at_notion_child_limit() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let operations = (0..101)
+        .map(|index| PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("paragraph-1")),
+            content: format!("Paragraph {index}."),
+        })
+        .collect::<Vec<_>>();
+    let plan = PushPlan::new(vec![RemoteId::new("page-1")], operations);
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    assert_eq!(result.effects.len(), 101);
+    assert_eq!(
+        result.effects.first(),
+        Some(&JournalApplyEffect::CreatedBlock {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            parent_id: RemoteId::new("page-1"),
+            block_id: RemoteId::new("created-1"),
+        })
+    );
+    assert_eq!(
+        result.effects.last(),
+        Some(&JournalApplyEffect::CreatedBlock {
+            operation_id: operation_ids[100].clone(),
+            operation_index: 100,
+            parent_id: RemoteId::new("page-1"),
+            block_id: RemoteId::new("created-101"),
+        })
+    );
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(writes.len(), 2);
+    let WriteCall::Append { body: first, .. } = &writes[0] else {
+        panic!("expected first append");
+    };
+    let WriteCall::Append { body: second, .. } = &writes[1] else {
+        panic!("expected second append");
+    };
+    assert_eq!(
+        first
+            .get("children")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(100)
+    );
+    assert_eq!(
+        second
+            .get("children")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        second
+            .pointer("/position/after_block/id")
+            .and_then(Value::as_str),
+        Some("created-100")
+    );
+}
+
+#[test]
 fn apply_decodes_rendered_rich_text_line_breaks() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -654,43 +834,31 @@ fn apply_uses_start_position_and_chains_adjacent_new_blocks() {
 
     let writes = api.writes.lock().expect("writes");
     assert_eq!(
-        writes[0],
-        WriteCall::Append {
+        writes.as_slice(),
+        [WriteCall::Append {
             block_id: "page-1".to_string(),
             body: json!({
-                "children": [{
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": rich_text_json("First new paragraph."),
+                "children": [
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": rich_text_json("First new paragraph."),
+                        },
                     },
-                }],
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": rich_text_json("Second new paragraph."),
+                        },
+                    },
+                ],
                 "position": {
                     "type": "start",
                 },
             }),
-        }
-    );
-    assert_eq!(
-        writes[1],
-        WriteCall::Append {
-            block_id: "page-1".to_string(),
-            body: json!({
-                "children": [{
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": rich_text_json("Second new paragraph."),
-                    },
-                }],
-                "position": {
-                    "type": "after_block",
-                    "after_block": {
-                        "id": "created-1",
-                    },
-                },
-            }),
-        }
+        }]
     );
 }
 
@@ -4558,18 +4726,27 @@ impl NotionApi for RecordingNotionApi {
     }
 
     fn append_block_children(&self, block_id: &str, body: Value) -> LocalityResult<BlockListDto> {
+        let child_count = body
+            .get("children")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(1);
         self.writes.lock().expect("writes").push(WriteCall::Append {
             block_id: block_id.to_string(),
             body,
         });
         let mut append_count = self.append_count.lock().expect("append count");
-        *append_count += 1;
-        Ok(PaginatedListDto {
-            results: vec![paragraph_block(
+        let mut results = Vec::new();
+        for _ in 0..child_count {
+            *append_count += 1;
+            results.push(paragraph_block(
                 &format!("created-{}", *append_count),
                 "Created.",
                 false,
-            )],
+            ));
+        }
+        Ok(PaginatedListDto {
+            results,
             next_cursor: None,
             has_more: false,
         })

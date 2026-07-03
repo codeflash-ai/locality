@@ -45,6 +45,10 @@ for local throwaway builds.
 The Windows desktop app uses the same platform lifecycle layer as the CLI. When
 a Windows Cloud Files mount is activated or opened, the app registers the sync
 root if needed and supervises `locality-cloud-files.exe run` for that mount.
+During first activation, the desktop app waits for `localityd` to expose
+mount-point children before starting the Cloud Files runtime, so the helper seeds
+root placeholders from discovered workspace metadata instead of from an empty
+initial projection.
 
 Installed files:
 
@@ -55,8 +59,11 @@ localityd.exe
 locality-cloud-files.exe
 ```
 
-The NSIS uninstall hook removes the installed sidecars, the per-user Windows
-login item, and Locality-managed terminal command shims. It does not delete
+The NSIS uninstall hook stops the desktop app, `localityd.exe`, `loc.exe`, and
+Cloud Files provider runtimes; runs the desktop binary's `--prepare-uninstall`
+cleanup entry point; removes installed sidecars; removes the per-user Windows
+login item; removes Locality-managed terminal command shims; and removes
+Locality-managed agent guidance and MCP `loc` entries. It does not delete
 user-visible mount folders.
 
 Because the current-user install directory is also the default Locality state

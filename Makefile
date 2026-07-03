@@ -134,6 +134,11 @@ install-macos-file-provider: ## Install/register the local macOS File Provider d
 prepare-desktop-dev-sidecars: ## Build debug desktop sidecars used by Tauri dev.
 	$(DESKTOP_NPM) run dev:prepare
 
+.PHONY: dev-restart
+dev-restart: build-desktop prepare-desktop-dev-sidecars ## Build UI/debug sidecars, restart the dev daemon, and launch the Tauri dev app.
+	$(LOC_DEBUG) daemon restart
+	$(DESKTOP_NPM) run tauri -- dev
+
 .PHONY: clean-start-plan
 clean-start-plan: ## Print the local Locality clean-start reset actions without deleting anything.
 	scripts/clean-start.sh

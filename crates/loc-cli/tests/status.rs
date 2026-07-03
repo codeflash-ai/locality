@@ -746,6 +746,52 @@ fn status_reports_pending_and_failed_journals() {
 }
 
 #[test]
+fn status_ignores_failed_journals_older_than_latest_reconciliation() {
+    let fixture = StatusFixture::new();
+    let mut store = fixture.store();
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+    fixture.write_page("Roadmap.md", "page-1", "# Roadmap\n\nSame paragraph.");
+    store
+        .append_journal(journal_entry(
+            "push-1",
+            "page-1",
+            JournalStatus::Failed("old connector failed".to_string()),
+        ))
+        .expect("append failed journal");
+    store
+        .append_journal(journal_entry("push-2", "page-1", JournalStatus::Reconciled))
+        .expect("append reconciled journal");
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.join("Roadmap.md")),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+    let entry = &report.mounts[0].entries[0];
+
+    assert!(report.clean, "{report:#?}");
+    assert_eq!(entry.state, StatusState::Clean);
+    assert_eq!(entry.sync_state, StatusSyncState::AllSynced);
+    assert_eq!(entry.failed_journal_count, 0);
+    assert_eq!(report.summary.failed_journals, 0);
+    assert!(
+        entry
+            .issues
+            .iter()
+            .all(|issue| issue.code != "failed_journal" && issue.code != "last_failure"),
+        "{entry:#?}"
+    );
+}
+
+#[test]
 fn status_returns_structured_error_for_unknown_path() {
     let fixture = StatusFixture::new();
     let store = fixture.store();

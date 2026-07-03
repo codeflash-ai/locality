@@ -1538,9 +1538,23 @@ fn journal_counts(
 ) -> (usize, usize) {
     let mut pending = 0;
     let mut failed = 0;
+    let latest_success = journals
+        .iter()
+        .filter(|journal| journal_matches_entity(journal, mount_id, remote_id))
+        .filter(|journal| {
+            matches!(
+                journal.status,
+                JournalStatus::Reconciled | JournalStatus::Reverted
+            )
+        })
+        .map(|journal| journal.push_id.0.as_str())
+        .max();
 
     for journal in journals {
         if !journal_matches_entity(journal, mount_id, remote_id) {
+            continue;
+        }
+        if latest_success.is_some_and(|push_id| journal.push_id.0.as_str() <= push_id) {
             continue;
         }
 

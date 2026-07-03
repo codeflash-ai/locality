@@ -32,6 +32,7 @@ export type MountRow = {
   title: string;
   subtitle: string;
   localPath: string;
+  displayPath: string;
   projection: string;
   access: string;
   content: string;
@@ -53,6 +54,7 @@ export function mountRows(
     title: mount.connectorName || mount.connector,
     subtitle: mountSubtitle(mount),
     localPath: mount.localPath,
+    displayPath: compactPath(mount.localPath),
     projection: mount.projection,
     access: mountAccessLabel(mount),
     content: mountContentLabel(mount),
@@ -128,8 +130,69 @@ export function mountStatusTone(mount: MountSummary): "ready" | "warn" | "danger
   return "ready";
 }
 
+export function compactPath(path: string, maxLength = 64): string {
+  const trimmed = path.trim();
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+
+  const separator = trimmed.includes("\\") && !trimmed.includes("/") ? "\\" : "/";
+  const normalized = trimmed.replace(/[\\/]+/g, separator).replace(/[\\/]+$/, "");
+  const parts = normalized.split(/[\\/]+/).filter(Boolean);
+  if (parts.length <= 1) {
+    return truncateLeading(trimmed, maxLength);
+  }
+
+  const prefix = pathPrefix(normalized, parts[0] ?? "", separator);
+  let best = "";
+  for (let tailCount = 1; tailCount <= parts.length; tailCount += 1) {
+    const tail = parts.slice(-tailCount).join(separator);
+    const candidate = compactPathCandidate(prefix, separator, tail);
+    if (candidate.length <= maxLength) {
+      best = candidate;
+    } else if (best) {
+      break;
+    }
+  }
+
+  return best || truncateLeading(trimmed, maxLength);
+}
+
 function isReadyStatus(status: string): boolean {
   return status.trim().toLowerCase() === "ready";
+}
+
+function pathPrefix(path: string, firstPart: string, separator: string): string {
+  if (path.startsWith(`~${separator}`)) {
+    return "~";
+  }
+  if (path.startsWith(separator)) {
+    return "";
+  }
+  if (/^[A-Za-z]:$/.test(firstPart)) {
+    return firstPart;
+  }
+  return firstPart;
+}
+
+function compactPathCandidate(prefix: string, separator: string, tail: string): string {
+  if (!prefix && separator === "/") {
+    return `/.../${tail}`;
+  }
+  if (prefix === "~") {
+    return `~/.../${tail}`;
+  }
+  if (/^[A-Za-z]:$/.test(prefix)) {
+    return `${prefix}${separator}...${separator}${tail}`;
+  }
+  return `${prefix}${separator}...${separator}${tail}`;
+}
+
+function truncateLeading(value: string, maxLength: number): string {
+  if (maxLength <= 3) {
+    return value.slice(0, Math.max(0, maxLength));
+  }
+  return `...${value.slice(-(maxLength - 3))}`;
 }
 
 function isRealMount(mount: MountSummary): boolean {

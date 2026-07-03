@@ -371,6 +371,28 @@ fn render_rich_text_escapes_literal_equation_markers() {
 }
 
 #[test]
+fn render_rich_text_escapes_literal_currency_dollars() {
+    let bundle = locality_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: paragraph_block(
+                "paragraph-1",
+                vec![rich_text("Raised $500k at a $16,000,000 cap.")],
+            ),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "Raised \\$500k at a \\$16,000,000 cap.\n"
+    );
+    assert_eq!(rendered.shadow.blocks.len(), 1);
+}
+
+#[test]
 fn render_rich_text_escapes_literal_explicit_mention_markers() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page: page("page-1", "Roadmap"),

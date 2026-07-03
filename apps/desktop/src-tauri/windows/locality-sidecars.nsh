@@ -56,6 +56,18 @@
   !insertmacro STOP_LOCALITY_PROCESS_IMAGE "loc.exe"
 !macroend
 
+!macro PREPARE_LOCALITY_UNINSTALL
+  ${If} ${FileExists} "$INSTDIR\Locality.exe"
+    DetailPrint "Preparing Locality user integrations for uninstall..."
+    nsExec::ExecToLog '"$INSTDIR\Locality.exe" --prepare-uninstall'
+    Pop $0
+  ${ElseIf} ${FileExists} "$INSTDIR\locality-desktop.exe"
+    DetailPrint "Preparing Locality user integrations for uninstall..."
+    nsExec::ExecToLog '"$INSTDIR\locality-desktop.exe" --prepare-uninstall'
+    Pop $0
+  ${EndIf}
+!macroend
+
 !macro DELETE_LOCALITY_INSTALLED_FILE FILE_NAME
   !define UniqueID ${__LINE__}
   Push $0
@@ -122,6 +134,8 @@
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  !insertmacro STOP_LOCALITY_INSTALL_PROCESSES
+  !insertmacro PREPARE_LOCALITY_UNINSTALL
   !insertmacro STOP_LOCALITY_INSTALL_PROCESSES
 !macroend
 

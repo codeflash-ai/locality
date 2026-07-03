@@ -37,6 +37,16 @@ Apply requests include the core `push_id`, mount ID, approved push plan, and det
 
 Apply results include changed remote IDs plus operation-level journal effects. Created-block and created-entity effects must include the remote IDs assigned by the source, because reconcile and undo use those IDs to read back, materialize, and reverse appends and creates safely.
 
+Connectors may lower an approved `PushPlan` into connector-specific execution
+steps before making remote API calls. Those steps may batch multiple compatible
+plan operations into fewer remote requests, but the connector-neutral `PushPlan`
+remains operation-granular. When batching, apply must still return one
+`JournalApplyEffect` for each original plan operation, with the correct
+`operation_id`, `operation_index`, and remote ID. The Notion connector uses this
+rule to lower contiguous compatible `append_block` operations into
+`append block children` calls of up to 100 children while preserving per-block
+journal and undo semantics.
+
 Undo requests include the target push ID, mount ID, and a connector-neutral complete undo plan. Connectors should fail the request rather than partially applying a plan they cannot support.
 
 ## v1 connector
