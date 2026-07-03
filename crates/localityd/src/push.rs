@@ -46,6 +46,7 @@ use locality_notion::markdown_table::parse_markdown_table_shape;
 use locality_notion::media::{
     load_media_manifest, media_manifest_entry, resolve_media_href_with_content_root, sha256_hex,
 };
+use locality_notion::projection::{is_notion_private_root_id, is_notion_workspace_root_id};
 use locality_store::{
     AutoSaveRepository, EntityRecord, EntityRepository, FreshnessStateRepository,
     JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
@@ -2031,6 +2032,26 @@ where
     })
 }
 
+fn create_parent_scope_for_entity(mount: &MountConfig, parent: &EntityRecord) -> CreateParentScope {
+    if mount.connector == "notion" && is_notion_private_root_id(&parent.remote_id) {
+        return CreateParentScope::PrivateWorkspace;
+    }
+    if mount.connector == "notion" && is_notion_workspace_root_id(&parent.remote_id) {
+        return CreateParentScope::WorkspaceRoot;
+    }
+    CreateParentScope::Remote
+}
+
+fn notion_workspace_root_create_validation(relative_path: &Path) -> ValidationIssue {
+    ValidationIssue::new(
+        "notion_workspace_root_create_ambiguous",
+        relative_path,
+        None,
+        "New root workspace pages are ambiguous because Notion does not expose a stable teamspace parent through this API.",
+        Some("Create under Private/ for a private page, or create below an existing page that Locality can use as the parent.".to_string()),
+    )
+}
+
 fn create_entity_pipeline(
     relative_path: &Path,
     parsed: &locality_core::canonical::ParsedCanonicalDocument,
@@ -2114,6 +2135,11 @@ fn create_entity_pipeline(
         ));
     }
 
+    let parent_scope = create_parent_scope_for_entity(mount, parent);
+    if parent_scope == CreateParentScope::WorkspaceRoot {
+        validation.push(notion_workspace_root_create_validation(relative_path));
+    }
+
     let mut completed_stages = vec![PushStage::ParseAndValidate];
     if !validation.is_clean() {
         return PushPipelineResult {
@@ -2136,7 +2162,7 @@ fn create_entity_pipeline(
         vec![PushOperation::CreateEntity {
             parent_id: parent.remote_id.clone(),
             parent_kind: Some(parent.kind.clone()),
-            parent_scope: CreateParentScope::Remote,
+            parent_scope,
             title: parsed.frontmatter.title.clone().unwrap_or_default(),
             properties,
             body: parsed.document.body.clone(),
