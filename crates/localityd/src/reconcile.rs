@@ -198,9 +198,11 @@ where
 
         for (entry, existing) in entries.iter().zip(existing_entities.iter()) {
             if !reserved_root_projection_moves_applied
-                && reserved_root_projection_moves
-                    .iter()
-                    .any(|planned_move| planned_move.remote_id == entry.remote_id)
+                && reserved_root_projection_move_affects_record(
+                    entry,
+                    existing.as_ref(),
+                    &reserved_root_projection_moves,
+                )
             {
                 apply_reserved_notion_root_projection_moves(
                     mount,
