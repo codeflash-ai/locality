@@ -192,9 +192,29 @@ where
                     .map_err(LocalityError::from)
             })
             .collect::<LocalityResult<Vec<_>>>()?;
-        rename_reserved_notion_root_projection_collisions(mount, &entries, &existing_entities)?;
+        let reserved_root_projection_moves =
+            plan_reserved_notion_root_projection_moves(mount, &entries, &existing_entities)?;
+        let mut reserved_root_projection_moves_applied = reserved_root_projection_moves.is_empty();
 
         for (entry, existing) in entries.iter().zip(existing_entities.iter()) {
+            if !reserved_root_projection_moves_applied
+                && reserved_root_projection_moves
+                    .iter()
+                    .any(|planned_move| planned_move.remote_id == entry.remote_id)
+            {
+                apply_reserved_notion_root_projection_moves(
+                    mount,
+                    &reserved_root_projection_moves,
+                )?;
+                save_reserved_notion_root_projection_move_records(
+                    store,
+                    &entries,
+                    &existing_entities,
+                    &reserved_root_projection_moves,
+                )?;
+                reserved_root_projection_moves_applied = true;
+            }
+
             let observed_at = observation_timestamp();
             record_remote_observation(store, entry, existing.as_ref(), &observed_at)?;
             let entity_plan = strategy.entity_plan(EntityFetchSchedule {
@@ -400,13 +420,13 @@ fn rename_projection_if_needed(
     Ok(())
 }
 
-fn rename_reserved_notion_root_projection_collisions(
+fn plan_reserved_notion_root_projection_moves(
     mount: &MountConfig,
     entries: &[TreeEntry],
     existing_entities: &[Option<EntityRecord>],
-) -> LocalityResult<()> {
+) -> LocalityResult<Vec<ReservedRootProjectionMove>> {
     if mount.projection.uses_virtual_filesystem() || !is_notion_workspace_mount(mount) {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut reserved_stage_paths = BTreeSet::new();
@@ -449,10 +469,28 @@ fn rename_reserved_notion_root_projection_collisions(
             continue;
         }
         moves.push(ReservedRootProjectionMove {
+            remote_id: entry.remote_id.clone(),
             source,
             stage: stage_path,
             destination,
         });
+    }
+
+    Ok(moves)
+}
+
+fn apply_reserved_notion_root_projection_moves(
+    mount: &MountConfig,
+    moves: &[ReservedRootProjectionMove],
+) -> LocalityResult<()> {
+    for planned_move in moves {
+        if mount.root.join(&planned_move.destination).exists() {
+            return Err(LocalityError::Io(format!(
+                "reserved Notion root projection destination `{}` already exists while moving `{}`",
+                mount.root.join(&planned_move.destination).display(),
+                mount.root.join(&planned_move.source).display()
+            )));
+        }
     }
 
     for (index, planned_move) in moves.iter().enumerate() {
@@ -478,8 +516,29 @@ fn rename_reserved_notion_root_projection_collisions(
     Ok(())
 }
 
+fn save_reserved_notion_root_projection_move_records<S>(
+    store: &mut S,
+    entries: &[TreeEntry],
+    existing_entities: &[Option<EntityRecord>],
+    moves: &[ReservedRootProjectionMove],
+) -> LocalityResult<()>
+where
+    S: EntityRepository,
+{
+    for (entry, existing) in entries.iter().zip(existing_entities.iter()) {
+        if moves
+            .iter()
+            .any(|planned_move| planned_move.remote_id == entry.remote_id)
+        {
+            store.save_entity(merged_entity_record(entry, existing.as_ref()))?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReservedRootProjectionMove {
+    remote_id: RemoteId,
     source: PathBuf,
     stage: PathBuf,
     destination: PathBuf,

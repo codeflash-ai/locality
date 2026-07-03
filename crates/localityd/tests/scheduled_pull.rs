@@ -635,6 +635,137 @@ fn scheduled_pull_keeps_entity_path_when_reserved_root_final_destination_exists(
 }
 
 #[test]
+fn scheduled_pull_keeps_reserved_root_disk_when_unrelated_projection_fails_before_entity_save() {
+    let root = temp_root("scheduled-pull-reserved-root-unrelated-failure");
+    let mount_id = MountId::new("notion-main");
+    let remote_id = RemoteId::new("page-1");
+    let mount = MountConfig::new(mount_id.clone(), "notion", root.clone());
+    let old_path = PathBuf::from("private/page.md");
+    let new_path = PathBuf::from("Workspace/private/page.md");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "private",
+            old_path.clone(),
+        ))
+        .expect("save old entity");
+    std::fs::create_dir_all(root.join("private")).expect("old container");
+    std::fs::write(root.join(&old_path), "old body").expect("old page");
+    std::fs::write(root.join("Blocked"), "not a directory").expect("block parent");
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![
+            directory_entry(&mount_id, "notion-root:private", "Private", "Private"),
+            directory_entry(&mount_id, "notion-root:workspace", "Workspace", "Workspace"),
+            database_entry(&mount_id, "blocked-db", "Blocked", "Blocked/Tasks"),
+            page_entry(
+                &mount_id,
+                "page-1",
+                "private",
+                "Workspace/private/page.md",
+                "2026-06-11T00:00:00Z",
+            ),
+        ],
+    );
+    let mut hydration = HydrationQueue::new();
+
+    let result = localityd::reconcile::reconcile_scheduled_pull(
+        &mut store,
+        &mut hydration,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: true,
+        },
+        &source,
+        &DefaultFetchScheduleStrategy,
+        &HydrationPolicy::default(),
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.join(&old_path)).expect("old page"),
+        "old body"
+    );
+    assert!(!root.join(&new_path).exists());
+    let entity = store
+        .get_entity(&mount_id, &remote_id)
+        .expect("get entity")
+        .expect("entity remains present");
+    assert_eq!(entity.path, old_path);
+}
+
+#[test]
+fn scheduled_pull_keeps_reserved_root_disk_when_final_destination_is_created_before_repair() {
+    let root = temp_root("scheduled-pull-reserved-root-late-destination");
+    let mount_id = MountId::new("notion-main");
+    let remote_id = RemoteId::new("page-1");
+    let mount = MountConfig::new(mount_id.clone(), "notion", root.clone());
+    let old_path = PathBuf::from("private/page.md");
+    let new_path = PathBuf::from("Workspace/private/page.md");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "private",
+            old_path.clone(),
+        ))
+        .expect("save old entity");
+    std::fs::create_dir_all(root.join("private")).expect("old container");
+    std::fs::write(root.join(&old_path), "old body").expect("old page");
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![
+            directory_entry(&mount_id, "notion-root:private", "Private", "Private"),
+            directory_entry(&mount_id, "notion-root:workspace", "Workspace", "Workspace"),
+            database_entry(&mount_id, "occupied-db", "private", "Workspace/private"),
+            page_entry(
+                &mount_id,
+                "page-1",
+                "private",
+                "Workspace/private/page.md",
+                "2026-06-11T00:00:00Z",
+            ),
+        ],
+    );
+    let mut hydration = HydrationQueue::new();
+
+    let result = localityd::reconcile::reconcile_scheduled_pull(
+        &mut store,
+        &mut hydration,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: true,
+        },
+        &source,
+        &DefaultFetchScheduleStrategy,
+        &HydrationPolicy::default(),
+    );
+
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.join(&old_path)).expect("old page"),
+        "old body"
+    );
+    assert!(!root.join(&new_path).exists());
+    let entity = store
+        .get_entity(&mount_id, &remote_id)
+        .expect("get entity")
+        .expect("entity remains present");
+    assert_eq!(entity.path, old_path);
+}
+
+#[test]
 fn scheduled_pull_does_not_move_unrelated_reserved_root_for_normal_rename() {
     let root = temp_root("scheduled-pull-normal-rename-reserved-root");
     let mount_id = MountId::new("notion-main");
