@@ -295,14 +295,14 @@ path into Notion creation without bypassing the explicit push model.
 
 Workspace Notion mounts use the access granted to the connected integration and
 expose two synthetic directories under the mount-point root: `Private/` and
-`Workspace/`. When the connection exposes an owner user, accessible top-level
-workspace pages created by that owner appear under `Private/`; this is derived
-from the direct workspace parent plus owner creator. Existing accessible
-top-level workspace or team pages and databases appear under `Workspace/`, along
-with searchable accessible objects that Locality cannot safely place under an
-observed parent. Create private top-level pages under `Private/`; direct
-creation under `Workspace/` is rejected because parent selection is ambiguous.
-Create child pages inside an existing page directory.
+`Workspace/`. When the connection exposes a user owner, accessible top-level
+workspace pages created by that owner or by that user's bot appear under
+`Private/`; this is derived from the direct workspace parent plus those creator
+IDs. Existing accessible top-level workspace or team pages and databases appear
+under `Workspace/`, along with searchable accessible objects that Locality
+cannot safely place under an observed parent. Create private top-level pages
+under `Private/`; direct creation under `Workspace/` is rejected because parent
+selection is ambiguous. Create child pages inside an existing page directory.
 
 Example private page draft under a workspace mount:
 
@@ -390,11 +390,11 @@ for the current host.
 `loc pull <mount-root>` starts from the mount mode. For `--root-page` Notion
 mounts, it enumerates the configured page. For `--workspace` mounts, it
 enumerates the Locality synthetic roots, places accessible top-level workspace
-pages created by the connection owner under `Private/` when that owner is known,
-lists shared top-level pages, databases, and searchable accessible objects that
-Locality cannot safely place under an observed parent under `Workspace/`, and
-uses `Private/` for local private drafts without treating the mount root as a
-Notion page.
+pages created by the connection owner or that user's bot under `Private/` when
+that owner is known, lists shared top-level pages, databases, and searchable
+accessible objects that Locality cannot safely place under an observed parent
+under `Workspace/`, and uses `Private/` for local private drafts without
+treating the mount root as a Notion page.
 
 For plain-file mounts, pull writes stub Markdown files for projected pages,
 creates directories for projected databases, writes database `_schema.yaml`

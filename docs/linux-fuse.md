@@ -120,11 +120,12 @@ ls -la "$HOME/Locality/notion-main"
 
 For workspace Notion mounts, the FUSE virtual listing shows the synthetic
 `Private/` and `Workspace/` roots under the mount point. These roots are folders
-only and do not contain `page.md`. When the connection exposes an owner user,
-accessible top-level workspace pages created by that owner appear under
-`Private/`; this is derived from the direct workspace parent plus owner creator.
-Create private top-level pages under `Private/`; create children inside existing
-page directories rather than directly under `Workspace/`.
+only and do not contain `page.md`. When the connection exposes a user owner,
+accessible top-level workspace pages created by that owner or by that user's
+bot appear under `Private/`; this is derived from the direct workspace parent
+plus those creator IDs. Create private top-level pages under `Private/`; create
+children inside existing page directories rather than directly under
+`Workspace/`.
 
 Read a projected Markdown file to force hydration:
 

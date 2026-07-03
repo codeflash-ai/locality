@@ -17,7 +17,7 @@ Working rules:
 
 Notion facts:
 - Pages are directories. Edit `page.md` for the page body; sibling entries in that directory are child Notion content.
-- `Private/` holds known owner-created top-level pages; `Workspace/` holds shared pages/databases.
+- `Private/` holds known private top-level pages; `Workspace/` holds shared pages/databases.
 - For a workspace Notion mount, create private top-level pages under `Private/<title>/page.md`.
 - Do not create directly under `Workspace/`; create child pages inside an existing page directory.
 - Prefer `loc create page --title "New Page" --parent <parent-directory>` for new pages.

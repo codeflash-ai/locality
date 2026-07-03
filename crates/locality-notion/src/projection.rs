@@ -166,7 +166,7 @@ pub fn resolve_page_path_entries(
         api,
         mount_id,
         root_page_id,
-        private_owner_user_id: private_workspace_owner_user_id(api),
+        private_workspace_creator_ids: private_workspace_creator_ids(api),
         resolved: BTreeMap::new(),
         resolving: BTreeSet::new(),
         entries: Vec::new(),
@@ -210,7 +210,7 @@ struct ExactPathResolver<'a> {
     api: &'a dyn NotionApi,
     mount_id: MountId,
     root_page_id: Option<&'a RemoteId>,
-    private_owner_user_id: Option<String>,
+    private_workspace_creator_ids: BTreeSet<String>,
     resolved: BTreeMap<String, TreeEntry>,
     resolving: BTreeSet<String>,
     entries: Vec<TreeEntry>,
@@ -251,7 +251,7 @@ impl ExactPathResolver<'_> {
             page_entry(self.mount_id.clone(), &page, title, path)
         } else {
             let parent = if self.root_page_id.is_none()
-                && is_private_workspace_page(&page, self.private_owner_user_id.as_deref())
+                && is_private_workspace_page(&page, &self.private_workspace_creator_ids)
             {
                 ParentListing::Root(PathBuf::from(NOTION_PRIVATE_ROOT_DIR))
             } else {
@@ -527,7 +527,7 @@ struct WorkspaceRootProjection {
 struct WorkspaceRootSnapshot {
     pages: Vec<PageDto>,
     databases: Vec<DatabaseDto>,
-    private_owner_user_id: Option<String>,
+    private_workspace_creator_ids: BTreeSet<String>,
 }
 
 impl WorkspaceRootSnapshot {
@@ -535,7 +535,7 @@ impl WorkspaceRootSnapshot {
         Ok(Self {
             pages: search_all_pages(api)?,
             databases: search_all_databases(api)?,
-            private_owner_user_id: private_workspace_owner_user_id(api),
+            private_workspace_creator_ids: private_workspace_creator_ids(api),
         })
     }
 }
@@ -605,7 +605,7 @@ fn project_workspace_root_from_snapshot(
             page,
             source_root,
             &accessible_page_ids,
-            snapshot.private_owner_user_id.as_deref(),
+            &snapshot.private_workspace_creator_ids,
         )
     }) {
         let title = page_title(page);
@@ -676,7 +676,7 @@ fn project_workspace_root_from_snapshot(
         .iter()
         .filter(|page| {
             source_root == WorkspaceSourceRootProjection::Workspace
-                && !is_private_workspace_page(page, snapshot.private_owner_user_id.as_deref())
+                && !is_private_workspace_page(page, &snapshot.private_workspace_creator_ids)
                 && is_workspace_fallback_page(
                     page,
                     &projected_page_ids,
@@ -895,59 +895,80 @@ fn projected_child_entry(mount_id: &MountId, projected: ProjectedChildWithPath) 
     }
 }
 
-fn private_workspace_owner_user_id(api: &dyn NotionApi) -> Option<String> {
-    let current_user = api.retrieve_current_user().ok()?;
+fn private_workspace_creator_ids(api: &dyn NotionApi) -> BTreeSet<String> {
+    let mut creator_ids = BTreeSet::new();
+    let Ok(current_user) = api.retrieve_current_user() else {
+        return creator_ids;
+    };
     if current_user
         .get("type")
         .and_then(|kind| kind.as_str())
         .is_some_and(|kind| kind == "person")
     {
-        return current_user
+        if let Some(id) = current_user
             .get("id")
             .and_then(|id| id.as_str())
             .filter(|id| !id.is_empty())
-            .map(str::to_string);
+        {
+            creator_ids.insert(id.to_string());
+        }
+        return creator_ids;
     }
 
-    let owner = current_user.get("bot")?.get("owner")?;
+    let Some(owner) = current_user.get("bot").and_then(|bot| bot.get("owner")) else {
+        return creator_ids;
+    };
     if owner.get("type").and_then(|kind| kind.as_str()) != Some("user") {
-        return None;
+        return creator_ids;
     }
-    owner
-        .get("user")?
+    if let Some(id) = current_user
         .get("id")
         .and_then(|id| id.as_str())
         .filter(|id| !id.is_empty())
-        .map(str::to_string)
+    {
+        creator_ids.insert(id.to_string());
+    }
+    if let Some(id) = owner
+        .get("user")
+        .and_then(|user| user.get("id"))
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+    {
+        creator_ids.insert(id.to_string());
+    }
+    creator_ids
 }
 
 fn is_source_root_page(
     page: &PageDto,
     source_root: WorkspaceSourceRootProjection,
     accessible_page_ids: &BTreeSet<&str>,
-    private_owner_user_id: Option<&str>,
+    private_workspace_creator_ids: &BTreeSet<String>,
 ) -> bool {
     match source_root {
         WorkspaceSourceRootProjection::Private => {
-            is_private_workspace_page(page, private_owner_user_id)
+            is_private_workspace_page(page, private_workspace_creator_ids)
         }
         WorkspaceSourceRootProjection::Workspace => {
             is_workspace_root_page(page, accessible_page_ids)
-                && !is_private_workspace_page(page, private_owner_user_id)
+                && !is_private_workspace_page(page, private_workspace_creator_ids)
         }
     }
 }
 
-fn is_private_workspace_page(page: &PageDto, private_owner_user_id: Option<&str>) -> bool {
-    let Some(private_owner_user_id) = private_owner_user_id else {
+fn is_private_workspace_page(
+    page: &PageDto,
+    private_workspace_creator_ids: &BTreeSet<String>,
+) -> bool {
+    if private_workspace_creator_ids.is_empty() {
         return false;
-    };
+    }
     if !is_direct_workspace_parent(page.parent.as_ref()) {
         return false;
     }
     page.created_by
         .as_ref()
-        .is_some_and(|created_by| created_by.id == private_owner_user_id)
+        .is_some_and(|created_by| private_workspace_creator_ids.contains(&created_by.id))
 }
 
 fn is_direct_workspace_parent(parent: Option<&ParentDto>) -> bool {
@@ -2056,6 +2077,30 @@ mod tests {
                     || entry.path == Path::new("Private/scratchpad/page.md")
             }),
             "private workspace pages must not duplicate under Workspace/"
+        );
+    }
+
+    #[test]
+    fn workspace_enumeration_projects_bot_created_private_workspace_pages_under_private() {
+        let api = FakeNotionApi::new()
+            .with_current_user(owner_user_response("owner-user"))
+            .with_page(page_with_title_and_creator(
+                "created-by-bot",
+                "Created By Bot",
+                workspace_parent(),
+                "bot-user",
+            ));
+
+        let entries = enumerate_shared_pages(&api, MountId::new("notion-main"))
+            .expect("enumerate shared pages");
+
+        assert_tree_entry(
+            &entries,
+            "created-by-bot",
+            EntityKind::Page,
+            "Created By Bot",
+            "Private/created-by-bot/page.md",
+            HydrationState::Stub,
         );
     }
 
