@@ -23,7 +23,7 @@ use locality_notion::dto::{
     UrlBlockDto,
 };
 use locality_notion::projection::{NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_ID};
-use locality_notion::{NotionConfig, NotionConnector};
+use locality_notion::{NotionConfig, NotionConnector, PrivateWorkspaceCreateAuthMode};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -3573,6 +3573,114 @@ fn apply_creates_private_workspace_page_without_parent_payload() {
 }
 
 #[test]
+fn apply_private_workspace_probe_allows_person_token_without_parent_payload() {
+    let api = Arc::new(
+        RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false).with_current_user(json!({
+            "object": "user",
+            "id": "person-user-1",
+            "type": "person",
+            "person": {},
+        })),
+    );
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_private_workspace_create_auth_mode(
+            PrivateWorkspaceCreateAuthMode::ProbeTokenSubject,
+        ),
+        api.clone(),
+    );
+    let plan = PushPlan::new(
+        vec![RemoteId::new(NOTION_PRIVATE_ROOT_ID)],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "PAT Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: String::new(),
+            source_path: "Private/PAT Draft/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("person token allows private workspace create");
+
+    assert_eq!(*api.current_user_calls.lock().expect("calls"), 1);
+    assert_eq!(
+        api.writes.lock().expect("writes").as_slice(),
+        [WriteCall::CreatePage {
+            body: json!({
+                "properties": {
+                    "title": {
+                        "title": rich_text_json("PAT Draft"),
+                    },
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
+fn apply_private_workspace_probe_rejects_bot_token_before_create() {
+    let api = Arc::new(
+        RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false).with_current_user(json!({
+            "object": "user",
+            "id": "bot-user-1",
+            "type": "bot",
+            "bot": {
+                "workspace_name": "Example Workspace",
+            },
+        })),
+    );
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_private_workspace_create_auth_mode(
+            PrivateWorkspaceCreateAuthMode::ProbeTokenSubject,
+        ),
+        api.clone(),
+    );
+    let plan = PushPlan::new(
+        vec![RemoteId::new(NOTION_PRIVATE_ROOT_ID)],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "Bot Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: String::new(),
+            source_path: "Private/Bot Draft/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect_err("bot token cannot create parentless private workspace pages");
+
+    assert!(matches!(error, LocalityError::Unsupported(_)));
+    assert_eq!(*api.current_user_calls.lock().expect("calls"), 1);
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
 fn apply_rejects_workspace_root_create_before_prior_writes() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -4142,6 +4250,8 @@ struct RecordingNotionApi {
     database: DatabaseDto,
     data_source: DataSourceDto,
     children: BTreeMap<(String, Option<String>), BlockListDto>,
+    current_user: Option<Value>,
+    current_user_calls: Mutex<usize>,
     writes: Mutex<Vec<WriteCall>>,
     append_count: Mutex<usize>,
 }
@@ -4271,6 +4381,8 @@ impl RecordingNotionApi {
                 ..Default::default()
             },
             children,
+            current_user: None,
+            current_user_calls: Mutex::new(0),
             writes: Mutex::new(Vec::new()),
             append_count: Mutex::new(0),
         }
@@ -4313,13 +4425,29 @@ impl RecordingNotionApi {
                 ..Default::default()
             },
             children,
+            current_user: None,
+            current_user_calls: Mutex::new(0),
             writes: Mutex::new(Vec::new()),
             append_count: Mutex::new(0),
         }
     }
+
+    fn with_current_user(mut self, current_user: Value) -> Self {
+        self.current_user = Some(current_user);
+        self
+    }
 }
 
 impl NotionApi for RecordingNotionApi {
+    fn retrieve_current_user(&self) -> LocalityResult<Value> {
+        *self.current_user_calls.lock().expect("current user calls") += 1;
+        self.current_user
+            .clone()
+            .ok_or(LocalityError::NotImplemented(
+                "retrieve Notion current user",
+            ))
+    }
+
     fn retrieve_page(&self, page_id: &str) -> LocalityResult<PageDto> {
         if page_id == self.page.id {
             Ok(self.page.clone())

@@ -20,6 +20,7 @@ use locality_core::{LocalityError, LocalityResult};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::PrivateWorkspaceCreateAuthMode;
 use crate::client::NotionApi;
 use crate::dto::{
     BlockDto, BlockTreeDto, DataSourceDto, FileBlockDto, NotionPageBundle, PageDto,
@@ -35,6 +36,7 @@ use crate::projection::{NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_ID};
 const NOTION_RICH_TEXT_CONTENT_LIMIT: usize = 2000;
 const NOTION_RICH_TEXT_SENTENCE_SPLIT_LOOKBACK: usize = 400;
 const WORKSPACE_ROOT_CREATE_UNSUPPORTED: &str = "creating a Notion page directly under Workspace/ is ambiguous; create under Private/ or below an existing page";
+const PRIVATE_WORKSPACE_CREATE_BOT_UNSUPPORTED: &str = "creating a Notion page under Private/ requires a public OAuth connection or personal access token; internal integration tokens cannot create parentless pages";
 
 pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> LocalityResult<()> {
     let database_create_parent_ids = database_create_parent_ids(&request.plan.operations);
@@ -70,6 +72,7 @@ pub fn check_concurrency(api: &dyn NotionApi, request: ApplyPlanRequest<'_>) -> 
 
 pub fn apply_plan(
     api: &dyn NotionApi,
+    private_workspace_create_auth_mode: PrivateWorkspaceCreateAuthMode,
     request: ApplyPlanRequest<'_>,
 ) -> LocalityResult<ApplyPlanResult> {
     validate_operation_ids(&request)?;
@@ -317,6 +320,7 @@ pub fn apply_plan(
             } => {
                 let request_body = create_page_body(
                     api,
+                    private_workspace_create_auth_mode,
                     parent_id,
                     parent_kind.as_ref(),
                     parent_scope,
@@ -1067,6 +1071,7 @@ fn update_properties_body(
 
 fn create_page_body(
     api: &dyn NotionApi,
+    private_workspace_create_auth_mode: PrivateWorkspaceCreateAuthMode,
     parent_id: &RemoteId,
     parent_kind: Option<&locality_core::model::EntityKind>,
     parent_scope: &CreateParentScope,
@@ -1075,6 +1080,7 @@ fn create_page_body(
     body: &str,
 ) -> LocalityResult<Value> {
     if *parent_scope == CreateParentScope::PrivateWorkspace {
+        ensure_private_workspace_create_allowed(api, private_workspace_create_auth_mode)?;
         let mut request = json!({
             "properties": {
                 "title": {
@@ -1134,6 +1140,27 @@ fn create_page_body(
     }
 
     Ok(request)
+}
+
+fn ensure_private_workspace_create_allowed(
+    api: &dyn NotionApi,
+    mode: PrivateWorkspaceCreateAuthMode,
+) -> LocalityResult<()> {
+    match mode {
+        PrivateWorkspaceCreateAuthMode::Allow => Ok(()),
+        PrivateWorkspaceCreateAuthMode::Reject => Err(LocalityError::Unsupported(
+            PRIVATE_WORKSPACE_CREATE_BOT_UNSUPPORTED,
+        )),
+        PrivateWorkspaceCreateAuthMode::ProbeTokenSubject => {
+            let current_user = api.retrieve_current_user()?;
+            if current_user.get("type").and_then(Value::as_str) == Some("person") {
+                return Ok(());
+            }
+            Err(LocalityError::Unsupported(
+                PRIVATE_WORKSPACE_CREATE_BOT_UNSUPPORTED,
+            ))
+        }
+    }
 }
 
 fn create_properties_body(

@@ -14,7 +14,7 @@ use locality_notion::oauth::{
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerRefresh,
     NotionOAuthRefresh, StoredNotionCredential,
 };
-use locality_notion::{NotionConfig, NotionConnector};
+use locality_notion::{NotionConfig, NotionConnector, PrivateWorkspaceCreateAuthMode};
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
     CredentialStore, EntityRecord, MountConfig, MountRepository,
@@ -180,6 +180,7 @@ where
         warn_env_fallback_once();
         let config = NotionConfig {
             root_page_id: mount.remote_root_id.clone(),
+            private_workspace_create_auth_mode: PrivateWorkspaceCreateAuthMode::ProbeTokenSubject,
             ..Default::default()
         };
         return Ok(NotionConnector::new(config));
@@ -256,9 +257,15 @@ fn connector_from_connection(
     }
 
     let token = connection_access_token(credentials, connection)?;
+    let private_workspace_create_auth_mode = if connection.auth_kind == "oauth" {
+        PrivateWorkspaceCreateAuthMode::Allow
+    } else {
+        PrivateWorkspaceCreateAuthMode::ProbeTokenSubject
+    };
     let config = NotionConfig {
         workspace_id: connection.workspace_id.clone(),
         root_page_id: mount.remote_root_id.clone(),
+        private_workspace_create_auth_mode,
         token: Some(token),
         token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
     };
