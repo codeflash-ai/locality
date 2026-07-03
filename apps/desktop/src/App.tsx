@@ -20,6 +20,7 @@ import {
   ListChecks,
   Loader2,
   Minus,
+  Plus,
   Power,
   RefreshCw,
   RotateCcw,
@@ -34,6 +35,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  compactPath,
   mountAccessLabel,
   mountRows,
   mountStatusLabel,
@@ -2155,7 +2157,16 @@ function MountsView({
   return (
     <div className="view-stack mounts-view">
       <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Mounts" }]} />
-      <ViewHeader title="Mounts">
+      <ViewHeader title="Mounted folders">
+        <SecondaryButton
+          compact
+          busy={creating}
+          disabled={connectionMissing(snapshot)}
+          icon={<Plus />}
+          onClick={() => void createMount()}
+        >
+          Add Mount
+        </SecondaryButton>
         <SecondaryButton
           compact
           busy={refreshing}
@@ -2170,8 +2181,8 @@ function MountsView({
         <section className="empty-action-panel">
           <BrandTile variant="folder" />
           <div>
-            <h2>Create your Notion mount point</h2>
-            <p>Use the default notion mount point under the shared Locality folder.</p>
+            <h2>Add a Notion mounted folder</h2>
+            <p>Use the default Notion folder under the shared Locality location.</p>
           </div>
           <PrimaryButton
             busy={creating}
@@ -2179,87 +2190,68 @@ function MountsView({
             icon={<FolderOpen />}
             onClick={() => void createMount()}
           >
-            Create Notion Mount Point
+            Add Notion Mount
           </PrimaryButton>
         </section>
       ) : (
         <>
           <p className="view-copy">
-            {rows.length} mount {rows.length === 1 ? "point" : "points"} registered for this Locality state.
+            {rows.length} mounted {rows.length === 1 ? "folder" : "folders"} registered for this Locality state.
           </p>
-          <section className="mounts-table-panel" aria-label="Registered mount points">
-            <table className="mounts-table">
-              <thead>
-                <tr>
-                  <th scope="col">Mount</th>
-                  <th scope="col">Local path</th>
-                  <th scope="col">Projection</th>
-                  <th scope="col">Access</th>
-                  <th scope="col">Content</th>
-                  <th scope="col">Status</th>
-                  <th scope="col">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row) => (
-                  <tr key={row.id}>
-                    <td>
-                      <button
-                        className="mount-name-button"
-                        type="button"
-                        onClick={() => onSelectMount(row.id)}
-                      >
-                        <strong>{row.title}</strong>
-                        <span>{row.subtitle}</span>
-                      </button>
-                      {row.active && <span className="mount-primary-tag">Primary</span>}
-                    </td>
-                    <td>
-                      <code className="mount-path-cell">{row.localPath}</code>
-                    </td>
-                    <td>{row.projection}</td>
-                    <td>{row.access}</td>
-                    <td>{row.content}</td>
-                    <td>
-                      <StatusPill tone={row.tone} title={row.status}>
-                        <span className="mount-status-text">{row.status}</span>
-                      </StatusPill>
-                    </td>
-                    <td>
-                      <div className="mount-row-actions">
-                        <button
-                          className="mount-table-action"
-                          type="button"
-                          onClick={() => void openMountFolder(row.localPath)}
-                        >
-                          <FolderOpen />
-                          <span>Open</span>
-                        </button>
-                        <button
-                          className="mount-table-action"
-                          type="button"
-                          onClick={() => {
-                            setActionError("");
-                            copyText(row.localPath);
-                          }}
-                        >
-                          <Copy />
-                          <span>Copy</span>
-                        </button>
-                        <button
-                          className="mount-table-action"
-                          type="button"
-                          onClick={() => onSelectMount(row.id)}
-                        >
-                          <ChevronRight />
-                          <span>Details</span>
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <section className="mounts-grid" aria-label="Registered mounted folders">
+            {rows.map((row) => (
+              <article className={`mount-card ${row.active ? "active" : ""}`} key={row.id}>
+                <div className="mount-card-top">
+                  <button className="mount-card-title" type="button" onClick={() => onSelectMount(row.id)}>
+                    <span className="mount-card-icon">
+                      <FolderOpen />
+                    </span>
+                    <span>
+                      <strong>{row.title}</strong>
+                      <span>{row.subtitle}</span>
+                    </span>
+                  </button>
+                  <StatusPill tone={row.tone} title={row.status}>
+                    <span className="mount-status-text">{row.status}</span>
+                  </StatusPill>
+                </div>
+                <div className="mount-card-path">
+                  <code title={row.localPath}>{row.displayPath}</code>
+                  <button
+                    className="icon-button has-tooltip"
+                    data-tooltip="Copy path"
+                    type="button"
+                    onClick={() => {
+                      setActionError("");
+                      copyText(row.localPath);
+                    }}
+                  >
+                    <Copy />
+                  </button>
+                  <button
+                    className="icon-button has-tooltip"
+                    data-tooltip="Open folder"
+                    type="button"
+                    onClick={() => void openMountFolder(row.localPath)}
+                  >
+                    <FolderOpen />
+                  </button>
+                </div>
+                <div className="mount-card-meta">
+                  {row.active && <span className="primary">Primary</span>}
+                  <span>{row.projection}</span>
+                  <span>{row.access}</span>
+                  <span>{row.content}</span>
+                </div>
+                <div className="mount-card-footer">
+                  <span>{row.mount.mountId}</span>
+                  <button className="mount-details-button" type="button" onClick={() => onSelectMount(row.id)}>
+                    Details
+                    <ChevronRight />
+                  </button>
+                </div>
+              </article>
+            ))}
           </section>
         </>
       )}
@@ -2323,7 +2315,6 @@ function FilesView({
       </section>
 
       <RecentFilesPanel items={snapshot.recentFiles} />
-      <MountedWorkspacesPanel mounts={snapshot.mounts} />
     </div>
   );
 }
@@ -2434,7 +2425,7 @@ function CurrentWorkspacePanel({
 
       <div className="workspace-path-row">
         <FolderOpen />
-        <code>{snapshot.mount.localPath}</code>
+        <code title={snapshot.mount.localPath}>{compactPath(snapshot.mount.localPath, 76)}</code>
         <button className="icon-button has-tooltip" data-tooltip="Copy path" onClick={() => copyText(snapshot.mount.localPath)}>
           <Copy />
         </button>
@@ -2619,8 +2610,8 @@ function MountDetailView({
           <FolderOpen />
         </div>
         <div>
-          <p className="label">{mount.connectorName} mount point</p>
-          <h2>{mount.localPath}</h2>
+          <p className="label">{mount.connectorName} mounted folder</p>
+          <h2 title={mount.localPath}>{compactPath(mount.localPath, 78)}</h2>
           <p>
             Locality exposes this connected workspace as local files at the registered mount point.
           </p>
@@ -2762,46 +2753,6 @@ function RecentFilesPanel({
   );
 }
 
-function MountedWorkspacesPanel({ mounts }: { mounts: MountSummary[] }) {
-  return (
-    <section className="panel discovery-panel">
-      <div>
-        <p className="label">Workspaces</p>
-        <h2>{mounts.length ? "Local folders" : "No workspaces yet"}</h2>
-        <p>These are the roots Locality exposes as local folders.</p>
-      </div>
-      {mounts.length ? (
-        <div className="workspace-discovery-list">
-          {mounts.map((mount) => (
-            <div className="workspace-discovery-row" key={mount.mountId}>
-              <FolderOpen />
-              <div>
-                <strong>{mount.workspaceName}</strong>
-                <div className="workspace-row-path">
-                  <code>{mount.localPath}</code>
-                  <button className="icon-button has-tooltip" data-tooltip="Copy path" onClick={() => copyText(mount.localPath)}>
-                    <Copy />
-                  </button>
-                </div>
-                <span>{mount.connectorName} · {mount.accessScope}</span>
-              </div>
-              <SecondaryButton
-                compact
-                icon={<FolderOpen />}
-                onClick={() => void callCommand("open_path", { path: mount.localPath }, { ok: true })}
-              >
-                Open
-              </SecondaryButton>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <EmptyDiscoveryState text="Connect a workspace to make files available locally." />
-      )}
-    </section>
-  );
-}
-
 function FileDiscoveryRow({ item }: { item: LocatedItem }) {
   const [error, setError] = useState("");
   const stateIcon =
@@ -2830,7 +2781,7 @@ function FileDiscoveryRow({ item }: { item: LocatedItem }) {
       <div className="file-state">{stateIcon}</div>
       <div>
         <strong>{item.title}</strong>
-        <code>{item.localPath}</code>
+        <code title={item.localPath}>{compactPath(item.localPath, 68)}</code>
         <span>{item.kind} · {locatedStateLabel(item.state)}</span>
         {error && <p className="field-error">{error}</p>}
       </div>

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  compactPath,
   mountAccessLabel,
   mountRows,
   mountStatusLabel,
@@ -70,6 +71,7 @@ describe("mount display helpers", () => {
       title: "Notion",
       subtitle: "CodeFlash / notion",
       localPath: "/home/ada/Locality/notion",
+      displayPath: "/home/ada/Locality/notion",
       projection: "Linux FUSE",
       access: "Edit enabled",
       content: "24 items, 3 pending",
@@ -84,6 +86,15 @@ describe("mount display helpers", () => {
       content: "4 items",
       active: false,
     });
+  });
+
+  it("compacts long paths from the middle so filenames remain visible", () => {
+    expect(compactPath("/home/ada/Locality/notion/Engineering/Roadmap 2026/page.md", 42)).toBe(
+      "/.../Engineering/Roadmap 2026/page.md",
+    );
+    expect(compactPath("~/Library/CloudStorage/Locality/notion", 64)).toBe(
+      "~/Library/CloudStorage/Locality/notion",
+    );
   });
 
   it("selects the clicked mount row by mount id", () => {
