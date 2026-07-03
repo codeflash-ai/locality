@@ -463,8 +463,13 @@ where
     let result = connector.list_children(ListChildrenRequest {
         mount_id: mount.mount_id.clone(),
         container,
-        parent_path,
+        parent_path: parent_path.clone(),
     })?;
+    let returned_remote_ids = result
+        .entries
+        .iter()
+        .map(|entry| entry.remote_id.clone())
+        .collect::<BTreeSet<_>>();
 
     let mut saved = 0;
     let mut changed = false;
@@ -479,8 +484,25 @@ where
         store.save_entity(record).map_err(LocalityError::from)?;
         saved += 1;
     }
+    for entity in entities.iter().filter(|entity| {
+        entity_listing_parent_path(entity) == parent_path
+            && !returned_remote_ids.contains(&entity.remote_id)
+            && refreshed_child_can_be_pruned(entity)
+    }) {
+        store
+            .delete_entity(&mount.mount_id, &entity.remote_id)
+            .map_err(LocalityError::from)?;
+        changed = true;
+    }
 
     Ok(VirtualFsRefreshChildrenReport { saved, changed })
+}
+
+fn refreshed_child_can_be_pruned(entity: &EntityRecord) -> bool {
+    !matches!(
+        entity.hydration,
+        HydrationState::Dirty | HydrationState::Conflicted
+    )
 }
 
 pub fn virtual_fs_children_refresh_needed<S>(
@@ -2986,6 +3008,125 @@ mod tests {
         assert!(report.children.iter().any(|child| {
             child.identifier == "children:page-new" && child.kind == VirtualFsItemKind::Folder
         }));
+    }
+
+    #[test]
+    fn refresh_source_root_prunes_clean_children_no_longer_returned_by_connector() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(notion_synthetic_root_entity(
+                &mount_id,
+                locality_notion::projection::NOTION_WORKSPACE_ROOT_ID,
+                locality_notion::projection::NOTION_WORKSPACE_ROOT_DIR,
+                locality_notion::projection::NOTION_WORKSPACE_ROOT_DIR,
+            ))
+            .expect("save workspace root");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("old-child"),
+                EntityKind::Page,
+                "Old Child",
+                "Workspace/old-child/page.md",
+            ))
+            .expect("save stale flattened child");
+
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("root-page"),
+                kind: EntityKind::Page,
+                title: "Root Page".to_string(),
+                path: "Workspace/root-page/page.md".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::from("Workspace"),
+        };
+
+        let saved = refresh_virtual_fs_children(
+            &mut store,
+            &connector,
+            &mount_id,
+            locality_notion::projection::NOTION_WORKSPACE_ROOT_ID,
+        )
+        .expect("refresh workspace source root");
+
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("old-child"))
+                .expect("get stale child")
+                .is_none(),
+            "stale clean children from the refreshed source root should be removed"
+        );
+        let report = virtual_fs_children(
+            &store,
+            &mount_id,
+            locality_notion::projection::NOTION_WORKSPACE_ROOT_ID,
+        )
+        .expect("workspace children");
+        assert_eq!(report.children.len(), 1);
+        assert_eq!(report.children[0].identifier, "children:root-page");
+    }
+
+    #[test]
+    fn refresh_source_root_keeps_dirty_children_no_longer_returned_by_connector() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(notion_synthetic_root_entity(
+                &mount_id,
+                locality_notion::projection::NOTION_WORKSPACE_ROOT_ID,
+                locality_notion::projection::NOTION_WORKSPACE_ROOT_DIR,
+                locality_notion::projection::NOTION_WORKSPACE_ROOT_DIR,
+            ))
+            .expect("save workspace root");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("dirty-child"),
+                    EntityKind::Page,
+                    "Dirty Child",
+                    "Workspace/dirty-child/page.md",
+                )
+                .with_hydration(HydrationState::Dirty),
+            )
+            .expect("save dirty child");
+
+        let connector = StaticChildrenConnector {
+            entries: Vec::new(),
+            expected_parent_path: PathBuf::from("Workspace"),
+        };
+
+        let saved = refresh_virtual_fs_children(
+            &mut store,
+            &connector,
+            &mount_id,
+            locality_notion::projection::NOTION_WORKSPACE_ROOT_ID,
+        )
+        .expect("refresh workspace source root");
+
+        assert_eq!(saved.saved, 0);
+        assert!(!saved.changed);
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("dirty-child"))
+                .expect("get dirty child")
+                .is_some(),
+            "dirty children must remain available for conflict/review handling"
+        );
     }
 
     #[test]

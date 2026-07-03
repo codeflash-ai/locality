@@ -1932,7 +1932,7 @@ fn enumerate_suffixes_every_colliding_sibling_name() {
 }
 
 #[test]
-fn list_children_returns_workspace_root_pages_and_fallbacks_without_duplicates() {
+fn list_children_returns_workspace_root_pages_without_flattening_observed_children() {
     let api = FixtureNotionApi::workspace();
     let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
 
@@ -1966,7 +1966,7 @@ fn list_children_returns_workspace_root_pages_and_fallbacks_without_duplicates()
         })
         .expect("list workspace synthetic root");
 
-    assert_eq!(result.entries.len(), 3);
+    assert_eq!(result.entries.len(), 2);
     assert_eq!(result.entries[0].remote_id, RemoteId::new("root-page"));
     assert_eq!(result.entries[0].kind, EntityKind::Page);
     assert_eq!(
@@ -1981,13 +1981,12 @@ fn list_children_returns_workspace_root_pages_and_fallbacks_without_duplicates()
         result.entries[1].path,
         Path::new(NOTION_WORKSPACE_ROOT_DIR).join("tasks")
     );
-    assert_eq!(result.entries[2].remote_id, RemoteId::new("nested-page"));
-    assert_eq!(result.entries[2].kind, EntityKind::Page);
-    assert_eq!(
-        result.entries[2].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("nested")
-            .join("page.md")
+    assert!(
+        result
+            .entries
+            .iter()
+            .all(|entry| entry.remote_id != RemoteId::new("nested-page")),
+        "searchable child pages with an observed parent must not be duplicated under Workspace/"
     );
 }
 

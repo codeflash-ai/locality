@@ -498,6 +498,16 @@ fn project_workspace_root(
         .iter()
         .map(|page| page.id.as_str())
         .collect::<BTreeSet<_>>();
+    let accessible_database_ids = databases
+        .iter()
+        .map(|database| database.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let accessible_data_source_ids = databases
+        .iter()
+        .flat_map(|database| database.data_sources.iter())
+        .map(|data_source| data_source.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let search_projection = SearchParentProjection::new(&pages, &databases);
     let mut root_children = Vec::new();
 
     for page in pages
@@ -534,11 +544,29 @@ fn project_workspace_root(
             for projected in projected_root_children {
                 push_projected_tree_entry(api, mount_id, projected, used_paths, &mut tree_entries)?;
             }
-            tree_entries
+            let mut projected_page_ids = tree_entries
                 .iter()
                 .filter(|entry| entry.kind == EntityKind::Page)
                 .map(|entry| entry.remote_id.0.clone())
-                .collect::<BTreeSet<_>>()
+                .collect::<BTreeSet<_>>();
+            let mut projected_database_ids = tree_entries
+                .iter()
+                .filter(|entry| entry.kind == EntityKind::Database)
+                .map(|entry| entry.remote_id.0.clone())
+                .collect::<BTreeSet<_>>();
+            let projected_parents = tree_entries.clone();
+            for entry in &projected_parents {
+                push_search_parent_descendants(
+                    &search_projection,
+                    mount_id,
+                    entry,
+                    &mut projected_page_ids,
+                    &mut projected_database_ids,
+                    used_paths,
+                    &mut tree_entries,
+                );
+            }
+            projected_page_ids
         }
         WorkspaceRootProjectionMode::ShallowListing => projected_root_children
             .iter()
@@ -550,7 +578,15 @@ fn project_workspace_root(
     };
     let fallback_pages = pages
         .iter()
-        .filter(|page| !projected_page_ids.contains(&page.id))
+        .filter(|page| {
+            is_workspace_fallback_page(
+                page,
+                &projected_page_ids,
+                &accessible_page_ids,
+                &accessible_database_ids,
+                &accessible_data_source_ids,
+            )
+        })
         .map(|page| ProjectedChild::Page {
             page: page.clone(),
             title: page_title(page),
@@ -558,13 +594,249 @@ fn project_workspace_root(
         .collect::<Vec<_>>();
     for projected in allocate_child_paths(parent_path, fallback_pages, used_paths) {
         push_projected_listing_entry(mount_id, projected.clone(), &mut listing_entries);
-        push_projected_listing_entry(mount_id, projected, &mut tree_entries);
+        let entry = projected_child_entry(mount_id, projected);
+        if mode == WorkspaceRootProjectionMode::FullTree {
+            let mut projected_page_ids = tree_entries
+                .iter()
+                .filter(|entry| entry.kind == EntityKind::Page)
+                .map(|entry| entry.remote_id.0.clone())
+                .collect::<BTreeSet<_>>();
+            let mut projected_database_ids = tree_entries
+                .iter()
+                .filter(|entry| entry.kind == EntityKind::Database)
+                .map(|entry| entry.remote_id.0.clone())
+                .collect::<BTreeSet<_>>();
+            if entry.kind == EntityKind::Page {
+                projected_page_ids.insert(entry.remote_id.0.clone());
+            }
+            tree_entries.push(entry.clone());
+            push_search_parent_descendants(
+                &search_projection,
+                mount_id,
+                &entry,
+                &mut projected_page_ids,
+                &mut projected_database_ids,
+                used_paths,
+                &mut tree_entries,
+            );
+        } else {
+            tree_entries.push(entry);
+        }
     }
 
     Ok(WorkspaceRootProjection {
         tree_entries,
         listing_entries,
     })
+}
+
+struct SearchParentProjection {
+    children_by_page_id: BTreeMap<String, Vec<ProjectedChild>>,
+    rows_by_database_id: BTreeMap<String, Vec<ProjectedChild>>,
+}
+
+impl SearchParentProjection {
+    fn new(pages: &[PageDto], databases: &[DatabaseDto]) -> Self {
+        let database_ids = databases
+            .iter()
+            .map(|database| database.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let database_id_by_data_source_id = databases
+            .iter()
+            .flat_map(|database| {
+                database
+                    .data_sources
+                    .iter()
+                    .map(|data_source| (data_source.id.as_str(), database.id.as_str()))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut children_by_page_id = BTreeMap::<String, Vec<ProjectedChild>>::new();
+        let mut rows_by_database_id = BTreeMap::<String, Vec<ProjectedChild>>::new();
+
+        for page in pages {
+            let title = page_title(page);
+            if let Some(parent_page_id) = page.parent.as_ref().and_then(|parent| {
+                (parent.kind == "page_id")
+                    .then_some(parent.page_id.as_deref())
+                    .flatten()
+            }) {
+                children_by_page_id
+                    .entry(parent_page_id.to_string())
+                    .or_default()
+                    .push(ProjectedChild::Page {
+                        page: page.clone(),
+                        title,
+                    });
+            } else if let Some(database_id) = page.parent.as_ref().and_then(|parent| {
+                parent
+                    .data_source_id
+                    .as_deref()
+                    .and_then(|data_source_id| database_id_by_data_source_id.get(data_source_id))
+                    .copied()
+                    .or_else(|| {
+                        parent
+                            .database_id
+                            .as_deref()
+                            .filter(|database_id| database_ids.contains(database_id))
+                    })
+            }) {
+                rows_by_database_id
+                    .entry(database_id.to_string())
+                    .or_default()
+                    .push(ProjectedChild::Page {
+                        page: page.clone(),
+                        title,
+                    });
+            }
+        }
+
+        for database in databases {
+            let Some(parent_page_id) = database.parent.as_ref().and_then(|parent| {
+                (parent.kind == "page_id")
+                    .then_some(parent.page_id.as_deref())
+                    .flatten()
+            }) else {
+                continue;
+            };
+            let title = database_title(database).unwrap_or_else(|| "Untitled database".to_string());
+            children_by_page_id
+                .entry(parent_page_id.to_string())
+                .or_default()
+                .push(ProjectedChild::Database {
+                    database: database.clone(),
+                    title,
+                });
+        }
+
+        Self {
+            children_by_page_id,
+            rows_by_database_id,
+        }
+    }
+}
+
+fn push_search_parent_descendants(
+    search_projection: &SearchParentProjection,
+    mount_id: &MountId,
+    parent_entry: &TreeEntry,
+    projected_page_ids: &mut BTreeSet<String>,
+    projected_database_ids: &mut BTreeSet<String>,
+    used_paths: &mut BTreeSet<PathBuf>,
+    entries: &mut Vec<TreeEntry>,
+) {
+    let (parent_dir, children) = match parent_entry.kind {
+        EntityKind::Page => (
+            page_child_dir(&parent_entry.path),
+            search_projection
+                .children_by_page_id
+                .get(parent_entry.remote_id.as_str()),
+        ),
+        EntityKind::Database => (
+            parent_entry.path.clone(),
+            search_projection
+                .rows_by_database_id
+                .get(parent_entry.remote_id.as_str()),
+        ),
+        EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => return,
+    };
+
+    let Some(children) = children else {
+        return;
+    };
+    let missing_children = children
+        .iter()
+        .filter(|child| {
+            !projected_child_already_projected(child, projected_page_ids, projected_database_ids)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for projected in allocate_child_paths(&parent_dir, missing_children, used_paths) {
+        let entry = projected_child_entry(mount_id, projected);
+        match entry.kind {
+            EntityKind::Page => {
+                projected_page_ids.insert(entry.remote_id.0.clone());
+            }
+            EntityKind::Database => {
+                projected_database_ids.insert(entry.remote_id.0.clone());
+            }
+            EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => {}
+        }
+        entries.push(entry.clone());
+        push_search_parent_descendants(
+            search_projection,
+            mount_id,
+            &entry,
+            projected_page_ids,
+            projected_database_ids,
+            used_paths,
+            entries,
+        );
+    }
+}
+
+fn projected_child_already_projected(
+    child: &ProjectedChild,
+    projected_page_ids: &BTreeSet<String>,
+    projected_database_ids: &BTreeSet<String>,
+) -> bool {
+    match child {
+        ProjectedChild::Page { page, .. } => projected_page_ids.contains(&page.id),
+        ProjectedChild::Database { database, .. } => projected_database_ids.contains(&database.id),
+    }
+}
+
+fn projected_child_entry(mount_id: &MountId, projected: ProjectedChildWithPath) -> TreeEntry {
+    match projected.child {
+        ProjectedChild::Page { page, title } => {
+            page_entry(mount_id.clone(), &page, title, projected.path)
+        }
+        ProjectedChild::Database { database, title } => {
+            database_entry(mount_id.clone(), &database, title, projected.path)
+        }
+    }
+}
+
+fn is_workspace_fallback_page(
+    page: &PageDto,
+    projected_page_ids: &BTreeSet<String>,
+    accessible_page_ids: &BTreeSet<&str>,
+    accessible_database_ids: &BTreeSet<&str>,
+    accessible_data_source_ids: &BTreeSet<&str>,
+) -> bool {
+    if projected_page_ids.contains(&page.id) {
+        return false;
+    }
+
+    let Some(parent) = page.parent.as_ref() else {
+        return true;
+    };
+
+    if parent
+        .page_id
+        .as_deref()
+        .is_some_and(|parent_id| accessible_page_ids.contains(parent_id))
+    {
+        return false;
+    }
+
+    if parent
+        .database_id
+        .as_deref()
+        .is_some_and(|database_id| accessible_database_ids.contains(database_id))
+    {
+        return false;
+    }
+
+    if parent
+        .data_source_id
+        .as_deref()
+        .is_some_and(|data_source_id| accessible_data_source_ids.contains(data_source_id))
+    {
+        return false;
+    }
+
+    true
 }
 
 fn search_all_pages(api: &dyn NotionApi) -> LocalityResult<Vec<PageDto>> {
@@ -1516,6 +1788,41 @@ mod tests {
     }
 
     #[test]
+    fn workspace_enumeration_uses_search_parent_edges_for_nested_pages() {
+        let api = FakeNotionApi::new()
+            .with_page(page_with_title(
+                "root-page",
+                "Root Page",
+                workspace_parent(),
+            ))
+            .with_page(page_with_title(
+                "search-child",
+                "Search Child",
+                page_parent("root-page"),
+            ));
+
+        let entries = enumerate_shared_pages(&api, MountId::new("notion-main"))
+            .expect("enumerate shared pages");
+
+        assert_tree_entry(
+            &entries,
+            "root-page",
+            EntityKind::Page,
+            "Root Page",
+            "Workspace/root-page/page.md",
+            HydrationState::Stub,
+        );
+        assert_tree_entry(
+            &entries,
+            "search-child",
+            EntityKind::Page,
+            "Search Child",
+            "Workspace/root-page/search-child/page.md",
+            HydrationState::Stub,
+        );
+    }
+
+    #[test]
     fn root_page_enumeration_does_not_add_workspace_synthetic_roots() {
         let api = FakeNotionApi::new().with_page(page_with_title(
             "root-page",
@@ -1670,12 +1977,24 @@ mod tests {
             "Workspace/tasks",
             HydrationState::Stub,
         );
+        assert!(
+            workspace_children
+                .iter()
+                .all(|entry| entry.remote_id.as_str() != "child-page"),
+            "child pages with accessible parents must not flatten under Workspace/"
+        );
+        assert!(
+            workspace_children
+                .iter()
+                .all(|entry| entry.remote_id.as_str() != "task-row"),
+            "database rows with accessible data sources must not flatten under Workspace/"
+        );
         assert_eq!(api.retrieve_block_children_calls(), 0);
         assert_eq!(api.query_data_source_calls(), 0);
     }
 
     #[test]
-    fn workspace_source_root_lists_fallback_searchable_pages_under_workspace() {
+    fn workspace_source_root_does_not_flatten_searchable_children_with_accessible_parent() {
         let api = FakeNotionApi::new()
             .with_page(page_with_title(
                 "root-page",
@@ -1697,6 +2016,47 @@ mod tests {
         )
         .expect("list workspace synthetic root");
 
+        assert_eq!(
+            workspace_children
+                .iter()
+                .filter(|entry| entry.remote_id.as_str() == "search-only-child")
+                .count(),
+            0,
+            "child pages with accessible parents must stay below that parent, not flatten under Workspace/"
+        );
+        assert_tree_entry(
+            &workspace_children,
+            "root-page",
+            EntityKind::Page,
+            "Root Page",
+            "Workspace/root-page/page.md",
+            HydrationState::Stub,
+        );
+    }
+
+    #[test]
+    fn workspace_source_root_lists_fallback_searchable_pages_with_inaccessible_parent() {
+        let api = FakeNotionApi::new()
+            .with_page(page_with_title(
+                "root-page",
+                "Root Page",
+                workspace_parent(),
+            ))
+            .with_page(page_with_title(
+                "orphaned-search-page",
+                "Orphaned Search Page",
+                page_parent("inaccessible-parent"),
+            ));
+
+        let workspace_children = list_container_children(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            ChildContainer::SourceRoot(RemoteId::new(NOTION_WORKSPACE_ROOT_ID)),
+            Path::new(NOTION_WORKSPACE_ROOT_DIR),
+        )
+        .expect("list workspace synthetic root");
+
         assert_tree_entry(
             &workspace_children,
             "root-page",
@@ -1707,10 +2067,10 @@ mod tests {
         );
         assert_tree_entry(
             &workspace_children,
-            "search-only-child",
+            "orphaned-search-page",
             EntityKind::Page,
-            "Search Only Child",
-            "Workspace/search-only-child/page.md",
+            "Orphaned Search Page",
+            "Workspace/orphaned-search-page/page.md",
             HydrationState::Stub,
         );
     }
