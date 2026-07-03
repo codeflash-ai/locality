@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use locality_core::freshness::{FreshnessTier, RemoteVersion};
-use locality_core::hydration::HydrationReason;
+use locality_core::hydration::{HydrationPolicy, HydrationReason};
 use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
@@ -20,7 +20,7 @@ use localityd::reconcile::{
     DefaultFetchScheduleStrategy, EntityFetchPlan, EntityFetchSchedule, FetchScheduleStrategy,
     MountFetchPlan, MountFetchSchedule, ScheduledPullSource,
 };
-use localityd::scheduler::PullScheduler;
+use localityd::scheduler::{PullScheduler, PullSchedulerTick};
 use localityd::supervisor::DaemonSupervisor;
 use localityd::watcher::FileWatcher;
 
@@ -447,6 +447,208 @@ fn scheduled_pull_renames_existing_projection_when_remote_title_changes() {
     assert_eq!(child_entity.path, PathBuf::from("Vision/Child/page.md"));
 }
 
+#[test]
+fn scheduled_pull_keeps_entity_path_when_projection_rename_fails() {
+    let root = temp_root("scheduled-pull-rename-failure");
+    let mount_id = MountId::new("notion-main");
+    let remote_id = RemoteId::new("page-1");
+    let mount = MountConfig::new(mount_id.clone(), "notion", root.clone());
+    let old_path = PathBuf::from("Old/page.md");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "Old",
+            old_path.clone(),
+        ))
+        .expect("save old entity");
+    std::fs::create_dir_all(root.join("Old")).expect("old container");
+    std::fs::write(root.join(&old_path), "old body").expect("old page");
+    std::fs::write(root.join("Blocked"), "not a directory").expect("block parent");
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![page_entry(
+            &mount_id,
+            "page-1",
+            "Moved",
+            "Blocked/Moved/page.md",
+            "2026-06-11T00:00:00Z",
+        )],
+    );
+    let mut hydration = HydrationQueue::new();
+
+    let result = localityd::reconcile::reconcile_scheduled_pull(
+        &mut store,
+        &mut hydration,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: true,
+        },
+        &source,
+        &DefaultFetchScheduleStrategy,
+        &HydrationPolicy::default(),
+    );
+
+    assert!(result.is_err());
+    let entity = store
+        .get_entity(&mount_id, &remote_id)
+        .expect("get entity")
+        .expect("entity remains present");
+    assert_eq!(entity.path, old_path);
+}
+
+#[test]
+fn scheduled_pull_moves_migrated_reserved_root_container_left_on_disk() {
+    let root = temp_root("scheduled-pull-migrated-reserved-root");
+    let mount_id = MountId::new("notion-main");
+    let remote_id = RemoteId::new("page-1");
+    let mount = MountConfig::new(mount_id.clone(), "notion", root.clone());
+    let migrated_path = PathBuf::from("Workspace/private/page.md");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "private",
+            migrated_path.clone(),
+        ))
+        .expect("save migrated entity");
+    std::fs::create_dir_all(root.join("private")).expect("old container");
+    std::fs::write(root.join("private/page.md"), "local body").expect("old page");
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![
+            directory_entry(&mount_id, "notion-root:private", "Private", "Private"),
+            directory_entry(&mount_id, "notion-root:workspace", "Workspace", "Workspace"),
+            page_entry(
+                &mount_id,
+                "page-1",
+                "private",
+                "Workspace/private/page.md",
+                "2026-06-11T00:00:00Z",
+            ),
+        ],
+    );
+    let mut hydration = HydrationQueue::new();
+
+    localityd::reconcile::reconcile_scheduled_pull(
+        &mut store,
+        &mut hydration,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: true,
+        },
+        &source,
+        &DefaultFetchScheduleStrategy,
+        &HydrationPolicy::default(),
+    )
+    .expect("scheduled pull");
+
+    assert!(!root.join("private/page.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join(&migrated_path)).expect("migrated page"),
+        "local body"
+    );
+    let entity = store
+        .get_entity(&mount_id, &remote_id)
+        .expect("get entity")
+        .expect("entity");
+    assert_eq!(entity.path, migrated_path);
+}
+
+#[test]
+fn scheduled_pull_stages_all_reserved_root_collisions_before_final_moves() {
+    let root = temp_root("scheduled-pull-simultaneous-reserved-roots");
+    let mount_id = MountId::new("notion-main");
+    let private_id = RemoteId::new("private-page");
+    let workspace_id = RemoteId::new("workspace-page");
+    let mount = MountConfig::new(mount_id.clone(), "notion", root.clone());
+    let private_path = PathBuf::from("Workspace/private/page.md");
+    let workspace_path = PathBuf::from("Workspace/workspace/page.md");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            mount_id.clone(),
+            private_id.clone(),
+            EntityKind::Page,
+            "private",
+            private_path.clone(),
+        ))
+        .expect("save private entity");
+    store
+        .save_entity(EntityRecord::new(
+            mount_id.clone(),
+            workspace_id.clone(),
+            EntityKind::Page,
+            "workspace",
+            "Workspace/page.md",
+        ))
+        .expect("save workspace entity");
+    std::fs::create_dir_all(root.join("private")).expect("old private container");
+    std::fs::write(root.join("private/page.md"), "private body").expect("old private page");
+    std::fs::create_dir_all(root.join("Workspace")).expect("old workspace container");
+    std::fs::write(root.join("Workspace/page.md"), "workspace body").expect("old workspace page");
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![
+            directory_entry(&mount_id, "notion-root:private", "Private", "Private"),
+            directory_entry(&mount_id, "notion-root:workspace", "Workspace", "Workspace"),
+            page_entry(
+                &mount_id,
+                "private-page",
+                "private",
+                "Workspace/private/page.md",
+                "2026-06-11T00:00:00Z",
+            ),
+            page_entry(
+                &mount_id,
+                "workspace-page",
+                "workspace",
+                "Workspace/workspace/page.md",
+                "2026-06-11T00:00:00Z",
+            ),
+        ],
+    );
+    let mut hydration = HydrationQueue::new();
+
+    localityd::reconcile::reconcile_scheduled_pull(
+        &mut store,
+        &mut hydration,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: true,
+        },
+        &source,
+        &DefaultFetchScheduleStrategy,
+        &HydrationPolicy::default(),
+    )
+    .expect("scheduled pull");
+
+    assert!(!root.join("private/page.md").exists());
+    assert!(!root.join("Workspace/page.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join(&private_path)).expect("private page"),
+        "private body"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(&workspace_path)).expect("workspace page"),
+        "workspace body"
+    );
+    assert!(!root.join("Workspace/workspace/private/page.md").exists());
+}
+
 fn supervisor_with_mounts(
     mounts: impl IntoIterator<Item = MountConfig>,
 ) -> DaemonSupervisor<InMemoryStateStore, RecordingWatcher, HydrationQueue> {
@@ -499,6 +701,20 @@ fn database_entry(mount_id: &MountId, remote_id: &str, title: &str, path: &str) 
         hydration: HydrationState::Stub,
         content_hash: None,
         remote_edited_at: Some("2026-06-10T00:00:00Z".to_string()),
+        stub_frontmatter: None,
+    }
+}
+
+fn directory_entry(mount_id: &MountId, remote_id: &str, title: &str, path: &str) -> TreeEntry {
+    TreeEntry {
+        mount_id: mount_id.clone(),
+        remote_id: RemoteId::new(remote_id),
+        kind: EntityKind::Directory,
+        title: title.to_string(),
+        path: PathBuf::from(path),
+        hydration: HydrationState::Virtual,
+        content_hash: None,
+        remote_edited_at: None,
         stub_frontmatter: None,
     }
 }
