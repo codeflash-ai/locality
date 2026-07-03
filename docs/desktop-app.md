@@ -138,6 +138,16 @@ The app can track setup internally with human concepts:
 - Preparing files for agents
 - Starting background sync
 
+On macOS, this step is a blocked File Provider gate. If the Locality File
+Provider is registered but not yet enabled, the onboarding screen stays on step
+4, offers an `Allow in macOS` action, and opens Finder at the Locality File
+Provider root when possible. If macOS has accepted approval but has not yet
+materialized `~/Library/CloudStorage/Locality`, the screen remains blocked with
+`Check again` until the folder exists and the mount root passes verification.
+
+The final ready screen must not appear until File Provider approval, the
+CloudStorage root, and the mount root are all verified successfully.
+
 Do not show hydration queues, polling intervals, or low-level daemon concepts in
 the onboarding UI. Do not make the user wait for the full workspace projection
 or initial sync to finish before moving forward. Once Notion is connected, Locality

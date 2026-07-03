@@ -49,7 +49,17 @@ import {
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
 import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
-import { classifyMountSetupError, type MountSetupError } from "./onboarding-errors";
+import { classifyMountSetupError } from "./onboarding-errors";
+import {
+  failedMountOnboardingReport,
+  mountOnboardingHeadline,
+  mountOnboardingInstructions,
+  mountOnboardingNeedsInstructions,
+  mountOnboardingNextAction,
+  mountOnboardingPrimaryLabel,
+  mountOnboardingSupplementaryNote,
+  type WorkspaceMountOnboardingReport,
+} from "./onboarding-mount";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
@@ -1158,7 +1168,7 @@ function Onboarding({
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
-  const [mountError, setMountError] = useState<MountSetupError | null>(null);
+  const [mountOnboarding, setMountOnboarding] = useState<WorkspaceMountOnboardingReport | null>(null);
   const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
@@ -1250,15 +1260,15 @@ function Onboarding({
         connectionReady: connectionReadyNow,
         mountMissing: mountMissing(snapshot),
         mounting,
-        hasMountError: mountError !== null,
+        hasMountError: mountOnboarding !== null,
         mountPath,
         startRequested: mountStartRequestedRef.current,
       })
     ) {
       return;
     }
-    void startMount();
-  }, [connectionReadyNow, mountError, mountPath, mounting, snapshot.mount.status, step]);
+    void runMountOnboarding("start");
+  }, [connectionReadyNow, mountOnboarding, mountPath, mounting, snapshot.mount.status, step]);
 
   useEffect(() => {
     if (step !== 5 || mountMissing(snapshot) || agentGuidanceState !== "idle") {
@@ -1313,22 +1323,26 @@ function Onboarding({
     setLoginCopyMessage("Copied login link.");
   }
 
-  async function startMount() {
-    if (mountStartRequestedRef.current) {
+  async function runMountOnboarding(action: "start" | "allow_in_macos" | "check_again") {
+    if (mountStartRequestedRef.current || mounting) {
       return;
     }
 
     mountStartRequestedRef.current = true;
-    setMountError(null);
     setMounting(true);
     try {
-      const report = await callCommand<ActionReport>(
-        "create_workspace_mount",
-        { path: mountPath },
-        { ok: true, message: "Created demo mount." },
+      const report = await callCommand<WorkspaceMountOnboardingReport>(
+        "run_workspace_mount_onboarding",
+        { request: { path: mountPath, action } },
+        {
+          state: "created",
+          message: "Created demo mount.",
+          primaryAction: "retry_setup",
+          launchStrategy: "none",
+        },
       );
-      if (!report.ok) {
-        setMountError(classifyMountSetupError(report.message));
+      setMountOnboarding(report);
+      if (report.state !== "created") {
         return;
       }
       const cliReady = await ensureCliAvailable();
@@ -1343,9 +1357,10 @@ function Onboarding({
       setMountPathDirty(false);
       setMountPath(nextSnapshot.mount.localPath);
       await installAgentGuidance(nextSnapshot.mount.localPath);
+      setMountOnboarding(null);
       setStep(5);
     } catch (error) {
-      setMountError(classifyMountSetupError(errorMessage(error)));
+      setMountOnboarding(failedMountOnboardingReport(errorMessage(error)));
     } finally {
       mountStartRequestedRef.current = false;
       setMounting(false);
@@ -1363,10 +1378,10 @@ function Onboarding({
       { ok: true, message: "Locality terminal command is ready." },
     );
     if (!report.ok) {
-      setMountError(classifyMountSetupError(report.message));
+      setMountOnboarding(failedMountOnboardingReport(report.message));
       return false;
     }
-    setMountError(null);
+    setMountOnboarding(null);
     return true;
   }
 
@@ -1386,21 +1401,21 @@ function Onboarding({
         setMountPath(selected.replace(/\/$/, ""));
       }
     } catch (error) {
-      setMountError(classifyMountSetupError(errorMessage(error)));
+      setMountOnboarding(failedMountOnboardingReport(errorMessage(error)));
     }
   }
 
   async function openMountFolder() {
-    setMountError(null);
     const report = await callCommand<ActionReport>(
       "open_path",
       { path: mountPath },
       { ok: true, message: "Opened demo folder." },
     );
     if (!report.ok) {
-      setMountError(classifyMountSetupError(report.message));
+      setMountOnboarding(failedMountOnboardingReport(report.message));
       return;
     }
+    setMountOnboarding(null);
   }
 
   function finishOnboarding() {
@@ -1436,7 +1451,11 @@ function Onboarding({
 
   const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
   const finalPrompt = agentGuidanceReport?.prompt || suggestedAgentPrompt(mountPath);
-  const showRecoveryChooser = mountRecoveryEnabled(mountError);
+  const mountSetupError =
+    mountOnboarding?.state === "failed"
+      ? classifyMountSetupError(mountOnboarding.message)
+      : null;
+  const showRecoveryChooser = mountRecoveryEnabled(mountSetupError);
 
   return (
     <main className="setup-shell">
@@ -1535,36 +1554,60 @@ function Onboarding({
         )}
 
         {step === 4 && (
-          <SetupContent mark={<BrandTile variant="progress" />} variant="wide">
+          <SetupContent
+            mark={<BrandTile variant={mountOnboarding?.state === "failed" ? "folder" : "progress"} />}
+            variant="wide"
+          >
             <div>
               <div className="eyebrow">Local folder</div>
-              <h1>Creating your local folder.</h1>
+              <h1>{mountOnboardingHeadline(mountOnboarding)}</h1>
               <p>
-                Locality is creating your Notion folder under the default CloudStorage root and
-                preparing agent guidance.
+                {mountOnboarding?.message ??
+                  "Locality is creating your Notion folder under the default CloudStorage root and preparing agent guidance."}
               </p>
             </div>
             <div className="sync-note">
-              {mountError ? <AlertTriangle /> : <Loader2 className="spin-icon" />}
-              {mountError ? "Folder setup needs attention" : "Creating folder and preparing Notion files"}
+              {mounting ? (
+                <Loader2 className="spin-icon" />
+              ) : mountOnboarding?.state === "failed" ? (
+                <AlertTriangle />
+              ) : (
+                <FolderOpen />
+              )}
+              {mounting
+                ? "Checking File Provider approval"
+                : mountOnboarding?.message ?? "Creating folder and preparing Notion files"}
             </div>
             <div className="path-field ready-path-field">
               <span>{mountPath}</span>
             </div>
-            {mountError?.kind !== "file-provider-disabled" && (
+            {showRecoveryChooser ? (
               <div className="button-row">
-                <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
-                  {mounting ? "Creating Local Folder" : mountError ? "Try Again" : "Preparing Local Folder"}
+                <PrimaryButton
+                  busy={mounting}
+                  disabled={!mountPath.trim()}
+                  onClick={() => void runMountOnboarding(mountOnboardingNextAction(mountOnboarding))}
+                >
+                  {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
                 </PrimaryButton>
-                {showRecoveryChooser && (
-                  <SecondaryButton disabled={mounting} onClick={() => void chooseFolder()}>
-                    Choose Folder
-                  </SecondaryButton>
-                )}
+                <SecondaryButton disabled={mounting} onClick={() => void chooseFolder()}>
+                  Choose Folder
+                </SecondaryButton>
               </div>
+            ) : (
+              <PrimaryButton
+                busy={mounting}
+                disabled={!mountPath.trim()}
+                onClick={() => void runMountOnboarding(mountOnboardingNextAction(mountOnboarding))}
+              >
+                {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
+              </PrimaryButton>
             )}
-            {mountError && (
-              <MountSetupErrorCallout error={mountError} onRetry={startMount} retrying={mounting} />
+            {mountOnboardingNeedsInstructions(mountOnboarding) && (
+              <p className="quiet-note">{mountOnboardingInstructions(mountOnboarding)}</p>
+            )}
+            {mountOnboardingSupplementaryNote(mountOnboarding) && (
+              <p className="quiet-note">{mountOnboardingSupplementaryNote(mountOnboarding)}</p>
             )}
             <p className="quiet-note">
               Locality uses the default CloudStorage location so Finder and your agents see the
@@ -1584,7 +1627,7 @@ function Onboarding({
                 new Notion changes to appear locally.
               </p>
             </div>
-            {mountError && <p className="field-error">{mountError.message}</p>}
+            {mountOnboarding && <p className="field-error">{mountOnboarding.message}</p>}
             <div className="final-actions">
               <PrimaryButton onClick={finishOnboarding}>
                 Open Locality
@@ -5081,40 +5124,6 @@ function SetupContent({
       >
         {mark ? mark : null}
         {children}
-      </div>
-    </div>
-  );
-}
-
-function MountSetupErrorCallout({
-  error,
-  onRetry,
-  retrying,
-}: {
-  error: MountSetupError;
-  onRetry: () => void;
-  retrying: boolean;
-}) {
-  if (error.kind !== "file-provider-disabled") {
-    return <p className="field-error">{error.message}</p>;
-  }
-
-  return (
-    <div className="setup-permission-callout">
-      <div className="setup-permission-icon">
-        <FolderOpen />
-      </div>
-      <div className="setup-permission-copy">
-        <strong>Enable Locality in Finder</strong>
-        <p>
-          Locality is installed, but macOS has not enabled its File Provider yet. In Finder, look
-          for Locality under Locations and choose Enable. If Finder does not show it, open System
-          Settings, go to Privacy &amp; Security, then enable Locality under Extensions or File
-          Providers.
-        </p>
-        <PrimaryButton compact busy={retrying} onClick={onRetry}>
-          Retry
-        </PrimaryButton>
       </div>
     </div>
   );
