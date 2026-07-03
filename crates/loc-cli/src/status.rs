@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use locality_core::canonical::parse_canonical_markdown;
+use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
 use locality_core::conflict::unresolved_conflict_marker_line;
 use locality_core::diff::{BlockDiffEngine, DiffEngine};
 use locality_core::freshness::FreshnessTier;
@@ -1241,6 +1241,9 @@ where
     {
         return (StatusState::Stub, Vec::new());
     }
+    if entity.hydration == HydrationState::Hydrated && !cache_exists {
+        return classify_virtual_page_state_from_shadow(store, mount, entity);
+    }
     if !cache_exists {
         return (
             StatusState::Missing,
@@ -1263,6 +1266,48 @@ where
             );
         }
     };
+
+    classify_page_contents(store, mount, entity, &contents)
+}
+
+fn classify_virtual_page_state_from_shadow<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity: &EntityRecord,
+) -> (StatusState, Vec<StatusIssue>)
+where
+    S: ShadowRepository,
+{
+    let shadow = match store.load_shadow(&mount.mount_id, &entity.remote_id) {
+        Ok(shadow) => shadow,
+        Err(StoreError::ShadowMissing { .. }) => {
+            return (
+                StatusState::Error,
+                vec![StatusIssue::new(
+                    "shadow_missing",
+                    "Synced Tree shadow snapshot is missing",
+                )],
+            );
+        }
+        Err(error) => {
+            return (
+                StatusState::Error,
+                vec![StatusIssue::new(
+                    "shadow_read_failed",
+                    format!("failed to read Synced Tree shadow: {error}"),
+                )],
+            );
+        }
+    };
+    let frontmatter = if shadow.frontmatter.trim().is_empty() {
+        frontmatter_from_entity(entity)
+    } else {
+        shadow.frontmatter.clone()
+    };
+    let contents = render_canonical_markdown(&CanonicalDocument::new(
+        frontmatter,
+        shadow.rendered_body.clone(),
+    ));
 
     classify_page_contents(store, mount, entity, &contents)
 }
@@ -1582,6 +1627,26 @@ fn absolute_path(path: &Path) -> Result<PathBuf, StatusError> {
 
 fn default_state_root() -> PathBuf {
     locality_platform::default_state_root()
+}
+
+fn frontmatter_from_entity(entity: &EntityRecord) -> String {
+    let mut frontmatter = format!("loc:\n  id: {}\n  type: page\n", entity.remote_id.0);
+    if let Some(remote_edited_at) = &entity.remote_edited_at {
+        frontmatter.push_str(&format!("  remote_edited_at: {remote_edited_at}\n"));
+    }
+    frontmatter.push_str(&format!("title: {}\n", yaml_string(&entity.title)));
+    frontmatter
+}
+
+fn yaml_string(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.'))
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 fn find_mount_for_path<'a>(mounts: &'a [MountConfig], path: &Path) -> Option<&'a MountConfig> {

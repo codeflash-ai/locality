@@ -593,6 +593,30 @@ try {
     Write-Step "pushing page edit"
     Invoke-Native -FilePath $locBin -Arguments @("push", $pageFile, "-y", "--json") -Step "push edited page" | Out-Null
     Wait-ForStatusContains -Path $pageFile -Needle '"state": "clean"'
+
+    Write-Step "verifying missing clean content cache stays synced"
+    $relativePageFile = [System.IO.Path]::GetRelativePath($NotionMount, $pageFile)
+    $contentRoot = Join-Path (Join-Path (Join-Path $stateRoot "content") $mountId) "files"
+    $contentCachePage = Join-Path $contentRoot $relativePageFile
+    if (-not (Test-Path -LiteralPath $contentCachePage)) {
+        throw "expected hydrated content cache at $contentCachePage"
+    }
+    Remove-ItemWithTimeout -Path $contentCachePage
+    $statusAfterCacheLossOutput = Invoke-Native -FilePath $locBin -Arguments @("status", $pageFile, "--json") -Step "loc status after deleting content cache"
+    $statusAfterCacheLoss = $statusAfterCacheLossOutput | ConvertFrom-Json
+    $cacheLossEntry = @($statusAfterCacheLoss.mounts | ForEach-Object { $_.entries } | Select-Object -First 1)[0]
+    if (-not $statusAfterCacheLoss.clean -or -not $cacheLossEntry -or $cacheLossEntry.state -ne "clean") {
+        throw "missing clean content cache should remain clean: $statusAfterCacheLossOutput"
+    }
+    $contentCacheMissingIssues = @($cacheLossEntry.issues | Where-Object { $_.code -eq "content_cache_missing" })
+    if ($contentCacheMissingIssues.Count -gt 0) {
+        throw "missing clean content cache reported content_cache_missing: $statusAfterCacheLossOutput"
+    }
+    Invoke-Native -FilePath $locBin -Arguments @("restore", $pageFile, "--json") -Step "restore deleted content cache" | Out-Null
+    if (-not (Test-Path -LiteralPath $contentCachePage)) {
+        throw "restore did not recreate hydrated content cache at $contentCachePage"
+    }
+
     Write-Step "verifying page edit in Notion"
     $remoteText = Get-NotionBlockText -PageId $scratchPageId
     if (-not $remoteText.Contains($editMarker)) {

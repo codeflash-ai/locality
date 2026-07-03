@@ -852,6 +852,45 @@ fn status_reads_virtual_projection_from_content_cache() {
 }
 
 #[test]
+fn status_keeps_clean_windows_cloud_files_page_synced_when_content_cache_is_missing() {
+    let fixture = StatusFixture::new();
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+                .projection(ProjectionMode::WindowsCloudFiles),
+        )
+        .expect("save virtual mount");
+    fixture.hydrated_page(
+        &mut store,
+        "page-1",
+        "Roadmap.md",
+        "# Roadmap\n\nSame paragraph.",
+    );
+
+    let report = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status report");
+
+    assert!(report.clean, "{report:#?}");
+    assert_eq!(report.summary.clean, 1);
+    assert_eq!(report.summary.missing, 0);
+    assert_eq!(report.summary.review_needed, 0);
+    assert_eq!(entry_state(&report, "Roadmap.md"), StatusState::Clean);
+    assert_eq!(
+        entry_sync_state(&report, "Roadmap.md"),
+        StatusSyncState::AllSynced
+    );
+    assert!(status_entry(&report, "Roadmap.md").issues.is_empty());
+}
+
+#[test]
 fn status_reports_stub_virtual_cache_edits_as_dirty() {
     let fixture = StatusFixture::new();
     let mut store = InMemoryStateStore::new();
