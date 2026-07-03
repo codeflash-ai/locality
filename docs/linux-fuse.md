@@ -118,6 +118,12 @@ ls -la "$HOME/Locality"
 ls -la "$HOME/Locality/notion-main"
 ```
 
+For workspace Notion mounts, the FUSE virtual listing shows the synthetic
+`Private/` and `Workspace/` roots under the mount point. These roots are folders
+only and do not contain `page.md`. Create private top-level pages under
+`Private/`; create children inside existing page directories rather than
+directly under `Workspace/`.
+
 Read a projected Markdown file to force hydration:
 
 ```bash

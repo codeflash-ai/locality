@@ -185,6 +185,20 @@ When two siblings normalize to the same slug, all colliding siblings use a short
 remote ID suffix such as `slugified-title aaaaaa/page.md`. The suffix lengthens
 only when needed to keep sibling names unique.
 
+## Workspace Mount Root Layout
+
+Workspace Notion mounts expose two synthetic directories at the mount root:
+`Private/` and `Workspace/`. Existing accessible top-level Notion pages and
+databases appear under `Workspace/`, along with searchable accessible objects
+that Locality cannot safely place under an observed parent.
+
+A local draft at `Private/<Page Title>/page.md` is pushed, or synced by Live
+Mode, as a private workspace page by omitting the Notion API `parent` payload.
+Direct creation under `Workspace/` is rejected because parent selection is
+ambiguous. To create child pages, create a page directory inside an existing
+page directory; the containing directory continues to determine the remote
+parent.
+
 Each Notion page is a directory. The page body lives in `page.md`; sibling entries in the same directory are child Notion content:
 
 ```text
