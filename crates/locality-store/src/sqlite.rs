@@ -43,6 +43,12 @@ const DB_FILE: &str = "state.sqlite3";
 const SCHEMA_VERSION: i64 = 15;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
+const NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION: i64 = 1;
+const NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
+const NOTION_PRIVATE_ROOT_ID: &str = "notion-root:private";
+const NOTION_WORKSPACE_ROOT_ID: &str = "notion-root:workspace";
+const NOTION_PRIVATE_ROOT_DIR: &str = "Private";
+const NOTION_WORKSPACE_ROOT_DIR: &str = "Workspace";
 const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
 const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
 const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
@@ -77,6 +83,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
         component_id: "projection:macos_file_provider",
         component_kind: "projection_layout",
         current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: NOTION_WORKSPACE_ROOTS_COMPONENT_ID,
+        component_kind: "projection_layout",
+        current_version: NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION,
         min_reader_version: 1,
         required: true,
         rebuildable: false,
@@ -1526,6 +1541,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         ensure_state_components_allow_schema_migration(connection, user_version)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
+        migrate_notion_workspace_roots_projection_layout_to_v1(connection)?;
         return Ok(());
     }
 
@@ -1912,6 +1928,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         seed_default_notion_profile(connection)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, user_version < 13)?;
+        migrate_notion_workspace_roots_projection_layout_to_v1(connection)?;
         seed_current_state_components(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
@@ -1964,8 +1981,19 @@ fn state_component_issue_allows_schema_migration(
         } if component_id == "projection:windows_cloud_files"
     ) || matches!(
         issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found: 0,
+            current: NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION,
+        } if component_id == NOTION_WORKSPACE_ROOTS_COMPONENT_ID
+    ) || matches!(
+        issue,
         StateCompatibilityIssue::MissingComponent { component_id }
             if component_id == "projection:windows_cloud_files"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if component_id == NOTION_WORKSPACE_ROOTS_COMPONENT_ID
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
@@ -2632,6 +2660,231 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
     )
 }
 
+fn migrate_notion_workspace_roots_projection_layout_to_v1(
+    connection: &Connection,
+) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let component = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = ?1",
+            params![NOTION_WORKSPACE_ROOTS_COMPONENT_ID],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if let Some((component_version, min_reader_version)) = component {
+        if component_version > NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION {
+            return Err(StoreError::StateCompatibility(format!(
+                "state component {NOTION_WORKSPACE_ROOTS_COMPONENT_ID} version {component_version} is newer than supported version {NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION}",
+            )));
+        }
+        if min_reader_version > NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION {
+            return Err(StoreError::StateCompatibility(format!(
+                "state component {NOTION_WORKSPACE_ROOTS_COMPONENT_ID} requires reader version {min_reader_version}, but supported version is {NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION}",
+            )));
+        }
+        if component_version >= NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION {
+            return Ok(());
+        }
+    }
+
+    let from_version = component.map(|(version, _)| version).unwrap_or(0);
+    let transaction = connection.unchecked_transaction()?;
+    let workspace_mounts = {
+        let mut statement = transaction.prepare(
+            "SELECT mount_id
+             FROM mounts
+             WHERE connector = 'notion'
+               AND remote_root_id IS NULL
+             ORDER BY mount_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for mount_id in &workspace_mounts {
+        upsert_notion_workspace_synthetic_root(
+            &transaction,
+            mount_id,
+            NOTION_PRIVATE_ROOT_ID,
+            NOTION_PRIVATE_ROOT_DIR,
+        )?;
+        upsert_notion_workspace_synthetic_root(
+            &transaction,
+            mount_id,
+            NOTION_WORKSPACE_ROOT_ID,
+            NOTION_WORKSPACE_ROOT_DIR,
+        )?;
+    }
+
+    let mut rewritten_paths = 0;
+    rewritten_paths += rewrite_notion_workspace_root_paths(
+        &transaction,
+        "entities",
+        "path",
+        "AND remote_id NOT IN ('notion-root:private', 'notion-root:workspace')",
+        false,
+    )?;
+    rewritten_paths += rewrite_notion_workspace_root_paths(
+        &transaction,
+        "remote_observations",
+        "projected_path",
+        "",
+        false,
+    )?;
+    rewritten_paths +=
+        rewrite_notion_workspace_root_paths(&transaction, "hydration_jobs", "path", "", false)?;
+    rewritten_paths += rewrite_notion_workspace_root_paths(
+        &transaction,
+        "virtual_mutations",
+        "projected_path",
+        "",
+        false,
+    )?;
+    rewritten_paths += rewrite_notion_workspace_root_paths(
+        &transaction,
+        "virtual_mutations",
+        "original_path",
+        "",
+        false,
+    )?;
+    rewritten_paths += rewrite_notion_workspace_root_paths(
+        &transaction,
+        "virtual_mutations",
+        "content_path",
+        "",
+        true,
+    )?;
+    rewritten_paths += rewrite_notion_workspace_root_paths(
+        &transaction,
+        "auto_save_enrollments",
+        "path",
+        "",
+        false,
+    )?;
+
+    if !workspace_mounts.is_empty() || rewritten_paths > 0 {
+        rebuild_entity_search_index(&transaction)?;
+    }
+    upsert_current_state_component_version(
+        &transaction,
+        NOTION_WORKSPACE_ROOTS_COMPONENT_ID,
+        NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION,
+    )?;
+    if from_version > 0 || !workspace_mounts.is_empty() || rewritten_paths > 0 {
+        record_component_migration(
+            &transaction,
+            NOTION_WORKSPACE_ROOTS_COMPONENT_ID,
+            from_version,
+            NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION,
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn upsert_notion_workspace_synthetic_root(
+    connection: &Connection,
+    mount_id: &str,
+    remote_id: &str,
+    title_and_path: &str,
+) -> StoreResult<()> {
+    connection.execute(
+        "INSERT INTO entities (
+            mount_id,
+            remote_id,
+            kind_json,
+            title,
+            path,
+            hydration_json,
+            content_hash,
+            remote_edited_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, NULL, NULL)
+         ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+            kind_json = excluded.kind_json,
+            title = excluded.title,
+            path = excluded.path,
+            hydration_json = excluded.hydration_json,
+            content_hash = NULL,
+            remote_edited_at = NULL",
+        params![
+            mount_id,
+            remote_id,
+            to_json(&EntityKind::Directory)?,
+            title_and_path,
+            to_json(&HydrationState::Virtual)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn rewrite_notion_workspace_root_paths(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    extra_where: &str,
+    skip_absolute: bool,
+) -> StoreResult<usize> {
+    let select_sql = format!(
+        "SELECT rowid, {column}
+         FROM {table}
+         WHERE mount_id IN (
+             SELECT mount_id
+             FROM mounts
+             WHERE connector = 'notion'
+               AND remote_root_id IS NULL
+         )
+           AND {column} IS NOT NULL
+           {extra_where}
+         ORDER BY rowid"
+    );
+    let rows = {
+        let mut statement = connection.prepare(&select_sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let update_sql = format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2");
+    let mut rewritten = 0;
+    for (rowid, path) in rows {
+        let Some(rewritten_path) = notion_workspace_root_repaired_path(&path, skip_absolute) else {
+            continue;
+        };
+        connection.execute(&update_sql, params![rewritten_path, rowid])?;
+        rewritten += 1;
+    }
+    Ok(rewritten)
+}
+
+fn notion_workspace_root_repaired_path(path: &str, skip_absolute: bool) -> Option<String> {
+    if path.is_empty()
+        || path == NOTION_PRIVATE_ROOT_DIR
+        || path == NOTION_WORKSPACE_ROOT_DIR
+        || path.starts_with("Private/")
+        || path.starts_with("Private\\")
+        || path.starts_with("Workspace/")
+        || path.starts_with("Workspace\\")
+        || (skip_absolute && is_probably_absolute_path(path))
+    {
+        None
+    } else {
+        Some(format!("{NOTION_WORKSPACE_ROOT_DIR}/{path}"))
+    }
+}
+
+fn is_probably_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with('\\')
+        || (bytes.len() >= 3
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\')
+            && bytes[0].is_ascii_alphabetic())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MissingProjectionComponent {
     Error,
@@ -2783,40 +3036,58 @@ fn connector_root_directory_name(connector: &str) -> String {
 
 fn seed_current_state_components(connection: &Connection) -> StoreResult<()> {
     create_state_management_tables(connection)?;
-    let updated_at = unix_timestamp_string();
     for definition in CURRENT_COMPONENT_DEFINITIONS {
-        connection.execute(
-            "INSERT INTO state_components (
-                component_id,
-                component_kind,
-                version,
-                min_reader_version,
-                required,
-                rebuildable,
-                data_json,
-                updated_at
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(component_id) DO UPDATE SET
-                component_kind = excluded.component_kind,
-                version = excluded.version,
-                min_reader_version = excluded.min_reader_version,
-                required = excluded.required,
-                rebuildable = excluded.rebuildable,
-                data_json = excluded.data_json,
-                updated_at = excluded.updated_at",
-            params![
-                definition.component_id,
-                definition.component_kind,
-                definition.current_version,
-                definition.min_reader_version,
-                bool_to_int(definition.required),
-                bool_to_int(definition.rebuildable),
-                definition.data_json,
-                &updated_at,
-            ],
+        upsert_current_state_component_version(
+            connection,
+            definition.component_id,
+            definition.current_version,
         )?;
     }
+    Ok(())
+}
+
+fn upsert_current_state_component_version(
+    connection: &Connection,
+    component_id: &str,
+    version: i64,
+) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let definition = CURRENT_COMPONENT_DEFINITIONS
+        .iter()
+        .find(|definition| definition.component_id == component_id)
+        .expect("known state component definition");
+    let updated_at = unix_timestamp_string();
+    connection.execute(
+        "INSERT INTO state_components (
+            component_id,
+            component_kind,
+            version,
+            min_reader_version,
+            required,
+            rebuildable,
+            data_json,
+            updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(component_id) DO UPDATE SET
+            component_kind = excluded.component_kind,
+            version = excluded.version,
+            min_reader_version = excluded.min_reader_version,
+            required = excluded.required,
+            rebuildable = excluded.rebuildable,
+            data_json = excluded.data_json,
+            updated_at = excluded.updated_at",
+        params![
+            definition.component_id,
+            definition.component_kind,
+            version,
+            definition.min_reader_version,
+            bool_to_int(definition.required),
+            bool_to_int(definition.rebuildable),
+            definition.data_json,
+            &updated_at,
+        ],
+    )?;
     Ok(())
 }
 
@@ -2857,7 +3128,9 @@ fn seed_missing_state_components(connection: &Connection) -> StoreResult<()> {
 fn repairable_missing_state_component(component_id: &str) -> bool {
     !matches!(
         component_id,
-        "projection:linux_fuse" | "projection:windows_cloud_files"
+        "projection:linux_fuse"
+            | "projection:windows_cloud_files"
+            | NOTION_WORKSPACE_ROOTS_COMPONENT_ID
     )
 }
 
@@ -2899,6 +3172,49 @@ fn record_schema_migration(connection: &Connection, from: i64, to: i64) -> Store
         params![migration_id, from, to, env!("CARGO_PKG_VERSION"), now],
     )?;
     Ok(())
+}
+
+fn record_component_migration(
+    connection: &Connection,
+    component_id: &str,
+    from: i64,
+    to: i64,
+) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let now = unix_timestamp_string();
+    let migration_id = component_migration_id(component_id, from, to);
+    connection.execute(
+        "INSERT INTO state_migrations (
+            migration_id,
+            from_schema_version,
+            to_schema_version,
+            app_version,
+            app_build_id,
+            daemon_build_id,
+            started_at,
+            finished_at,
+            status,
+            error_json
+         )
+         VALUES (?1, ?2, ?2, ?3, NULL, NULL, ?4, ?4, 'finished', NULL)
+         ON CONFLICT(migration_id) DO NOTHING",
+        params![migration_id, SCHEMA_VERSION, env!("CARGO_PKG_VERSION"), now],
+    )?;
+    Ok(())
+}
+
+fn component_migration_id(component_id: &str, from: i64, to: i64) -> String {
+    let component = component_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("component-{component}-{from}-to-{to}")
 }
 
 fn read_user_version(connection: &Connection) -> StoreResult<i64> {

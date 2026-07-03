@@ -133,6 +133,14 @@ fn sqlite_store_seeds_state_compatibility_components() {
                 0,
             ),
             (
+                "projection:notion_workspace_roots".to_string(),
+                "projection_layout".to_string(),
+                1,
+                1,
+                1,
+                0,
+            ),
+            (
                 "projection:plain_files".to_string(),
                 "projection_layout".to_string(),
                 1,
@@ -1012,6 +1020,247 @@ fn sqlite_store_newer_windows_cloud_files_reader_requirement_does_not_rewrite_mo
         )
         .expect("mount root");
     assert_eq!(PathBuf::from(root), old_shared_root);
+}
+
+#[test]
+fn sqlite_store_repairs_missing_notion_workspace_roots_component() {
+    let fixture = SqliteFixture::new();
+    let db_path = seed_notion_workspace_roots_legacy_state(&fixture);
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute(
+            "DELETE FROM state_components
+             WHERE component_id = 'projection:notion_workspace_roots'",
+            [],
+        )
+        .expect("delete notion workspace roots component");
+    drop(connection);
+
+    let before =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
+    assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+    assert_eq!(
+        before.issues,
+        vec![StateCompatibilityIssue::MissingComponent {
+            component_id: "projection:notion_workspace_roots".to_string(),
+        }]
+    );
+
+    let reopened = fixture.open();
+
+    let after =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
+    assert_eq!(after.status, StateCompatibilityStatus::Ready);
+    assert!(after.issues.is_empty());
+
+    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+    let synthetic_roots = query_entities_for_mount(&connection, &fixture.mount_id);
+    assert_eq!(
+        synthetic_roots,
+        vec![
+            (
+                "notion-root:private".to_string(),
+                "directory".to_string(),
+                "Private".to_string(),
+                "Private".to_string(),
+                "virtual".to_string(),
+            ),
+            (
+                "notion-root:workspace".to_string(),
+                "directory".to_string(),
+                "Workspace".to_string(),
+                "Workspace".to_string(),
+                "virtual".to_string(),
+            ),
+            (
+                "already-workspace".to_string(),
+                "page".to_string(),
+                "Already".to_string(),
+                "Workspace/Already/page.md".to_string(),
+                "stub".to_string(),
+            ),
+            (
+                "workspace-page".to_string(),
+                "page".to_string(),
+                "Roadmap".to_string(),
+                "Workspace/Roadmap/page.md".to_string(),
+                "stub".to_string(),
+            ),
+        ]
+    );
+
+    let root_page_path: String = connection
+        .query_row(
+            "SELECT path
+             FROM entities
+             WHERE mount_id = 'notion-root-page'
+               AND remote_id = 'root-child'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("root-page entity path");
+    let non_notion_path: String = connection
+        .query_row(
+            "SELECT path
+             FROM entities
+             WHERE mount_id = 'google-docs-main'
+               AND remote_id = 'doc-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("non-notion entity path");
+    assert_eq!(root_page_path, "Root Child/page.md");
+    assert_eq!(non_notion_path, "Doc/page.md");
+
+    let observation_path: String = connection
+        .query_row(
+            "SELECT projected_path
+             FROM remote_observations
+             WHERE mount_id = ?1
+               AND remote_id = 'workspace-page'",
+            params![fixture.mount_id.0.as_str()],
+            |row| row.get(0),
+        )
+        .expect("remote observation path");
+    let hydration_path: String = connection
+        .query_row(
+            "SELECT path
+             FROM hydration_jobs
+             WHERE mount_id = ?1
+               AND remote_id = 'workspace-page'",
+            params![fixture.mount_id.0.as_str()],
+            |row| row.get(0),
+        )
+        .expect("hydration job path");
+    let mutation_paths: (String, String, String) = connection
+        .query_row(
+            "SELECT original_path, projected_path, content_path
+             FROM virtual_mutations
+             WHERE mount_id = ?1
+               AND local_id = 'local:rename'",
+            params![fixture.mount_id.0.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("virtual mutation paths");
+    let auto_save_path: String = connection
+        .query_row(
+            "SELECT path
+             FROM auto_save_enrollments
+             WHERE mount_id = ?1
+               AND remote_id = 'workspace-page'",
+            params![fixture.mount_id.0.as_str()],
+            |row| row.get(0),
+        )
+        .expect("auto-save path");
+    let indexed_path: String = connection
+        .query_row(
+            "SELECT path
+             FROM entity_search_fts
+             WHERE mount_id = ?1
+               AND remote_id = 'workspace-page'",
+            params![fixture.mount_id.0.as_str()],
+            |row| row.get(0),
+        )
+        .expect("indexed path");
+    assert_eq!(observation_path, "Workspace/Roadmap/page.md");
+    assert_eq!(hydration_path, "Workspace/Roadmap/page.md");
+    assert_eq!(
+        mutation_paths,
+        (
+            "Workspace/Roadmap/page.md".to_string(),
+            "Workspace/Roadmap Renamed/page.md".to_string(),
+            "Workspace/Roadmap Renamed/page.md".to_string(),
+        )
+    );
+    assert_eq!(auto_save_path, "Workspace/Roadmap/page.md");
+    assert_eq!(indexed_path, "Workspace/Roadmap/page.md");
+
+    let component_version: i64 = connection
+        .query_row(
+            "SELECT version
+             FROM state_components
+             WHERE component_id = 'projection:notion_workspace_roots'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("component version");
+    let migration_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM state_migrations
+             WHERE migration_id = 'component-projection-notion_workspace_roots-0-to-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("component migration count");
+    assert_eq!(component_version, 1);
+    assert_eq!(migration_count, 1);
+}
+
+#[test]
+fn sqlite_store_blocks_newer_notion_workspace_roots_component_without_rewriting() {
+    let fixture = SqliteFixture::new();
+    let db_path = seed_notion_workspace_roots_legacy_state(&fixture);
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 999
+             WHERE component_id = 'projection:notion_workspace_roots'",
+            [],
+        )
+        .expect("bump notion workspace roots component");
+    drop(connection);
+
+    let report =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
+    assert_eq!(report.status, StateCompatibilityStatus::NeedsUpdate);
+    assert_eq!(
+        report.issues,
+        vec![StateCompatibilityIssue::NewerComponent {
+            component_id: "projection:notion_workspace_roots".to_string(),
+            found: 999,
+            supported: 1,
+        }]
+    );
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+
+    assert_notion_workspace_roots_state_not_rewritten(&db_path, &fixture.mount_id);
+}
+
+#[test]
+fn sqlite_store_blocks_newer_notion_workspace_roots_reader_without_rewriting() {
+    let fixture = SqliteFixture::new();
+    let db_path = seed_notion_workspace_roots_legacy_state(&fixture);
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET min_reader_version = 999
+             WHERE component_id = 'projection:notion_workspace_roots'",
+            [],
+        )
+        .expect("bump notion workspace roots reader");
+    drop(connection);
+
+    let report =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
+    assert_eq!(report.status, StateCompatibilityStatus::NeedsUpdate);
+    assert_eq!(
+        report.issues,
+        vec![StateCompatibilityIssue::ComponentRequiresNewerReader {
+            component_id: "projection:notion_workspace_roots".to_string(),
+            min_reader_version: 999,
+            supported: 1,
+        }]
+    );
+
+    let error = SqliteStateStore::open(fixture.state_root.clone()).expect_err("open blocked");
+    assert!(matches!(error, StoreError::StateCompatibility(_)));
+
+    assert_notion_workspace_roots_state_not_rewritten(&db_path, &fixture.mount_id);
 }
 
 #[test]
@@ -2858,6 +3107,196 @@ fn sqlite_table_exists(connection: &Connection, table_name: &str) -> bool {
         )
         .expect("sqlite table count");
     table_count > 0
+}
+
+fn seed_notion_workspace_roots_legacy_state(fixture: &SqliteFixture) -> PathBuf {
+    let mut store = fixture.open();
+    let root_page_mount = MountId::new("notion-root-page");
+    let non_notion_mount = MountId::new("google-docs-main");
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.mount_root.join("workspace"),
+        ))
+        .expect("save workspace notion mount");
+    store
+        .save_mount(
+            MountConfig::new(
+                root_page_mount.clone(),
+                "notion",
+                fixture.mount_root.join("root-page"),
+            )
+            .with_remote_root_id(RemoteId::new("root-page")),
+        )
+        .expect("save root-page notion mount");
+    store
+        .save_mount(MountConfig::new(
+            non_notion_mount.clone(),
+            "google-docs",
+            fixture.mount_root.join("google-docs"),
+        ))
+        .expect("save non-notion mount");
+
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("workspace-page"),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap/page.md",
+        ))
+        .expect("save workspace entity");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("already-workspace"),
+            EntityKind::Page,
+            "Already",
+            "Workspace/Already/page.md",
+        ))
+        .expect("save already migrated workspace entity");
+    store
+        .save_entity(EntityRecord::new(
+            root_page_mount,
+            RemoteId::new("root-child"),
+            EntityKind::Page,
+            "Root Child",
+            "Root Child/page.md",
+        ))
+        .expect("save root-page entity");
+    store
+        .save_entity(EntityRecord::new(
+            non_notion_mount,
+            RemoteId::new("doc-1"),
+            EntityKind::Page,
+            "Doc",
+            "Doc/page.md",
+        ))
+        .expect("save non-notion entity");
+    store
+        .save_remote_observation(RemoteObservationRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("workspace-page"),
+            EntityKind::Page,
+            "Roadmap",
+            "Roadmap/page.md",
+            "2026-07-03T00:00:00Z",
+        ))
+        .expect("save workspace observation");
+    store
+        .upsert_hydration_job(HydrationJobRecord {
+            mount_id: fixture.mount_id.clone(),
+            remote_id: RemoteId::new("workspace-page"),
+            path: PathBuf::from("Roadmap/page.md"),
+            target_state: HydrationState::Hydrated,
+            reason: HydrationReason::Policy,
+            attempts: 0,
+            last_error: None,
+        })
+        .expect("save workspace hydration job");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "local:rename".to_string(),
+            mutation_kind: VirtualMutationKind::Rename,
+            target_remote_id: Some(RemoteId::new("workspace-page")),
+            parent_remote_id: None,
+            original_path: Some(PathBuf::from("Roadmap/page.md")),
+            projected_path: PathBuf::from("Roadmap Renamed/page.md"),
+            title: "Roadmap Renamed".to_string(),
+            content_path: Some(PathBuf::from("Roadmap Renamed/page.md")),
+            created_at: "2026-07-03T00:00:00Z".to_string(),
+            updated_at: "2026-07-03T00:00:00Z".to_string(),
+        })
+        .expect("save workspace virtual mutation");
+    let mut enrollment = AutoSaveEnrollmentRecord::new(
+        fixture.mount_id.clone(),
+        "Roadmap/page.md",
+        AutoSaveOrigin::UserEnabled,
+        "2026-07-03T00:00:00Z",
+    );
+    enrollment.remote_id = Some(RemoteId::new("workspace-page"));
+    store
+        .save_auto_save_enrollment(enrollment)
+        .expect("save workspace auto-save");
+
+    store.db_path.clone()
+}
+
+fn query_entities_for_mount(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> Vec<(String, String, String, String, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT remote_id, kind_json, title, path, hydration_json
+             FROM entities
+             WHERE mount_id = ?1
+             ORDER BY path, remote_id",
+        )
+        .expect("prepare entities query");
+    let rows = statement
+        .query_map(params![mount_id.0.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .expect("query entities");
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect entities")
+        .into_iter()
+        .map(|(remote_id, kind_json, title, path, hydration_json)| {
+            (
+                remote_id,
+                serde_json::from_str::<String>(&kind_json).expect("kind json"),
+                title,
+                path,
+                serde_json::from_str::<String>(&hydration_json).expect("hydration json"),
+            )
+        })
+        .collect()
+}
+
+fn assert_notion_workspace_roots_state_not_rewritten(db_path: &PathBuf, mount_id: &MountId) {
+    let connection = Connection::open(db_path).expect("raw connection");
+    let workspace_path: String = connection
+        .query_row(
+            "SELECT path
+             FROM entities
+             WHERE mount_id = ?1
+               AND remote_id = 'workspace-page'",
+            params![mount_id.0.as_str()],
+            |row| row.get(0),
+        )
+        .expect("workspace entity path");
+    let synthetic_root_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM entities
+             WHERE mount_id = ?1
+               AND remote_id IN ('notion-root:private', 'notion-root:workspace')",
+            params![mount_id.0.as_str()],
+            |row| row.get(0),
+        )
+        .expect("synthetic root count");
+    let migration_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM state_migrations
+             WHERE migration_id = 'component-projection-notion_workspace_roots-0-to-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("component migration count");
+
+    assert_eq!(workspace_path, "Roadmap/page.md");
+    assert_eq!(synthetic_root_count, 0);
+    assert_eq!(migration_count, 0);
 }
 
 struct SqliteFixture {
