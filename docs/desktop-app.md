@@ -339,10 +339,14 @@ Important language:
 - Use "restore local file" for local recovery from shadow state.
 - Use "undo push" only for journal-backed remote undo.
 - Live Mode is opt-in, rate-limited to one sync action per tick, and must keep
-  the same push guardrails: stop on conflicts, blocked files, and
-  review-required changes. The normal local-write path comes from File Provider
-  callbacks; a visible-file reconciliation fallback is throttled and scoped to
-  the active already-hydrated page. When there is no local pending change, Live
+  the same push guardrails. Remote drift while local edits are pending is an
+  expected two-way sync case: Live Mode should pull the remote version, merge
+  non-overlapping edits, or write inline conflict markers for that file without
+  disabling mount-level Live Mode. It should pause only for review-required,
+  destructive, blocked, or unrecoverable work. The normal local-write path comes
+  from File Provider callbacks; a visible-file reconciliation fallback is
+  throttled and scoped to the active already-hydrated page. When there is no
+  local pending change, Live
   Mode asks `localityd` to queue one remote check for an already-hydrated page.
   If the daemon sees a remote change, it hydrates the page through the normal
   `RemoteFastForward` path and refreshes the visible CloudStorage projection

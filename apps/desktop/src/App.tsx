@@ -125,6 +125,37 @@ type DebugQueueStatus = {
   schedulerMode: string;
   activeIntervalMs: number;
   coldIntervalMs: number;
+  liveMode: DebugLiveModeStatus;
+};
+
+type DebugLiveModeStatus = {
+  mountId?: string | null;
+  enabled: boolean;
+  state: string;
+  label: string;
+  reason?: string | null;
+  lastRunAt?: string | null;
+  trackedFiles: DebugLiveModeFile[];
+};
+
+type DebugLiveModeFile = {
+  path: string;
+  title: string;
+  remoteId: string;
+  hydration: string;
+  status: string;
+  syncState: string;
+  activeForPolling: boolean;
+  remoteCheckDue: boolean;
+  pollingReason?: string | null;
+  freshnessTier?: string | null;
+  lastCheckedAt?: string | null;
+  lastOpenedAt?: string | null;
+  lastLocalChangeAt?: string | null;
+  remoteHintPending: boolean;
+  autoSaveState?: string | null;
+  autoSaveReason?: string | null;
+  issueCodes: string[];
 };
 
 type DebugQueueActive = {
@@ -442,6 +473,35 @@ const sampleDebugQueueStatus: DebugQueueStatus = {
   schedulerMode: "polling",
   activeIntervalMs: 5000,
   coldIntervalMs: 60000,
+  liveMode: {
+    mountId: "notion-main",
+    enabled: true,
+    state: "syncing",
+    label: "Live Mode syncing",
+    reason: null,
+    lastRunAt: "unix_ms:1782033299158",
+    trackedFiles: [
+      {
+        path: "Launch Plan/page.md",
+        title: "Launch Plan",
+        remoteId: "launch-plan",
+        hydration: "dirty",
+        status: "pending_changes",
+        syncState: "pendinglocalchanges",
+        activeForPolling: true,
+        remoteCheckDue: true,
+        pollingReason: "recent local edit",
+        freshnessTier: "immediate",
+        lastCheckedAt: "unix_ms:1782033299158",
+        lastOpenedAt: "unix_ms:1782033285000",
+        lastLocalChangeAt: "unix_ms:1782033290000",
+        remoteHintPending: false,
+        autoSaveState: "active",
+        autoSaveReason: null,
+        issueCodes: ["local_body_changed"],
+      },
+    ],
+  },
 };
 
 const loadingSnapshot: DesktopSnapshot = {
@@ -3132,6 +3192,7 @@ function DebugQueueView() {
             <Metric label="Active poll" value={formatDuration(status.activeIntervalMs)} />
             <Metric label="Cold poll" value={formatDuration(status.coldIntervalMs)} />
           </div>
+          <DebugLiveModeSection liveMode={status.liveMode} />
           <DebugActiveJobs active={status.active} />
           <div className="debug-queue-sections">
             {status.sections.map((section) => (
@@ -3139,6 +3200,52 @@ function DebugQueueView() {
             ))}
           </div>
         </>
+      )}
+    </section>
+  );
+}
+
+function DebugLiveModeSection({ liveMode }: { liveMode: DebugLiveModeStatus }) {
+  const meta = [
+    liveMode.mountId ? `mount ${liveMode.mountId}` : null,
+    liveMode.enabled ? "enabled" : "off",
+    liveMode.lastRunAt ? `last run ${debugTimestampValueLabel(liveMode.lastRunAt)}` : null,
+  ].filter(Boolean) as string[];
+
+  return (
+    <section className="debug-queue-section debug-live-mode-section">
+      <div className="debug-queue-section-header">
+        <div>
+          <h3>Live Mode tracked files</h3>
+          <p>{[liveMode.label, ...meta].join(" · ")}</p>
+          {liveMode.reason && <p className="debug-live-mode-reason">{liveMode.reason}</p>}
+        </div>
+      </div>
+      {liveMode.trackedFiles.length ? (
+        liveMode.trackedFiles.map((file) => (
+          <DebugQueueRow
+            key={`${file.remoteId}-${file.path}`}
+            title={file.title || file.path}
+            detail={file.path}
+            meta={[
+              file.status,
+              file.activeForPolling ? "active polling" : null,
+              file.remoteCheckDue ? "check due" : null,
+              file.pollingReason ? `poll ${file.pollingReason}` : null,
+              `sync ${file.syncState}`,
+              `hydration ${file.hydration}`,
+              file.freshnessTier ? `tier ${file.freshnessTier}` : null,
+              file.remoteHintPending ? "remote hint" : null,
+              file.autoSaveState ? `auto ${file.autoSaveState}` : null,
+              file.lastCheckedAt ? `checked ${debugTimestampValueLabel(file.lastCheckedAt)}` : null,
+              file.lastOpenedAt ? `opened ${debugTimestampValueLabel(file.lastOpenedAt)}` : null,
+              file.lastLocalChangeAt ? `local ${debugTimestampValueLabel(file.lastLocalChangeAt)}` : null,
+              ...file.issueCodes,
+            ].filter(Boolean) as string[]}
+          />
+        ))
+      ) : (
+        <p className="debug-queue-empty">No files are currently tracked by Live Mode.</p>
       )}
     </section>
   );
@@ -3227,6 +3334,14 @@ function debugTimestampLabel(unixMs: number) {
     minute: "2-digit",
     second: "2-digit",
   }).format(new Date(unixMs));
+}
+
+function debugTimestampValueLabel(value: string) {
+  const unixMs = Number(value.startsWith("unix_ms:") ? value.slice("unix_ms:".length) : value);
+  if (Number.isFinite(unixMs) && unixMs > 0) {
+    return debugTimestampLabel(unixMs);
+  }
+  return value;
 }
 
 function formatDuration(ms: number) {

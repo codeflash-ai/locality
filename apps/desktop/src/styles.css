@@ -2700,6 +2700,11 @@ p {
   gap: 12px;
 }
 
+.debug-live-mode-section {
+  max-height: 420px;
+  overflow: auto;
+}
+
 .debug-queue-section-header {
   display: flex;
   align-items: center;
@@ -2710,6 +2715,12 @@ p {
 
 .debug-queue-section-header h3 {
   font-size: 14px;
+}
+
+.debug-live-mode-reason {
+  max-width: 720px;
+  margin-top: 6px;
+  color: var(--subtle) !important;
 }
 
 .debug-queue-row {

@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(clippy::items_after_test_module)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io;
@@ -535,14 +535,56 @@ async fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
     snapshot
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopDebugQueueStatus {
+    #[serde(flatten)]
+    queue: DaemonDebugQueueStatus,
+    live_mode: DesktopLiveModeDebugStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopLiveModeDebugStatus {
+    mount_id: Option<String>,
+    enabled: bool,
+    state: String,
+    label: String,
+    reason: Option<String>,
+    last_run_at: Option<String>,
+    tracked_files: Vec<DesktopLiveModeDebugFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopLiveModeDebugFile {
+    path: String,
+    title: String,
+    remote_id: String,
+    hydration: String,
+    status: String,
+    sync_state: String,
+    active_for_polling: bool,
+    remote_check_due: bool,
+    polling_reason: Option<String>,
+    freshness_tier: Option<String>,
+    last_checked_at: Option<String>,
+    last_opened_at: Option<String>,
+    last_local_change_at: Option<String>,
+    remote_hint_pending: bool,
+    auto_save_state: Option<String>,
+    auto_save_reason: Option<String>,
+    issue_codes: Vec<String>,
+}
+
 #[tauri::command]
-async fn debug_notion_queue_status() -> Result<DaemonDebugQueueStatus, String> {
+async fn debug_notion_queue_status() -> Result<DesktopDebugQueueStatus, String> {
     tauri::async_runtime::spawn_blocking(debug_notion_queue_status_blocking)
         .await
         .map_err(|error| format!("Could not inspect daemon debug queue: {error}"))?
 }
 
-fn debug_notion_queue_status_blocking() -> Result<DaemonDebugQueueStatus, String> {
+fn debug_notion_queue_status_blocking() -> Result<DesktopDebugQueueStatus, String> {
     let response = send_request_with_timeout(
         &default_state_root(),
         &DaemonRequest::DebugQueueStatus,
@@ -558,8 +600,189 @@ fn debug_notion_queue_status_blocking() -> Result<DaemonDebugQueueStatus, String
     let payload = response
         .payload
         .ok_or_else(|| "Daemon debug queue returned an empty response.".to_string())?;
-    serde_json::from_value(payload)
-        .map_err(|error| format!("Could not decode daemon debug queue: {error}"))
+    let queue = serde_json::from_value(payload)
+        .map_err(|error| format!("Could not decode daemon debug queue: {error}"))?;
+    let live_mode = debug_live_mode_status_blocking()?;
+    Ok(DesktopDebugQueueStatus { queue, live_mode })
+}
+
+fn debug_live_mode_status_blocking() -> Result<DesktopLiveModeDebugStatus, String> {
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state for Live Mode debug: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts for Live Mode debug: {error}"))?;
+    let Some(mount) = choose_mount(&mounts) else {
+        return Ok(DesktopLiveModeDebugStatus {
+            mount_id: None,
+            enabled: false,
+            state: "off".to_string(),
+            label: "Live Mode off".to_string(),
+            reason: None,
+            last_run_at: None,
+            tracked_files: Vec::new(),
+        });
+    };
+    let pending_changes = pending_changes_for_mount(&store, &state_root, &mount.mount_id)?;
+    let summary = mount_live_mode_summary(&store, Some(&mount), &pending_changes);
+    let tracked_files =
+        debug_live_mode_tracked_files_for_mount(&store, &state_root, &mount, &pending_changes)?;
+
+    Ok(DesktopLiveModeDebugStatus {
+        mount_id: Some(mount.mount_id.0),
+        enabled: summary.enabled,
+        state: summary.state,
+        label: summary.label,
+        reason: summary.reason,
+        last_run_at: summary.last_run_at,
+        tracked_files,
+    })
+}
+
+fn debug_live_mode_tracked_files_for_mount(
+    store: &SqliteStateStore,
+    state_root: &Path,
+    mount: &MountConfig,
+    pending_changes: &[PendingChange],
+) -> Result<Vec<DesktopLiveModeDebugFile>, String> {
+    let freshness_by_remote_id = store
+        .list_freshness_states(&mount.mount_id)
+        .map_err(|error| format!("Could not inspect Live Mode freshness state: {error}"))?
+        .into_iter()
+        .map(|freshness| (freshness.remote_id.clone(), freshness))
+        .collect::<BTreeMap<_, _>>();
+    let autosave_by_path = store
+        .list_auto_save_enrollments(&mount.mount_id)
+        .map_err(|error| format!("Could not inspect Live Mode file state: {error}"))?
+        .into_iter()
+        .map(|enrollment| (enrollment.path.clone(), enrollment))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = pending_changes
+        .iter()
+        .map(|change| PathBuf::from(&change.local_path))
+        .collect::<BTreeSet<_>>();
+    for enrollment in autosave_by_path.values() {
+        paths.insert(enrollment.path.clone());
+    }
+    for entity in store
+        .list_entities(&mount.mount_id)
+        .map_err(|error| format!("Could not inspect mounted files for Live Mode debug: {error}"))?
+    {
+        if entity.kind != EntityKind::Page {
+            continue;
+        }
+        if entity.hydration == HydrationState::Dirty
+            || entity.hydration == HydrationState::Conflicted
+        {
+            paths.insert(entity.path.clone());
+            continue;
+        }
+        if let Some(freshness) = freshness_by_remote_id.get(&entity.remote_id)
+            && (freshness.remote_hint_pending
+                || live_mode_target_is_recently_active(Some(freshness), live_mode_now_ms()))
+        {
+            paths.insert(entity.path.clone());
+        }
+    }
+
+    let access_root = mount_access_root(mount);
+    let mut files = Vec::new();
+    for path in paths.into_iter().take(120) {
+        let absolute = access_root.join(&path);
+        let status = match run_status(
+            store,
+            StatusOptions {
+                path: Some(absolute),
+                state_root: Some(state_root.to_path_buf()),
+                ..StatusOptions::default()
+            },
+        ) {
+            Ok(status) => status,
+            Err(_) => continue,
+        };
+        let Some(entry) = status
+            .mounts
+            .iter()
+            .find(|mount_status| mount_status.mount_id == mount.mount_id.0)
+            .and_then(|mount_status| mount_status.entries.first())
+        else {
+            continue;
+        };
+        let remote_id = RemoteId::new(entry.entity_id.clone());
+        let freshness = freshness_by_remote_id.get(&remote_id);
+        let enrollment = autosave_by_path.get(Path::new(&entry.path));
+        let now_ms = live_mode_now_ms();
+        let active_for_polling = live_mode_target_is_recently_active(freshness, now_ms);
+        let remote_check_due = active_for_polling && live_mode_remote_check_is_due(freshness, now_ms);
+        files.push(DesktopLiveModeDebugFile {
+            path: entry.path.clone(),
+            title: entry.title.clone(),
+            remote_id: entry.entity_id.clone(),
+            hydration: format!("{:?}", entry.state).to_ascii_lowercase(),
+            status: pending_state_for_entry(entry).to_string(),
+            sync_state: format!("{:?}", entry.sync_state).to_ascii_lowercase(),
+            active_for_polling,
+            remote_check_due,
+            polling_reason: debug_live_mode_polling_reason(freshness, now_ms),
+            freshness_tier: freshness
+                .map(|freshness| format!("{:?}", freshness.tier).to_ascii_lowercase()),
+            last_checked_at: freshness.and_then(|freshness| freshness.last_checked_at.clone()),
+            last_opened_at: freshness.and_then(|freshness| freshness.last_opened_at.clone()),
+            last_local_change_at: freshness
+                .and_then(|freshness| freshness.last_local_change_at.clone()),
+            remote_hint_pending: freshness.is_some_and(|freshness| freshness.remote_hint_pending),
+            auto_save_state: enrollment
+                .map(|enrollment| format!("{:?}", enrollment.state).to_ascii_lowercase()),
+            auto_save_reason: enrollment.and_then(|enrollment| enrollment.last_reason.clone()),
+            issue_codes: entry
+                .issues
+                .iter()
+                .map(|issue| issue.code.clone())
+                .collect(),
+        });
+    }
+    files.sort_by(|left, right| {
+        debug_live_mode_file_rank(left)
+            .cmp(&debug_live_mode_file_rank(right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(files)
+}
+
+fn debug_live_mode_polling_reason(
+    freshness: Option<&FreshnessStateRecord>,
+    now_ms: u128,
+) -> Option<String> {
+    let freshness = freshness?;
+    if freshness.remote_hint_pending {
+        return Some("remote hint pending".to_string());
+    }
+    if live_mode_timestamp_is_within(
+        freshness.last_local_change_at.as_deref(),
+        now_ms,
+        LIVE_MODE_ACTIVE_TARGET_WINDOW,
+    ) {
+        return Some("recent local edit".to_string());
+    }
+    if live_mode_timestamp_is_within(
+        freshness.last_opened_at.as_deref(),
+        now_ms,
+        LIVE_MODE_ACTIVE_TARGET_WINDOW,
+    ) {
+        return Some("recently opened".to_string());
+    }
+    None
+}
+
+fn debug_live_mode_file_rank(file: &DesktopLiveModeDebugFile) -> u8 {
+    match file.status.as_str() {
+        "conflict" => 0,
+        "needs_review" | "pending_changes" => 1,
+        "remote_update_available" => 2,
+        _ if file.remote_hint_pending => 3,
+        _ => 4,
+    }
 }
 
 #[tauri::command]
@@ -1358,7 +1581,7 @@ where
     Sync: FnMut(&PendingChange, &Path) -> Result<(), String>,
     Check: FnMut(&LiveModeRemoteTarget) -> Result<(), String>,
     FastForward: FnMut(&LiveModeRemoteTarget) -> Result<(), String>,
-    Merge: FnMut(&PendingChange, &Path) -> Result<bool, String>,
+    Merge: FnMut(&PendingChange, &Path) -> Result<LiveModeRemoteDriftMerge, String>,
 {
     if !live_mode_has_mounted_folder(snapshot) {
         return ActionReport {
@@ -1417,7 +1640,7 @@ where
         }
         if live_mode_change_may_merge_remote_drift(change) {
             match merge_remote_drift(change, &target) {
-                Ok(true) => {
+                Ok(LiveModeRemoteDriftMerge::Clean) => {
                     if let Err(message) = sync_target(change, &target) {
                         return ActionReport { ok: false, message };
                     }
@@ -1427,7 +1650,16 @@ where
                             .to_string(),
                     };
                 }
-                Ok(false) => {}
+                Ok(LiveModeRemoteDriftMerge::ConflictMarkersWritten) => {
+                    return ActionReport {
+                        ok: true,
+                        message: format!(
+                            "Live Mode pulled remote updates for `{}` and wrote conflict markers for review.",
+                            change.title
+                        ),
+                    };
+                }
+                Ok(LiveModeRemoteDriftMerge::Unchanged) => {}
                 Err(message) => return ActionReport { ok: false, message },
             }
         }
@@ -1653,8 +1885,6 @@ fn live_mode_failure_should_pause(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     message.starts_with("Live Mode paused for")
         || message.contains("Review required before pushing")
-        || lower.contains("conflict")
-        || lower.contains("changed since last sync")
         || lower.contains("could not identify the remote page")
 }
 
@@ -2061,10 +2291,17 @@ fn live_mode_send_daemon_queue_request(request: DaemonRequest) -> Result<(), Str
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveModeRemoteDriftMerge {
+    Unchanged,
+    Clean,
+    ConflictMarkersWritten,
+}
+
 fn live_mode_merge_remote_drift_target(
     _change: &PendingChange,
     target: &Path,
-) -> Result<bool, String> {
+) -> Result<LiveModeRemoteDriftMerge, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
@@ -2075,14 +2312,16 @@ fn live_mode_merge_remote_drift_target(
         .find_entity_by_path(&mount.mount_id, &relative_path)
         .map_err(|error| format!("Live Mode could not inspect local metadata: {error}"))?
     else {
-        return Ok(false);
+        return Ok(LiveModeRemoteDriftMerge::Unchanged);
     };
     if entity.kind != EntityKind::Page {
-        return Ok(false);
+        return Ok(LiveModeRemoteDriftMerge::Unchanged);
     }
     let previous_shadow = match store.load_shadow(&mount.mount_id, &entity.remote_id) {
         Ok(shadow) => shadow,
-        Err(locality_store::StoreError::ShadowMissing { .. }) => return Ok(false),
+        Err(locality_store::StoreError::ShadowMissing { .. }) => {
+            return Ok(LiveModeRemoteDriftMerge::Unchanged);
+        }
         Err(error) => {
             return Err(format!(
                 "Live Mode could not inspect the current page shadow: {error}"
@@ -2103,7 +2342,7 @@ fn live_mode_merge_remote_drift_target(
         ))
         .map_err(|error| format!("Live Mode could not inspect Notion changes: {error}"))?;
     if rendered.shadow == previous_shadow {
-        return Ok(false);
+        return Ok(LiveModeRemoteDriftMerge::Unchanged);
     }
 
     let output_root = live_mode_projection_output_root(&state_root, &mount);
@@ -2128,22 +2367,20 @@ fn live_mode_merge_remote_drift_target(
     })?;
     let remote_document =
         document_with_absolute_media_hrefs(&rendered.document, &entity.path, &output_root);
-    let Some(merged) = live_mode_merge_remote_drift_markdown(
+    let merge = live_mode_merge_remote_drift_markdown(
         &local_contents,
         previous_shadow.rendered_body.as_str(),
         &remote_document,
-    ) else {
-        return Ok(false);
-    };
+    );
 
-    write_file_atomic(&read_path, merged.as_bytes()).map_err(|error| {
+    write_file_atomic(&read_path, merge.markdown.as_bytes()).map_err(|error| {
         format!(
             "Live Mode could not write `{}`: {error}",
             read_path.display()
         )
     })?;
     if read_path != target && target.exists() {
-        write_file_atomic(&target, merged.as_bytes()).map_err(|error| {
+        write_file_atomic(&target, merge.markdown.as_bytes()).map_err(|error| {
             format!(
                 "Live Mode could not refresh visible file `{}`: {error}",
                 target.display()
@@ -2155,7 +2392,11 @@ fn live_mode_merge_remote_drift_target(
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
         .map_err(|error| format!("Live Mode could not update local shadow: {error}"))?;
     if entity.hydration.can_transition_to(&HydrationState::Dirty) {
-        entity.hydration = HydrationState::Dirty;
+        entity.hydration = if merge.has_conflicts {
+            HydrationState::Conflicted
+        } else {
+            HydrationState::Dirty
+        };
     }
     entity.content_hash = Some(rendered.shadow.body_hash.clone());
     if rendered.remote_edited_at.is_some() {
@@ -2167,20 +2408,30 @@ fn live_mode_merge_remote_drift_target(
     save_live_mode_remote_observation(&mut store, &mount, &entity, rendered.remote_edited_at)?;
     clear_live_mode_remote_hint(&mut store, &mount.mount_id, &entity.remote_id)?;
 
-    Ok(true)
+    if merge.has_conflicts {
+        Ok(LiveModeRemoteDriftMerge::ConflictMarkersWritten)
+    } else {
+        Ok(LiveModeRemoteDriftMerge::Clean)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveModeRemoteDriftMarkdownMerge {
+    markdown: String,
+    has_conflicts: bool,
 }
 
 fn live_mode_merge_remote_drift_markdown(
     local_contents: &str,
     base_body: &str,
     remote_document: &locality_core::model::CanonicalDocument,
-) -> Option<String> {
+) -> LiveModeRemoteDriftMarkdownMerge {
     let merged =
         render_inline_conflict_markdown_with_base(local_contents, Some(base_body), remote_document);
-    if has_unresolved_conflict_markers(&merged) {
-        return None;
+    LiveModeRemoteDriftMarkdownMerge {
+        has_conflicts: has_unresolved_conflict_markers(&merged),
+        markdown: merged,
     }
-    Some(merged)
 }
 
 fn live_mode_projection_output_root(state_root: &Path, mount: &MountConfig) -> PathBuf {
@@ -8933,6 +9184,8 @@ fn env_first(keys: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::LiveModeRemoteDriftMerge;
+
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -9635,12 +9888,30 @@ mod tests {
             &local,
             "Intro.\n\nOld middle.\n\nFooter.\n",
             &remote,
-        )
-        .expect("non-overlapping changes merge cleanly");
+        );
 
-        assert!(!has_unresolved_conflict_markers(&merged));
-        assert!(merged.contains("Remote intro."));
-        assert!(merged.contains("Local middle."));
+        assert!(!merged.has_conflicts);
+        assert!(!has_unresolved_conflict_markers(&merged.markdown));
+        assert!(merged.markdown.contains("Remote intro."));
+        assert!(merged.markdown.contains("Local middle."));
+    }
+
+    #[test]
+    fn live_mode_merge_remote_drift_materializes_conflict_markers_for_overlapping_changes() {
+        let frontmatter = "title: Roadmap\n".to_string();
+        let local = render_canonical_markdown(&CanonicalDocument::new(
+            frontmatter.clone(),
+            "Local intro.\n\nFooter.\n".to_string(),
+        ));
+        let remote = CanonicalDocument::new(frontmatter, "Remote intro.\n\nFooter.\n".to_string());
+
+        let merged =
+            live_mode_merge_remote_drift_markdown(&local, "Base intro.\n\nFooter.\n", &remote);
+
+        assert!(merged.has_conflicts);
+        assert!(has_unresolved_conflict_markers(&merged.markdown));
+        assert!(merged.markdown.contains("Local intro."));
+        assert!(merged.markdown.contains("Remote intro."));
     }
 
     #[test]
@@ -9827,7 +10098,7 @@ mod tests {
             |_| panic!("mergeable local+remote drift should not queue remote fast-forward"),
             |change, target| {
                 merged.push((change.title.clone(), target.to_path_buf()));
-                Ok(true)
+                Ok(LiveModeRemoteDriftMerge::Clean)
             },
         );
 
@@ -9841,6 +10112,42 @@ mod tests {
         assert_eq!(merged[0].0, "Roadmap");
         assert!(merged[0].1.ends_with("Engineering/Roadmap/page.md"));
         assert_eq!(synced[0].1, merged[0].1);
+    }
+
+    #[test]
+    fn live_mode_tick_keeps_running_after_writing_conflict_markers() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes = vec![PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "roadmap-page".to_string(),
+            title: "Roadmap".to_string(),
+            local_path: "Engineering/Roadmap/page.md".to_string(),
+            summary: "remote changed while local edits are pending".to_string(),
+            state: "needs_review".to_string(),
+            issue_codes: vec!["remote_changed_with_local_pending".to_string()],
+            live_mode: sample_live_mode_status(true),
+        }];
+        let mut merged = Vec::new();
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            &[],
+            |_, _| panic!("conflicted local+remote drift should not push"),
+            |_| panic!("conflicted local+remote drift should not use remote pull cursor"),
+            |_| panic!("conflicted local+remote drift should not queue remote fast-forward"),
+            |change, target| {
+                merged.push((change.title.clone(), target.to_path_buf()));
+                Ok(LiveModeRemoteDriftMerge::ConflictMarkersWritten)
+            },
+        );
+
+        assert!(report.ok);
+        assert_eq!(
+            report.message,
+            "Live Mode pulled remote updates for `Roadmap` and wrote conflict markers for review."
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0, "Roadmap");
     }
 
     #[test]
