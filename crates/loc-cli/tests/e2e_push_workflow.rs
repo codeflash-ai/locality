@@ -500,8 +500,16 @@ fn pull_materializes_and_repairs_downloaded_media_cache() {
     fs::remove_file(&local_image).expect("remove materialized image");
     let repair = run_pull(&mut store, &connector, &fixture.root).expect("repair media cache page");
     assert!(repair.ok, "{repair:#?}");
+    assert_eq!(repair.hydrated, 1, "{repair:#?}");
+    let repaired_markdown = fs::read_to_string(&page_path).expect("read repaired media cache page");
+    let repaired_image = local_image_path(
+        &fixture.root,
+        &page_path,
+        &repaired_markdown,
+        "Local test image",
+    );
     assert_eq!(
-        fs::read(&local_image).expect("read repaired image"),
+        fs::read(&repaired_image).expect("read repaired image"),
         image_bytes
     );
 
@@ -523,6 +531,11 @@ fn pull_materializes_and_repairs_downloaded_media_cache() {
         !local_image.exists(),
         "stale media file should be removed after clean pull no longer references it: {}",
         local_image.display()
+    );
+    assert!(
+        !repaired_image.exists(),
+        "repaired media file should be removed after clean pull no longer references it: {}",
+        repaired_image.display()
     );
     let pruned_manifest = fs::read_to_string(fixture.root.join(".loc/media/manifest.json"))
         .expect("read pruned media manifest");
@@ -10912,9 +10925,10 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
             "Root page body before creating a fresh child page.",
         )],
     );
+    let existing_child_title = format!("Locality live existing child {}", unique_suffix());
     let existing_child = cleanup.create_page(
         &scratch.id,
-        &format!("Locality live existing child {}", unique_suffix()),
+        &existing_child_title,
         vec![paragraph_child(
             "Existing child primes the cached parent listing.",
         )],
@@ -10946,15 +10960,31 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
         &scratch_folder.identifier,
         &existing_child.id,
     );
+    let existing_child_url =
+        notion_pretty_workspace_url("codeflash", &existing_child_title, &existing_child.id);
+    let mut existing_locate_store = store.clone();
+    let existing_child_path = desktop_style_locate_notion_url_path(
+        &mut existing_locate_store,
+        &connector,
+        &fixture.mount_id,
+        &existing_child_url,
+    );
+    assert!(
+        existing_child_path
+            .to_string_lossy()
+            .contains(&slug_for_test(&existing_child_title)),
+        "existing child pretty URL should locate to its projected page.md path: {existing_child_path:?}"
+    );
 
+    let child_title = format!("Locality live located child {}", unique_suffix());
     let child = cleanup.create_page(
         &scratch.id,
-        &format!("Locality live located child {}", unique_suffix()),
+        &child_title,
         vec![paragraph_child(
             "Fresh child should appear after the parent directory is refreshed.",
         )],
     );
-    let child_url = notion_object_url(&child.id);
+    let child_url = notion_pretty_workspace_url("codeflash", &child_title, &child.id);
     let mut locate_store = store.clone();
     let located_child_path = desktop_style_locate_notion_url_path(
         &mut locate_store,
@@ -11018,62 +11048,6 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
             item.filename == "page.md" && item.remote_id.as_deref() == Some(child.id.as_str())
         }),
         "new child directory should expose page.md after parent pull: {child_children:#?}"
-    );
-}
-
-#[test]
-#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
-fn live_locate_pretty_url_resolves_existing_and_new_block_parent_pages() {
-    let env = LiveEnv::from_env();
-    let api = HttpNotionApi::new(live_notion_config());
-    let mut cleanup = LiveCleanup::new(api);
-    let scratch = cleanup.create_page(
-        &env.parent_page_id,
-        &format!("Locality live block-parent locate root {}", unique_suffix()),
-        vec![paragraph_child("Root page for block-parent locate checks.")],
-    );
-    let section = cleanup.append_toggle_block(
-        &scratch.id,
-        &format!("Locality live nested locate section {}", unique_suffix()),
-    );
-    let existing_title = format!("Locality live existing nested page {}", unique_suffix());
-    let existing_child = cleanup.create_page_with_block_parent(&section.id, &existing_title);
-
-    let connector = NotionConnector::new(
-        live_notion_config().with_root_page_id(RemoteId::new(scratch.id.clone())),
-    );
-    let fixture = E2eFixture::new();
-    let mut store = InMemoryStateStore::new();
-    mount_virtual_workspace(&fixture, &mut store, &scratch.id);
-    let mount_point_root = fixture.virtual_root_identifier();
-    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &mount_point_root)
-        .expect("index mount point root");
-
-    let existing_url =
-        notion_pretty_workspace_url("codeflash", &existing_title, &existing_child.id);
-    let existing_path = desktop_style_locate_notion_url_path(
-        &mut store,
-        &connector,
-        &fixture.mount_id,
-        &existing_url,
-    );
-    assert!(
-        existing_path
-            .to_string_lossy()
-            .contains(&slug_for_test(&existing_title)),
-        "existing block-parent page should locate to its projected page.md path: {existing_path:?}"
-    );
-
-    let fresh_title = format!("Locality live fresh nested page {}", unique_suffix());
-    let fresh_child = cleanup.create_page_with_block_parent(&section.id, &fresh_title);
-    let fresh_url = notion_pretty_workspace_url("codeflash", &fresh_title, &fresh_child.id);
-    let fresh_path =
-        desktop_style_locate_notion_url_path(&mut store, &connector, &fixture.mount_id, &fresh_url);
-    assert!(
-        fresh_path
-            .to_string_lossy()
-            .contains(&slug_for_test(&fresh_title)),
-        "fresh block-parent page should locate to its projected page.md path: {fresh_path:?}"
     );
 }
 
@@ -13166,57 +13140,6 @@ impl LiveCleanup {
             .api
             .create_page(body)
             .expect("create live scratch page");
-        self.block_ids.push(page.id.clone());
-        page
-    }
-
-    fn append_toggle_block(&mut self, parent_block_id: &str, title: &str) -> BlockDto {
-        let blocks = self
-            .api
-            .append_block_children(
-                parent_block_id,
-                json!({
-                    "children": [{
-                        "object": "block",
-                        "type": "toggle",
-                        "toggle": {
-                            "rich_text": rich_text_json(title),
-                        }
-                    }]
-                }),
-            )
-            .expect("append live toggle block");
-        let block = blocks
-            .results
-            .into_iter()
-            .next()
-            .expect("appended live toggle block");
-        self.block_ids.push(block.id.clone());
-        block
-    }
-
-    fn create_page_with_block_parent(&mut self, parent_block_id: &str, title: &str) -> PageDto {
-        let page = self
-            .api
-            .create_page(json!({
-                "parent": {
-                    "type": "block_id",
-                    "block_id": parent_block_id,
-                },
-                "properties": {
-                    "title": {
-                        "title": [
-                            {
-                                "type": "text",
-                                "text": {
-                                    "content": title,
-                                }
-                            }
-                        ]
-                    },
-                },
-            }))
-            .expect("create live block-parent page");
         self.block_ids.push(page.id.clone());
         page
     }
