@@ -1284,6 +1284,13 @@ fn sqlite_store_repairs_page_shaped_notion_workspace_root_name_collisions() {
                 "virtual".to_string(),
             ),
             (
+                "already-workspace-child".to_string(),
+                "page".to_string(),
+                "Already Child".to_string(),
+                "Workspace/Already/Child/page.md".to_string(),
+                "stub".to_string(),
+            ),
+            (
                 "already-workspace".to_string(),
                 "page".to_string(),
                 "Already".to_string(),
@@ -1291,10 +1298,24 @@ fn sqlite_store_repairs_page_shaped_notion_workspace_root_name_collisions() {
                 "stub".to_string(),
             ),
             (
+                "private-page-child".to_string(),
+                "page".to_string(),
+                "Private Child".to_string(),
+                "Workspace/Private/Child/page.md".to_string(),
+                "stub".to_string(),
+            ),
+            (
                 "private-page".to_string(),
                 "page".to_string(),
                 "Private".to_string(),
                 "Workspace/Private/page.md".to_string(),
+                "stub".to_string(),
+            ),
+            (
+                "workspace-page-child".to_string(),
+                "page".to_string(),
+                "Workspace Child".to_string(),
+                "Workspace/Workspace/Child/page.md".to_string(),
                 "stub".to_string(),
             ),
             (
@@ -1319,12 +1340,24 @@ fn sqlite_store_repairs_page_shaped_notion_workspace_root_name_collisions() {
                 "Workspace/Already/page.md".to_string()
             ),
             (
+                "already-workspace-child".to_string(),
+                "Workspace/Already/Child/page.md".to_string()
+            ),
+            (
                 "private-page".to_string(),
                 "Workspace/Private/page.md".to_string()
             ),
             (
+                "private-page-child".to_string(),
+                "Workspace/Private/Child/page.md".to_string()
+            ),
+            (
                 "workspace-page".to_string(),
                 "Workspace/Workspace/page.md".to_string()
+            ),
+            (
+                "workspace-page-child".to_string(),
+                "Workspace/Workspace/Child/page.md".to_string()
             ),
         ]
     );
@@ -1336,12 +1369,24 @@ fn sqlite_store_repairs_page_shaped_notion_workspace_root_name_collisions() {
                 "Workspace/Already/page.md".to_string()
             ),
             (
+                "already-workspace-child".to_string(),
+                "Workspace/Already/Child/page.md".to_string()
+            ),
+            (
                 "private-page".to_string(),
                 "Workspace/Private/page.md".to_string()
             ),
             (
+                "private-page-child".to_string(),
+                "Workspace/Private/Child/page.md".to_string()
+            ),
+            (
                 "workspace-page".to_string(),
                 "Workspace/Workspace/page.md".to_string()
+            ),
+            (
+                "workspace-page-child".to_string(),
+                "Workspace/Workspace/Child/page.md".to_string()
             ),
         ]
     );
@@ -1358,12 +1403,24 @@ fn sqlite_store_repairs_page_shaped_notion_workspace_root_name_collisions() {
                 "Workspace/Already/page.md".to_string()
             ),
             (
+                "already-workspace-child".to_string(),
+                "Workspace/Already/Child/page.md".to_string()
+            ),
+            (
                 "private-page".to_string(),
                 "Workspace/Private/page.md".to_string()
             ),
             (
+                "private-page-child".to_string(),
+                "Workspace/Private/Child/page.md".to_string()
+            ),
+            (
                 "workspace-page".to_string(),
                 "Workspace/Workspace/page.md".to_string()
+            ),
+            (
+                "workspace-page-child".to_string(),
+                "Workspace/Workspace/Child/page.md".to_string()
             ),
         ]
     );
@@ -1377,16 +1434,34 @@ fn sqlite_store_repairs_page_shaped_notion_workspace_root_name_collisions() {
                 Some("Workspace/Already/page.md".to_string()),
             ),
             (
+                "local:already-workspace-child".to_string(),
+                Some("Workspace/Already/Child/page.md".to_string()),
+                "Workspace/Already/Child/page.md".to_string(),
+                Some("Workspace/Already/Child/page.md".to_string()),
+            ),
+            (
                 "local:private-page".to_string(),
                 Some("Workspace/Private/page.md".to_string()),
                 "Workspace/Private/page.md".to_string(),
                 Some("Workspace/Private/page.md".to_string()),
             ),
             (
+                "local:private-page-child".to_string(),
+                Some("Workspace/Private/Child/page.md".to_string()),
+                "Workspace/Private/Child/page.md".to_string(),
+                Some("Workspace/Private/Child/page.md".to_string()),
+            ),
+            (
                 "local:workspace-page".to_string(),
                 Some("Workspace/Workspace/page.md".to_string()),
                 "Workspace/Workspace/page.md".to_string(),
                 Some("Workspace/Workspace/page.md".to_string()),
+            ),
+            (
+                "local:workspace-page-child".to_string(),
+                Some("Workspace/Workspace/Child/page.md".to_string()),
+                "Workspace/Workspace/Child/page.md".to_string(),
+                Some("Workspace/Workspace/Child/page.md".to_string()),
             ),
         ]
     );
@@ -3462,8 +3537,23 @@ fn seed_notion_workspace_root_page_name_collision_state(fixture: &SqliteFixture)
 
     for (remote_id, title, path) in [
         ("private-page", "Private", "Private/page.md"),
+        (
+            "private-page-child",
+            "Private Child",
+            "Private/Child/page.md",
+        ),
         ("workspace-page", "Workspace", "Workspace/page.md"),
+        (
+            "workspace-page-child",
+            "Workspace Child",
+            "Workspace/Child/page.md",
+        ),
         ("already-workspace", "Already", "Workspace/Already/page.md"),
+        (
+            "already-workspace-child",
+            "Already Child",
+            "Workspace/Already/Child/page.md",
+        ),
     ] {
         let remote_id_value = remote_id;
         let remote_id = RemoteId::new(remote_id_value);
@@ -3476,15 +3566,24 @@ fn seed_notion_workspace_root_page_name_collision_state(fixture: &SqliteFixture)
                 path,
             ))
             .expect("save workspace entity");
+        let mut observation = RemoteObservationRecord::new(
+            fixture.mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            title,
+            path,
+            "2026-07-03T00:00:00Z",
+        );
+        observation = match remote_id_value {
+            "private-page-child" => observation.with_parent(RemoteId::new("private-page")),
+            "workspace-page-child" => observation.with_parent(RemoteId::new("workspace-page")),
+            "already-workspace-child" => {
+                observation.with_parent(RemoteId::new("already-workspace"))
+            }
+            _ => observation,
+        };
         store
-            .save_remote_observation(RemoteObservationRecord::new(
-                fixture.mount_id.clone(),
-                remote_id.clone(),
-                EntityKind::Page,
-                title,
-                path,
-                "2026-07-03T00:00:00Z",
-            ))
+            .save_remote_observation(observation)
             .expect("save workspace observation");
         store
             .upsert_hydration_job(HydrationJobRecord {

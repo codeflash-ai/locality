@@ -5,6 +5,7 @@
 //! columns, while shadow block arrays and journal plans are stored as JSON blobs
 //! until query needs justify normalization.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2704,50 +2705,70 @@ fn migrate_notion_workspace_roots_projection_layout_to_v1(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
+    let root_repair_evidence = notion_workspace_root_repair_evidence(&transaction)?;
     let mut rewritten_paths = 0;
     rewritten_paths += rewrite_notion_workspace_root_paths(
         &transaction,
         "entities",
         "path",
+        Some("remote_id"),
         "AND remote_id NOT IN ('notion-root:private', 'notion-root:workspace')",
         false,
+        &root_repair_evidence,
     )?;
     rewritten_paths += rewrite_notion_workspace_root_paths(
         &transaction,
         "remote_observations",
         "projected_path",
+        Some("remote_id"),
         "",
         false,
+        &root_repair_evidence,
     )?;
-    rewritten_paths +=
-        rewrite_notion_workspace_root_paths(&transaction, "hydration_jobs", "path", "", false)?;
+    rewritten_paths += rewrite_notion_workspace_root_paths(
+        &transaction,
+        "hydration_jobs",
+        "path",
+        Some("remote_id"),
+        "",
+        false,
+        &root_repair_evidence,
+    )?;
     rewritten_paths += rewrite_notion_workspace_root_paths(
         &transaction,
         "virtual_mutations",
         "projected_path",
+        Some("target_remote_id"),
         "",
         false,
+        &root_repair_evidence,
     )?;
     rewritten_paths += rewrite_notion_workspace_root_paths(
         &transaction,
         "virtual_mutations",
         "original_path",
+        Some("target_remote_id"),
         "",
         false,
+        &root_repair_evidence,
     )?;
     rewritten_paths += rewrite_notion_workspace_root_paths(
         &transaction,
         "virtual_mutations",
         "content_path",
+        Some("target_remote_id"),
         "",
         true,
+        &root_repair_evidence,
     )?;
     rewritten_paths += rewrite_notion_workspace_root_paths(
         &transaction,
         "auto_save_enrollments",
         "path",
+        Some("remote_id"),
         "",
         false,
+        &root_repair_evidence,
     )?;
 
     for mount_id in &workspace_mounts {
@@ -2783,6 +2804,118 @@ fn migrate_notion_workspace_roots_projection_layout_to_v1(
     }
     transaction.commit()?;
     Ok(())
+}
+
+struct NotionWorkspaceRootRepairEvidence {
+    legacy_subtree_remote_ids: HashMap<String, HashSet<String>>,
+}
+
+impl NotionWorkspaceRootRepairEvidence {
+    fn includes_remote_id(&self, mount_id: &str, remote_id: Option<&str>) -> bool {
+        let Some(remote_id) = remote_id else {
+            return false;
+        };
+        self.legacy_subtree_remote_ids
+            .get(mount_id)
+            .is_some_and(|remote_ids| remote_ids.contains(remote_id))
+    }
+}
+
+fn notion_workspace_root_repair_evidence(
+    connection: &Connection,
+) -> StoreResult<NotionWorkspaceRootRepairEvidence> {
+    let legacy_root_remote_ids = {
+        let mut statement = connection.prepare(
+            "SELECT mount_id, remote_id, path
+             FROM entities
+             WHERE mount_id IN (
+                 SELECT mount_id
+                 FROM mounts
+                 WHERE connector = 'notion'
+                   AND remote_root_id IS NULL
+             )
+               AND remote_id NOT IN ('notion-root:private', 'notion-root:workspace')
+             ORDER BY mount_id, remote_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut root_remote_ids: HashMap<String, HashSet<String>> = HashMap::new();
+        for row in rows {
+            let (mount_id, remote_id, path) = row?;
+            if is_legacy_notion_workspace_root_entity_path(&path) {
+                root_remote_ids
+                    .entry(mount_id)
+                    .or_default()
+                    .insert(remote_id);
+            }
+        }
+        root_remote_ids
+    };
+
+    let mut children_by_mount_and_parent: HashMap<String, HashMap<String, Vec<String>>> =
+        HashMap::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT mount_id, remote_id, parent_remote_id
+             FROM remote_observations
+             WHERE mount_id IN (
+                 SELECT mount_id
+                 FROM mounts
+                 WHERE connector = 'notion'
+                   AND remote_root_id IS NULL
+             )
+               AND parent_remote_id IS NOT NULL
+             ORDER BY mount_id, parent_remote_id, remote_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (mount_id, remote_id, parent_remote_id) = row?;
+            children_by_mount_and_parent
+                .entry(mount_id)
+                .or_default()
+                .entry(parent_remote_id)
+                .or_default()
+                .push(remote_id);
+        }
+    }
+
+    let mut legacy_subtree_remote_ids = HashMap::new();
+    for (mount_id, root_remote_ids) in legacy_root_remote_ids {
+        let mut subtree_remote_ids = root_remote_ids;
+        let mut queue = subtree_remote_ids
+            .iter()
+            .cloned()
+            .collect::<VecDeque<String>>();
+        while let Some(parent_remote_id) = queue.pop_front() {
+            let Some(children) = children_by_mount_and_parent
+                .get(&mount_id)
+                .and_then(|children_by_parent| children_by_parent.get(&parent_remote_id))
+            else {
+                continue;
+            };
+            for child_remote_id in children {
+                if subtree_remote_ids.insert(child_remote_id.clone()) {
+                    queue.push_back(child_remote_id.clone());
+                }
+            }
+        }
+        legacy_subtree_remote_ids.insert(mount_id, subtree_remote_ids);
+    }
+
+    Ok(NotionWorkspaceRootRepairEvidence {
+        legacy_subtree_remote_ids,
+    })
 }
 
 fn upsert_notion_workspace_synthetic_root(
@@ -2825,11 +2958,14 @@ fn rewrite_notion_workspace_root_paths(
     connection: &Connection,
     table: &str,
     column: &str,
+    remote_id_column: Option<&str>,
     extra_where: &str,
     skip_absolute: bool,
+    root_repair_evidence: &NotionWorkspaceRootRepairEvidence,
 ) -> StoreResult<usize> {
+    let remote_id_column = remote_id_column.unwrap_or("NULL");
     let select_sql = format!(
-        "SELECT rowid, {column}
+        "SELECT rowid, mount_id, {remote_id_column}, {column}
          FROM {table}
          WHERE mount_id IN (
              SELECT mount_id
@@ -2844,14 +2980,23 @@ fn rewrite_notion_workspace_root_paths(
     let rows = {
         let mut statement = connection.prepare(&select_sql)?;
         let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let update_sql = format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2");
     let mut rewritten = 0;
-    for (rowid, path) in rows {
-        let Some(rewritten_path) = notion_workspace_root_repaired_path(&path, skip_absolute) else {
+    for (rowid, mount_id, remote_id, path) in rows {
+        let repair_reserved_prefix =
+            root_repair_evidence.includes_remote_id(&mount_id, remote_id.as_deref());
+        let Some(rewritten_path) =
+            notion_workspace_root_repaired_path(&path, skip_absolute, repair_reserved_prefix)
+        else {
             continue;
         };
         connection.execute(&update_sql, params![rewritten_path, rowid])?;
@@ -2860,7 +3005,11 @@ fn rewrite_notion_workspace_root_paths(
     Ok(rewritten)
 }
 
-fn notion_workspace_root_repaired_path(path: &str, skip_absolute: bool) -> Option<String> {
+fn notion_workspace_root_repaired_path(
+    path: &str,
+    skip_absolute: bool,
+    repair_reserved_prefix: bool,
+) -> Option<String> {
     if path.is_empty() || (skip_absolute && is_probably_absolute_path(path)) {
         None
     } else if is_legacy_notion_workspace_root_page_path(path) {
@@ -2870,9 +3019,21 @@ fn notion_workspace_root_repaired_path(path: &str, skip_absolute: bool) -> Optio
         || path.starts_with("Workspace/")
         || path.starts_with("Workspace\\")
     {
-        None
+        if repair_reserved_prefix {
+            Some(format!("{NOTION_WORKSPACE_ROOT_DIR}/{path}"))
+        } else {
+            None
+        }
     } else {
         Some(format!("{NOTION_WORKSPACE_ROOT_DIR}/{path}"))
+    }
+}
+
+fn is_legacy_notion_workspace_root_entity_path(path: &str) -> bool {
+    if path == NOTION_PRIVATE_ROOT_DIR || path == NOTION_WORKSPACE_ROOT_DIR {
+        true
+    } else {
+        is_legacy_notion_workspace_root_page_path(path)
     }
 }
 
