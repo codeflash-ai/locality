@@ -79,12 +79,25 @@ pub fn enumerate_shared_pages(
     let mut entries = Vec::new();
 
     entries.extend(synthetic_workspace_root_entries(&mount_id));
-    let workspace_projection = project_workspace_root(
+    let workspace_snapshot = WorkspaceRootSnapshot::load(api)?;
+    let private_projection = project_workspace_root_from_snapshot(
+        api,
+        &mount_id,
+        Path::new(NOTION_PRIVATE_ROOT_DIR),
+        &mut used_paths,
+        WorkspaceRootProjectionMode::FullTree,
+        WorkspaceSourceRootProjection::Private,
+        &workspace_snapshot,
+    )?;
+    entries.extend(private_projection.tree_entries);
+    let workspace_projection = project_workspace_root_from_snapshot(
         api,
         &mount_id,
         Path::new(NOTION_WORKSPACE_ROOT_DIR),
         &mut used_paths,
         WorkspaceRootProjectionMode::FullTree,
+        WorkspaceSourceRootProjection::Workspace,
+        &workspace_snapshot,
     )?;
     entries.extend(workspace_projection.tree_entries);
 
@@ -107,7 +120,7 @@ pub fn list_container_children(
             )))
         }
         ChildContainer::SourceRoot(remote_id) if is_notion_private_root_id(&remote_id) => {
-            Ok(Vec::new())
+            list_private_root_children(api, mount_id, parent_path)
         }
         ChildContainer::SourceRoot(remote_id) if is_notion_workspace_root_id(&remote_id) => {
             list_workspace_root_children(api, mount_id, parent_path)
@@ -153,6 +166,7 @@ pub fn resolve_page_path_entries(
         api,
         mount_id,
         root_page_id,
+        private_owner_user_id: private_workspace_owner_user_id(api),
         resolved: BTreeMap::new(),
         resolving: BTreeSet::new(),
         entries: Vec::new(),
@@ -196,6 +210,7 @@ struct ExactPathResolver<'a> {
     api: &'a dyn NotionApi,
     mount_id: MountId,
     root_page_id: Option<&'a RemoteId>,
+    private_owner_user_id: Option<String>,
     resolved: BTreeMap<String, TreeEntry>,
     resolving: BTreeSet<String>,
     entries: Vec<TreeEntry>,
@@ -235,7 +250,13 @@ impl ExactPathResolver<'_> {
             let path = allocate_page_path(Path::new(""), &title, &page.id, &mut used_paths);
             page_entry(self.mount_id.clone(), &page, title, path)
         } else {
-            let parent = self.parent_listing(page.parent.as_ref())?;
+            let parent = if self.root_page_id.is_none()
+                && is_private_workspace_page(&page, self.private_owner_user_id.as_deref())
+            {
+                ParentListing::Root(PathBuf::from(NOTION_PRIVATE_ROOT_DIR))
+            } else {
+                self.parent_listing(page.parent.as_ref())?
+            };
             self.find_projected_child(parent, page_id, EntityKind::Page)?
         };
 
@@ -322,6 +343,12 @@ impl ExactPathResolver<'_> {
                     && parent_path == Path::new(NOTION_WORKSPACE_ROOT_DIR) =>
             {
                 list_workspace_root_children(self.api, self.mount_id.clone(), &parent_path)?
+            }
+            ParentListing::Root(parent_path)
+                if self.root_page_id.is_none()
+                    && parent_path == Path::new(NOTION_PRIVATE_ROOT_DIR) =>
+            {
+                list_private_root_children(self.api, self.mount_id.clone(), &parent_path)?
             }
             ParentListing::Root(parent_path) => list_root_children(
                 self.api,
@@ -470,6 +497,24 @@ fn list_workspace_root_children(
         parent_path,
         &mut used_paths,
         WorkspaceRootProjectionMode::ShallowListing,
+        WorkspaceSourceRootProjection::Workspace,
+    )?;
+    Ok(projection.listing_entries)
+}
+
+fn list_private_root_children(
+    api: &dyn NotionApi,
+    mount_id: MountId,
+    parent_path: &Path,
+) -> LocalityResult<Vec<TreeEntry>> {
+    let mut used_paths = BTreeSet::new();
+    let projection = project_workspace_root(
+        api,
+        &mount_id,
+        parent_path,
+        &mut used_paths,
+        WorkspaceRootProjectionMode::ShallowListing,
+        WorkspaceSourceRootProjection::Private,
     )?;
     Ok(projection.listing_entries)
 }
@@ -479,10 +524,32 @@ struct WorkspaceRootProjection {
     listing_entries: Vec<TreeEntry>,
 }
 
+struct WorkspaceRootSnapshot {
+    pages: Vec<PageDto>,
+    databases: Vec<DatabaseDto>,
+    private_owner_user_id: Option<String>,
+}
+
+impl WorkspaceRootSnapshot {
+    fn load(api: &dyn NotionApi) -> LocalityResult<Self> {
+        Ok(Self {
+            pages: search_all_pages(api)?,
+            databases: search_all_databases(api)?,
+            private_owner_user_id: private_workspace_owner_user_id(api),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceRootProjectionMode {
     FullTree,
     ShallowListing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceSourceRootProjection {
+    Private,
+    Workspace,
 }
 
 fn project_workspace_root(
@@ -491,29 +558,56 @@ fn project_workspace_root(
     parent_path: &Path,
     used_paths: &mut BTreeSet<PathBuf>,
     mode: WorkspaceRootProjectionMode,
+    source_root: WorkspaceSourceRootProjection,
 ) -> LocalityResult<WorkspaceRootProjection> {
-    let pages = search_all_pages(api)?;
-    let databases = search_all_databases(api)?;
-    let accessible_page_ids = pages
+    let snapshot = WorkspaceRootSnapshot::load(api)?;
+    project_workspace_root_from_snapshot(
+        api,
+        mount_id,
+        parent_path,
+        used_paths,
+        mode,
+        source_root,
+        &snapshot,
+    )
+}
+
+fn project_workspace_root_from_snapshot(
+    api: &dyn NotionApi,
+    mount_id: &MountId,
+    parent_path: &Path,
+    used_paths: &mut BTreeSet<PathBuf>,
+    mode: WorkspaceRootProjectionMode,
+    source_root: WorkspaceSourceRootProjection,
+    snapshot: &WorkspaceRootSnapshot,
+) -> LocalityResult<WorkspaceRootProjection> {
+    let accessible_page_ids = snapshot
+        .pages
         .iter()
         .map(|page| page.id.as_str())
         .collect::<BTreeSet<_>>();
-    let accessible_database_ids = databases
+    let accessible_database_ids = snapshot
+        .databases
         .iter()
         .map(|database| database.id.as_str())
         .collect::<BTreeSet<_>>();
-    let accessible_data_source_ids = databases
+    let accessible_data_source_ids = snapshot
+        .databases
         .iter()
         .flat_map(|database| database.data_sources.iter())
         .map(|data_source| data_source.id.as_str())
         .collect::<BTreeSet<_>>();
-    let search_projection = SearchParentProjection::new(&pages, &databases);
+    let search_projection = SearchParentProjection::new(&snapshot.pages, &snapshot.databases);
     let mut root_children = Vec::new();
 
-    for page in pages
-        .iter()
-        .filter(|page| is_workspace_root_page(page, &accessible_page_ids))
-    {
+    for page in snapshot.pages.iter().filter(|page| {
+        is_source_root_page(
+            page,
+            source_root,
+            &accessible_page_ids,
+            snapshot.private_owner_user_id.as_deref(),
+        )
+    }) {
         let title = page_title(page);
         root_children.push(ProjectedChild::Page {
             page: page.clone(),
@@ -521,15 +615,16 @@ fn project_workspace_root(
         });
     }
 
-    for database in databases
-        .iter()
-        .filter(|database| is_workspace_root_parent(database.parent.as_ref(), &accessible_page_ids))
-    {
-        let title = database_title(database).unwrap_or_else(|| "Untitled database".to_string());
-        root_children.push(ProjectedChild::Database {
-            database: database.clone(),
-            title,
-        });
+    if source_root == WorkspaceSourceRootProjection::Workspace {
+        for database in snapshot.databases.iter().filter(|database| {
+            is_workspace_root_parent(database.parent.as_ref(), &accessible_page_ids)
+        }) {
+            let title = database_title(database).unwrap_or_else(|| "Untitled database".to_string());
+            root_children.push(ProjectedChild::Database {
+                database: database.clone(),
+                title,
+            });
+        }
     }
 
     let mut tree_entries = Vec::new();
@@ -576,16 +671,19 @@ fn project_workspace_root(
             })
             .collect::<BTreeSet<_>>(),
     };
-    let fallback_pages = pages
+    let fallback_pages = snapshot
+        .pages
         .iter()
         .filter(|page| {
-            is_workspace_fallback_page(
-                page,
-                &projected_page_ids,
-                &accessible_page_ids,
-                &accessible_database_ids,
-                &accessible_data_source_ids,
-            )
+            source_root == WorkspaceSourceRootProjection::Workspace
+                && !is_private_workspace_page(page, snapshot.private_owner_user_id.as_deref())
+                && is_workspace_fallback_page(
+                    page,
+                    &projected_page_ids,
+                    &accessible_page_ids,
+                    &accessible_database_ids,
+                    &accessible_data_source_ids,
+                )
         })
         .map(|page| ProjectedChild::Page {
             page: page.clone(),
@@ -794,6 +892,68 @@ fn projected_child_entry(mount_id: &MountId, projected: ProjectedChildWithPath) 
         ProjectedChild::Database { database, title } => {
             database_entry(mount_id.clone(), &database, title, projected.path)
         }
+    }
+}
+
+fn private_workspace_owner_user_id(api: &dyn NotionApi) -> Option<String> {
+    let current_user = api.retrieve_current_user().ok()?;
+    if current_user
+        .get("type")
+        .and_then(|kind| kind.as_str())
+        .is_some_and(|kind| kind == "person")
+    {
+        return current_user
+            .get("id")
+            .and_then(|id| id.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+    }
+
+    let owner = current_user.get("bot")?.get("owner")?;
+    if owner.get("type").and_then(|kind| kind.as_str()) != Some("user") {
+        return None;
+    }
+    owner
+        .get("user")?
+        .get("id")
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn is_source_root_page(
+    page: &PageDto,
+    source_root: WorkspaceSourceRootProjection,
+    accessible_page_ids: &BTreeSet<&str>,
+    private_owner_user_id: Option<&str>,
+) -> bool {
+    match source_root {
+        WorkspaceSourceRootProjection::Private => {
+            is_private_workspace_page(page, private_owner_user_id)
+        }
+        WorkspaceSourceRootProjection::Workspace => {
+            is_workspace_root_page(page, accessible_page_ids)
+                && !is_private_workspace_page(page, private_owner_user_id)
+        }
+    }
+}
+
+fn is_private_workspace_page(page: &PageDto, private_owner_user_id: Option<&str>) -> bool {
+    let Some(private_owner_user_id) = private_owner_user_id else {
+        return false;
+    };
+    if !is_direct_workspace_parent(page.parent.as_ref()) {
+        return false;
+    }
+    page.created_by
+        .as_ref()
+        .is_some_and(|created_by| created_by.id == private_owner_user_id)
+}
+
+fn is_direct_workspace_parent(parent: Option<&ParentDto>) -> bool {
+    match parent {
+        None => false,
+        Some(parent) => parent.workspace == Some(true) || parent.kind == "workspace",
     }
 }
 
@@ -1507,7 +1667,7 @@ mod tests {
     use crate::client::NotionApi;
     use crate::dto::{
         BlockDto, BlockListDto, DataSourceDto, DataSourceSummaryDto, DatabaseDto, DatabaseListDto,
-        PageDto, PageListDto, PagePropertyDto, ParentDto, RichTextDto,
+        PageDto, PageListDto, PagePropertyDto, ParentDto, RichTextDto, UserMentionDto,
     };
 
     #[test]
@@ -1723,6 +1883,38 @@ mod tests {
     }
 
     #[test]
+    fn exact_page_resolution_uses_private_root_for_owner_workspace_page() {
+        let api = FakeNotionApi::new()
+            .with_current_user(owner_user_response("owner-user"))
+            .with_page(page_with_title_and_creator(
+                "scratchpad",
+                "Scratchpad",
+                workspace_parent(),
+                "owner-user",
+            ));
+
+        let entries = resolve_page_path_entries(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            &RemoteId::new("scratchpad"),
+        )
+        .expect("resolve private workspace page");
+
+        let resolved = entries
+            .iter()
+            .find(|entry| entry.remote_id.as_str() == "scratchpad")
+            .expect("resolved target entry");
+
+        assert_eq!(
+            resolved.path,
+            Path::new(NOTION_PRIVATE_ROOT_DIR)
+                .join("scratchpad")
+                .join(PAGE_DOCUMENT_FILENAME)
+        );
+    }
+
+    #[test]
     fn workspace_enumeration_adds_synthetic_roots_and_places_workspace_objects_under_workspace() {
         let api = FakeNotionApi::new()
             .with_page(page_with_title(
@@ -1823,6 +2015,125 @@ mod tests {
     }
 
     #[test]
+    fn workspace_enumeration_projects_owner_workspace_pages_under_private() {
+        let api = FakeNotionApi::new()
+            .with_current_user(owner_user_response("owner-user"))
+            .with_page(page_with_title_and_creator(
+                "scratchpad",
+                "Scratchpad",
+                workspace_parent(),
+                "owner-user",
+            ))
+            .with_page(page_with_title_and_creator(
+                "company",
+                "Company",
+                workspace_parent(),
+                "workspace-user",
+            ));
+
+        let entries = enumerate_shared_pages(&api, MountId::new("notion-main"))
+            .expect("enumerate shared pages");
+
+        assert_tree_entry(
+            &entries,
+            "scratchpad",
+            EntityKind::Page,
+            "Scratchpad",
+            "Private/scratchpad/page.md",
+            HydrationState::Stub,
+        );
+        assert_tree_entry(
+            &entries,
+            "company",
+            EntityKind::Page,
+            "Company",
+            "Workspace/company/page.md",
+            HydrationState::Stub,
+        );
+        assert!(
+            entries.iter().all(|entry| {
+                entry.remote_id.as_str() != "scratchpad"
+                    || entry.path == Path::new("Private/scratchpad/page.md")
+            }),
+            "private workspace pages must not duplicate under Workspace/"
+        );
+    }
+
+    #[test]
+    fn workspace_enumeration_keeps_owner_pages_with_omitted_parent_under_workspace() {
+        let mut legacy_page = page_with_title_and_creator(
+            "legacy-page",
+            "Legacy Page",
+            workspace_parent(),
+            "owner-user",
+        );
+        legacy_page.parent = None;
+        let api = FakeNotionApi::new()
+            .with_current_user(owner_user_response("owner-user"))
+            .with_page(legacy_page);
+
+        let entries = enumerate_shared_pages(&api, MountId::new("notion-main"))
+            .expect("enumerate shared pages");
+
+        assert_tree_entry(
+            &entries,
+            "legacy-page",
+            EntityKind::Page,
+            "Legacy Page",
+            "Workspace/legacy-page/page.md",
+            HydrationState::Stub,
+        );
+        assert!(
+            entries.iter().all(|entry| {
+                entry.remote_id.as_str() != "legacy-page"
+                    || entry.path == Path::new("Workspace/legacy-page/page.md")
+            }),
+            "omitted parent metadata is not a strong enough private-page signal"
+        );
+    }
+
+    #[test]
+    fn workspace_enumeration_reuses_search_snapshot_for_private_and_workspace_roots() {
+        let api = FakeNotionApi::new()
+            .with_current_user(owner_user_response("owner-user"))
+            .with_page(page_with_title_and_creator(
+                "scratchpad",
+                "Scratchpad",
+                workspace_parent(),
+                "owner-user",
+            ))
+            .with_page(page_with_title_and_creator(
+                "company",
+                "Company",
+                workspace_parent(),
+                "workspace-user",
+            ));
+
+        let entries = enumerate_shared_pages(&api, MountId::new("notion-main"))
+            .expect("enumerate shared pages");
+
+        assert_tree_entry(
+            &entries,
+            "scratchpad",
+            EntityKind::Page,
+            "Scratchpad",
+            "Private/scratchpad/page.md",
+            HydrationState::Stub,
+        );
+        assert_tree_entry(
+            &entries,
+            "company",
+            EntityKind::Page,
+            "Company",
+            "Workspace/company/page.md",
+            HydrationState::Stub,
+        );
+        assert_eq!(api.retrieve_current_user_calls(), 1);
+        assert_eq!(api.search_pages_calls(), 1);
+        assert_eq!(api.search_databases_calls(), 1);
+    }
+
+    #[test]
     fn root_page_enumeration_does_not_add_workspace_synthetic_roots() {
         let api = FakeNotionApi::new().with_page(page_with_title(
             "root-page",
@@ -1920,6 +2231,105 @@ mod tests {
         .expect("list private synthetic root");
 
         assert!(private_children.is_empty());
+    }
+
+    #[test]
+    fn workspace_source_roots_place_owner_workspace_pages_under_private_only() {
+        let api = FakeNotionApi::new()
+            .with_current_user(owner_user_response("owner-user"))
+            .with_page(page_with_title_and_creator(
+                "scratchpad",
+                "Scratchpad",
+                workspace_parent(),
+                "owner-user",
+            ))
+            .with_page(page_with_title_and_creator(
+                "company",
+                "Company",
+                workspace_parent(),
+                "workspace-user",
+            ))
+            .with_database(database_with_title(
+                "engineering-db",
+                "Engineering Wiki",
+                workspace_parent(),
+                Vec::new(),
+            ))
+            .with_page(page_with_title_and_creator(
+                "temp",
+                "temp",
+                database_parent("engineering-db"),
+                "owner-user",
+            ))
+            .with_page(page_with_title_and_creator(
+                "temp-row",
+                "temp row",
+                data_source_parent("engineering-ds"),
+                "owner-user",
+            ));
+
+        let private_children = list_container_children(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            ChildContainer::SourceRoot(RemoteId::new(NOTION_PRIVATE_ROOT_ID)),
+            Path::new(NOTION_PRIVATE_ROOT_DIR),
+        )
+        .expect("list private synthetic root");
+
+        assert_eq!(private_children.len(), 1);
+        assert_tree_entry(
+            &private_children,
+            "scratchpad",
+            EntityKind::Page,
+            "Scratchpad",
+            "Private/scratchpad/page.md",
+            HydrationState::Stub,
+        );
+        assert!(
+            private_children
+                .iter()
+                .all(|entry| entry.remote_id.as_str() != "temp"),
+            "owner-created pages below an existing database must stay under that database"
+        );
+        assert!(
+            private_children
+                .iter()
+                .all(|entry| entry.remote_id.as_str() != "temp-row"),
+            "owner-created pages below an existing data source must stay under that database"
+        );
+
+        let workspace_children = list_container_children(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            ChildContainer::SourceRoot(RemoteId::new(NOTION_WORKSPACE_ROOT_ID)),
+            Path::new(NOTION_WORKSPACE_ROOT_DIR),
+        )
+        .expect("list workspace synthetic root");
+
+        assert_tree_entry(
+            &workspace_children,
+            "company",
+            EntityKind::Page,
+            "Company",
+            "Workspace/company/page.md",
+            HydrationState::Stub,
+        );
+        assert_tree_entry(
+            &workspace_children,
+            "engineering-db",
+            EntityKind::Database,
+            "Engineering Wiki",
+            "Workspace/engineering-wiki",
+            HydrationState::Stub,
+        );
+        assert!(
+            workspace_children
+                .iter()
+                .all(|entry| entry.remote_id.as_str() != "scratchpad"),
+            "owner-created top-level workspace pages must not duplicate under Workspace/"
+        );
     }
 
     #[test]
@@ -2128,6 +2538,7 @@ mod tests {
             parent: None,
             created_time: None,
             last_edited_time: None,
+            created_by: None,
             archived: false,
             in_trash: false,
             properties: BTreeMap::new(),
@@ -2147,6 +2558,38 @@ mod tests {
         page.properties
             .insert("Name".to_string(), title_property(title));
         page
+    }
+
+    fn page_with_title_and_creator(
+        id: &str,
+        title: &str,
+        parent: ParentDto,
+        created_by_id: &str,
+    ) -> PageDto {
+        let mut page = page_with_title(id, title, parent);
+        page.created_by = Some(UserMentionDto {
+            id: created_by_id.to_string(),
+            ..Default::default()
+        });
+        page
+    }
+
+    fn owner_user_response(user_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "object": "user",
+            "id": "bot-user",
+            "type": "bot",
+            "bot": {
+                "owner": {
+                    "type": "user",
+                    "user": {
+                        "object": "user",
+                        "id": user_id,
+                        "type": "person"
+                    }
+                }
+            }
+        })
     }
 
     fn database_with_title(
@@ -2238,6 +2681,10 @@ mod tests {
         data_sources: BTreeMap<String, DataSourceDto>,
         database_rows: BTreeMap<String, Vec<String>>,
         page_children: BTreeMap<String, Vec<BlockDto>>,
+        current_user: Option<serde_json::Value>,
+        retrieve_current_user_calls: AtomicUsize,
+        search_pages_calls: AtomicUsize,
+        search_databases_calls: AtomicUsize,
         retrieve_block_children_calls: AtomicUsize,
         query_data_source_calls: AtomicUsize,
     }
@@ -2249,6 +2696,11 @@ mod tests {
 
         fn with_page(mut self, page: PageDto) -> Self {
             self.pages.insert(page.id.clone(), page);
+            self
+        }
+
+        fn with_current_user(mut self, current_user: serde_json::Value) -> Self {
+            self.current_user = Some(current_user);
             self
         }
 
@@ -2283,6 +2735,18 @@ mod tests {
         fn query_data_source_calls(&self) -> usize {
             self.query_data_source_calls.load(Ordering::Relaxed)
         }
+
+        fn retrieve_current_user_calls(&self) -> usize {
+            self.retrieve_current_user_calls.load(Ordering::Relaxed)
+        }
+
+        fn search_pages_calls(&self) -> usize {
+            self.search_pages_calls.load(Ordering::Relaxed)
+        }
+
+        fn search_databases_calls(&self) -> usize {
+            self.search_databases_calls.load(Ordering::Relaxed)
+        }
     }
 
     impl std::fmt::Debug for FakeNotionApi {
@@ -2292,6 +2756,14 @@ mod tests {
     }
 
     impl NotionApi for FakeNotionApi {
+        fn retrieve_current_user(&self) -> LocalityResult<serde_json::Value> {
+            self.retrieve_current_user_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.current_user
+                .clone()
+                .ok_or_else(|| LocalityError::NotImplemented("retrieve fake Notion current user"))
+        }
+
         fn retrieve_page(&self, page_id: &str) -> LocalityResult<PageDto> {
             self.pages
                 .get(page_id)
@@ -2351,6 +2823,7 @@ mod tests {
         }
 
         fn search_pages(&self, _start_cursor: Option<&str>) -> LocalityResult<PageListDto> {
+            self.search_pages_calls.fetch_add(1, Ordering::Relaxed);
             Ok(PageListDto {
                 results: self.pages.values().cloned().collect(),
                 next_cursor: None,
@@ -2359,6 +2832,7 @@ mod tests {
         }
 
         fn search_databases(&self, _start_cursor: Option<&str>) -> LocalityResult<DatabaseListDto> {
+            self.search_databases_calls.fetch_add(1, Ordering::Relaxed);
             Ok(DatabaseListDto {
                 results: self.databases.values().cloned().collect(),
                 next_cursor: None,

@@ -462,7 +462,7 @@ where
 
     let result = connector.list_children(ListChildrenRequest {
         mount_id: mount.mount_id.clone(),
-        container,
+        container: container.clone(),
         parent_path: parent_path.clone(),
     })?;
     let returned_remote_ids = result
@@ -484,9 +484,21 @@ where
         store.save_entity(record).map_err(LocalityError::from)?;
         saved += 1;
     }
+    let rehomed_remote_ids = rehome_clean_children_moved_to_sibling_source_roots(
+        store,
+        connector,
+        &mount,
+        &entities,
+        &container,
+        &parent_path,
+        &returned_remote_ids,
+        &mut saved,
+        &mut changed,
+    )?;
     for entity in entities.iter().filter(|entity| {
         entity_listing_parent_path(entity) == parent_path
             && !returned_remote_ids.contains(&entity.remote_id)
+            && !rehomed_remote_ids.contains(&entity.remote_id)
             && refreshed_child_can_be_pruned(entity)
     }) {
         store
@@ -496,6 +508,74 @@ where
     }
 
     Ok(VirtualFsRefreshChildrenReport { saved, changed })
+}
+
+fn rehome_clean_children_moved_to_sibling_source_roots<S, C>(
+    store: &mut S,
+    connector: &C,
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+    container: &ChildContainer,
+    parent_path: &Path,
+    returned_remote_ids: &BTreeSet<RemoteId>,
+    saved: &mut usize,
+    changed: &mut bool,
+) -> LocalityResult<BTreeSet<RemoteId>>
+where
+    S: EntityRepository,
+    C: Connector + ?Sized,
+{
+    let ChildContainer::SourceRoot(current_source_root_id) = container else {
+        return Ok(BTreeSet::new());
+    };
+    let stale_clean_remote_ids = entities
+        .iter()
+        .filter(|entity| {
+            entity_listing_parent_path(entity) == parent_path
+                && !returned_remote_ids.contains(&entity.remote_id)
+                && refreshed_child_can_be_pruned(entity)
+        })
+        .map(|entity| entity.remote_id.clone())
+        .collect::<BTreeSet<_>>();
+    if stale_clean_remote_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let sibling_source_roots = entities
+        .iter()
+        .filter(|entity| {
+            entity.kind == EntityKind::Directory
+                && entity.remote_id != *current_source_root_id
+                && (is_notion_private_root_entity(mount, entity)
+                    || is_notion_workspace_root_entity(mount, entity))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut rehomed_remote_ids = BTreeSet::new();
+    for sibling_root in sibling_source_roots {
+        let result = connector.list_children(ListChildrenRequest {
+            mount_id: mount.mount_id.clone(),
+            container: ChildContainer::SourceRoot(sibling_root.remote_id.clone()),
+            parent_path: sibling_root.path.clone(),
+        })?;
+        for entry in result.entries {
+            if !stale_clean_remote_ids.contains(&entry.remote_id) {
+                continue;
+            }
+            let existing = store
+                .get_entity(&entry.mount_id, &entry.remote_id)
+                .map_err(LocalityError::from)?;
+            let record = refreshed_entity_record(entry, existing.as_ref());
+            if existing.as_ref() != Some(&record) {
+                *changed = true;
+            }
+            rehomed_remote_ids.insert(record.remote_id.clone());
+            store.save_entity(record).map_err(LocalityError::from)?;
+            *saved += 1;
+        }
+    }
+
+    Ok(rehomed_remote_ids)
 }
 
 fn refreshed_child_can_be_pruned(entity: &EntityRecord) -> bool {
@@ -2624,12 +2704,13 @@ impl ProviderIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
     use locality_connector::{
-        ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
-        ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
-        ListChildrenResult, NativeEntity, ParsedEntity,
+        ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, ChildContainer,
+        Connector, ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest,
+        ListChildrenRequest, ListChildrenResult, NativeEntity, ParsedEntity,
     };
     use locality_core::{
         LocalityError,
@@ -3130,6 +3211,84 @@ mod tests {
     }
 
     #[test]
+    fn refresh_source_root_rehomes_clean_child_moved_to_sibling_source_root() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(notion_synthetic_root_entity(
+                &mount_id,
+                NOTION_PRIVATE_ROOT_ID,
+                NOTION_PRIVATE_ROOT_DIR,
+                NOTION_PRIVATE_ROOT_DIR,
+            ))
+            .expect("save private root");
+        store
+            .save_entity(notion_synthetic_root_entity(
+                &mount_id,
+                NOTION_WORKSPACE_ROOT_ID,
+                NOTION_WORKSPACE_ROOT_DIR,
+                NOTION_WORKSPACE_ROOT_DIR,
+            ))
+            .expect("save workspace root");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("scratchpad"),
+                EntityKind::Page,
+                "Scratchpad",
+                "Workspace/scratchpad/page.md",
+            ))
+            .expect("save old workspace child");
+
+        let connector = SourceRootChildrenConnector {
+            entries_by_source_root: BTreeMap::from([
+                (NOTION_WORKSPACE_ROOT_ID.to_string(), Vec::new()),
+                (
+                    NOTION_PRIVATE_ROOT_ID.to_string(),
+                    vec![TreeEntry {
+                        mount_id: mount_id.clone(),
+                        remote_id: RemoteId::new("scratchpad"),
+                        kind: EntityKind::Page,
+                        title: "Scratchpad".to_string(),
+                        path: "Private/scratchpad/page.md".into(),
+                        hydration: HydrationState::Stub,
+                        content_hash: None,
+                        remote_edited_at: None,
+                        stub_frontmatter: None,
+                    }],
+                ),
+            ]),
+        };
+
+        let saved = refresh_virtual_fs_children(
+            &mut store,
+            &connector,
+            &mount_id,
+            NOTION_WORKSPACE_ROOT_ID,
+        )
+        .expect("refresh workspace source root");
+
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
+        let scratchpad = store
+            .get_entity(&mount_id, &RemoteId::new("scratchpad"))
+            .expect("get scratchpad")
+            .expect("scratchpad should be rehomed, not pruned");
+        assert_eq!(scratchpad.path, PathBuf::from("Private/scratchpad/page.md"));
+
+        let workspace = virtual_fs_children(&store, &mount_id, NOTION_WORKSPACE_ROOT_ID)
+            .expect("workspace children");
+        assert!(workspace.children.is_empty());
+        let private = virtual_fs_children(&store, &mount_id, NOTION_PRIVATE_ROOT_ID)
+            .expect("private children");
+        assert_eq!(private.children.len(), 1);
+        assert_eq!(private.children[0].identifier, "children:scratchpad");
+    }
+
+    #[test]
     fn refresh_database_children_moves_existing_row_into_database_directory() {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
@@ -3306,6 +3465,96 @@ mod tests {
     struct StaticChildrenConnector {
         entries: Vec<TreeEntry>,
         expected_parent_path: PathBuf,
+    }
+
+    struct SourceRootChildrenConnector {
+        entries_by_source_root: BTreeMap<String, Vec<TreeEntry>>,
+    }
+
+    impl Connector for SourceRootChildrenConnector {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind("test")
+        }
+
+        fn capabilities(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities {
+                supports_lazy_child_enumeration: true,
+                ..ConnectorCapabilities::default()
+            }
+        }
+
+        fn enumerate(
+            &self,
+            _request: EnumerateRequest,
+        ) -> locality_core::LocalityResult<Vec<TreeEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn list_children(
+            &self,
+            request: ListChildrenRequest,
+        ) -> locality_core::LocalityResult<ListChildrenResult> {
+            let ChildContainer::SourceRoot(source_root_id) = request.container else {
+                return Err(LocalityError::InvalidState(
+                    "expected source root children request".to_string(),
+                ));
+            };
+            Ok(ListChildrenResult {
+                entries: self
+                    .entries_by_source_root
+                    .get(source_root_id.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+        }
+
+        fn fetch(&self, request: FetchRequest) -> locality_core::LocalityResult<NativeEntity> {
+            let _ = request;
+            Err(locality_core::LocalityError::NotImplemented(
+                "fixture fetch",
+            ))
+        }
+
+        fn render(
+            &self,
+            _entity: &NativeEntity,
+        ) -> locality_core::LocalityResult<CanonicalDocument> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fixture render",
+            ))
+        }
+
+        fn parse(
+            &self,
+            _document: &CanonicalDocument,
+        ) -> locality_core::LocalityResult<ParsedEntity> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fixture parse",
+            ))
+        }
+
+        fn check_concurrency(
+            &self,
+            _request: ApplyPlanRequest<'_>,
+        ) -> locality_core::LocalityResult<()> {
+            Ok(())
+        }
+
+        fn apply(
+            &self,
+            _request: ApplyPlanRequest<'_>,
+        ) -> locality_core::LocalityResult<ApplyPlanResult> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fixture apply",
+            ))
+        }
+
+        fn apply_undo(
+            &self,
+            _request: ApplyUndoRequest<'_>,
+        ) -> locality_core::LocalityResult<ApplyUndoResult> {
+            Err(locality_core::LocalityError::NotImplemented("fixture undo"))
+        }
     }
 
     impl Connector for StaticChildrenConnector {

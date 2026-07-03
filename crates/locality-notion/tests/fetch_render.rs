@@ -2750,6 +2750,7 @@ fn page_with_parent(id: &str, title: &str, parent: Option<ParentDto>) -> PageDto
         parent,
         created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
         last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+        created_by: None,
         archived: false,
         in_trash: false,
         properties: BTreeMap::from([(

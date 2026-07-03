@@ -188,9 +188,13 @@ only when needed to keep sibling names unique.
 ## Workspace Mount Root Layout
 
 Workspace Notion mounts expose two synthetic directories at the mount root:
-`Private/` and `Workspace/`. Existing accessible top-level Notion pages and
-databases appear under `Workspace/`, along with searchable accessible objects
-that Locality cannot safely place under an observed parent.
+`Private/` and `Workspace/`. When the connection exposes an owner user,
+accessible top-level workspace pages created by that owner appear under
+`Private/`; Notion does not expose a separate private flag here, so Locality
+uses the direct workspace parent plus owner creator as the classifier. Existing
+accessible top-level workspace or team pages and databases appear under
+`Workspace/`, along with searchable accessible objects that Locality cannot
+safely place under an observed parent.
 
 A local draft at `Private/<Page Title>/page.md` is pushed, or synced by Live
 Mode, as a private workspace page by omitting the Notion API `parent` payload.
