@@ -1250,6 +1250,149 @@ fn sqlite_store_repairs_exact_notion_workspace_root_name_collisions() {
 }
 
 #[test]
+fn sqlite_store_repairs_page_shaped_notion_workspace_root_name_collisions() {
+    let fixture = SqliteFixture::new();
+    let db_path = seed_notion_workspace_root_page_name_collision_state(&fixture);
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute(
+            "DELETE FROM state_components
+             WHERE component_id = 'projection:notion_workspace_roots'",
+            [],
+        )
+        .expect("delete notion workspace roots component");
+    drop(connection);
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+
+    assert_eq!(
+        query_entities_for_mount(&connection, &fixture.mount_id),
+        vec![
+            (
+                "notion-root:private".to_string(),
+                "directory".to_string(),
+                "Private".to_string(),
+                "Private".to_string(),
+                "virtual".to_string(),
+            ),
+            (
+                "notion-root:workspace".to_string(),
+                "directory".to_string(),
+                "Workspace".to_string(),
+                "Workspace".to_string(),
+                "virtual".to_string(),
+            ),
+            (
+                "already-workspace".to_string(),
+                "page".to_string(),
+                "Already".to_string(),
+                "Workspace/Already/page.md".to_string(),
+                "stub".to_string(),
+            ),
+            (
+                "private-page".to_string(),
+                "page".to_string(),
+                "Private".to_string(),
+                "Workspace/Private/page.md".to_string(),
+                "stub".to_string(),
+            ),
+            (
+                "workspace-page".to_string(),
+                "page".to_string(),
+                "Workspace".to_string(),
+                "Workspace/Workspace/page.md".to_string(),
+                "stub".to_string(),
+            ),
+        ]
+    );
+    assert_eq!(
+        query_paths_by_remote_id(
+            &connection,
+            "remote_observations",
+            "projected_path",
+            &fixture.mount_id
+        ),
+        vec![
+            (
+                "already-workspace".to_string(),
+                "Workspace/Already/page.md".to_string()
+            ),
+            (
+                "private-page".to_string(),
+                "Workspace/Private/page.md".to_string()
+            ),
+            (
+                "workspace-page".to_string(),
+                "Workspace/Workspace/page.md".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        query_paths_by_remote_id(&connection, "hydration_jobs", "path", &fixture.mount_id),
+        vec![
+            (
+                "already-workspace".to_string(),
+                "Workspace/Already/page.md".to_string()
+            ),
+            (
+                "private-page".to_string(),
+                "Workspace/Private/page.md".to_string()
+            ),
+            (
+                "workspace-page".to_string(),
+                "Workspace/Workspace/page.md".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        query_paths_by_remote_id(
+            &connection,
+            "auto_save_enrollments",
+            "path",
+            &fixture.mount_id
+        ),
+        vec![
+            (
+                "already-workspace".to_string(),
+                "Workspace/Already/page.md".to_string()
+            ),
+            (
+                "private-page".to_string(),
+                "Workspace/Private/page.md".to_string()
+            ),
+            (
+                "workspace-page".to_string(),
+                "Workspace/Workspace/page.md".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        query_virtual_mutation_paths(&connection, &fixture.mount_id),
+        vec![
+            (
+                "local:already-workspace".to_string(),
+                Some("Workspace/Already/page.md".to_string()),
+                "Workspace/Already/page.md".to_string(),
+                Some("Workspace/Already/page.md".to_string()),
+            ),
+            (
+                "local:private-page".to_string(),
+                Some("Workspace/Private/page.md".to_string()),
+                "Workspace/Private/page.md".to_string(),
+                Some("Workspace/Private/page.md".to_string()),
+            ),
+            (
+                "local:workspace-page".to_string(),
+                Some("Workspace/Workspace/page.md".to_string()),
+                "Workspace/Workspace/page.md".to_string(),
+                Some("Workspace/Workspace/page.md".to_string()),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn sqlite_store_blocks_newer_notion_workspace_roots_component_without_rewriting() {
     let fixture = SqliteFixture::new();
     let db_path = seed_notion_workspace_roots_legacy_state(&fixture);
@@ -3307,6 +3450,83 @@ fn seed_notion_workspace_root_name_collision_state(fixture: &SqliteFixture) -> P
     store.db_path.clone()
 }
 
+fn seed_notion_workspace_root_page_name_collision_state(fixture: &SqliteFixture) -> PathBuf {
+    let mut store = fixture.open();
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.mount_root.join("workspace"),
+        ))
+        .expect("save workspace notion mount");
+
+    for (remote_id, title, path) in [
+        ("private-page", "Private", "Private/page.md"),
+        ("workspace-page", "Workspace", "Workspace/page.md"),
+        ("already-workspace", "Already", "Workspace/Already/page.md"),
+    ] {
+        let remote_id_value = remote_id;
+        let remote_id = RemoteId::new(remote_id_value);
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                title,
+                path,
+            ))
+            .expect("save workspace entity");
+        store
+            .save_remote_observation(RemoteObservationRecord::new(
+                fixture.mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                title,
+                path,
+                "2026-07-03T00:00:00Z",
+            ))
+            .expect("save workspace observation");
+        store
+            .upsert_hydration_job(HydrationJobRecord {
+                mount_id: fixture.mount_id.clone(),
+                remote_id: remote_id.clone(),
+                path: PathBuf::from(path),
+                target_state: HydrationState::Hydrated,
+                reason: HydrationReason::Policy,
+                attempts: 0,
+                last_error: None,
+            })
+            .expect("save workspace hydration job");
+        store
+            .save_virtual_mutation(VirtualMutationRecord {
+                mount_id: fixture.mount_id.clone(),
+                local_id: format!("local:{remote_id_value}"),
+                mutation_kind: VirtualMutationKind::Rename,
+                target_remote_id: Some(remote_id.clone()),
+                parent_remote_id: None,
+                original_path: Some(PathBuf::from(path)),
+                projected_path: PathBuf::from(path),
+                title: title.to_string(),
+                content_path: Some(PathBuf::from(path)),
+                created_at: "2026-07-03T00:00:00Z".to_string(),
+                updated_at: "2026-07-03T00:00:00Z".to_string(),
+            })
+            .expect("save workspace virtual mutation");
+        let mut enrollment = AutoSaveEnrollmentRecord::new(
+            fixture.mount_id.clone(),
+            path,
+            AutoSaveOrigin::UserEnabled,
+            "2026-07-03T00:00:00Z",
+        );
+        enrollment.remote_id = Some(remote_id);
+        store
+            .save_auto_save_enrollment(enrollment)
+            .expect("save workspace auto-save");
+    }
+
+    store.db_path.clone()
+}
+
 fn query_entities_for_mount(
     connection: &Connection,
     mount_id: &MountId,
@@ -3343,6 +3563,55 @@ fn query_entities_for_mount(
             )
         })
         .collect()
+}
+
+fn query_paths_by_remote_id(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    mount_id: &MountId,
+) -> Vec<(String, String)> {
+    let sql = format!(
+        "SELECT remote_id, {column}
+         FROM {table}
+         WHERE mount_id = ?1
+           AND remote_id IS NOT NULL
+         ORDER BY remote_id"
+    );
+    let mut statement = connection.prepare(&sql).expect("prepare paths query");
+    let rows = statement
+        .query_map(params![mount_id.0.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query paths");
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect paths")
+}
+
+fn query_virtual_mutation_paths(
+    connection: &Connection,
+    mount_id: &MountId,
+) -> Vec<(String, Option<String>, String, Option<String>)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT local_id, original_path, projected_path, content_path
+             FROM virtual_mutations
+             WHERE mount_id = ?1
+             ORDER BY local_id",
+        )
+        .expect("prepare virtual mutation paths query");
+    let rows = statement
+        .query_map(params![mount_id.0.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .expect("query virtual mutation paths");
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect virtual mutation paths")
 }
 
 fn assert_notion_workspace_roots_state_not_rewritten(db_path: &PathBuf, mount_id: &MountId) {

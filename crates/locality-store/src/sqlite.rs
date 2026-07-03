@@ -14,6 +14,7 @@ use locality_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use locality_core::path_projection::PAGE_DOCUMENT_FILENAME;
 use locality_core::planner::{PlanSummary, PushOperation, PushPlan};
 use locality_core::shadow::ShadowDocument;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -2860,17 +2861,37 @@ fn rewrite_notion_workspace_root_paths(
 }
 
 fn notion_workspace_root_repaired_path(path: &str, skip_absolute: bool) -> Option<String> {
-    if path.is_empty()
-        || path.starts_with("Private/")
+    if path.is_empty() || (skip_absolute && is_probably_absolute_path(path)) {
+        None
+    } else if is_legacy_notion_workspace_root_page_path(path) {
+        Some(format!("{NOTION_WORKSPACE_ROOT_DIR}/{path}"))
+    } else if path.starts_with("Private/")
         || path.starts_with("Private\\")
         || path.starts_with("Workspace/")
         || path.starts_with("Workspace\\")
-        || (skip_absolute && is_probably_absolute_path(path))
     {
         None
     } else {
         Some(format!("{NOTION_WORKSPACE_ROOT_DIR}/{path}"))
     }
+}
+
+fn is_legacy_notion_workspace_root_page_path(path: &str) -> bool {
+    is_legacy_root_page_path(path, NOTION_PRIVATE_ROOT_DIR)
+        || is_legacy_root_page_path(path, NOTION_WORKSPACE_ROOT_DIR)
+}
+
+fn is_legacy_root_page_path(path: &str, root_dir: &str) -> bool {
+    let Some(suffix) = path.strip_prefix(root_dir) else {
+        return false;
+    };
+    let Some(suffix) = suffix
+        .strip_prefix('/')
+        .or_else(|| suffix.strip_prefix('\\'))
+    else {
+        return false;
+    };
+    suffix == PAGE_DOCUMENT_FILENAME
 }
 
 fn is_probably_absolute_path(path: &str) -> bool {
