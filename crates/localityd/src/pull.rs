@@ -958,6 +958,30 @@ fn apply_reserved_notion_root_projection_moves(
         }
     }
 
+    ensure_reserved_notion_root_directories_after_projection_moves(mount, moves)?;
+
+    Ok(())
+}
+
+fn ensure_reserved_notion_root_directories_after_projection_moves(
+    mount: &MountConfig,
+    moves: &[ReservedRootProjectionMove],
+) -> Result<(), PullError> {
+    if moves.is_empty()
+        || mount.projection.uses_virtual_filesystem()
+        || !is_notion_workspace_mount(mount)
+    {
+        return Ok(());
+    }
+
+    for root_name in [NOTION_PRIVATE_ROOT, NOTION_WORKSPACE_ROOT] {
+        let path = mount.root.join(root_name);
+        std::fs::create_dir_all(&path).map_err(|error| PullError::WriteFile {
+            path,
+            message: error.to_string(),
+        })?;
+    }
+
     Ok(())
 }
 
@@ -2372,6 +2396,30 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn reserved_root_move_recreates_synthetic_root_directories_after_batch() {
+        let fixture = PullFixture::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone());
+        std::fs::create_dir_all(fixture.root.join("private")).expect("old container");
+        std::fs::write(fixture.root.join("private/page.md"), "local body").expect("old page");
+        let moves = vec![super::ReservedRootProjectionMove {
+            remote_id: RemoteId::new("page-1"),
+            source: PathBuf::from("private"),
+            stage: PathBuf::from(".loc-upgrade-stage-private"),
+            destination: PathBuf::from("Workspace/private"),
+        }];
+
+        super::apply_reserved_notion_root_projection_moves(&mount, &moves).expect("apply moves");
+
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("Workspace/private/page.md"))
+                .expect("moved page"),
+            "local body"
+        );
+        assert!(fixture.root.join("Private").is_dir());
+        assert!(fixture.root.join("Workspace").is_dir());
     }
 
     #[test]

@@ -515,6 +515,26 @@ fn apply_reserved_notion_root_projection_moves(
         }
     }
 
+    ensure_reserved_notion_root_directories_after_projection_moves(mount, moves)?;
+
+    Ok(())
+}
+
+fn ensure_reserved_notion_root_directories_after_projection_moves(
+    mount: &MountConfig,
+    moves: &[ReservedRootProjectionMove],
+) -> LocalityResult<()> {
+    if moves.is_empty()
+        || mount.projection.uses_virtual_filesystem()
+        || !is_notion_workspace_mount(mount)
+    {
+        return Ok(());
+    }
+
+    for root_name in [NOTION_PRIVATE_ROOT, NOTION_WORKSPACE_ROOT] {
+        create_dir_all(&mount.root.join(root_name))?;
+    }
+
     Ok(())
 }
 
@@ -949,4 +969,49 @@ fn rename_projected_path(from: &Path, to: &Path) -> LocalityResult<()> {
 fn read_to_string(path: &Path) -> LocalityResult<String> {
     std::fs::read_to_string(path)
         .map_err(|error| LocalityError::Io(format!("failed to read `{}`: {error}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use locality_core::model::{MountId, RemoteId};
+    use locality_store::MountConfig;
+
+    #[test]
+    fn reserved_root_move_recreates_synthetic_root_directories_after_batch() {
+        let root = temp_root("reconcile-reserved-root-synthetic-roots");
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(mount_id, "notion", root.clone());
+        std::fs::create_dir_all(root.join("private")).expect("old container");
+        std::fs::write(root.join("private/page.md"), "local body").expect("old page");
+        let moves = vec![super::ReservedRootProjectionMove {
+            remote_id: RemoteId::new("page-1"),
+            source: PathBuf::from("private"),
+            stage: PathBuf::from(".loc-upgrade-stage-private"),
+            destination: PathBuf::from("Workspace/private"),
+        }];
+
+        super::apply_reserved_notion_root_projection_moves(&mount, &moves).expect("apply moves");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("Workspace/private/page.md")).expect("moved page"),
+            "local body"
+        );
+        assert!(root.join("Private").is_dir());
+        assert!(root.join("Workspace").is_dir());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("loc-{label}-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp root");
+        root
+    }
 }
