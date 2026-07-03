@@ -10818,23 +10818,35 @@ mod tests {
 
     #[test]
     fn macos_workspace_mount_onboarding_state_requires_approval_when_domain_is_disabled() {
+        let expected = if cfg!(target_os = "macos") {
+            Some(super::MacosWorkspaceMountOnboardingState::ApprovalRequired)
+        } else {
+            None
+        };
+
         assert_eq!(
             super::macos_workspace_mount_onboarding_state(
                 "Could not open macOS File Provider domain `loc`: The Locality File Provider is registered but not enabled.",
                 false,
             ),
-            Some(super::MacosWorkspaceMountOnboardingState::ApprovalRequired)
+            expected
         );
     }
 
     #[test]
     fn macos_workspace_mount_onboarding_state_waits_for_cloudstorage_root_when_enabled() {
+        let expected = if cfg!(target_os = "macos") {
+            Some(super::MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot)
+        } else {
+            None
+        };
+
         assert_eq!(
             super::macos_workspace_mount_onboarding_state(
                 "Could not open macOS File Provider domain `loc`: locality-file-providerctl did not return a CloudStorage URL",
                 true,
             ),
-            Some(super::MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot)
+            expected
         );
     }
 
