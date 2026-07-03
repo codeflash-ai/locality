@@ -6979,12 +6979,6 @@ fn macos_file_provider_mount_root_health_error(root: &Path, details: &str) -> Op
             root.display()
         ));
     }
-    if !details.contains("itemIdentifier") {
-        return Some(format!(
-            "The macOS File Provider mount root `{}` is not provider-owned yet. Open Locality in Finder once the File Provider domain is ready, then reconnect Notion.",
-            root.display()
-        ));
-    }
     None
 }
 
@@ -10975,6 +10969,23 @@ mod tests {
                 displayName = notion;
                 isUploaded = 1;
                 itemIdentifier = "m:bm90aW9uLW1haW4:bW91bnQ6bm90aW9uLW1haW4";
+              }
+            );
+        "#;
+
+        assert_eq!(
+            macos_file_provider_mount_root_health_error(Path::new("/tmp/Locality/notion"), details),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_mount_root_health_accepts_missing_item_identifier() {
+        let details = r#"
+            fileproviderItems = (
+              {
+                displayName = notion;
+                isUploaded = 1;
               }
             );
         "#;
