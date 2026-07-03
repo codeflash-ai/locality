@@ -2450,7 +2450,7 @@ impl InlineParser<'_> {
         }
 
         if rest.starts_with('$')
-            && let Some(end) = find_closing(rest, 1, "$")
+            && let Some(end) = find_inline_equation_closing(rest)
         {
             return Ok(Some((
                 vec![RichTextWritePart::Equation {
@@ -2627,6 +2627,28 @@ fn parse_nested(
 
 fn find_closing(input: &str, start: usize, marker: &str) -> Option<usize> {
     find_unescaped_marker(input, start, marker)
+}
+
+fn find_inline_equation_closing(input: &str) -> Option<usize> {
+    if !input.starts_with('$') {
+        return None;
+    }
+
+    let first = input[1..].chars().next()?;
+    if first.is_whitespace() || first == '$' {
+        return None;
+    }
+
+    let end = find_unescaped_marker(input, 1, "$")?;
+    let expression = &input[1..end];
+    if expression.is_empty()
+        || expression.contains('\n')
+        || expression.chars().count() > NOTION_RICH_TEXT_CONTENT_LIMIT
+    {
+        return None;
+    }
+
+    Some(end)
 }
 
 fn find_unescaped_marker(input: &str, start: usize, marker: &str) -> Option<usize> {
@@ -3837,6 +3859,42 @@ mod tests {
             NOTION_RICH_TEXT_CONTENT_LIMIT
         );
         assert_eq!(parts[2]["text"]["content"], "a".repeat(33));
+    }
+
+    #[test]
+    fn rich_text_payload_keeps_oversized_inline_equation_span_as_text() {
+        let content = format!(
+            "Contract proposal was $1.55 k. {} Then the cap was $16,000,000.",
+            "ordinary transcript text ".repeat(1800)
+        );
+
+        let payload = rich_text_payload(&content, None).expect("rich text payload");
+        let parts = payload.as_array().expect("payload array");
+
+        assert!(parts.len() > 1, "{parts:#?}");
+        assert!(
+            parts.iter().all(|part| part["type"] == "text"),
+            "{parts:#?}"
+        );
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part["text"]["content"].as_str().unwrap_or_default())
+                .collect::<String>(),
+            content
+        );
+    }
+
+    #[test]
+    fn rich_text_payload_keeps_multiline_inline_equation_span_as_text() {
+        let content = "First amount $1.55 k.\n\nMore prose.\n\nAnother amount $16,000,000.";
+
+        let payload = rich_text_payload(content, None).expect("rich text payload");
+        let parts = payload.as_array().expect("payload array");
+
+        assert_eq!(parts.len(), 1, "{parts:#?}");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"]["content"], content);
     }
 
     #[test]
