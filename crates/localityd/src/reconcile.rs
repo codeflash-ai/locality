@@ -541,13 +541,17 @@ fn reserved_notion_root_page_move_steps(
         ));
     }
 
-    let existing_root =
-        workspace_reserved_child_component(&entry_container, comparison)?.to_owned();
-    Some(reserved_notion_root_page_move_steps_from_containers(
-        PathBuf::from(&existing_root),
-        &existing_root,
-        entry_container,
-    ))
+    if existing_path == entry_path {
+        let existing_root =
+            workspace_reserved_child_component(&entry_container, comparison)?.to_owned();
+        return Some(reserved_notion_root_page_move_steps_from_containers(
+            PathBuf::from(&existing_root),
+            &existing_root,
+            entry_container,
+        ));
+    }
+
+    None
 }
 
 fn reserved_notion_root_page_move_steps_from_containers(
