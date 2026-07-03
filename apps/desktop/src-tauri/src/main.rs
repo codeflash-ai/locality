@@ -1118,9 +1118,11 @@ async fn create_desktop_mount(app: AppHandle, request: CreateDesktopMountRequest
 
 #[tauri::command]
 async fn run_workspace_mount_onboarding(
+    app: AppHandle,
     request: WorkspaceMountOnboardingRequest,
 ) -> WorkspaceMountOnboardingReport {
-    tauri::async_runtime::spawn_blocking(move || run_workspace_mount_onboarding_blocking(request))
+    let report =
+        tauri::async_runtime::spawn_blocking(move || run_workspace_mount_onboarding_blocking(request))
         .await
         .unwrap_or_else(|error| {
             workspace_mount_onboarding_report(
@@ -1129,7 +1131,11 @@ async fn run_workspace_mount_onboarding(
                 WorkspaceMountOnboardingPrimaryAction::RetrySetup,
                 WorkspaceMountOnboardingLaunchStrategy::None,
             )
-        })
+        });
+    if workspace_mount_onboarding_should_refresh_surfaces(&report) {
+        refresh_desktop_surfaces(&app);
+    }
+    report
 }
 
 async fn create_desktop_mount_command(
@@ -1172,7 +1178,10 @@ fn run_workspace_mount_onboarding_blocking(
             let launch_strategy = launch_macos_file_provider_approval_surface();
             return workspace_mount_onboarding_report(
                 MacosWorkspaceMountOnboardingState::ApprovalRequired,
-                "Enable Locality in Finder, then return here and click Check again.",
+                workspace_mount_onboarding_curated_message(
+                    MacosWorkspaceMountOnboardingState::ApprovalRequired,
+                )
+                .expect("approval_required message"),
                 WorkspaceMountOnboardingPrimaryAction::CheckAgain,
                 launch_strategy,
             );
@@ -8364,6 +8373,26 @@ fn workspace_mount_onboarding_report(
     }
 }
 
+fn workspace_mount_onboarding_curated_message(
+    state: MacosWorkspaceMountOnboardingState,
+) -> Option<&'static str> {
+    match state {
+        MacosWorkspaceMountOnboardingState::ApprovalRequired => {
+            Some("Enable Locality in Finder, then return here and click Check again.")
+        }
+        MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot => {
+            Some("Locality is still waiting for the CloudStorage folder to appear.")
+        }
+        _ => None,
+    }
+}
+
+fn workspace_mount_onboarding_should_refresh_surfaces(
+    report: &WorkspaceMountOnboardingReport,
+) -> bool {
+    report.state == MacosWorkspaceMountOnboardingState::Created.as_str()
+}
+
 #[cfg(target_os = "macos")]
 fn macos_workspace_mount_onboarding_state(
     message: &str,
@@ -8408,7 +8437,7 @@ fn classify_workspace_mount_onboarding_failure(message: &str) -> WorkspaceMountO
                 };
                 return workspace_mount_onboarding_report(
                     state,
-                    message,
+                    workspace_mount_onboarding_curated_message(state).unwrap_or(message),
                     primary_action,
                     WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
                 );
@@ -11064,12 +11093,70 @@ mod tests {
             assert_eq!(report.state, "approval_required");
             assert_eq!(report.primary_action, "allow_in_macos");
             assert_eq!(report.launch_strategy, "instructions_only");
+            assert_eq!(
+                report.message,
+                "Enable Locality in Finder, then return here and click Check again."
+            );
         } else {
             assert_eq!(report.state, "failed");
             assert_eq!(report.primary_action, "retry_setup");
             assert_eq!(report.launch_strategy, "none");
+            assert_eq!(report.message, message);
         }
-        assert_eq!(report.message, message);
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_curated_message_matches_recoverable_state() {
+        assert_eq!(
+            super::workspace_mount_onboarding_curated_message(
+                super::MacosWorkspaceMountOnboardingState::ApprovalRequired
+            ),
+            Some("Enable Locality in Finder, then return here and click Check again.")
+        );
+        assert_eq!(
+            super::workspace_mount_onboarding_curated_message(
+                super::MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot
+            ),
+            Some("Locality is still waiting for the CloudStorage folder to appear.")
+        );
+        assert_eq!(
+            super::workspace_mount_onboarding_curated_message(
+                super::MacosWorkspaceMountOnboardingState::Created
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_refreshes_surfaces_only_for_created_reports() {
+        let created = super::workspace_mount_onboarding_report(
+            super::MacosWorkspaceMountOnboardingState::Created,
+            "Mount ready.",
+            super::WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+            super::WorkspaceMountOnboardingLaunchStrategy::None,
+        );
+        let waiting = super::workspace_mount_onboarding_report(
+            super::MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot,
+            "Locality is still waiting for the CloudStorage folder to appear.",
+            super::WorkspaceMountOnboardingPrimaryAction::CheckAgain,
+            super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+        );
+        let failed = super::workspace_mount_onboarding_report(
+            super::MacosWorkspaceMountOnboardingState::Failed,
+            "Mount failed.",
+            super::WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+            super::WorkspaceMountOnboardingLaunchStrategy::None,
+        );
+
+        assert!(super::workspace_mount_onboarding_should_refresh_surfaces(
+            &created
+        ));
+        assert!(!super::workspace_mount_onboarding_should_refresh_surfaces(
+            &waiting
+        ));
+        assert!(!super::workspace_mount_onboarding_should_refresh_surfaces(
+            &failed
+        ));
     }
 
     #[test]
