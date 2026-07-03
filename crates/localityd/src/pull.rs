@@ -969,16 +969,42 @@ where
     S: EntityRepository,
 {
     for (entry, existing) in entries.iter().zip(existing_entities.iter()) {
-        if moves
-            .iter()
-            .any(|planned_move| planned_move.remote_id == entry.remote_id)
-        {
+        if reserved_root_projection_move_affects_record(entry, existing.as_ref(), moves) {
             store
                 .save_entity(merged_entity_record(entry, existing.as_ref()))
                 .map_err(PullError::Store)?;
         }
     }
     Ok(())
+}
+
+fn reserved_root_projection_move_affects_record(
+    entry: &TreeEntry,
+    existing: Option<&EntityRecord>,
+    moves: &[ReservedRootProjectionMove],
+) -> bool {
+    if moves
+        .iter()
+        .any(|planned_move| planned_move.remote_id == entry.remote_id)
+    {
+        return true;
+    }
+
+    let Some(existing) = existing else {
+        return false;
+    };
+
+    moves.iter().any(|planned_move| {
+        path_is_within_subtree(
+            &existing.path,
+            &planned_move.source,
+            PathCaseComparison::CaseInsensitive,
+        ) && path_is_within_subtree(
+            &entry.path,
+            &planned_move.destination,
+            PathCaseComparison::CaseInsensitive,
+        )
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1147,6 +1173,35 @@ fn single_normal_component(path: &Path) -> Option<&str> {
 fn component_eq(left: &str, right: &str, comparison: PathCaseComparison) -> bool {
     match comparison {
         PathCaseComparison::CaseInsensitive => left.eq_ignore_ascii_case(right),
+    }
+}
+
+fn path_is_within_subtree(path: &Path, subtree: &Path, comparison: PathCaseComparison) -> bool {
+    let mut path_components = path.components();
+    for subtree_component in subtree.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        if !path_component_eq(path_component, subtree_component, comparison) {
+            return false;
+        }
+    }
+    true
+}
+
+fn path_component_eq(
+    left: Component<'_>,
+    right: Component<'_>,
+    comparison: PathCaseComparison,
+) -> bool {
+    match (left, right) {
+        (Component::Normal(left), Component::Normal(right)) => {
+            let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
+                return left == right;
+            };
+            component_eq(left, right, comparison)
+        }
+        (left, right) => left == right,
     }
 }
 
@@ -2549,6 +2604,99 @@ mod tests {
             .expect("get entity")
             .expect("entity remains present");
         assert_eq!(entity.path, old_path);
+    }
+
+    #[test]
+    fn mount_root_pull_saves_reserved_root_descendant_paths_when_later_entry_fails() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let root_remote_id = RemoteId::new("page-1");
+        let child_remote_id = RemoteId::new("child-page");
+        let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone());
+        let old_root_path = PathBuf::from("private/page.md");
+        let old_child_path = PathBuf::from("private/Child/page.md");
+        let new_root_path = PathBuf::from("Workspace/private/page.md");
+        let new_child_path = PathBuf::from("Workspace/private/Child/page.md");
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                root_remote_id.clone(),
+                EntityKind::Page,
+                "private",
+                old_root_path.clone(),
+            ))
+            .expect("save old root entity");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                child_remote_id.clone(),
+                EntityKind::Page,
+                "Child",
+                old_child_path.clone(),
+            ))
+            .expect("save old child entity");
+        std::fs::create_dir_all(fixture.root.join("private/Child")).expect("old child container");
+        std::fs::write(fixture.root.join(&old_root_path), "root body").expect("old root page");
+        std::fs::write(fixture.root.join(&old_child_path), "child body").expect("old child page");
+        std::fs::write(fixture.root.join("Blocked"), "not a directory").expect("block parent");
+        let source = FakePullSource::new(
+            vec![
+                directory_entry(
+                    &fixture.mount_id,
+                    "notion-root:private",
+                    "Private",
+                    "Private",
+                ),
+                directory_entry(
+                    &fixture.mount_id,
+                    "notion-root:workspace",
+                    "Workspace",
+                    "Workspace",
+                ),
+                tree_entry(
+                    &fixture.mount_id,
+                    &root_remote_id,
+                    "private",
+                    "Workspace/private/page.md",
+                    HydrationState::Stub,
+                ),
+                database_entry(&fixture.mount_id, "blocked-db", "Blocked", "Blocked/Tasks"),
+                tree_entry(
+                    &fixture.mount_id,
+                    &child_remote_id,
+                    "Child",
+                    "Workspace/private/Child/page.md",
+                    HydrationState::Stub,
+                ),
+            ],
+            Vec::new(),
+        );
+
+        let result =
+            super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None);
+
+        assert!(matches!(result, Err(super::PullError::WriteFile { .. })));
+        assert!(!fixture.root.join(&old_root_path).exists());
+        assert!(!fixture.root.join(&old_child_path).exists());
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join(&new_root_path)).expect("moved root page"),
+            "root body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join(&new_child_path)).expect("moved child page"),
+            "child body"
+        );
+        let root_entity = store
+            .get_entity(&fixture.mount_id, &root_remote_id)
+            .expect("get root entity")
+            .expect("root entity remains present");
+        assert_eq!(root_entity.path, new_root_path);
+        let child_entity = store
+            .get_entity(&fixture.mount_id, &child_remote_id)
+            .expect("get child entity")
+            .expect("child entity remains present");
+        assert_eq!(child_entity.path, new_child_path);
     }
 
     #[test]

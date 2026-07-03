@@ -526,14 +526,40 @@ where
     S: EntityRepository,
 {
     for (entry, existing) in entries.iter().zip(existing_entities.iter()) {
-        if moves
-            .iter()
-            .any(|planned_move| planned_move.remote_id == entry.remote_id)
-        {
+        if reserved_root_projection_move_affects_record(entry, existing.as_ref(), moves) {
             store.save_entity(merged_entity_record(entry, existing.as_ref()))?;
         }
     }
     Ok(())
+}
+
+fn reserved_root_projection_move_affects_record(
+    entry: &TreeEntry,
+    existing: Option<&EntityRecord>,
+    moves: &[ReservedRootProjectionMove],
+) -> bool {
+    if moves
+        .iter()
+        .any(|planned_move| planned_move.remote_id == entry.remote_id)
+    {
+        return true;
+    }
+
+    let Some(existing) = existing else {
+        return false;
+    };
+
+    moves.iter().any(|planned_move| {
+        path_is_within_subtree(
+            &existing.path,
+            &planned_move.source,
+            PathCaseComparison::CaseInsensitive,
+        ) && path_is_within_subtree(
+            &entry.path,
+            &planned_move.destination,
+            PathCaseComparison::CaseInsensitive,
+        )
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -690,6 +716,35 @@ fn single_normal_component(path: &Path) -> Option<&str> {
 fn component_eq(left: &str, right: &str, comparison: PathCaseComparison) -> bool {
     match comparison {
         PathCaseComparison::CaseInsensitive => left.eq_ignore_ascii_case(right),
+    }
+}
+
+fn path_is_within_subtree(path: &Path, subtree: &Path, comparison: PathCaseComparison) -> bool {
+    let mut path_components = path.components();
+    for subtree_component in subtree.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        if !path_component_eq(path_component, subtree_component, comparison) {
+            return false;
+        }
+    }
+    true
+}
+
+fn path_component_eq(
+    left: Component<'_>,
+    right: Component<'_>,
+    comparison: PathCaseComparison,
+) -> bool {
+    match (left, right) {
+        (Component::Normal(left), Component::Normal(right)) => {
+            let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
+                return left == right;
+            };
+            component_eq(left, right, comparison)
+        }
+        (left, right) => left == right,
     }
 }
 
