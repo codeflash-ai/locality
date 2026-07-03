@@ -244,6 +244,8 @@ pub struct BlockDto {
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
+    pub parent: Option<ParentDto>,
+    #[serde(default)]
     pub has_children: bool,
     #[serde(default)]
     pub archived: bool,

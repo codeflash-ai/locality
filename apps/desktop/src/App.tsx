@@ -48,7 +48,8 @@ import {
   type ProviderRuntimeSummary,
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
-import { shouldAutoCreateMount } from "./onboarding-flow";
+import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
+import { classifyMountSetupError } from "./onboarding-errors";
 import {
   failedMountOnboardingReport,
   mountOnboardingHeadline,
@@ -1161,6 +1162,7 @@ function Onboarding({
   const [loginCopyMessage, setLoginCopyMessage] = useState("");
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
+  const [mountPathDirty, setMountPathDirty] = useState(false);
   const [locateUrl, setLocateUrl] = useState("");
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
@@ -1169,6 +1171,7 @@ function Onboarding({
   const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
+  const mountStartRequestedRef = useRef(false);
   const connectionReadyNow = oauthReady || connectionReady(snapshot);
 
   async function installAgentGuidance(path: string) {
@@ -1204,8 +1207,10 @@ function Onboarding({
   }, [snapshot.connection.workspaceName]);
 
   useEffect(() => {
-    setMountPath(snapshot.mount.localPath);
-  }, [snapshot.mount.localPath]);
+    if (!mountPathDirty) {
+      setMountPath(snapshot.mount.localPath);
+    }
+  }, [mountPathDirty, snapshot.mount.localPath]);
 
   useEffect(() => {
     if (step !== 3 || !oauthInFlight || oauthReady) {
@@ -1256,6 +1261,7 @@ function Onboarding({
         mounting,
         hasMountError: mountOnboarding !== null,
         mountPath,
+        startRequested: mountStartRequestedRef.current,
       })
     ) {
       return;
@@ -1317,10 +1323,11 @@ function Onboarding({
   }
 
   async function runMountOnboarding(action: "start" | "allow_in_macos" | "check_again") {
-    if (mounting) {
+    if (mountStartRequestedRef.current || mounting) {
       return;
     }
 
+    mountStartRequestedRef.current = true;
     setMounting(true);
     try {
       const report = await callCommand<WorkspaceMountOnboardingReport>(
@@ -1346,6 +1353,7 @@ function Onboarding({
         undefined,
         sampleSnapshot,
       );
+      setMountPathDirty(false);
       setMountPath(nextSnapshot.mount.localPath);
       await installAgentGuidance(nextSnapshot.mount.localPath);
       setMountOnboarding(null);
@@ -1353,6 +1361,7 @@ function Onboarding({
     } catch (error) {
       setMountOnboarding(failedMountOnboardingReport(errorMessage(error)));
     } finally {
+      mountStartRequestedRef.current = false;
       setMounting(false);
     }
   }
@@ -1373,6 +1382,26 @@ function Onboarding({
     }
     setMountOnboarding(null);
     return true;
+  }
+
+  async function chooseFolder() {
+    if (mountStartRequestedRef.current || mounting) {
+      return;
+    }
+
+    try {
+      const selected = await callCommand<string | null>(
+        "choose_mount_folder",
+        { current: mountPath },
+        null,
+      );
+      if (selected) {
+        setMountPathDirty(true);
+        setMountPath(selected.replace(/\/$/, ""));
+      }
+    } catch (error) {
+      setMountOnboarding(failedMountOnboardingReport(errorMessage(error)));
+    }
   }
 
   async function openMountFolder() {
@@ -1421,6 +1450,11 @@ function Onboarding({
 
   const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
   const finalPrompt = agentGuidanceReport?.prompt || suggestedAgentPrompt(mountPath);
+  const mountSetupError =
+    mountOnboarding?.state === "failed"
+      ? classifyMountSetupError(mountOnboarding.message)
+      : null;
+  const showRecoveryChooser = mountRecoveryEnabled(mountSetupError);
 
   return (
     <main className="setup-shell">
@@ -1546,13 +1580,28 @@ function Onboarding({
             <div className="path-field ready-path-field">
               <span>{mountPath}</span>
             </div>
-            <PrimaryButton
-              busy={mounting}
-              disabled={!mountPath.trim()}
-              onClick={() => void runMountOnboarding(mountOnboardingNextAction(mountOnboarding))}
-            >
-              {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
-            </PrimaryButton>
+            {showRecoveryChooser ? (
+              <div className="button-row">
+                <PrimaryButton
+                  busy={mounting}
+                  disabled={!mountPath.trim()}
+                  onClick={() => void runMountOnboarding(mountOnboardingNextAction(mountOnboarding))}
+                >
+                  {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
+                </PrimaryButton>
+                <SecondaryButton disabled={mounting} onClick={() => void chooseFolder()}>
+                  Choose Folder
+                </SecondaryButton>
+              </div>
+            ) : (
+              <PrimaryButton
+                busy={mounting}
+                disabled={!mountPath.trim()}
+                onClick={() => void runMountOnboarding(mountOnboardingNextAction(mountOnboarding))}
+              >
+                {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
+              </PrimaryButton>
+            )}
             {mountOnboardingNeedsInstructions(mountOnboarding) && (
               <p className="quiet-note">
                 Open Finder, choose Locality under Locations, enable the File Provider, then
@@ -5056,24 +5105,28 @@ function SetupContent({
 }) {
   if (side) {
     return (
-      <div className="setup-content split-setup">
-        <div className="setup-copy">
-          {mark ? mark : null}
-          {children}
+      <div className="setup-scrollport">
+        <div className="setup-content split-setup">
+          <div className="setup-copy">
+            {mark ? mark : null}
+            {children}
+          </div>
+          <aside className="setup-side">{side}</aside>
         </div>
-        <aside className="setup-side">{side}</aside>
       </div>
     );
   }
 
   return (
-    <div
-      className={`setup-content ${variant === "final" ? "final-setup" : ""} ${
-        variant === "wide" ? "wide-setup" : ""
-      }`}
-    >
-      {mark ? mark : null}
-      {children}
+    <div className="setup-scrollport">
+      <div
+        className={`setup-content ${variant === "final" ? "final-setup" : ""} ${
+          variant === "wide" ? "wide-setup" : ""
+        }`}
+      >
+        {mark ? mark : null}
+        {children}
+      </div>
     </div>
   );
 }

@@ -500,8 +500,16 @@ fn pull_materializes_and_repairs_downloaded_media_cache() {
     fs::remove_file(&local_image).expect("remove materialized image");
     let repair = run_pull(&mut store, &connector, &fixture.root).expect("repair media cache page");
     assert!(repair.ok, "{repair:#?}");
+    assert_eq!(repair.hydrated, 1, "{repair:#?}");
+    let repaired_markdown = fs::read_to_string(&page_path).expect("read repaired media cache page");
+    let repaired_image = local_image_path(
+        &fixture.root,
+        &page_path,
+        &repaired_markdown,
+        "Local test image",
+    );
     assert_eq!(
-        fs::read(&local_image).expect("read repaired image"),
+        fs::read(&repaired_image).expect("read repaired image"),
         image_bytes
     );
 
@@ -523,6 +531,11 @@ fn pull_materializes_and_repairs_downloaded_media_cache() {
         !local_image.exists(),
         "stale media file should be removed after clean pull no longer references it: {}",
         local_image.display()
+    );
+    assert!(
+        !repaired_image.exists(),
+        "repaired media file should be removed after clean pull no longer references it: {}",
+        repaired_image.display()
     );
     let pruned_manifest = fs::read_to_string(fixture.root.join(".loc/media/manifest.json"))
         .expect("read pruned media manifest");
@@ -10912,9 +10925,10 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
             "Root page body before creating a fresh child page.",
         )],
     );
+    let existing_child_title = format!("Locality live existing child {}", unique_suffix());
     let existing_child = cleanup.create_page(
         &scratch.id,
-        &format!("Locality live existing child {}", unique_suffix()),
+        &existing_child_title,
         vec![paragraph_child(
             "Existing child primes the cached parent listing.",
         )],
@@ -10946,15 +10960,31 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
         &scratch_folder.identifier,
         &existing_child.id,
     );
+    let existing_child_url =
+        notion_pretty_workspace_url("codeflash", &existing_child_title, &existing_child.id);
+    let mut existing_locate_store = store.clone();
+    let existing_child_path = desktop_style_locate_notion_url_path(
+        &mut existing_locate_store,
+        &connector,
+        &fixture.mount_id,
+        &existing_child_url,
+    );
+    assert!(
+        existing_child_path
+            .to_string_lossy()
+            .contains(&slug_for_test(&existing_child_title)),
+        "existing child pretty URL should locate to its projected page.md path: {existing_child_path:?}"
+    );
 
+    let child_title = format!("Locality live located child {}", unique_suffix());
     let child = cleanup.create_page(
         &scratch.id,
-        &format!("Locality live located child {}", unique_suffix()),
+        &child_title,
         vec![paragraph_child(
             "Fresh child should appear after the parent directory is refreshed.",
         )],
     );
-    let child_url = notion_object_url(&child.id);
+    let child_url = notion_pretty_workspace_url("codeflash", &child_title, &child.id);
     let mut locate_store = store.clone();
     let located_child_path = desktop_style_locate_notion_url_path(
         &mut locate_store,
@@ -15266,6 +15296,15 @@ fn compact_notion_id(input: &str) -> String {
 
 fn notion_object_url(id: &str) -> String {
     format!("https://www.notion.so/{}", normalize_notion_id(id))
+}
+
+fn notion_pretty_workspace_url(workspace_slug: &str, title: &str, id: &str) -> String {
+    format!(
+        "https://app.notion.com/p/{}/{}-{}",
+        workspace_slug,
+        slug_for_test(title),
+        normalize_notion_id(id)
+    )
 }
 
 fn slug_for_test(title: &str) -> String {

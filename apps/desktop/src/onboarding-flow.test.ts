@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { shouldAutoCreateMount } from "./onboarding-flow";
+import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
 
 describe("shouldAutoCreateMount", () => {
   it("starts automatic mount creation on the setup step when the workspace is connected", () => {
@@ -11,6 +11,7 @@ describe("shouldAutoCreateMount", () => {
         mounting: false,
         hasMountError: false,
         mountPath: "~/Library/CloudStorage/Locality/notion",
+        startRequested: false,
       }),
     ).toBe(true);
   });
@@ -24,6 +25,21 @@ describe("shouldAutoCreateMount", () => {
         mounting: false,
         hasMountError: true,
         mountPath: "~/Library/CloudStorage/Locality/notion",
+        startRequested: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not auto-start while a mount request is already in flight", () => {
+    expect(
+      shouldAutoCreateMount({
+        step: 4,
+        connectionReady: true,
+        mountMissing: true,
+        mounting: false,
+        hasMountError: false,
+        mountPath: "~/Library/CloudStorage/Locality/notion",
+        startRequested: true,
       }),
     ).toBe(false);
   });
@@ -37,6 +53,7 @@ describe("shouldAutoCreateMount", () => {
         mounting: false,
         hasMountError: false,
         mountPath: "~/Library/CloudStorage/Locality/notion",
+        startRequested: false,
       }),
     ).toBe(false);
     expect(
@@ -47,6 +64,7 @@ describe("shouldAutoCreateMount", () => {
         mounting: false,
         hasMountError: false,
         mountPath: "~/Library/CloudStorage/Locality/notion",
+        startRequested: false,
       }),
     ).toBe(false);
     expect(
@@ -57,6 +75,39 @@ describe("shouldAutoCreateMount", () => {
         mounting: false,
         hasMountError: false,
         mountPath: "   ",
+        startRequested: false,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("mountRecoveryEnabled", () => {
+  it("shows chooser recovery for path validation failures", () => {
+    expect(
+      mountRecoveryEnabled({
+        kind: "path-validation",
+        message: "Choose a folder path, not a file: /tmp/notion",
+      }),
+    ).toBe(true);
+    expect(
+      mountRecoveryEnabled({
+        kind: "path-validation",
+        message: "Mount parent folder is read-only: /tmp",
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps chooser recovery hidden for non-path failures", () => {
+    expect(
+      mountRecoveryEnabled({
+        kind: "file-provider-disabled",
+        message: "The Locality File Provider is registered but not enabled.",
+      }),
+    ).toBe(false);
+    expect(
+      mountRecoveryEnabled({
+        kind: "generic",
+        message: "Could not load the top-level Notion folder",
       }),
     ).toBe(false);
   });

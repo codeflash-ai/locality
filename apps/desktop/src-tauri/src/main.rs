@@ -801,7 +801,8 @@ fn debug_live_mode_tracked_files_for_mount(
         let enrollment = autosave_by_path.get(Path::new(&entry.path));
         let now_ms = live_mode_now_ms();
         let active_for_polling = live_mode_target_is_recently_active(freshness, now_ms);
-        let remote_check_due = active_for_polling && live_mode_remote_check_is_due(freshness, now_ms);
+        let remote_check_due =
+            active_for_polling && live_mode_remote_check_is_due(freshness, now_ms);
         files.push(DesktopLiveModeDebugFile {
             path: entry.path.clone(),
             title: entry.title.clone(),
