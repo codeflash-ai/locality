@@ -84,6 +84,7 @@ pub fn enumerate_shared_pages(
         &mount_id,
         Path::new(NOTION_WORKSPACE_ROOT_DIR),
         &mut used_paths,
+        WorkspaceRootProjectionMode::FullTree,
     )?;
     entries.extend(workspace_projection.tree_entries);
 
@@ -463,7 +464,13 @@ fn list_workspace_root_children(
     parent_path: &Path,
 ) -> LocalityResult<Vec<TreeEntry>> {
     let mut used_paths = BTreeSet::new();
-    let projection = project_workspace_root(api, &mount_id, parent_path, &mut used_paths)?;
+    let projection = project_workspace_root(
+        api,
+        &mount_id,
+        parent_path,
+        &mut used_paths,
+        WorkspaceRootProjectionMode::ShallowListing,
+    )?;
     Ok(projection.listing_entries)
 }
 
@@ -472,11 +479,18 @@ struct WorkspaceRootProjection {
     listing_entries: Vec<TreeEntry>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceRootProjectionMode {
+    FullTree,
+    ShallowListing,
+}
+
 fn project_workspace_root(
     api: &dyn NotionApi,
     mount_id: &MountId,
     parent_path: &Path,
     used_paths: &mut BTreeSet<PathBuf>,
+    mode: WorkspaceRootProjectionMode,
 ) -> LocalityResult<WorkspaceRootProjection> {
     let pages = search_all_pages(api)?;
     let databases = search_all_databases(api)?;
@@ -514,15 +528,26 @@ fn project_workspace_root(
     for projected in projected_root_children.iter().cloned() {
         push_projected_listing_entry(mount_id, projected, &mut listing_entries);
     }
-    for projected in projected_root_children {
-        push_projected_tree_entry(api, mount_id, projected, used_paths, &mut tree_entries)?;
-    }
 
-    let projected_page_ids = tree_entries
-        .iter()
-        .filter(|entry| entry.kind == EntityKind::Page)
-        .map(|entry| entry.remote_id.0.clone())
-        .collect::<BTreeSet<_>>();
+    let projected_page_ids = match mode {
+        WorkspaceRootProjectionMode::FullTree => {
+            for projected in projected_root_children {
+                push_projected_tree_entry(api, mount_id, projected, used_paths, &mut tree_entries)?;
+            }
+            tree_entries
+                .iter()
+                .filter(|entry| entry.kind == EntityKind::Page)
+                .map(|entry| entry.remote_id.0.clone())
+                .collect::<BTreeSet<_>>()
+        }
+        WorkspaceRootProjectionMode::ShallowListing => projected_root_children
+            .iter()
+            .filter_map(|projected| match &projected.child {
+                ProjectedChild::Page { page, .. } => Some(page.id.clone()),
+                ProjectedChild::Database { .. } => None,
+            })
+            .collect::<BTreeSet<_>>(),
+    };
     let fallback_pages = pages
         .iter()
         .filter(|page| !projected_page_ids.contains(&page.id))
@@ -1194,6 +1219,7 @@ fn short_id(remote_id: &str, len: usize) -> String {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
         NOTION_PRIVATE_ROOT_DIR, NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_DIR,
@@ -1590,6 +1616,65 @@ mod tests {
     }
 
     #[test]
+    fn workspace_source_root_listing_is_shallow() {
+        let api = FakeNotionApi::new()
+            .with_page(page_with_title(
+                "team-page",
+                "Team Page",
+                workspace_parent(),
+            ))
+            .with_page(page_with_title(
+                "child-page",
+                "Child Page",
+                page_parent("team-page"),
+            ))
+            .with_database(database_with_title(
+                "tasks-db",
+                "Tasks",
+                workspace_parent(),
+                vec![DataSourceSummaryDto {
+                    id: "tasks-ds".to_string(),
+                    name: Some("Tasks".to_string()),
+                }],
+            ))
+            .with_page(page_with_title(
+                "task-row",
+                "Task Row",
+                data_source_parent("tasks-ds"),
+            ))
+            .with_page_children("team-page", vec![child_page("child-page", "Child Page")])
+            .with_database_rows("tasks-ds", vec!["task-row"]);
+
+        let workspace_children = list_container_children(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            ChildContainer::SourceRoot(RemoteId::new(NOTION_WORKSPACE_ROOT_ID)),
+            Path::new(NOTION_WORKSPACE_ROOT_DIR),
+        )
+        .expect("list workspace synthetic root");
+
+        assert_tree_entry(
+            &workspace_children,
+            "team-page",
+            EntityKind::Page,
+            "Team Page",
+            "Workspace/team-page/page.md",
+            HydrationState::Stub,
+        );
+        assert_tree_entry(
+            &workspace_children,
+            "tasks-db",
+            EntityKind::Database,
+            "Tasks",
+            "Workspace/tasks",
+            HydrationState::Stub,
+        );
+        assert_eq!(api.retrieve_block_children_calls(), 0);
+        assert_eq!(api.query_data_source_calls(), 0);
+    }
+
+    #[test]
     fn workspace_source_root_lists_fallback_searchable_pages_under_workspace() {
         let api = FakeNotionApi::new()
             .with_page(page_with_title(
@@ -1793,6 +1878,8 @@ mod tests {
         data_sources: BTreeMap<String, DataSourceDto>,
         database_rows: BTreeMap<String, Vec<String>>,
         page_children: BTreeMap<String, Vec<BlockDto>>,
+        retrieve_block_children_calls: AtomicUsize,
+        query_data_source_calls: AtomicUsize,
     }
 
     impl FakeNotionApi {
@@ -1827,6 +1914,14 @@ mod tests {
         fn with_page_children(mut self, page_id: &str, children: Vec<BlockDto>) -> Self {
             self.page_children.insert(page_id.to_string(), children);
             self
+        }
+
+        fn retrieve_block_children_calls(&self) -> usize {
+            self.retrieve_block_children_calls.load(Ordering::Relaxed)
+        }
+
+        fn query_data_source_calls(&self) -> usize {
+            self.query_data_source_calls.load(Ordering::Relaxed)
         }
     }
 
@@ -1863,6 +1958,7 @@ mod tests {
             data_source_id: &str,
             _start_cursor: Option<&str>,
         ) -> LocalityResult<PageListDto> {
+            self.query_data_source_calls.fetch_add(1, Ordering::Relaxed);
             Ok(PageListDto {
                 results: self
                     .database_rows
@@ -1881,6 +1977,8 @@ mod tests {
             block_id: &str,
             _start_cursor: Option<&str>,
         ) -> LocalityResult<BlockListDto> {
+            self.retrieve_block_children_calls
+                .fetch_add(1, Ordering::Relaxed);
             Ok(BlockListDto {
                 results: self
                     .page_children

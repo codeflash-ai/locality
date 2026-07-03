@@ -661,7 +661,11 @@ where
     S: EntityRepository,
 {
     if relative_path.as_os_str().is_empty() {
-        return Ok(None);
+        return Ok(Some(VirtualDirectoryTarget {
+            parent_path: PathBuf::new(),
+            container: Some(ChildContainer::Root),
+            schema_database_id: None,
+        }));
     }
 
     let page_container_target = store
@@ -1569,7 +1573,7 @@ fn write_assets(root: &Path, assets: &[HydratedAsset]) -> Result<(), PullError> 
 
 fn should_pull_mount_root(mount: &MountConfig, relative_path: &Path, target_path: &Path) -> bool {
     if relative_path.as_os_str().is_empty() {
-        return true;
+        return !mount.projection.uses_virtual_filesystem();
     }
     if mount.projection.uses_virtual_filesystem() {
         return false;
@@ -2186,7 +2190,8 @@ impl PullError {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use locality_connector::{
         ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
@@ -3192,6 +3197,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn virtual_mount_root_pull_refreshes_root_children_without_full_enumeration() {
+        let fixture = PullFixture::new();
+        let state_root = fixture.root.join("state");
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+            .projection(ProjectionMode::LinuxFuse);
+        store.save_mount(mount).expect("save mount");
+        let workspace_root = directory_entry(
+            &fixture.mount_id,
+            "notion-root:workspace",
+            "Workspace",
+            "Workspace",
+        );
+        let source =
+            FakePullSource::new(Vec::new(), Vec::new()).with_child_entries(vec![workspace_root]);
+
+        let report = super::run_pull_with_state_root(
+            &mut store,
+            &source,
+            fixture.root.clone(),
+            Some(&state_root),
+        )
+        .expect("pull virtual mount root");
+
+        assert_eq!(source.enumerate_calls(), 0);
+        assert_eq!(source.list_children_calls(), 1);
+        assert_eq!(report.enumerated, 1);
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &RemoteId::new("notion-root:workspace"))
+                .expect("read workspace root")
+                .is_some()
+        );
+    }
+
     struct PullFixture {
         mount: MountConfig,
         mount_id: MountId,
@@ -3294,8 +3335,11 @@ mod tests {
     #[derive(Clone)]
     struct FakePullSource {
         entries: Vec<locality_core::model::TreeEntry>,
+        child_entries: Vec<locality_core::model::TreeEntry>,
         rendered: BTreeMap<RemoteId, HydratedEntity>,
         schemas: BTreeMap<RemoteId, String>,
+        enumerate_calls: Arc<AtomicUsize>,
+        list_children_calls: Arc<AtomicUsize>,
     }
 
     impl FakePullSource {
@@ -3305,17 +3349,33 @@ mod tests {
         ) -> Self {
             Self {
                 entries,
+                child_entries: Vec::new(),
                 rendered: rendered
                     .into_iter()
                     .map(|entity| (entity.shadow.entity_id.clone(), entity))
                     .collect(),
                 schemas: BTreeMap::new(),
+                enumerate_calls: Arc::new(AtomicUsize::new(0)),
+                list_children_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
         fn with_schema(mut self, database_id: &RemoteId, schema: &str) -> Self {
             self.schemas.insert(database_id.clone(), schema.to_string());
             self
+        }
+
+        fn with_child_entries(mut self, entries: Vec<locality_core::model::TreeEntry>) -> Self {
+            self.child_entries = entries;
+            self
+        }
+
+        fn enumerate_calls(&self) -> usize {
+            self.enumerate_calls.load(Ordering::Relaxed)
+        }
+
+        fn list_children_calls(&self) -> usize {
+            self.list_children_calls.load(Ordering::Relaxed)
         }
     }
 
@@ -3336,6 +3396,7 @@ mod tests {
             &self,
             _request: EnumerateRequest,
         ) -> LocalityResult<Vec<locality_core::model::TreeEntry>> {
+            self.enumerate_calls.fetch_add(1, Ordering::Relaxed);
             Ok(self.entries.clone())
         }
 
@@ -3347,9 +3408,10 @@ mod tests {
             &self,
             _request: ListChildrenRequest,
         ) -> LocalityResult<ListChildrenResult> {
-            Err(locality_core::LocalityError::NotImplemented(
-                "fake list children",
-            ))
+            self.list_children_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ListChildrenResult {
+                entries: self.child_entries.clone(),
+            })
         }
 
         fn fetch(&self, _request: FetchRequest) -> LocalityResult<NativeEntity> {
