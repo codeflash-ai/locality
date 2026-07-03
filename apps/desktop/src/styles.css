@@ -1639,6 +1639,53 @@ p {
   font-size: var(--type-small);
 }
 
+.setup-permission-callout {
+  display: flex;
+  align-items: flex-start;
+  max-width: 680px;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid rgba(217, 140, 31, 0.22);
+  border-radius: 14px;
+  background: rgba(255, 248, 235, 0.82);
+  box-shadow: 0 12px 24px rgba(96, 72, 28, 0.06);
+}
+
+.setup-permission-icon {
+  display: grid;
+  flex: 0 0 36px;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid rgba(217, 140, 31, 0.22);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.78);
+  color: #a46411;
+}
+
+.setup-permission-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.setup-permission-copy {
+  display: grid;
+  gap: 9px;
+}
+
+.setup-permission-copy strong {
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.setup-permission-copy p {
+  max-width: 590px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .success-note {
   color: var(--green) !important;
   font-size: var(--type-small) !important;

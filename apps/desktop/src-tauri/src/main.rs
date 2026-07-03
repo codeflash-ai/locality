@@ -7846,6 +7846,7 @@ fn connection_metadata_changed(
 fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
     message.contains("The application cannot be used right now")
         || message.contains("locality-file-providerctl was not found")
+        || message.contains("registered but not enabled")
 }
 
 fn connection_metadata_key(
@@ -10307,6 +10308,9 @@ mod tests {
     fn file_provider_unavailable_error_is_recoverable_after_access_change() {
         assert!(super::recoverable_macos_file_provider_activation_error(
             "Could not register macOS File Provider: The application cannot be used right now."
+        ));
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            "Could not open macOS File Provider domain `loc`: The Locality File Provider is registered but not enabled."
         ));
         assert!(!super::recoverable_macos_file_provider_activation_error(
             "Could not load the top-level Notion folder"

@@ -46,6 +46,7 @@ import {
   type ProviderRuntimeSummary,
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
+import { classifyMountSetupError, type MountSetupError } from "./onboarding-errors";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
@@ -1094,7 +1095,7 @@ function Onboarding({
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
-  const [mountError, setMountError] = useState("");
+  const [mountError, setMountError] = useState<MountSetupError | null>(null);
   const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
@@ -1235,7 +1236,7 @@ function Onboarding({
       return;
     }
 
-    setMountError("");
+    setMountError(null);
     setMounting(true);
     try {
       const report = await callCommand<ActionReport>(
@@ -1244,7 +1245,7 @@ function Onboarding({
         { ok: true, message: "Created demo mount." },
       );
       if (!report.ok) {
-        setMountError(report.message);
+        setMountError(classifyMountSetupError(report.message));
         return;
       }
       const cliReady = await ensureCliAvailable();
@@ -1261,7 +1262,7 @@ function Onboarding({
       await installAgentGuidance(nextSnapshot.mount.localPath);
       setStep(5);
     } catch (error) {
-      setMountError(errorMessage(error));
+      setMountError(classifyMountSetupError(errorMessage(error)));
     } finally {
       setMounting(false);
     }
@@ -1278,15 +1279,15 @@ function Onboarding({
       { ok: true, message: "Locality terminal command is ready." },
     );
     if (!report.ok) {
-      setMountError(report.message);
+      setMountError(classifyMountSetupError(report.message));
       return false;
     }
-    setMountError("");
+    setMountError(null);
     return true;
   }
 
   async function chooseFolder() {
-    setMountError("");
+    setMountError(null);
     try {
       const selected = await callCommand<string | null>(
         "choose_mount_folder",
@@ -1298,19 +1299,19 @@ function Onboarding({
         setMountPath(selected.replace(/\/$/, ""));
       }
     } catch (error) {
-      setMountError(errorMessage(error));
+      setMountError(classifyMountSetupError(errorMessage(error)));
     }
   }
 
   async function openMountFolder() {
-    setMountError("");
+    setMountError(null);
     const report = await callCommand<ActionReport>(
       "open_path",
       { path: mountPath },
       { ok: true, message: "Opened demo folder." },
     );
     if (!report.ok) {
-      setMountError(report.message);
+      setMountError(classifyMountSetupError(report.message));
       return;
     }
   }
@@ -1472,7 +1473,9 @@ function Onboarding({
             <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
               {mounting ? "Mounting Notion" : "Create Local Folder"}
             </PrimaryButton>
-            {mountError && <p className="field-error">{mountError}</p>}
+            {mountError && (
+              <MountSetupErrorCallout error={mountError} onRetry={startMount} retrying={mounting} />
+            )}
             <p className="quiet-note">
               The Notion mount point will include AGENTS.md and CLAUDE.md to help your agents edit
               files natively.
@@ -1491,7 +1494,7 @@ function Onboarding({
                 new Notion changes to appear locally.
               </p>
             </div>
-            {mountError && <p className="field-error">{mountError}</p>}
+            {mountError && <p className="field-error">{mountError.message}</p>}
             <div className="final-actions">
               <PrimaryButton onClick={finishOnboarding}>
                 Open Locality
@@ -4940,6 +4943,40 @@ function SetupContent({
     >
       {mark ? mark : null}
       {children}
+    </div>
+  );
+}
+
+function MountSetupErrorCallout({
+  error,
+  onRetry,
+  retrying,
+}: {
+  error: MountSetupError;
+  onRetry: () => void;
+  retrying: boolean;
+}) {
+  if (error.kind !== "file-provider-disabled") {
+    return <p className="field-error">{error.message}</p>;
+  }
+
+  return (
+    <div className="setup-permission-callout">
+      <div className="setup-permission-icon">
+        <FolderOpen />
+      </div>
+      <div className="setup-permission-copy">
+        <strong>Enable Locality in Finder</strong>
+        <p>
+          Locality is installed, but macOS has not enabled its File Provider yet. In Finder, look
+          for Locality under Locations and choose Enable. If Finder does not show it, open System
+          Settings, go to Privacy &amp; Security, then enable Locality under Extensions or File
+          Providers.
+        </p>
+        <PrimaryButton compact busy={retrying} onClick={onRetry}>
+          Retry
+        </PrimaryButton>
+      </div>
     </div>
   );
 }
