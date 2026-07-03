@@ -8,8 +8,12 @@ describe("onboarding layout styles", () => {
   it("keeps the onboarding window chrome fixed while the content scrolls", () => {
     expect(styles).toMatch(/\.setup-window\s*\{\s*display:\s*grid;\s*grid-template-rows:\s*auto minmax\(0, 1fr\);\s*\}/s);
     expect(styles).toMatch(
-      /\.setup-window > \.setup-content\s*\{\s*min-height:\s*0;\s*overflow-y:\s*auto;\s*overflow-x:\s*hidden;\s*overscroll-behavior:\s*contain;\s*scrollbar-gutter:\s*stable;\s*\}/s,
+      /\.setup-window > \.setup-scrollport\s*\{\s*min-height:\s*0;\s*overflow-y:\s*auto;\s*overflow-x:\s*hidden;\s*overscroll-behavior:\s*contain;\s*scrollbar-gutter:\s*stable;\s*\}/s,
     );
+  });
+
+  it("keeps short onboarding steps centered without clipping tall ones above scrollTop zero", () => {
+    expect(styles).toMatch(/\.setup-scrollport > \.setup-content\s*\{\s*min-height:\s*100%;\s*\}/s);
   });
 
   it("allows the ready-screen prompt copy to wrap when the mount path is long", () => {

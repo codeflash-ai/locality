@@ -211,16 +211,19 @@ p {
   align-content: center;
   gap: 22px;
   justify-content: center;
-  min-height: 0;
   padding: 64px 78px;
 }
 
-.setup-window > .setup-content {
+.setup-window > .setup-scrollport {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
+}
+
+.setup-scrollport > .setup-content {
+  min-height: 100%;
 }
 
 .setup-content.split-setup {

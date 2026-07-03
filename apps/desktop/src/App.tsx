@@ -5032,24 +5032,28 @@ function SetupContent({
 }) {
   if (side) {
     return (
-      <div className="setup-content split-setup">
-        <div className="setup-copy">
-          {mark ? mark : null}
-          {children}
+      <div className="setup-scrollport">
+        <div className="setup-content split-setup">
+          <div className="setup-copy">
+            {mark ? mark : null}
+            {children}
+          </div>
+          <aside className="setup-side">{side}</aside>
         </div>
-        <aside className="setup-side">{side}</aside>
       </div>
     );
   }
 
   return (
-    <div
-      className={`setup-content ${variant === "final" ? "final-setup" : ""} ${
-        variant === "wide" ? "wide-setup" : ""
-      }`}
-    >
-      {mark ? mark : null}
-      {children}
+    <div className="setup-scrollport">
+      <div
+        className={`setup-content ${variant === "final" ? "final-setup" : ""} ${
+          variant === "wide" ? "wide-setup" : ""
+        }`}
+      >
+        {mark ? mark : null}
+        {children}
+      </div>
     </div>
   );
 }
