@@ -45,6 +45,10 @@ for local throwaway builds.
 The Windows desktop app uses the same platform lifecycle layer as the CLI. When
 a Windows Cloud Files mount is activated or opened, the app registers the sync
 root if needed and supervises `locality-cloud-files.exe run` for that mount.
+During first activation, the desktop app waits for `localityd` to expose
+mount-point children before starting the Cloud Files runtime, so the helper seeds
+root placeholders from discovered workspace metadata instead of from an empty
+initial projection.
 
 Installed files:
 
