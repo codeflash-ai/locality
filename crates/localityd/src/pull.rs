@@ -875,7 +875,13 @@ fn rename_reserved_notion_root_projection_collisions(
             continue;
         }
         if mount.root.join(&steps[1].1).exists() {
-            continue;
+            return Err(PullError::WriteFile {
+                path: mount.root.join(&steps[1].1),
+                message: format!(
+                    "reserved Notion root projection destination already exists while moving `{}`",
+                    mount.root.join(&steps[0].0).display()
+                ),
+            });
         }
 
         let stage_path =
@@ -2351,6 +2357,75 @@ mod tests {
             .expect("get entity")
             .expect("entity");
         assert_eq!(entity.path, migrated_path);
+    }
+
+    #[test]
+    fn mount_root_pull_keeps_entity_path_when_reserved_root_final_destination_exists() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let remote_id = RemoteId::new("page-1");
+        let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone());
+        let old_path = PathBuf::from("private/page.md");
+        let new_path = PathBuf::from("Workspace/private/page.md");
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                "private",
+                old_path.clone(),
+            ))
+            .expect("save old entity");
+        std::fs::create_dir_all(fixture.root.join("private")).expect("old container");
+        std::fs::write(fixture.root.join(&old_path), "old body").expect("old page");
+        std::fs::create_dir_all(fixture.root.join("Workspace/private"))
+            .expect("destination container");
+        std::fs::write(fixture.root.join(&new_path), "unrelated body")
+            .expect("unrelated destination page");
+        let source = FakePullSource::new(
+            vec![
+                directory_entry(
+                    &fixture.mount_id,
+                    "notion-root:private",
+                    "Private",
+                    "Private",
+                ),
+                directory_entry(
+                    &fixture.mount_id,
+                    "notion-root:workspace",
+                    "Workspace",
+                    "Workspace",
+                ),
+                tree_entry(
+                    &fixture.mount_id,
+                    &remote_id,
+                    "private",
+                    "Workspace/private/page.md",
+                    HydrationState::Stub,
+                ),
+            ],
+            Vec::new(),
+        );
+
+        let result =
+            super::pull_mount_root(&mut store, &source, &mount, fixture.root.clone(), None);
+
+        assert!(matches!(result, Err(super::PullError::WriteFile { .. })));
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join(&old_path)).expect("old page"),
+            "old body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join(&new_path))
+                .expect("unrelated destination page"),
+            "unrelated body"
+        );
+        let entity = store
+            .get_entity(&fixture.mount_id, &remote_id)
+            .expect("get entity")
+            .expect("entity remains present");
+        assert_eq!(entity.path, old_path);
     }
 
     #[test]

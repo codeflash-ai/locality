@@ -432,7 +432,11 @@ fn rename_reserved_notion_root_projection_collisions(
             continue;
         }
         if mount.root.join(&steps[1].1).exists() {
-            continue;
+            return Err(LocalityError::Io(format!(
+                "reserved Notion root projection destination `{}` already exists while moving `{}`",
+                mount.root.join(&steps[1].1).display(),
+                mount.root.join(&steps[0].0).display()
+            )));
         }
 
         let stage_path =
