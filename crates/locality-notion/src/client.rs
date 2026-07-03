@@ -111,6 +111,10 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
         let _ = data_source_id;
         Err(LocalityError::NotImplemented("retrieve Notion data source"))
     }
+    fn retrieve_block(&self, block_id: &str) -> LocalityResult<BlockDto> {
+        let _ = block_id;
+        Err(LocalityError::NotImplemented("retrieve Notion block"))
+    }
     fn query_data_source(
         &self,
         data_source_id: &str,
@@ -755,6 +759,10 @@ impl NotionApi for HttpNotionApi {
 
     fn retrieve_data_source(&self, data_source_id: &str) -> LocalityResult<DataSourceDto> {
         self.get_json(&format!("/v1/data_sources/{data_source_id}"), &[])
+    }
+
+    fn retrieve_block(&self, block_id: &str) -> LocalityResult<BlockDto> {
+        self.get_json(&format!("/v1/blocks/{block_id}"), &[])
     }
 
     fn query_data_source(

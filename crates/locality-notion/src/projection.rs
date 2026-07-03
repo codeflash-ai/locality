@@ -268,11 +268,28 @@ impl ExactPathResolver<'_> {
                 parent_path: parent_entry.path,
             });
         }
+        if let Some(block_id) = parent.block_id.as_deref() {
+            return self.block_parent_listing(block_id);
+        }
 
         Err(LocalityError::InvalidState(format!(
             "cannot resolve a stable local path for Notion parent `{}`",
             parent.kind
         )))
+    }
+
+    fn block_parent_listing(&mut self, block_id: &str) -> LocalityResult<ParentListing> {
+        let resolving_key = format!("block:{block_id}");
+        if !self.resolving.insert(resolving_key.clone()) {
+            return Err(LocalityError::InvalidState(format!(
+                "notion hierarchy for block `{block_id}` contains a parent cycle"
+            )));
+        }
+
+        let block = self.api.retrieve_block(block_id)?;
+        let listing = self.parent_listing(block.parent.as_ref());
+        self.resolving.remove(&resolving_key);
+        listing
     }
 
     fn find_projected_child(
@@ -1327,6 +1344,57 @@ mod tests {
     }
 
     #[test]
+    fn exact_page_resolution_walks_block_id_parent_to_containing_page() {
+        let api = FakeNotionApi::new()
+            .with_page(page_with_title(
+                "launch-root",
+                "Launch Root",
+                workspace_parent(),
+            ))
+            .with_page(page_with_title(
+                "technical-launch-post",
+                "Longer Technical Launch Post",
+                block_parent("nested-section"),
+            ))
+            .with_block(block_with_parent(
+                "nested-section",
+                "toggle",
+                page_parent("launch-root"),
+            ))
+            .with_page_children(
+                "launch-root",
+                vec![container_block("nested-section", "toggle")],
+            )
+            .with_page_children(
+                "nested-section",
+                vec![child_page(
+                    "technical-launch-post",
+                    "Longer Technical Launch Post",
+                )],
+            );
+
+        let entries = resolve_page_path_entries(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            &RemoteId::new("technical-launch-post"),
+        )
+        .expect("resolve exact page hierarchy through block parent");
+
+        let resolved = entries
+            .iter()
+            .find(|entry| entry.remote_id.as_str() == "technical-launch-post")
+            .expect("resolved target entry");
+
+        assert_eq!(
+            resolved.path,
+            Path::new("launch-root")
+                .join("longer-technical-launch-post")
+                .join(PAGE_DOCUMENT_FILENAME)
+        );
+    }
+
+    #[test]
     fn notion_id_matching_ignores_hyphen_formatting_for_exact_url_resolution() {
         assert!(super::notion_ids_equal(
             "38e3ac0e-bb88-8140-94e2-d9ff17e60faa",
@@ -1443,9 +1511,37 @@ mod tests {
         }
     }
 
+    fn block_parent(block_id: &str) -> ParentDto {
+        ParentDto {
+            kind: "block_id".to_string(),
+            block_id: Some(block_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn block_with_parent(id: &str, kind: &str, parent: ParentDto) -> BlockDto {
+        BlockDto {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            parent: Some(parent),
+            has_children: true,
+            ..Default::default()
+        }
+    }
+
+    fn container_block(id: &str, kind: &str) -> BlockDto {
+        BlockDto {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            has_children: true,
+            ..Default::default()
+        }
+    }
+
     #[derive(Default)]
     struct FakeNotionApi {
         pages: BTreeMap<String, PageDto>,
+        blocks: BTreeMap<String, BlockDto>,
         databases: BTreeMap<String, DatabaseDto>,
         data_sources: BTreeMap<String, DataSourceDto>,
         database_rows: BTreeMap<String, Vec<String>>,
@@ -1459,6 +1555,11 @@ mod tests {
 
         fn with_page(mut self, page: PageDto) -> Self {
             self.pages.insert(page.id.clone(), page);
+            self
+        }
+
+        fn with_block(mut self, block: BlockDto) -> Self {
+            self.blocks.insert(block.id.clone(), block);
             self
         }
 
@@ -1499,6 +1600,13 @@ mod tests {
                 .get(page_id)
                 .cloned()
                 .ok_or_else(|| LocalityError::RemoteNotFound(page_id.to_string()))
+        }
+
+        fn retrieve_block(&self, block_id: &str) -> LocalityResult<BlockDto> {
+            self.blocks
+                .get(block_id)
+                .cloned()
+                .ok_or_else(|| LocalityError::RemoteNotFound(block_id.to_string()))
         }
 
         fn retrieve_database(&self, database_id: &str) -> LocalityResult<DatabaseDto> {
@@ -1550,7 +1658,11 @@ mod tests {
         }
 
         fn search_pages(&self, _start_cursor: Option<&str>) -> LocalityResult<PageListDto> {
-            Ok(PageListDto::default())
+            Ok(PageListDto {
+                results: self.pages.values().cloned().collect(),
+                next_cursor: None,
+                has_more: false,
+            })
         }
 
         fn search_databases(&self, _start_cursor: Option<&str>) -> LocalityResult<DatabaseListDto> {

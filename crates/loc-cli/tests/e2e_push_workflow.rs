@@ -11023,6 +11023,62 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
 
 #[test]
 #[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_locate_pretty_url_resolves_existing_and_new_block_parent_pages() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live block-parent locate root {}", unique_suffix()),
+        vec![paragraph_child("Root page for block-parent locate checks.")],
+    );
+    let section = cleanup.append_toggle_block(
+        &scratch.id,
+        &format!("Locality live nested locate section {}", unique_suffix()),
+    );
+    let existing_title = format!("Locality live existing nested page {}", unique_suffix());
+    let existing_child = cleanup.append_child_page_block(&section.id, &existing_title);
+
+    let connector = NotionConnector::new(
+        live_notion_config().with_root_page_id(RemoteId::new(scratch.id.clone())),
+    );
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    mount_virtual_workspace(&fixture, &mut store, &scratch.id);
+    let mount_point_root = fixture.virtual_root_identifier();
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &mount_point_root)
+        .expect("index mount point root");
+
+    let existing_url =
+        notion_pretty_workspace_url("codeflash", &existing_title, &existing_child.id);
+    let existing_path = desktop_style_locate_notion_url_path(
+        &mut store,
+        &connector,
+        &fixture.mount_id,
+        &existing_url,
+    );
+    assert!(
+        existing_path
+            .to_string_lossy()
+            .contains(&slug_for_test(&existing_title)),
+        "existing block-parent page should locate to its projected page.md path: {existing_path:?}"
+    );
+
+    let fresh_title = format!("Locality live fresh nested page {}", unique_suffix());
+    let fresh_child = cleanup.append_child_page_block(&section.id, &fresh_title);
+    let fresh_url = notion_pretty_workspace_url("codeflash", &fresh_title, &fresh_child.id);
+    let fresh_path =
+        desktop_style_locate_notion_url_path(&mut store, &connector, &fixture.mount_id, &fresh_url);
+    assert!(
+        fresh_path
+            .to_string_lossy()
+            .contains(&slug_for_test(&fresh_title)),
+        "fresh block-parent page should locate to its projected page.md path: {fresh_path:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_cyclic_diverse_page_read_noop_preserves_notion() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(live_notion_config());
@@ -13112,6 +13168,56 @@ impl LiveCleanup {
             .expect("create live scratch page");
         self.block_ids.push(page.id.clone());
         page
+    }
+
+    fn append_toggle_block(&mut self, parent_block_id: &str, title: &str) -> BlockDto {
+        let blocks = self
+            .api
+            .append_block_children(
+                parent_block_id,
+                json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "toggle",
+                        "toggle": {
+                            "rich_text": rich_text_json(title),
+                        }
+                    }]
+                }),
+            )
+            .expect("append live toggle block");
+        let block = blocks
+            .results
+            .into_iter()
+            .next()
+            .expect("appended live toggle block");
+        self.block_ids.push(block.id.clone());
+        block
+    }
+
+    fn append_child_page_block(&mut self, parent_block_id: &str, title: &str) -> BlockDto {
+        let blocks = self
+            .api
+            .append_block_children(
+                parent_block_id,
+                json!({
+                    "children": [{
+                        "object": "block",
+                        "type": "child_page",
+                        "child_page": {
+                            "title": title,
+                        }
+                    }]
+                }),
+            )
+            .expect("append live child page block");
+        let block = blocks
+            .results
+            .into_iter()
+            .next()
+            .expect("appended live child page block");
+        self.block_ids.push(block.id.clone());
+        block
     }
 
     fn current_user_id(&self) -> String {
@@ -15266,6 +15372,15 @@ fn compact_notion_id(input: &str) -> String {
 
 fn notion_object_url(id: &str) -> String {
     format!("https://www.notion.so/{}", normalize_notion_id(id))
+}
+
+fn notion_pretty_workspace_url(workspace_slug: &str, title: &str, id: &str) -> String {
+    format!(
+        "https://app.notion.com/p/{}/{}-{}",
+        workspace_slug,
+        slug_for_test(title),
+        normalize_notion_id(id)
+    )
 }
 
 fn slug_for_test(title: &str) -> String {
