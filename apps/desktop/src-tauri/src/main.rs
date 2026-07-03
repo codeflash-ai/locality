@@ -305,6 +305,68 @@ struct ActionReport {
     message: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceMountOnboardingReport {
+    state: String,
+    message: String,
+    primary_action: String,
+    launch_strategy: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacosWorkspaceMountOnboardingState {
+    Created,
+    ApprovalRequired,
+    WaitingForCloudStorageRoot,
+    Failed,
+}
+
+impl MacosWorkspaceMountOnboardingState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::ApprovalRequired => "approval_required",
+            Self::WaitingForCloudStorageRoot => "waiting_for_cloudstorage_root",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceMountOnboardingPrimaryAction {
+    AllowInMacos,
+    CheckAgain,
+    RetrySetup,
+}
+
+impl WorkspaceMountOnboardingPrimaryAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowInMacos => "allow_in_macos",
+            Self::CheckAgain => "check_again",
+            Self::RetrySetup => "retry_setup",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceMountOnboardingLaunchStrategy {
+    OpenFinder,
+    InstructionsOnly,
+    None,
+}
+
+impl WorkspaceMountOnboardingLaunchStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenFinder => "open_finder",
+            Self::InstructionsOnly => "instructions_only",
+            Self::None => "none",
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MountIdRequest {
@@ -8191,6 +8253,45 @@ fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
         || message.contains("registered but not enabled")
 }
 
+fn workspace_mount_onboarding_report(
+    state: MacosWorkspaceMountOnboardingState,
+    message: impl Into<String>,
+    primary_action: WorkspaceMountOnboardingPrimaryAction,
+    launch_strategy: WorkspaceMountOnboardingLaunchStrategy,
+) -> WorkspaceMountOnboardingReport {
+    WorkspaceMountOnboardingReport {
+        state: state.as_str().to_string(),
+        message: message.into(),
+        primary_action: primary_action.as_str().to_string(),
+        launch_strategy: launch_strategy.as_str().to_string(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_workspace_mount_onboarding_state(
+    message: &str,
+    user_enabled: bool,
+) -> Option<MacosWorkspaceMountOnboardingState> {
+    if message.contains("registered but not enabled") {
+        return Some(MacosWorkspaceMountOnboardingState::ApprovalRequired);
+    }
+    if user_enabled
+        && (message.contains("did not return a CloudStorage URL")
+            || message.contains("macOS has not created"))
+    {
+        return Some(MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot);
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_workspace_mount_onboarding_state(
+    _message: &str,
+    _user_enabled: bool,
+) -> Option<MacosWorkspaceMountOnboardingState> {
+    None
+}
+
 fn connection_metadata_key(
     connection: &ConnectionRecord,
 ) -> (&str, Option<&str>, Option<&str>, Option<&str>) {
@@ -10713,6 +10814,43 @@ mod tests {
         assert!(!super::recoverable_macos_file_provider_activation_error(
             "Could not load the top-level Notion folder"
         ));
+    }
+
+    #[test]
+    fn macos_workspace_mount_onboarding_state_requires_approval_when_domain_is_disabled() {
+        assert_eq!(
+            super::macos_workspace_mount_onboarding_state(
+                "Could not open macOS File Provider domain `loc`: The Locality File Provider is registered but not enabled.",
+                false,
+            ),
+            Some(super::MacosWorkspaceMountOnboardingState::ApprovalRequired)
+        );
+    }
+
+    #[test]
+    fn macos_workspace_mount_onboarding_state_waits_for_cloudstorage_root_when_enabled() {
+        assert_eq!(
+            super::macos_workspace_mount_onboarding_state(
+                "Could not open macOS File Provider domain `loc`: locality-file-providerctl did not return a CloudStorage URL",
+                true,
+            ),
+            Some(super::MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot)
+        );
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_report_uses_retry_setup_for_failed_state() {
+        let report = super::workspace_mount_onboarding_report(
+            super::MacosWorkspaceMountOnboardingState::Failed,
+            "Could not load the top-level Notion folder.",
+            super::WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+            super::WorkspaceMountOnboardingLaunchStrategy::None,
+        );
+
+        assert_eq!(report.state, "failed");
+        assert_eq!(report.primary_action, "retry_setup");
+        assert_eq!(report.launch_strategy, "none");
+        assert_eq!(report.message, "Could not load the top-level Notion folder.");
     }
 
     #[test]
