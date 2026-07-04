@@ -130,15 +130,19 @@ When `TAURI_UPDATER_PUBKEY` and `TAURI_SIGNING_PRIVATE_KEY` are set,
 copies the stable alias to:
 
 ```text
-target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip
-target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip.sig
+target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe
+target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe.sig
 ```
+
+When the GitHub workflow Authenticode-signs the installer through Azure Artifact
+Signing, it regenerates the Tauri updater `.sig` after Authenticode signing so
+the updater signature covers the final published bytes.
 
 Render the Windows updater manifest with:
 
 ```powershell
 $env:UPDATER_MANIFEST_OUTPUT = "target/release/bundle/updater/latest-windows.json"
-$env:UPDATER_WINDOWS_X86_64_ARTIFACT = "target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip"
+$env:UPDATER_WINDOWS_X86_64_ARTIFACT = "target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe"
 bash scripts/render-tauri-updater-manifest.sh
 ```
 
@@ -154,8 +158,7 @@ Artifact Signing when configured, builds the NSIS package, renders
 ```text
 Locality-release-windows-x86_64-setup.exe
 Locality-release-windows-x86_64-setup.exe.sha256
-Locality-release-windows-x86_64.nsis.zip
-Locality-release-windows-x86_64.nsis.zip.sig
+Locality-release-windows-x86_64-setup.exe.sig
 latest-windows.json
 SHA256SUMS-windows
 ```
