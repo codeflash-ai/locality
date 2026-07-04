@@ -28,8 +28,8 @@ use loc_cli::file_provider::{
 };
 #[cfg(target_os = "macos")]
 use loc_cli::file_provider::{
-    macos_file_provider_domain_url, register_macos_file_provider_domain,
-    run_macos_file_provider_helper,
+    macos_file_provider_domain_url, open_macos_file_provider_extension_browser,
+    register_macos_file_provider_domain, run_macos_file_provider_helper,
 };
 use loc_cli::local_oauth::run_local_oauth_authorization;
 use loc_cli::mount::{MountOptions, run_mount};
@@ -1138,6 +1138,40 @@ async fn run_workspace_mount_onboarding(
         refresh_desktop_surfaces(&app);
     }
     report
+}
+
+#[tauri::command]
+async fn open_macos_extension_browser_spike() -> ActionReport {
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "macos")]
+        {
+            macos_extension_browser_spike_report(open_macos_file_provider_extension_browser())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            action_error("macOS extension browser spike is only available on macOS.".to_string())
+        }
+    })
+    .await
+    .unwrap_or_else(|error| action_error(format!("Extension browser spike worker failed: {error}")))
+}
+
+fn macos_extension_browser_spike_report(
+    result: Result<
+        loc_cli::file_provider::FileProviderHelperReport,
+        loc_cli::file_provider::FileProviderHelperError,
+    >,
+) -> ActionReport {
+    match result {
+        Ok(_) => ActionReport {
+            ok: true,
+            message: "Closed macOS extension browser spike.".to_string(),
+        },
+        Err(error) => action_error(format!(
+            "Could not open macOS extension browser spike: {}",
+            error.message()
+        )),
+    }
 }
 
 async fn create_desktop_mount_command(
@@ -11195,6 +11229,34 @@ mod tests {
     }
 
     #[test]
+    fn macos_extension_browser_spike_report_returns_error_when_helper_is_missing() {
+        let report = super::macos_extension_browser_spike_report(Err(
+            loc_cli::file_provider::FileProviderHelperError::Missing,
+        ));
+
+        assert!(!report.ok);
+        assert!(report
+            .message
+            .contains("Could not open macOS extension browser spike"));
+    }
+
+    #[test]
+    fn macos_extension_browser_spike_report_returns_success_when_helper_exits_cleanly() {
+        let report = super::macos_extension_browser_spike_report(Ok(
+            loc_cli::file_provider::FileProviderHelperReport {
+                helper: std::path::PathBuf::from("/tmp/locality-file-providerctl"),
+                helper_report: serde_json::json!({
+                    "action": "extension-browser-spike",
+                    "message": "closed extension-browser-spike"
+                }),
+            },
+        ));
+
+        assert!(report.ok);
+        assert_eq!(report.message, "Closed macOS extension browser spike.");
+    }
+
+    #[test]
     fn tray_popover_hides_only_when_tray_window_loses_focus() {
         assert!(should_hide_tray_popover(
             "tray",
@@ -13426,6 +13488,7 @@ fn main() {
             create_workspace_mount,
             create_desktop_mount,
             run_workspace_mount_onboarding,
+            open_macos_extension_browser_spike,
             install_agent_guidance,
             locate_notion_page,
             search_notion_pages,

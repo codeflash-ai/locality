@@ -1532,6 +1532,11 @@ pub fn open_macos_file_provider_domain(
     Ok(report)
 }
 
+pub fn open_macos_file_provider_extension_browser(
+) -> Result<FileProviderHelperReport, FileProviderHelperError> {
+    run_macos_file_provider_helper("extension-browser-spike", Vec::new())
+}
+
 pub fn macos_file_provider_domain_url(mount_id: &str) -> Result<PathBuf, FileProviderHelperError> {
     resolve_macos_file_provider_domain(mount_id).map(|(_, url)| url)
 }
