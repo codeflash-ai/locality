@@ -9,17 +9,18 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/clean-start.sh [--yes] [--keep-credentials] [--state-dir PATH] [--app-path PATH]
 
-Reset this machine to a clean Locality testing state.
+Reset this machine to a fresh-install Locality testing state.
 
 By default this is a dry run. Pass --yes to actually stop processes, unregister
-File Provider domains, remove local Locality state, remove the installed app, and
+File Provider domains, remove local Locality state, remove Locality app bundles
+from standard install locations, remove Locality File Provider persistence, and
 delete Locality keychain connection credentials.
 
 Options:
   --yes               Execute the cleanup. Without this flag, only print actions.
   --keep-credentials  Do not delete Locality connection secrets from the keychain.
   --state-dir PATH    State directory to delete. Defaults to LOCALITY_STATE_DIR or ~/.loc.
-  --app-path PATH     Installed app bundle to delete. Defaults to /Applications/Locality.app.
+  --app-path PATH     Additional Locality app bundle to delete.
   -h, --help          Show this help.
 USAGE
 }

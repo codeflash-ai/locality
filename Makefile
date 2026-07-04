@@ -144,7 +144,7 @@ clean-start-plan: ## Print the local Locality clean-start reset actions without 
 	scripts/clean-start.sh
 
 .PHONY: clean-start
-clean-start: ## Stop Locality and remove local app/state/mounts/credentials for fresh manual testing.
+clean-start: ## Stop Locality and remove app/state/provider residue for fresh-install manual testing.
 	scripts/clean-start.sh --yes
 
 .PHONY: check
