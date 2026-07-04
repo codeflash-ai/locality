@@ -1,6 +1,4 @@
-import AppKit
 import Darwin
-import ExtensionKit
 @preconcurrency import FileProvider
 import Foundation
 
@@ -38,13 +36,12 @@ private enum Command {
   case unregister(mountId: String)
   case list
   case reset
-  case extensionBrowserSpike
 
   static func parse(_ arguments: [String]) throws -> Self {
     let args = arguments.filter { $0 != "--json" }
     guard let action = args.first else {
       throw UsageError(
-        "usage: locality-file-providerctl register|open|unregister|list|reset|extension-browser-spike [options]")
+        "usage: locality-file-providerctl register|open|unregister|list|reset [options]")
     }
 
     switch action {
@@ -75,8 +72,6 @@ private enum Command {
       return .list
     case "reset":
       return .reset
-    case "extension-browser-spike":
-      return .extensionBrowserSpike
     default:
       throw UsageError("unknown file provider action: \(action)")
     }
@@ -239,66 +234,7 @@ private enum Command {
         url: nil,
         message: "removed all file provider domains"
       )
-    case .extensionBrowserSpike:
-      let app = ExtensionBrowserSpikeApp()
-      return try app.run()
     }
-  }
-}
-
-private final class ExtensionBrowserSpikeApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
-  private let result = AsyncResultBox<FileProviderCtlReport>()
-  private var window: NSWindow?
-
-  func run() throws -> FileProviderCtlReport {
-    let app = NSApplication.shared
-    app.setActivationPolicy(.regular)
-    app.delegate = self
-    app.run()
-    return try result.get()
-      ?? FileProviderCtlReport(
-        ok: true,
-        action: "extension-browser-spike",
-        domain: nil,
-        domains: nil,
-        url: nil,
-        message: "closed extension-browser-spike"
-      )
-  }
-
-  func applicationDidFinishLaunching(_ notification: Notification) {
-    let browser = EXAppExtensionBrowserViewController()
-    let window = NSWindow(
-      contentRect: NSRect(x: 0, y: 0, width: 720, height: 560),
-      styleMask: [.titled, .closable, .miniaturizable, .resizable],
-      backing: .buffered,
-      defer: false
-    )
-    window.title = "Locality Approval Window (Spike)"
-    window.contentViewController = browser
-    window.center()
-    window.delegate = self
-    window.makeKeyAndOrderFront(nil)
-    self.window = window
-    NSApp.activate(ignoringOtherApps: true)
-  }
-
-  func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-    true
-  }
-
-  func windowWillClose(_ notification: Notification) {
-    result.complete(.success(
-      FileProviderCtlReport(
-        ok: true,
-        action: "extension-browser-spike",
-        domain: nil,
-        domains: nil,
-        url: nil,
-        message: "closed extension-browser-spike"
-      )
-    ))
-    NSApp.terminate(nil)
   }
 }
 

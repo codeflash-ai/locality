@@ -28,7 +28,6 @@ swiftc \
   -target "${TARGET}" \
   -parse-as-library \
   -framework AppKit \
-  -framework ExtensionKit \
   -framework FileProvider \
   -framework Foundation \
   -Xlinker -sectcreate \

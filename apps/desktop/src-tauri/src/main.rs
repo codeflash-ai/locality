@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(clippy::items_after_test_module)]
 
+#[cfg(target_os = "macos")]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -28,8 +30,8 @@ use loc_cli::file_provider::{
 };
 #[cfg(target_os = "macos")]
 use loc_cli::file_provider::{
-    macos_file_provider_domain_url, open_macos_file_provider_extension_browser,
-    register_macos_file_provider_domain, run_macos_file_provider_helper,
+    macos_file_provider_domain_url, register_macos_file_provider_domain,
+    run_macos_file_provider_helper,
 };
 use loc_cli::local_oauth::run_local_oauth_authorization;
 use loc_cli::mount::{MountOptions, run_mount};
@@ -99,6 +101,15 @@ use localityd::virtual_fs::{
     virtual_fs_content_base, virtual_fs_content_path, virtual_fs_content_root,
 };
 use notify::{RecursiveMode, Watcher};
+#[cfg(target_os = "macos")]
+use objc2::{ClassType, MainThreadOnly, extern_class, msg_send, rc::Retained, runtime::NSObject};
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSResponder,
+    NSViewController, NSWindow, NSWindowStyleMask,
+};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, ns_string};
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, Rect, WebviewUrl,
@@ -138,6 +149,23 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250);
 const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
+
+#[cfg(target_os = "macos")]
+#[link(name = "ExtensionKit", kind = "framework")]
+unsafe extern "C" {}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    static MACOS_EXTENSION_BROWSER_SPIKE_WINDOW: RefCell<Option<Retained<NSWindow>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(target_os = "macos")]
+extern_class!(
+    #[unsafe(super(NSViewController, NSResponder, NSObject))]
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct EXAppExtensionBrowserViewController;
+);
 const LIVE_MODE_RUNNER_ACTIVE_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_MODE_RUNNER_IDLE_RECHECK: Duration = Duration::from_secs(5 * 60);
 
@@ -1141,11 +1169,11 @@ async fn run_workspace_mount_onboarding(
 }
 
 #[tauri::command]
-async fn open_macos_extension_browser_spike() -> ActionReport {
+async fn open_macos_extension_browser_spike(app: AppHandle) -> ActionReport {
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "macos")]
         {
-            macos_extension_browser_spike_report(open_macos_file_provider_extension_browser())
+            macos_extension_browser_spike_report(open_macos_extension_browser_spike_window(app))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1157,21 +1185,76 @@ async fn open_macos_extension_browser_spike() -> ActionReport {
 }
 
 fn macos_extension_browser_spike_report(
-    result: Result<
-        loc_cli::file_provider::FileProviderHelperReport,
-        loc_cli::file_provider::FileProviderHelperError,
-    >,
+    result: Result<(), String>,
 ) -> ActionReport {
     match result {
-        Ok(_) => ActionReport {
+        Ok(()) => ActionReport {
             ok: true,
-            message: "Closed macOS extension browser spike.".to_string(),
+            message: "Opened macOS extension browser spike.".to_string(),
         },
-        Err(error) => action_error(format!(
-            "Could not open macOS extension browser spike: {}",
-            error.message()
-        )),
+        Err(error) => action_error(format!("Could not open macOS extension browser spike: {error}")),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_extension_browser_spike_window(app: AppHandle) -> Result<(), String> {
+    let (send, recv) = mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let _ = send.send(show_macos_extension_browser_spike_window());
+    })
+    .map_err(|error| format!("Could not schedule spike window on the main thread: {error}"))?;
+    recv.recv().map_err(|error| {
+        format!("macOS extension browser spike window task did not finish: {error}")
+    })?
+}
+
+#[cfg(target_os = "macos")]
+impl EXAppExtensionBrowserViewController {
+    fn new() -> Result<Retained<Self>, String> {
+        let browser = unsafe { Retained::from_raw(msg_send![Self::class(), new]) };
+        browser.ok_or_else(|| "EXAppExtensionBrowserViewController returned nil".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn show_macos_extension_browser_spike_window() -> Result<(), String> {
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| "macOS extension browser spike requires the main thread".to_string())?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+
+    MACOS_EXTENSION_BROWSER_SPIKE_WINDOW.with(|slot| -> Result<(), String> {
+        let mut slot = slot.borrow_mut();
+        let window = if let Some(window) = slot.as_ref() {
+            window.clone()
+        } else {
+            let browser = EXAppExtensionBrowserViewController::new()?;
+            let window = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    NSWindow::alloc(mtm),
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(720.0, 560.0)),
+                    NSWindowStyleMask::Titled
+                        | NSWindowStyleMask::Closable
+                        | NSWindowStyleMask::Miniaturizable
+                        | NSWindowStyleMask::Resizable,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
+            };
+            unsafe { window.setReleasedWhenClosed(false) };
+            window.setTitle(ns_string!("Locality Approval Window (Spike)"));
+            window.setContentMinSize(NSSize::new(720.0, 560.0));
+            window.setContentViewController(Some(browser.as_super()));
+            window.center();
+            *slot = Some(window.clone());
+            window
+        };
+
+        window.makeKeyAndOrderFront(None);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+        Ok(())
+    })
 }
 
 async fn create_desktop_mount_command(
@@ -6352,6 +6435,11 @@ fn desktop_smoke_test_requested() -> bool {
     std::env::var_os("LOCALITY_DESKTOP_SMOKE_TEST").is_some()
 }
 
+fn desktop_extension_browser_spike_requested() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("LOCALITY_DESKTOP_EXTENSION_BROWSER_SPIKE").is_some()
+}
+
 fn install_terminal_cli_link() -> Result<PathBuf, String> {
     if app_store_distribution() {
         if let Some(path) = find_command_in_path("loc") {
@@ -11229,9 +11317,9 @@ mod tests {
     }
 
     #[test]
-    fn macos_extension_browser_spike_report_returns_error_when_helper_is_missing() {
+    fn macos_extension_browser_spike_report_returns_error_when_open_fails() {
         let report = super::macos_extension_browser_spike_report(Err(
-            loc_cli::file_provider::FileProviderHelperError::Missing,
+            "spike window is unavailable".to_string(),
         ));
 
         assert!(!report.ok);
@@ -11241,19 +11329,11 @@ mod tests {
     }
 
     #[test]
-    fn macos_extension_browser_spike_report_returns_success_when_helper_exits_cleanly() {
-        let report = super::macos_extension_browser_spike_report(Ok(
-            loc_cli::file_provider::FileProviderHelperReport {
-                helper: std::path::PathBuf::from("/tmp/locality-file-providerctl"),
-                helper_report: serde_json::json!({
-                    "action": "extension-browser-spike",
-                    "message": "closed extension-browser-spike"
-                }),
-            },
-        ));
+    fn macos_extension_browser_spike_report_returns_success_when_window_opens() {
+        let report = super::macos_extension_browser_spike_report(Ok(()));
 
         assert!(report.ok);
-        assert_eq!(report.message, "Closed macOS extension browser spike.");
+        assert_eq!(report.message, "Opened macOS extension browser spike.");
     }
 
     #[test]
@@ -13464,6 +13544,16 @@ fn main() {
             refresh_launch_at_login_cache_async();
             configure_main_window_chrome(app);
             build_tray(app)?;
+            #[cfg(target_os = "macos")]
+            if desktop_extension_browser_spike_requested() {
+                if let Err(error) = show_macos_extension_browser_spike_window() {
+                    desktop_log(
+                        "error",
+                        "macos.extension_browser_spike.startup",
+                        error,
+                    );
+                }
+            }
             start_desktop_activation_listener(app.app_handle().clone(), activation_event_handle);
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());

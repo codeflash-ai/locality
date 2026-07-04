@@ -51,12 +51,14 @@ import { connectionMissing, connectionReady } from "./connection-state";
 import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
 import { classifyMountSetupError } from "./onboarding-errors";
 import {
+  mountOnboardingExtensionBrowserSpikeLabel,
   failedMountOnboardingReport,
   mountOnboardingHeadline,
   mountOnboardingInstructions,
   mountOnboardingNeedsInstructions,
   mountOnboardingNextAction,
   mountOnboardingPrimaryLabel,
+  mountOnboardingShowsExtensionBrowserSpike,
   mountOnboardingSupplementaryNote,
   type WorkspaceMountOnboardingReport,
 } from "./onboarding-mount";
@@ -1170,6 +1172,7 @@ function Onboarding({
   const [locateError, setLocateError] = useState("");
   const [mountOnboarding, setMountOnboarding] = useState<WorkspaceMountOnboardingReport | null>(null);
   const [mounting, setMounting] = useState(false);
+  const [openingApprovalSpike, setOpeningApprovalSpike] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
   const mountStartRequestedRef = useRef(false);
@@ -1418,6 +1421,28 @@ function Onboarding({
     setMountOnboarding(null);
   }
 
+  async function openApprovalWindowSpike() {
+    if (openingApprovalSpike || mounting) {
+      return;
+    }
+
+    setOpeningApprovalSpike(true);
+    try {
+      const report = await callCommand<ActionReport>(
+        "open_macos_extension_browser_spike",
+        undefined,
+        { ok: true, message: "Closed demo approval window." },
+      );
+      if (!report.ok) {
+        setMountOnboarding(failedMountOnboardingReport(report.message));
+      }
+    } catch (error) {
+      setMountOnboarding(failedMountOnboardingReport(errorMessage(error)));
+    } finally {
+      setOpeningApprovalSpike(false);
+    }
+  }
+
   function finishOnboarding() {
     onComplete();
   }
@@ -1456,6 +1481,10 @@ function Onboarding({
       ? classifyMountSetupError(mountOnboarding.message)
       : null;
   const showRecoveryChooser = mountRecoveryEnabled(mountSetupError);
+  const showApprovalSpike = mountOnboardingShowsExtensionBrowserSpike(mountOnboarding, {
+    devMode: import.meta.env.DEV,
+    appStoreDistribution,
+  });
 
   return (
     <main className="setup-shell">
@@ -1581,7 +1610,7 @@ function Onboarding({
             <div className="path-field ready-path-field">
               <span>{mountPath}</span>
             </div>
-            {showRecoveryChooser ? (
+            {showRecoveryChooser || showApprovalSpike ? (
               <div className="button-row">
                 <PrimaryButton
                   busy={mounting}
@@ -1590,9 +1619,20 @@ function Onboarding({
                 >
                   {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
                 </PrimaryButton>
-                <SecondaryButton disabled={mounting} onClick={() => void chooseFolder()}>
-                  Choose Folder
-                </SecondaryButton>
+                {showRecoveryChooser && (
+                  <SecondaryButton disabled={mounting} onClick={() => void chooseFolder()}>
+                    Choose Folder
+                  </SecondaryButton>
+                )}
+                {showApprovalSpike && (
+                  <SecondaryButton
+                    busy={openingApprovalSpike}
+                    disabled={mounting}
+                    onClick={() => void openApprovalWindowSpike()}
+                  >
+                    {mountOnboardingExtensionBrowserSpikeLabel(openingApprovalSpike)}
+                  </SecondaryButton>
+                )}
               </div>
             ) : (
               <PrimaryButton
