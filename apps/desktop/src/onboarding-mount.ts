@@ -86,6 +86,21 @@ export function mountOnboardingSupplementaryNote(
   return "Locality is waiting for macOS to create the CloudStorage folder before the final onboarding step can continue.";
 }
 
+export function mountOnboardingShowsExtensionBrowserSpike(
+  report: WorkspaceMountOnboardingReport | null,
+  options: { devMode: boolean; appStoreDistribution: boolean },
+) {
+  return (
+    options.devMode &&
+    !options.appStoreDistribution &&
+    report?.state === "approval_required"
+  );
+}
+
+export function mountOnboardingExtensionBrowserSpikeLabel(busy: boolean) {
+  return busy ? "Opening Approval Window" : "Open Approval Window (Spike)";
+}
+
 export function mountOnboardingNextAction(
   report: WorkspaceMountOnboardingReport | null,
 ): "start" | "allow_in_macos" | "check_again" {

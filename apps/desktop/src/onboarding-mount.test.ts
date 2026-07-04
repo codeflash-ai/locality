@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import * as onboardingMount from "./onboarding-mount";
 import {
   failedMountOnboardingReport,
+  mountOnboardingExtensionBrowserSpikeLabel,
   mountOnboardingHeadline,
   mountOnboardingNeedsInstructions,
   mountOnboardingNextAction,
   mountOnboardingPrimaryLabel,
+  mountOnboardingShowsExtensionBrowserSpike,
   mountOnboardingSupplementaryNote,
   type WorkspaceMountOnboardingReport,
 } from "./onboarding-mount";
@@ -109,6 +111,48 @@ describe("mount onboarding helpers", () => {
       "check_again",
     );
     expect(mountOnboardingNextAction(report({ primaryAction: "retry_setup" }))).toBe("start");
+  });
+
+  it("shows the extension browser spike only for approval_required in direct dev builds", () => {
+    expect(
+      mountOnboardingShowsExtensionBrowserSpike(report({ state: "approval_required" }), {
+        devMode: true,
+        appStoreDistribution: false,
+      }),
+    ).toBe(true);
+    expect(
+      mountOnboardingShowsExtensionBrowserSpike(
+        report({
+          state: "waiting_for_cloudstorage_root",
+          primaryAction: "check_again",
+        }),
+        {
+          devMode: true,
+          appStoreDistribution: false,
+        },
+      ),
+    ).toBe(false);
+    expect(
+      mountOnboardingShowsExtensionBrowserSpike(report({ state: "approval_required" }), {
+        devMode: false,
+        appStoreDistribution: false,
+      }),
+    ).toBe(false);
+    expect(
+      mountOnboardingShowsExtensionBrowserSpike(report({ state: "approval_required" }), {
+        devMode: true,
+        appStoreDistribution: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("switches the spike label while the browser helper is running", () => {
+    expect(mountOnboardingExtensionBrowserSpikeLabel(false)).toBe(
+      "Open Approval Window (Spike)",
+    );
+    expect(mountOnboardingExtensionBrowserSpikeLabel(true)).toBe(
+      "Opening Approval Window",
+    );
   });
 
   it("wraps generic failures into a retryable onboarding report", () => {
