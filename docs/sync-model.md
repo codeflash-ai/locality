@@ -85,6 +85,12 @@ A file can be clean even if the Remote Tree has changed since that shadow was
 stored. That means the local copy has no local edits and can usually be
 fast-forwarded.
 
+When a Remote Tree observation confirms that a materialized Notion page was
+deleted remotely, Locality treats the local projection as removable only if the
+file is clean. Clean materialized plain-file pages are removed from the Local
+Tree and Synced Tree automatically; pages with pending local edits or an
+unsupported/ambiguous projection stay visible for review.
+
 ### Pending Local File
 
 A pending local file has been changed in the Local Tree by a human, agent, or

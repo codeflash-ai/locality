@@ -370,7 +370,7 @@ fn remote_delete_observation_e2e_removes_unopened_online_only_page() {
 }
 
 #[test]
-fn remote_delete_observation_e2e_review_then_restored_check_clears_status() {
+fn remote_delete_observation_e2e_removes_clean_hydrated_page() {
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
     let api = Arc::new(MutableNotionApi::new());
@@ -391,6 +391,7 @@ fn remote_delete_observation_e2e_review_then_restored_check_clears_status() {
     .expect("mount");
     run_pull(&mut store, &connector, &fixture.root).expect("initial pull");
 
+    let page_path = fixture.page_file();
     let remote_id = RemoteId::new("page-1");
     let synced_version = store
         .get_entity(&fixture.mount_id, &remote_id)
@@ -398,10 +399,85 @@ fn remote_delete_observation_e2e_review_then_restored_check_clears_status() {
         .expect("entity")
         .remote_edited_at
         .expect("synced remote version");
+
     apply_remote_observation(
         &mut store,
         observe_job(&fixture.mount_id, &remote_id),
         remote_observation(&fixture.mount_id, &remote_id, true, &synced_version),
+    )
+    .expect("apply deleted observation");
+
+    assert!(
+        !page_path.exists(),
+        "clean materialized remote-deleted page should be removed"
+    );
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &remote_id)
+            .expect("get entity")
+            .is_none()
+    );
+    let status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status");
+    assert!(status.clean, "{status:#?}");
+    assert_eq!(status.summary.total, 0, "{status:#?}");
+}
+
+#[test]
+fn remote_delete_observation_e2e_review_then_restored_check_clears_remote_deleted_issue() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount");
+
+    let remote_id = RemoteId::new("page-1");
+    let synced_version = "remote-v1";
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Stub)
+            .with_remote_edited_at(synced_version),
+        )
+        .expect("save entity");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                fixture.mount_id.clone(),
+                remote_id.clone(),
+                FreshnessTier::Cold,
+            )
+            .opened_at("now"),
+        )
+        .expect("save freshness");
+
+    apply_remote_observation(
+        &mut store,
+        observe_job(&fixture.mount_id, &remote_id),
+        remote_observation(&fixture.mount_id, &remote_id, true, synced_version),
     )
     .expect("apply deleted observation");
 
@@ -414,7 +490,7 @@ fn remote_delete_observation_e2e_review_then_restored_check_clears_status() {
     )
     .expect("deleted status");
     let entry = status.mounts[0].entries.first().expect("status entry");
-    assert_eq!(entry.sync_state, StatusSyncState::RemoteUpdateAvailable);
+    assert_eq!(entry.sync_state, StatusSyncState::ReviewNeeded);
     assert!(
         entry
             .issues
@@ -426,7 +502,7 @@ fn remote_delete_observation_e2e_review_then_restored_check_clears_status() {
     apply_remote_observation(
         &mut store,
         observe_job(&fixture.mount_id, &remote_id),
-        remote_observation(&fixture.mount_id, &remote_id, false, &synced_version),
+        remote_observation(&fixture.mount_id, &remote_id, false, synced_version),
     )
     .expect("apply restored observation");
 
@@ -438,14 +514,14 @@ fn remote_delete_observation_e2e_review_then_restored_check_clears_status() {
         },
     )
     .expect("restored status");
-    assert!(status.clean, "{status:#?}");
-    let entry = status.mounts[0].entries.first().expect("status entry");
     assert!(
-        entry
-            .issues
+        status
+            .mounts
             .iter()
+            .flat_map(|mount| mount.entries.iter())
+            .flat_map(|entry| entry.issues.iter())
             .all(|issue| issue.code != "remote_deleted"),
-        "{entry:#?}"
+        "{status:#?}"
     );
 }
 
@@ -10914,6 +10990,74 @@ fn live_locate_notion_url_returns_markdown_path_and_can_prioritize_hydration() {
 
 #[test]
 #[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_remote_delete_observation_removes_clean_hydrated_plain_file_page() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live remote delete {}", unique_suffix()),
+        vec![paragraph_child(
+            "Clean page should disappear locally after remote archive.",
+        )],
+    );
+    let connector = NotionConnector::new(live_notion_config());
+    let (fixture, mut store, page_path, markdown) = pull_live_page(&connector, &scratch.id);
+    assert!(page_path.exists(), "live page was not materialized");
+    assert!(
+        markdown.contains("Clean page should disappear locally after remote archive."),
+        "{markdown}"
+    );
+
+    cleanup
+        .api
+        .delete_block(&scratch.id)
+        .expect("archive live scratch page");
+    let observation = wait_for_live_deleted_observation(
+        &connector,
+        &fixture.mount_id,
+        &scratch.id,
+        "remote delete clean hydrated plain file",
+    );
+
+    apply_remote_observation(
+        &mut store,
+        observe_job(&fixture.mount_id, &RemoteId::new(scratch.id.clone())),
+        observation,
+    )
+    .expect("apply live deleted observation");
+
+    assert!(
+        !page_path.exists(),
+        "clean hydrated page should be removed after live remote delete"
+    );
+    assert!(
+        page_path
+            .parent()
+            .is_some_and(|directory| !directory.exists()),
+        "page directory should be removed after deleting page.md"
+    );
+    assert!(
+        store
+            .get_entity(&fixture.mount_id, &RemoteId::new(scratch.id.clone()))
+            .expect("get deleted live entity")
+            .is_none()
+    );
+
+    let status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(fixture.root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("live remote delete status");
+    assert!(status.clean, "{status:#?}");
+    assert_eq!(status.summary.total, 0, "{status:#?}");
+}
+
+#[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
     let env = LiveEnv::from_env();
     let api = HttpNotionApi::new(live_notion_config());
@@ -13654,6 +13798,37 @@ fn wait_for_live_block_text(api: &HttpNotionApi, page_id: &str, text: &str, cont
 
     panic!(
         "{context}: live page `{page_id}` did not expose expected text `{text}` before timeout; last observed blocks: {last_snapshot}"
+    );
+}
+
+fn wait_for_live_deleted_observation(
+    connector: &NotionConnector,
+    mount_id: &MountId,
+    page_id: &str,
+    context: &str,
+) -> RemoteObservation {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let remote_id = RemoteId::new(page_id.to_string());
+    let mut last_observation = String::new();
+
+    while Instant::now() < deadline {
+        match connector.observe(ObserveRequest {
+            mount_id: mount_id.clone(),
+            remote_id: remote_id.clone(),
+        }) {
+            Ok(observation) if observation.deleted => return observation,
+            Ok(observation) => {
+                last_observation = format!("{observation:#?}");
+            }
+            Err(error) => {
+                last_observation = error.to_string();
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    panic!(
+        "{context}: live page `{page_id}` did not expose a deleted observation before timeout; last observation: {last_observation}"
     );
 }
 

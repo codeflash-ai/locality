@@ -3744,7 +3744,9 @@ where
         + RemoteObservationRepository
         + FreshnessStateRepository
         + MountLiveModeRepository
-        + AutoSaveRepository,
+        + AutoSaveRepository
+        + MountRepository
+        + ShadowRepository,
     C: Connector,
 {
     if job.kind != SyncJobKind::ObserveEntity {
@@ -3765,7 +3767,9 @@ where
         + RemoteObservationRepository
         + FreshnessStateRepository
         + MountLiveModeRepository
-        + AutoSaveRepository,
+        + AutoSaveRepository
+        + MountRepository
+        + ShadowRepository,
     C: Connector,
 {
     let Some(remote_id) = job.remote_id.clone() else {
@@ -3792,7 +3796,9 @@ where
         + RemoteObservationRepository
         + FreshnessStateRepository
         + MountLiveModeRepository
-        + AutoSaveRepository,
+        + AutoSaveRepository
+        + MountRepository
+        + ShadowRepository,
 {
     let Some(remote_id) = job.remote_id.clone() else {
         return Err(LocalityError::InvalidState(
@@ -3815,26 +3821,34 @@ where
     let existing_freshness = store
         .get_freshness_state(&job.mount_id, &remote_id)
         .map_err(LocalityError::from)?;
-    if observation.deleted
-        && existing.as_ref().is_some_and(|entity| {
-            should_auto_delete_unopened_remote_delete(entity, existing_freshness.as_ref())
-        })
-    {
-        store
-            .delete_entity(&job.mount_id, &remote_id)
-            .map_err(LocalityError::from)?;
-        store
-            .delete_freshness_state(&job.mount_id, &remote_id)
-            .map_err(LocalityError::from)?;
-        store
-            .delete_remote_observation(&job.mount_id, &remote_id)
-            .map_err(LocalityError::from)?;
-        return Ok(FreshnessRuntimeReport {
-            job,
-            remote_hint_pending: false,
-            queued_hydrations: Vec::new(),
-            follow_up_jobs: Vec::new(),
-        });
+    if observation.deleted {
+        match remote_delete_policy(
+            store,
+            &job.mount_id,
+            existing.as_ref(),
+            existing_freshness.as_ref(),
+        )? {
+            RemoteDeletePolicy::RemoveMetadata(_reason) => {
+                delete_remote_deleted_state(store, &job.mount_id, &remote_id)?;
+                return Ok(FreshnessRuntimeReport {
+                    job,
+                    remote_hint_pending: false,
+                    queued_hydrations: Vec::new(),
+                    follow_up_jobs: Vec::new(),
+                });
+            }
+            RemoteDeletePolicy::RemoveCleanProjection { path, reason: _ } => {
+                remove_clean_remote_deleted_projection(&path)?;
+                delete_remote_deleted_state(store, &job.mount_id, &remote_id)?;
+                return Ok(FreshnessRuntimeReport {
+                    job,
+                    remote_hint_pending: false,
+                    queued_hydrations: Vec::new(),
+                    follow_up_jobs: Vec::new(),
+                });
+            }
+            RemoteDeletePolicy::PreserveForReview(_reason) => {}
+        }
     }
 
     let remote_hint_pending = observed_remote_version_changed(existing.as_ref(), &observation);
@@ -3877,6 +3891,122 @@ where
         queued_hydrations,
         follow_up_jobs: Vec::new(),
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteDeletePolicy {
+    RemoveMetadata(RemoteDeleteReason),
+    RemoveCleanProjection {
+        path: PathBuf,
+        reason: RemoteDeleteReason,
+    },
+    PreserveForReview(RemoteDeleteReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteDeleteReason {
+    UnopenedOnlineOnly,
+    CleanHydratedPlainFile,
+    UnknownEntity,
+    LocalPendingOrDirty,
+    MissingMount,
+    UnsupportedProjection,
+    UnsupportedEntityState,
+}
+
+fn remote_delete_policy<S>(
+    store: &S,
+    mount_id: &MountId,
+    existing: Option<&EntityRecord>,
+    freshness: Option<&FreshnessStateRecord>,
+) -> locality_core::LocalityResult<RemoteDeletePolicy>
+where
+    S: MountRepository + ShadowRepository,
+{
+    let Some(entity) = existing else {
+        return Ok(RemoteDeletePolicy::PreserveForReview(
+            RemoteDeleteReason::UnknownEntity,
+        ));
+    };
+
+    if should_auto_delete_unopened_remote_delete(entity, freshness) {
+        return Ok(RemoteDeletePolicy::RemoveMetadata(
+            RemoteDeleteReason::UnopenedOnlineOnly,
+        ));
+    }
+
+    if entity.kind != EntityKind::Page || entity.hydration != HydrationState::Hydrated {
+        return Ok(RemoteDeletePolicy::PreserveForReview(
+            RemoteDeleteReason::UnsupportedEntityState,
+        ));
+    }
+    if freshness.is_some_and(|state| state.last_local_change_at.is_some()) {
+        return Ok(RemoteDeletePolicy::PreserveForReview(
+            RemoteDeleteReason::LocalPendingOrDirty,
+        ));
+    }
+
+    let Some(mount) = store.get_mount(mount_id).map_err(LocalityError::from)? else {
+        return Ok(RemoteDeletePolicy::PreserveForReview(
+            RemoteDeleteReason::MissingMount,
+        ));
+    };
+    if mount.projection.uses_virtual_filesystem() {
+        return Ok(RemoteDeletePolicy::PreserveForReview(
+            RemoteDeleteReason::UnsupportedProjection,
+        ));
+    }
+
+    let path = mount.root.join(&entity.path);
+    if hydrated_file_matches_shadow(store, &mount, entity, &path)? {
+        return Ok(RemoteDeletePolicy::RemoveCleanProjection {
+            path,
+            reason: RemoteDeleteReason::CleanHydratedPlainFile,
+        });
+    }
+    Ok(RemoteDeletePolicy::PreserveForReview(
+        RemoteDeleteReason::LocalPendingOrDirty,
+    ))
+}
+
+fn delete_remote_deleted_state<S>(
+    store: &mut S,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+) -> locality_core::LocalityResult<()>
+where
+    S: EntityRepository + FreshnessStateRepository + RemoteObservationRepository,
+{
+    store
+        .delete_entity(mount_id, remote_id)
+        .map_err(LocalityError::from)?;
+    store
+        .delete_freshness_state(mount_id, remote_id)
+        .map_err(LocalityError::from)?;
+    store
+        .delete_remote_observation(mount_id, remote_id)
+        .map_err(LocalityError::from)?;
+    Ok(())
+}
+
+fn remove_clean_remote_deleted_projection(path: &Path) -> locality_core::LocalityResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(LocalityError::Io(format!(
+                "failed to remove remote-deleted clean projection `{}`: {error}",
+                path.display()
+            )));
+        }
+    }
+
+    if path.file_name().is_some_and(|name| name == "page.md")
+        && let Some(directory) = path.parent()
+    {
+        let _ = std::fs::remove_dir(directory);
+    }
+    Ok(())
 }
 
 fn auto_fast_forward_requests_from_observation<S>(
@@ -4530,6 +4660,106 @@ mod tests {
     }
 
     #[test]
+    fn remote_observation_auto_deletes_clean_hydrated_plain_file_remote_delete() {
+        let fixture = RuntimeAutoSaveFixture::new();
+        let mut store = fixture.store_without_auto_save();
+        let connector = ObservingConnector {
+            observation: RemoteObservation {
+                mount_id: fixture.mount_id.clone(),
+                remote_id: fixture.remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Roadmap".to_string(),
+                parent_remote_id: None,
+                projected_path: "Roadmap.md".into(),
+                remote_version: Some(RemoteVersion::new("remote-v1")),
+                deleted: true,
+                raw_metadata_json: "{}".to_string(),
+            },
+        };
+
+        let report = execute_observe_entity_job(
+            &mut store,
+            &connector,
+            observe_job(&fixture.mount_id, &fixture.remote_id),
+        )
+        .expect("observe");
+
+        assert!(!report.remote_hint_pending);
+        assert!(
+            !fixture.page_path.exists(),
+            "clean materialized page should be removed"
+        );
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &fixture.remote_id)
+                .expect("get entity")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_freshness_state(&fixture.mount_id, &fixture.remote_id)
+                .expect("get freshness")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_remote_observation(&fixture.mount_id, &fixture.remote_id)
+                .expect("get observation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remote_observation_keeps_dirty_hydrated_remote_delete_for_review() {
+        let fixture = RuntimeAutoSaveFixture::new();
+        let mut store = fixture.store_without_auto_save();
+        fixture.write_page("Locally changed body.");
+        let connector = ObservingConnector {
+            observation: RemoteObservation {
+                mount_id: fixture.mount_id.clone(),
+                remote_id: fixture.remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Roadmap".to_string(),
+                parent_remote_id: None,
+                projected_path: "Roadmap.md".into(),
+                remote_version: Some(RemoteVersion::new("remote-v1")),
+                deleted: true,
+                raw_metadata_json: "{}".to_string(),
+            },
+        };
+
+        let report = execute_observe_entity_job(
+            &mut store,
+            &connector,
+            observe_job(&fixture.mount_id, &fixture.remote_id),
+        )
+        .expect("observe");
+
+        assert!(report.remote_hint_pending);
+        assert!(fixture.page_path.exists(), "dirty page should be preserved");
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &fixture.remote_id)
+                .expect("get entity")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_freshness_state(&fixture.mount_id, &fixture.remote_id)
+                .expect("get freshness")
+                .expect("freshness")
+                .remote_hint_pending
+        );
+        assert!(
+            store
+                .get_remote_observation(&fixture.mount_id, &fixture.remote_id)
+                .expect("get observation")
+                .expect("observation")
+                .deleted
+        );
+    }
+
+    #[test]
     fn remote_observation_keeps_opened_online_only_remote_delete_for_review() {
         let mount_id = MountId::new("notion-main");
         let remote_id = RemoteId::new("page-1");
@@ -4836,6 +5066,7 @@ mod tests {
             [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
         )
         .expect("shadow")
+        .with_frontmatter("loc:\n  id: page-1\n  type: page\ntitle: Roadmap\n")
     }
 
     fn temp_runtime_root(prefix: &str) -> PathBuf {
