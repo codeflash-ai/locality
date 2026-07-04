@@ -264,13 +264,16 @@ remove_support_files() {
 }
 
 remove_apps() {
-  local app_path
+  local app_path plugin_path
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    while IFS= read -r plugin_path; do
+      [[ -n "${plugin_path}" ]] || continue
+      run_quiet pluginkit -r "${plugin_path}"
+    done < <(clean_start_target_plugin_paths "${EXTRA_APP_PATH}")
+  fi
   for app_path in "${APP_PATHS[@]}"; do
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-      run_quiet pluginkit -r "${app_path}"
-      if [[ -x "${LSREGISTER}" ]]; then
-        run_quiet "${LSREGISTER}" -u "${app_path}"
-      fi
+    if [[ "$(uname -s)" == "Darwin" ]] && [[ -x "${LSREGISTER}" ]]; then
+      run_quiet "${LSREGISTER}" -u "${app_path}"
     fi
     remove_path "${app_path}"
   done

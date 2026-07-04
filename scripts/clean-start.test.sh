@@ -62,6 +62,21 @@ test_target_helper_paths_prefer_deduplicated_targets() {
 ${tmp_home}/Applications/Locality.app/Contents/MacOS/locality-file-providerctl"
 }
 
+test_registered_plugin_paths_from_match_output_extracts_unique_appex_paths() {
+  local actual
+  actual="$(clean_start_registered_plugin_paths_from_match_output <<'EOF'
+-  F ai.codeflash.locality.Locality.FileProvider(0.1)	1D45FC5C-5FDA-4C5F-9506-689AC1FA6824	2026-07-02 17:33:59 +0000	/private/var/folders/gt/6989l91x4ls_47vdhp33t7sm0000gn/T/tmp.gEoTLYqS5S/mount/Locality.app/Contents/PlugIns/LocalityFileProvider.appex
+-  F ai.codeflash.locality.Locality.FileProvider(0.1)	1D45FC5C-5FDA-4C5F-9506-689AC1FA6824	2026-07-02 17:33:59 +0000	/private/var/folders/gt/6989l91x4ls_47vdhp33t7sm0000gn/T/tmp.gEoTLYqS5S/mount/Locality.app/Contents/PlugIns/LocalityFileProvider.appex
++  F ai.codeflash.locality.Locality.FileProvider(0.1)	3D9D0683-3D14-4F95-BCDC-862C6F2CE933	2026-07-04 02:40:25 +0000	/Applications/Locality.app/Contents/PlugIns/LocalityFileProvider.appex
+ (2 plug-ins)
+EOF
+)"
+  assert_lines_equal \
+    "${actual}" \
+    "/private/var/folders/gt/6989l91x4ls_47vdhp33t7sm0000gn/T/tmp.gEoTLYqS5S/mount/Locality.app/Contents/PlugIns/LocalityFileProvider.appex
+/Applications/Locality.app/Contents/PlugIns/LocalityFileProvider.appex"
+}
+
 test_support_paths_include_locality_file_provider_persistence() {
   local tmp_home actual
   tmp_home="$(mktemp -d)"
@@ -87,6 +102,7 @@ main() {
   test_target_app_paths_append_extra_bundle_without_replacing_defaults
   test_target_helper_paths_follow_all_target_bundles
   test_target_helper_paths_prefer_deduplicated_targets
+  test_registered_plugin_paths_from_match_output_extracts_unique_appex_paths
   test_support_paths_include_locality_file_provider_persistence
   test_mount_root_candidates_include_existing_cloudstorage_aliases
   printf 'clean-start helper tests passed\n'

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+LOCALITY_FILE_PROVIDER_BUNDLE_ID="ai.codeflash.locality.Locality.FileProvider"
+
 append_unique() {
   local array_name="$1"
   local value="$2"
@@ -36,6 +38,43 @@ clean_start_target_helper_paths() {
     append_unique helper_paths "${app_path}/Contents/MacOS/locality-file-providerctl"
   done < <(clean_start_target_app_paths "${extra_app_path}")
   printf '%s\n' "${helper_paths[@]}"
+}
+
+clean_start_registered_plugin_paths_from_match_output() {
+  local plugin_paths=()
+  local line path
+  while IFS= read -r line; do
+    case "${line}" in
+      *"/"*"LocalityFileProvider.appex")
+        path="/${line#*/}"
+        append_unique plugin_paths "${path}"
+        ;;
+    esac
+  done
+  [[ ${#plugin_paths[@]} -gt 0 ]] || return 0
+  printf '%s\n' "${plugin_paths[@]}"
+}
+
+clean_start_registered_plugin_paths() {
+  [[ "$(uname -s)" == "Darwin" ]] || return 0
+  command -v pluginkit >/dev/null 2>&1 || return 0
+  pluginkit -m -D -v -i "${LOCALITY_FILE_PROVIDER_BUNDLE_ID}" 2>/dev/null \
+    | clean_start_registered_plugin_paths_from_match_output
+}
+
+clean_start_target_plugin_paths() {
+  local extra_app_path="${1:-}"
+  local plugin_paths=()
+  local app_path plugin_path
+  while IFS= read -r app_path; do
+    [[ -n "${app_path}" ]] || continue
+    append_unique plugin_paths "${app_path}/Contents/PlugIns/LocalityFileProvider.appex"
+  done < <(clean_start_target_app_paths "${extra_app_path}")
+  while IFS= read -r plugin_path; do
+    [[ -n "${plugin_path}" ]] || continue
+    append_unique plugin_paths "${plugin_path}"
+  done < <(clean_start_registered_plugin_paths)
+  printf '%s\n' "${plugin_paths[@]}"
 }
 
 clean_start_mount_root_candidates() {
