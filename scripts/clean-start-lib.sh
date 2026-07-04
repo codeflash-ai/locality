@@ -84,7 +84,7 @@ clean_start_mount_root_candidates() {
   )
   local cloud_root
   for cloud_root in "${HOME}/Library/CloudStorage"/Locality-*; do
-    [[ -e "${cloud_root}" ]] || continue
+    [[ -e "${cloud_root}" || -L "${cloud_root}" ]] || continue
     append_unique roots "${cloud_root}"
   done
   printf '%s\n' "${roots[@]}"

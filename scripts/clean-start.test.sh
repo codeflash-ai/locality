@@ -97,6 +97,15 @@ test_mount_root_candidates_include_existing_cloudstorage_aliases() {
   assert_contains_line "${actual}" "${tmp_home}/Library/CloudStorage/Locality-notion-main"
 }
 
+test_mount_root_candidates_include_broken_cloudstorage_alias_symlinks() {
+  local tmp_home actual
+  tmp_home="$(mktemp -d)"
+  mkdir -p "${tmp_home}/Library/CloudStorage"
+  ln -s "${tmp_home}/missing" "${tmp_home}/Library/CloudStorage/Locality-Locality"
+  actual="$(HOME="${tmp_home}" clean_start_mount_root_candidates)"
+  assert_contains_line "${actual}" "${tmp_home}/Library/CloudStorage/Locality-Locality"
+}
+
 main() {
   test_target_app_paths_include_system_and_user_bundles
   test_target_app_paths_append_extra_bundle_without_replacing_defaults
@@ -105,6 +114,7 @@ main() {
   test_registered_plugin_paths_from_match_output_extracts_unique_appex_paths
   test_support_paths_include_locality_file_provider_persistence
   test_mount_root_candidates_include_existing_cloudstorage_aliases
+  test_mount_root_candidates_include_broken_cloudstorage_alias_symlinks
   printf 'clean-start helper tests passed\n'
 }
 
