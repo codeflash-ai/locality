@@ -87,7 +87,8 @@ fast-forwarded.
 
 When a Remote Tree observation confirms that a materialized Notion page was
 deleted remotely, Locality treats the local projection as removable only if the
-file is clean. Clean materialized plain-file pages are removed from the Local
+file is clean. Clean materialized plain-file pages and clean File Provider
+content-cache pages with matching visible replicas are removed from the Local
 Tree and Synced Tree automatically; pages with pending local edits or an
 unsupported/ambiguous projection stay visible for review.
 

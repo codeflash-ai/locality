@@ -33,6 +33,7 @@ use localityd::file_provider as daemon_file_provider;
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::hydration::write_parent_database_schema_cache;
 use localityd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
+use localityd::runtime::repair_clean_remote_deleted_projections;
 use localityd::virtual_fs::{
     VirtualFsChildrenReport, mount_point_identifier, virtual_fs_ancestor_container_identifiers,
     virtual_fs_content_root, virtual_projection_root,
@@ -2354,6 +2355,7 @@ fn status(args: &[String], json: bool) -> i32 {
     if let Some(target) = options.path.as_deref() {
         reconcile_projection_changes_best_effort("status", &mut store, &state_root, Some(target));
     }
+    let _ = repair_clean_remote_deleted_projections(&mut store, Some(&state_root), None);
 
     match run_status(&store, options) {
         Ok(report) if json => {
