@@ -52,6 +52,16 @@ test_target_helper_paths_follow_all_target_bundles() {
   assert_contains_line "${actual}" "${extra_app}/Contents/MacOS/locality-file-providerctl"
 }
 
+test_target_helper_paths_prefer_deduplicated_targets() {
+  local tmp_home actual
+  tmp_home="$(mktemp -d)"
+  actual="$(HOME="${tmp_home}" clean_start_target_helper_paths "${tmp_home}/Applications/Locality.app")"
+  assert_lines_equal \
+    "${actual}" \
+    "/Applications/Locality.app/Contents/MacOS/locality-file-providerctl
+${tmp_home}/Applications/Locality.app/Contents/MacOS/locality-file-providerctl"
+}
+
 test_support_paths_include_locality_file_provider_persistence() {
   local tmp_home actual
   tmp_home="$(mktemp -d)"
@@ -76,6 +86,7 @@ main() {
   test_target_app_paths_include_system_and_user_bundles
   test_target_app_paths_append_extra_bundle_without_replacing_defaults
   test_target_helper_paths_follow_all_target_bundles
+  test_target_helper_paths_prefer_deduplicated_targets
   test_support_paths_include_locality_file_provider_persistence
   test_mount_root_candidates_include_existing_cloudstorage_aliases
   printf 'clean-start helper tests passed\n'

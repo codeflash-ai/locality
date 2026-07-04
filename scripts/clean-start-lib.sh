@@ -29,11 +29,13 @@ clean_start_target_app_paths() {
 
 clean_start_target_helper_paths() {
   local extra_app_path="${1:-}"
+  local helper_paths=()
   local app_path
   while IFS= read -r app_path; do
     [[ -n "${app_path}" ]] || continue
-    printf '%s\n' "${app_path}/Contents/MacOS/locality-file-providerctl"
+    append_unique helper_paths "${app_path}/Contents/MacOS/locality-file-providerctl"
   done < <(clean_start_target_app_paths "${extra_app_path}")
+  printf '%s\n' "${helper_paths[@]}"
 }
 
 clean_start_mount_root_candidates() {
