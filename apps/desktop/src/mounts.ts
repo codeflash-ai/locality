@@ -130,6 +130,10 @@ export function mountStatusTone(mount: MountSummary): "ready" | "warn" | "danger
   return "ready";
 }
 
+export function mountEntityCountLabel(mount: MountSummary): string {
+  return `${mount.entityCount} ${mount.entityCount === 1 ? "item" : "items"}`;
+}
+
 export function compactPath(path: string, maxLength = 64): string {
   const trimmed = path.trim();
   if (trimmed.length <= maxLength) {
@@ -213,7 +217,7 @@ function mountPathName(path: string): string {
 }
 
 function mountContentLabel(mount: MountSummary): string {
-  const itemLabel = `${mount.entityCount} ${mount.entityCount === 1 ? "item" : "items"}`;
+  const itemLabel = mountEntityCountLabel(mount);
   if (mount.pendingChangeCount === 0) {
     return itemLabel;
   }

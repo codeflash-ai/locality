@@ -436,7 +436,7 @@ impl HttpNotionApi {
             if status == StatusCode::NOT_FOUND {
                 return Err(LocalityError::RemoteNotFound(body));
             }
-            if is_notion_rate_limited(status) && attempt < notion_rate_limit_retries() {
+            if is_retryable_notion_http_status(status) && attempt < notion_rate_limit_retries() {
                 record_notion_rate_limit(attempt, retry_after);
                 continue;
             }
@@ -531,7 +531,7 @@ impl HttpNotionApi {
             let body = response
                 .text()
                 .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
-            if is_notion_rate_limited(status) && attempt < notion_rate_limit_retries() {
+            if is_retryable_notion_http_status(status) && attempt < notion_rate_limit_retries() {
                 record_notion_rate_limit(attempt, retry_after);
                 continue;
             }
@@ -737,6 +737,18 @@ fn retry_after_header(headers: &HeaderMap) -> Option<Duration> {
 
 fn is_notion_rate_limited(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529
+}
+
+fn is_retryable_notion_http_status(status: StatusCode) -> bool {
+    is_notion_rate_limited(status)
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT
+                | StatusCode::INTERNAL_SERVER_ERROR
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        )
 }
 
 fn rate_limit_backoff(attempt: usize) -> Duration {
@@ -1009,6 +1021,71 @@ mod tests {
             result.expect("retry timeout request").get("ok"),
             Some(&Value::Bool(true))
         );
+    }
+
+    #[test]
+    fn send_request_retries_service_unavailable_before_returning_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        let url = format!("http://{}/transient", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let mut accepted = 0;
+            while !server_stop.load(Ordering::Relaxed) || accepted == 0 {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        accepted += 1;
+                        read_http_request_headers(&mut stream);
+                        if accepted == 1 {
+                            let _ = write_service_unavailable_response(&mut stream);
+                            continue;
+                        }
+
+                        let _ = write_ok_response(&mut stream);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept local request: {error}"),
+                }
+            }
+            accepted
+        });
+
+        let api = HttpNotionApi {
+            config: crate::NotionConfig::default(),
+            client: notion_http_client_builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+                .expect("build timeout client"),
+        };
+        let mut attempts = 0;
+        let result = api.send_request_with_retry::<Value>("GET", "/test", || {
+            attempts += 1;
+            api.client.get(&url)
+        });
+
+        stop.store(true, Ordering::Relaxed);
+        let accepted = server.join().expect("join local server");
+        assert_eq!(accepted, 2);
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            result.expect("retry 503 request").get("ok"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    fn write_service_unavailable_response(stream: &mut TcpStream) -> std::io::Result<()> {
+        let body = br#"{"object":"error","status":503,"code":"service_unavailable"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )?;
+        stream.write_all(body)
     }
 
     fn write_ok_response(stream: &mut TcpStream) -> std::io::Result<()> {

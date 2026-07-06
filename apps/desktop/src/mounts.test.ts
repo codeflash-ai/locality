@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   compactPath,
+  mountEntityCountLabel,
   mountAccessLabel,
   mountRows,
   mountStatusLabel,
@@ -86,6 +87,11 @@ describe("mount display helpers", () => {
       content: "4 items",
       active: false,
     });
+  });
+
+  it("labels indexed mount entities as items, not physical files", () => {
+    expect(mountEntityCountLabel(mount({ entityCount: 1 }))).toBe("1 item");
+    expect(mountEntityCountLabel(mount({ entityCount: 260 }))).toBe("260 items");
   });
 
   it("compacts long paths from the middle so filenames remain visible", () => {
