@@ -314,6 +314,12 @@ pub struct HttpNotionApi {
     client: Client,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotionRetryClass {
+    ReadSafe,
+    Mutation,
+}
+
 impl HttpNotionApi {
     pub fn new(config: NotionConfig) -> Self {
         let client = notion_http_client_builder()
@@ -338,7 +344,7 @@ impl HttpNotionApi {
             .map(|(key, value)| ((*key).to_string(), value.clone()))
             .collect::<Vec<_>>();
 
-        self.send_request_with_retry("GET", path, || {
+        self.send_request_with_retry("GET", path, NotionRetryClass::ReadSafe, || {
             let mut request = self
                 .client
                 .get(&url)
@@ -357,6 +363,18 @@ impl HttpNotionApi {
         T: DeserializeOwned,
     {
         self.send_json(reqwest::Method::POST, path, Some(body))
+    }
+
+    fn post_read_json<T>(&self, path: &str, body: impl Serialize) -> LocalityResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.send_json_with_retry_class(
+            reqwest::Method::POST,
+            path,
+            Some(body),
+            NotionRetryClass::ReadSafe,
+        )
     }
 
     fn patch_json<T>(&self, path: &str, body: impl Serialize) -> LocalityResult<T>
@@ -436,7 +454,9 @@ impl HttpNotionApi {
             if status == StatusCode::NOT_FOUND {
                 return Err(LocalityError::RemoteNotFound(body));
             }
-            if is_retryable_notion_http_status(status) && attempt < notion_rate_limit_retries() {
+            if is_retryable_notion_http_status(status, NotionRetryClass::Mutation)
+                && attempt < notion_rate_limit_retries()
+            {
                 record_notion_rate_limit(attempt, retry_after);
                 continue;
             }
@@ -460,6 +480,20 @@ impl HttpNotionApi {
         T: DeserializeOwned,
         B: Serialize,
     {
+        self.send_json_with_retry_class(method, path, body, NotionRetryClass::Mutation)
+    }
+
+    fn send_json_with_retry_class<T, B>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<B>,
+        retry_class: NotionRetryClass,
+    ) -> LocalityResult<T>
+    where
+        T: DeserializeOwned,
+        B: Serialize,
+    {
         let token = self.token()?;
         let body = body
             .map(serde_json::to_value)
@@ -471,7 +505,7 @@ impl HttpNotionApi {
             path.trim_start_matches('/')
         );
 
-        self.send_request_with_retry(method.as_str(), path, || {
+        self.send_request_with_retry(method.as_str(), path, retry_class, || {
             let mut request = self
                 .client
                 .request(method.clone(), &url)
@@ -488,6 +522,7 @@ impl HttpNotionApi {
         &self,
         method: &str,
         path: &str,
+        retry_class: NotionRetryClass,
         mut build_request: impl FnMut() -> reqwest::blocking::RequestBuilder,
     ) -> LocalityResult<T>
     where
@@ -531,7 +566,9 @@ impl HttpNotionApi {
             let body = response
                 .text()
                 .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
-            if is_retryable_notion_http_status(status) && attempt < notion_rate_limit_retries() {
+            if is_retryable_notion_http_status(status, retry_class)
+                && attempt < notion_rate_limit_retries()
+            {
                 record_notion_rate_limit(attempt, retry_after);
                 continue;
             }
@@ -739,16 +776,17 @@ fn is_notion_rate_limited(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529
 }
 
-fn is_retryable_notion_http_status(status: StatusCode) -> bool {
+fn is_retryable_notion_http_status(status: StatusCode, retry_class: NotionRetryClass) -> bool {
     is_notion_rate_limited(status)
-        || matches!(
-            status,
-            StatusCode::REQUEST_TIMEOUT
-                | StatusCode::INTERNAL_SERVER_ERROR
-                | StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-        )
+        || (retry_class == NotionRetryClass::ReadSafe
+            && matches!(
+                status,
+                StatusCode::REQUEST_TIMEOUT
+                    | StatusCode::INTERNAL_SERVER_ERROR
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            ))
 }
 
 fn rate_limit_backoff(attempt: usize) -> Duration {
@@ -790,7 +828,7 @@ impl NotionApi for HttpNotionApi {
             body["start_cursor"] = json!(start_cursor);
         }
 
-        self.post_json(&format!("/v1/data_sources/{data_source_id}/query"), body)
+        self.post_read_json(&format!("/v1/data_sources/{data_source_id}/query"), body)
     }
 
     fn retrieve_block_children(
@@ -823,12 +861,12 @@ impl NotionApi for HttpNotionApi {
             body["start_cursor"] = json!(start_cursor);
         }
 
-        self.post_json("/v1/search", body)
+        self.post_read_json("/v1/search", body)
     }
 
     fn search_databases(&self, start_cursor: Option<&str>) -> LocalityResult<DatabaseListDto> {
         let data_sources: DataSourceListDto =
-            self.post_json("/v1/search", data_source_search_body(start_cursor))?;
+            self.post_read_json("/v1/search", data_source_search_body(start_cursor))?;
         let mut seen = BTreeSet::new();
         let mut databases = Vec::new();
         for data_source in data_sources.results {
@@ -924,8 +962,8 @@ fn data_source_search_body(start_cursor: Option<&str>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpNotionApi, data_source_search_body, notion_http_client_builder, rate_limit_backoff,
-        retry_after_header,
+        HttpNotionApi, NotionRetryClass, data_source_search_body, notion_http_client_builder,
+        rate_limit_backoff, retry_after_header,
     };
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use serde_json::Value;
@@ -1002,10 +1040,15 @@ mod tests {
                 .expect("build timeout client"),
         };
         let mut attempts = 0;
-        let result = api.send_request_with_retry::<Value>("GET", "/test", || {
-            attempts += 1;
-            api.client.get(&url)
-        });
+        let result = api.send_request_with_retry::<Value>(
+            "GET",
+            "/test",
+            NotionRetryClass::ReadSafe,
+            || {
+                attempts += 1;
+                api.client.get(&url)
+            },
+        );
 
         stop.store(true, Ordering::Relaxed);
         let accepted = server.join().expect("join local server");
@@ -1063,10 +1106,15 @@ mod tests {
                 .expect("build timeout client"),
         };
         let mut attempts = 0;
-        let result = api.send_request_with_retry::<Value>("GET", "/test", || {
-            attempts += 1;
-            api.client.get(&url)
-        });
+        let result = api.send_request_with_retry::<Value>(
+            "GET",
+            "/test",
+            NotionRetryClass::ReadSafe,
+            || {
+                attempts += 1;
+                api.client.get(&url)
+            },
+        );
 
         stop.store(true, Ordering::Relaxed);
         let accepted = server.join().expect("join local server");
@@ -1076,6 +1124,69 @@ mod tests {
             result.expect("retry 503 request").get("ok"),
             Some(&Value::Bool(true))
         );
+    }
+
+    #[test]
+    fn send_request_does_not_retry_service_unavailable_for_mutation_methods() {
+        for method in ["POST", "PATCH"] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+            listener
+                .set_nonblocking(true)
+                .expect("set listener nonblocking");
+            let url = format!("http://{}/transient", listener.local_addr().unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let server = thread::spawn(move || {
+                let mut accepted = 0;
+                while !server_stop.load(Ordering::Relaxed) || accepted == 0 {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            accepted += 1;
+                            read_http_request_headers(&mut stream);
+                            let _ = write_service_unavailable_response(&mut stream);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept local request: {error}"),
+                    }
+                }
+                accepted
+            });
+
+            let api = HttpNotionApi {
+                config: crate::NotionConfig::default(),
+                client: notion_http_client_builder()
+                    .timeout(Duration::from_millis(500))
+                    .build()
+                    .expect("build timeout client"),
+            };
+            let mut attempts = 0;
+            let result = api.send_request_with_retry::<Value>(
+                method,
+                "/test",
+                NotionRetryClass::Mutation,
+                || {
+                    attempts += 1;
+                    api.client.request(
+                        reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                        &url,
+                    )
+                },
+            );
+
+            stop.store(true, Ordering::Relaxed);
+            let accepted = server.join().expect("join local server");
+            assert_eq!(accepted, 1, "{method} should not retry HTTP 503");
+            assert_eq!(attempts, 1, "{method} should only be built once");
+            assert!(
+                result
+                    .expect_err("mutation 503 should be returned without retry")
+                    .to_string()
+                    .contains("notion api returned HTTP 503"),
+                "{method} should surface the original HTTP 503"
+            );
+        }
     }
 
     fn write_service_unavailable_response(stream: &mut TcpStream) -> std::io::Result<()> {
