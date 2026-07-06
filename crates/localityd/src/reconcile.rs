@@ -4,7 +4,8 @@
 //! a strategy decides what to fetch for a mount, and this module executes that
 //! decision by enumerating, refreshing local projections, and queueing hydration.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
@@ -23,6 +24,11 @@ use locality_store::{
 use crate::hydration::HydrationEngine;
 use crate::scheduler::PullSchedulerTick;
 use crate::virtual_fs::virtual_fs_content_root;
+
+const NOTION_CONNECTOR: &str = "notion";
+const NOTION_PRIVATE_ROOT: &str = "Private";
+const NOTION_WORKSPACE_ROOT: &str = "Workspace";
+const UPGRADE_STAGE_PREFIX: &str = ".loc-upgrade-stage";
 
 pub trait ScheduledPullSource {
     fn enumerate_mount(&self, mount: &MountConfig) -> LocalityResult<Vec<TreeEntry>>;
@@ -178,8 +184,39 @@ where
         report.mounts_polled += 1;
         report.enumerated += entries.len();
 
-        for entry in &entries {
-            let existing = store.get_entity(&entry.mount_id, &entry.remote_id)?;
+        let existing_entities = entries
+            .iter()
+            .map(|entry| {
+                store
+                    .get_entity(&entry.mount_id, &entry.remote_id)
+                    .map_err(LocalityError::from)
+            })
+            .collect::<LocalityResult<Vec<_>>>()?;
+        let reserved_root_projection_moves =
+            plan_reserved_notion_root_projection_moves(mount, &entries, &existing_entities)?;
+        let mut reserved_root_projection_moves_applied = reserved_root_projection_moves.is_empty();
+
+        for (entry, existing) in entries.iter().zip(existing_entities.iter()) {
+            if !reserved_root_projection_moves_applied
+                && reserved_root_projection_move_affects_record(
+                    entry,
+                    existing.as_ref(),
+                    &reserved_root_projection_moves,
+                )
+            {
+                apply_reserved_notion_root_projection_moves(
+                    mount,
+                    &reserved_root_projection_moves,
+                )?;
+                save_reserved_notion_root_projection_move_records(
+                    store,
+                    &entries,
+                    &existing_entities,
+                    &reserved_root_projection_moves,
+                )?;
+                reserved_root_projection_moves_applied = true;
+            }
+
             let observed_at = observation_timestamp();
             record_remote_observation(store, entry, existing.as_ref(), &observed_at)?;
             let entity_plan = strategy.entity_plan(EntityFetchSchedule {
@@ -192,7 +229,6 @@ where
             });
 
             let record = merged_entity_record(entry, existing.as_ref());
-            store.save_entity(record)?;
             rename_projection_if_needed(mount, existing.as_ref(), entry)?;
 
             match refresh_projection(source, mount, entry, state_root)? {
@@ -200,6 +236,7 @@ where
                 ProjectionWrite::Schema => report.schemas_written += 1,
                 ProjectionWrite::None => {}
             }
+            store.save_entity(record)?;
 
             if let Some(reason) = entity_plan.queue_hydration {
                 hydration.queue(HydrationRequest::new(
@@ -385,6 +422,376 @@ fn rename_projection_if_needed(
     Ok(())
 }
 
+fn plan_reserved_notion_root_projection_moves(
+    mount: &MountConfig,
+    entries: &[TreeEntry],
+    existing_entities: &[Option<EntityRecord>],
+) -> LocalityResult<Vec<ReservedRootProjectionMove>> {
+    if mount.projection.uses_virtual_filesystem() || !is_notion_workspace_mount(mount) {
+        return Ok(Vec::new());
+    }
+
+    let mut reserved_stage_paths = BTreeSet::new();
+    let mut reserved_source_paths = BTreeSet::new();
+    let mut reserved_destination_paths = BTreeSet::new();
+    let mut moves = Vec::new();
+    for (entry, existing) in entries.iter().zip(existing_entities.iter()) {
+        if entry.kind != EntityKind::Page {
+            continue;
+        }
+        let Some(existing) = existing else {
+            continue;
+        };
+
+        let Some(steps) = reserved_notion_root_page_move_steps(
+            &existing.path,
+            &entry.path,
+            PathCaseComparison::CaseInsensitive,
+        ) else {
+            continue;
+        };
+        if !mount.root.join(&steps[0].0).join("page.md").exists() {
+            continue;
+        }
+        if mount.root.join(&steps[1].1).exists() {
+            return Err(LocalityError::Io(format!(
+                "reserved Notion root projection destination `{}` already exists while moving `{}`",
+                mount.root.join(&steps[1].1).display(),
+                mount.root.join(&steps[0].0).display()
+            )));
+        }
+
+        let stage_path =
+            unique_upgrade_stage_path(&mount.root, &steps[0].1, &mut reserved_stage_paths)?;
+        let source = steps[0].0.clone();
+        let destination = steps[1].1.clone();
+        if !reserved_source_paths.insert(source.clone())
+            || !reserved_destination_paths.insert(destination.clone())
+        {
+            continue;
+        }
+        moves.push(ReservedRootProjectionMove {
+            remote_id: entry.remote_id.clone(),
+            source,
+            stage: stage_path,
+            destination,
+        });
+    }
+
+    Ok(moves)
+}
+
+fn apply_reserved_notion_root_projection_moves(
+    mount: &MountConfig,
+    moves: &[ReservedRootProjectionMove],
+) -> LocalityResult<()> {
+    for planned_move in moves {
+        if mount.root.join(&planned_move.destination).exists() {
+            return Err(LocalityError::Io(format!(
+                "reserved Notion root projection destination `{}` already exists while moving `{}`",
+                mount.root.join(&planned_move.destination).display(),
+                mount.root.join(&planned_move.source).display()
+            )));
+        }
+    }
+
+    for (index, planned_move) in moves.iter().enumerate() {
+        if let Err(error) = rename_projected_path(
+            &mount.root.join(&planned_move.source),
+            &mount.root.join(&planned_move.stage),
+        ) {
+            rollback_staged_reserved_root_projection_moves(&mount.root, &moves[..index]);
+            return Err(error);
+        }
+    }
+
+    for (index, planned_move) in moves.iter().enumerate() {
+        if let Err(error) = rename_projected_path(
+            &mount.root.join(&planned_move.stage),
+            &mount.root.join(&planned_move.destination),
+        ) {
+            rollback_reserved_root_projection_final_failure(&mount.root, &moves, index);
+            return Err(error);
+        }
+    }
+
+    ensure_reserved_notion_root_directories_after_projection_moves(mount, moves)?;
+
+    Ok(())
+}
+
+fn ensure_reserved_notion_root_directories_after_projection_moves(
+    mount: &MountConfig,
+    moves: &[ReservedRootProjectionMove],
+) -> LocalityResult<()> {
+    if moves.is_empty()
+        || mount.projection.uses_virtual_filesystem()
+        || !is_notion_workspace_mount(mount)
+    {
+        return Ok(());
+    }
+
+    for root_name in [NOTION_PRIVATE_ROOT, NOTION_WORKSPACE_ROOT] {
+        create_dir_all(&mount.root.join(root_name))?;
+    }
+
+    Ok(())
+}
+
+fn save_reserved_notion_root_projection_move_records<S>(
+    store: &mut S,
+    entries: &[TreeEntry],
+    existing_entities: &[Option<EntityRecord>],
+    moves: &[ReservedRootProjectionMove],
+) -> LocalityResult<()>
+where
+    S: EntityRepository,
+{
+    for (entry, existing) in entries.iter().zip(existing_entities.iter()) {
+        if reserved_root_projection_move_affects_record(entry, existing.as_ref(), moves) {
+            store.save_entity(merged_entity_record(entry, existing.as_ref()))?;
+        }
+    }
+    Ok(())
+}
+
+fn reserved_root_projection_move_affects_record(
+    entry: &TreeEntry,
+    existing: Option<&EntityRecord>,
+    moves: &[ReservedRootProjectionMove],
+) -> bool {
+    if moves
+        .iter()
+        .any(|planned_move| planned_move.remote_id == entry.remote_id)
+    {
+        return true;
+    }
+
+    let Some(existing) = existing else {
+        return false;
+    };
+
+    moves.iter().any(|planned_move| {
+        path_is_within_subtree(
+            &existing.path,
+            &planned_move.source,
+            PathCaseComparison::CaseInsensitive,
+        ) && path_is_within_subtree(
+            &entry.path,
+            &planned_move.destination,
+            PathCaseComparison::CaseInsensitive,
+        )
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReservedRootProjectionMove {
+    remote_id: RemoteId,
+    source: PathBuf,
+    stage: PathBuf,
+    destination: PathBuf,
+}
+
+fn rollback_staged_reserved_root_projection_moves(
+    root: &Path,
+    moves: &[ReservedRootProjectionMove],
+) {
+    for planned_move in moves.iter().rev() {
+        rollback_projected_path(root, &planned_move.stage, &planned_move.source);
+    }
+}
+
+fn rollback_reserved_root_projection_final_failure(
+    root: &Path,
+    moves: &[ReservedRootProjectionMove],
+    failed_final_index: usize,
+) {
+    for planned_move in moves[..failed_final_index].iter().rev() {
+        rollback_projected_path(root, &planned_move.destination, &planned_move.source);
+    }
+    rollback_staged_reserved_root_projection_moves(root, &moves[failed_final_index..]);
+}
+
+fn rollback_projected_path(root: &Path, from: &Path, to: &Path) {
+    let from = root.join(from);
+    let to = root.join(to);
+    if std::fs::rename(&from, &to).is_err() && to.is_dir() {
+        let _ = std::fs::remove_dir(&to);
+        let _ = std::fs::rename(from, to);
+    }
+}
+
+fn is_notion_workspace_mount(mount: &MountConfig) -> bool {
+    mount.connector == NOTION_CONNECTOR && mount.remote_root_id.is_none()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathCaseComparison {
+    CaseInsensitive,
+}
+
+fn reserved_notion_root_page_move_steps(
+    existing_path: &Path,
+    entry_path: &Path,
+    comparison: PathCaseComparison,
+) -> Option<Vec<(PathBuf, PathBuf)>> {
+    if !is_page_document_path(existing_path) || !is_page_document_path(entry_path) {
+        return None;
+    }
+
+    let existing_container = page_container_path(existing_path);
+    let entry_container = page_container_path(entry_path);
+    if let Some(existing_root) =
+        reserved_root_component(&existing_container, comparison).map(str::to_owned)
+        && is_workspace_child_container(&entry_container, comparison)
+    {
+        return Some(reserved_notion_root_page_move_steps_from_containers(
+            existing_container,
+            &existing_root,
+            entry_container,
+        ));
+    }
+
+    if existing_path == entry_path {
+        let existing_root =
+            workspace_reserved_child_component(&entry_container, comparison)?.to_owned();
+        return Some(reserved_notion_root_page_move_steps_from_containers(
+            PathBuf::from(&existing_root),
+            &existing_root,
+            entry_container,
+        ));
+    }
+
+    None
+}
+
+fn reserved_notion_root_page_move_steps_from_containers(
+    existing_container: PathBuf,
+    existing_root: &str,
+    entry_container: PathBuf,
+) -> Vec<(PathBuf, PathBuf)> {
+    let stage_path = PathBuf::from(format!(
+        "{UPGRADE_STAGE_PREFIX}-{}",
+        existing_root.to_ascii_lowercase()
+    ));
+    vec![
+        (existing_container, stage_path.clone()),
+        (stage_path, entry_container.to_path_buf()),
+    ]
+}
+
+fn reserved_root_component(path: &Path, comparison: PathCaseComparison) -> Option<&str> {
+    let component = single_normal_component(path)?;
+    if component_eq(component, NOTION_PRIVATE_ROOT, comparison)
+        || component_eq(component, NOTION_WORKSPACE_ROOT, comparison)
+    {
+        return Some(component);
+    }
+    None
+}
+
+fn is_workspace_child_container(path: &Path, comparison: PathCaseComparison) -> bool {
+    workspace_child_component(path, comparison).is_some()
+}
+
+fn workspace_reserved_child_component(path: &Path, comparison: PathCaseComparison) -> Option<&str> {
+    let child = workspace_child_component(path, comparison)?;
+    if component_eq(child, NOTION_PRIVATE_ROOT, comparison)
+        || component_eq(child, NOTION_WORKSPACE_ROOT, comparison)
+    {
+        return Some(child);
+    }
+    None
+}
+
+fn workspace_child_component(path: &Path, comparison: PathCaseComparison) -> Option<&str> {
+    let mut components = path.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return None;
+    };
+    let Some(first) = first.to_str() else {
+        return None;
+    };
+    if !component_eq(first, NOTION_WORKSPACE_ROOT, comparison) {
+        return None;
+    }
+    let Some(Component::Normal(child)) = components.next() else {
+        return None;
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    child.to_str()
+}
+
+fn single_normal_component(path: &Path) -> Option<&str> {
+    let mut components = path.components();
+    let Some(Component::Normal(component)) = components.next() else {
+        return None;
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    component.to_str()
+}
+
+fn component_eq(left: &str, right: &str, comparison: PathCaseComparison) -> bool {
+    match comparison {
+        PathCaseComparison::CaseInsensitive => left.eq_ignore_ascii_case(right),
+    }
+}
+
+fn path_is_within_subtree(path: &Path, subtree: &Path, comparison: PathCaseComparison) -> bool {
+    let mut path_components = path.components();
+    for subtree_component in subtree.components() {
+        let Some(path_component) = path_components.next() else {
+            return false;
+        };
+        if !path_component_eq(path_component, subtree_component, comparison) {
+            return false;
+        }
+    }
+    true
+}
+
+fn path_component_eq(
+    left: Component<'_>,
+    right: Component<'_>,
+    comparison: PathCaseComparison,
+) -> bool {
+    match (left, right) {
+        (Component::Normal(left), Component::Normal(right)) => {
+            let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
+                return left == right;
+            };
+            component_eq(left, right, comparison)
+        }
+        (left, right) => left == right,
+    }
+}
+
+fn unique_upgrade_stage_path(
+    root: &Path,
+    base: &Path,
+    reserved: &mut BTreeSet<PathBuf>,
+) -> LocalityResult<PathBuf> {
+    if !root.join(base).exists() && reserved.insert(base.to_path_buf()) {
+        return Ok(base.to_path_buf());
+    }
+
+    for index in 1..1000 {
+        let candidate = PathBuf::from(format!("{}-{index}", base.display()));
+        if !root.join(&candidate).exists() && reserved.insert(candidate.clone()) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(LocalityError::Io(format!(
+        "failed to choose a temporary projection upgrade path for `{}`",
+        base.display()
+    )))
+}
+
 fn rename_page_projection_if_needed(
     mount: &MountConfig,
     existing_path: &Path,
@@ -562,4 +969,49 @@ fn rename_projected_path(from: &Path, to: &Path) -> LocalityResult<()> {
 fn read_to_string(path: &Path) -> LocalityResult<String> {
     std::fs::read_to_string(path)
         .map_err(|error| LocalityError::Io(format!("failed to read `{}`: {error}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use locality_core::model::{MountId, RemoteId};
+    use locality_store::MountConfig;
+
+    #[test]
+    fn reserved_root_move_recreates_synthetic_root_directories_after_batch() {
+        let root = temp_root("reconcile-reserved-root-synthetic-roots");
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(mount_id, "notion", root.clone());
+        std::fs::create_dir_all(root.join("private")).expect("old container");
+        std::fs::write(root.join("private/page.md"), "local body").expect("old page");
+        let moves = vec![super::ReservedRootProjectionMove {
+            remote_id: RemoteId::new("page-1"),
+            source: PathBuf::from("private"),
+            stage: PathBuf::from(".loc-upgrade-stage-private"),
+            destination: PathBuf::from("Workspace/private"),
+        }];
+
+        super::apply_reserved_notion_root_projection_moves(&mount, &moves).expect("apply moves");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("Workspace/private/page.md")).expect("moved page"),
+            "local body"
+        );
+        assert!(root.join("Private").is_dir());
+        assert!(root.join("Workspace").is_dir());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("loc-{label}-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp root");
+        root
+    }
 }

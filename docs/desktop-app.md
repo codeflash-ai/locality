@@ -116,8 +116,9 @@ launchd, and helper logs separately.
 ### 4. Create Workspace Mount
 
 The desktop product target is a workspace-level Notion mount using the access
-granted during OAuth. The current CLI is root-page-oriented, so this requires a
-desktop-facing setup API or CLI extension before the polished app ships.
+granted during OAuth. The CLI and backend can express this with `--workspace`
+and root-less Notion mount creation; the remaining desktop work is polished
+setup orchestration around that existing path.
 
 Target orchestration:
 
@@ -447,7 +448,8 @@ or daemon IPC client.
 ### Stage 1: Product Contract
 
 - Define the desktop-facing command/API contract.
-- Add workspace-level Notion mount support if the CLI cannot already express it.
+- Keep the desktop command/API contract aligned with the existing workspace
+  Notion mount path.
 - Add `locate notion <url>` for the post-onboarding URL workflow.
 - Make locate prioritize the requested page or database during initial
   workspace preparation.
