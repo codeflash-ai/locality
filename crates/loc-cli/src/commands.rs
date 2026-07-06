@@ -25,8 +25,9 @@ use locality_notion::oauth::{
 };
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileRepository,
-    EntityRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
-    SqliteStateStore, open_credential_store,
+    EntityRepository, FreshnessStateRepository, JournalRepository, MountConfig, MountRepository,
+    ProjectionMode, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    VirtualMutationRepository, open_credential_store,
 };
 use localityd::execution::PushJobReport;
 use localityd::file_provider as daemon_file_provider;
@@ -77,7 +78,10 @@ use crate::push::{
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
 use crate::search::{SearchError, SearchOptions, SearchReport, notion_id_from_url, run_search};
-use crate::status::{StatusError, StatusOptions, StatusReport, StatusSyncState, run_status};
+use crate::status::{
+    StatusError, StatusOptions, StatusReport, StatusSyncState, run_status,
+    scoped_mount_ids_for_status_target,
+};
 use crate::templates::{
     TemplateApplyOptions, TemplateApplyReport, TemplateListReport, TemplateNewOptions,
     TemplateNewReport, TemplatePackError, TemplateValidateReport, run_template_apply,
@@ -2390,7 +2394,12 @@ fn status(args: &[String], json: bool) -> i32 {
     if let Some(target) = options.path.as_deref() {
         reconcile_projection_changes_best_effort("status", &mut store, &state_root, Some(target));
     }
-    let _ = repair_clean_remote_deleted_projections(&mut store, Some(&state_root), None);
+    repair_clean_remote_deleted_projections_best_effort(
+        "status",
+        &mut store,
+        Some(&state_root),
+        options.path.as_deref(),
+    );
 
     match run_status(&store, options) {
         Ok(report) if json => {
@@ -6251,6 +6260,40 @@ fn reconcile_projection_changes_best_effort(
     }
 }
 
+fn repair_clean_remote_deleted_projections_best_effort<S>(
+    command: &'static str,
+    store: &mut S,
+    state_root: Option<&Path>,
+    target: Option<&Path>,
+) where
+    S: MountRepository
+        + EntityRepository
+        + FreshnessStateRepository
+        + RemoteObservationRepository
+        + ShadowRepository
+        + VirtualMutationRepository,
+{
+    let scoped_mount_ids = match scoped_mount_ids_for_status_target(store, None, target) {
+        Ok(scoped_mount_ids) => scoped_mount_ids,
+        Err(error) => {
+            eprintln!(
+                "loc {command}: skipped clean remote-delete repair: {}",
+                error.message()
+            );
+            return;
+        }
+    };
+
+    for mount_id in scoped_mount_ids {
+        if let Err(error) =
+            repair_clean_remote_deleted_projections(store, state_root, Some(&mount_id))
+        {
+            eprintln!("loc {command}: skipped clean remote-delete repair: {error}");
+            break;
+        }
+    }
+}
+
 fn escape_json_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -6304,24 +6347,22 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "windows")]
     use std::fs;
     use std::io::Cursor;
-    use std::path::Path;
-    #[cfg(target_os = "windows")]
-    use std::path::PathBuf;
-    #[cfg(target_os = "windows")]
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    use locality_core::model::{MountId, RemoteId};
+    use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+    use locality_core::shadow::ShadowDocument;
     use locality_google_docs::GOOGLE_DOCS_CONNECTOR_ID;
-    #[cfg(target_os = "windows")]
-    use locality_store::SqliteStateStore;
     use locality_store::{
-        ConnectionId, InMemoryStateStore, MountConfig, MountRepository, ProjectionMode,
+        ConnectionId, EntityRecord, EntityRepository, InMemoryStateStore, MountConfig,
+        MountRepository, ProjectionMode, RemoteObservationRecord, RemoteObservationRepository,
+        ShadowRepository, SqliteStateStore,
     };
 
     use crate::diff::{DiffReport, GuardrailOutput};
@@ -6343,7 +6384,8 @@ mod tests {
         projection_mode_for_target, projection_usage_options_for_target,
         prompt_for_push_confirmation, pull_direct_fallback_error,
         should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        spinner_config_for_command, spinner_enabled, validate_virtual_projection_registration,
+        spinner_config_for_command, spinner_enabled, status as run_status_command,
+        validate_virtual_projection_registration,
     };
 
     #[test]
@@ -7395,6 +7437,79 @@ mod tests {
     }
 
     #[test]
+    fn status_target_path_repairs_remote_deletes_only_inside_the_inspected_mount() {
+        let _lock = state_root_env_lock().lock().expect("state root env lock");
+        let state_root = unique_temp_path("loc-status-state-root");
+        let target_root = unique_temp_path("loc-status-target-root");
+        let other_root = unique_temp_path("loc-status-other-root");
+        fs::create_dir_all(&target_root).expect("target root");
+        fs::create_dir_all(&other_root).expect("other root");
+        let mut store = SqliteStateStore::open(state_root.clone()).expect("open sqlite state");
+        let target_mount = MountConfig::new(MountId::new("notion-target"), "notion", &target_root);
+        let other_mount = MountConfig::new(MountId::new("notion-other"), "notion", &other_root);
+        store
+            .save_mount(target_mount.clone())
+            .expect("save target mount");
+        store
+            .save_mount(other_mount.clone())
+            .expect("save other mount");
+        seed_clean_remote_deleted_page(
+            &mut store,
+            &target_mount,
+            "target-page",
+            "Target.md",
+            "Target",
+        );
+        seed_clean_remote_deleted_page(&mut store, &other_mount, "other-page", "Other.md", "Other");
+        drop(store);
+
+        let previous = std::env::var_os("LOCALITY_STATE_DIR");
+        unsafe {
+            std::env::set_var("LOCALITY_STATE_DIR", &state_root);
+        }
+
+        let exit = run_status_command(&[target_root.display().to_string()], true);
+
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("LOCALITY_STATE_DIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("LOCALITY_STATE_DIR");
+            },
+        }
+
+        assert_eq!(exit, EXIT_SUCCESS);
+
+        let store = SqliteStateStore::open(state_root.clone()).expect("reopen sqlite state");
+        assert!(
+            store
+                .get_entity(&target_mount.mount_id, &RemoteId::new("target-page"))
+                .expect("load target entity")
+                .is_none()
+        );
+        assert!(
+            !target_root.join("Target.md").exists(),
+            "targeted repair should remove the inspected remote-deleted file"
+        );
+        assert!(
+            store
+                .get_entity(&other_mount.mount_id, &RemoteId::new("other-page"))
+                .expect("load unrelated entity")
+                .is_some(),
+            "status targeted at one mount must not delete remote-deleted state from another mount"
+        );
+        assert!(
+            other_root.join("Other.md").exists(),
+            "status targeted at one mount must not remove unrelated mount files"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&target_root);
+        let _ = fs::remove_dir_all(&other_root);
+    }
+
+    #[test]
     fn pull_direct_fallback_refuses_timeout_and_virtual_mount_without_daemon() {
         let virtual_mount =
             MountConfig::new(MountId::new("notion-main"), "notion", "/tmp/loc/notion")
@@ -7594,5 +7709,87 @@ mod tests {
         std::iter::once("loc".to_string())
             .chain(args.into_iter().map(|arg| arg.as_ref().to_string()))
             .collect()
+    }
+
+    fn state_root_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    fn seed_clean_remote_deleted_page<S>(
+        store: &mut S,
+        mount: &MountConfig,
+        remote_id: &str,
+        path: &str,
+        title: &str,
+    ) where
+        S: EntityRepository + RemoteObservationRepository + ShadowRepository,
+    {
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount.mount_id.clone(),
+                    RemoteId::new(remote_id),
+                    EntityKind::Page,
+                    title,
+                    path,
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_remote_edited_at("remote-v1"),
+            )
+            .expect("save entity");
+        store
+            .save_shadow(
+                &mount.mount_id,
+                shadow(remote_id, &format!("# {title}\n\nSame paragraph.\n")),
+            )
+            .expect("save shadow");
+        store
+            .save_remote_observation(
+                RemoteObservationRecord::new(
+                    mount.mount_id.clone(),
+                    RemoteId::new(remote_id),
+                    EntityKind::Page,
+                    title,
+                    path,
+                    "2026-07-06T00:00:00Z",
+                )
+                .deleted(true),
+            )
+            .expect("save remote observation");
+        let absolute_path = mount.root.join(path);
+        fs::create_dir_all(absolute_path.parent().expect("page parent")).expect("page parent");
+        fs::write(
+            absolute_path,
+            canonical_markdown(remote_id, title, &format!("# {title}\n\nSame paragraph.\n")),
+        )
+        .expect("write canonical page");
+    }
+
+    fn canonical_markdown(remote_id: &str, title: &str, body: &str) -> String {
+        format!(
+            "---\nloc:\n  id: {remote_id}\n  type: page\n  synced_at: now\n  remote_edited_at: remote-v1\ntitle: {title}\n---\n{body}"
+        )
+    }
+
+    fn shadow(remote_id: &str, body: &str) -> ShadowDocument {
+        ShadowDocument::from_synced_body(
+            RemoteId::new(remote_id),
+            body,
+            9,
+            [
+                RemoteId::new(format!("{remote_id}-heading-1")),
+                RemoteId::new(format!("{remote_id}-paragraph-1")),
+            ],
+        )
+        .expect("shadow")
     }
 }

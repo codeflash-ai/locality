@@ -6,7 +6,7 @@
 //! until query needs justify normalization.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::LocalityResult;
@@ -15,7 +15,9 @@ use locality_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
 };
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-use locality_core::path_projection::PAGE_DOCUMENT_FILENAME;
+use locality_core::path_projection::{
+    PAGE_DOCUMENT_FILENAME, is_page_document_path, page_container_path,
+};
 use locality_core::planner::{PlanSummary, PushOperation, PushPlan};
 use locality_core::shadow::ShadowDocument;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -45,12 +47,13 @@ const DB_FILE: &str = "state.sqlite3";
 const SCHEMA_VERSION: i64 = 15;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
-const NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION: i64 = 1;
+const NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
 const NOTION_PRIVATE_ROOT_ID: &str = "notion-root:private";
 const NOTION_WORKSPACE_ROOT_ID: &str = "notion-root:workspace";
 const NOTION_PRIVATE_ROOT_DIR: &str = "Private";
 const NOTION_WORKSPACE_ROOT_DIR: &str = "Workspace";
+const WORKSPACE_ROOT_MIGRATION_STAGE_PREFIX: &str = ".loc-workspace-root-migration-stage";
 const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
 const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
 const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
@@ -197,7 +200,7 @@ impl SqliteStateStore {
         let db_path = root.join(DB_FILE);
         let store = Self { root, db_path };
         let connection = store.connection()?;
-        initialize_schema(&connection)?;
+        initialize_schema(&connection, &store.root)?;
         ensure_current_state_is_readable(&connection)?;
         Ok(store)
     }
@@ -1530,7 +1533,7 @@ type FreshnessStateRow = (
     i64,
 );
 
-fn initialize_schema(connection: &Connection) -> StoreResult<()> {
+fn initialize_schema(connection: &Connection, state_root: &Path) -> StoreResult<()> {
     let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if user_version > SCHEMA_VERSION {
         return Err(StoreError::SchemaVersion {
@@ -1543,7 +1546,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         ensure_state_components_allow_schema_migration(connection, user_version)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
-        migrate_notion_workspace_roots_projection_layout_to_v1(connection)?;
+        migrate_notion_workspace_roots_projection_layout_to_v1(connection, state_root)?;
         return Ok(());
     }
 
@@ -1930,7 +1933,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         seed_default_notion_profile(connection)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, user_version < 13)?;
-        migrate_notion_workspace_roots_projection_layout_to_v1(connection)?;
+        migrate_notion_workspace_roots_projection_layout_to_v1(connection, state_root)?;
         seed_current_state_components(connection)?;
         connection.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     }
@@ -1985,9 +1988,10 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::OlderComponent {
             component_id,
-            found: 0,
+            found,
             current: NOTION_WORKSPACE_ROOTS_PROJECTION_LAYOUT_VERSION,
         } if component_id == NOTION_WORKSPACE_ROOTS_COMPONENT_ID
+            && (*found == 0 || (*found == 1 && user_version >= 15))
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
@@ -2664,6 +2668,7 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
 
 fn migrate_notion_workspace_roots_projection_layout_to_v1(
     connection: &Connection,
+    state_root: &Path,
 ) -> StoreResult<()> {
     create_state_management_tables(connection)?;
     let component = connection
@@ -2692,9 +2697,8 @@ fn migrate_notion_workspace_roots_projection_layout_to_v1(
     }
 
     let from_version = component.map(|(version, _)| version).unwrap_or(0);
-    let transaction = connection.unchecked_transaction()?;
     let workspace_mounts = {
-        let mut statement = transaction.prepare(
+        let mut statement = connection.prepare(
             "SELECT mount_id
              FROM mounts
              WHERE connector = 'notion'
@@ -2705,7 +2709,9 @@ fn migrate_notion_workspace_roots_projection_layout_to_v1(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let root_repair_evidence = notion_workspace_root_repair_evidence(&transaction)?;
+    let root_repair_evidence = notion_workspace_root_repair_evidence(connection)?;
+    repair_notion_workspace_projection_files(connection, state_root, &root_repair_evidence)?;
+    let transaction = connection.unchecked_transaction()?;
     let mut rewritten_paths = 0;
     rewritten_paths += rewrite_notion_workspace_root_paths(
         &transaction,
@@ -2821,6 +2827,20 @@ impl NotionWorkspaceRootRepairEvidence {
     }
 }
 
+#[derive(Clone, Debug)]
+struct NotionWorkspaceProjectionMount {
+    mount_id: String,
+    root: PathBuf,
+    projection: ProjectionMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionPathMove {
+    source: PathBuf,
+    stage: PathBuf,
+    destination: PathBuf,
+}
+
 fn notion_workspace_root_repair_evidence(
     connection: &Connection,
 ) -> StoreResult<NotionWorkspaceRootRepairEvidence> {
@@ -2915,6 +2935,394 @@ fn notion_workspace_root_repair_evidence(
 
     Ok(NotionWorkspaceRootRepairEvidence {
         legacy_subtree_remote_ids,
+    })
+}
+
+fn repair_notion_workspace_projection_files(
+    connection: &Connection,
+    state_root: &Path,
+    root_repair_evidence: &NotionWorkspaceRootRepairEvidence,
+) -> StoreResult<()> {
+    for mount in notion_workspace_projection_mounts(connection)? {
+        let projection_moves = notion_workspace_projection_move_candidates(
+            connection,
+            &mount.mount_id,
+            root_repair_evidence,
+        )?;
+        apply_notion_workspace_projection_moves(
+            &mount.root,
+            &projection_moves,
+            !mount.projection.uses_virtual_filesystem(),
+        )?;
+
+        if mount.projection.uses_virtual_filesystem() {
+            let content_moves = notion_workspace_content_move_candidates(
+                connection,
+                &mount.mount_id,
+                root_repair_evidence,
+            )?;
+            apply_notion_workspace_projection_moves(
+                &notion_workspace_content_root(state_root, &mount.mount_id),
+                &content_moves,
+                false,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn notion_workspace_projection_mounts(
+    connection: &Connection,
+) -> StoreResult<Vec<NotionWorkspaceProjectionMount>> {
+    let mut statement = connection.prepare(
+        "SELECT mount_id, root, projection_json
+         FROM mounts
+         WHERE connector = 'notion'
+           AND remote_root_id IS NULL
+         ORDER BY mount_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(mount_id, root, projection_json)| {
+            Ok(NotionWorkspaceProjectionMount {
+                mount_id,
+                root: PathBuf::from(root),
+                projection: from_json(&projection_json)?,
+            })
+        })
+        .collect()
+}
+
+fn notion_workspace_projection_move_candidates(
+    connection: &Connection,
+    mount_id: &str,
+    root_repair_evidence: &NotionWorkspaceRootRepairEvidence,
+) -> StoreResult<Vec<(PathBuf, PathBuf)>> {
+    let mut statement = connection.prepare(
+        "SELECT remote_id, kind_json, path
+         FROM entities
+         WHERE mount_id = ?1
+           AND remote_id NOT IN ('notion-root:private', 'notion-root:workspace')
+         ORDER BY remote_id",
+    )?;
+    let rows = statement.query_map(params![mount_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut candidates = Vec::new();
+    for (remote_id, kind_json, path) in rows {
+        let kind = from_json::<EntityKind>(&kind_json)?;
+        let desired_path = notion_workspace_root_repaired_path(
+            &path,
+            false,
+            root_repair_evidence.includes_remote_id(mount_id, Some(&remote_id)),
+        )
+        .unwrap_or(path.clone());
+        append_notion_workspace_move_candidate(
+            &mut candidates,
+            projection_move_unit_path(&kind, Path::new(&path)),
+            projection_move_unit_path(&kind, Path::new(&desired_path)),
+        );
+    }
+
+    Ok(candidates)
+}
+
+fn notion_workspace_content_move_candidates(
+    connection: &Connection,
+    mount_id: &str,
+    root_repair_evidence: &NotionWorkspaceRootRepairEvidence,
+) -> StoreResult<Vec<(PathBuf, PathBuf)>> {
+    let mut candidates =
+        notion_workspace_projection_move_candidates(connection, mount_id, root_repair_evidence)?;
+    let mut statement = connection.prepare(
+        "SELECT COALESCE(target_remote_id, parent_remote_id), content_path
+         FROM virtual_mutations
+         WHERE mount_id = ?1
+           AND content_path IS NOT NULL
+         ORDER BY local_id",
+    )?;
+    let rows = statement.query_map(params![mount_id], |row| {
+        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (remote_id, content_path) = row?;
+        let desired_path = notion_workspace_root_repaired_path(
+            &content_path,
+            true,
+            root_repair_evidence.includes_remote_id(mount_id, remote_id.as_deref()),
+        )
+        .unwrap_or(content_path.clone());
+        append_notion_workspace_move_candidate(
+            &mut candidates,
+            projection_move_unit_from_path(Path::new(&content_path)),
+            projection_move_unit_from_path(Path::new(&desired_path)),
+        );
+    }
+
+    Ok(candidates)
+}
+
+fn append_notion_workspace_move_candidate(
+    candidates: &mut Vec<(PathBuf, PathBuf)>,
+    current_unit: PathBuf,
+    desired_unit: PathBuf,
+) {
+    if current_unit != desired_unit {
+        candidates.push((current_unit, desired_unit));
+        return;
+    }
+
+    if let Some(legacy_source) = legacy_workspace_projection_source(&desired_unit) {
+        candidates.push((legacy_source, desired_unit));
+    }
+}
+
+fn projection_move_unit_path(kind: &EntityKind, path: &Path) -> PathBuf {
+    match kind {
+        EntityKind::Page => projection_move_unit_from_path(path),
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_) => path.to_path_buf(),
+    }
+}
+
+fn projection_move_unit_from_path(path: &Path) -> PathBuf {
+    if is_page_document_path(path) {
+        page_container_path(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn legacy_workspace_projection_source(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return None;
+    };
+    if first.to_str()? != NOTION_WORKSPACE_ROOT_DIR {
+        return None;
+    }
+
+    let mut legacy_path = PathBuf::new();
+    for component in components {
+        let Component::Normal(component) = component else {
+            return None;
+        };
+        legacy_path.push(component);
+    }
+
+    if legacy_path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(legacy_path)
+    }
+}
+
+fn apply_notion_workspace_projection_moves(
+    root: &Path,
+    candidates: &[(PathBuf, PathBuf)],
+    ensure_synthetic_roots: bool,
+) -> StoreResult<()> {
+    let moves = prepared_projection_path_moves(root, candidates)?;
+    if moves.is_empty() {
+        return Ok(());
+    }
+
+    for (index, planned_move) in moves.iter().enumerate() {
+        if let Err(error) = std::fs::rename(
+            root.join(&planned_move.source),
+            root.join(&planned_move.stage),
+        ) {
+            rollback_staged_projection_moves(root, &moves[..index]);
+            return Err(StoreError::from(error));
+        }
+    }
+
+    for (index, planned_move) in moves.iter().enumerate() {
+        if let Some(parent) = root.join(&planned_move.destination).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Err(error) = std::fs::rename(
+            root.join(&planned_move.stage),
+            root.join(&planned_move.destination),
+        ) {
+            rollback_projection_final_failure(root, &moves, index);
+            return Err(StoreError::from(error));
+        }
+    }
+
+    if ensure_synthetic_roots {
+        std::fs::create_dir_all(root.join(NOTION_PRIVATE_ROOT_DIR))?;
+        std::fs::create_dir_all(root.join(NOTION_WORKSPACE_ROOT_DIR))?;
+    }
+
+    Ok(())
+}
+
+fn prepared_projection_path_moves(
+    root: &Path,
+    candidates: &[(PathBuf, PathBuf)],
+) -> StoreResult<Vec<ProjectionPathMove>> {
+    let mut sorted = candidates
+        .iter()
+        .filter(|(source, destination)| source != destination)
+        .cloned()
+        .collect::<Vec<_>>();
+    sorted.sort_by_key(|(source, _)| source.components().count());
+
+    let mut stage_index = 0usize;
+    let mut moves = Vec::new();
+    for (source, destination) in sorted {
+        if moves
+            .iter()
+            .any(|existing| projection_move_covered_by(existing, &source, &destination))
+        {
+            continue;
+        }
+        if moves.iter().any(|existing| {
+            (existing.source == source && existing.destination != destination)
+                || (existing.destination == destination && existing.source != source)
+        }) {
+            return Err(StoreError::Io(format!(
+                "conflicting Notion workspace projection repairs for `{}`",
+                root.join(&source).display()
+            )));
+        }
+
+        let source_exists = root.join(&source).exists();
+        let destination_exists = root.join(&destination).exists();
+        if !source_exists {
+            continue;
+        }
+        if destination_exists {
+            return Err(StoreError::Io(format!(
+                "Notion workspace projection destination `{}` already exists while moving `{}`",
+                root.join(&destination).display(),
+                root.join(&source).display()
+            )));
+        }
+
+        moves.push(ProjectionPathMove {
+            source,
+            stage: unique_workspace_root_migration_stage_path(root, &mut stage_index)?,
+            destination,
+        });
+    }
+
+    Ok(moves)
+}
+
+fn projection_move_covered_by(
+    existing: &ProjectionPathMove,
+    source: &Path,
+    destination: &Path,
+) -> bool {
+    let Ok(source_suffix) = source.strip_prefix(&existing.source) else {
+        return false;
+    };
+    let Ok(destination_suffix) = destination.strip_prefix(&existing.destination) else {
+        return false;
+    };
+    source_suffix == destination_suffix
+}
+
+fn unique_workspace_root_migration_stage_path(
+    root: &Path,
+    next_index: &mut usize,
+) -> StoreResult<PathBuf> {
+    for _ in 0..1000 {
+        let candidate = PathBuf::from(format!(
+            "{WORKSPACE_ROOT_MIGRATION_STAGE_PREFIX}-{}",
+            *next_index
+        ));
+        *next_index += 1;
+        if !root.join(&candidate).exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(StoreError::Io(format!(
+        "failed to choose a temporary Notion workspace migration path under `{}`",
+        root.display()
+    )))
+}
+
+fn rollback_staged_projection_moves(root: &Path, moves: &[ProjectionPathMove]) {
+    for planned_move in moves.iter().rev() {
+        rollback_projection_path(root, &planned_move.stage, &planned_move.source);
+    }
+}
+
+fn rollback_projection_final_failure(
+    root: &Path,
+    moves: &[ProjectionPathMove],
+    failed_final_index: usize,
+) {
+    for planned_move in moves[..failed_final_index].iter().rev() {
+        rollback_projection_path(root, &planned_move.destination, &planned_move.source);
+    }
+    rollback_staged_projection_moves(root, &moves[failed_final_index..]);
+}
+
+fn rollback_projection_path(root: &Path, from: &Path, to: &Path) {
+    let from = root.join(from);
+    let to = root.join(to);
+    if std::fs::rename(&from, &to).is_err() && to.is_dir() {
+        let _ = std::fs::remove_dir(&to);
+        let _ = std::fs::rename(from, to);
+    }
+}
+
+fn notion_workspace_content_root(state_root: &Path, mount_id: &str) -> PathBuf {
+    notion_workspace_content_base(state_root)
+        .join(mount_id)
+        .join("files")
+}
+
+fn notion_workspace_content_base(state_root: &Path) -> PathBuf {
+    if let Ok(root) = std::env::var("LOCALITY_VIRTUAL_FS_CONTENT_ROOT") {
+        return PathBuf::from(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    if notion_workspace_uses_default_state_root(state_root)
+        && let Some(group_container) = notion_workspace_macos_app_group_container()
+    {
+        return group_container.join("content");
+    }
+
+    state_root.join("content")
+}
+
+#[cfg(target_os = "macos")]
+fn notion_workspace_uses_default_state_root(state_root: &Path) -> bool {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".loc") == state_root)
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn notion_workspace_macos_app_group_container() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(|home| {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Group Containers")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
     })
 }
 

@@ -135,7 +135,7 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "projection:notion_workspace_roots".to_string(),
                 "projection_layout".to_string(),
-                1,
+                2,
                 1,
                 1,
                 0,
@@ -1188,13 +1188,109 @@ fn sqlite_store_repairs_missing_notion_workspace_roots_component() {
         .query_row(
             "SELECT COUNT(*)
              FROM state_migrations
-             WHERE migration_id = 'component-projection-notion_workspace_roots-0-to-1'",
+             WHERE migration_id = 'component-projection-notion_workspace_roots-0-to-2'",
             [],
             |row| row.get(0),
         )
         .expect("component migration count");
-    assert_eq!(component_version, 1);
+    assert_eq!(component_version, 2);
     assert_eq!(migration_count, 1);
+}
+
+#[test]
+fn sqlite_store_repairs_v1_notion_workspace_root_plain_projection_files() {
+    let fixture = SqliteFixture::new();
+    let db_path = seed_notion_workspace_roots_v1_state(&fixture, ProjectionMode::PlainFiles);
+    let legacy_path = fixture.mount_root.join("workspace").join("Roadmap/page.md");
+    let migrated_path = fixture
+        .mount_root
+        .join("workspace")
+        .join("Workspace/Roadmap/page.md");
+    fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("legacy parent");
+    fs::write(&legacy_path, "legacy workspace body").expect("legacy workspace page");
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+    let component_version: i64 = connection
+        .query_row(
+            "SELECT version
+             FROM state_components
+             WHERE component_id = 'projection:notion_workspace_roots'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("component version");
+    let migration_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM state_migrations
+             WHERE migration_id = 'component-projection-notion_workspace_roots-1-to-2'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("component migration count");
+
+    assert_eq!(component_version, 2);
+    assert_eq!(migration_count, 1);
+    assert!(!legacy_path.exists());
+    assert_eq!(
+        fs::read_to_string(&migrated_path).expect("migrated workspace page"),
+        "legacy workspace body"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT path
+                 FROM entities
+                 WHERE mount_id = ?1
+                   AND remote_id = 'workspace-page'",
+                params![fixture.mount_id.0.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("workspace entity path"),
+        "Workspace/Roadmap/page.md"
+    );
+    let _ = db_path;
+}
+
+#[test]
+fn sqlite_store_repairs_v1_notion_workspace_root_virtual_content_files() {
+    let fixture = SqliteFixture::new();
+    let reopened = fixture.open();
+    drop(reopened);
+    let _db_path = seed_notion_workspace_roots_v1_state(&fixture, ProjectionMode::LinuxFuse);
+    let legacy_path = fixture
+        .state_root
+        .join("content")
+        .join(fixture.mount_id.0.as_str())
+        .join("files/Roadmap/page.md");
+    let migrated_path = fixture
+        .state_root
+        .join("content")
+        .join(fixture.mount_id.0.as_str())
+        .join("files/Workspace/Roadmap/page.md");
+    fs::create_dir_all(legacy_path.parent().expect("legacy content parent"))
+        .expect("legacy content parent");
+    fs::write(&legacy_path, "legacy content cache body").expect("legacy content cache");
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+    let component_version: i64 = connection
+        .query_row(
+            "SELECT version
+             FROM state_components
+             WHERE component_id = 'projection:notion_workspace_roots'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("component version");
+
+    assert_eq!(component_version, 2);
+    assert!(!legacy_path.exists());
+    assert_eq!(
+        fs::read_to_string(&migrated_path).expect("migrated content cache page"),
+        "legacy content cache body"
+    );
 }
 
 #[test]
@@ -1508,7 +1604,7 @@ fn sqlite_store_blocks_newer_notion_workspace_roots_component_without_rewriting(
         vec![StateCompatibilityIssue::NewerComponent {
             component_id: "projection:notion_workspace_roots".to_string(),
             found: 999,
-            supported: 1,
+            supported: 2,
         }]
     );
 
@@ -1541,7 +1637,7 @@ fn sqlite_store_blocks_newer_notion_workspace_roots_reader_without_rewriting() {
         vec![StateCompatibilityIssue::ComponentRequiresNewerReader {
             component_id: "projection:notion_workspace_roots".to_string(),
             min_reader_version: 999,
-            supported: 1,
+            supported: 2,
         }]
     );
 
@@ -3512,6 +3608,70 @@ fn seed_notion_workspace_roots_legacy_state(fixture: &SqliteFixture) -> PathBuf 
     store.db_path.clone()
 }
 
+fn seed_notion_workspace_roots_v1_state(
+    fixture: &SqliteFixture,
+    projection: ProjectionMode,
+) -> PathBuf {
+    let mut store = fixture.open();
+    let mount_root = fixture.mount_root.join("workspace");
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", &mount_root)
+                .projection(projection),
+        )
+        .expect("save workspace notion mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("notion-root:private"),
+                EntityKind::Directory,
+                "Private",
+                "Private",
+            )
+            .with_hydration(HydrationState::Virtual),
+        )
+        .expect("save private synthetic root");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("notion-root:workspace"),
+                EntityKind::Directory,
+                "Workspace",
+                "Workspace",
+            )
+            .with_hydration(HydrationState::Virtual),
+        )
+        .expect("save workspace synthetic root");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("workspace-page"),
+                EntityKind::Page,
+                "Roadmap",
+                "Workspace/Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save migrated workspace entity");
+    drop(store);
+
+    let connection = Connection::open(fixture.state_root.join("state.sqlite3"))
+        .expect("raw downgraded connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1
+             WHERE component_id = 'projection:notion_workspace_roots'",
+            [],
+        )
+        .expect("downgrade notion workspace roots component");
+
+    fixture.state_root.join("state.sqlite3")
+}
+
 fn seed_notion_workspace_root_name_collision_state(fixture: &SqliteFixture) -> PathBuf {
     let mut store = fixture.open();
     store
@@ -3793,7 +3953,7 @@ fn assert_notion_workspace_roots_state_not_rewritten(db_path: &PathBuf, mount_id
         .query_row(
             "SELECT COUNT(*)
              FROM state_migrations
-             WHERE migration_id = 'component-projection-notion_workspace_roots-0-to-1'",
+             WHERE migration_id = 'component-projection-notion_workspace_roots-0-to-2'",
             [],
             |row| row.get(0),
         )

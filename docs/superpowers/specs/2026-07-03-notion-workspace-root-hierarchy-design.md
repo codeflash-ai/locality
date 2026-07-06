@@ -43,7 +43,6 @@ honestly now, while leaving room for real teamspace containers later.
 
 - Do not infer teamspace membership from page titles, search order, URLs, or
   other heuristics.
-- Do not migrate existing mounted state in this first change.
 - Do not create Notion teamspace pages unless a future Notion API surface gives
   Locality a stable teamspace parent.
 - Do not change child-page, database, database-row, media, or `page.md`
@@ -186,6 +185,15 @@ real configured root page, and direct children belong below that page.
 Virtual filesystem listings should expose the same synthetic directories as
 plain-file pulls. The synthetic directories are folders only. Opening them lists
 children; they do not contain `page.md`.
+
+## Upgrade Repair
+
+Existing workspace-level Notion mounts created before the synthetic `Private/`
+and `Workspace/` roots shipped must repair persisted local state on reopen.
+That repair must move legacy projection files and virtual content-cache files
+from the old mount-root layout into the new `Workspace/...` layout before the
+store rewrites persisted projected paths, so upgraded mounts keep their hydrated
+or dirty local content attached to the correct entities.
 
 ## Push And Apply
 
