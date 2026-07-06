@@ -16,14 +16,15 @@ use locality_core::shadow::ShadowDocument;
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
-    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord, MountConfig,
-    MountLiveModeRecord, RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
+    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord,
+    MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord, RemoteObservationRecord,
+    ShadowSnapshotRecord, VirtualMutationRecord,
 };
 use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
     EntitySearchRepository, FreshnessStateRepository, HydrationJobRepository, JournalRepository,
-    MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
-    VirtualMutationRepository,
+    MetadataDiscoveryJobRepository, MountLiveModeRepository, MountRepository,
+    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
 };
 
 type EntityKey = (MountId, RemoteId);
@@ -34,6 +35,7 @@ type VirtualMutationKey = (MountId, String);
 type AutoSaveKey = (MountId, PathBuf);
 type RemoteObservationKey = (MountId, RemoteId);
 type FreshnessStateKey = (MountId, RemoteId);
+type MetadataDiscoveryJobKey = (MountId, String);
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryStateStore {
@@ -49,6 +51,7 @@ pub struct InMemoryStateStore {
     auto_save_enrollments: BTreeMap<AutoSaveKey, AutoSaveEnrollmentRecord>,
     remote_observations: BTreeMap<RemoteObservationKey, RemoteObservationRecord>,
     freshness_states: BTreeMap<FreshnessStateKey, FreshnessStateRecord>,
+    metadata_discovery_jobs: BTreeMap<MetadataDiscoveryJobKey, MetadataDiscoveryJobRecord>,
     journals: BTreeMap<String, JournalEntry>,
 }
 
@@ -89,6 +92,13 @@ impl InMemoryStateStore {
         (mount_id.clone(), remote_id.clone())
     }
 
+    fn metadata_discovery_job_key(
+        mount_id: &MountId,
+        container_identifier: &str,
+    ) -> MetadataDiscoveryJobKey {
+        (mount_id.clone(), container_identifier.to_string())
+    }
+
     fn clear_mount_source_state(&mut self, mount_id: &MountId) {
         self.entities
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
@@ -107,6 +117,8 @@ impl InMemoryStateStore {
         self.remote_observations
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
         self.freshness_states
+            .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
+        self.metadata_discovery_jobs
             .retain(|(entry_mount_id, _), _| entry_mount_id != mount_id);
         self.journals.retain(|_, entry| entry.mount_id != *mount_id);
     }
@@ -569,6 +581,73 @@ impl HydrationJobRepository for InMemoryStateStore {
             job.last_error = Some(message);
         }
 
+        Ok(())
+    }
+}
+
+impl MetadataDiscoveryJobRepository for InMemoryStateStore {
+    fn upsert_metadata_discovery_job(
+        &mut self,
+        job: MetadataDiscoveryJobRecord,
+    ) -> StoreResult<()> {
+        let key = Self::metadata_discovery_job_key(&job.mount_id, &job.container_identifier);
+        if let Some(existing) = self.metadata_discovery_jobs.get_mut(&key) {
+            existing.priority = existing.priority.max(job.priority);
+            existing.depth = existing.depth.min(job.depth);
+            existing.updated_at = job.updated_at;
+        } else {
+            self.metadata_discovery_jobs.insert(key, job);
+        }
+        Ok(())
+    }
+
+    fn list_metadata_discovery_jobs(&self) -> StoreResult<Vec<MetadataDiscoveryJobRecord>> {
+        let mut jobs = self
+            .metadata_discovery_jobs
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        jobs.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.depth.cmp(&right.depth))
+                .then_with(|| left.attempts.cmp(&right.attempts))
+                .then_with(|| left.mount_id.0.cmp(&right.mount_id.0))
+                .then_with(|| left.container_identifier.cmp(&right.container_identifier))
+        });
+        Ok(jobs)
+    }
+
+    fn delete_metadata_discovery_job(
+        &mut self,
+        mount_id: &MountId,
+        container_identifier: &str,
+    ) -> StoreResult<()> {
+        self.metadata_discovery_jobs
+            .remove(&Self::metadata_discovery_job_key(
+                mount_id,
+                container_identifier,
+            ));
+        Ok(())
+    }
+
+    fn record_metadata_discovery_job_failure(
+        &mut self,
+        mount_id: &MountId,
+        container_identifier: &str,
+        message: String,
+    ) -> StoreResult<()> {
+        if let Some(job) = self
+            .metadata_discovery_jobs
+            .get_mut(&Self::metadata_discovery_job_key(
+                mount_id,
+                container_identifier,
+            ))
+        {
+            job.attempts = job.attempts.saturating_add(1);
+            job.last_error = Some(message);
+        }
         Ok(())
     }
 }

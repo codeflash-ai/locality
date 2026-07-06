@@ -364,6 +364,15 @@ explain_remote_change
 The daemon spends a bounded budget per tick and never recursively scans the full
 workspace unless explicitly requested.
 
+Current daemon implementation:
+
+- Workspace virtual mounts use a durable metadata-discovery queue for
+  `enumerate_children` work. Jobs are persisted in SQLite by mount and container
+  identifier, reloaded when the daemon starts, deleted only after a successful
+  child refresh, and retained with failure metadata when a refresh fails.
+- The queue is metadata-only: child refresh jobs update entities, placeholders,
+  and virtual filesystem container state, but they do not hydrate page bodies.
+
 ### Stage 5: Pending Files Become Hot
 
 When local content changes, mark the file pending, promote it to hot, schedule a
@@ -502,6 +511,10 @@ Current local-only implementation:
   for pending, ready, deferred, and budgeted work. Runtime status reports those
   metrics so future UI/diagnostics can observe sync pressure without exposing
   hydration internals in the normal product UI.
+- Workspace virtual metadata discovery also uses bounded daemon workers. Root
+  and mount-point containers are queued when virtual mounts are primed, and each
+  successful child refresh durably queues newly discovered folder containers so
+  large workspaces can continue enumeration after daemon restarts.
 - Relay/webhook delivery remains intentionally unimplemented; Stage 10 only
   improves local scheduling and connector contracts.
 

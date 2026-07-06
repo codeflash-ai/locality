@@ -32,8 +32,9 @@ use locality_core::shadow::{ShadowDocument, rendered_bodies_equivalent};
 use locality_notion::client::{notion_request_debug_status, notion_requests_per_second_setting};
 use locality_store::{
     AutoSaveRepository, AutoSaveState, EntityRecord, EntityRepository, FreshnessStateRecord,
-    FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository, MountConfig,
-    MountLiveModeRepository, MountRepository, ProjectionMode, RemoteObservationRecord,
+    FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
+    MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
+    MountConfig, MountLiveModeRepository, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, open_credential_store,
 };
 use serde_json::{Value, json};
@@ -1200,6 +1201,7 @@ impl RuntimeState {
         sender: Sender<RuntimeMessage>,
     ) -> Self {
         let hydration = load_persisted_hydrations(&config.state_root);
+        let child_refreshes = load_persisted_child_refreshes(&config.state_root);
 
         Self {
             scheduler: PullScheduler::new(config.pull_scheduler.clone()),
@@ -1208,7 +1210,7 @@ impl RuntimeState {
             runner,
             sender,
             pending_requests: VecDeque::new(),
-            child_refreshes: ChildRefreshQueue::default(),
+            child_refreshes,
             active_child_refreshes: BTreeMap::new(),
             completed_child_refreshes: BTreeMap::new(),
             hydration,
@@ -1607,6 +1609,7 @@ impl RuntimeState {
                 result,
             } => match result {
                 Ok(report) => {
+                    self.delete_metadata_discovery_job(&mount_id, &container_identifier);
                     self.mark_child_refresh_completed(&mount_id, &container_identifier, priority);
                     if report.changed {
                         self.signal_macos_file_provider_container(&mount_id, &container_identifier);
@@ -1619,6 +1622,11 @@ impl RuntimeState {
                     );
                 }
                 Err(error) => {
+                    self.record_metadata_discovery_failure(
+                        &mount_id,
+                        &container_identifier,
+                        error.to_string(),
+                    );
                     eprintln!(
                         "localityd virtual filesystem child refresh failed for `{mount_id}:{container_identifier}`: {error}"
                     );
@@ -1982,13 +1990,70 @@ impl RuntimeState {
         if self.active_child_refreshes.contains_key(&key) {
             return;
         }
-        self.child_refreshes.queue(ChildRefreshRequest {
+        let request = ChildRefreshRequest {
             mount_id,
             container_identifier,
             priority,
             depth,
-        });
+        };
+        self.persist_child_refresh(&request);
+        self.child_refreshes.queue(request);
         self.maybe_start_next_job();
+    }
+
+    fn persist_child_refresh(&self, request: &ChildRefreshRequest) {
+        let now = freshness_timestamp();
+        let job = MetadataDiscoveryJobRecord {
+            mount_id: MountId::new(request.mount_id.clone()),
+            container_identifier: request.container_identifier.clone(),
+            priority: metadata_discovery_priority_from_child_refresh(request.priority),
+            depth: request.depth,
+            attempts: 0,
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        match SqliteStateStore::open(self.config.state_root.clone())
+            .and_then(|mut store| store.upsert_metadata_discovery_job(job))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!("localityd failed to persist metadata discovery request: {error}")
+            }
+        }
+    }
+
+    fn delete_metadata_discovery_job(&self, mount_id: &str, container_identifier: &str) {
+        match SqliteStateStore::open(self.config.state_root.clone()).and_then(|mut store| {
+            store.delete_metadata_discovery_job(&MountId::new(mount_id), container_identifier)
+        }) {
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!(
+                    "localityd failed to remove completed metadata discovery request: {error}"
+                )
+            }
+        }
+    }
+
+    fn record_metadata_discovery_failure(
+        &self,
+        mount_id: &str,
+        container_identifier: &str,
+        message: String,
+    ) {
+        match SqliteStateStore::open(self.config.state_root.clone()).and_then(|mut store| {
+            store.record_metadata_discovery_job_failure(
+                &MountId::new(mount_id),
+                container_identifier,
+                message,
+            )
+        }) {
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!("localityd failed to record metadata discovery failure: {error}")
+            }
+        }
     }
 
     fn mark_child_refresh_completed(
@@ -2661,6 +2726,47 @@ fn load_persisted_hydrations(state_root: &Path) -> HydrationQueue {
     }
 
     queue
+}
+
+fn load_persisted_child_refreshes(state_root: &Path) -> ChildRefreshQueue {
+    let mut queue = ChildRefreshQueue::default();
+    match SqliteStateStore::open(state_root.to_path_buf())
+        .and_then(|store| store.list_metadata_discovery_jobs())
+    {
+        Ok(jobs) => {
+            for job in jobs {
+                queue.queue(ChildRefreshRequest {
+                    mount_id: job.mount_id.0,
+                    container_identifier: job.container_identifier,
+                    priority: child_refresh_priority_from_metadata(job.priority),
+                    depth: job.depth,
+                });
+            }
+        }
+        Err(error) => {
+            eprintln!("localityd failed to load persisted metadata discovery requests: {error}")
+        }
+    }
+
+    queue
+}
+
+fn metadata_discovery_priority_from_child_refresh(
+    priority: ChildRefreshPriority,
+) -> MetadataDiscoveryPriority {
+    match priority {
+        ChildRefreshPriority::Background => MetadataDiscoveryPriority::Background,
+        ChildRefreshPriority::Interactive => MetadataDiscoveryPriority::Interactive,
+    }
+}
+
+fn child_refresh_priority_from_metadata(
+    priority: MetadataDiscoveryPriority,
+) -> ChildRefreshPriority {
+    match priority {
+        MetadataDiscoveryPriority::Background => ChildRefreshPriority::Background,
+        MetadataDiscoveryPriority::Interactive => ChildRefreshPriority::Interactive,
+    }
 }
 
 fn remote_fast_forward_previous_shadow(
@@ -4410,8 +4516,10 @@ fn locality_error_code(error: &LocalityError) -> &'static str {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use locality_core::LocalityError;
     use locality_core::canonical::render_canonical_markdown;
     use locality_core::freshness::{
         ChangeHintKind, FreshnessTier, RemoteObservation, RemoteVersion, SyncJob, SyncJobKind,
@@ -4423,18 +4531,21 @@ mod tests {
     use locality_store::{
         AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
         ConnectionRecord, ConnectionRepository, EntityRecord, EntityRepository,
-        FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, MountConfig,
-        MountLiveModeRecord, MountLiveModeRepository, MountRepository, ProjectionMode,
+        FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore,
+        MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
+        MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountRepository, ProjectionMode,
         RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
     };
 
+    use crate::virtual_fs::VirtualFsRefreshChildrenReport;
     use crate::watcher::{FileEvent, FileEventKind};
 
     use super::{
-        ActiveChildRefresh, ChildRefreshPriority, ChildRefreshQueue, ChildRefreshRequest,
-        DefaultRuntimeJobRunner, RemoteDiscoveryHint, RuntimeJobRunner, execute_file_event,
-        execute_observe_entity_job, observable_remote_identifier,
-        remote_fast_forward_discovery_hints, repair_clean_remote_deleted_projections,
+        ActiveChildRefresh, ActiveRuntimeJob, ChildRefreshPriority, ChildRefreshQueue,
+        ChildRefreshRequest, DefaultRuntimeJobRunner, JobCompletion, RemoteDiscoveryHint,
+        RuntimeJobRunner, RuntimeState, execute_file_event, execute_observe_entity_job,
+        observable_remote_identifier, remote_fast_forward_discovery_hints,
+        repair_clean_remote_deleted_projections,
     };
 
     #[test]
@@ -4511,6 +4622,132 @@ mod tests {
         active.clear();
         let deeper = queue.pop_ready(&active).expect("deeper refresh");
         assert_eq!(deeper.container_identifier, "children:page-a1");
+    }
+
+    #[test]
+    fn metadata_discovery_jobs_reload_into_child_refresh_queue() {
+        let state_root = temp_runtime_root("runtime-metadata-discovery-reload");
+        seed_virtual_mount(&state_root);
+        {
+            let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+            store
+                .upsert_metadata_discovery_job(metadata_discovery_job(
+                    "children:page-1",
+                    MetadataDiscoveryPriority::Interactive,
+                    3,
+                ))
+                .expect("queue discovery");
+        }
+
+        let runtime = runtime_state_for_root(state_root.clone());
+        let requests = runtime.child_refreshes.debug_requests(10);
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].mount_id, "notion-main");
+        assert_eq!(requests[0].container_identifier, "children:page-1");
+        assert_eq!(requests[0].priority, ChildRefreshPriority::Interactive);
+        assert_eq!(requests[0].depth, 3);
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn queue_child_refresh_persists_metadata_discovery_job() {
+        let state_root = temp_runtime_root("runtime-metadata-discovery-persist");
+        seed_virtual_mount(&state_root);
+        let mut runtime = runtime_state_for_root(state_root.clone());
+        runtime.active_job = Some(test_active_job());
+
+        runtime.queue_child_refresh(
+            "notion-main".to_string(),
+            "children:page-1".to_string(),
+            ChildRefreshPriority::Interactive,
+            2,
+        );
+
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("open store")
+            .list_metadata_discovery_jobs()
+            .expect("list discovery");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].container_identifier, "children:page-1");
+        assert_eq!(jobs[0].priority, MetadataDiscoveryPriority::Interactive);
+        assert_eq!(jobs[0].depth, 2);
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn successful_child_refresh_deletes_metadata_discovery_job() {
+        let state_root = temp_runtime_root("runtime-metadata-discovery-success");
+        seed_virtual_mount(&state_root);
+        {
+            let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+            store
+                .upsert_metadata_discovery_job(metadata_discovery_job(
+                    "children:page-1",
+                    MetadataDiscoveryPriority::Background,
+                    1,
+                ))
+                .expect("queue discovery");
+        }
+        let mut runtime = runtime_state_for_root(state_root.clone());
+
+        runtime.handle_completion(JobCompletion::VirtualFsRefreshChildren {
+            mount_id: "notion-main".to_string(),
+            container_identifier: "children:page-1".to_string(),
+            depth: 1,
+            priority: ChildRefreshPriority::Background,
+            result: Ok(VirtualFsRefreshChildrenReport::default()),
+        });
+
+        assert!(
+            SqliteStateStore::open(state_root.clone())
+                .expect("open store")
+                .list_metadata_discovery_jobs()
+                .expect("list discovery")
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn failed_child_refresh_records_metadata_discovery_failure() {
+        let state_root = temp_runtime_root("runtime-metadata-discovery-failure");
+        seed_virtual_mount(&state_root);
+        {
+            let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+            store
+                .upsert_metadata_discovery_job(metadata_discovery_job(
+                    "children:page-1",
+                    MetadataDiscoveryPriority::Background,
+                    1,
+                ))
+                .expect("queue discovery");
+        }
+        let mut runtime = runtime_state_for_root(state_root.clone());
+
+        runtime.handle_completion(JobCompletion::VirtualFsRefreshChildren {
+            mount_id: "notion-main".to_string(),
+            container_identifier: "children:page-1".to_string(),
+            depth: 1,
+            priority: ChildRefreshPriority::Background,
+            result: Err(LocalityError::InvalidState("rate limited".to_string())),
+        });
+
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("open store")
+            .list_metadata_discovery_jobs()
+            .expect("list discovery");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].attempts, 1);
+        assert_eq!(
+            jobs[0].last_error.as_deref(),
+            Some("invalid state: rate limited")
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
@@ -5305,6 +5542,58 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn seed_virtual_mount(state_root: &Path) {
+        let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open store");
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("notion-main"),
+                    "notion",
+                    state_root.join("Locality/notion-main"),
+                )
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+    }
+
+    fn runtime_state_for_root(state_root: PathBuf) -> RuntimeState {
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        RuntimeState::new(
+            crate::DaemonConfig {
+                state_root,
+                ..crate::DaemonConfig::default()
+            },
+            Arc::new(DefaultRuntimeJobRunner),
+            sender,
+        )
+    }
+
+    fn test_active_job() -> ActiveRuntimeJob {
+        ActiveRuntimeJob {
+            kind: "test".to_string(),
+            target: None,
+            started_at: std::time::Instant::now(),
+            started_at_unix_ms: 0,
+        }
+    }
+
+    fn metadata_discovery_job(
+        container_identifier: &str,
+        priority: MetadataDiscoveryPriority,
+        depth: u32,
+    ) -> MetadataDiscoveryJobRecord {
+        MetadataDiscoveryJobRecord {
+            mount_id: MountId::new("notion-main"),
+            container_identifier: container_identifier.to_string(),
+            priority,
+            depth,
+            attempts: 0,
+            last_error: None,
+            created_at: "2026-07-06T00:00:00Z".to_string(),
+            updated_at: "2026-07-06T00:00:00Z".to_string(),
+        }
     }
 
     fn shadow_with_child_page_links<const N: usize>(
