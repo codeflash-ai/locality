@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(clippy::items_after_test_module)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io;
@@ -87,6 +87,7 @@ use localityd::ipc::{
 };
 use localityd::media::{document_with_absolute_media_hrefs, update_hydrated_media_manifest};
 use localityd::push::execute_auto_save_push_job_with_content_root;
+use localityd::runtime::repair_clean_remote_deleted_projections;
 use localityd::source::{
     ResolvedSource, resolve_source_for_mount_id, resolve_source_for_path, source_display_name,
 };
@@ -305,6 +306,68 @@ struct ActionReport {
     message: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceMountOnboardingReport {
+    state: String,
+    message: String,
+    primary_action: String,
+    launch_strategy: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacosWorkspaceMountOnboardingState {
+    Created,
+    ApprovalRequired,
+    WaitingForCloudStorageRoot,
+    Failed,
+}
+
+impl MacosWorkspaceMountOnboardingState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::ApprovalRequired => "approval_required",
+            Self::WaitingForCloudStorageRoot => "waiting_for_cloudstorage_root",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceMountOnboardingPrimaryAction {
+    AllowInMacos,
+    CheckAgain,
+    RetrySetup,
+}
+
+impl WorkspaceMountOnboardingPrimaryAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowInMacos => "allow_in_macos",
+            Self::CheckAgain => "check_again",
+            Self::RetrySetup => "retry_setup",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceMountOnboardingLaunchStrategy {
+    OpenFinder,
+    InstructionsOnly,
+    None,
+}
+
+impl WorkspaceMountOnboardingLaunchStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenFinder => "open_finder",
+            Self::InstructionsOnly => "instructions_only",
+            Self::None => "none",
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MountIdRequest {
@@ -321,6 +384,31 @@ struct CreateDesktopMountRequest {
     read_only: bool,
     notion_root_page: Option<String>,
     google_docs_workspace_folder: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceMountOnboardingRequest {
+    path: String,
+    action: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceMountOnboardingAction {
+    Start,
+    AllowInMacos,
+    CheckAgain,
+}
+
+impl WorkspaceMountOnboardingAction {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "start" => Ok(Self::Start),
+            "allow_in_macos" => Ok(Self::AllowInMacos),
+            "check_again" => Ok(Self::CheckAgain),
+            other => Err(format!("Unsupported onboarding mount action `{other}`.")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -535,14 +623,56 @@ async fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
     snapshot
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopDebugQueueStatus {
+    #[serde(flatten)]
+    queue: DaemonDebugQueueStatus,
+    live_mode: DesktopLiveModeDebugStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopLiveModeDebugStatus {
+    mount_id: Option<String>,
+    enabled: bool,
+    state: String,
+    label: String,
+    reason: Option<String>,
+    last_run_at: Option<String>,
+    tracked_files: Vec<DesktopLiveModeDebugFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopLiveModeDebugFile {
+    path: String,
+    title: String,
+    remote_id: String,
+    hydration: String,
+    status: String,
+    sync_state: String,
+    active_for_polling: bool,
+    remote_check_due: bool,
+    polling_reason: Option<String>,
+    freshness_tier: Option<String>,
+    last_checked_at: Option<String>,
+    last_opened_at: Option<String>,
+    last_local_change_at: Option<String>,
+    remote_hint_pending: bool,
+    auto_save_state: Option<String>,
+    auto_save_reason: Option<String>,
+    issue_codes: Vec<String>,
+}
+
 #[tauri::command]
-async fn debug_notion_queue_status() -> Result<DaemonDebugQueueStatus, String> {
+async fn debug_notion_queue_status() -> Result<DesktopDebugQueueStatus, String> {
     tauri::async_runtime::spawn_blocking(debug_notion_queue_status_blocking)
         .await
         .map_err(|error| format!("Could not inspect daemon debug queue: {error}"))?
 }
 
-fn debug_notion_queue_status_blocking() -> Result<DaemonDebugQueueStatus, String> {
+fn debug_notion_queue_status_blocking() -> Result<DesktopDebugQueueStatus, String> {
     let response = send_request_with_timeout(
         &default_state_root(),
         &DaemonRequest::DebugQueueStatus,
@@ -558,8 +688,190 @@ fn debug_notion_queue_status_blocking() -> Result<DaemonDebugQueueStatus, String
     let payload = response
         .payload
         .ok_or_else(|| "Daemon debug queue returned an empty response.".to_string())?;
-    serde_json::from_value(payload)
-        .map_err(|error| format!("Could not decode daemon debug queue: {error}"))
+    let queue = serde_json::from_value(payload)
+        .map_err(|error| format!("Could not decode daemon debug queue: {error}"))?;
+    let live_mode = debug_live_mode_status_blocking()?;
+    Ok(DesktopDebugQueueStatus { queue, live_mode })
+}
+
+fn debug_live_mode_status_blocking() -> Result<DesktopLiveModeDebugStatus, String> {
+    let state_root = default_state_root();
+    let store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state for Live Mode debug: {error}"))?;
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| format!("Could not load mounts for Live Mode debug: {error}"))?;
+    let Some(mount) = choose_mount(&mounts) else {
+        return Ok(DesktopLiveModeDebugStatus {
+            mount_id: None,
+            enabled: false,
+            state: "off".to_string(),
+            label: "Live Mode off".to_string(),
+            reason: None,
+            last_run_at: None,
+            tracked_files: Vec::new(),
+        });
+    };
+    let pending_changes = pending_changes_for_mount(&store, &state_root, &mount.mount_id)?;
+    let summary = mount_live_mode_summary(&store, Some(&mount), &pending_changes);
+    let tracked_files =
+        debug_live_mode_tracked_files_for_mount(&store, &state_root, &mount, &pending_changes)?;
+
+    Ok(DesktopLiveModeDebugStatus {
+        mount_id: Some(mount.mount_id.0),
+        enabled: summary.enabled,
+        state: summary.state,
+        label: summary.label,
+        reason: summary.reason,
+        last_run_at: summary.last_run_at,
+        tracked_files,
+    })
+}
+
+fn debug_live_mode_tracked_files_for_mount(
+    store: &SqliteStateStore,
+    state_root: &Path,
+    mount: &MountConfig,
+    pending_changes: &[PendingChange],
+) -> Result<Vec<DesktopLiveModeDebugFile>, String> {
+    let freshness_by_remote_id = store
+        .list_freshness_states(&mount.mount_id)
+        .map_err(|error| format!("Could not inspect Live Mode freshness state: {error}"))?
+        .into_iter()
+        .map(|freshness| (freshness.remote_id.clone(), freshness))
+        .collect::<BTreeMap<_, _>>();
+    let autosave_by_path = store
+        .list_auto_save_enrollments(&mount.mount_id)
+        .map_err(|error| format!("Could not inspect Live Mode file state: {error}"))?
+        .into_iter()
+        .map(|enrollment| (enrollment.path.clone(), enrollment))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = pending_changes
+        .iter()
+        .map(|change| PathBuf::from(&change.local_path))
+        .collect::<BTreeSet<_>>();
+    for enrollment in autosave_by_path.values() {
+        paths.insert(enrollment.path.clone());
+    }
+    for entity in store
+        .list_entities(&mount.mount_id)
+        .map_err(|error| format!("Could not inspect mounted files for Live Mode debug: {error}"))?
+    {
+        if entity.kind != EntityKind::Page {
+            continue;
+        }
+        if entity.hydration == HydrationState::Dirty
+            || entity.hydration == HydrationState::Conflicted
+        {
+            paths.insert(entity.path.clone());
+            continue;
+        }
+        if let Some(freshness) = freshness_by_remote_id.get(&entity.remote_id)
+            && (freshness.remote_hint_pending
+                || live_mode_target_is_recently_active(Some(freshness), live_mode_now_ms()))
+        {
+            paths.insert(entity.path.clone());
+        }
+    }
+
+    let access_root = mount_access_root(mount);
+    let mut files = Vec::new();
+    for path in paths.into_iter().take(120) {
+        let absolute = access_root.join(&path);
+        let status = match run_status(
+            store,
+            StatusOptions {
+                path: Some(absolute),
+                state_root: Some(state_root.to_path_buf()),
+                ..StatusOptions::default()
+            },
+        ) {
+            Ok(status) => status,
+            Err(_) => continue,
+        };
+        let Some(entry) = status
+            .mounts
+            .iter()
+            .find(|mount_status| mount_status.mount_id == mount.mount_id.0)
+            .and_then(|mount_status| mount_status.entries.first())
+        else {
+            continue;
+        };
+        let remote_id = RemoteId::new(entry.entity_id.clone());
+        let freshness = freshness_by_remote_id.get(&remote_id);
+        let enrollment = autosave_by_path.get(Path::new(&entry.path));
+        let now_ms = live_mode_now_ms();
+        let active_for_polling = live_mode_target_is_recently_active(freshness, now_ms);
+        let remote_check_due =
+            active_for_polling && live_mode_remote_check_is_due(freshness, now_ms);
+        files.push(DesktopLiveModeDebugFile {
+            path: entry.path.clone(),
+            title: entry.title.clone(),
+            remote_id: entry.entity_id.clone(),
+            hydration: format!("{:?}", entry.state).to_ascii_lowercase(),
+            status: pending_state_for_entry(entry).to_string(),
+            sync_state: format!("{:?}", entry.sync_state).to_ascii_lowercase(),
+            active_for_polling,
+            remote_check_due,
+            polling_reason: debug_live_mode_polling_reason(freshness, now_ms),
+            freshness_tier: freshness
+                .map(|freshness| format!("{:?}", freshness.tier).to_ascii_lowercase()),
+            last_checked_at: freshness.and_then(|freshness| freshness.last_checked_at.clone()),
+            last_opened_at: freshness.and_then(|freshness| freshness.last_opened_at.clone()),
+            last_local_change_at: freshness
+                .and_then(|freshness| freshness.last_local_change_at.clone()),
+            remote_hint_pending: freshness.is_some_and(|freshness| freshness.remote_hint_pending),
+            auto_save_state: enrollment
+                .map(|enrollment| format!("{:?}", enrollment.state).to_ascii_lowercase()),
+            auto_save_reason: enrollment.and_then(|enrollment| enrollment.last_reason.clone()),
+            issue_codes: entry
+                .issues
+                .iter()
+                .map(|issue| issue.code.clone())
+                .collect(),
+        });
+    }
+    files.sort_by(|left, right| {
+        debug_live_mode_file_rank(left)
+            .cmp(&debug_live_mode_file_rank(right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(files)
+}
+
+fn debug_live_mode_polling_reason(
+    freshness: Option<&FreshnessStateRecord>,
+    now_ms: u128,
+) -> Option<String> {
+    let freshness = freshness?;
+    if freshness.remote_hint_pending {
+        return Some("remote hint pending".to_string());
+    }
+    if live_mode_timestamp_is_within(
+        freshness.last_local_change_at.as_deref(),
+        now_ms,
+        LIVE_MODE_ACTIVE_TARGET_WINDOW,
+    ) {
+        return Some("recent local edit".to_string());
+    }
+    if live_mode_timestamp_is_within(
+        freshness.last_opened_at.as_deref(),
+        now_ms,
+        LIVE_MODE_ACTIVE_TARGET_WINDOW,
+    ) {
+        return Some("recently opened".to_string());
+    }
+    None
+}
+
+fn debug_live_mode_file_rank(file: &DesktopLiveModeDebugFile) -> u8 {
+    match file.status.as_str() {
+        "conflict" => 0,
+        "needs_review" | "pending_changes" => 1,
+        "remote_update_available" => 2,
+        _ if file.remote_hint_pending => 3,
+        _ => 4,
+    }
 }
 
 #[tauri::command]
@@ -806,6 +1118,29 @@ async fn create_desktop_mount(app: AppHandle, request: CreateDesktopMountRequest
     create_desktop_mount_command(app, request).await
 }
 
+#[tauri::command]
+async fn run_workspace_mount_onboarding(
+    app: AppHandle,
+    request: WorkspaceMountOnboardingRequest,
+) -> WorkspaceMountOnboardingReport {
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        run_workspace_mount_onboarding_blocking(request)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        workspace_mount_onboarding_report(
+            MacosWorkspaceMountOnboardingState::Failed,
+            format!("Mount onboarding worker failed: {error}"),
+            WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+            WorkspaceMountOnboardingLaunchStrategy::None,
+        )
+    });
+    if workspace_mount_onboarding_should_refresh_surfaces(&report) {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
 async fn create_desktop_mount_command(
     app: AppHandle,
     request: CreateDesktopMountRequest,
@@ -823,6 +1158,65 @@ async fn create_desktop_mount_command(
         refresh_desktop_surfaces(&app);
     }
     report
+}
+
+fn run_workspace_mount_onboarding_blocking(
+    request: WorkspaceMountOnboardingRequest,
+) -> WorkspaceMountOnboardingReport {
+    let action = match WorkspaceMountOnboardingAction::parse(request.action.trim()) {
+        Ok(action) => action,
+        Err(message) => {
+            return workspace_mount_onboarding_report(
+                MacosWorkspaceMountOnboardingState::Failed,
+                message,
+                WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+                WorkspaceMountOnboardingLaunchStrategy::None,
+            );
+        }
+    };
+
+    if matches!(action, WorkspaceMountOnboardingAction::AllowInMacos) {
+        #[cfg(target_os = "macos")]
+        {
+            let launch_strategy = launch_macos_file_provider_approval_surface();
+            return workspace_mount_onboarding_report(
+                MacosWorkspaceMountOnboardingState::ApprovalRequired,
+                workspace_mount_onboarding_curated_message(
+                    MacosWorkspaceMountOnboardingState::ApprovalRequired,
+                )
+                .expect("approval_required message"),
+                WorkspaceMountOnboardingPrimaryAction::CheckAgain,
+                launch_strategy,
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return workspace_mount_onboarding_report(
+                MacosWorkspaceMountOnboardingState::Failed,
+                "macOS File Provider approval is only available on macOS.",
+                WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+                WorkspaceMountOnboardingLaunchStrategy::None,
+            );
+        }
+    }
+
+    match create_desktop_mount_blocking(CreateDesktopMountRequest {
+        connector: "notion".to_string(),
+        path: request.path,
+        mount_id: "notion-main".to_string(),
+        connection_id: None,
+        read_only: false,
+        notion_root_page: None,
+        google_docs_workspace_folder: None,
+    }) {
+        Ok(message) => workspace_mount_onboarding_report(
+            MacosWorkspaceMountOnboardingState::Created,
+            message,
+            WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+            WorkspaceMountOnboardingLaunchStrategy::None,
+        ),
+        Err(message) => classify_workspace_mount_onboarding_failure(&message),
+    }
 }
 
 #[tauri::command]
@@ -1358,7 +1752,7 @@ where
     Sync: FnMut(&PendingChange, &Path) -> Result<(), String>,
     Check: FnMut(&LiveModeRemoteTarget) -> Result<(), String>,
     FastForward: FnMut(&LiveModeRemoteTarget) -> Result<(), String>,
-    Merge: FnMut(&PendingChange, &Path) -> Result<bool, String>,
+    Merge: FnMut(&PendingChange, &Path) -> Result<LiveModeRemoteDriftMerge, String>,
 {
     if !live_mode_has_mounted_folder(snapshot) {
         return ActionReport {
@@ -1417,7 +1811,7 @@ where
         }
         if live_mode_change_may_merge_remote_drift(change) {
             match merge_remote_drift(change, &target) {
-                Ok(true) => {
+                Ok(LiveModeRemoteDriftMerge::Clean) => {
                     if let Err(message) = sync_target(change, &target) {
                         return ActionReport { ok: false, message };
                     }
@@ -1427,7 +1821,16 @@ where
                             .to_string(),
                     };
                 }
-                Ok(false) => {}
+                Ok(LiveModeRemoteDriftMerge::ConflictMarkersWritten) => {
+                    return ActionReport {
+                        ok: true,
+                        message: format!(
+                            "Live Mode pulled remote updates for `{}` and wrote conflict markers for review.",
+                            change.title
+                        ),
+                    };
+                }
+                Ok(LiveModeRemoteDriftMerge::Unchanged) => {}
                 Err(message) => return ActionReport { ok: false, message },
             }
         }
@@ -1653,8 +2056,6 @@ fn live_mode_failure_should_pause(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     message.starts_with("Live Mode paused for")
         || message.contains("Review required before pushing")
-        || lower.contains("conflict")
-        || lower.contains("changed since last sync")
         || lower.contains("could not identify the remote page")
 }
 
@@ -2061,10 +2462,17 @@ fn live_mode_send_daemon_queue_request(request: DaemonRequest) -> Result<(), Str
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveModeRemoteDriftMerge {
+    Unchanged,
+    Clean,
+    ConflictMarkersWritten,
+}
+
 fn live_mode_merge_remote_drift_target(
     _change: &PendingChange,
     target: &Path,
-) -> Result<bool, String> {
+) -> Result<LiveModeRemoteDriftMerge, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
@@ -2075,14 +2483,16 @@ fn live_mode_merge_remote_drift_target(
         .find_entity_by_path(&mount.mount_id, &relative_path)
         .map_err(|error| format!("Live Mode could not inspect local metadata: {error}"))?
     else {
-        return Ok(false);
+        return Ok(LiveModeRemoteDriftMerge::Unchanged);
     };
     if entity.kind != EntityKind::Page {
-        return Ok(false);
+        return Ok(LiveModeRemoteDriftMerge::Unchanged);
     }
     let previous_shadow = match store.load_shadow(&mount.mount_id, &entity.remote_id) {
         Ok(shadow) => shadow,
-        Err(locality_store::StoreError::ShadowMissing { .. }) => return Ok(false),
+        Err(locality_store::StoreError::ShadowMissing { .. }) => {
+            return Ok(LiveModeRemoteDriftMerge::Unchanged);
+        }
         Err(error) => {
             return Err(format!(
                 "Live Mode could not inspect the current page shadow: {error}"
@@ -2103,7 +2513,7 @@ fn live_mode_merge_remote_drift_target(
         ))
         .map_err(|error| format!("Live Mode could not inspect Notion changes: {error}"))?;
     if rendered.shadow == previous_shadow {
-        return Ok(false);
+        return Ok(LiveModeRemoteDriftMerge::Unchanged);
     }
 
     let output_root = live_mode_projection_output_root(&state_root, &mount);
@@ -2128,22 +2538,20 @@ fn live_mode_merge_remote_drift_target(
     })?;
     let remote_document =
         document_with_absolute_media_hrefs(&rendered.document, &entity.path, &output_root);
-    let Some(merged) = live_mode_merge_remote_drift_markdown(
+    let merge = live_mode_merge_remote_drift_markdown(
         &local_contents,
         previous_shadow.rendered_body.as_str(),
         &remote_document,
-    ) else {
-        return Ok(false);
-    };
+    );
 
-    write_file_atomic(&read_path, merged.as_bytes()).map_err(|error| {
+    write_file_atomic(&read_path, merge.markdown.as_bytes()).map_err(|error| {
         format!(
             "Live Mode could not write `{}`: {error}",
             read_path.display()
         )
     })?;
     if read_path != target && target.exists() {
-        write_file_atomic(&target, merged.as_bytes()).map_err(|error| {
+        write_file_atomic(&target, merge.markdown.as_bytes()).map_err(|error| {
             format!(
                 "Live Mode could not refresh visible file `{}`: {error}",
                 target.display()
@@ -2155,7 +2563,11 @@ fn live_mode_merge_remote_drift_target(
         .save_shadow(&mount.mount_id, rendered.shadow.clone())
         .map_err(|error| format!("Live Mode could not update local shadow: {error}"))?;
     if entity.hydration.can_transition_to(&HydrationState::Dirty) {
-        entity.hydration = HydrationState::Dirty;
+        entity.hydration = if merge.has_conflicts {
+            HydrationState::Conflicted
+        } else {
+            HydrationState::Dirty
+        };
     }
     entity.content_hash = Some(rendered.shadow.body_hash.clone());
     if rendered.remote_edited_at.is_some() {
@@ -2167,20 +2579,30 @@ fn live_mode_merge_remote_drift_target(
     save_live_mode_remote_observation(&mut store, &mount, &entity, rendered.remote_edited_at)?;
     clear_live_mode_remote_hint(&mut store, &mount.mount_id, &entity.remote_id)?;
 
-    Ok(true)
+    if merge.has_conflicts {
+        Ok(LiveModeRemoteDriftMerge::ConflictMarkersWritten)
+    } else {
+        Ok(LiveModeRemoteDriftMerge::Clean)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveModeRemoteDriftMarkdownMerge {
+    markdown: String,
+    has_conflicts: bool,
 }
 
 fn live_mode_merge_remote_drift_markdown(
     local_contents: &str,
     base_body: &str,
     remote_document: &locality_core::model::CanonicalDocument,
-) -> Option<String> {
+) -> LiveModeRemoteDriftMarkdownMerge {
     let merged =
         render_inline_conflict_markdown_with_base(local_contents, Some(base_body), remote_document);
-    if has_unresolved_conflict_markers(&merged) {
-        return None;
+    LiveModeRemoteDriftMarkdownMerge {
+        has_conflicts: has_unresolved_conflict_markers(&merged),
+        markdown: merged,
     }
-    Some(merged)
 }
 
 fn live_mode_projection_output_root(state_root: &Path, mount: &MountConfig) -> PathBuf {
@@ -2927,6 +3349,13 @@ fn pending_changes_for_mount(
     state_root: &Path,
     mount_id: &MountId,
 ) -> Result<Vec<PendingChange>, String> {
+    if let Ok(mut repair_store) = SqliteStateStore::open(state_root.to_path_buf()) {
+        let _ = repair_clean_remote_deleted_projections(
+            &mut repair_store,
+            Some(state_root),
+            Some(mount_id),
+        );
+    }
     let status = run_status(
         store,
         StatusOptions {
@@ -6728,12 +7157,6 @@ fn macos_file_provider_mount_root_health_error(root: &Path, details: &str) -> Op
             root.display()
         ));
     }
-    if !details.contains("itemIdentifier") {
-        return Some(format!(
-            "The macOS File Provider mount root `{}` is not provider-owned yet. Open Locality in Finder once the File Provider domain is ready, then reconnect Notion.",
-            root.display()
-        ));
-    }
     None
 }
 
@@ -7944,6 +8367,151 @@ fn recoverable_macos_file_provider_activation_error(message: &str) -> bool {
     message.contains("The application cannot be used right now")
         || message.contains("locality-file-providerctl was not found")
         || message.contains("registered but not enabled")
+        || message.contains("did not return a CloudStorage URL")
+        || message.contains("macOS has not created")
+}
+
+fn workspace_mount_onboarding_report(
+    state: MacosWorkspaceMountOnboardingState,
+    message: impl Into<String>,
+    primary_action: WorkspaceMountOnboardingPrimaryAction,
+    launch_strategy: WorkspaceMountOnboardingLaunchStrategy,
+) -> WorkspaceMountOnboardingReport {
+    WorkspaceMountOnboardingReport {
+        state: state.as_str().to_string(),
+        message: message.into(),
+        primary_action: primary_action.as_str().to_string(),
+        launch_strategy: launch_strategy.as_str().to_string(),
+    }
+}
+
+fn workspace_mount_onboarding_curated_message(
+    state: MacosWorkspaceMountOnboardingState,
+) -> Option<&'static str> {
+    match state {
+        MacosWorkspaceMountOnboardingState::ApprovalRequired => {
+            Some("Enable Locality in Finder, then return here and click Check again.")
+        }
+        MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot => {
+            Some("Locality is still waiting for the CloudStorage folder to appear.")
+        }
+        _ => None,
+    }
+}
+
+fn workspace_mount_onboarding_should_refresh_surfaces(
+    report: &WorkspaceMountOnboardingReport,
+) -> bool {
+    report.state == MacosWorkspaceMountOnboardingState::Created.as_str()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_workspace_mount_onboarding_state(
+    message: &str,
+    user_enabled: bool,
+) -> Option<MacosWorkspaceMountOnboardingState> {
+    if message.contains("registered but not enabled") {
+        return Some(MacosWorkspaceMountOnboardingState::ApprovalRequired);
+    }
+    if user_enabled
+        && (message.contains("did not return a CloudStorage URL")
+            || message.contains("macOS has not created"))
+    {
+        return Some(MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot);
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_workspace_mount_onboarding_state(
+    _message: &str,
+    _user_enabled: bool,
+) -> Option<MacosWorkspaceMountOnboardingState> {
+    None
+}
+
+fn classify_workspace_mount_onboarding_failure(message: &str) -> WorkspaceMountOnboardingReport {
+    #[cfg(target_os = "macos")]
+    {
+        if recoverable_macos_file_provider_activation_error(message) {
+            let user_enabled = macos_workspace_mount_domain_user_enabled().unwrap_or(false);
+            if let Some(state) = macos_workspace_mount_onboarding_state(message, user_enabled) {
+                let primary_action = match state {
+                    MacosWorkspaceMountOnboardingState::ApprovalRequired => {
+                        WorkspaceMountOnboardingPrimaryAction::AllowInMacos
+                    }
+                    MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot => {
+                        WorkspaceMountOnboardingPrimaryAction::CheckAgain
+                    }
+                    _ => WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+                };
+                return workspace_mount_onboarding_report(
+                    state,
+                    workspace_mount_onboarding_curated_message(state).unwrap_or(message),
+                    primary_action,
+                    WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+                );
+            }
+        }
+    }
+
+    workspace_mount_onboarding_report(
+        MacosWorkspaceMountOnboardingState::Failed,
+        message,
+        WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+        WorkspaceMountOnboardingLaunchStrategy::None,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
+    let report =
+        run_macos_file_provider_helper("list", Vec::new()).map_err(|error| error.message())?;
+    Ok(report
+        .helper_report
+        .get("domains")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|domains| {
+            domains.iter().find(|domain| {
+                domain.get("identifier").and_then(serde_json::Value::as_str)
+                    == Some(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+            })
+        })
+        .and_then(|domain| domain.get("userEnabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_approval_surface_path(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|path| path.exists()).cloned()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_file_provider_approval_surface_path(_candidates: &[PathBuf]) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn launch_macos_file_provider_approval_surface() -> WorkspaceMountOnboardingLaunchStrategy {
+    if let Some(path) =
+        macos_file_provider_approval_surface_path(&macos_file_provider_cloud_storage_roots())
+    {
+        if open_in_file_manager(&path).is_ok() {
+            return WorkspaceMountOnboardingLaunchStrategy::OpenFinder;
+        }
+    }
+    WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch_macos_file_provider_approval_surface() -> WorkspaceMountOnboardingLaunchStrategy {
+    WorkspaceMountOnboardingLaunchStrategy::None
 }
 
 fn connection_metadata_key(
@@ -8933,6 +9501,8 @@ fn env_first(keys: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::LiveModeRemoteDriftMerge;
+
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -8940,7 +9510,7 @@ mod tests {
 
     use loc_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
     use locality_core::canonical::render_canonical_markdown;
-    use locality_core::freshness::FreshnessTier;
+    use locality_core::freshness::{FreshnessTier, RemoteVersion};
     use locality_core::journal::{JournalEntry, JournalStatus, PushId};
     use locality_core::model::{
         CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
@@ -8953,7 +9523,7 @@ mod tests {
         FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
         LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
         MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
-        ShadowRepository, SqliteStateStore,
+        RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
@@ -9635,12 +10205,30 @@ mod tests {
             &local,
             "Intro.\n\nOld middle.\n\nFooter.\n",
             &remote,
-        )
-        .expect("non-overlapping changes merge cleanly");
+        );
 
-        assert!(!has_unresolved_conflict_markers(&merged));
-        assert!(merged.contains("Remote intro."));
-        assert!(merged.contains("Local middle."));
+        assert!(!merged.has_conflicts);
+        assert!(!has_unresolved_conflict_markers(&merged.markdown));
+        assert!(merged.markdown.contains("Remote intro."));
+        assert!(merged.markdown.contains("Local middle."));
+    }
+
+    #[test]
+    fn live_mode_merge_remote_drift_materializes_conflict_markers_for_overlapping_changes() {
+        let frontmatter = "title: Roadmap\n".to_string();
+        let local = render_canonical_markdown(&CanonicalDocument::new(
+            frontmatter.clone(),
+            "Local intro.\n\nFooter.\n".to_string(),
+        ));
+        let remote = CanonicalDocument::new(frontmatter, "Remote intro.\n\nFooter.\n".to_string());
+
+        let merged =
+            live_mode_merge_remote_drift_markdown(&local, "Base intro.\n\nFooter.\n", &remote);
+
+        assert!(merged.has_conflicts);
+        assert!(has_unresolved_conflict_markers(&merged.markdown));
+        assert!(merged.markdown.contains("Local intro."));
+        assert!(merged.markdown.contains("Remote intro."));
     }
 
     #[test]
@@ -9827,7 +10415,7 @@ mod tests {
             |_| panic!("mergeable local+remote drift should not queue remote fast-forward"),
             |change, target| {
                 merged.push((change.title.clone(), target.to_path_buf()));
-                Ok(true)
+                Ok(LiveModeRemoteDriftMerge::Clean)
             },
         );
 
@@ -9841,6 +10429,42 @@ mod tests {
         assert_eq!(merged[0].0, "Roadmap");
         assert!(merged[0].1.ends_with("Engineering/Roadmap/page.md"));
         assert_eq!(synced[0].1, merged[0].1);
+    }
+
+    #[test]
+    fn live_mode_tick_keeps_running_after_writing_conflict_markers() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes = vec![PendingChange {
+            mount_id: "notion-main".to_string(),
+            entity_id: "roadmap-page".to_string(),
+            title: "Roadmap".to_string(),
+            local_path: "Engineering/Roadmap/page.md".to_string(),
+            summary: "remote changed while local edits are pending".to_string(),
+            state: "needs_review".to_string(),
+            issue_codes: vec!["remote_changed_with_local_pending".to_string()],
+            live_mode: sample_live_mode_status(true),
+        }];
+        let mut merged = Vec::new();
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            &[],
+            |_, _| panic!("conflicted local+remote drift should not push"),
+            |_| panic!("conflicted local+remote drift should not use remote pull cursor"),
+            |_| panic!("conflicted local+remote drift should not queue remote fast-forward"),
+            |change, target| {
+                merged.push((change.title.clone(), target.to_path_buf()));
+                Ok(LiveModeRemoteDriftMerge::ConflictMarkersWritten)
+            },
+        );
+
+        assert!(report.ok);
+        assert_eq!(
+            report.message,
+            "Live Mode pulled remote updates for `Roadmap` and wrote conflict markers for review."
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0, "Roadmap");
     }
 
     #[test]
@@ -10415,6 +11039,170 @@ mod tests {
     }
 
     #[test]
+    fn workspace_mount_onboarding_treats_cloudstorage_delay_as_recoverable_after_approval() {
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            "Could not open macOS File Provider domain `loc`: locality-file-providerctl did not return a CloudStorage URL"
+        ));
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            "Could not open macOS File Provider domain `loc`: File Provider domain loc exists but macOS has not created /Users/test/Library/CloudStorage/Locality"
+        ));
+    }
+
+    #[test]
+    fn macos_file_provider_approval_surface_path_uses_first_existing_candidate() {
+        let temp = TestTempDir::new("approval-surface");
+        let missing = temp.path().join("Library/CloudStorage/Locality");
+        let existing = temp.path().join("Library/CloudStorage/Locality-Locality");
+        fs::create_dir_all(&existing).expect("create fallback root");
+
+        let expected = if cfg!(target_os = "macos") {
+            Some(existing.clone())
+        } else {
+            None
+        };
+
+        assert_eq!(
+            super::macos_file_provider_approval_surface_path(&[missing, existing]),
+            expected
+        );
+    }
+
+    #[test]
+    fn macos_workspace_mount_onboarding_state_requires_approval_when_domain_is_disabled() {
+        let expected = if cfg!(target_os = "macos") {
+            Some(super::MacosWorkspaceMountOnboardingState::ApprovalRequired)
+        } else {
+            None
+        };
+
+        assert_eq!(
+            super::macos_workspace_mount_onboarding_state(
+                "Could not open macOS File Provider domain `loc`: The Locality File Provider is registered but not enabled.",
+                false,
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn macos_workspace_mount_onboarding_state_waits_for_cloudstorage_root_when_enabled() {
+        let expected = if cfg!(target_os = "macos") {
+            Some(super::MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot)
+        } else {
+            None
+        };
+
+        assert_eq!(
+            super::macos_workspace_mount_onboarding_state(
+                "Could not open macOS File Provider domain `loc`: locality-file-providerctl did not return a CloudStorage URL",
+                true,
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_preserves_application_unavailable_guidance() {
+        let message = "Could not register macOS File Provider: The application cannot be used right now. The Locality macOS File Provider app or extension is not available to macOS. For local development, run `make install-macos-file-provider`, then reopen Locality and enable the File Provider if macOS asks.";
+
+        assert!(super::recoverable_macos_file_provider_activation_error(
+            message
+        ));
+
+        let report = super::classify_workspace_mount_onboarding_failure(message);
+        assert_eq!(report.state, "failed");
+        assert_eq!(report.primary_action, "retry_setup");
+        assert_eq!(report.launch_strategy, "none");
+        assert_eq!(report.message, message);
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_curated_message_matches_recoverable_state() {
+        assert_eq!(
+            super::workspace_mount_onboarding_curated_message(
+                super::MacosWorkspaceMountOnboardingState::ApprovalRequired
+            ),
+            Some("Enable Locality in Finder, then return here and click Check again.")
+        );
+        assert_eq!(
+            super::workspace_mount_onboarding_curated_message(
+                super::MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot
+            ),
+            Some("Locality is still waiting for the CloudStorage folder to appear.")
+        );
+        assert_eq!(
+            super::workspace_mount_onboarding_curated_message(
+                super::MacosWorkspaceMountOnboardingState::Created
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_refreshes_surfaces_only_for_created_reports() {
+        let created = super::workspace_mount_onboarding_report(
+            super::MacosWorkspaceMountOnboardingState::Created,
+            "Mount ready.",
+            super::WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+            super::WorkspaceMountOnboardingLaunchStrategy::None,
+        );
+        let waiting = super::workspace_mount_onboarding_report(
+            super::MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot,
+            "Locality is still waiting for the CloudStorage folder to appear.",
+            super::WorkspaceMountOnboardingPrimaryAction::CheckAgain,
+            super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+        );
+        let failed = super::workspace_mount_onboarding_report(
+            super::MacosWorkspaceMountOnboardingState::Failed,
+            "Mount failed.",
+            super::WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+            super::WorkspaceMountOnboardingLaunchStrategy::None,
+        );
+
+        assert!(super::workspace_mount_onboarding_should_refresh_surfaces(
+            &created
+        ));
+        assert!(!super::workspace_mount_onboarding_should_refresh_surfaces(
+            &waiting
+        ));
+        assert!(!super::workspace_mount_onboarding_should_refresh_surfaces(
+            &failed
+        ));
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_report_uses_retry_setup_for_failed_state() {
+        let report = super::workspace_mount_onboarding_report(
+            super::MacosWorkspaceMountOnboardingState::Failed,
+            "Could not load the top-level Notion folder.",
+            super::WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+            super::WorkspaceMountOnboardingLaunchStrategy::None,
+        );
+
+        assert_eq!(report.state, "failed");
+        assert_eq!(report.primary_action, "retry_setup");
+        assert_eq!(report.launch_strategy, "none");
+        assert_eq!(
+            report.message,
+            "Could not load the top-level Notion folder."
+        );
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_report_uses_check_again_for_waiting_root() {
+        let report = super::workspace_mount_onboarding_report(
+            super::MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot,
+            "Locality is still waiting for the CloudStorage folder to appear.",
+            super::WorkspaceMountOnboardingPrimaryAction::CheckAgain,
+            super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+        );
+
+        assert_eq!(report.state, "waiting_for_cloudstorage_root");
+        assert_eq!(report.primary_action, "check_again");
+        assert_eq!(report.launch_strategy, "instructions_only");
+    }
+
+    #[test]
     fn tray_popover_hides_only_when_tray_window_loses_focus() {
         assert!(should_hide_tray_popover(
             "tray",
@@ -10668,6 +11456,23 @@ mod tests {
                 displayName = notion;
                 isUploaded = 1;
                 itemIdentifier = "m:bm90aW9uLW1haW4:bW91bnQ6bm90aW9uLW1haW4";
+              }
+            );
+        "#;
+
+        assert_eq!(
+            macos_file_provider_mount_root_health_error(Path::new("/tmp/Locality/notion"), details),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_mount_root_health_accepts_missing_item_identifier() {
+        let details = r#"
+            fileproviderItems = (
+              {
+                displayName = notion;
+                isUploaded = 1;
               }
             );
         "#;
@@ -11081,6 +11886,96 @@ mod tests {
         assert_eq!(changes[0].state, "needs_review");
         assert_eq!(changes[0].summary, "remote page deleted or unavailable");
         assert_eq!(changes[0].issue_codes, vec!["remote_deleted"]);
+    }
+
+    #[test]
+    fn pending_changes_repairs_clean_stale_remote_deleted_page() {
+        let temp = TestTempDir::new("desktop-pending-repairs-clean-remote-delete");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("notion"),
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+        let remote_id = RemoteId::new("page-1");
+        let relative_path = PathBuf::from("Roadmap/page.md");
+        let page_path = mount.root.join(&relative_path);
+        let content_path =
+            localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount.mount_id)
+                .join(&relative_path);
+        fs::create_dir_all(page_path.parent().expect("page parent")).expect("create page parent");
+        fs::create_dir_all(content_path.parent().expect("content parent"))
+            .expect("create content parent");
+        let file_frontmatter = "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: remote-v1\ntitle: Roadmap\n";
+        let shadow_frontmatter = "loc:\n  id: page-1\n  type: page\ntitle: Roadmap\n";
+        let body = "# Roadmap\n\nOriginal body.\n";
+        let rendered = render_canonical_markdown(&CanonicalDocument::new(file_frontmatter, body));
+        fs::write(&page_path, &rendered).expect("write clean visible page");
+        fs::write(&content_path, rendered).expect("write clean content cache");
+
+        let shadow = ShadowDocument::from_synced_body(
+            remote_id.clone(),
+            body,
+            7,
+            [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+        )
+        .expect("shadow")
+        .with_frontmatter(shadow_frontmatter);
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount.mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    relative_path.clone(),
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_remote_edited_at("remote-v1"),
+            )
+            .expect("save entity");
+        store
+            .save_shadow(&mount.mount_id, shadow)
+            .expect("save shadow");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount.mount_id.clone(),
+                    remote_id.clone(),
+                    FreshnessTier::Hot,
+                )
+                .remote_hint_pending(true),
+            )
+            .expect("save freshness");
+        store
+            .save_remote_observation(
+                RemoteObservationRecord::new(
+                    mount.mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    relative_path.clone(),
+                    "unix_ms:1",
+                )
+                .with_remote_version(RemoteVersion::new("remote-v2"))
+                .deleted(true),
+            )
+            .expect("save observation");
+
+        let changes = super::pending_changes_for_mount(&store, temp.path(), &mount.mount_id)
+            .expect("pending changes");
+
+        assert!(changes.is_empty());
+        assert!(!page_path.exists());
+        assert!(!content_path.exists());
+        assert!(
+            store
+                .get_entity(&mount.mount_id, &remote_id)
+                .expect("get entity")
+                .is_none()
+        );
     }
 
     #[test]
@@ -12628,6 +13523,7 @@ fn main() {
             ensure_terminal_cli_available,
             create_workspace_mount,
             create_desktop_mount,
+            run_workspace_mount_onboarding,
             install_agent_guidance,
             locate_notion_page,
             search_notion_pages,

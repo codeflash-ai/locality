@@ -220,17 +220,18 @@ Design notes:
 - Add a quiet proof point that the local machine talks directly to the connected
   app and workspace content is not routed through a backend.
 
-### 4. Choose Local Folder
+### 4. Create Local Folder
 
-Purpose: preserve the existing mount setup and make the CloudStorage root clear.
+Purpose: keep the CloudStorage root clear without asking the user to choose a
+path during onboarding.
 
 Primary copy:
 
 ```text
-Choose where your files appear.
+Creating your local folder.
 
-Locality keeps your connected apps under one CloudStorage root. Agents and
-Finder will use this folder.
+Locality creates your connected apps under one CloudStorage root. Agents and
+Finder will use this folder automatically.
 ```
 
 Default path:
@@ -239,7 +240,7 @@ Default path:
 ~/Library/CloudStorage/Locality/notion
 ```
 
-Primary action: `Create Local Folder`
+Entry action: advance here automatically after Notion is connected.
 
 Mounting state:
 
@@ -250,9 +251,12 @@ Preparing Notion files and agent guidance.
 
 Design notes:
 
-- Keep the action disabled/busy while mounting so it cannot be clicked twice.
+- Use the default CloudStorage mount root. Do not prompt for a folder choice in
+  onboarding unless the automatic mount creation fails and needs recovery.
+- Keep retry affordances disabled/busy while mounting so setup cannot start
+  twice.
 - Do not show a folder-layout preview here; screen 2 already teaches the file
-  structure. Keep this step focused on the mount location and busy state.
+  structure. Keep this step focused on the mount busy state.
 - If macOS asks for File Provider access here instead of screen 1, the screen
   should say "macOS will ask Locality to enable the local file bridge."
 
@@ -305,7 +309,7 @@ Design notes:
 | Current | Proposed |
 | --- | --- |
 | Let your agents edit Notion as local files. | Your work apps, as local files for agents. |
-| Where should your Notion files appear? | Choose where your files appear. |
+| Where should your Notion files appear? | Creating your local folder. |
 | The Notion folder will include AGENTS.md and CLAUDE.md. | Locality adds agent guidance so tools know what is safe to edit. |
 | Open Notion Folder | Open Locality Folder |
 | Agents can use Locality | Agents are ready to use this folder |
@@ -315,7 +319,7 @@ Design notes:
 - File Provider permission not granted.
 - Notion OAuth denied or timed out.
 - Browser failed to open, with copy login link fallback.
-- Folder path invalid, non-empty, or outside the user home.
+- Automatic folder creation failed.
 - Mount creation in progress.
 - Agent guidance install partial failure.
 - Ready state with Live Mode off.

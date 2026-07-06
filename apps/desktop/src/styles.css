@@ -118,6 +118,11 @@ p {
     linear-gradient(180deg, #f7faf9 0%, var(--bg) 100%);
 }
 
+.setup-window {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 .window-chrome {
   display: grid;
   grid-template-columns: 90px 1fr 90px;
@@ -206,8 +211,19 @@ p {
   align-content: center;
   gap: 22px;
   justify-content: center;
-  min-height: calc(100vh - 38px);
   padding: 64px 78px;
+}
+
+.setup-window > .setup-scrollport {
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.setup-scrollport > .setup-content {
+  min-height: 100%;
 }
 
 .setup-content.split-setup {
@@ -1166,6 +1182,7 @@ p {
   font-size: 11px;
   font-weight: 700;
   line-height: 1.38;
+  overflow-wrap: anywhere;
 }
 
 .agent-guidance-card {
@@ -2700,6 +2717,11 @@ p {
   gap: 12px;
 }
 
+.debug-live-mode-section {
+  max-height: 420px;
+  overflow: auto;
+}
+
 .debug-queue-section-header {
   display: flex;
   align-items: center;
@@ -2710,6 +2732,12 @@ p {
 
 .debug-queue-section-header h3 {
   font-size: 14px;
+}
+
+.debug-live-mode-reason {
+  max-width: 720px;
+  margin-top: 6px;
+  color: var(--subtle) !important;
 }
 
 .debug-queue-row {

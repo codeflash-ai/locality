@@ -21,7 +21,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: release-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -104,8 +104,6 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       PUBLISH_CHANNEL: release
-      PUBLISH_REQUIRE_SIGNING: "1"
-      LOCALITY_WINDOWS_EXTERNAL_CODESIGN: "1"
       PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
       TAURI_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/latest/download/latest-windows.json
       TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
@@ -173,13 +171,7 @@ jobs:
           $missing = @()
           foreach ($name in @(
             "TAURI_UPDATER_PUBKEY",
-            "TAURI_SIGNING_PRIVATE_KEY",
-            "AZURE_CLIENT_ID",
-            "AZURE_TENANT_ID",
-            "AZURE_SUBSCRIPTION_ID",
-            "AZURE_ARTIFACT_SIGNING_ENDPOINT",
-            "AZURE_ARTIFACT_SIGNING_ACCOUNT",
-            "AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE"
+            "TAURI_SIGNING_PRIVATE_KEY"
           )) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
               $missing += $name
@@ -190,7 +182,46 @@ jobs:
             exit 1
           }
 
+      - name: Configure Authenticode signing
+        id: windows-signing
+        shell: pwsh
+        run: |
+          $azureNames = @(
+            "AZURE_CLIENT_ID",
+            "AZURE_TENANT_ID",
+            "AZURE_SUBSCRIPTION_ID",
+            "AZURE_ARTIFACT_SIGNING_ENDPOINT",
+            "AZURE_ARTIFACT_SIGNING_ACCOUNT",
+            "AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE"
+          )
+
+          $missing = @()
+          $present = @()
+          foreach ($name in $azureNames) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              $missing += $name
+            } else {
+              $present += $name
+            }
+          }
+
+          if ($present.Count -eq $azureNames.Count) {
+            "enabled=true" >> $env:GITHUB_OUTPUT
+            "PUBLISH_REQUIRE_SIGNING=1" >> $env:GITHUB_ENV
+            "LOCALITY_WINDOWS_EXTERNAL_CODESIGN=1" >> $env:GITHUB_ENV
+            Write-Host "Azure Artifact Signing is configured; Windows Authenticode signing enabled."
+          } elseif ($present.Count -eq 0) {
+            "enabled=false" >> $env:GITHUB_OUTPUT
+            "PUBLISH_REQUIRE_SIGNING=0" >> $env:GITHUB_ENV
+            "LOCALITY_WINDOWS_EXTERNAL_CODESIGN=" >> $env:GITHUB_ENV
+            Write-Warning "Azure Artifact Signing secrets are not configured; publishing unsigned Windows installer assets."
+          } else {
+            Write-Error "Partial Azure Artifact Signing configuration. Missing: $($missing -join ', ')"
+            exit 1
+          }
+
       - name: Azure login
+        if: steps.windows-signing.outputs.enabled == 'true'
         uses: azure/login@v3
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
@@ -204,6 +235,7 @@ jobs:
         run: ./apps/desktop/scripts/prepare-windows-bundle.ps1
 
       - name: Sign Windows sidecars
+        if: steps.windows-signing.outputs.enabled == 'true'
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: ${{ env.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -215,6 +247,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Validate signed Windows sidecars
+        if: steps.windows-signing.outputs.enabled == 'true'
         shell: pwsh
         run: |
           . ./scripts/windows-codesign.ps1
@@ -230,6 +263,7 @@ jobs:
         run: ./scripts/publish-windows.ps1
 
       - name: Sign Windows installers
+        if: steps.windows-signing.outputs.enabled == 'true'
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: ${{ env.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
@@ -241,6 +275,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Validate signed Windows installers
+        if: steps.windows-signing.outputs.enabled == 'true'
         shell: pwsh
         run: |
           . ./scripts/windows-codesign.ps1
@@ -250,12 +285,23 @@ jobs:
             "$hash  $($_.Name)" | Set-Content -Encoding ascii -LiteralPath "$($_.FullName).sha256"
           }
 
+      - name: Refresh Windows updater signatures
+        if: steps.windows-signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          Get-ChildItem target/release/bundle/windows -Filter *.exe -File | ForEach-Object {
+            npm --prefix apps/desktop run tauri -- signer sign $_.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "failed to refresh updater signature for $($_.FullName)"
+            }
+          }
+
       - name: Render Windows updater manifest
         shell: bash
         env:
           GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
           UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-windows.json
-          UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip
+          UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe
           UPDATER_NOTES: Locality ${{ env.APP_VERSION }} Windows update.
         run: scripts/render-tauri-updater-manifest.sh
 
@@ -264,7 +310,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path target/release/github-assets | Out-Null
           Copy-Item target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe* target/release/github-assets/
-          Copy-Item target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip* target/release/github-assets/
           Copy-Item target/release/bundle/updater/latest-windows.json target/release/github-assets/
           Get-ChildItem target/release/github-assets -File |
             Sort-Object Name |

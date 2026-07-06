@@ -48,7 +48,18 @@ import {
   type ProviderRuntimeSummary,
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
-import { classifyMountSetupError, type MountSetupError } from "./onboarding-errors";
+import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
+import { classifyMountSetupError } from "./onboarding-errors";
+import {
+  failedMountOnboardingReport,
+  mountOnboardingHeadline,
+  mountOnboardingInstructions,
+  mountOnboardingNeedsInstructions,
+  mountOnboardingNextAction,
+  mountOnboardingPrimaryLabel,
+  mountOnboardingSupplementaryNote,
+  type WorkspaceMountOnboardingReport,
+} from "./onboarding-mount";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
@@ -125,6 +136,37 @@ type DebugQueueStatus = {
   schedulerMode: string;
   activeIntervalMs: number;
   coldIntervalMs: number;
+  liveMode: DebugLiveModeStatus;
+};
+
+type DebugLiveModeStatus = {
+  mountId?: string | null;
+  enabled: boolean;
+  state: string;
+  label: string;
+  reason?: string | null;
+  lastRunAt?: string | null;
+  trackedFiles: DebugLiveModeFile[];
+};
+
+type DebugLiveModeFile = {
+  path: string;
+  title: string;
+  remoteId: string;
+  hydration: string;
+  status: string;
+  syncState: string;
+  activeForPolling: boolean;
+  remoteCheckDue: boolean;
+  pollingReason?: string | null;
+  freshnessTier?: string | null;
+  lastCheckedAt?: string | null;
+  lastOpenedAt?: string | null;
+  lastLocalChangeAt?: string | null;
+  remoteHintPending: boolean;
+  autoSaveState?: string | null;
+  autoSaveReason?: string | null;
+  issueCodes: string[];
 };
 
 type DebugQueueActive = {
@@ -442,6 +484,35 @@ const sampleDebugQueueStatus: DebugQueueStatus = {
   schedulerMode: "polling",
   activeIntervalMs: 5000,
   coldIntervalMs: 60000,
+  liveMode: {
+    mountId: "notion-main",
+    enabled: true,
+    state: "syncing",
+    label: "Live Mode syncing",
+    reason: null,
+    lastRunAt: "unix_ms:1782033299158",
+    trackedFiles: [
+      {
+        path: "Launch Plan/page.md",
+        title: "Launch Plan",
+        remoteId: "launch-plan",
+        hydration: "dirty",
+        status: "pending_changes",
+        syncState: "pendinglocalchanges",
+        activeForPolling: true,
+        remoteCheckDue: true,
+        pollingReason: "recent local edit",
+        freshnessTier: "immediate",
+        lastCheckedAt: "unix_ms:1782033299158",
+        lastOpenedAt: "unix_ms:1782033285000",
+        lastLocalChangeAt: "unix_ms:1782033290000",
+        remoteHintPending: false,
+        autoSaveState: "active",
+        autoSaveReason: null,
+        issueCodes: ["local_body_changed"],
+      },
+    ],
+  },
 };
 
 const loadingSnapshot: DesktopSnapshot = {
@@ -1097,10 +1168,12 @@ function Onboarding({
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
-  const [mountError, setMountError] = useState<MountSetupError | null>(null);
+  const [mountOnboarding, setMountOnboarding] = useState<WorkspaceMountOnboardingReport | null>(null);
   const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
+  const mountStartRequestedRef = useRef(false);
+  const connectionReadyNow = oauthReady || connectionReady(snapshot);
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -1181,6 +1254,23 @@ function Onboarding({
   }, [snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
 
   useEffect(() => {
+    if (
+      !shouldAutoCreateMount({
+        step,
+        connectionReady: connectionReadyNow,
+        mountMissing: mountMissing(snapshot),
+        mounting,
+        hasMountError: mountOnboarding !== null,
+        mountPath,
+        startRequested: mountStartRequestedRef.current,
+      })
+    ) {
+      return;
+    }
+    void runMountOnboarding("start");
+  }, [connectionReadyNow, mountOnboarding, mountPath, mounting, snapshot.mount.status, step]);
+
+  useEffect(() => {
     if (step !== 5 || mountMissing(snapshot) || agentGuidanceState !== "idle") {
       return;
     }
@@ -1233,21 +1323,26 @@ function Onboarding({
     setLoginCopyMessage("Copied login link.");
   }
 
-  async function startMount() {
-    if (mounting) {
+  async function runMountOnboarding(action: "start" | "allow_in_macos" | "check_again") {
+    if (mountStartRequestedRef.current || mounting) {
       return;
     }
 
-    setMountError(null);
+    mountStartRequestedRef.current = true;
     setMounting(true);
     try {
-      const report = await callCommand<ActionReport>(
-        "create_workspace_mount",
-        { path: mountPath },
-        { ok: true, message: "Created demo mount." },
+      const report = await callCommand<WorkspaceMountOnboardingReport>(
+        "run_workspace_mount_onboarding",
+        { request: { path: mountPath, action } },
+        {
+          state: "created",
+          message: "Created demo mount.",
+          primaryAction: "retry_setup",
+          launchStrategy: "none",
+        },
       );
-      if (!report.ok) {
-        setMountError(classifyMountSetupError(report.message));
+      setMountOnboarding(report);
+      if (report.state !== "created") {
         return;
       }
       const cliReady = await ensureCliAvailable();
@@ -1262,10 +1357,12 @@ function Onboarding({
       setMountPathDirty(false);
       setMountPath(nextSnapshot.mount.localPath);
       await installAgentGuidance(nextSnapshot.mount.localPath);
+      setMountOnboarding(null);
       setStep(5);
     } catch (error) {
-      setMountError(classifyMountSetupError(errorMessage(error)));
+      setMountOnboarding(failedMountOnboardingReport(errorMessage(error)));
     } finally {
+      mountStartRequestedRef.current = false;
       setMounting(false);
     }
   }
@@ -1281,15 +1378,18 @@ function Onboarding({
       { ok: true, message: "Locality terminal command is ready." },
     );
     if (!report.ok) {
-      setMountError(classifyMountSetupError(report.message));
+      setMountOnboarding(failedMountOnboardingReport(report.message));
       return false;
     }
-    setMountError(null);
+    setMountOnboarding(null);
     return true;
   }
 
   async function chooseFolder() {
-    setMountError(null);
+    if (mountStartRequestedRef.current || mounting) {
+      return;
+    }
+
     try {
       const selected = await callCommand<string | null>(
         "choose_mount_folder",
@@ -1301,21 +1401,21 @@ function Onboarding({
         setMountPath(selected.replace(/\/$/, ""));
       }
     } catch (error) {
-      setMountError(classifyMountSetupError(errorMessage(error)));
+      setMountOnboarding(failedMountOnboardingReport(errorMessage(error)));
     }
   }
 
   async function openMountFolder() {
-    setMountError(null);
     const report = await callCommand<ActionReport>(
       "open_path",
       { path: mountPath },
       { ok: true, message: "Opened demo folder." },
     );
     if (!report.ok) {
-      setMountError(classifyMountSetupError(report.message));
+      setMountOnboarding(failedMountOnboardingReport(report.message));
       return;
     }
+    setMountOnboarding(null);
   }
 
   function finishOnboarding() {
@@ -1349,9 +1449,13 @@ function Onboarding({
     }
   }
 
-  const connectionReadyNow = oauthReady || connectionReady(snapshot);
   const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
   const finalPrompt = agentGuidanceReport?.prompt || suggestedAgentPrompt(mountPath);
+  const mountSetupError =
+    mountOnboarding?.state === "failed"
+      ? classifyMountSetupError(mountOnboarding.message)
+      : null;
+  const showRecoveryChooser = mountRecoveryEnabled(mountSetupError);
 
   return (
     <main className="setup-shell">
@@ -1413,7 +1517,7 @@ function Onboarding({
               </h1>
               <p>
                 {connectionReadyNow
-                  ? `${workspaceLabel} is ready. Next, choose where Locality should place the Notion mount point.`
+                  ? `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare agent guidance.`
                   : oauthInFlight
                     ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
                     : "Connect the workspace you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
@@ -1450,37 +1554,64 @@ function Onboarding({
         )}
 
         {step === 4 && (
-          <SetupContent variant="wide">
+          <SetupContent
+            mark={<BrandTile variant={mountOnboarding?.state === "failed" ? "folder" : "progress"} />}
+            variant="wide"
+          >
             <div>
               <div className="eyebrow">Local folder</div>
-              <h1>Choose where your files appear.</h1>
+              <h1>{mountOnboardingHeadline(mountOnboarding)}</h1>
               <p>
-                Locality keeps your connected apps under one CloudStorage root. Agents and Finder
-                will use this folder.
+                {mountOnboarding?.message ??
+                  "Locality is creating your Notion folder under the default CloudStorage root and preparing agent guidance."}
               </p>
             </div>
-            <div className="path-field setup-path-field">
-              <input
-                value={mountPath}
-                disabled={mounting}
-                onChange={(event) => {
-                  setMountPathDirty(true);
-                  setMountPath(event.target.value);
-                }}
-              />
-              <SecondaryButton disabled={mounting} onClick={chooseFolder}>
-                Choose
-              </SecondaryButton>
+            <div className="sync-note">
+              {mounting ? (
+                <Loader2 className="spin-icon" />
+              ) : mountOnboarding?.state === "failed" ? (
+                <AlertTriangle />
+              ) : (
+                <FolderOpen />
+              )}
+              {mounting
+                ? "Checking File Provider approval"
+                : mountOnboarding?.message ?? "Creating folder and preparing Notion files"}
             </div>
-            <PrimaryButton busy={mounting} disabled={!mountPath.trim()} onClick={startMount}>
-              {mounting ? "Mounting Notion" : "Create Local Folder"}
-            </PrimaryButton>
-            {mountError && (
-              <MountSetupErrorCallout error={mountError} onRetry={startMount} retrying={mounting} />
+            <div className="path-field ready-path-field">
+              <span>{mountPath}</span>
+            </div>
+            {showRecoveryChooser ? (
+              <div className="button-row">
+                <PrimaryButton
+                  busy={mounting}
+                  disabled={!mountPath.trim()}
+                  onClick={() => void runMountOnboarding(mountOnboardingNextAction(mountOnboarding))}
+                >
+                  {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
+                </PrimaryButton>
+                <SecondaryButton disabled={mounting} onClick={() => void chooseFolder()}>
+                  Choose Folder
+                </SecondaryButton>
+              </div>
+            ) : (
+              <PrimaryButton
+                busy={mounting}
+                disabled={!mountPath.trim()}
+                onClick={() => void runMountOnboarding(mountOnboardingNextAction(mountOnboarding))}
+              >
+                {mountOnboardingPrimaryLabel(mountOnboarding, mounting)}
+              </PrimaryButton>
+            )}
+            {mountOnboardingNeedsInstructions(mountOnboarding) && (
+              <p className="quiet-note">{mountOnboardingInstructions(mountOnboarding)}</p>
+            )}
+            {mountOnboardingSupplementaryNote(mountOnboarding) && (
+              <p className="quiet-note">{mountOnboardingSupplementaryNote(mountOnboarding)}</p>
             )}
             <p className="quiet-note">
-              The Notion mount point will include AGENTS.md and CLAUDE.md to help your agents edit
-              files natively.
+              Locality uses the default CloudStorage location so Finder and your agents see the
+              same Notion folder automatically.
             </p>
           </SetupContent>
         )}
@@ -1496,7 +1627,7 @@ function Onboarding({
                 new Notion changes to appear locally.
               </p>
             </div>
-            {mountError && <p className="field-error">{mountError.message}</p>}
+            {mountOnboarding && <p className="field-error">{mountOnboarding.message}</p>}
             <div className="final-actions">
               <PrimaryButton onClick={finishOnboarding}>
                 Open Locality
@@ -3132,6 +3263,7 @@ function DebugQueueView() {
             <Metric label="Active poll" value={formatDuration(status.activeIntervalMs)} />
             <Metric label="Cold poll" value={formatDuration(status.coldIntervalMs)} />
           </div>
+          <DebugLiveModeSection liveMode={status.liveMode} />
           <DebugActiveJobs active={status.active} />
           <div className="debug-queue-sections">
             {status.sections.map((section) => (
@@ -3139,6 +3271,52 @@ function DebugQueueView() {
             ))}
           </div>
         </>
+      )}
+    </section>
+  );
+}
+
+function DebugLiveModeSection({ liveMode }: { liveMode: DebugLiveModeStatus }) {
+  const meta = [
+    liveMode.mountId ? `mount ${liveMode.mountId}` : null,
+    liveMode.enabled ? "enabled" : "off",
+    liveMode.lastRunAt ? `last run ${debugTimestampValueLabel(liveMode.lastRunAt)}` : null,
+  ].filter(Boolean) as string[];
+
+  return (
+    <section className="debug-queue-section debug-live-mode-section">
+      <div className="debug-queue-section-header">
+        <div>
+          <h3>Live Mode tracked files</h3>
+          <p>{[liveMode.label, ...meta].join(" · ")}</p>
+          {liveMode.reason && <p className="debug-live-mode-reason">{liveMode.reason}</p>}
+        </div>
+      </div>
+      {liveMode.trackedFiles.length ? (
+        liveMode.trackedFiles.map((file) => (
+          <DebugQueueRow
+            key={`${file.remoteId}-${file.path}`}
+            title={file.title || file.path}
+            detail={file.path}
+            meta={[
+              file.status,
+              file.activeForPolling ? "active polling" : null,
+              file.remoteCheckDue ? "check due" : null,
+              file.pollingReason ? `poll ${file.pollingReason}` : null,
+              `sync ${file.syncState}`,
+              `hydration ${file.hydration}`,
+              file.freshnessTier ? `tier ${file.freshnessTier}` : null,
+              file.remoteHintPending ? "remote hint" : null,
+              file.autoSaveState ? `auto ${file.autoSaveState}` : null,
+              file.lastCheckedAt ? `checked ${debugTimestampValueLabel(file.lastCheckedAt)}` : null,
+              file.lastOpenedAt ? `opened ${debugTimestampValueLabel(file.lastOpenedAt)}` : null,
+              file.lastLocalChangeAt ? `local ${debugTimestampValueLabel(file.lastLocalChangeAt)}` : null,
+              ...file.issueCodes,
+            ].filter(Boolean) as string[]}
+          />
+        ))
+      ) : (
+        <p className="debug-queue-empty">No files are currently tracked by Live Mode.</p>
       )}
     </section>
   );
@@ -3227,6 +3405,14 @@ function debugTimestampLabel(unixMs: number) {
     minute: "2-digit",
     second: "2-digit",
   }).format(new Date(unixMs));
+}
+
+function debugTimestampValueLabel(value: string) {
+  const unixMs = Number(value.startsWith("unix_ms:") ? value.slice("unix_ms:".length) : value);
+  if (Number.isFinite(unixMs) && unixMs > 0) {
+    return debugTimestampLabel(unixMs);
+  }
+  return value;
 }
 
 function formatDuration(ms: number) {
@@ -4917,57 +5103,27 @@ function SetupContent({
 }) {
   if (side) {
     return (
-      <div className="setup-content split-setup">
-        <div className="setup-copy">
-          {mark ? mark : null}
-          {children}
+      <div className="setup-scrollport">
+        <div className="setup-content split-setup">
+          <div className="setup-copy">
+            {mark ? mark : null}
+            {children}
+          </div>
+          <aside className="setup-side">{side}</aside>
         </div>
-        <aside className="setup-side">{side}</aside>
       </div>
     );
   }
 
   return (
-    <div
-      className={`setup-content ${variant === "final" ? "final-setup" : ""} ${
-        variant === "wide" ? "wide-setup" : ""
-      }`}
-    >
-      {mark ? mark : null}
-      {children}
-    </div>
-  );
-}
-
-function MountSetupErrorCallout({
-  error,
-  onRetry,
-  retrying,
-}: {
-  error: MountSetupError;
-  onRetry: () => void;
-  retrying: boolean;
-}) {
-  if (error.kind !== "file-provider-disabled") {
-    return <p className="field-error">{error.message}</p>;
-  }
-
-  return (
-    <div className="setup-permission-callout">
-      <div className="setup-permission-icon">
-        <FolderOpen />
-      </div>
-      <div className="setup-permission-copy">
-        <strong>Enable Locality in Finder</strong>
-        <p>
-          Locality is installed, but macOS has not enabled its File Provider yet. In Finder, look
-          for Locality under Locations and choose Enable. If Finder does not show it, open System
-          Settings, go to Privacy &amp; Security, then enable Locality under Extensions or File
-          Providers.
-        </p>
-        <PrimaryButton compact busy={retrying} onClick={onRetry}>
-          Retry
-        </PrimaryButton>
+    <div className="setup-scrollport">
+      <div
+        className={`setup-content ${variant === "final" ? "final-setup" : ""} ${
+          variant === "wide" ? "wide-setup" : ""
+        }`}
+      >
+        {mark ? mark : null}
+        {children}
       </div>
     </div>
   );

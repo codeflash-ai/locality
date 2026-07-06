@@ -77,12 +77,16 @@ provider against SQLite deletion.
 
 ## Code Signing
 
-Release builds Authenticode-sign the sidecars before NSIS packaging and sign the
-final installer after packaging. The GitHub release workflow uses Azure Artifact
-Signing with OpenID Connect so the Windows signing key stays in Azure instead of
-being exported as a PFX into GitHub.
+Release builds can Authenticode-sign the sidecars before NSIS packaging and sign
+the final installer after packaging. The GitHub release workflow uses Azure
+Artifact Signing with OpenID Connect when the Azure signing configuration is
+present, so the Windows signing key stays in Azure instead of being exported as a
+PFX into GitHub. If none of the Azure signing values are configured, the workflow
+publishes unsigned Windows installer assets and emits a warning. A partial Azure
+configuration fails the release because that usually means signing was intended
+but misconfigured.
 
-Required repository secrets:
+Optional repository secrets for Authenticode signing:
 
 - `AZURE_CLIENT_ID`: client/application ID for the Entra app registration used
   by GitHub Actions OIDC.
@@ -126,15 +130,19 @@ When `TAURI_UPDATER_PUBKEY` and `TAURI_SIGNING_PRIVATE_KEY` are set,
 copies the stable alias to:
 
 ```text
-target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip
-target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip.sig
+target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe
+target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe.sig
 ```
+
+When the GitHub workflow Authenticode-signs the installer through Azure Artifact
+Signing, it regenerates the Tauri updater `.sig` after Authenticode signing so
+the updater signature covers the final published bytes.
 
 Render the Windows updater manifest with:
 
 ```powershell
 $env:UPDATER_MANIFEST_OUTPUT = "target/release/bundle/updater/latest-windows.json"
-$env:UPDATER_WINDOWS_X86_64_ARTIFACT = "target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip"
+$env:UPDATER_WINDOWS_X86_64_ARTIFACT = "target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe"
 bash scripts/render-tauri-updater-manifest.sh
 ```
 
@@ -144,19 +152,24 @@ The GitHub workflow in `.github/workflows/release-windows.yml` publishes the
 Windows channel from a `v*` tag or manual workflow dispatch. It runs on
 `windows-latest`, verifies the tag points at current `main`, verifies the tag
 matches the Tauri app version, signs sidecars and installers through Azure
-Artifact Signing, builds the NSIS package, renders `latest-windows.json`, creates or
-updates the GitHub Release, and uploads:
+Artifact Signing when configured, builds the NSIS package, renders
+`latest-windows.json`, creates or updates the GitHub Release, and uploads:
 
 ```text
 Locality-release-windows-x86_64-setup.exe
 Locality-release-windows-x86_64-setup.exe.sha256
-Locality-release-windows-x86_64.nsis.zip
-Locality-release-windows-x86_64.nsis.zip.sig
+Locality-release-windows-x86_64-setup.exe.sig
 latest-windows.json
 SHA256SUMS-windows
 ```
 
 Required repository secrets:
+
+- `TAURI_UPDATER_PUBKEY`: public updater signing key.
+- `TAURI_SIGNING_PRIVATE_KEY`: private updater signing key.
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: updater key password, if one was set.
+
+Optional repository secrets for Authenticode signing:
 
 - `AZURE_CLIENT_ID`: client/application ID for the Entra app registration used
   by GitHub Actions OIDC.
@@ -167,9 +180,6 @@ Required repository secrets:
   account, for example `https://eus.codesigning.azure.net/`.
 - `AZURE_ARTIFACT_SIGNING_ACCOUNT`: Artifact Signing account name.
 - `AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE`: certificate profile name.
-- `TAURI_UPDATER_PUBKEY`: public updater signing key.
-- `TAURI_SIGNING_PRIVATE_KEY`: private updater signing key.
-- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: updater key password, if one was set.
 
 Optional repository variable:
 

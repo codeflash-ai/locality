@@ -85,6 +85,13 @@ A file can be clean even if the Remote Tree has changed since that shadow was
 stored. That means the local copy has no local edits and can usually be
 fast-forwarded.
 
+When a Remote Tree observation confirms that a materialized Notion page was
+deleted remotely, Locality treats the local projection as removable only if the
+file is clean. Clean materialized plain-file pages and clean File Provider
+content-cache pages with matching visible replicas are removed from the Local
+Tree and Synced Tree automatically; pages with pending local edits or an
+unsupported/ambiguous projection stay visible for review.
+
 ### Pending Local File
 
 A pending local file has been changed in the Local Tree by a human, agent, or
@@ -423,8 +430,11 @@ Current implementation:
   unresolved remote hint.
 - Recently opened or locally touched files get a short working-copy lease; Locality
   re-observes after the lease instead of replacing the file immediately.
-- If a local file becomes pending before the auto hydration runs, the hydration
-  executor skips without fetching remote content or inserting conflict markers.
+- If a local file becomes pending before the auto hydration runs, Live Mode
+  handles the file through the dirty pull/merge path instead of disabling the
+  mount. Non-overlapping remote and local edits are merged; overlapping edits
+  write inline conflict markers to the local file and leave that file for human
+  or agent resolution while mount-level Live Mode remains enabled.
 - Successful hydration clears the entity's pending remote hint so status returns
   to `all_synced` once the local shadow and remote version agree.
 - On macOS File Provider mounts, successful `remote_fast_forward` hydration also
@@ -433,6 +443,12 @@ Current implementation:
   so a missed File Provider write is not overwritten. Workspace virtual mounts
   still avoid full workspace polling; their scheduled background path is limited
   to bounded per-entity freshness checks for known active or hydrated pages.
+- Live Mode treats Notion `last_edited_time` as a freshness hint, not proof that
+  the child block tree has reached read-after-write consistency. If a
+  `live_mode_remote_fast_forward` fetch reports a newer remote version but
+  renders the same body, block tree, title, and properties as the previous
+  Synced Tree shadow, Locality keeps the remote hint pending and retries instead
+  of advancing the synced version into a false-clean state.
 
 ### Stage 8: Remote Change Explanation
 

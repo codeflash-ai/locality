@@ -139,6 +139,16 @@ The app can track setup internally with human concepts:
 - Preparing files for agents
 - Starting background sync
 
+On macOS, this step is a blocked File Provider gate. If the Locality File
+Provider is registered but not yet enabled, the onboarding screen stays on step
+4, offers an `Allow in macOS` action, and opens Finder at the Locality File
+Provider root when possible. If macOS has accepted approval but has not yet
+materialized `~/Library/CloudStorage/Locality`, the screen remains blocked with
+`Check again` until the folder exists and the mount root passes verification.
+
+The final ready screen must not appear until File Provider approval, the
+CloudStorage root, and the mount root are all verified successfully.
+
 Do not show hydration queues, polling intervals, or low-level daemon concepts in
 the onboarding UI. Do not make the user wait for the full workspace projection
 or initial sync to finish before moving forward. Once Notion is connected, Locality
@@ -340,10 +350,14 @@ Important language:
 - Use "restore local file" for local recovery from shadow state.
 - Use "undo push" only for journal-backed remote undo.
 - Live Mode is opt-in, rate-limited to one sync action per tick, and must keep
-  the same push guardrails: stop on conflicts, blocked files, and
-  review-required changes. The normal local-write path comes from File Provider
-  callbacks; a visible-file reconciliation fallback is throttled and scoped to
-  the active already-hydrated page. When there is no local pending change, Live
+  the same push guardrails. Remote drift while local edits are pending is an
+  expected two-way sync case: Live Mode should pull the remote version, merge
+  non-overlapping edits, or write inline conflict markers for that file without
+  disabling mount-level Live Mode. It should pause only for review-required,
+  destructive, blocked, or unrecoverable work. The normal local-write path comes
+  from File Provider callbacks; a visible-file reconciliation fallback is
+  throttled and scoped to the active already-hydrated page. When there is no
+  local pending change, Live
   Mode asks `localityd` to queue one remote check for an already-hydrated page.
   If the daemon sees a remote change, it hydrates the page through the normal
   `RemoteFastForward` path and refreshes the visible CloudStorage projection

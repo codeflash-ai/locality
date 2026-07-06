@@ -156,6 +156,11 @@ where
                 rendered.shadow.entity_id.0, request.remote_id.0
             )));
         }
+        let previous_shadow = match self.store.load_shadow(&mount.mount_id, &entity.remote_id) {
+            Ok(shadow) => Some(shadow),
+            Err(StoreError::ShadowMissing { .. }) => None,
+            Err(error) => return Err(LocalityError::from(error)),
+        };
 
         write_parent_database_schema_cache(self.store, self.source, &mount, &entity, &output_root)?;
 
@@ -188,6 +193,17 @@ where
                 self.mark_dirty_if_allowed(entity)?;
             }
             return Ok(HydrationOutcome::SkippedDirty);
+        }
+
+        if request.reason == HydrationReason::LiveModeRemoteFastForward
+            && live_mode_remote_fast_forward_render_looks_stale(
+                &entity,
+                previous_shadow.as_ref(),
+                &rendered,
+            )
+        {
+            self.keep_remote_hint_pending(&request.mount_id, &request.remote_id)?;
+            return Ok(HydrationOutcome::Hydrated);
         }
 
         for asset in &rendered.assets {
@@ -455,6 +471,24 @@ where
             return Ok(());
         };
         freshness.remote_hint_pending = false;
+        self.store
+            .save_freshness_state(freshness)
+            .map_err(LocalityError::from)
+    }
+
+    fn keep_remote_hint_pending(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+    ) -> LocalityResult<()> {
+        let Some(mut freshness) = self
+            .store
+            .get_freshness_state(mount_id, remote_id)
+            .map_err(LocalityError::from)?
+        else {
+            return Ok(());
+        };
+        freshness.remote_hint_pending = true;
         self.store
             .save_freshness_state(freshness)
             .map_err(LocalityError::from)
@@ -851,6 +885,38 @@ fn file_has_unresolved_conflict_markers(path: &Path) -> LocalityResult<bool> {
 fn same_remote_version(entity: &EntityRecord, rendered: &HydratedEntity) -> bool {
     rendered.remote_edited_at.is_some()
         && rendered.remote_edited_at.as_deref() == entity.remote_edited_at.as_deref()
+}
+
+fn live_mode_remote_fast_forward_render_looks_stale(
+    entity: &EntityRecord,
+    previous_shadow: Option<&ShadowDocument>,
+    rendered: &HydratedEntity,
+) -> bool {
+    if rendered.remote_edited_at.as_deref() == entity.remote_edited_at.as_deref() {
+        return false;
+    }
+    let Some(previous_shadow) = previous_shadow else {
+        return false;
+    };
+    if rendered.shadow.rendered_body != previous_shadow.rendered_body
+        || rendered.shadow.blocks != previous_shadow.blocks
+    {
+        return false;
+    }
+
+    frontmatter_without_sync_versions(&rendered.document.frontmatter)
+        == frontmatter_without_sync_versions(&previous_shadow.frontmatter)
+}
+
+fn frontmatter_without_sync_versions(frontmatter: &str) -> String {
+    frontmatter
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("synced_at:") && !trimmed.starts_with("remote_edited_at:")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn write_atomic(path: &Path, contents: String) -> LocalityResult<()> {

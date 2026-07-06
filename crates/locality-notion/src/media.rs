@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use locality_core::path_projection::page_container_path;
 use locality_core::{LocalityError, LocalityResult};
@@ -20,6 +22,8 @@ use crate::client::notion_http_client;
 const LOCALITY_DIR: &str = ".loc";
 const MEDIA_DIR: &str = "media";
 const MEDIA_MANIFEST: &str = "manifest.json";
+const MEDIA_FETCH_ATTEMPTS: usize = 3;
+const MEDIA_FETCH_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaAsset {
@@ -121,7 +125,7 @@ pub fn fetch_media_asset_report(assets: &[MediaAsset]) -> MediaFetchReport {
     let mut report = MediaFetchReport::default();
 
     for asset in assets.iter().filter(|asset| should_download(asset)) {
-        match fetch_media_asset(&client, asset) {
+        match fetch_media_asset_with_retries(&client, asset) {
             Ok(downloaded) => report.downloaded.push(downloaded),
             Err(error) => report.failed.push(MediaDownloadFailure {
                 block_id: asset.block_id.clone(),
@@ -134,6 +138,26 @@ pub fn fetch_media_asset_report(assets: &[MediaAsset]) -> MediaFetchReport {
     }
 
     report
+}
+
+fn fetch_media_asset_with_retries(
+    client: &Client,
+    asset: &MediaAsset,
+) -> LocalityResult<DownloadedMediaAsset> {
+    let mut last_error = None;
+    for attempt in 1..=MEDIA_FETCH_ATTEMPTS {
+        match fetch_media_asset(client, asset) {
+            Ok(downloaded) => return Ok(downloaded),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < MEDIA_FETCH_ATTEMPTS {
+                    thread::sleep(MEDIA_FETCH_RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| LocalityError::Io("media download failed".to_string())))
 }
 
 fn fetch_media_asset(client: &Client, asset: &MediaAsset) -> LocalityResult<DownloadedMediaAsset> {
@@ -604,7 +628,10 @@ mod tests {
     #[cfg(windows)]
     use super::resolve_media_href_with_content_root;
     use super::{MediaAsset, local_media_href, media_local_path, resolve_media_href};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::Path;
+    use std::thread;
 
     #[test]
     fn media_paths_mirror_page_paths_under_media_directory() {
@@ -738,5 +765,47 @@ mod tests {
         };
 
         assert!(!super::should_download(&relative));
+    }
+
+    #[test]
+    fn media_fetch_retries_transient_connection_failures() {
+        let bytes = b"retry-media-bytes".to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind media test server");
+        let url = format!(
+            "http://{}/retry-image.png",
+            listener.local_addr().expect("media test server addr")
+        );
+        let handle = thread::spawn(move || {
+            let (first, _) = listener.accept().expect("accept failed media request");
+            drop(first);
+
+            let (second, _) = listener.accept().expect("accept retried media request");
+            serve_test_media_response(second, &bytes);
+        });
+
+        let report = super::fetch_media_asset_report(&[MediaAsset {
+            block_id: "image-block".to_string(),
+            kind: "image".to_string(),
+            source_url: url,
+            local_path: Path::new(".loc/media/Page/image.png").to_path_buf(),
+        }]);
+
+        handle.join().expect("join media test server");
+        assert!(report.failed.is_empty(), "{report:#?}");
+        assert_eq!(report.downloaded.len(), 1, "{report:#?}");
+        assert_eq!(report.downloaded[0].bytes, b"retry-media-bytes");
+    }
+
+    fn serve_test_media_response(mut stream: TcpStream, bytes: &[u8]) {
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request);
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .expect("write media response headers");
+        stream.write_all(bytes).expect("write media response body");
     }
 }
