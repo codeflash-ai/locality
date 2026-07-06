@@ -18,6 +18,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc search <query> [--connector <connector>] [--limit <n>] [--json]`
 - `loc create page --title <title> [--parent <dir>] [--json]`
 - `loc templates list|validate|new|apply [args] [--json]`
+- `loc okf export <path> --out <dir> [--json]`
 - `loc inspect <path> [--json]`
 - `loc pull <path> [--json]`
 - `loc push [path] [-y|--yes] [--confirm] [--json]`
@@ -253,6 +254,34 @@ JSON output is stable enough for agents:
 
 With Live Mode enabled, the same pending local create can sync automatically
 unless Locality requires review.
+
+## OKF Export
+
+`loc okf export <path> --out <dir>` creates an Open Knowledge Format bundle
+from an already-mounted Locality directory. The command is intentionally
+read-only with respect to Locality state and remote tools: it reads existing
+Markdown files, skips unhydrated stubs, and writes a separate OKF directory.
+
+The first export mode keeps Locality's existing sync contract intact. Mounted
+pages still use `page.md`; OKF export maps those pages into concept documents:
+
+```text
+Locality projection                OKF bundle
+engineering-wiki/page.md      ->   engineering-wiki.md
+engineering-wiki/standups/
+  page.md                     ->   engineering-wiki/standups.md
+```
+
+The exporter writes `index.md` files for progressive disclosure, preserves
+useful source frontmatter as OKF extension fields, and records Locality identity
+under a `locality:` extension block. It refuses to write into a non-empty output
+directory so repeated exports cannot accidentally overwrite work.
+
+Example:
+
+```bash
+loc okf export ~/Library/CloudStorage/Locality/notion/engineering-wiki --out ~/Desktop/engineering-wiki-okf
+```
 
 ## Template Packs
 
