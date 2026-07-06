@@ -277,14 +277,12 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
             block,
             block.bulleted_list_item.as_ref(),
             |text| format!("- {text}"),
-            "bulleted_list_item",
             RenderedBlockSpacing::BulletedListItem,
         ),
         "numbered_list_item" => list_item_block(
             block,
             block.numbered_list_item.as_ref(),
             |text| format!("1. {text}"),
-            "numbered_list_item",
             RenderedBlockSpacing::NumberedListItem,
         ),
         "to_do" => match &block.to_do {
@@ -420,14 +418,18 @@ fn list_item_block(
     block: &BlockDto,
     content: Option<&RichTextBlockDto>,
     render: impl FnOnce(&str) -> String,
-    empty_directive_type: &str,
     spacing: RenderedBlockSpacing,
 ) -> RenderedBlock {
-    let mut block = rich_text_block(block, content, render, empty_directive_type);
-    if block.shadow_id.is_some() {
-        block.spacing = spacing;
-    }
-    block
+    let Some(content) = content else {
+        return directive_block(block, &format!("malformed_{}", block.kind), None);
+    };
+    let text = rich_text_to_markdown(&content.rich_text);
+    let markdown = if text.trim().is_empty() && spacing == RenderedBlockSpacing::BulletedListItem {
+        "-".to_string()
+    } else {
+        render(&text)
+    };
+    list_item_rendered_block(markdown, Some(RemoteId::new(block.id.clone())), spacing)
 }
 
 fn equation_block(block: &BlockDto, equation: Option<&EquationBlockDto>) -> RenderedBlock {

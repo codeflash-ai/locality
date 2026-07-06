@@ -404,7 +404,8 @@ fn is_heading(line: &str) -> bool {
 
 fn is_list_item(line: &str) -> bool {
     let trimmed = line.trim_start();
-    trimmed.starts_with("- ")
+    matches!(trimmed, "-" | "*" | "+")
+        || trimmed.starts_with("- ")
         || trimmed.starts_with("* ")
         || trimmed.starts_with("+ ")
         || trimmed.starts_with("- [ ] ")

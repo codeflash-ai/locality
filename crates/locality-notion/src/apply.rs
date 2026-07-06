@@ -3863,6 +3863,9 @@ fn parse_to_do(markdown: &str) -> Option<(bool, &str)> {
 
 fn parse_bulleted_list_item(markdown: &str) -> Option<&str> {
     let trimmed = markdown.trim_start();
+    if matches!(trimmed, "-" | "*" | "+") {
+        return Some("");
+    }
     trimmed
         .strip_prefix("- ")
         .or_else(|| trimmed.strip_prefix("* "))

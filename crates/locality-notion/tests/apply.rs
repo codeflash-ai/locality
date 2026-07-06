@@ -138,6 +138,57 @@ fn apply_updates_appends_and_archives_supported_blocks() {
 }
 
 #[test]
+fn apply_appends_bare_bullet_marker_as_empty_bulleted_list_item() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("paragraph-1")),
+            content: "-".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Append {
+            block_id: "page-1".to_string(),
+            body: json!({
+                "children": [{
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                        "rich_text": [],
+                    },
+                }],
+                "position": {
+                    "type": "after_block",
+                    "after_block": {
+                        "id": "paragraph-1",
+                    },
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_replaces_block_by_appending_after_old_block_then_archiving_old_block() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());

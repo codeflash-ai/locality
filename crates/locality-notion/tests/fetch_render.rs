@@ -214,6 +214,30 @@ fn render_consecutive_list_blocks_as_tight_markdown_list() {
 }
 
 #[test]
+fn render_empty_bulleted_list_item_as_empty_markdown_bullet() {
+    let bundle = locality_notion::dto::NotionPageBundle {
+        page: page("page-1", "Roadmap"),
+        blocks: vec![BlockTreeDto {
+            block: rich_text_block("empty-bullet", "bulleted_list_item", ""),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(rendered.document.body, "-\n");
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| (block.remote_id.as_str(), block.kind.clone()))
+            .collect::<Vec<_>>(),
+        vec![("empty-bullet", MarkdownBlockKind::List)]
+    );
+}
+
+#[test]
 fn render_rich_text_line_breaks_inside_one_shadow_block() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page: page("page-1", "Roadmap"),
