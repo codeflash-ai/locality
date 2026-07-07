@@ -105,7 +105,9 @@ where
     let refresh_bases =
         prepare_visible_projection_pull(store, state_root, &mount, &relative_path, &target_path)?;
 
-    let report = if should_pull_mount_root(&mount, &relative_path, &target_path) {
+    let report = if should_pull_workspace_virtual_mount_root(&mount, &relative_path) {
+        pull_workspace_virtual_mount_root(store, &source, &mount, target_path.clone())
+    } else if should_pull_mount_root(&mount, &relative_path, &target_path) {
         pull_mount_root(store, &source, &mount, target_path.clone(), state_root)
     } else if let Some(report) = pull_virtual_directory_path(
         store,
@@ -135,6 +137,47 @@ where
         &refresh_bases,
     )?;
     Ok(report)
+}
+
+fn pull_workspace_virtual_mount_root<S, Source>(
+    store: &mut S,
+    source: &Source,
+    mount: &MountConfig,
+    target_path: PathBuf,
+) -> Result<PullReport, PullError>
+where
+    S: EntityRepository,
+    Source: SourceAdapter,
+{
+    let result = source
+        .list_children(ListChildrenRequest {
+            mount_id: mount.mount_id.clone(),
+            container: ChildContainer::Root,
+            parent_path: PathBuf::new(),
+        })
+        .map_err(PullError::Connector)?;
+    let enumerated = result.entries.len();
+    for entry in result.entries {
+        let existing = store
+            .get_entity(&entry.mount_id, &entry.remote_id)
+            .map_err(PullError::Store)?;
+        let record = virtual_child_entity_record(entry, existing.as_ref());
+        store.save_entity(record).map_err(PullError::Store)?;
+    }
+
+    Ok(PullReport {
+        ok: true,
+        command: "pull".to_string(),
+        via: "cli".to_string(),
+        mount_id: mount.mount_id.0.clone(),
+        root: mount.root.display().to_string(),
+        target: target_path.display().to_string(),
+        enumerated,
+        stubbed: 0,
+        hydrated: 0,
+        skipped_dirty: 0,
+        conflicts: Vec::new(),
+    })
 }
 
 fn prepare_visible_projection_pull<S>(
@@ -1153,6 +1196,12 @@ fn should_pull_mount_root(mount: &MountConfig, relative_path: &Path, target_path
     }
 
     target_path.is_dir()
+}
+
+fn should_pull_workspace_virtual_mount_root(mount: &MountConfig, relative_path: &Path) -> bool {
+    relative_path.as_os_str().is_empty()
+        && mount.projection.uses_virtual_filesystem()
+        && mount.remote_root_id.is_none()
 }
 
 fn accept_remote_projection<S>(
