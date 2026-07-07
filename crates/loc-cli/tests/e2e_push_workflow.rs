@@ -29,7 +29,7 @@ use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken
 use locality_connector::{
     ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
     ConnectorCapabilities, ConnectorKind, ConnectorUndoApplier, EnumerateRequest, FetchRequest,
-    NativeEntity, ObserveRequest, ParsedEntity,
+    ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
 };
 use locality_core::canonical::render_canonical_markdown;
 use locality_core::conflict::{
@@ -86,6 +86,7 @@ use localityd::reconcile::{
 };
 use localityd::runtime::{apply_remote_observation, workspace_virtual_freshness_jobs};
 use localityd::scheduler::{PullScheduler, PullSchedulerTick};
+use localityd::source::{SourceAdapter, SourcePushValidator};
 use localityd::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, commit_virtual_fs_write, create_virtual_fs_directory,
     create_virtual_fs_file, materialize_virtual_fs_item_with_content_root,
@@ -5581,7 +5582,7 @@ fn virtual_projection_modes_page_directory_pull_recursively_hydrates_descendant_
             "{projection:?}: {directory_pull:#?}"
         );
         assert_eq!(
-            directory_pull.hydrated, 2,
+            directory_pull.hydrated, 3,
             "{projection:?}: {directory_pull:#?}"
         );
         assert_eq!(
@@ -6188,6 +6189,119 @@ fn shared_virtual_projection_modes_root_lists_mount_points_and_statuses_all_moun
             "{projection:?}: {notion_status:#?}"
         );
         assert!(notion_status.clean, "{projection:?}: {notion_status:#?}");
+    }
+}
+
+#[test]
+fn virtual_projection_modes_pull_page_directory_hydrates_target_and_descendants() {
+    for projection in [
+        ProjectionMode::MacosFileProvider,
+        ProjectionMode::LinuxFuse,
+        ProjectionMode::WindowsCloudFiles,
+    ] {
+        let fixture = E2eFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let source = NestedPagePullSource::new(&fixture.mount_id);
+        run_mount(
+            &mut store,
+            MountOptions {
+                mount_id: fixture.mount_id.clone(),
+                connector: "notion".to_string(),
+                root: fixture.root.clone(),
+                remote_root_id: Some(RemoteId::new("root-page")),
+                connection_id: Some(ConnectionId::new("work")),
+                read_only: false,
+                projection: projection.clone(),
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("mount {projection:?} recursive page pull fixture: {error:?}")
+        });
+
+        let initial_pull = run_pull_with_state_root(
+            &mut store,
+            &source,
+            &fixture.root,
+            Some(&fixture.state_root),
+        )
+        .unwrap_or_else(|error| {
+            panic!("{projection:?}: initial recursive page pull root: {error:?}")
+        });
+        assert!(initial_pull.ok, "{projection:?}: {initial_pull:#?}");
+
+        let content_root = fixture.content_root();
+        let target_directory = fixture.root.join("Roadmap").join("Design Notes");
+        let target_page_path = content_root.join("Roadmap/Design Notes/page.md");
+        assert!(
+            !target_page_path.exists(),
+            "{projection:?}: initial root pull should leave target page online-only"
+        );
+
+        let recursive_pull = run_pull_with_state_root(
+            &mut store,
+            &source,
+            &target_directory,
+            Some(&fixture.state_root),
+        )
+        .unwrap_or_else(|error| panic!("{projection:?}: recursive directory pull: {error:?}"));
+        assert!(recursive_pull.ok, "{projection:?}: {recursive_pull:#?}");
+        assert_eq!(
+            recursive_pull.hydrated, 3,
+            "{projection:?}: {recursive_pull:#?}"
+        );
+        assert_eq!(
+            recursive_pull.enumerated, 2,
+            "{projection:?}: recursive directory pull should enumerate nested descendants: {recursive_pull:#?}"
+        );
+
+        let target_entity = store
+            .find_entity_by_path(
+                &fixture.mount_id,
+                &PathBuf::from("Roadmap/Design Notes/page.md"),
+            )
+            .unwrap_or_else(|error| panic!("{projection:?}: read target entity: {error:?}"))
+            .unwrap_or_else(|| panic!("{projection:?}: missing target entity after pull"));
+        assert_eq!(
+            target_entity.hydration,
+            HydrationState::Hydrated,
+            "{projection:?}: pulling a page directory should hydrate that directory's own page.md"
+        );
+        assert!(
+            target_page_path.exists(),
+            "{projection:?}: pulling a page directory should materialize its own page.md"
+        );
+        assert!(
+            fs::read_to_string(&target_page_path)
+                .unwrap_or_else(|error| panic!("{projection:?}: read target page: {error}"))
+                .contains("Design notes body."),
+            "{projection:?}: hydrated target page should contain rendered content"
+        );
+
+        let appendix_path = content_root.join("Roadmap/Design Notes/Appendix/page.md");
+        let further_reading_path =
+            content_root.join("Roadmap/Design Notes/Appendix/Further Reading/page.md");
+        assert!(
+            appendix_path.exists(),
+            "{projection:?}: recursive page-directory pull should hydrate child page.md files"
+        );
+        assert!(
+            further_reading_path.exists(),
+            "{projection:?}: recursive page-directory pull should hydrate nested descendant page.md files"
+        );
+        assert!(
+            fs::read_to_string(&appendix_path)
+                .unwrap_or_else(|error| panic!("{projection:?}: read appendix page: {error}"))
+                .contains("Appendix body."),
+            "{projection:?}: hydrated child page should contain rendered content"
+        );
+        assert!(
+            fs::read_to_string(&further_reading_path)
+                .unwrap_or_else(|error| panic!(
+                    "{projection:?}: read further reading page: {error}"
+                ))
+                .contains("Further reading body."),
+            "{projection:?}: hydrated nested descendant should contain rendered content"
+        );
     }
 }
 
@@ -12723,6 +12837,212 @@ impl Drop for E2eFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
         let _ = fs::remove_dir_all(&self.state_root);
+    }
+}
+
+#[derive(Clone)]
+struct NestedPagePullSource {
+    entries: Vec<TreeEntry>,
+    child_entries: BTreeMap<PathBuf, Vec<TreeEntry>>,
+    rendered: BTreeMap<RemoteId, HydratedEntity>,
+}
+
+impl NestedPagePullSource {
+    fn new(mount_id: &MountId) -> Self {
+        let root_id = "root-page";
+        let child_id = "child-page";
+        let nested_id = "nested-page";
+        let deep_id = "deep-page";
+        Self {
+            entries: vec![
+                nested_pull_tree_entry(mount_id, root_id, "Roadmap", "Roadmap/page.md"),
+                nested_pull_tree_entry(
+                    mount_id,
+                    child_id,
+                    "Design Notes",
+                    "Roadmap/Design Notes/page.md",
+                ),
+            ],
+            child_entries: BTreeMap::from([
+                (
+                    PathBuf::from("Roadmap/Design Notes"),
+                    vec![nested_pull_tree_entry(
+                        mount_id,
+                        nested_id,
+                        "Appendix",
+                        "Roadmap/Design Notes/Appendix/page.md",
+                    )],
+                ),
+                (
+                    PathBuf::from("Roadmap/Design Notes/Appendix"),
+                    vec![nested_pull_tree_entry(
+                        mount_id,
+                        deep_id,
+                        "Further Reading",
+                        "Roadmap/Design Notes/Appendix/Further Reading/page.md",
+                    )],
+                ),
+            ]),
+            rendered: BTreeMap::from([
+                (
+                    RemoteId::new(root_id),
+                    nested_pull_hydrated_page(root_id, "Roadmap", "Root body."),
+                ),
+                (
+                    RemoteId::new(child_id),
+                    nested_pull_hydrated_page(child_id, "Design Notes", "Design notes body."),
+                ),
+                (
+                    RemoteId::new(nested_id),
+                    nested_pull_hydrated_page(nested_id, "Appendix", "Appendix body."),
+                ),
+                (
+                    RemoteId::new(deep_id),
+                    nested_pull_hydrated_page(deep_id, "Further Reading", "Further reading body."),
+                ),
+            ]),
+        }
+    }
+}
+
+impl Connector for NestedPagePullSource {
+    fn kind(&self) -> ConnectorKind {
+        ConnectorKind("nested-page-pull-test")
+    }
+
+    fn capabilities(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities {
+            supports_lazy_child_enumeration: true,
+            ..ConnectorCapabilities::default()
+        }
+    }
+
+    fn enumerate(
+        &self,
+        _request: EnumerateRequest,
+    ) -> locality_core::LocalityResult<Vec<TreeEntry>> {
+        Ok(self.entries.clone())
+    }
+
+    fn list_children(
+        &self,
+        request: ListChildrenRequest,
+    ) -> locality_core::LocalityResult<ListChildrenResult> {
+        Ok(ListChildrenResult {
+            entries: self
+                .child_entries
+                .get(&request.parent_path)
+                .cloned()
+                .unwrap_or_default(),
+        })
+    }
+
+    fn fetch(&self, _request: FetchRequest) -> locality_core::LocalityResult<NativeEntity> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "nested page pull test fetch",
+        ))
+    }
+
+    fn render(&self, _entity: &NativeEntity) -> locality_core::LocalityResult<CanonicalDocument> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "nested page pull test render",
+        ))
+    }
+
+    fn parse(&self, _document: &CanonicalDocument) -> locality_core::LocalityResult<ParsedEntity> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "nested page pull test parse",
+        ))
+    }
+
+    fn check_concurrency(
+        &self,
+        _request: ApplyPlanRequest<'_>,
+    ) -> locality_core::LocalityResult<()> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "nested page pull test concurrency",
+        ))
+    }
+
+    fn apply(
+        &self,
+        _request: ApplyPlanRequest<'_>,
+    ) -> locality_core::LocalityResult<ApplyPlanResult> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "nested page pull test apply",
+        ))
+    }
+
+    fn apply_undo(
+        &self,
+        _request: ApplyUndoRequest<'_>,
+    ) -> locality_core::LocalityResult<ApplyUndoResult> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "nested page pull test undo",
+        ))
+    }
+}
+
+impl HydrationSource for NestedPagePullSource {
+    fn fetch_render(
+        &self,
+        request: &HydrationRequest,
+    ) -> locality_core::LocalityResult<HydratedEntity> {
+        assert_eq!(request.reason, HydrationReason::ExplicitPull);
+        self.rendered
+            .get(&request.remote_id)
+            .cloned()
+            .ok_or_else(|| {
+                locality_core::LocalityError::InvalidState(format!(
+                    "missing rendered page {}",
+                    request.remote_id.as_str()
+                ))
+            })
+    }
+}
+
+impl SourcePushValidator for NestedPagePullSource {}
+
+impl SourceAdapter for NestedPagePullSource {}
+
+fn nested_pull_tree_entry(
+    mount_id: &MountId,
+    remote_id: &str,
+    title: &str,
+    path: &str,
+) -> TreeEntry {
+    TreeEntry {
+        mount_id: mount_id.clone(),
+        remote_id: RemoteId::new(remote_id),
+        kind: EntityKind::Page,
+        title: title.to_string(),
+        path: PathBuf::from(path),
+        hydration: HydrationState::Stub,
+        content_hash: None,
+        remote_edited_at: Some("2026-06-11T00:00:00.000Z".to_string()),
+        stub_frontmatter: None,
+    }
+}
+
+fn nested_pull_hydrated_page(remote_id: &str, title: &str, body: &str) -> HydratedEntity {
+    let document = CanonicalDocument::new(
+        format!("loc:\n  id: {remote_id}\n  type: page\ntitle: {title}\n"),
+        format!("{body}\n"),
+    );
+    let body_start_line = document.frontmatter.lines().count() + 3;
+    let shadow = ShadowDocument::from_synced_body(
+        RemoteId::new(remote_id),
+        document.body.clone(),
+        body_start_line,
+        [RemoteId::new(format!("{remote_id}-block"))],
+    )
+    .expect("nested pull shadow")
+    .with_frontmatter(document.frontmatter.clone());
+    HydratedEntity {
+        document,
+        shadow,
+        remote_edited_at: Some("2026-06-11T00:00:00.000Z".to_string()),
+        assets: Vec::new(),
     }
 }
 

@@ -407,7 +407,34 @@ Windows it removes the Cloud Files sync-root registration; use `stop` first when
 you only want to stop the runtime. `list` and `reset` target the platform helper
 for the current host.
 
-`loc pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads file-like media under `.loc/media/`, and persists the root page Synced Tree shadow snapshot. It also checks already-hydrated enumerated pages for local `.loc/media` links whose files are missing and rehydrates only those pages so deleted media can be downloaded again when the remote file is still available. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. Pulling a virtual Notion database directory refreshes its row listing and `_schema.yaml`; when the database has 5 or fewer rows, it also hydrates clean row `page.md` files so small databases are immediately editable. `loc pull <page-file>` hydrates one known entity and downloads its file-like media. Pull refuses to overwrite a hydrated file if its body no longer matches the Synced Tree shadow, returning a dirty skip instead.
+`loc pull <mount-root>` starts from the mount mode. For `--root-page` Notion
+mounts, it enumerates the configured page. For `--workspace` mounts, it
+enumerates the Locality synthetic roots, places accessible top-level workspace
+pages created by the connection owner or that user's bot under `Private/` when
+that owner is known, lists shared top-level pages, databases, and searchable
+accessible objects that Locality cannot safely place under an observed parent
+under `Workspace/`, and uses `Private/` for local private drafts without
+treating the mount root as a Notion page.
+
+For plain-file mounts, pull writes stub Markdown files for projected pages,
+creates directories for projected databases, writes database `_schema.yaml`
+files, and enumerates database row stubs with property frontmatter. On
+`--root-page` mounts it also hydrates the configured page, downloads file-like
+media for that page under `.loc/media/`, and persists that page's Synced Tree
+shadow snapshot. It checks already-hydrated enumerated pages for local
+`.loc/media` links whose files are missing and rehydrates only those pages so
+deleted media can be downloaded again when the remote file is still available.
+
+For virtual filesystem mounts, pull leaves unhydrated entries online-only and
+only writes content when hydration is requested. Pulling a virtual Notion
+database directory refreshes its row listing and `_schema.yaml`; when the
+database has 5 or fewer rows, it also hydrates clean row `page.md` files so
+small databases are immediately editable. `loc pull <page-directory>` hydrates
+that directory's own `page.md` and recursively refreshes child page
+directories below it across projection modes. `loc pull <page-file>` hydrates
+one known entity and downloads its file-like media. Pull refuses to overwrite a
+hydrated file if its body no longer matches the Synced Tree shadow, returning a
+dirty skip instead.
 
 The JSON report includes `via`, `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts. `via` is `daemon` when the Unix socket handled the job and `cli` when the command executed directly.
 
