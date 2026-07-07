@@ -107,8 +107,14 @@ where
     let relative_path = matched.relative_path;
     let source = source.scoped_to_mount(&mount);
     let page_directory = page_directory_target(store, &mount, &relative_path)?;
-    let refresh_bases =
-        prepare_visible_projection_pull(store, state_root, &mount, &relative_path, &target_path)?;
+    let refresh_bases = prepare_visible_projection_pull(
+        store,
+        state_root,
+        &mount,
+        &relative_path,
+        &target_path,
+        page_directory.is_some(),
+    )?;
 
     let report = if should_pull_mount_root(
         &mount,
@@ -162,6 +168,7 @@ fn prepare_visible_projection_pull<S>(
     mount: &MountConfig,
     relative_path: &Path,
     target_path: &Path,
+    is_page_directory_target: bool,
 ) -> Result<Vec<ProjectionRefreshBase>, PullError>
 where
     S: MountRepository
@@ -180,7 +187,10 @@ where
     ) {
         return Ok(Vec::new());
     }
-    if mount.projection.uses_virtual_filesystem() && !is_page_document_path(relative_path) {
+    if mount.projection.uses_virtual_filesystem()
+        && !is_page_directory_target
+        && !is_page_document_path(relative_path)
+    {
         return Ok(Vec::new());
     }
 

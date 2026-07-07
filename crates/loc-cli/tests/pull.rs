@@ -967,6 +967,99 @@ fn pull_file_provider_page_directory_materializes_visible_child_pages() {
 }
 
 #[test]
+fn pull_file_provider_page_directory_reconciles_visible_child_edit_before_hydration() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("loc-cli-pull-visible-directory-reconcile-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::WindowsCloudFiles);
+    let connector = fixture.connector_with_nested_child("Roadmap");
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+
+    run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture
+            .mount_point_root()
+            .join("roadmap")
+            .join("design-notes"),
+        Some(&state_root),
+    )
+    .expect("hydrate visible page directory");
+
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let visible_child = fixture
+        .mount_point_root()
+        .join("roadmap")
+        .join("design-notes")
+        .join("appendix")
+        .join("page.md");
+    fs::write(
+        &visible_child,
+        concat!(
+            "---\n",
+            "loc:\n",
+            "  id: 99999999999999999999999999999999\n",
+            "  type: page\n",
+            "  synced_at: now\n",
+            "  remote_edited_at: now\n",
+            "title: Appendix\n",
+            "---\n",
+            "Local visible appendix edit.\n",
+        ),
+    )
+    .expect("missed visible child edit");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture
+            .mount_point_root()
+            .join("roadmap")
+            .join("design-notes"),
+        Some(&state_root),
+    )
+    .expect("pull visible page directory with dirty child");
+
+    assert!(!report.ok);
+    assert_eq!(report.skipped_dirty, 1);
+    assert_eq!(report.hydrated, 1);
+    assert!(report.conflicts.is_empty());
+    let visible = fs::read_to_string(&visible_child).expect("read visible child");
+    assert!(
+        visible.contains("Local visible appendix edit."),
+        "{visible}"
+    );
+    assert!(
+        !visible.contains("Nested child body."),
+        "visible edit was overwritten: {visible}"
+    );
+    let cached = fs::read_to_string(
+        content_root
+            .join("roadmap")
+            .join("design-notes")
+            .join("appendix")
+            .join("page.md"),
+    )
+    .expect("read cached child");
+    assert!(cached.contains("Local visible appendix edit."), "{cached}");
+    assert!(
+        !cached.contains("Nested child body."),
+        "cache edit was overwritten: {cached}"
+    );
+    let child = store
+        .find_entity_by_path(
+            &fixture.mount_id,
+            &PathBuf::from("roadmap/design-notes/appendix/page.md"),
+        )
+        .expect("find child")
+        .expect("child entity");
+    assert_eq!(child.hydration, HydrationState::Dirty);
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
 fn pull_plain_files_page_directory_hydrates_target_and_descendants() {
     let fixture = PullFixture::new();
     let mut store = InMemoryStateStore::new();
