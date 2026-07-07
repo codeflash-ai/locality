@@ -327,6 +327,8 @@ pub struct BlockDto {
     pub custom_block: Option<serde_json::Value>,
     #[serde(default)]
     pub button: Option<serde_json::Value>,
+    #[serde(default)]
+    pub unsupported: Option<UnsupportedBlockDto>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,6 +480,12 @@ pub struct EmptyBlockDto {}
 pub struct MeetingNotesBlockDto {
     #[serde(default)]
     pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsupportedBlockDto {
+    #[serde(default)]
+    pub block_type: Option<String>,
 }
 
 /// One Notion rich text segment.

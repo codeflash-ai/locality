@@ -68,7 +68,8 @@ Sources used for the baseline:
 | `ai_block` | Directive | No | fixture | AI-generated/native Notion object; no safe writer. |
 | `custom_block` | Directive | No | fixture | Unknown/custom native payload; no safe writer. |
 | `button` | Directive | No | fixture | Button actions are not Markdown content. |
-| Unknown future block | Directive | No | fixture | Forward compatibility path: preserve block ID and avoid lossy edits. |
+| API `unsupported` subtype-only artifact (`copy_indicator`, legacy `button`, `alias`) | Omitted | No | fixture, live API audit | The API exposes only `unsupported.block_type` and no Markdown content or target. These are treated as non-content UI/artifact blocks so they do not appear as visible `::loc` text. |
+| Unknown future block / other API `unsupported` block | Directive | No | fixture | Forward compatibility path: preserve block ID and avoid lossy edits. Literal Notion API `unsupported` blocks without an artifact subtype render with a human-readable directive title. |
 
 ## Rich Text
 
