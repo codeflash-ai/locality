@@ -2056,6 +2056,34 @@ fn enumerate_shared_workspace_projects_nested_pages_and_database_rows_under_pare
 }
 
 #[test]
+fn enumerate_shared_workspace_does_not_project_page_children_as_database_rows() {
+    let api =
+        FixtureNotionApi::workspace_database_row_with_page_child_also_returned_by_data_source();
+    let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
+
+    let entries = connector
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("enumerate workspace tree");
+
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].path, Path::new("engineering-wiki"));
+    assert_eq!(entries[0].kind, EntityKind::Database);
+    assert_eq!(
+        entries[1].path,
+        Path::new("engineering-wiki/standups-with-locality/page.md")
+    );
+    assert_eq!(entries[1].kind, EntityKind::Page);
+    assert_eq!(
+        entries[2].path,
+        Path::new("engineering-wiki/standups-with-locality/2026-06-26/page.md")
+    );
+    assert_eq!(entries[2].kind, EntityKind::Page);
+}
+
+#[test]
 fn enumerate_shared_workspace_keeps_shared_database_row_when_database_is_not_shared() {
     let api = FixtureNotionApi::shared_orphan_database_row();
     let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
@@ -2499,6 +2527,79 @@ impl FixtureNotionApi {
             databases: BTreeMap::new(),
             data_sources: BTreeMap::new(),
             data_source_pages: BTreeMap::new(),
+        }
+    }
+
+    fn workspace_database_row_with_page_child_also_returned_by_data_source() -> Self {
+        let database_id = "engineering-db";
+        let data_source_id = "engineering-ds";
+        let standups_id = "standups-page";
+        let standup_date_id = "standup-2026-06-26";
+        let standups = page_with_parent(
+            standups_id,
+            "Standups with Locality",
+            Some(ParentDto {
+                kind: "data_source_id".to_string(),
+                data_source_id: Some(data_source_id.to_string()),
+                database_id: Some(database_id.to_string()),
+                ..Default::default()
+            }),
+        );
+        let standup_date = page_with_parent(
+            standup_date_id,
+            "2026-06-26",
+            Some(ParentDto {
+                kind: "page_id".to_string(),
+                page_id: Some(standups_id.to_string()),
+                ..Default::default()
+            }),
+        );
+        let database = DatabaseDto {
+            id: database_id.to_string(),
+            parent: Some(ParentDto {
+                kind: "workspace".to_string(),
+                workspace: Some(true),
+                ..Default::default()
+            }),
+            title: vec![rich_text("Engineering Wiki")],
+            data_sources: vec![DataSourceSummaryDto {
+                id: data_source_id.to_string(),
+                name: Some("Engineering Wiki".to_string()),
+            }],
+            ..Default::default()
+        };
+        let data_source_pages = BTreeMap::from([(
+            (data_source_id.to_string(), None),
+            PaginatedListDto {
+                results: vec![standups.clone(), standup_date.clone()],
+                next_cursor: None,
+                has_more: false,
+            },
+        )]);
+        let children = BTreeMap::from([
+            (
+                (standups_id.to_string(), None),
+                PaginatedListDto {
+                    results: vec![child_page_block(standup_date_id, "2026-06-26")],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            (
+                (standup_date_id.to_string(), None),
+                PaginatedListDto::default(),
+            ),
+        ]);
+
+        Self {
+            pages: BTreeMap::from([
+                (standups.id.clone(), standups),
+                (standup_date.id.clone(), standup_date),
+            ]),
+            children,
+            databases: BTreeMap::from([(database.id.clone(), database)]),
+            data_sources: BTreeMap::new(),
+            data_source_pages,
         }
     }
 
