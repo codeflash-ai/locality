@@ -1,0 +1,113 @@
+---
+title: "Filesystem model"
+description: "Understand how app objects become folders, Markdown files, stubs, schemas, and pending changes."
+---
+
+Locality is built around one rule: if a task can be expressed as a file operation, the product should make that the natural path.
+
+## Notion shape
+
+Notion pages are directories. The body of the page is `page.md`.
+
+```text
+engineering-wiki/
+  page.md
+  standups-with-locality/
+    page.md
+    2026-07-02/
+      page.md
+```
+
+A child page lives inside its parent page directory. The containing directory determines the remote parent. Do not infer the remote parent from title search results.
+
+## Databases
+
+A Notion database is projected as a directory.
+
+```text
+content-calendar/
+  _schema.yaml
+  launch-post/
+    page.md
+  changelog-draft/
+    page.md
+```
+
+`_schema.yaml` describes the database properties Locality can validate before push. Row pages are normal page directories with `page.md`; their frontmatter includes supported row properties.
+
+When the UI says `database`, it means a Notion database-like object, not Locality's internal SQLite database.
+
+## Google Docs shape
+
+Google Drive folders become directories. Google Docs documents become page directories containing `page.md`.
+
+```text
+google-docs-main/
+  planning/
+    launch-brief/
+      page.md
+```
+
+Non-Google-Docs Drive files are ignored by the V1 connector.
+
+## Frontmatter
+
+Locality uses YAML frontmatter for identity and source metadata.
+
+```md
+---
+title: "Launch Plan"
+loc:
+  id: "..."
+  source: "notion"
+---
+```
+
+Preserve existing Locality frontmatter unless the task is explicitly about identity, migration, or rendering. Agents should edit the body and supported user-facing properties, not the generated identity block.
+
+## Stubs and hydration
+
+Large workspaces should not require a full first sync. Locality can list many objects before every body is downloaded.
+
+- **stub**: Locality knows the object exists, but the body is not ready locally;
+- **hydrated**: `page.md` content is available and tracked;
+- **dirty**: the local file changed from the last synced shadow;
+- **conflicted**: Locality found unresolved conflict markers or an unsafe merge state.
+
+Opening, locating, pulling, or editing a file can prioritize hydration for that path.
+
+## Media
+
+Downloaded media lives under `.loc/media/` at the projection root.
+
+```text
+notion-main/
+  .loc/
+    media/
+      engineering-wiki/
+        launch-plan/
+          image-0123456789ab.png
+  engineering-wiki/
+    launch-plan/
+      page.md
+```
+
+This keeps content directories readable while giving agents and editors stable local files for images, PDFs, audio, video, and other supported media.
+
+## Local create
+
+Create a new page with the CLI:
+
+```bash
+loc create page --title "Launch Plan" --parent ~/Library/CloudStorage/Locality/notion-main/go-to-market
+```
+
+Or manually create the directory shape:
+
+```text
+go-to-market/
+  launch-plan/
+    page.md
+```
+
+New local pages do not have a `loc:` identity block until Locality pushes them and reconciles the remote object.

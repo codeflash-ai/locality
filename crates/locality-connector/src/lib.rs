@@ -69,9 +69,6 @@ pub enum ChildContainer {
     /// The mount root. For workspace mounts, this is the visible workspace root;
     /// for scoped mounts, this is the configured remote root.
     Root,
-    /// Connector-defined synthetic source root, such as Notion's Private or
-    /// Workspace directory.
-    SourceRoot(RemoteId),
     /// Child pages/databases under a page.
     PageChildren(RemoteId),
     /// Row pages under a database-like collection.

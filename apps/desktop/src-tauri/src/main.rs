@@ -934,12 +934,11 @@ async fn run_notion_connection_flow(
 
     let state_root = default_state_root();
     let activity_state_root = state_root.clone();
-    let result =
-        tauri::async_runtime::spawn_blocking(move || {
-            connect_notion_with_broker(state_root, open_browser)
-        })
-            .await
-            .map_err(|error| format!("Notion OAuth worker failed: {error}"));
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        connect_notion_with_broker(state_root, open_browser)
+    })
+    .await
+    .map_err(|error| format!("Notion OAuth worker failed: {error}"));
     CONNECT_NOTION_IN_PROGRESS.store(false, Ordering::Release);
     clear_notion_login_link();
 

@@ -1,0 +1,84 @@
+---
+title: "Notion connector"
+description: "How Notion pages, databases, blocks, media, and properties map into Locality."
+---
+
+The Notion connector mounts content shared with the Locality integration.
+
+## Connect
+
+```bash
+loc connect notion --name notion-default
+```
+
+Development token fallback:
+
+```bash
+echo "$NOTION_TOKEN" | loc connect notion --token-stdin --name notion-default
+```
+
+## Mount
+
+Workspace mount:
+
+```bash
+loc mount notion ~/Library/CloudStorage/Locality/notion-main --workspace --projection macos-file-provider
+```
+
+Specific root page:
+
+```bash
+loc mount notion ~/Locality/notion-main --root-page <page-id> --projection plain-files
+loc pull ~/Locality/notion-main
+```
+
+## Projection
+
+```text
+notion-main/
+  engineering-wiki/
+    page.md
+    standups-with-locality/
+      page.md
+  content-calendar/
+    _schema.yaml
+    launch-post/
+      page.md
+```
+
+- pages are directories;
+- page bodies live in `page.md`;
+- child pages live under parent page directories;
+- databases are directories;
+- database schemas live in `_schema.yaml`;
+- database rows are page directories.
+
+## Supported writes
+
+Locality currently supports conservative Notion writes:
+
+- update, append, archive, and move selected simple blocks;
+- update supported page properties;
+- create new rows in single-data-source databases;
+- update local file-like media for supported media blocks;
+- reconcile changed pages after push.
+
+Unsupported or lossy Notion structures are preserved as `::loc{...}` directives and block unsafe pushes when needed.
+
+## Databases
+
+The word `database` in Locality UI means a Notion database-like object. It is projected as a directory, not as a hidden Locality database.
+
+Before pushing row property edits, Locality validates supported properties against `_schema.yaml`.
+
+## Common Notion errors
+
+| Error | Meaning | Fix |
+| --- | --- | --- |
+| `object_not_found` | The page ID is not visible to the integration, or the pasted URL is not a Notion page/database URL. | Share the page with the integration, reconnect, or use the right connector. |
+| `unresolved_conflict_markers` | The file still contains conflict marker lines. | Edit to the intended final content and remove every marker. |
+| `unsupported_operations` | The diff contains a change the connector cannot safely apply. | Narrow the edit or keep the unsupported block unchanged. |
+
+## Agent rule
+
+When creating or moving content, the containing directory determines the Notion parent. Do not choose a parent by matching titles from search results.

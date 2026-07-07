@@ -1,24 +1,31 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loc_cli::create::{CreateError, CreatePageOptions, run_create_page};
 use locality_core::model::{MountId, RemoteId};
-use locality_store::{InMemoryStateStore, MountConfig, MountRepository};
+use locality_store::{
+    InMemoryStateStore, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
+    VirtualMutationRepository,
+};
+use serde_json::Value;
 
 #[test]
 fn create_page_writes_page_directory_from_title() {
     let fixture = CreateFixture::new("loc-create-page");
-    let store = fixture.store(false);
+    let mut store = fixture.store(false);
     let parent = fixture.root.join("go-to-market");
     fs::create_dir_all(&parent).expect("parent");
 
     let report = run_create_page(
-        &store,
+        &mut store,
         CreatePageOptions {
             title: "Launch Plan".to_string(),
             parent: Some(parent.clone()),
+            private: false,
+            state_root: None,
         },
     )
     .expect("create page");
@@ -42,15 +49,143 @@ fn create_page_writes_page_directory_from_title() {
 }
 
 #[test]
-fn create_page_escapes_yaml_title() {
-    let fixture = CreateFixture::new("loc-create-page-escaping");
-    let store = fixture.store(false);
+fn create_page_private_writes_notion_private_marker() {
+    let fixture = CreateFixture::new("loc-create-page-private");
+    let mut store = fixture.store(false);
 
     let report = run_create_page(
-        &store,
+        &mut store,
+        CreatePageOptions {
+            title: "Private Draft".to_string(),
+            parent: Some(fixture.root.clone()),
+            private: true,
+            state_root: None,
+        },
+    )
+    .expect("create private page");
+
+    let page_path = fixture.root.join("Private Draft/page.md");
+    assert!(report.private);
+    assert_eq!(Path::new(&report.path), page_path);
+    assert_eq!(
+        fs::read_to_string(page_path).expect("page"),
+        "---\nloc:\n  private: true\ntitle: \"Private Draft\"\n---\n"
+    );
+}
+
+#[test]
+fn create_page_private_requires_notion_mount() {
+    let fixture = CreateFixture::new("loc-create-page-private-non-notion");
+    let mut store = fixture.store_with_connector("google-docs", false);
+
+    let error = run_create_page(
+        &mut store,
+        CreatePageOptions {
+            title: "Private Draft".to_string(),
+            parent: Some(fixture.root.clone()),
+            private: true,
+            state_root: None,
+        },
+    )
+    .expect_err("private create is notion-only");
+
+    assert!(
+        matches!(error, CreateError::PrivateUnsupported { connector } if connector == "google-docs")
+    );
+}
+
+#[test]
+fn cli_create_page_private_flag_writes_marker() {
+    let fixture = CreateFixture::new("loc-create-page-private-cli");
+    let state_root = fixture.temp.path("state");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("sqlite");
+    store
+        .save_mount(MountConfig {
+            mount_id: MountId::new("notion-main"),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("root-page")),
+            connection_id: None,
+            read_only: false,
+            projection: locality_store::ProjectionMode::PlainFiles,
+        })
+        .expect("save mount");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .env("LOCALITY_STATE_DIR", &state_root)
+        .args([
+            "create",
+            "page",
+            "--title",
+            "Private CLI Draft",
+            "--parent",
+            fixture.root.to_str().expect("root path"),
+            "--private",
+            "--json",
+        ])
+        .output()
+        .expect("loc create");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(report["private"], true);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("Private CLI Draft/page.md")).expect("page"),
+        "---\nloc:\n  private: true\ntitle: \"Private CLI Draft\"\n---\n"
+    );
+}
+
+#[test]
+fn create_page_private_at_virtual_mount_root_stages_pending_create() {
+    let fixture = CreateFixture::new("loc-create-page-private-virtual-root");
+    let mut store = fixture.store_with_projection(ProjectionMode::LinuxFuse, false);
+    let state_root = fixture.temp.path("state");
+
+    let report = run_create_page(
+        &mut store,
+        CreatePageOptions {
+            title: "Private Root Draft".to_string(),
+            parent: Some(fixture.root.clone()),
+            private: true,
+            state_root: Some(state_root.clone()),
+        },
+    )
+    .expect("create private virtual root page");
+
+    let projected_path = PathBuf::from("Private Root Draft/page.md");
+    assert_eq!(
+        Path::new(&report.path),
+        fixture.root.join(&projected_path).as_path()
+    );
+    let mutation = store
+        .find_virtual_mutation_by_path(&MountId::new("notion-main"), &projected_path)
+        .expect("find mutation")
+        .expect("pending create mutation");
+    assert_eq!(mutation.parent_remote_id, None);
+    assert_eq!(mutation.projected_path, projected_path);
+    assert_eq!(
+        fs::read_to_string(mutation.content_path.expect("content path")).expect("content"),
+        "---\nloc:\n  private: true\ntitle: \"Private Root Draft\"\n---\n"
+    );
+}
+
+#[test]
+fn create_page_escapes_yaml_title() {
+    let fixture = CreateFixture::new("loc-create-page-escaping");
+    let mut store = fixture.store(false);
+
+    let report = run_create_page(
+        &mut store,
         CreatePageOptions {
             title: "Quote \"Plan\"".to_string(),
             parent: Some(fixture.root.clone()),
+            private: false,
+            state_root: None,
         },
     )
     .expect("create page");
@@ -66,14 +201,16 @@ fn create_page_escapes_yaml_title() {
 #[test]
 fn create_page_refuses_existing_page_directory() {
     let fixture = CreateFixture::new("loc-create-page-existing");
-    let store = fixture.store(false);
+    let mut store = fixture.store(false);
     fs::create_dir_all(fixture.root.join("Launch Plan")).expect("existing");
 
     let error = run_create_page(
-        &store,
+        &mut store,
         CreatePageOptions {
             title: "Launch Plan".to_string(),
             parent: Some(fixture.root.clone()),
+            private: false,
+            state_root: None,
         },
     )
     .expect_err("existing target");
@@ -84,15 +221,17 @@ fn create_page_refuses_existing_page_directory() {
 #[test]
 fn create_page_requires_parent_inside_mount() {
     let fixture = CreateFixture::new("loc-create-page-outside");
-    let store = fixture.store(false);
+    let mut store = fixture.store(false);
     let outside = fixture.temp.path("outside");
     fs::create_dir_all(&outside).expect("outside");
 
     let error = run_create_page(
-        &store,
+        &mut store,
         CreatePageOptions {
             title: "Launch Plan".to_string(),
             parent: Some(outside.clone()),
+            private: false,
+            state_root: None,
         },
     )
     .expect_err("outside mount");
@@ -103,13 +242,15 @@ fn create_page_requires_parent_inside_mount() {
 #[test]
 fn create_page_refuses_read_only_mount() {
     let fixture = CreateFixture::new("loc-create-page-read-only");
-    let store = fixture.store(true);
+    let mut store = fixture.store(true);
 
     let error = run_create_page(
-        &store,
+        &mut store,
         CreatePageOptions {
             title: "Launch Plan".to_string(),
             parent: Some(fixture.root.clone()),
+            private: false,
+            state_root: None,
         },
     )
     .expect_err("read only");
@@ -120,13 +261,15 @@ fn create_page_refuses_read_only_mount() {
 #[test]
 fn create_page_rejects_titles_that_are_paths() {
     let fixture = CreateFixture::new("loc-create-page-invalid-title");
-    let store = fixture.store(false);
+    let mut store = fixture.store(false);
 
     let error = run_create_page(
-        &store,
+        &mut store,
         CreatePageOptions {
             title: "Parent/Child".to_string(),
             parent: Some(fixture.root.clone()),
+            private: false,
+            state_root: None,
         },
     )
     .expect_err("invalid title");
@@ -148,16 +291,37 @@ impl CreateFixture {
     }
 
     fn store(&self, read_only: bool) -> InMemoryStateStore {
+        self.store_with_connector("notion", read_only)
+    }
+
+    fn store_with_connector(&self, connector: &str, read_only: bool) -> InMemoryStateStore {
+        self.store_with_connector_and_projection(connector, ProjectionMode::PlainFiles, read_only)
+    }
+
+    fn store_with_projection(
+        &self,
+        projection: ProjectionMode,
+        read_only: bool,
+    ) -> InMemoryStateStore {
+        self.store_with_connector_and_projection("notion", projection, read_only)
+    }
+
+    fn store_with_connector_and_projection(
+        &self,
+        connector: &str,
+        projection: ProjectionMode,
+        read_only: bool,
+    ) -> InMemoryStateStore {
         let mut store = InMemoryStateStore::new();
         store
             .save_mount(MountConfig {
                 mount_id: MountId::new("notion-main"),
-                connector: "notion".to_string(),
+                connector: connector.to_string(),
                 root: self.root.clone(),
                 remote_root_id: Some(RemoteId::new("root-page")),
                 connection_id: None,
                 read_only,
-                projection: locality_store::ProjectionMode::PlainFiles,
+                projection,
             })
             .expect("save mount");
         store

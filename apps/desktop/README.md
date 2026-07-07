@@ -86,5 +86,6 @@ the GitHub release workflow.
 This app implements the first desktop UI pass from `docs/desktop-app.md` and
 `docs/desktop-ui-screens.md`. The Tauri shell now reads local Locality state,
 starts the Notion broker OAuth flow, exposes the main daily-use screens, and
-opens a tray popover window. Remaining product gaps, including onboarding polish
-and multi-file push orchestration, are tracked in `docs/deviations.md`.
+opens a tray popover window. Remaining product gaps, especially workspace-level
+Notion mount creation and multi-file push orchestration, are tracked in
+`docs/deviations.md`.

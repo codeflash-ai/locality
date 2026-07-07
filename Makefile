@@ -12,6 +12,16 @@ LOC_DEBUG := target/debug/loc$(EXE_SUFFIX)
 LOC_RELEASE := target/release/loc$(EXE_SUFFIX)
 LOCALITY_FILE_PROVIDER_TARGET ?= notion-main
 
+ifeq ($(OS),Windows_NT)
+CLEAN_START_PLAN_CMD := & '.\scripts\clean-start.ps1'
+CLEAN_START_CMD := & '.\scripts\clean-start.ps1' -Yes
+clean-start-plan clean-start: SHELL := powershell.exe
+clean-start-plan clean-start: .SHELLFLAGS := -NoProfile -ExecutionPolicy Bypass -Command
+else
+CLEAN_START_PLAN_CMD := scripts/clean-start.sh
+CLEAN_START_CMD := scripts/clean-start.sh --yes
+endif
+
 DESKTOP_DIR := apps/desktop
 DESKTOP_NPM := $(NPM) --prefix $(DESKTOP_DIR)
 DESKTOP_NODE_MODULES_STAMP := $(DESKTOP_DIR)/node_modules/.package-lock.json
@@ -141,11 +151,11 @@ dev-restart: build-desktop prepare-desktop-dev-sidecars ## Build UI/debug sideca
 
 .PHONY: clean-start-plan
 clean-start-plan: ## Print the local Locality clean-start reset actions without deleting anything.
-	scripts/clean-start.sh
+	$(CLEAN_START_PLAN_CMD)
 
 .PHONY: clean-start
 clean-start: ## Stop Locality and remove local app/state/mounts/credentials for fresh manual testing.
-	scripts/clean-start.sh --yes
+	$(CLEAN_START_CMD)
 
 .PHONY: check
 check: check-rust check-desktop check-oauth-service ## Run Rust and app checks.
@@ -209,6 +219,18 @@ dev-desktop: ## Start the Vite desktop frontend dev server.
 .PHONY: preview-desktop
 preview-desktop: ## Preview the built desktop frontend.
 	$(DESKTOP_NPM) run preview
+
+.PHONY: docs-dev
+docs-dev: ## Start the Mintlify docs preview from an isolated docs workspace.
+	scripts/mintlify-docs.sh dev
+
+.PHONY: docs-validate
+docs-validate: ## Validate the Mintlify docs build.
+	scripts/mintlify-docs.sh validate
+
+.PHONY: docs-broken-links
+docs-broken-links: ## Check Mintlify docs links from an isolated docs workspace.
+	scripts/mintlify-docs.sh broken-links
 
 .PHONY: dev-tauri
 dev-tauri: ## Start the Tauri desktop app in development mode.

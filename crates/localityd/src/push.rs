@@ -25,7 +25,7 @@ use locality_core::path_projection::{
     is_page_document_path, page_container_path, page_document_path,
 };
 use locality_core::planner::GuardrailDecision;
-use locality_core::planner::{CreateParentScope, GuardrailPolicy, PushOperation, PushPlan};
+use locality_core::planner::{GuardrailPolicy, PushOperation, PushPlan};
 use locality_core::push::{
     PushApplier, PushApplyRequest, PushApplyResult, PushApproval, PushConcurrencyCheck,
     PushConcurrencyRequest, PushExecutionRequest, PushExecutionResult, PushPipelineAction,
@@ -46,7 +46,6 @@ use locality_notion::markdown_table::parse_markdown_table_shape;
 use locality_notion::media::{
     load_media_manifest, media_manifest_entry, resolve_media_href_with_content_root, sha256_hex,
 };
-use locality_notion::projection::{is_notion_private_root_id, is_notion_workspace_root_id};
 use locality_store::{
     AutoSaveRepository, EntityRecord, EntityRepository, FreshnessStateRepository,
     JournalRepository, MountConfig, MountRepository, RemoteObservationRecord,
@@ -1494,7 +1493,13 @@ where
     Validator: SourcePushValidator + ?Sized,
 {
     let contents = read_to_string(&absolute_path)?;
-    let parent = required_parent_entity(store, &mount, &relative_path)?;
+    let parsed = parse_canonical_markdown(&contents);
+    let private_create = parsed.as_ref().is_ok_and(private_create_requested);
+    let parent = if private_create {
+        workspace_create_parent(&mount)
+    } else {
+        required_parent_entity(store, &mount, &relative_path)?
+    };
     if let Some(line) = unresolved_conflict_marker_line(&contents) {
         return Ok(PreparedPush {
             absolute_path,
@@ -1504,7 +1509,7 @@ where
             pipeline: validation_pipeline(unresolved_conflict_marker_issue(&relative_path, line)),
         });
     }
-    let parsed = match parse_canonical_markdown(&contents) {
+    let parsed = match parsed {
         Ok(parsed) => parsed,
         Err(error) => {
             return Ok(PreparedPush {
@@ -1519,7 +1524,7 @@ where
     let schema_validation = validator.validate_create_frontmatter(SourceValidationContext {
         state_root,
         mount: &mount,
-        parent: Some(&parent),
+        parent: if private_create { None } else { Some(&parent) },
         relative_path: &relative_path,
         parsed: &parsed,
         shadow: None,
@@ -1687,31 +1692,18 @@ where
             validator,
         );
     }
-    let parent_id = pending.parent_remote_id.clone().ok_or_else(|| {
-        PushPrepareError::Core(LocalityError::InvalidState(format!(
-            "pending create `{}` is missing a parent remote id",
-            pending.local_id
-        )))
-    })?;
-    let parent = pending_create_parent_entity(store, &mount, &parent_id)?;
     let read_path = pending_create_read_path(&mount, &pending, state_root, &absolute_path)?;
     let contents = read_to_string(&read_path)?;
-    if let Some(line) = unresolved_conflict_marker_line(&contents) {
-        return Ok(PreparedPush {
-            absolute_path,
-            mount,
-            entity: parent,
-            shadows: Vec::new(),
-            pipeline: validation_pipeline(unresolved_conflict_marker_issue(
-                &pending.projected_path,
-                line,
-            )),
-        });
-    }
     let parsed = match parse_canonical_markdown(&contents) {
         Ok(parsed) => parsed,
         Err(error) => match pending_create_projected_parse_fallback(&read_path, &absolute_path) {
             Some(parsed) => {
+                let parent = pending_create_parent_for_private_marker(
+                    store,
+                    &mount,
+                    &pending,
+                    private_create_requested(&parsed),
+                )?;
                 return prepare_pending_create_from_parsed(
                     job,
                     state_root,
@@ -1724,6 +1716,8 @@ where
                 );
             }
             None => {
+                let parent =
+                    pending_create_parent_for_private_marker(store, &mount, &pending, false)?;
                 return Ok(PreparedPush {
                     absolute_path,
                     mount,
@@ -1737,6 +1731,24 @@ where
             }
         },
     };
+    let parent = pending_create_parent_for_private_marker(
+        store,
+        &mount,
+        &pending,
+        private_create_requested(&parsed),
+    )?;
+    if let Some(line) = unresolved_conflict_marker_line(&contents) {
+        return Ok(PreparedPush {
+            absolute_path,
+            mount,
+            entity: parent,
+            shadows: Vec::new(),
+            pipeline: validation_pipeline(unresolved_conflict_marker_issue(
+                &pending.projected_path,
+                line,
+            )),
+        });
+    }
     prepare_pending_create_from_parsed(
         job,
         state_root,
@@ -1747,6 +1759,28 @@ where
         parsed,
         validator,
     )
+}
+
+fn pending_create_parent_for_private_marker<S>(
+    store: &S,
+    mount: &MountConfig,
+    pending: &VirtualMutationRecord,
+    private_create: bool,
+) -> Result<EntityRecord, PushPrepareError>
+where
+    S: EntityRepository,
+{
+    if private_create {
+        return Ok(workspace_create_parent(mount));
+    }
+
+    let parent_id = pending.parent_remote_id.clone().ok_or_else(|| {
+        PushPrepareError::Core(LocalityError::InvalidState(format!(
+            "pending create `{}` is missing a parent remote id",
+            pending.local_id
+        )))
+    })?;
+    pending_create_parent_entity(store, mount, &parent_id)
 }
 
 fn pending_create_parent_entity<S>(
@@ -1797,10 +1831,16 @@ fn prepare_pending_create_from_parsed<Validator>(
 where
     Validator: SourcePushValidator + ?Sized,
 {
+    let private_create = private_create_requested(&parsed);
+    let parent = if private_create {
+        workspace_create_parent(&mount)
+    } else {
+        parent
+    };
     let schema_validation = validator.validate_create_frontmatter(SourceValidationContext {
         state_root,
         mount: &mount,
-        parent: Some(&parent),
+        parent: if private_create { None } else { Some(&parent) },
         relative_path: &pending.projected_path,
         parsed: &parsed,
         shadow: None,
@@ -2032,26 +2072,6 @@ where
     })
 }
 
-fn create_parent_scope_for_entity(mount: &MountConfig, parent: &EntityRecord) -> CreateParentScope {
-    if mount.connector == "notion" && is_notion_private_root_id(&parent.remote_id) {
-        return CreateParentScope::PrivateWorkspace;
-    }
-    if mount.connector == "notion" && is_notion_workspace_root_id(&parent.remote_id) {
-        return CreateParentScope::WorkspaceRoot;
-    }
-    CreateParentScope::Remote
-}
-
-fn notion_workspace_root_create_validation(relative_path: &Path) -> ValidationIssue {
-    ValidationIssue::new(
-        "notion_workspace_root_create_ambiguous",
-        relative_path,
-        None,
-        "New root workspace pages are ambiguous because Notion does not expose a stable teamspace parent through this API.",
-        Some("Create under Private/ for a private page, or create below an existing page that Locality can use as the parent.".to_string()),
-    )
-}
-
 fn create_entity_pipeline(
     relative_path: &Path,
     parsed: &locality_core::canonical::ParsedCanonicalDocument,
@@ -2072,6 +2092,16 @@ fn create_entity_pipeline(
 
     let mut validation = ValidationReport::clean();
     validation.extend(schema_validation);
+    let private_create = private_create_requested(parsed);
+    if private_create && mount.connector != "notion" {
+        validation.push(ValidationIssue::new(
+            "create_entity_private_unsupported",
+            relative_path,
+            Some(1),
+            "`loc.private: true` is only supported for Notion page creation",
+            Some("remove `loc.private`, or create this page inside a Notion mount".to_string()),
+        ));
+    }
     if parsed.remote_id().is_some() {
         validation.push(ValidationIssue::new(
             "create_entity_has_remote_id",
@@ -2135,11 +2165,6 @@ fn create_entity_pipeline(
         ));
     }
 
-    let parent_scope = create_parent_scope_for_entity(mount, parent);
-    if parent_scope == CreateParentScope::WorkspaceRoot {
-        validation.push(notion_workspace_root_create_validation(relative_path));
-    }
-
     let mut completed_stages = vec![PushStage::ParseAndValidate];
     if !validation.is_clean() {
         return PushPipelineResult {
@@ -2157,12 +2182,27 @@ fn create_entity_pipeline(
         .iter()
         .map(|(key, value)| (key.clone(), property_value_from_frontmatter(value)))
         .collect::<BTreeMap<_, _>>();
+    let affected_entities = if private_create {
+        Vec::new()
+    } else {
+        vec![parent.remote_id.clone()]
+    };
+    let parent_id = if private_create {
+        workspace_parent_id(mount)
+    } else {
+        parent.remote_id.clone()
+    };
+    let parent_kind = if private_create {
+        None
+    } else {
+        Some(parent.kind.clone())
+    };
     let plan = PushPlan::new(
-        vec![parent.remote_id.clone()],
+        affected_entities,
         vec![PushOperation::CreateEntity {
-            parent_id: parent.remote_id.clone(),
-            parent_kind: Some(parent.kind.clone()),
-            parent_scope,
+            parent_id,
+            parent_kind,
+            parent_workspace: private_create,
             title: parsed.frontmatter.title.clone().unwrap_or_default(),
             properties,
             body: parsed.document.body.clone(),
@@ -2189,6 +2229,31 @@ fn create_entity_pipeline(
         action,
         completed_stages,
     }
+}
+
+fn private_create_requested(parsed: &locality_core::canonical::ParsedCanonicalDocument) -> bool {
+    parsed
+        .frontmatter
+        .loc
+        .as_ref()
+        .is_some_and(|metadata| metadata.private)
+}
+
+fn workspace_create_parent(mount: &MountConfig) -> EntityRecord {
+    EntityRecord::new(
+        mount.mount_id.clone(),
+        workspace_parent_id(mount),
+        EntityKind::Directory,
+        "Workspace",
+        PathBuf::new(),
+    )
+}
+
+fn workspace_parent_id(mount: &MountConfig) -> RemoteId {
+    mount
+        .remote_root_id
+        .clone()
+        .unwrap_or_else(|| RemoteId::new("workspace"))
 }
 
 fn projection_read_path(

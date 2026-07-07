@@ -1,0 +1,79 @@
+---
+title: "Use with agents"
+description: "Give agents local files, clear rules, and a safe review path back to the source app."
+---
+
+Locality works best when the agent edits mounted Markdown directly and leaves the sync decision explicit.
+
+## Agent contract
+
+Tell the agent three things:
+
+```text
+Use Locality for this workspace.
+Edit the mounted Markdown files directly.
+Before pushing, show me `loc diff` for the file you changed.
+```
+
+Use a concrete path whenever possible:
+
+```text
+Update the launch plan at:
+~/Library/CloudStorage/Locality/notion-main/go-to-market/launch-plan/page.md
+```
+
+## What agents should do
+
+- read mounted files with normal file tools;
+- edit `page.md` directly;
+- preserve Locality frontmatter and `::loc{...}` directives;
+- use `loc status <path>` when they need state;
+- use `loc diff <path>` before remote writes;
+- push only when the user asks, or when Live Mode reports a review path.
+
+## What agents should avoid
+
+- do not rewrite generated `loc:` identity frontmatter;
+- do not edit `_schema.yaml` unless the task is explicitly about database schema;
+- do not remove `::loc{...}` directives unless replacing the underlying unsupported block intentionally;
+- do not run broad `loc push` commands without a scoped path;
+- do not delete old-looking folders until `loc status` confirms they are untracked and safe to remove.
+
+## Live Mode behavior
+
+When Live Mode is enabled, agents should not run routine `loc pull` or `loc push` after every edit. They should edit the file and stop.
+
+Use `loc status` only when:
+
+- the desktop app reports attention needed;
+- the file is conflicted;
+- the user asks for a push;
+- the agent needs to explain what is pending.
+
+## Good agent prompt
+
+```text
+Use Locality to edit my Notion workspace.
+
+Target file:
+~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-checklist/page.md
+
+Make the requested Markdown edits directly in that file. Preserve existing
+frontmatter, block identity directives, and database schema files. When done,
+run `loc diff` for the target file and summarize the planned remote changes.
+Do not push unless I explicitly approve it.
+```
+
+## MCP fallback
+
+If an agent cannot execute the host `loc` binary because of sandboxing, use the Locality MCP fallback named `loc` with CLI-style arguments:
+
+```json
+{"argv":["status","~/Library/CloudStorage/Locality/notion-main","--json"]}
+```
+
+Direct CLI execution is still preferred when available.
+
+## Installed guidance
+
+During onboarding, Locality can install concise guidance for supported local agents and create mount-local files such as `AGENTS.md` and `CLAUDE.md`. Those files are intentionally short. The most important rule remains the same: work in files, review with Locality, then sync safely.

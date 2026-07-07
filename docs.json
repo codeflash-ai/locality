@@ -1,0 +1,99 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "luma",
+  "name": "Locality",
+  "description": "Locality mounts apps like Notion and Google Docs as local files for humans, editors, and agents.",
+  "colors": {
+    "primary": "#0F766E",
+    "light": "#14B8A6",
+    "dark": "#0F766E"
+  },
+  "icons": {
+    "library": "lucide"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/codeflash-ai/locality",
+        "icon": "github"
+      },
+      {
+        "label": "Releases",
+        "href": "https://github.com/codeflash-ai/locality/releases",
+        "icon": "download"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Install Locality",
+      "href": "/docs/install"
+    }
+  },
+  "contextual": {
+    "options": ["copy"]
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Start",
+        "icon": "rocket",
+        "pages": [
+          "docs/overview",
+          "docs/install",
+          "docs/quickstart",
+          "docs/filesystem-model"
+        ]
+      },
+      {
+        "group": "Use Locality",
+        "icon": "folder-sync",
+        "pages": [
+          "docs/desktop",
+          "docs/agents",
+          "docs/best-practices",
+          "docs/sync-safety",
+          "docs/use-cases"
+        ]
+      },
+      {
+        "group": "Reference",
+        "icon": "terminal",
+        "pages": [
+          "docs/cli-reference",
+          "docs/connectors/notion",
+          "docs/connectors/google-docs",
+          "docs/okf-export"
+        ]
+      },
+      {
+        "group": "Operations",
+        "icon": "settings",
+        "pages": [
+          "docs/troubleshooting",
+          "docs/development"
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/codeflash-ai/locality"
+    },
+    "links": [
+      {
+        "label": "Product",
+        "items": [
+          {
+            "label": "Install",
+            "href": "/docs/install"
+          },
+          {
+            "label": "GitHub Releases",
+            "href": "https://github.com/codeflash-ai/locality/releases"
+          }
+        ]
+      }
+    ]
+  }
+}

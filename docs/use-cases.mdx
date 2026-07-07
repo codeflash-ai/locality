@@ -1,0 +1,110 @@
+---
+title: "Use cases"
+description: "Practical workflows where Locality gives humans and agents a useful local file interface."
+---
+
+These are the workflows Locality should explain and support first.
+
+## Engineering wiki updates
+
+Use Locality when the source material is already in Notion but the edit is easier with an agent.
+
+Example:
+
+```text
+Update the engineering onboarding page with the new dev setup commands.
+Keep the existing structure.
+Show me the Locality diff before pushing.
+```
+
+Why Locality helps:
+
+- the agent can inspect nearby docs with file search;
+- the user can review a concrete Markdown diff;
+- push updates the original Notion page after approval.
+
+## Meeting notes to action docs
+
+Mount standups, planning notes, or meeting recaps. Ask an agent to turn them into follow-ups, status updates, or launch checklists.
+
+Good target files:
+
+- `standups-with-locality/2026-07-02/page.md`;
+- `product/planning/week-28/page.md`;
+- `go-to-market/launch-notes/page.md`.
+
+Review with:
+
+```bash
+loc diff <page.md>
+```
+
+## Content operations
+
+Use Locality for edits that need consistency across many pages:
+
+- terminology cleanup;
+- launch messaging updates;
+- changelog drafts;
+- support article refreshes;
+- brand voice review;
+- product name corrections.
+
+The agent can search the local workspace, make scoped edits, and leave pending changes for review.
+
+## Database-backed workflows
+
+Notion databases appear as directories with row pages and `_schema.yaml`.
+
+Useful examples:
+
+- content calendar rows;
+- customer proof points;
+- bug triage notes;
+- user research repository;
+- CRM-style account notes.
+
+Create a new row as a page:
+
+```bash
+loc create page --title "Launch FAQ" --parent ~/Library/CloudStorage/Locality/notion-main/content-calendar
+```
+
+Then review and push:
+
+```bash
+loc diff ~/Library/CloudStorage/Locality/notion-main/content-calendar/launch-faq/page.md
+loc push ~/Library/CloudStorage/Locality/notion-main/content-calendar/launch-faq/page.md -y
+```
+
+## Portable knowledge bundles
+
+Export mounted content into Open Knowledge Format when you want an offline, connector-neutral bundle.
+
+```bash
+loc okf export ~/Library/CloudStorage/Locality/notion-main/engineering-wiki --out ~/Desktop/engineering-wiki-okf
+```
+
+Good uses:
+
+- share context with another agent;
+- archive a project workspace;
+- feed a retrieval or indexing pipeline;
+- demo Locality without giving direct Notion access.
+
+## Safe agent handoff
+
+Give the agent one mounted path, one job, and one review rule.
+
+```text
+Target:
+~/Library/CloudStorage/Locality/notion-main/go-to-market/launch-plan/page.md
+
+Task:
+Rewrite the rollout section for clarity and add an owner checklist.
+
+Rule:
+Do not push. Run `loc diff` and summarize the planned changes.
+```
+
+That workflow keeps the remote app protected while still letting the agent do real work.

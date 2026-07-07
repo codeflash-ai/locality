@@ -122,6 +122,7 @@ enum RenderedBlockSpacing {
     Normal,
     BulletedListItem,
     NumberedListItem,
+    Omitted,
 }
 
 impl RenderedBlockSpacing {
@@ -152,7 +153,9 @@ fn render_markdown_body(blocks: &[RenderedBlock]) -> String {
 
     for block in blocks {
         if block.markdown.is_empty() {
-            pending_empty_blocks += 1;
+            if block.spacing != RenderedBlockSpacing::Omitted {
+                pending_empty_blocks += 1;
+            }
             continue;
         }
 
@@ -373,7 +376,7 @@ fn render_block(block: &BlockDto, options: &RenderOptions) -> RenderedBlock {
         "meeting_notes" => titled_directive(block, "meeting_notes", block.meeting_notes.as_ref()),
         "transcription" => titled_directive(block, "transcription", block.transcription.as_ref()),
         "tab" | "ai_block" | "custom_block" | "button" => directive_block(block, &block.kind, None),
-        "unsupported" => directive_block(block, "unsupported", None),
+        "unsupported" => unsupported_block(block),
         other => directive_block(block, &format!("unsupported_{other}"), None),
     };
     if rendered.shadow_id.is_some() {
@@ -616,6 +619,31 @@ fn directive_block_with_attrs(
     }
 }
 
+fn unsupported_block(block: &BlockDto) -> RenderedBlock {
+    let Some(block_type) = block.unsupported.as_ref().and_then(|value| {
+        value
+            .block_type
+            .as_deref()
+            .filter(|block_type| !block_type.is_empty())
+    }) else {
+        return directive_block(block, "unsupported", Some("Unsupported Notion block"));
+    };
+
+    if is_subtype_only_unsupported_artifact(block_type) {
+        return omitted_block();
+    }
+
+    directive_block_with_attrs(
+        block,
+        "unsupported",
+        vec![("block_type", block_type.to_string())],
+    )
+}
+
+fn is_subtype_only_unsupported_artifact(block_type: &str) -> bool {
+    matches!(block_type, "alias" | "button" | "copy_indicator")
+}
+
 fn rendered_block(markdown: String, shadow_id: Option<RemoteId>) -> RenderedBlock {
     RenderedBlock {
         markdown,
@@ -625,6 +653,12 @@ fn rendered_block(markdown: String, shadow_id: Option<RemoteId>) -> RenderedBloc
         spacing: RenderedBlockSpacing::Normal,
         media_asset: None,
     }
+}
+
+fn omitted_block() -> RenderedBlock {
+    let mut block = rendered_block(String::new(), None);
+    block.spacing = RenderedBlockSpacing::Omitted;
+    block
 }
 
 fn list_item_rendered_block(

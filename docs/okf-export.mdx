@@ -1,0 +1,55 @@
+---
+title: "OKF export"
+description: "Export mounted Locality content into a portable Open Knowledge Format bundle."
+---
+
+Open Knowledge Format export is an additive view over a Locality mount. It does not replace the mounted `page.md` sync format.
+
+## Export
+
+```bash
+loc okf export <mounted-path> --out <empty-dir>
+```
+
+Example:
+
+```bash
+loc okf export ~/Library/CloudStorage/Locality/notion-main/engineering-wiki --out ~/Desktop/engineering-wiki-okf
+```
+
+The output directory must be empty so repeated exports do not overwrite work by accident.
+
+## Mapping
+
+```text
+Locality projection                         OKF bundle
+engineering-wiki/page.md               ->   engineering-wiki.md
+engineering-wiki/standups/page.md      ->   engineering-wiki/standups.md
+```
+
+The exporter also writes index files for progressive disclosure and stores Locality identity under extension fields.
+
+## What gets exported
+
+- hydrated mounted Markdown content;
+- useful source frontmatter;
+- connector/source hints;
+- Locality identity metadata under `locality:`;
+- generated index files.
+
+Unhydrated stubs are skipped and reported.
+
+## Good uses
+
+- portable agent context bundles;
+- source-neutral demos;
+- archive snapshots;
+- retrieval/indexing input;
+- handoff to a workflow that should not need app credentials.
+
+## Non-goals
+
+- no remote writes;
+- no replacement for mounted `page.md`;
+- no direct OKF Live Mode;
+- no silent import overwrite of existing mounted content.
