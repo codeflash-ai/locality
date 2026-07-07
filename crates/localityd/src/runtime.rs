@@ -6,8 +6,10 @@
 //! responsive during network I/O.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(target_os = "macos")]
 use std::env;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -1201,7 +1203,11 @@ impl RuntimeState {
         sender: Sender<RuntimeMessage>,
     ) -> Self {
         let hydration = load_persisted_hydrations(&config.state_root);
-        let child_refreshes = load_persisted_child_refreshes(&config.state_root);
+        let child_refreshes = if config.background_connector_sync {
+            load_persisted_child_refreshes(&config.state_root)
+        } else {
+            ChildRefreshQueue::default()
+        };
 
         Self {
             scheduler: PullScheduler::new(config.pull_scheduler.clone()),
@@ -1627,6 +1633,14 @@ impl RuntimeState {
                         &container_identifier,
                         error.to_string(),
                     );
+                    if self.config.background_connector_sync {
+                        self.child_refreshes.queue(ChildRefreshRequest {
+                            mount_id: mount_id.clone(),
+                            container_identifier: container_identifier.clone(),
+                            priority,
+                            depth,
+                        });
+                    }
                     eprintln!(
                         "localityd virtual filesystem child refresh failed for `{mount_id}:{container_identifier}`: {error}"
                     );
@@ -1794,6 +1808,9 @@ impl RuntimeState {
     }
 
     fn maybe_start_child_refresh_jobs(&mut self) {
+        if !self.config.background_connector_sync {
+            return;
+        }
         while self.active_job.is_none()
             && self.active_child_refreshes.len() < MAX_CHILD_REFRESH_WORKERS
         {
@@ -4652,6 +4669,46 @@ mod tests {
     }
 
     #[test]
+    fn metadata_discovery_jobs_do_not_reload_when_background_sync_disabled() {
+        let state_root = temp_runtime_root("runtime-metadata-discovery-background-disabled");
+        seed_virtual_mount(&state_root);
+        {
+            let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+            store
+                .upsert_metadata_discovery_job(metadata_discovery_job(
+                    "children:page-1",
+                    MetadataDiscoveryPriority::Interactive,
+                    3,
+                ))
+                .expect("queue discovery");
+        }
+
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let runtime = RuntimeState::new(
+            crate::DaemonConfig {
+                state_root: state_root.clone(),
+                background_connector_sync: false,
+                ..crate::DaemonConfig::default()
+            },
+            Arc::new(DefaultRuntimeJobRunner),
+            sender,
+        );
+
+        assert!(runtime.child_refreshes.debug_requests(10).is_empty());
+        assert_eq!(
+            SqliteStateStore::open(state_root.clone())
+                .expect("open store")
+                .list_metadata_discovery_jobs()
+                .expect("list discovery")
+                .len(),
+            1,
+            "disable should suppress in-memory scheduling without deleting durable work"
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
     fn queue_child_refresh_persists_metadata_discovery_job() {
         let state_root = temp_runtime_root("runtime-metadata-discovery-persist");
         seed_virtual_mount(&state_root);
@@ -4746,6 +4803,50 @@ mod tests {
             jobs[0].last_error.as_deref(),
             Some("invalid state: rate limited")
         );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn failed_child_refresh_requeues_metadata_discovery_request() {
+        let state_root = temp_runtime_root("runtime-metadata-discovery-failure-requeue");
+        seed_virtual_mount(&state_root);
+        {
+            let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+            store
+                .upsert_metadata_discovery_job(metadata_discovery_job(
+                    "children:page-1",
+                    MetadataDiscoveryPriority::Background,
+                    1,
+                ))
+                .expect("queue discovery");
+        }
+        let mut runtime = runtime_state_for_root(state_root.clone());
+        let request = ChildRefreshRequest {
+            mount_id: "notion-main".to_string(),
+            container_identifier: "children:page-1".to_string(),
+            priority: ChildRefreshPriority::Background,
+            depth: 1,
+        };
+        let popped = runtime
+            .child_refreshes
+            .pop_ready(&BTreeMap::new())
+            .expect("loaded request is ready");
+        assert_eq!(popped, request);
+        runtime
+            .active_child_refreshes
+            .insert(request.key(), ActiveChildRefresh::new(request.clone()));
+        runtime.active_job = Some(test_active_job());
+
+        runtime.handle_completion(JobCompletion::VirtualFsRefreshChildren {
+            mount_id: request.mount_id.clone(),
+            container_identifier: request.container_identifier.clone(),
+            depth: request.depth,
+            priority: request.priority,
+            result: Err(LocalityError::InvalidState("rate limited".to_string())),
+        });
+
+        assert_eq!(runtime.child_refreshes.debug_requests(10), vec![request]);
 
         let _ = std::fs::remove_dir_all(state_root);
     }
