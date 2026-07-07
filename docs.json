@@ -26,7 +26,10 @@
         "group": "Use Locality",
         "icon": "folder-sync",
         "pages": [
-          "docs/desktop"
+          "docs/desktop",
+          "docs/agents",
+          "docs/sync-safety",
+          "docs/use-cases"
         ]
       }
     ]
