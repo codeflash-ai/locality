@@ -537,6 +537,94 @@ fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
 }
 
 #[test]
+fn render_notion_unsupported_block_as_labeled_directive() {
+    let bundle = locality_notion::dto::NotionPageBundle {
+        page: page("page-1", "Unsupported"),
+        blocks: vec![BlockTreeDto {
+            block: unsupported_block("unsupported-1", "unsupported"),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "::loc{id=unsupported-1 type=unsupported title=\"Unsupported Notion block\"}\n"
+    );
+    assert_eq!(rendered.shadow.blocks.len(), 1);
+    assert_eq!(
+        rendered.shadow.blocks[0].remote_id,
+        RemoteId::new("unsupported-1")
+    );
+    assert!(matches!(
+        rendered.shadow.blocks[0].kind,
+        MarkdownBlockKind::Directive { .. }
+    ));
+}
+
+#[test]
+fn render_subtype_only_unsupported_artifacts_as_empty_markdown() {
+    let raw = serde_json::to_vec(&json!({
+        "page": page("page-1", "Unsupported Artifacts"),
+        "blocks": [
+            {
+                "block": rich_text_block("paragraph-1", "paragraph", "Before"),
+                "children": [],
+            },
+            {
+                "block": {
+                    "id": "copy-indicator-1",
+                    "type": "unsupported",
+                    "unsupported": { "block_type": "copy_indicator" }
+                },
+                "children": [],
+            },
+            {
+                "block": {
+                    "id": "button-1",
+                    "type": "unsupported",
+                    "unsupported": { "block_type": "button" }
+                },
+                "children": [],
+            },
+            {
+                "block": {
+                    "id": "alias-1",
+                    "type": "unsupported",
+                    "unsupported": { "block_type": "alias" }
+                },
+                "children": [],
+            },
+            {
+                "block": rich_text_block("paragraph-2", "paragraph", "After"),
+                "children": [],
+            },
+        ],
+    }))
+    .expect("raw bundle");
+    let native = locality_connector::NativeEntity {
+        remote_id: RemoteId::new("page-1"),
+        kind: "notion_page".to_string(),
+        raw,
+    };
+
+    let rendered = locality_notion::render::render_native_entity(&native).expect("render");
+
+    assert_eq!(rendered.document.body, "Before\n\nAfter\n");
+    assert!(!rendered.document.body.contains("::loc"));
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| block.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["paragraph-1", "paragraph-2"]
+    );
+}
+
+#[test]
 fn render_code_block_uses_fence_longer_than_embedded_backticks() {
     let bundle = locality_notion::dto::NotionPageBundle {
         page: page("page-1", "Roadmap"),
