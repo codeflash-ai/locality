@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MACOS_WORKFLOW="${ROOT}/.github/workflows/release-macos.yml"
 WINDOWS_WORKFLOW="${ROOT}/.github/workflows/release-windows.yml"
+LINUX_WORKFLOW="${ROOT}/.github/workflows/release-linux.yml"
 UPDATER_SCRIPT="${ROOT}/scripts/render-tauri-updater-manifest.sh"
 
 fail() {
@@ -29,6 +30,21 @@ grep -F -q 'Locality_Windows.exe' "${WINDOWS_WORKFLOW}" \
 grep -F -q 'UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/windows/Locality_Windows_v${{ env.APP_VERSION }}.exe' "${WINDOWS_WORKFLOW}" \
   || fail "Windows updater manifest must point at the standard installer asset"
 
+grep -F -q 'Locality_Linux_v${APP_VERSION}.deb' "${LINUX_WORKFLOW}" \
+  || fail "Linux release workflow must publish Locality_Linux_v<version>.deb"
+grep -F -q 'Locality_Linux_v${APP_VERSION}.rpm' "${LINUX_WORKFLOW}" \
+  || fail "Linux release workflow must publish Locality_Linux_v<version>.rpm"
+grep -F -q 'Locality_Linux_v${APP_VERSION}.AppImage' "${LINUX_WORKFLOW}" \
+  || fail "Linux release workflow must publish Locality_Linux_v<version>.AppImage"
+grep -F -q 'Locality_Linux.deb' "${LINUX_WORKFLOW}" \
+  || fail "Linux release workflow must publish a stable Locality_Linux.deb alias"
+grep -F -q 'Locality_Linux.rpm' "${LINUX_WORKFLOW}" \
+  || fail "Linux release workflow must publish a stable Locality_Linux.rpm alias"
+grep -F -q 'Locality_Linux.AppImage' "${LINUX_WORKFLOW}" \
+  || fail "Linux release workflow must publish a stable Locality_Linux.AppImage alias"
+grep -F -q 'UPDATER_LINUX_X86_64_ARTIFACT: target/release/github-assets/Locality_Linux_v${{ env.APP_VERSION }}.AppImage' "${LINUX_WORKFLOW}" \
+  || fail "Linux updater manifest must point at the standard AppImage asset"
+
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-release-asset-names.XXXXXX")"
 cleanup() {
   rm -rf "${tmp_root}"
@@ -39,11 +55,14 @@ touch "${tmp_root}/Locality_Mac_Updater_v0.1.5.app.tar.gz"
 printf 'mac-signature\n' >"${tmp_root}/Locality_Mac_Updater_v0.1.5.app.tar.gz.sig"
 touch "${tmp_root}/Locality_Windows_v0.1.5.exe"
 printf 'windows-signature\n' >"${tmp_root}/Locality_Windows_v0.1.5.exe.sig"
+touch "${tmp_root}/Locality_Linux_v0.1.5.AppImage"
+printf 'linux-signature\n' >"${tmp_root}/Locality_Linux_v0.1.5.AppImage.sig"
 
 UPDATER_VERSION="0.1.5" \
   UPDATER_BASE_URL="https://example.invalid/releases/v0.1.5" \
   UPDATER_MANIFEST_OUTPUT="${tmp_root}/latest.json" \
   UPDATER_MACOS_AARCH64_ARTIFACT="${tmp_root}/Locality_Mac_Updater_v0.1.5.app.tar.gz" \
+  UPDATER_LINUX_X86_64_ARTIFACT="${tmp_root}/Locality_Linux_v0.1.5.AppImage" \
   UPDATER_WINDOWS_X86_64_ARTIFACT="${tmp_root}/Locality_Windows_v0.1.5.exe" \
   "${UPDATER_SCRIPT}" >/dev/null
 
@@ -51,7 +70,11 @@ grep -F -q '"darwin-aarch64"' "${tmp_root}/latest.json" \
   || fail "updater manifest must accept explicit macOS platform artifacts without arch in the filename"
 grep -F -q '"windows-x86_64"' "${tmp_root}/latest.json" \
   || fail "updater manifest must accept explicit Windows platform artifacts without arch in the filename"
+grep -F -q '"linux-x86_64"' "${tmp_root}/latest.json" \
+  || fail "updater manifest must accept explicit Linux platform artifacts without arch in the filename"
 grep -F -q 'Locality_Mac_Updater_v0.1.5.app.tar.gz' "${tmp_root}/latest.json" \
   || fail "updater manifest must use the standard macOS updater filename"
 grep -F -q 'Locality_Windows_v0.1.5.exe' "${tmp_root}/latest.json" \
   || fail "updater manifest must use the standard Windows installer filename"
+grep -F -q 'Locality_Linux_v0.1.5.AppImage' "${tmp_root}/latest.json" \
+  || fail "updater manifest must use the standard Linux AppImage filename"

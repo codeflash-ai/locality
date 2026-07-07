@@ -121,12 +121,16 @@ GitHub Release uploads use stable asset names so latest-release install URLs do
 not need to know the version or commit:
 
 ```sh
-curl -L -o /tmp/loc.deb https://github.com/codeflash-ai/locality/releases/latest/download/Locality-release-linux-x86_64.deb && sudo apt install /tmp/loc.deb
+curl -L -o /tmp/loc.deb https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb && sudo apt install /tmp/loc.deb
 ```
 
-The workflow still renders versioned package files inside the APT/RPM
+The GitHub Release also includes the versioned public aliases
+`Locality_Linux_v<version>.deb`, `Locality_Linux_v<version>.rpm`, and
+`Locality_Linux_v<version>.AppImage` for users who want the exact release asset.
+
+The workflow still renders date-and-commit package files inside the APT/RPM
 repositories deployed to GitHub Pages, but it does not upload those duplicate
-versioned files to the GitHub Release page.
+internal package names to the GitHub Release page.
 
 The same workflow renders static APT and RPM repository metadata under
 `target/release/linux-repo` and deploys it to GitHub Pages for non-prerelease
@@ -219,7 +223,7 @@ who want Tauri-managed self-update should run the AppImage channel instead.
 AppImage install command:
 
 ```sh
-mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/Locality.AppImage https://github.com/codeflash-ai/locality/releases/latest/download/Locality-release-linux-x86_64.AppImage && chmod +x ~/.local/bin/Locality.AppImage
+mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/Locality.AppImage https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.AppImage && chmod +x ~/.local/bin/Locality.AppImage
 ```
 
 The workflow shares the same release concurrency group as the macOS workflow so

@@ -207,23 +207,57 @@ jobs:
       - name: Build and validate Linux packages
         run: make publish-linux
 
+      - name: Create standard GitHub asset names
+        run: |
+          rm -rf target/release/github-assets
+          mkdir -p target/release/github-assets
+
+          deb="target/release/bundle/linux/Locality-release-linux-x86_64.deb"
+          rpm="target/release/bundle/linux/Locality-release-linux-x86_64.rpm"
+          appimage="target/release/bundle/updater/Locality-release-linux-x86_64.AppImage"
+          for artifact in "${deb}" "${rpm}" "${appimage}"; do
+            if [[ ! -f "${artifact}" ]]; then
+              echo "::error::Could not find Linux artifact ${artifact}."
+              exit 1
+            fi
+          done
+          if [[ ! -f "${appimage}.sig" ]]; then
+            echo "::error::Could not find Linux updater signature ${appimage}.sig."
+            exit 1
+          fi
+
+          cp "${deb}" "target/release/github-assets/Locality_Linux_v${APP_VERSION}.deb"
+          cp "${deb}" "target/release/github-assets/Locality_Linux.deb"
+          cp "${rpm}" "target/release/github-assets/Locality_Linux_v${APP_VERSION}.rpm"
+          cp "${rpm}" "target/release/github-assets/Locality_Linux.rpm"
+          cp "${appimage}" "target/release/github-assets/Locality_Linux_v${APP_VERSION}.AppImage"
+          cp "${appimage}.sig" "target/release/github-assets/Locality_Linux_v${APP_VERSION}.AppImage.sig"
+          cp "${appimage}" "target/release/github-assets/Locality_Linux.AppImage"
+          cp "${appimage}.sig" "target/release/github-assets/Locality_Linux.AppImage.sig"
+
+          for artifact in \
+            target/release/github-assets/Locality_Linux_v${APP_VERSION}.deb \
+            target/release/github-assets/Locality_Linux.deb \
+            target/release/github-assets/Locality_Linux_v${APP_VERSION}.rpm \
+            target/release/github-assets/Locality_Linux.rpm \
+            target/release/github-assets/Locality_Linux_v${APP_VERSION}.AppImage \
+            target/release/github-assets/Locality_Linux.AppImage
+          do
+            sha256sum "${artifact}" | sed "s#  ${artifact}#  $(basename "${artifact}")#" > "${artifact}.sha256"
+          done
+
       - name: Render updater manifest and package repositories
         env:
           GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
           UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-linux.json
+          UPDATER_LINUX_X86_64_ARTIFACT: target/release/github-assets/Locality_Linux_v${{ env.APP_VERSION }}.AppImage
           UPDATER_NOTES: Locality ${{ env.APP_VERSION }} Linux update.
         run: |
-          export UPDATER_LINUX_X86_64_ARTIFACT="target/release/bundle/updater/Locality-release-linux-x86_64.AppImage"
           make render-updater-manifest
           make render-linux-repositories
 
       - name: Collect release assets
         run: |
-          mkdir -p target/release/github-assets
-          cp target/release/bundle/linux/Locality-release-linux-x86_64.deb target/release/github-assets/
-          cp target/release/bundle/linux/Locality-release-linux-x86_64.rpm target/release/github-assets/
-          cp target/release/bundle/updater/Locality-release-linux-x86_64.AppImage target/release/github-assets/
-          cp target/release/bundle/updater/Locality-release-linux-x86_64.AppImage.sig target/release/github-assets/
           cp target/release/bundle/updater/latest-linux.json target/release/github-assets/
           sha256sum target/release/github-assets/* > target/release/github-assets/SHA256SUMS-linux
           ls -la target/release/github-assets

@@ -14,9 +14,9 @@ Install through a managed package path when possible. Use GitHub Releases when y
 | OS | Recommended install | Direct release asset |
 | --- | --- | --- |
 | macOS | Homebrew cask | `Locality_Mac_v<version>.dmg` |
-| Debian or Ubuntu | APT repository | `Locality-release-linux-x86_64.deb` |
-| Fedora, RHEL, or compatible | DNF repository | `Locality-release-linux-x86_64.rpm` |
-| Linux desktop self-update | AppImage | `Locality-release-linux-x86_64.AppImage` |
+| Debian or Ubuntu | APT repository | `Locality_Linux_v<version>.deb` |
+| Fedora, RHEL, or compatible | DNF repository | `Locality_Linux_v<version>.rpm` |
+| Linux desktop self-update | AppImage | `Locality_Linux_v<version>.AppImage` |
 | Windows | GitHub installer | `Locality_Windows_v<version>.exe` |
 
 Release assets also include updater manifests such as `latest-macos.json`, `latest-linux.json`, and `latest-windows.json`, plus checksums and signatures where available.
@@ -25,6 +25,9 @@ Stable latest-release URLs can use the unversioned aliases:
 
 ```text
 https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Mac.dmg
+https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb
+https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.rpm
+https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.AppImage
 https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Windows.exe
 ```
 
@@ -92,7 +95,7 @@ Use AppImage when you want the Tauri self-update channel instead of distro packa
 
 ```bash
 mkdir -p ~/.local/bin
-curl -L -o ~/.local/bin/Locality.AppImage https://github.com/codeflash-ai/locality/releases/latest/download/Locality-release-linux-x86_64.AppImage
+curl -L -o ~/.local/bin/Locality.AppImage https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.AppImage
 chmod +x ~/.local/bin/Locality.AppImage
 ~/.local/bin/Locality.AppImage
 ```
