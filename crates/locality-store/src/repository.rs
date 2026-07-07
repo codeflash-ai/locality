@@ -13,8 +13,9 @@ use locality_core::shadow::ShadowDocument;
 use crate::error::StoreResult;
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
-    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord, MountConfig,
-    MountLiveModeRecord, RemoteObservationRecord, ShadowSnapshotRecord, VirtualMutationRecord,
+    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord,
+    MetadataDiscoveryJobRecord, MountConfig, MountLiveModeRecord, RemoteObservationRecord,
+    ShadowSnapshotRecord, VirtualMutationRecord,
 };
 
 pub trait MountRepository {
@@ -159,6 +160,23 @@ pub trait HydrationJobRepository {
         &mut self,
         mount_id: &MountId,
         remote_id: &RemoteId,
+        message: String,
+    ) -> StoreResult<()>;
+}
+
+pub trait MetadataDiscoveryJobRepository {
+    fn upsert_metadata_discovery_job(&mut self, job: MetadataDiscoveryJobRecord)
+    -> StoreResult<()>;
+    fn list_metadata_discovery_jobs(&self) -> StoreResult<Vec<MetadataDiscoveryJobRecord>>;
+    fn delete_metadata_discovery_job(
+        &mut self,
+        mount_id: &MountId,
+        container_identifier: &str,
+    ) -> StoreResult<()>;
+    fn record_metadata_discovery_job_failure(
+        &mut self,
+        mount_id: &MountId,
+        container_identifier: &str,
         message: String,
     ) -> StoreResult<()>;
 }
