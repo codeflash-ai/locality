@@ -127,10 +127,13 @@ On Windows, `make clean-start-plan` dispatches to `scripts/clean-start.ps1` in
 dry-run mode. `make clean-start` stops Locality desktop, CLI, daemon, and Cloud
 Files helper processes; runs the installed desktop binary's `--prepare-uninstall`
 hook when available; removes the Windows login item and Locality-managed
-`loc.cmd` shims; and deletes the default `%LOCALAPPDATA%\Locality` install/state
-directory plus the default user-visible mount folder at `%USERPROFILE%\Locality`.
-Run `scripts/clean-start.ps1 -Yes -KeepCredentials` when testing app install
-state without clearing stored connection credentials.
+`loc.cmd` shims; resets Locality Windows Cloud Files registrations; and deletes
+the default `%LOCALAPPDATA%\Locality` install/state directory plus the default
+user-visible mount folder at `%USERPROFILE%\Locality`. If stale Cloud Files
+placeholders block normal deletion, the script briefly detaches `CldFlt` for the
+mount volume, removes the mount folder, and reattaches the filter. Run
+`scripts/clean-start.ps1 -Yes -KeepCredentials` when testing app install state
+without clearing stored connection credentials.
 
 Start the daemon in the foreground:
 

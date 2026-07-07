@@ -218,6 +218,140 @@ function Remove-PathIfExists {
     }
 }
 
+function Get-CloudFilesHelper {
+    $candidates = @()
+    if ($resolvedInstallDir) {
+        $candidates += Join-Path $resolvedInstallDir "locality-cloud-files.exe"
+    }
+    $localAppData = Get-LocalAppData
+    if ($localAppData) {
+        $candidates += Join-Path $localAppData "Locality\locality-cloud-files.exe"
+    }
+
+    foreach ($candidate in $candidates) {
+        $full = Convert-ToFullPath $candidate
+        if ($full -and (Test-Path -LiteralPath $full -PathType Leaf)) {
+            return $full
+        }
+    }
+    return $null
+}
+
+function Reset-WindowsCloudFilesRegistrations {
+    $helper = Get-CloudFilesHelper
+    if (-not $helper) {
+        Write-Warn "locality-cloud-files.exe not found; Windows Cloud Files registrations may remain"
+        return
+    }
+
+    Invoke-Step -Command @($helper, "reset", "--json") -AllowFailure -Script {
+        $output = & $helper reset --json 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw ($output -join "`n")
+        }
+    }
+}
+
+function Get-Fltmc {
+    if (-not [string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        $candidate = Join-Path $env:SystemRoot "System32\fltmc.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+    return "fltmc.exe"
+}
+
+function Get-CldFltInstancesForVolume {
+    param([string] $Volume)
+
+    $fltmc = Get-Fltmc
+    $output = & $fltmc instances -f CldFlt 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ($output -join "`n")
+    }
+
+    $instances = @()
+    foreach ($line in $output) {
+        if ($line -match '^\s*(?<volume>[A-Za-z]:)\s+(?<altitude>[0-9.]+)\s+(?<name>\S+)\s+') {
+            if ($Matches.volume -ieq $Volume) {
+                $instances += [pscustomobject]@{
+                    Name = $Matches.name
+                    Altitude = $Matches.altitude
+                }
+            }
+        }
+    }
+    return $instances
+}
+
+function Invoke-Fltmc {
+    param([string[]] $Arguments)
+
+    $fltmc = Get-Fltmc
+    $output = & $fltmc @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ($output -join "`n")
+    }
+}
+
+function Remove-PathWithCloudFilesFilterDetached {
+    param([string] $Path)
+
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        throw "could not determine volume for $Path"
+    }
+    $volume = $root.TrimEnd('\')
+    $instances = @(Get-CldFltInstancesForVolume $volume)
+    if ($instances.Count -eq 0) {
+        throw "CldFlt is not attached to $volume; cannot apply Windows Cloud Files cleanup fallback"
+    }
+
+    $detached = @()
+    try {
+        foreach ($instance in ($instances | Sort-Object { [double] $_.Altitude } -Descending)) {
+            Invoke-Step -Command @("fltmc", "detach", "CldFlt", $volume, $instance.Name) -Script {
+                Invoke-Fltmc @("detach", "CldFlt", $volume, $instance.Name)
+            }
+            $detached += $instance
+        }
+
+        Invoke-Step -Command @("Remove-Item", "-LiteralPath", $Path, "-Recurse", "-Force") -Script {
+            Remove-Item -LiteralPath $Path -Recurse -Force
+        }
+    } finally {
+        foreach ($instance in ($detached | Sort-Object { [double] $_.Altitude })) {
+            Invoke-Step -Command @("fltmc", "attach", "CldFlt", $volume, "-i", $instance.Name, "-a", $instance.Altitude) -AllowFailure -Script {
+                Invoke-Fltmc @("attach", "CldFlt", $volume, "-i", $instance.Name, "-a", $instance.Altitude)
+            }
+        }
+    }
+}
+
+function Remove-MountRootIfExists {
+    param([string] $Path)
+
+    $full = Convert-ToFullPath $Path
+    if (-not $full) {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $full)) {
+        return
+    }
+
+    Assert-SafeRemovalPath $full
+    try {
+        Invoke-Step -Command @("Remove-Item", "-LiteralPath", $full, "-Recurse", "-Force") -Script {
+            Remove-Item -LiteralPath $full -Recurse -Force
+        }
+    } catch {
+        Write-Warn "normal mount directory removal failed: $($_.Exception.Message)"
+        Write-Warn "detaching CldFlt for the mount volume to remove stale Windows Cloud Files placeholders"
+        Remove-PathWithCloudFilesFilterDetached $full
+    }
+}
+
 function Stop-ProcessImage {
     param([string] $ImageName)
 
@@ -276,9 +410,9 @@ function Invoke-PrepareUninstall {
     }
 
     Invoke-Step -Command @($binary, "--prepare-uninstall") -AllowFailure -Script {
-        & $binary --prepare-uninstall
-        if ($LASTEXITCODE -ne 0) {
-            throw "Locality --prepare-uninstall exited with code $LASTEXITCODE"
+        $process = Start-Process -FilePath $binary -ArgumentList "--prepare-uninstall" -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "Locality --prepare-uninstall exited with code $($process.ExitCode)"
         }
     }
 }
@@ -330,8 +464,9 @@ function Remove-KnownTerminalShims {
 }
 
 function Remove-MountRoots {
+    Reset-WindowsCloudFilesRegistrations
     foreach ($root in Get-DefaultMountRoots) {
-        Remove-PathIfExists $root
+        Remove-MountRootIfExists $root
     }
 }
 

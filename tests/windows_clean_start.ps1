@@ -115,6 +115,22 @@ function Test-YesRemovesStateInstallAndManagedShims {
     }
 }
 
+function Test-PrepareUninstallWaitsForWindowsAppHook {
+    $script = Get-Content -LiteralPath $scriptPath -Raw
+    Assert-Contains $script "Start-Process"
+    Assert-Contains $script "-Wait"
+    Assert-Contains $script "-PassThru"
+}
+
+function Test-CloudFilesMountCleanupFallbackIsPresent {
+    $script = Get-Content -LiteralPath $scriptPath -Raw
+    Assert-Contains $script "Reset-WindowsCloudFilesRegistrations"
+    Assert-Contains $script "locality-cloud-files.exe"
+    Assert-Contains $script "CldFlt"
+    Assert-Contains $script "fltmc"
+    Assert-Contains $script "Remove-MountRootIfExists"
+}
+
 function Test-MakeTargetsDispatchToWindowsScript {
     $planOutput = & make --dry-run clean-start-plan 2>&1
     if ($LASTEXITCODE -ne 0) {
@@ -134,5 +150,7 @@ function Test-MakeTargetsDispatchToWindowsScript {
 
 Test-DryRunPlansWindowsCleanupWithoutDeleting
 Test-YesRemovesStateInstallAndManagedShims
+Test-PrepareUninstallWaitsForWindowsAppHook
+Test-CloudFilesMountCleanupFallbackIsPresent
 Test-MakeTargetsDispatchToWindowsScript
 Write-Host "windows_clean_start: ok"
