@@ -14311,6 +14311,8 @@ struct LocalMediaServer {
     handle: JoinHandle<usize>,
 }
 
+const LOCAL_MEDIA_SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl LocalMediaServer {
     fn new(bytes: Vec<u8>, expected_requests: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local media server");
@@ -14322,13 +14324,14 @@ impl LocalMediaServer {
             listener
                 .set_nonblocking(true)
                 .expect("nonblocking media listener");
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut deadline = Instant::now() + LOCAL_MEDIA_SERVER_IDLE_TIMEOUT;
             let mut served = 0;
             while served < expected_requests && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         serve_local_media_response(stream, &bytes);
                         served += 1;
+                        deadline = Instant::now() + LOCAL_MEDIA_SERVER_IDLE_TIMEOUT;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -15251,6 +15254,7 @@ fn page(id: &str, title: &str) -> PageDto {
         parent: None,
         created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
         last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+        created_by: None,
         archived: false,
         in_trash: false,
         properties: BTreeMap::from([(

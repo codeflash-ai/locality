@@ -33,6 +33,7 @@ use localityd::file_provider as daemon_file_provider;
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::hydration::write_parent_database_schema_cache;
 use localityd::ipc::{DaemonClientError, DaemonRequest, send_request_with_timeout};
+use localityd::runtime::repair_clean_remote_deleted_projections;
 use localityd::virtual_fs::{
     VirtualFsChildrenReport, mount_point_identifier, virtual_fs_ancestor_container_identifiers,
     virtual_fs_content_root, virtual_projection_root,
@@ -68,6 +69,7 @@ use crate::local_oauth::{
     run_local_oauth_authorization,
 };
 use crate::mount::{MountError, MountOptions, MountReport, run_mount};
+use crate::okf::{OkfExportError, OkfExportOptions, OkfExportReport, run_okf_export};
 use crate::pull::{PullError, PullReport, run_pull_with_state_root};
 use crate::push::{
     PushOptions, PushReport, push_report_exit_code, run_push_with_daemon_at_state_root,
@@ -153,6 +155,11 @@ enum LocalityCommand {
     Templates {
         #[command(subcommand)]
         command: TemplatesCommand,
+    },
+    #[command(about = "Export mounted content as Open Knowledge Format bundles")]
+    Okf {
+        #[command(subcommand)]
+        command: OkfCommand,
     },
     #[command(about = "Explain local and remote sync state for a path")]
     Inspect(PathArg),
@@ -527,6 +534,24 @@ struct TemplateApplyArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum OkfCommand {
+    #[command(about = "Export a local projection as an OKF bundle")]
+    Export(OkfExportArgs),
+}
+
+#[derive(Debug, Args)]
+struct OkfExportArgs {
+    #[arg(value_name = "path", help = "Local mounted directory to export.")]
+    path: String,
+    #[arg(
+        long,
+        value_name = "dir",
+        help = "Empty directory to write the OKF bundle into."
+    )]
+    out: String,
+}
+
+#[derive(Debug, Subcommand)]
 enum FileProviderCommand {
     #[command(about = "Register a virtual filesystem provider for a mount")]
     Register(FileProviderTargetArg),
@@ -672,6 +697,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Search(_) => search(&legacy_args[1..], json),
         LocalityCommand::Create { .. } => create(&legacy_args[1..], json),
         LocalityCommand::Templates { .. } => templates(&legacy_args[1..], json),
+        LocalityCommand::Okf { .. } => okf(&legacy_args[1..], json),
         LocalityCommand::Inspect(_) => inspect(&legacy_args[1..], json),
         LocalityCommand::Pull(_) => pull(&legacy_args[1..], json),
         LocalityCommand::Push(_) => push(&legacy_args[1..], json),
@@ -867,6 +893,16 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     push_flag_value(&mut args, "--to", &options.to);
                     push_optional_flag_value(&mut args, "--title", options.title.as_deref());
                     push_flag(&mut args, "--force", options.force);
+                }
+            }
+        }
+        LocalityCommand::Okf { command } => {
+            args.push("okf".to_string());
+            match command {
+                OkfCommand::Export(options) => {
+                    args.push("export".to_string());
+                    args.push(options.path.clone());
+                    push_flag_value(&mut args, "--out", &options.out);
                 }
             }
         }
@@ -2354,6 +2390,7 @@ fn status(args: &[String], json: bool) -> i32 {
     if let Some(target) = options.path.as_deref() {
         reconcile_projection_changes_best_effort("status", &mut store, &state_root, Some(target));
     }
+    let _ = repair_clean_remote_deleted_projections(&mut store, Some(&state_root), None);
 
     match run_status(&store, options) {
         Ok(report) if json => {
@@ -2831,6 +2868,70 @@ fn templates(args: &[String], json: bool) -> i32 {
             EXIT_USAGE,
         ),
     }
+}
+
+fn okf(args: &[String], json: bool) -> i32 {
+    match first_positional(args) {
+        Some("export") => okf_export(args, json),
+        _ => command_error(
+            json,
+            CommandError::new(
+                "okf",
+                "usage",
+                "usage: loc okf export <path> --out <dir> [--json]",
+            ),
+            EXIT_USAGE,
+        ),
+    }
+}
+
+fn okf_export(args: &[String], json: bool) -> i32 {
+    let Some(source) = nth_positional(args, 1).map(PathBuf::from) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "okf_export",
+                "missing_path",
+                "source path is required: loc okf export <path> --out <dir>",
+            ),
+            EXIT_USAGE,
+        );
+    };
+    let Some(output) = flag_value(args, "--out").map(PathBuf::from) else {
+        return command_error(
+            json,
+            CommandError::new("okf_export", "missing_output", "--out <dir> is required"),
+            EXIT_USAGE,
+        );
+    };
+    let connector = okf_connector_hint(&source);
+    match run_okf_export(OkfExportOptions {
+        source,
+        output,
+        connector,
+    }) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_okf_export_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => okf_export_command_error(json, error),
+    }
+}
+
+fn okf_connector_hint(path: &Path) -> Option<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let store = SqliteStateStore::open(default_state_root()).ok()?;
+    let mounts = store.load_mounts().ok()?;
+    daemon_file_provider::find_mount_for_path(&mounts, &absolute)
+        .map(|(mount, _)| mount.connector.clone())
 }
 
 fn inspect(args: &[String], json: bool) -> i32 {
@@ -3805,6 +3906,19 @@ fn print_create_page_report(report: &CreatePageReport) {
     println!("  next:");
     for next in &report.next {
         println!("    {next}");
+    }
+}
+
+fn print_okf_export_report(report: &OkfExportReport) {
+    println!("exported OKF bundle {}", report.output);
+    println!("  source: {}", report.source);
+    println!("  concepts: {}", report.concepts);
+    println!("  indexes: {}", report.indexes);
+    if !report.skipped.is_empty() {
+        println!("  skipped:");
+        for skipped in &report.skipped {
+            println!("    {} ({})", skipped.path, skipped.reason);
+        }
     }
 }
 
@@ -5488,6 +5602,26 @@ fn create_command_error(json: bool, error: CreateError) -> i32 {
     command_error(
         json,
         CommandError::new("create_page", error.code(), error.message()),
+        exit_code,
+    )
+}
+
+fn okf_export_command_error(json: bool, error: OkfExportError) -> i32 {
+    let exit_code = match &error {
+        OkfExportError::CurrentDir { .. }
+        | OkfExportError::OutputInsideSource { .. }
+        | OkfExportError::OutputNotDirectory(_)
+        | OkfExportError::OutputNotEmpty(_)
+        | OkfExportError::OutputPathConflict { .. }
+        | OkfExportError::SourceMissing(_)
+        | OkfExportError::SourceNotDirectory(_) => EXIT_USAGE,
+        OkfExportError::WalkDirectory { .. }
+        | OkfExportError::WriteFile { .. }
+        | OkfExportError::YamlSerialize(_) => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("okf_export", error.code(), error.message()),
         exit_code,
     )
 }

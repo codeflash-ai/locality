@@ -47,6 +47,15 @@ impl PushPlan {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreateParentScope {
+    #[default]
+    Remote,
+    PrivateWorkspace,
+    WorkspaceRoot,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PushOperation {
@@ -87,6 +96,8 @@ pub enum PushOperation {
         parent_id: RemoteId,
         #[serde(default)]
         parent_kind: Option<EntityKind>,
+        #[serde(default)]
+        parent_scope: CreateParentScope,
         title: String,
         #[serde(default)]
         properties: BTreeMap<String, PropertyValue>,
@@ -252,4 +263,58 @@ impl PlanDegradation {
 #[serde(rename_all = "snake_case")]
 pub enum PlanDegradationKind {
     AmbiguousBlockAlignment,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CreateParentScope, PushOperation};
+    use crate::model::{EntityKind, RemoteId};
+
+    #[test]
+    fn create_entity_parent_scope_defaults_to_remote_when_missing_from_json() {
+        let value = serde_json::json!({
+            "type": "create_entity",
+            "parent_id": "page-parent",
+            "parent_kind": "page",
+            "title": "Child",
+            "properties": {},
+            "body": "",
+            "source_path": "Roadmap/Child/page.md"
+        });
+
+        let operation: PushOperation =
+            serde_json::from_value(value).expect("deserialize old create entity plan");
+
+        let PushOperation::CreateEntity {
+            parent_scope,
+            parent_id,
+            parent_kind,
+            ..
+        } = operation
+        else {
+            panic!("expected create entity");
+        };
+        assert_eq!(parent_scope, CreateParentScope::Remote);
+        assert_eq!(parent_id, RemoteId::new("page-parent"));
+        assert_eq!(parent_kind, Some(EntityKind::Page));
+    }
+
+    #[test]
+    fn create_entity_parent_scope_serializes_private_workspace() {
+        let operation = PushOperation::CreateEntity {
+            parent_id: RemoteId::new("notion-root:private"),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "Private Draft".to_string(),
+            properties: Default::default(),
+            body: "Draft body.".to_string(),
+            source_path: "Private/Private Draft/page.md".into(),
+        };
+
+        let value = serde_json::to_value(operation).expect("serialize create entity plan");
+
+        assert_eq!(value["type"], "create_entity");
+        assert_eq!(value["parent_scope"], "private_workspace");
+        assert_eq!(value["parent_id"], "notion-root:private");
+    }
 }

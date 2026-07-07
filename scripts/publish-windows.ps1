@@ -114,40 +114,25 @@ function Assert-SidecarsSigned {
     }
 }
 
-function Copy-UpdaterArtifacts {
+function Copy-UpdaterSignatures {
     param(
-        [string] $CommitShort,
-        [string] $Arch
+        [string] $Source,
+        [string] $VersionedDestination,
+        [string] $AliasDestination
     )
     if ([string]::IsNullOrWhiteSpace($env:TAURI_UPDATER_PUBKEY)) {
         Write-Log "Windows updater artifacts disabled; set TAURI_UPDATER_PUBKEY and TAURI_SIGNING_PRIVATE_KEY to enable"
         return
     }
 
-    $artifact = Latest-Artifact -Directory $NsisDir -Predicate {
-        $_.Name.EndsWith(".nsis.zip", [System.StringComparison]::OrdinalIgnoreCase) -or
-        $_.Name.EndsWith(".msi.zip", [System.StringComparison]::OrdinalIgnoreCase)
-    }
-    if (-not $artifact) {
-        Fail "Tauri did not produce a Windows updater zip artifact"
-    }
-    if (-not (Test-Path -LiteralPath "$($artifact.FullName).sig")) {
-        Fail "Tauri did not produce $($artifact.FullName).sig"
+    $signature = "$Source.sig"
+    if (-not (Test-Path -LiteralPath $signature)) {
+        Fail "Tauri did not produce $signature"
     }
 
-    $extension = if ($artifact.Name.EndsWith(".msi.zip", [System.StringComparison]::OrdinalIgnoreCase)) {
-        "msi.zip"
-    } else {
-        "nsis.zip"
-    }
-    New-Item -ItemType Directory -Force -Path $UpdaterDir | Out-Null
-    $versioned = Join-Path $UpdaterDir "$ProductName-$Channel-$DateStamp-$CommitShort-windows-$Arch.$extension"
-    $alias = Join-Path $UpdaterDir "$ProductName-$Channel-windows-$Arch.$extension"
-    Copy-Item -LiteralPath $artifact.FullName -Destination $versioned -Force
-    Copy-Item -LiteralPath "$($artifact.FullName).sig" -Destination "$versioned.sig" -Force
-    Copy-Item -LiteralPath $artifact.FullName -Destination $alias -Force
-    Copy-Item -LiteralPath "$($artifact.FullName).sig" -Destination "$alias.sig" -Force
-    Write-Log "published updater artifact $alias"
+    Copy-Item -LiteralPath $signature -Destination "$VersionedDestination.sig" -Force
+    Copy-Item -LiteralPath $signature -Destination "$AliasDestination.sig" -Force
+    Write-Log "published updater signatures for $AliasDestination"
 }
 
 Require-Command git
@@ -222,11 +207,13 @@ $versionedInstaller = Join-Path $WindowsOutDir "$ProductName-$Channel-$DateStamp
 $aliasInstaller = Join-Path $WindowsOutDir "$ProductName-$Channel-windows-$arch-setup.exe"
 Copy-ReleaseArtifact -Source $installer.FullName -Destination $versionedInstaller
 Copy-ReleaseArtifact -Source $installer.FullName -Destination $aliasInstaller
-Copy-UpdaterArtifacts -CommitShort $commitShort -Arch $arch
+Copy-UpdaterSignatures -Source $installer.FullName -VersionedDestination $versionedInstaller -AliasDestination $aliasInstaller
 
 Write-Host ""
 Write-Host "Published Windows installer:"
 Write-Host "  $versionedInstaller"
 Write-Host "  $versionedInstaller.sha256"
+Write-Host "  $versionedInstaller.sig"
 Write-Host "  $aliasInstaller"
 Write-Host "  $aliasInstaller.sha256"
+Write-Host "  $aliasInstaller.sig"

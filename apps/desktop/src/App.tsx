@@ -36,6 +36,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   compactPath,
+  mountEntityCountLabel,
   mountAccessLabel,
   mountRows,
   mountStatusLabel,
@@ -2605,7 +2606,7 @@ function CurrentWorkspacePanel({
       <div className="workspace-facts">
         <span>Permission: {snapshot.mount.readOnly ? "Read only" : "Edit enabled"}</span>
         <span>Projection: {snapshot.mount.projection}</span>
-        <span>Files: {snapshot.mount.entityCount}</span>
+        <span>Indexed: {mountEntityCountLabel(snapshot.mount)}</span>
         {showAccount && <span>Account: {accountLabel}</span>}
       </div>
 

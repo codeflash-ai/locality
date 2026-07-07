@@ -48,7 +48,7 @@ platform_for_archive() {
         *) fail "Linux updater artifact name must include x86_64, amd64, aarch64, or arm64: ${archive}" ;;
       esac
       ;;
-    *.nsis.zip|*.msi.zip)
+    *.nsis.zip|*.msi.zip|*.exe)
       case "$(basename "${archive}")" in
         *x86_64*|*amd64*) printf 'windows-x86_64\n' ;;
         *aarch64*|*arm64*) printf 'windows-aarch64\n' ;;
@@ -95,7 +95,7 @@ main() {
       archives+=("${archive}")
     done < <(
       find "${UPDATER_DIR}" -maxdepth 1 -type f \
-        \( -name '*.app.tar.gz' -o -name '*.AppImage' -o -name '*.nsis.zip' -o -name '*.msi.zip' \) | sort
+        \( -name '*.app.tar.gz' -o -name '*.AppImage' -o -name '*.nsis.zip' -o -name '*.msi.zip' -o -name '*.exe' \) | sort
     )
   fi
   [[ "${#archives[@]}" -gt 0 ]] || fail "no updater artifacts found in ${UPDATER_DIR}"

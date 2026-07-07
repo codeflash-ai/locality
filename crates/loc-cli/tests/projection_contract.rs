@@ -25,6 +25,10 @@ use locality_core::model::{
 use locality_core::planner::PushOperationKind;
 use locality_core::shadow::ShadowDocument;
 use locality_core::{LocalityError, LocalityResult};
+use locality_notion::projection::{
+    NOTION_PRIVATE_ROOT_DIR, NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_DIR,
+    NOTION_WORKSPACE_ROOT_ID,
+};
 use locality_store::{
     EntityRecord, EntityRepository, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
     VirtualMutationKind, VirtualMutationRepository,
@@ -121,6 +125,104 @@ fn virtual_projection_modes_share_browse_hydrate_write_contract() {
             .expect("get entity")
             .expect("entity");
         assert_eq!(entity.hydration, HydrationState::Dirty, "{projection:?}");
+    }
+}
+
+#[test]
+fn virtual_projection_modes_show_and_refresh_notion_synthetic_roots_as_source_roots() {
+    for projection in virtual_projection_modes() {
+        let fixture = ProjectionFixture::new(projection.clone());
+        let mut store = fixture.store();
+        fixture.seed_notion_workspace_roots(&mut store);
+        let source = ContractSource::default();
+        let content_root = fixture.content_root();
+
+        let mount = fixture.mount_config();
+        let mount_point_root = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &fixture.mount_id,
+            &mount_point_identifier(&mount),
+        )
+        .expect("browse mount point root");
+
+        assert_child_folder(&mount_point_root.children, NOTION_PRIVATE_ROOT_DIR);
+        assert_child_folder(&mount_point_root.children, NOTION_WORKSPACE_ROOT_DIR);
+        assert!(
+            !fixture.content_path("Private/page.md").exists(),
+            "{projection:?} synthetic Private root must not expose page.md"
+        );
+        assert!(
+            !fixture.content_path("Workspace/page.md").exists(),
+            "{projection:?} synthetic Workspace root must not expose page.md"
+        );
+
+        let workspace_refreshed = refresh_virtual_fs_children(
+            &mut store,
+            &source,
+            &fixture.mount_id,
+            NOTION_WORKSPACE_ROOT_ID,
+        )
+        .expect("refresh workspace synthetic root");
+        assert_eq!(workspace_refreshed.saved, 1, "{projection:?}");
+        assert!(workspace_refreshed.changed, "{projection:?}");
+        let workspace_child = store
+            .get_entity(&fixture.mount_id, &RemoteId::new("page-team-brief"))
+            .expect("get workspace child")
+            .expect("workspace child");
+        assert_eq!(
+            workspace_child.path,
+            Path::new("Workspace/Team Brief/page.md")
+        );
+
+        let workspace_children = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &fixture.mount_id,
+            NOTION_WORKSPACE_ROOT_ID,
+        )
+        .expect("browse workspace synthetic root");
+        let team_brief = assert_child_folder(&workspace_children.children, "Team Brief");
+        assert_eq!(team_brief.path, "Workspace/Team Brief");
+        assert_eq!(
+            team_brief.parent_identifier.as_deref(),
+            Some(NOTION_WORKSPACE_ROOT_ID)
+        );
+        assert!(
+            !fixture
+                .content_path("Workspace/Team Brief/page.md")
+                .exists(),
+            "{projection:?} workspace refresh must not hydrate page bodies"
+        );
+
+        let private_refreshed = refresh_virtual_fs_children(
+            &mut store,
+            &source,
+            &fixture.mount_id,
+            NOTION_PRIVATE_ROOT_ID,
+        )
+        .expect("refresh private synthetic root");
+        assert_eq!(private_refreshed.saved, 0, "{projection:?}");
+        assert!(!private_refreshed.changed, "{projection:?}");
+        let private_children = virtual_fs_children_with_content_root(
+            &store,
+            &content_root,
+            &fixture.mount_id,
+            NOTION_PRIVATE_ROOT_ID,
+        )
+        .expect("browse private synthetic root");
+        assert!(
+            private_children.children.is_empty(),
+            "{projection:?} synthetic Private root should list no fake children"
+        );
+        assert_eq!(
+            source.listed_containers(),
+            vec![
+                ChildContainer::SourceRoot(RemoteId::new(NOTION_WORKSPACE_ROOT_ID)),
+                ChildContainer::SourceRoot(RemoteId::new(NOTION_PRIVATE_ROOT_ID)),
+            ],
+            "{projection:?}"
+        );
     }
 }
 
@@ -286,6 +388,37 @@ impl ProjectionFixture {
             )
             .expect("save entity");
     }
+
+    fn seed_notion_workspace_roots<S>(&self, store: &mut S)
+    where
+        S: MountRepository + EntityRepository,
+    {
+        store.save_mount(self.mount_config()).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+                    EntityKind::Directory,
+                    NOTION_PRIVATE_ROOT_DIR,
+                    NOTION_PRIVATE_ROOT_DIR,
+                )
+                .with_hydration(HydrationState::Virtual),
+            )
+            .expect("save private root");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    self.mount_id.clone(),
+                    RemoteId::new(NOTION_WORKSPACE_ROOT_ID),
+                    EntityKind::Directory,
+                    NOTION_WORKSPACE_ROOT_DIR,
+                    NOTION_WORKSPACE_ROOT_DIR,
+                )
+                .with_hydration(HydrationState::Virtual),
+            )
+            .expect("save workspace root");
+    }
 }
 
 impl Drop for ProjectionFixture {
@@ -298,6 +431,13 @@ impl Drop for ProjectionFixture {
 #[derive(Default)]
 struct ContractSource {
     bodies: RefCell<std::collections::BTreeMap<RemoteId, String>>,
+    listed_containers: RefCell<Vec<ChildContainer>>,
+}
+
+impl ContractSource {
+    fn listed_containers(&self) -> Vec<ChildContainer> {
+        self.listed_containers.borrow().clone()
+    }
 }
 
 impl HydrationSource for ContractSource {
@@ -342,6 +482,9 @@ impl Connector for ContractSource {
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
+        self.listed_containers
+            .borrow_mut()
+            .push(request.container.clone());
         match request.container {
             ChildContainer::PageChildren(remote_id) if remote_id == RemoteId::new("page-home") => {
                 Ok(ListChildrenResult {
@@ -355,6 +498,23 @@ impl Connector for ContractSource {
                         content_hash: None,
                         remote_edited_at: Some("2026-06-20T00:00:00Z".to_string()),
                         stub_frontmatter: Some(frontmatter("page-launch", "Launch Plan")),
+                    }],
+                })
+            }
+            ChildContainer::SourceRoot(remote_id)
+                if remote_id == RemoteId::new(NOTION_WORKSPACE_ROOT_ID) =>
+            {
+                Ok(ListChildrenResult {
+                    entries: vec![TreeEntry {
+                        mount_id: request.mount_id,
+                        remote_id: RemoteId::new("page-team-brief"),
+                        kind: EntityKind::Page,
+                        title: "Team Brief".to_string(),
+                        path: request.parent_path.join("Team Brief/page.md"),
+                        hydration: HydrationState::Stub,
+                        content_hash: None,
+                        remote_edited_at: Some("2026-06-21T00:00:00Z".to_string()),
+                        stub_frontmatter: Some(frontmatter("page-team-brief", "Team Brief")),
                     }],
                 })
             }
@@ -390,12 +550,16 @@ impl Connector for ContractSource {
     }
 }
 
-fn assert_child_folder(children: &[localityd::virtual_fs::VirtualFsItem], filename: &str) {
+fn assert_child_folder<'a>(
+    children: &'a [localityd::virtual_fs::VirtualFsItem],
+    filename: &str,
+) -> &'a localityd::virtual_fs::VirtualFsItem {
     let child = children
         .iter()
         .find(|child| child.filename == filename)
         .unwrap_or_else(|| panic!("missing folder `{filename}`"));
     assert_eq!(child.kind, localityd::virtual_fs::VirtualFsItemKind::Folder);
+    child
 }
 
 fn assert_child_file(children: &[localityd::virtual_fs::VirtualFsItem], filename: &str) {

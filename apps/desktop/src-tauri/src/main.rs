@@ -87,6 +87,7 @@ use localityd::ipc::{
 };
 use localityd::media::{document_with_absolute_media_hrefs, update_hydrated_media_manifest};
 use localityd::push::execute_auto_save_push_job_with_content_root;
+use localityd::runtime::repair_clean_remote_deleted_projections;
 use localityd::source::{
     ResolvedSource, resolve_source_for_mount_id, resolve_source_for_path, source_display_name,
 };
@@ -3348,6 +3349,13 @@ fn pending_changes_for_mount(
     state_root: &Path,
     mount_id: &MountId,
 ) -> Result<Vec<PendingChange>, String> {
+    if let Ok(mut repair_store) = SqliteStateStore::open(state_root.to_path_buf()) {
+        let _ = repair_clean_remote_deleted_projections(
+            &mut repair_store,
+            Some(state_root),
+            Some(mount_id),
+        );
+    }
     let status = run_status(
         store,
         StatusOptions {
@@ -9502,7 +9510,7 @@ mod tests {
 
     use loc_cli::search::{SearchRemoteState, SearchResult, SearchSafety};
     use locality_core::canonical::render_canonical_markdown;
-    use locality_core::freshness::FreshnessTier;
+    use locality_core::freshness::{FreshnessTier, RemoteVersion};
     use locality_core::journal::{JournalEntry, JournalStatus, PushId};
     use locality_core::model::{
         CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
@@ -9515,7 +9523,7 @@ mod tests {
         FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
         LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
         MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
-        ShadowRepository, SqliteStateStore,
+        RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
@@ -11878,6 +11886,96 @@ mod tests {
         assert_eq!(changes[0].state, "needs_review");
         assert_eq!(changes[0].summary, "remote page deleted or unavailable");
         assert_eq!(changes[0].issue_codes, vec!["remote_deleted"]);
+    }
+
+    #[test]
+    fn pending_changes_repairs_clean_stale_remote_deleted_page() {
+        let temp = TestTempDir::new("desktop-pending-repairs-clean-remote-delete");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("notion"),
+        )
+        .projection(ProjectionMode::MacosFileProvider);
+        let remote_id = RemoteId::new("page-1");
+        let relative_path = PathBuf::from("Roadmap/page.md");
+        let page_path = mount.root.join(&relative_path);
+        let content_path =
+            localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount.mount_id)
+                .join(&relative_path);
+        fs::create_dir_all(page_path.parent().expect("page parent")).expect("create page parent");
+        fs::create_dir_all(content_path.parent().expect("content parent"))
+            .expect("create content parent");
+        let file_frontmatter = "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: remote-v1\ntitle: Roadmap\n";
+        let shadow_frontmatter = "loc:\n  id: page-1\n  type: page\ntitle: Roadmap\n";
+        let body = "# Roadmap\n\nOriginal body.\n";
+        let rendered = render_canonical_markdown(&CanonicalDocument::new(file_frontmatter, body));
+        fs::write(&page_path, &rendered).expect("write clean visible page");
+        fs::write(&content_path, rendered).expect("write clean content cache");
+
+        let shadow = ShadowDocument::from_synced_body(
+            remote_id.clone(),
+            body,
+            7,
+            [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+        )
+        .expect("shadow")
+        .with_frontmatter(shadow_frontmatter);
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount.mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    relative_path.clone(),
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_remote_edited_at("remote-v1"),
+            )
+            .expect("save entity");
+        store
+            .save_shadow(&mount.mount_id, shadow)
+            .expect("save shadow");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount.mount_id.clone(),
+                    remote_id.clone(),
+                    FreshnessTier::Hot,
+                )
+                .remote_hint_pending(true),
+            )
+            .expect("save freshness");
+        store
+            .save_remote_observation(
+                RemoteObservationRecord::new(
+                    mount.mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    relative_path.clone(),
+                    "unix_ms:1",
+                )
+                .with_remote_version(RemoteVersion::new("remote-v2"))
+                .deleted(true),
+            )
+            .expect("save observation");
+
+        let changes = super::pending_changes_for_mount(&store, temp.path(), &mount.mount_id)
+            .expect("pending changes");
+
+        assert!(changes.is_empty());
+        assert!(!page_path.exists());
+        assert!(!content_path.exists());
+        assert!(
+            store
+                .get_entity(&mount.mount_id, &remote_id)
+                .expect("get entity")
+                .is_none()
+        );
     }
 
     #[test]

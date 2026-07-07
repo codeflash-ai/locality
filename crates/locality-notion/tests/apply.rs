@@ -7,7 +7,9 @@ use std::sync::Mutex;
 use locality_connector::{ApplyPlanRequest, ApplyUndoRequest, Connector};
 use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::{EntityKind, MountId, RemoteId};
-use locality_core::planner::{PropertyValue, PushOperation, PushOperationKind, PushPlan};
+use locality_core::planner::{
+    CreateParentScope, PropertyValue, PushOperation, PushOperationKind, PushPlan,
+};
 use locality_core::push::RemotePrecondition;
 use locality_core::undo::{UndoOperation, UndoPlan, UndoPlanStatus};
 use locality_core::{LocalityError, LocalityResult};
@@ -20,7 +22,8 @@ use locality_notion::dto::{
     SelectOptionDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto, ToDoBlockDto,
     UrlBlockDto,
 };
-use locality_notion::{NotionConfig, NotionConnector};
+use locality_notion::projection::{NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_ID};
+use locality_notion::{NotionConfig, NotionConnector, PrivateWorkspaceCreateAuthMode};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -131,6 +134,57 @@ fn apply_updates_appends_and_archives_supported_blocks() {
                 block_id: "old-block".to_string(),
             },
         ]
+    );
+}
+
+#[test]
+fn apply_appends_bare_bullet_marker_as_empty_bulleted_list_item() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::AppendBlock {
+            parent_id: RemoteId::new("page-1"),
+            after: Some(RemoteId::new("paragraph-1")),
+            content: "-".to_string(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply");
+
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::Append {
+            block_id: "page-1".to_string(),
+            body: json!({
+                "children": [{
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                        "rich_text": [],
+                    },
+                }],
+                "position": {
+                    "type": "after_block",
+                    "after_block": {
+                        "id": "paragraph-1",
+                    },
+                },
+            }),
+        }]
     );
 }
 
@@ -1511,6 +1565,7 @@ fn check_concurrency_uses_database_metadata_for_row_create_parent() {
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("database-1"),
             parent_kind: Some(EntityKind::Database),
+            parent_scope: CreateParentScope::Remote,
             title: "New row".to_string(),
             properties: BTreeMap::new(),
             body: String::new(),
@@ -3665,6 +3720,300 @@ fn apply_updates_supported_page_properties() {
 }
 
 #[test]
+fn apply_creates_private_workspace_page_without_parent_payload() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new(NOTION_PRIVATE_ROOT_ID)],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "Private Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: "# Private body\n\nCreated from Locality.".to_string(),
+            source_path: "Private/Private Draft/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply private workspace create");
+
+    assert_eq!(
+        result.changed_remote_ids,
+        vec![RemoteId::new("created-page-1")]
+    );
+    assert_eq!(
+        result.effects,
+        vec![JournalApplyEffect::CreatedEntity {
+            operation_id: operation_ids[0].clone(),
+            operation_index: 0,
+            parent_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+            entity_id: RemoteId::new("created-page-1"),
+        }]
+    );
+    let writes = api.writes.lock().expect("writes");
+    assert_eq!(
+        writes.as_slice(),
+        [WriteCall::CreatePage {
+            body: json!({
+                "properties": {
+                    "title": {
+                        "title": rich_text_json("Private Draft"),
+                    },
+                },
+                "children": [{
+                    "object": "block",
+                    "type": "heading_1",
+                    "heading_1": {
+                        "rich_text": rich_text_json("Private body"),
+                    },
+                }, {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": rich_text_json("Created from Locality."),
+                    },
+                }],
+            }),
+        }]
+    );
+}
+
+#[test]
+fn apply_private_workspace_probe_allows_person_token_without_parent_payload() {
+    let api = Arc::new(
+        RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false).with_current_user(json!({
+            "object": "user",
+            "id": "person-user-1",
+            "type": "person",
+            "person": {},
+        })),
+    );
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_private_workspace_create_auth_mode(
+            PrivateWorkspaceCreateAuthMode::ProbeTokenSubject,
+        ),
+        api.clone(),
+    );
+    let plan = PushPlan::new(
+        vec![RemoteId::new(NOTION_PRIVATE_ROOT_ID)],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "PAT Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: String::new(),
+            source_path: "Private/PAT Draft/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("person token allows private workspace create");
+
+    assert_eq!(*api.current_user_calls.lock().expect("calls"), 1);
+    assert_eq!(
+        api.writes.lock().expect("writes").as_slice(),
+        [WriteCall::CreatePage {
+            body: json!({
+                "properties": {
+                    "title": {
+                        "title": rich_text_json("PAT Draft"),
+                    },
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
+fn apply_private_workspace_probe_rejects_bot_token_before_create() {
+    let api = Arc::new(
+        RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false).with_current_user(json!({
+            "object": "user",
+            "id": "bot-user-1",
+            "type": "bot",
+            "bot": {
+                "workspace_name": "Example Workspace",
+            },
+        })),
+    );
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_private_workspace_create_auth_mode(
+            PrivateWorkspaceCreateAuthMode::ProbeTokenSubject,
+        ),
+        api.clone(),
+    );
+    let plan = PushPlan::new(
+        vec![RemoteId::new(NOTION_PRIVATE_ROOT_ID)],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "Bot Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: String::new(),
+            source_path: "Private/Bot Draft/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect_err("bot token cannot create parentless private workspace pages");
+
+    assert!(matches!(error, LocalityError::Unsupported(_)));
+    assert_eq!(*api.current_user_calls.lock().expect("calls"), 1);
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
+fn apply_rejects_workspace_root_create_before_prior_writes() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![
+            RemoteId::new("page-1"),
+            RemoteId::new(NOTION_WORKSPACE_ROOT_ID),
+        ],
+        vec![
+            PushOperation::UpdateBlock {
+                block_id: RemoteId::new("paragraph-1"),
+                content: "Changed before unsupported create.".to_string(),
+            },
+            PushOperation::CreateEntity {
+                parent_id: RemoteId::new(NOTION_WORKSPACE_ROOT_ID),
+                parent_kind: Some(EntityKind::Directory),
+                parent_scope: CreateParentScope::WorkspaceRoot,
+                title: "Workspace Draft".to_string(),
+                properties: BTreeMap::new(),
+                body: String::new(),
+                source_path: "Workspace/Workspace Draft/page.md".into(),
+            },
+        ],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect_err("workspace root create is rejected before writes");
+
+    assert!(matches!(error, LocalityError::Unsupported(_)));
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
+fn apply_rejects_private_workspace_create_with_non_private_root_parent() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("wrong-private-root")],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new("wrong-private-root"),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "Private Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: String::new(),
+            source_path: "Private/Private Draft/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let error = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect_err("private workspace create requires private root parent");
+
+    assert!(matches!(error, LocalityError::InvalidState(_)));
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
+fn check_concurrency_skips_private_workspace_synthetic_create_parent() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new(NOTION_PRIVATE_ROOT_ID)],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+            parent_kind: Some(EntityKind::Directory),
+            parent_scope: CreateParentScope::PrivateWorkspace,
+            title: "Private Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: String::new(),
+            source_path: "Private/Private Draft/page.md".into(),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let preconditions = vec![RemotePrecondition {
+        remote_id: RemoteId::new(NOTION_PRIVATE_ROOT_ID),
+        remote_edited_at: Some("synthetic".to_string()),
+    }];
+
+    connector
+        .check_concurrency(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &[],
+            remote_preconditions: &preconditions,
+            local_root: None,
+        })
+        .expect("synthetic root precondition is skipped");
+}
+
+#[test]
 fn apply_creates_child_page_and_marks_parent_changed() {
     let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
     let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
@@ -3673,6 +4022,7 @@ fn apply_creates_child_page_and_marks_parent_changed() {
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("page-parent"),
             parent_kind: Some(EntityKind::Page),
+            parent_scope: CreateParentScope::Remote,
             title: "New child".to_string(),
             properties: BTreeMap::new(),
             body: "# Child body\n\nCreated from Locality.".to_string(),
@@ -3751,6 +4101,7 @@ fn apply_creates_child_page_with_consecutive_markdown_list_items_as_separate_blo
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("page-parent"),
             parent_kind: Some(EntityKind::Page),
+            parent_scope: CreateParentScope::Remote,
             title: "New child".to_string(),
             properties: BTreeMap::new(),
             body: "# Child body\n\n- First\n- Second\n- [ ] Third".to_string(),
@@ -3826,6 +4177,7 @@ fn apply_creates_child_page_with_emoji_shortcodes_and_new_tables() {
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("page-parent"),
             parent_kind: Some(EntityKind::Page),
+            parent_scope: CreateParentScope::Remote,
             title: "Fitness Log".to_string(),
             properties: BTreeMap::new(),
             body: "# Fitness Log\n\n## 😴 Sleep Data\n\n| \u{00a0} | \u{00a0} |\n| --- | --- |\n| :sleeping: Poor | :sparkles: Excellent |\n\n**Sleep Quality Scale:** :sleeping: Poor".to_string(),
@@ -3897,6 +4249,7 @@ fn apply_creates_database_row_with_properties_and_children() {
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("database-1"),
             parent_kind: Some(locality_core::model::EntityKind::Database),
+            parent_scope: CreateParentScope::Remote,
             title: "New task".to_string(),
             properties: [
                 (
@@ -4116,6 +4469,8 @@ struct RecordingNotionApi {
     database: DatabaseDto,
     data_source: DataSourceDto,
     children: BTreeMap<(String, Option<String>), BlockListDto>,
+    current_user: Option<Value>,
+    current_user_calls: Mutex<usize>,
     writes: Mutex<Vec<WriteCall>>,
     append_count: Mutex<usize>,
 }
@@ -4139,6 +4494,7 @@ impl RecordingNotionApi {
                 parent: None,
                 created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
                 last_edited_time: Some(last_edited_time.to_string()),
+                created_by: None,
                 archived: false,
                 in_trash: false,
                 properties: BTreeMap::new(),
@@ -4156,6 +4512,7 @@ impl RecordingNotionApi {
             parent: None,
             created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
             last_edited_time: Some(last_edited_time.to_string()),
+            created_by: None,
             archived: false,
             in_trash: false,
             properties,
@@ -4192,6 +4549,7 @@ impl RecordingNotionApi {
             parent: None,
             created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
             last_edited_time: Some(last_edited_time.to_string()),
+            created_by: None,
             archived: false,
             in_trash: false,
             properties: BTreeMap::new(),
@@ -4205,6 +4563,7 @@ impl RecordingNotionApi {
             parent: None,
             created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
             last_edited_time: Some(last_edited_time.to_string()),
+            created_by: None,
             archived: false,
             in_trash: false,
             properties: BTreeMap::new(),
@@ -4245,6 +4604,8 @@ impl RecordingNotionApi {
                 ..Default::default()
             },
             children,
+            current_user: None,
+            current_user_calls: Mutex::new(0),
             writes: Mutex::new(Vec::new()),
             append_count: Mutex::new(0),
         }
@@ -4287,13 +4648,29 @@ impl RecordingNotionApi {
                 ..Default::default()
             },
             children,
+            current_user: None,
+            current_user_calls: Mutex::new(0),
             writes: Mutex::new(Vec::new()),
             append_count: Mutex::new(0),
         }
     }
+
+    fn with_current_user(mut self, current_user: Value) -> Self {
+        self.current_user = Some(current_user);
+        self
+    }
 }
 
 impl NotionApi for RecordingNotionApi {
+    fn retrieve_current_user(&self) -> LocalityResult<Value> {
+        *self.current_user_calls.lock().expect("current user calls") += 1;
+        self.current_user
+            .clone()
+            .ok_or(LocalityError::NotImplemented(
+                "retrieve Notion current user",
+            ))
+    }
+
     fn retrieve_page(&self, page_id: &str) -> LocalityResult<PageDto> {
         if page_id == self.page.id {
             Ok(self.page.clone())
@@ -4303,6 +4680,7 @@ impl NotionApi for RecordingNotionApi {
                 parent: None,
                 created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
                 last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+                created_by: None,
                 archived: false,
                 in_trash: false,
                 properties: BTreeMap::from([("Name".to_string(), page_property("title"))]),
@@ -4375,6 +4753,7 @@ impl NotionApi for RecordingNotionApi {
             parent: None,
             created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
             last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+            created_by: None,
             archived: false,
             in_trash: false,
             properties: BTreeMap::new(),

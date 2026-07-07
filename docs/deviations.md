@@ -16,9 +16,6 @@ None.
   screen after starting the real broker flow in-process. The production app
   should replace this timer with real connection-state events from the OAuth
   callback and store refresh.
-- Desktop mount creation currently creates the requested local folder only.
-  Workspace-level Notion mounting still needs a core mount API that can mount an
-  entire authorized workspace rather than requiring `--root-page`.
 - The native Tauri tray now opens an initial rich popover window using the
   confirmed clean Aperture icon, refreshes its snapshot when opened, switches to
   amber/red badged icons only for review or reconnect states, and keeps the

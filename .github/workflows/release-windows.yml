@@ -285,12 +285,23 @@ jobs:
             "$hash  $($_.Name)" | Set-Content -Encoding ascii -LiteralPath "$($_.FullName).sha256"
           }
 
+      - name: Refresh Windows updater signatures
+        if: steps.windows-signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          Get-ChildItem target/release/bundle/windows -Filter *.exe -File | ForEach-Object {
+            npm --prefix apps/desktop run tauri -- signer sign $_.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "failed to refresh updater signature for $($_.FullName)"
+            }
+          }
+
       - name: Render Windows updater manifest
         shell: bash
         env:
           GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
           UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-windows.json
-          UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip
+          UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe
           UPDATER_NOTES: Locality ${{ env.APP_VERSION }} Windows update.
         run: scripts/render-tauri-updater-manifest.sh
 
@@ -299,7 +310,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path target/release/github-assets | Out-Null
           Copy-Item target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe* target/release/github-assets/
-          Copy-Item target/release/bundle/updater/Locality-release-windows-x86_64.nsis.zip* target/release/github-assets/
           Copy-Item target/release/bundle/updater/latest-windows.json target/release/github-assets/
           Get-ChildItem target/release/github-assets -File |
             Sort-Object Name |

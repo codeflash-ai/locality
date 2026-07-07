@@ -31,6 +31,15 @@ fn segments_common_markdown_blocks_with_source_spans() {
 }
 
 #[test]
+fn segments_bare_bullet_marker_as_empty_list_item() {
+    let blocks = segment_markdown_body("-\n", 1);
+
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].kind, MarkdownBlockKind::List);
+    assert_eq!(blocks[0].text, "-");
+}
+
+#[test]
 fn segments_code_fence_using_opening_fence_length() {
     let body =
         "````markdown\nBefore\n```python\nprint('nested')\n```\nAfter\n````\n\nNext paragraph.";
