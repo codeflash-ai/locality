@@ -618,6 +618,25 @@ impl From<HydrationRequest> for HydrationJobRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataDiscoveryPriority {
+    Background,
+    Interactive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataDiscoveryJobRecord {
+    pub mount_id: MountId,
+    pub container_identifier: String,
+    pub priority: MetadataDiscoveryPriority,
+    pub depth: u32,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShadowSnapshotRecord {
     pub mount_id: MountId,

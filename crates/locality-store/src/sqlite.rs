@@ -28,19 +28,21 @@ use crate::compatibility::{
 use crate::error::{StoreError, StoreResult};
 use crate::records::{
     AutoSaveEnrollmentRecord, ConnectionId, ConnectionRecord, ConnectorProfileId,
-    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord, MountConfig,
-    MountLiveModeRecord, MountLiveModeState, ProjectionMode, RemoteObservationRecord,
-    ShadowBlockRecord, ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
+    ConnectorProfileRecord, EntityRecord, FreshnessStateRecord, HydrationJobRecord,
+    MetadataDiscoveryJobRecord, MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord,
+    MountLiveModeState, ProjectionMode, RemoteObservationRecord, ShadowBlockRecord,
+    ShadowSnapshotRecord, VirtualMutationKind, VirtualMutationRecord,
 };
 use crate::repository::{
     AutoSaveRepository, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
     EntitySearchCandidate, EntitySearchRepository, FreshnessStateRepository,
-    HydrationJobRepository, JournalRepository, MountLiveModeRepository, MountRepository,
-    RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
+    HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
+    MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
+    VirtualMutationRepository,
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
@@ -138,6 +140,15 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
         min_reader_version: 1,
         required: true,
         rebuildable: false,
+        data_json: "{}",
+    },
+    StateComponentDefinition {
+        component_id: "durable:metadata_discovery",
+        component_kind: "durable_queue",
+        current_version: 1,
+        min_reader_version: 1,
+        required: true,
+        rebuildable: true,
         data_json: "{}",
     },
     StateComponentDefinition {
@@ -774,6 +785,115 @@ impl HydrationJobRepository for SqliteStateStore {
     }
 }
 
+impl MetadataDiscoveryJobRepository for SqliteStateStore {
+    fn upsert_metadata_discovery_job(
+        &mut self,
+        job: MetadataDiscoveryJobRecord,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        let sql = METADATA_DISCOVERY_JOB_SELECT_WITH_WHERE.to_owned()
+            + "WHERE mount_id = ?1 AND container_identifier = ?2";
+        let record = connection
+            .query_row(
+                &sql,
+                params![job.mount_id.0.as_str(), job.container_identifier.as_str()],
+                metadata_discovery_job_row,
+            )
+            .optional()?
+            .map(metadata_discovery_job_from_row)
+            .transpose()?
+            .map(|mut existing| {
+                existing.priority = existing.priority.max(job.priority);
+                existing.depth = existing.depth.min(job.depth);
+                existing.updated_at = job.updated_at.clone();
+                existing
+            })
+            .unwrap_or(job);
+
+        connection.execute(
+            "INSERT INTO metadata_discovery_jobs (
+                mount_id,
+                container_identifier,
+                priority_json,
+                depth,
+                attempts,
+                last_error,
+                created_at,
+                updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(mount_id, container_identifier) DO UPDATE SET
+                priority_json = excluded.priority_json,
+                depth = excluded.depth,
+                attempts = excluded.attempts,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at",
+            params![
+                record.mount_id.0.as_str(),
+                record.container_identifier.as_str(),
+                to_json(&record.priority)?,
+                i64::from(record.depth),
+                i64::from(record.attempts),
+                record.last_error.as_deref(),
+                record.created_at.as_str(),
+                record.updated_at.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_metadata_discovery_jobs(&self) -> StoreResult<Vec<MetadataDiscoveryJobRecord>> {
+        let connection = self.connection()?;
+        let mut statement =
+            connection.prepare(&(METADATA_DISCOVERY_JOB_SELECT_WITH_WHERE.to_owned()))?;
+        let rows = statement.query_map([], metadata_discovery_job_row)?;
+        let mut jobs = rows
+            .map(|row| metadata_discovery_job_from_row(row?))
+            .collect::<StoreResult<Vec<_>>>()?;
+        jobs.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.depth.cmp(&right.depth))
+                .then_with(|| left.attempts.cmp(&right.attempts))
+                .then_with(|| left.mount_id.0.cmp(&right.mount_id.0))
+                .then_with(|| left.container_identifier.cmp(&right.container_identifier))
+        });
+        Ok(jobs)
+    }
+
+    fn delete_metadata_discovery_job(
+        &mut self,
+        mount_id: &MountId,
+        container_identifier: &str,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM metadata_discovery_jobs
+             WHERE mount_id = ?1 AND container_identifier = ?2",
+            params![mount_id.0, container_identifier],
+        )?;
+        Ok(())
+    }
+
+    fn record_metadata_discovery_job_failure(
+        &mut self,
+        mount_id: &MountId,
+        container_identifier: &str,
+        message: String,
+    ) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE metadata_discovery_jobs
+             SET attempts = attempts + 1,
+                 last_error = ?3
+             WHERE mount_id = ?1 AND container_identifier = ?2",
+            params![mount_id.0, container_identifier, message],
+        )?;
+        Ok(())
+    }
+}
+
 impl ShadowRepository for SqliteStateStore {
     fn save_shadow(&mut self, mount_id: &MountId, shadow: ShadowDocument) -> StoreResult<()> {
         let connection = self.connection()?;
@@ -1352,6 +1472,7 @@ fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> Stor
         "entities",
         "shadows",
         "hydration_jobs",
+        "metadata_discovery_jobs",
         "virtual_mutations",
         "mount_live_modes",
         "auto_save_enrollments",
@@ -1406,6 +1527,11 @@ const FRESHNESS_STATE_SELECT_WITH_WHERE: &str = "
     SELECT mount_id, remote_id, tier_json, last_checked_at, next_check_at, last_opened_at,
            last_local_change_at, remote_hint_pending
     FROM freshness_states
+    ";
+const METADATA_DISCOVERY_JOB_SELECT_WITH_WHERE: &str = "
+    SELECT mount_id, container_identifier, priority_json, depth, attempts, last_error,
+           created_at, updated_at
+    FROM metadata_discovery_jobs
     ";
 
 type MountRow = (
@@ -1516,6 +1642,16 @@ type FreshnessStateRow = (
     Option<String>,
     i64,
 );
+type MetadataDiscoveryJobRow = (
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    String,
+    String,
+);
 
 fn initialize_schema(connection: &Connection) -> StoreResult<()> {
     let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -1621,6 +1757,19 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT,
             PRIMARY KEY (mount_id, remote_id),
+            FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS metadata_discovery_jobs (
+            mount_id TEXT NOT NULL,
+            container_identifier TEXT NOT NULL,
+            priority_json TEXT NOT NULL,
+            depth INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (mount_id, container_identifier),
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
 
@@ -1914,6 +2063,26 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         }
     }
 
+    if user_version < 16 {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS metadata_discovery_jobs (
+                mount_id TEXT NOT NULL,
+                container_identifier TEXT NOT NULL,
+                priority_json TEXT NOT NULL,
+                depth INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (mount_id, container_identifier),
+                FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
+            );",
+        )?;
+        if user_version >= 13 {
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
@@ -1980,6 +2149,10 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
             if user_version < 15 && component_id == "durable:live_mode"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::MissingComponent { component_id }
+            if user_version < 16 && component_id == "durable:metadata_discovery"
     )
 }
 
@@ -2117,6 +2290,45 @@ fn hydration_job_from_row(row: HydrationJobRow) -> StoreResult<HydrationJobRecor
         reason: from_json::<HydrationReason>(&row.4)?,
         attempts,
         last_error: row.6,
+    })
+}
+
+fn metadata_discovery_job_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MetadataDiscoveryJobRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+    ))
+}
+
+fn metadata_discovery_job_from_row(
+    row: MetadataDiscoveryJobRow,
+) -> StoreResult<MetadataDiscoveryJobRecord> {
+    let depth = u32::try_from(row.3)
+        .map_err(|_| StoreError::Database(format!("invalid metadata discovery depth {}", row.3)))?;
+    let attempts = u32::try_from(row.4).map_err(|_| {
+        StoreError::Database(format!(
+            "invalid metadata discovery attempt count {}",
+            row.4
+        ))
+    })?;
+
+    Ok(MetadataDiscoveryJobRecord {
+        mount_id: MountId(row.0),
+        container_identifier: row.1,
+        priority: from_json::<MetadataDiscoveryPriority>(&row.2)?,
+        depth,
+        attempts,
+        last_error: row.5,
+        created_at: row.6,
+        updated_at: row.7,
     })
 }
 

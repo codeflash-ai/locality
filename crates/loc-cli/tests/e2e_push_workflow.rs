@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -60,7 +60,7 @@ use locality_notion::client::{HttpNotionApi, NotionApi};
 use locality_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DatabaseDto, NotionPageBundle, PageDto, PageListDto,
     PagePropertyDto, PaginatedListDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
-    SyncedBlockDto, SyncedFromDto, TextRichTextDto,
+    SyncedBlockDto, SyncedFromDto, TextRichTextDto, TitleBlockDto,
 };
 use locality_notion::media::resolve_media_href_with_content_root;
 use locality_notion::oauth::{
@@ -5525,6 +5525,84 @@ fn virtual_projection_modes_restore_discards_cached_edit_and_status_returns_clea
         .expect("status after virtual restore");
         assert!(clean.clean, "{projection:?}: {clean:#?}");
         assert_eq!(clean.summary.dirty, 0, "{projection:?}: {clean:#?}");
+    }
+}
+
+#[test]
+fn virtual_projection_modes_page_directory_pull_recursively_hydrates_descendant_pages() {
+    for projection in [
+        ProjectionMode::MacosFileProvider,
+        ProjectionMode::LinuxFuse,
+        ProjectionMode::WindowsCloudFiles,
+    ] {
+        let fixture = E2eFixture::new();
+        let mut store = InMemoryStateStore::new();
+        mount_virtual_workspace_with_projection(
+            &fixture,
+            &mut store,
+            "project-page",
+            projection.clone(),
+        );
+        let connector = NotionConnector::with_api(
+            NotionConfig::default(),
+            Arc::new(RecursivePageDirectoryNotionApi::new()),
+        );
+
+        let initial_pull = run_pull_with_state_root(
+            &mut store,
+            &connector,
+            &fixture.root,
+            Some(&fixture.state_root),
+        )
+        .unwrap_or_else(|error| panic!("{projection:?}: pull virtual root: {error:?}"));
+        assert!(initial_pull.ok, "{projection:?}: {initial_pull:#?}");
+
+        let root_entity = store
+            .get_entity(&fixture.mount_id, &RemoteId::new("project-page"))
+            .unwrap_or_else(|error| panic!("{projection:?}: get project page: {error}"))
+            .unwrap_or_else(|| panic!("{projection:?}: missing project page entity"));
+        let root_directory = root_entity
+            .path
+            .parent()
+            .unwrap_or_else(|| panic!("{projection:?}: project page has no directory"))
+            .to_path_buf();
+
+        let directory_pull = run_pull_with_state_root(
+            &mut store,
+            &connector,
+            fixture.root.join(&root_directory),
+            Some(&fixture.state_root),
+        )
+        .unwrap_or_else(|error| panic!("{projection:?}: pull project page directory: {error:?}"));
+
+        assert!(directory_pull.ok, "{projection:?}: {directory_pull:#?}");
+        assert_eq!(
+            directory_pull.enumerated, 2,
+            "{projection:?}: {directory_pull:#?}"
+        );
+        assert_eq!(
+            directory_pull.hydrated, 2,
+            "{projection:?}: {directory_pull:#?}"
+        );
+        assert_eq!(
+            directory_pull.skipped_dirty, 0,
+            "{projection:?}: {directory_pull:#?}"
+        );
+
+        assert_hydrated_virtual_page(
+            &store,
+            &fixture,
+            &projection,
+            "design-notes-page",
+            "Design notes child body.",
+        );
+        assert_hydrated_virtual_page(
+            &store,
+            &fixture,
+            &projection,
+            "appendix-page",
+            "Appendix nested child body.",
+        );
     }
 }
 
@@ -12667,6 +12745,61 @@ fn seed_virtual_page(
     );
 }
 
+fn assert_hydrated_virtual_page(
+    store: &InMemoryStateStore,
+    fixture: &E2eFixture,
+    projection: &ProjectionMode,
+    remote_id: &str,
+    expected_body: &str,
+) {
+    let entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(remote_id))
+        .unwrap_or_else(|error| panic!("{projection:?}: get {remote_id}: {error}"))
+        .unwrap_or_else(|| panic!("{projection:?}: missing {remote_id} entity"));
+    assert_eq!(
+        entity.hydration,
+        HydrationState::Hydrated,
+        "{projection:?}: {entity:#?}"
+    );
+
+    let cached_path = fixture.content_root().join(&entity.path);
+    let cached = fs::read_to_string(&cached_path).unwrap_or_else(|error| {
+        panic!(
+            "{projection:?}: read hydrated cache {}: {error}",
+            cached_path.display()
+        )
+    });
+    assert!(
+        cached.contains(expected_body),
+        "{projection:?}: hydrated cache missing {expected_body:?}\n{cached}"
+    );
+    assert!(
+        !cached.contains(CanonicalDocument::STUB_MARKER),
+        "{projection:?}: hydrated cache should not remain a stub\n{cached}"
+    );
+
+    if matches!(
+        projection,
+        ProjectionMode::MacosFileProvider | ProjectionMode::WindowsCloudFiles
+    ) {
+        let visible_path = fixture.root.join(&entity.path);
+        let visible = fs::read_to_string(&visible_path).unwrap_or_else(|error| {
+            panic!(
+                "{projection:?}: read visible provider replica {}: {error}",
+                visible_path.display()
+            )
+        });
+        assert!(
+            visible.contains(expected_body),
+            "{projection:?}: visible provider replica missing {expected_body:?}\n{visible}"
+        );
+        assert!(
+            !visible.contains(CanonicalDocument::STUB_MARKER),
+            "{projection:?}: visible provider replica should not remain a stub\n{visible}"
+        );
+    }
+}
+
 fn seed_virtual_page_for_mount(
     store: &mut InMemoryStateStore,
     state_root: &Path,
@@ -14308,8 +14441,11 @@ fn collect_files_into(path: &Path, files: &mut Vec<PathBuf>) {
 struct LocalMediaServer {
     url: String,
     expected_requests: usize,
-    handle: JoinHandle<usize>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<usize>>,
 }
+
+const LOCAL_MEDIA_SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl LocalMediaServer {
     fn new(bytes: Vec<u8>, expected_requests: usize) -> Self {
@@ -14318,17 +14454,21 @@ impl LocalMediaServer {
             "http://{}/locality-e2e-image.png",
             listener.local_addr().expect("local media server addr")
         );
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
             listener
                 .set_nonblocking(true)
                 .expect("nonblocking media listener");
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut deadline = Instant::now() + LOCAL_MEDIA_SERVER_IDLE_TIMEOUT;
             let mut served = 0;
-            while served < expected_requests && Instant::now() < deadline {
+            while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        serve_local_media_response(stream, &bytes);
-                        served += 1;
+                        if serve_local_media_response(stream, &bytes) {
+                            served += 1;
+                            deadline = Instant::now() + LOCAL_MEDIA_SERVER_IDLE_TIMEOUT;
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -14342,7 +14482,8 @@ impl LocalMediaServer {
         Self {
             url,
             expected_requests,
-            handle,
+            stop,
+            handle: Some(handle),
         }
     }
 
@@ -14350,27 +14491,54 @@ impl LocalMediaServer {
         &self.url
     }
 
-    fn assert_served(self) {
-        let served = self.handle.join().expect("join local media server");
-        assert_eq!(
-            served, self.expected_requests,
-            "local media server should receive every expected download request"
+    fn assert_served(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let served = self
+            .handle
+            .take()
+            .expect("local media server join handle")
+            .join()
+            .expect("join local media server");
+        assert!(
+            served >= self.expected_requests,
+            "local media server should receive at least every expected download request: served {served}, expected {}",
+            self.expected_requests
         );
     }
 }
 
-fn serve_local_media_response(mut stream: TcpStream, bytes: &[u8]) {
+impl Drop for LocalMediaServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn serve_local_media_response(mut stream: TcpStream, bytes: &[u8]) -> bool {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let mut request = [0_u8; 1024];
-    let _ = stream.read(&mut request);
+    let Ok(read) = stream.read(&mut request) else {
+        return false;
+    };
+    let request = String::from_utf8_lossy(&request[..read]);
+    if !request.starts_with("GET /locality-e2e-image.png ") {
+        return false;
+    }
+
     let headers = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         bytes.len()
     );
-    stream
-        .write_all(headers.as_bytes())
-        .expect("write media response headers");
-    stream.write_all(bytes).expect("write media response body");
-    stream.flush().expect("flush media response");
+    if stream.write_all(headers.as_bytes()).is_err() {
+        return false;
+    }
+    if stream.write_all(bytes).is_err() {
+        return false;
+    }
+    stream.flush().is_ok()
 }
 
 #[derive(Debug, Default)]
@@ -14650,6 +14818,118 @@ impl GoogleDocsOAuthBrokerExchange for FakeGoogleDocsBrokerOAuthExchange {
                 .map(|scope| scope.to_string())
                 .collect(),
         })
+    }
+}
+
+#[derive(Debug)]
+struct RecursivePageDirectoryNotionApi {
+    pages: BTreeMap<String, PageDto>,
+    children: BTreeMap<String, BlockListDto>,
+}
+
+impl RecursivePageDirectoryNotionApi {
+    fn new() -> Self {
+        Self {
+            pages: BTreeMap::from([
+                ("project-page".to_string(), page("project-page", "Project")),
+                (
+                    "design-notes-page".to_string(),
+                    page("design-notes-page", "Design Notes"),
+                ),
+                (
+                    "appendix-page".to_string(),
+                    page("appendix-page", "Appendix"),
+                ),
+            ]),
+            children: BTreeMap::from([
+                (
+                    "project-page".to_string(),
+                    PaginatedListDto {
+                        results: vec![
+                            paragraph_block("project-paragraph", "Project root body."),
+                            child_page_block("design-notes-page", "Design Notes"),
+                        ],
+                        next_cursor: None,
+                        has_more: false,
+                    },
+                ),
+                (
+                    "design-notes-page".to_string(),
+                    PaginatedListDto {
+                        results: vec![
+                            paragraph_block("design-paragraph", "Design notes child body."),
+                            child_page_block("appendix-page", "Appendix"),
+                        ],
+                        next_cursor: None,
+                        has_more: false,
+                    },
+                ),
+                (
+                    "appendix-page".to_string(),
+                    PaginatedListDto {
+                        results: vec![paragraph_block(
+                            "appendix-paragraph",
+                            "Appendix nested child body.",
+                        )],
+                        next_cursor: None,
+                        has_more: false,
+                    },
+                ),
+            ]),
+        }
+    }
+}
+
+impl NotionApi for RecursivePageDirectoryNotionApi {
+    fn retrieve_page(&self, page_id: &str) -> locality_core::LocalityResult<PageDto> {
+        self.pages.get(page_id).cloned().ok_or_else(|| {
+            locality_core::LocalityError::InvalidState(format!("missing page {page_id}"))
+        })
+    }
+
+    fn retrieve_block_children(
+        &self,
+        block_id: &str,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        Ok(self.children.get(block_id).cloned().unwrap_or_default())
+    }
+
+    fn search_pages(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<PageListDto> {
+        Ok(PaginatedListDto {
+            results: self.pages.values().cloned().collect(),
+            next_cursor: None,
+            has_more: false,
+        })
+    }
+
+    fn update_block(
+        &self,
+        _block_id: &str,
+        _body: Value,
+    ) -> locality_core::LocalityResult<BlockDto> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "recursive page directory fixture update block",
+        ))
+    }
+
+    fn append_block_children(
+        &self,
+        _block_id: &str,
+        _body: Value,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "recursive page directory fixture append block children",
+        ))
+    }
+
+    fn delete_block(&self, _block_id: &str) -> locality_core::LocalityResult<BlockDto> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "recursive page directory fixture delete block",
+        ))
     }
 }
 
@@ -15273,6 +15553,18 @@ fn paragraph_block(id: &str, text: &str) -> BlockDto {
     block.paragraph = Some(RichTextBlockDto {
         rich_text: vec![rich_text(text)],
         color: None,
+    });
+    block
+}
+
+fn child_page_block(id: &str, title: &str) -> BlockDto {
+    let mut block = BlockDto {
+        id: id.to_string(),
+        kind: "child_page".to_string(),
+        ..Default::default()
+    };
+    block.child_page = Some(TitleBlockDto {
+        title: title.to_string(),
     });
     block
 }

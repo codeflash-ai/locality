@@ -107,21 +107,33 @@ projection.
 
 ## Operator Guide
 
-Reset a local macOS test machine to a clean Locality install state:
+Reset a local test machine to a clean Locality install state:
 
 ```bash
 make clean-start-plan
 make clean-start
 ```
 
-`make clean-start-plan` is a dry run. `make clean-start` stops the desktop app,
-daemon, and File Provider extension; unregisters File Provider domains; removes
-safe Locality mount roots such as `~/Documents/Locality`, `~/Library/CloudStorage/Locality`,
-and `~/Library/CloudStorage/Locality-*`;
-deletes `~/.loc`; removes the installed `/Applications/Locality.app`; and deletes Locality
-connection credentials from the keychain. Run
-`scripts/clean-start.sh --yes --keep-credentials` when testing app install state
-without clearing OAuth/PAT credentials.
+`make clean-start-plan` is a dry run. `make clean-start` executes the cleanup.
+On macOS, it stops the desktop app, daemon, and File Provider extension;
+unregisters File Provider domains; removes safe Locality mount roots such as
+`~/Documents/Locality`, `~/Library/CloudStorage/Locality`, and
+`~/Library/CloudStorage/Locality-*`; deletes `~/.loc`; removes the installed
+`/Applications/Locality.app`; and deletes Locality connection credentials from
+the keychain. Run `scripts/clean-start.sh --yes --keep-credentials` when
+testing app install state without clearing OAuth/PAT credentials.
+
+On Windows, `make clean-start-plan` dispatches to `scripts/clean-start.ps1` in
+dry-run mode. `make clean-start` stops Locality desktop, CLI, daemon, and Cloud
+Files helper processes; runs the installed desktop binary's `--prepare-uninstall`
+hook when available; removes the Windows login item and Locality-managed
+`loc.cmd` shims; resets Locality Windows Cloud Files registrations; and deletes
+the default `%LOCALAPPDATA%\Locality` install/state directory plus the default
+user-visible mount folder at `%USERPROFILE%\Locality`. If stale Cloud Files
+placeholders block normal deletion, the script briefly detaches `CldFlt` for the
+mount volume, removes the mount folder, and reattaches the filter. Run
+`scripts/clean-start.ps1 -Yes -KeepCredentials` when testing app install state
+without clearing stored connection credentials.
 
 Start the daemon in the foreground:
 

@@ -10,7 +10,8 @@ use locality_core::shadow::ShadowDocument;
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    InMemoryStateStore, JournalRepository, MountConfig, MountLiveModeRecord,
+    InMemoryStateStore, JournalRepository, MetadataDiscoveryJobRecord,
+    MetadataDiscoveryJobRepository, MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord,
     MountLiveModeRepository, MountLiveModeState, MountRepository, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository,
@@ -93,6 +94,12 @@ fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state()
         store.load_shadow(&mount_id(), &RemoteId::new("page-1")),
         Err(StoreError::ShadowMissing { .. })
     ));
+    assert!(
+        store
+            .list_metadata_discovery_jobs()
+            .expect("list metadata discovery")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -505,6 +512,80 @@ fn mount_id() -> MountId {
     MountId::new("notion-main")
 }
 
+#[test]
+fn metadata_discovery_jobs_promote_and_preserve_failures() {
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(mount_id(), "notion", "/tmp/loc/notion"))
+        .expect("save mount");
+
+    store
+        .upsert_metadata_discovery_job(metadata_discovery_job(
+            "children:page-1",
+            MetadataDiscoveryPriority::Background,
+            4,
+        ))
+        .expect("queue page-1");
+    store
+        .record_metadata_discovery_job_failure(
+            &mount_id(),
+            "children:page-1",
+            "rate limited".to_string(),
+        )
+        .expect("record failure");
+    store
+        .upsert_metadata_discovery_job(metadata_discovery_job(
+            "children:page-2",
+            MetadataDiscoveryPriority::Background,
+            1,
+        ))
+        .expect("queue page-2");
+    store
+        .upsert_metadata_discovery_job(metadata_discovery_job(
+            "children:page-1",
+            MetadataDiscoveryPriority::Interactive,
+            2,
+        ))
+        .expect("promote page-1");
+
+    let jobs = store
+        .list_metadata_discovery_jobs()
+        .expect("list metadata discovery");
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].container_identifier, "children:page-1");
+    assert_eq!(jobs[0].priority, MetadataDiscoveryPriority::Interactive);
+    assert_eq!(jobs[0].depth, 2);
+    assert_eq!(jobs[0].attempts, 1);
+    assert_eq!(jobs[0].last_error.as_deref(), Some("rate limited"));
+    assert_eq!(jobs[1].container_identifier, "children:page-2");
+}
+
+#[test]
+fn metadata_discovery_jobs_delete_completed_work() {
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(MountConfig::new(mount_id(), "notion", "/tmp/loc/notion"))
+        .expect("save mount");
+    store
+        .upsert_metadata_discovery_job(metadata_discovery_job(
+            "children:page-1",
+            MetadataDiscoveryPriority::Background,
+            0,
+        ))
+        .expect("queue page-1");
+
+    store
+        .delete_metadata_discovery_job(&mount_id(), "children:page-1")
+        .expect("delete job");
+
+    assert!(
+        store
+            .list_metadata_discovery_jobs()
+            .expect("list metadata discovery")
+            .is_empty()
+    );
+}
+
 fn entity_record(remote_id: &str, path: &str) -> EntityRecord {
     EntityRecord::new(
         mount_id(),
@@ -539,6 +620,23 @@ fn virtual_mutation(local_id: &str, path: &str) -> VirtualMutationRecord {
         content_path: None,
         created_at: "2026-06-15T00:00:00Z".to_string(),
         updated_at: "2026-06-15T00:00:00Z".to_string(),
+    }
+}
+
+fn metadata_discovery_job(
+    container_identifier: &str,
+    priority: MetadataDiscoveryPriority,
+    depth: u32,
+) -> MetadataDiscoveryJobRecord {
+    MetadataDiscoveryJobRecord {
+        mount_id: mount_id(),
+        container_identifier: container_identifier.to_string(),
+        priority,
+        depth,
+        attempts: 0,
+        last_error: None,
+        created_at: "2026-07-06T00:00:00Z".to_string(),
+        updated_at: "2026-07-06T00:00:00Z".to_string(),
     }
 }
 
@@ -596,6 +694,13 @@ fn seed_source_scoped_state(store: &mut InMemoryStateStore) {
             FreshnessTier::Hot,
         ))
         .expect("save freshness");
+    store
+        .upsert_metadata_discovery_job(metadata_discovery_job(
+            "children:page-1",
+            MetadataDiscoveryPriority::Background,
+            1,
+        ))
+        .expect("save metadata discovery");
     store
         .append_journal(journal_entry("push-1", JournalStatus::Prepared))
         .expect("append journal");
