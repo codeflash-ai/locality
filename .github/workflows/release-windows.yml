@@ -296,12 +296,35 @@ jobs:
             }
           }
 
+      - name: Create standard GitHub asset names
+        shell: pwsh
+        run: |
+          $source = "target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe"
+          $destination = "target/release/bundle/windows/Locality_Windows_v$env:APP_VERSION.exe"
+          $latestDestination = "target/release/bundle/windows/Locality_Windows.exe"
+          if (-not (Test-Path -LiteralPath $source)) {
+            Write-Error "Could not find Windows installer $source."
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath "$source.sig")) {
+            Write-Error "Could not find Windows updater signature $source.sig."
+            exit 1
+          }
+          Copy-Item -LiteralPath $source -Destination $destination -Force
+          Copy-Item -LiteralPath "$source.sig" -Destination "$destination.sig" -Force
+          Copy-Item -LiteralPath $source -Destination $latestDestination -Force
+          Copy-Item -LiteralPath "$source.sig" -Destination "$latestDestination.sig" -Force
+          foreach ($path in @($destination, $latestDestination)) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+            "$hash  $(Split-Path -Leaf $path)" | Set-Content -Encoding ascii -LiteralPath "$path.sha256"
+          }
+
       - name: Render Windows updater manifest
         shell: bash
         env:
           GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
           UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-windows.json
-          UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe
+          UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/windows/Locality_Windows_v${{ env.APP_VERSION }}.exe
           UPDATER_NOTES: Locality ${{ env.APP_VERSION }} Windows update.
         run: scripts/render-tauri-updater-manifest.sh
 
@@ -309,7 +332,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path target/release/github-assets | Out-Null
-          Copy-Item target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe* target/release/github-assets/
+          Copy-Item "target/release/bundle/windows/Locality_Windows_v$env:APP_VERSION.exe*" target/release/github-assets/
+          Copy-Item target/release/bundle/windows/Locality_Windows.exe* target/release/github-assets/
           Copy-Item target/release/bundle/updater/latest-windows.json target/release/github-assets/
           Get-ChildItem target/release/github-assets -File |
             Sort-Object Name |

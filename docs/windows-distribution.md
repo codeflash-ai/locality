@@ -180,9 +180,12 @@ Artifact Signing when configured, builds the NSIS package, renders
 `latest-windows.json`, creates or updates the GitHub Release, and uploads:
 
 ```text
-Locality-release-windows-x86_64-setup.exe
-Locality-release-windows-x86_64-setup.exe.sha256
-Locality-release-windows-x86_64-setup.exe.sig
+Locality_Windows_v0.1.0.exe
+Locality_Windows_v0.1.0.exe.sha256
+Locality_Windows_v0.1.0.exe.sig
+Locality_Windows.exe
+Locality_Windows.exe.sha256
+Locality_Windows.exe.sig
 latest-windows.json
 SHA256SUMS-windows
 ```

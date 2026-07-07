@@ -204,10 +204,37 @@ jobs:
       - name: Build, sign, notarize, and staple DMG
         run: make publish
 
+      - name: Create standard GitHub asset names
+        run: |
+          rm -rf target/release/github-assets
+          mkdir -p target/release/github-assets
+
+          dmg="$(find target/release/bundle/dmg -maxdepth 1 -type f -name 'Locality-release-*-notarized-*.dmg' | sort | tail -n 1)"
+          if [[ -z "${dmg}" ]]; then
+            echo "::error::Could not find notarized macOS DMG."
+            exit 1
+          fi
+          cp "${dmg}" "target/release/github-assets/Locality_Mac_v${APP_VERSION}.dmg"
+          cp "${dmg}" "target/release/github-assets/Locality_Mac.dmg"
+
+          updater="$(find target/release/bundle/updater -maxdepth 1 -type f -name '*.app.tar.gz' | sort | tail -n 1)"
+          if [[ -z "${updater}" ]]; then
+            echo "::error::Could not find macOS updater archive."
+            exit 1
+          fi
+          if [[ ! -f "${updater}.sig" ]]; then
+            echo "::error::Could not find macOS updater signature ${updater}.sig."
+            exit 1
+          fi
+          cp "${updater}" "target/release/github-assets/Locality_Mac_Updater_v${APP_VERSION}.app.tar.gz"
+          cp "${updater}.sig" "target/release/github-assets/Locality_Mac_Updater_v${APP_VERSION}.app.tar.gz.sig"
+
       - name: Render updater manifest and Homebrew cask
         env:
           GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
           HOMEBREW_RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          HOMEBREW_DMG: target/release/github-assets/Locality_Mac_v${{ env.APP_VERSION }}.dmg
+          UPDATER_MACOS_AARCH64_ARTIFACT: target/release/github-assets/Locality_Mac_Updater_v${{ env.APP_VERSION }}.app.tar.gz
           UPDATER_NOTES: "Locality ${{ env.APP_VERSION }} macOS update."
         run: |
           make render-updater-manifest
@@ -215,10 +242,6 @@ jobs:
 
       - name: Collect release assets
         run: |
-          mkdir -p target/release/github-assets
-          cp target/release/bundle/dmg/Locality-release-*-notarized-*.dmg target/release/github-assets/
-          cp target/release/bundle/updater/*.app.tar.gz target/release/github-assets/
-          cp target/release/bundle/updater/*.app.tar.gz.sig target/release/github-assets/
           cp target/release/bundle/updater/latest-macos.json target/release/github-assets/
           cp target/release/homebrew/Casks/loc.rb target/release/github-assets/loc.rb
           shasum -a 256 target/release/github-assets/* > target/release/github-assets/SHA256SUMS

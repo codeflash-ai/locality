@@ -13,13 +13,20 @@ Install through a managed package path when possible. Use GitHub Releases when y
 
 | OS | Recommended install | Direct release asset |
 | --- | --- | --- |
-| macOS | Homebrew cask | `*-notarized-aarch64.dmg` |
+| macOS | Homebrew cask | `Locality_Mac_v<version>.dmg` |
 | Debian or Ubuntu | APT repository | `Locality-release-linux-x86_64.deb` |
 | Fedora, RHEL, or compatible | DNF repository | `Locality-release-linux-x86_64.rpm` |
 | Linux desktop self-update | AppImage | `Locality-release-linux-x86_64.AppImage` |
-| Windows | GitHub installer | `Locality-release-windows-x86_64-setup.exe` |
+| Windows | GitHub installer | `Locality_Windows_v<version>.exe` |
 
 Release assets also include updater manifests such as `latest-macos.json`, `latest-linux.json`, and `latest-windows.json`, plus checksums and signatures where available.
+
+Stable latest-release URLs can use the unversioned aliases:
+
+```text
+https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Mac.dmg
+https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Windows.exe
+```
 
 ## macOS
 
@@ -40,7 +47,7 @@ brew upgrade --cask loc
 Direct download:
 
 1. Open the GitHub Releases page.
-2. Download the latest notarized Apple Silicon DMG: `*-notarized-aarch64.dmg`.
+2. Download the latest notarized Apple Silicon DMG: `Locality_Mac_v<version>.dmg`.
 3. Move `Locality.app` to Applications.
 4. Open Locality and complete onboarding.
 
@@ -95,7 +102,7 @@ chmod +x ~/.local/bin/Locality.AppImage
 Download the latest Windows installer from GitHub Releases:
 
 ```text
-Locality-release-windows-x86_64-setup.exe
+Locality_Windows_v<version>.exe
 ```
 
 The Windows installer includes:

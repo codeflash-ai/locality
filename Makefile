@@ -196,6 +196,10 @@ test-linux-publish-config: ## Validate Linux package publish configuration.
 test-macos-publish-config: ## Validate macOS package publish configuration.
 	tests/macos_publish_config.sh
 
+.PHONY: test-release-asset-names
+test-release-asset-names: ## Validate GitHub Release asset naming configuration.
+	tests/release_asset_names.sh
+
 .PHONY: fmt
 fmt: ## Format Rust code.
 	$(CARGO) fmt --all

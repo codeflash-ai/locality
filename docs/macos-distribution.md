@@ -275,8 +275,10 @@ The GitHub workflow in `.github/workflows/release-macos.yml` publishes the
 macOS channel from a `v*` tag or manual workflow dispatch. It runs on the
 GitHub-hosted `macos-15` arm64 runner, builds the notarized DMG, produces the
 signed updater archive, renders `latest-macos.json`, renders `loc.rb`, creates
-or updates the GitHub Release, uploads all release assets, and optionally pushes
-the cask to the Homebrew tap. It shares a release concurrency group with the
+or updates the GitHub Release, uploads the public DMG as
+`Locality_Mac_v<version>.dmg`, also uploads the stable latest-download alias
+`Locality_Mac.dmg`, and optionally pushes the cask to the Homebrew tap. It
+shares a release concurrency group with the
 Linux workflow so both workflows can target the same tag without racing while
 creating or updating the GitHub Release.
 

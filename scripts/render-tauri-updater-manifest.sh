@@ -75,24 +75,32 @@ main() {
   fi
 
   local -a archives=()
+  local -a platforms=()
+  add_archive() {
+    local platform="$1"
+    local archive="$2"
+    archives+=("${archive}")
+    platforms+=("${platform}")
+  }
+
   if [[ -n "${UPDATER_MACOS_AARCH64_ARTIFACT:-}" ]]; then
-    archives+=("${UPDATER_MACOS_AARCH64_ARTIFACT}")
+    add_archive "darwin-aarch64" "${UPDATER_MACOS_AARCH64_ARTIFACT}"
   fi
   if [[ -n "${UPDATER_LINUX_X86_64_ARTIFACT:-}" ]]; then
-    archives+=("${UPDATER_LINUX_X86_64_ARTIFACT}")
+    add_archive "linux-x86_64" "${UPDATER_LINUX_X86_64_ARTIFACT}"
   fi
   if [[ -n "${UPDATER_LINUX_AARCH64_ARTIFACT:-}" ]]; then
-    archives+=("${UPDATER_LINUX_AARCH64_ARTIFACT}")
+    add_archive "linux-aarch64" "${UPDATER_LINUX_AARCH64_ARTIFACT}"
   fi
   if [[ -n "${UPDATER_WINDOWS_X86_64_ARTIFACT:-}" ]]; then
-    archives+=("${UPDATER_WINDOWS_X86_64_ARTIFACT}")
+    add_archive "windows-x86_64" "${UPDATER_WINDOWS_X86_64_ARTIFACT}"
   fi
   if [[ -n "${UPDATER_WINDOWS_AARCH64_ARTIFACT:-}" ]]; then
-    archives+=("${UPDATER_WINDOWS_AARCH64_ARTIFACT}")
+    add_archive "windows-aarch64" "${UPDATER_WINDOWS_AARCH64_ARTIFACT}"
   fi
   if [[ "${#archives[@]}" == "0" ]]; then
     while IFS= read -r archive; do
-      archives+=("${archive}")
+      add_archive "$(platform_for_archive "${archive}")" "${archive}"
     done < <(
       find "${UPDATER_DIR}" -maxdepth 1 -type f \
         \( -name '*.app.tar.gz' -o -name '*.AppImage' -o -name '*.nsis.zip' -o -name '*.msi.zip' -o -name '*.exe' \) | sort
@@ -110,11 +118,12 @@ main() {
     printf '  "platforms": {\n'
 
     local first=1
-    local archive platform signature url
-    for archive in "${archives[@]}"; do
+    local index archive platform signature url
+    for index in "${!archives[@]}"; do
+      archive="${archives[${index}]}"
       [[ -f "${archive}" ]] || fail "missing updater artifact: ${archive}"
       [[ -f "${archive}.sig" ]] || fail "missing updater signature: ${archive}.sig"
-      platform="$(platform_for_archive "${archive}")"
+      platform="${platforms[${index}]}"
       signature="$(tr -d '\r\n' < "${archive}.sig")"
       url="$(artifact_url "${archive}")"
       if [[ "${first}" == "0" ]]; then
