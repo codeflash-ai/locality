@@ -876,12 +876,17 @@ fn debug_live_mode_file_rank(file: &DesktopLiveModeDebugFile) -> u8 {
 
 #[tauri::command]
 async fn connect_notion(app: AppHandle) -> ActionReport {
-    run_notion_connection_flow(app, NotionConnectionAction::Connect).await
+    run_notion_connection_flow(app, NotionConnectionAction::Connect, true).await
+}
+
+#[tauri::command]
+async fn connect_notion_without_browser(app: AppHandle) -> ActionReport {
+    run_notion_connection_flow(app, NotionConnectionAction::Connect, false).await
 }
 
 #[tauri::command]
 async fn change_notion_access(app: AppHandle) -> ActionReport {
-    run_notion_connection_flow(app, NotionConnectionAction::ChangeAccess).await
+    run_notion_connection_flow(app, NotionConnectionAction::ChangeAccess, true).await
 }
 
 #[derive(Clone, Copy)]
@@ -916,6 +921,7 @@ impl NotionConnectionAction {
 async fn run_notion_connection_flow(
     app: AppHandle,
     action: NotionConnectionAction,
+    open_browser: bool,
 ) -> ActionReport {
     if CONNECT_NOTION_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         return ActionReport {
@@ -929,10 +935,13 @@ async fn run_notion_connection_flow(
     let state_root = default_state_root();
     let activity_state_root = state_root.clone();
     let result =
-        tauri::async_runtime::spawn_blocking(move || connect_notion_with_broker(state_root))
+        tauri::async_runtime::spawn_blocking(move || {
+            connect_notion_with_broker(state_root, open_browser)
+        })
             .await
             .map_err(|error| format!("Notion OAuth worker failed: {error}"));
     CONNECT_NOTION_IN_PROGRESS.store(false, Ordering::Release);
+    clear_notion_login_link();
 
     let report = match result {
         Ok(Ok(message)) => {
@@ -8199,7 +8208,7 @@ fn open_macos_virtual_projection(_mount: &MountConfig) -> Result<(), String> {
     Err("macOS File Provider mounts can only be opened on macOS.".to_string())
 }
 
-fn connect_notion_with_broker(state_root: PathBuf) -> Result<String, String> {
+fn connect_notion_with_broker(state_root: PathBuf, open_browser: bool) -> Result<String, String> {
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let credentials = open_credential_store(&state_root);
@@ -8226,7 +8235,7 @@ fn connect_notion_with_broker(state_root: PathBuf) -> Result<String, String> {
         &authorization_url,
         &start.redirect_uri,
         &start.state,
-        false,
+        !open_browser,
         true,
     )
     .map_err(|error| error.message)?;
@@ -13512,6 +13521,7 @@ fn main() {
             desktop_snapshot,
             debug_notion_queue_status,
             connect_notion,
+            connect_notion_without_browser,
             change_notion_access,
             notion_login_link,
             install_state_review,

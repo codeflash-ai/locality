@@ -49,6 +49,7 @@ import {
   type ProviderRuntimeSummary,
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
+import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
 import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
 import { classifyMountSetupError } from "./onboarding-errors";
 import {
@@ -1236,6 +1237,12 @@ function Onboarding({
   }, [oauthInFlight, oauthReady, step]);
 
   useEffect(() => {
+    if (!oauthInFlight) {
+      setLoginUrl("");
+    }
+  }, [oauthInFlight]);
+
+  useEffect(() => {
     if (
       !snapshotLoaded ||
       window.location.hash === "#onboarding" ||
@@ -1278,19 +1285,71 @@ function Onboarding({
     void installAgentGuidance(mountPath);
   }, [agentGuidanceState, mountPath, snapshot.mount.status, step]);
 
-  async function startConnect() {
+  async function readLoginUrl() {
+    return callCommand<string | null>("notion_login_link", undefined, null).catch(() => null);
+  }
+
+  async function waitForLoginUrl(connectPromise?: Promise<unknown>) {
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const url = await readLoginUrl();
+      if (url) {
+        return url;
+      }
+      if (connectPromise) {
+        const state = await Promise.race([
+          connectPromise.then(() => "done"),
+          new Promise<"waiting">((resolve) => {
+            window.setTimeout(() => resolve("waiting"), 120);
+          }),
+        ]);
+        if (state === "done") {
+          break;
+        }
+      } else {
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 120);
+        });
+      }
+    }
+    return null;
+  }
+
+  async function runConnectFlow({
+    openBrowser,
+    onLoginUrlReady,
+  }: {
+    openBrowser: boolean;
+    onLoginUrlReady?: (url: string) => void | Promise<void>;
+  }) {
     setOauthError("");
     setLoginUrl("");
     setLoginCopyMessage("");
     setOauthReady(false);
     setOauthInFlight(true);
     setStep(3);
+
+    const connectPromise = callCommand<ActionReport>(
+      openBrowser ? "connect_notion" : "connect_notion_without_browser",
+      undefined,
+      { ok: true, message: "Connected demo workspace." },
+    ).then(
+      (report) => ({ ok: true as const, report }),
+      (error) => ({ ok: false as const, error }),
+    );
+
     try {
-      const report = await callCommand<ActionReport>(
-        "connect_notion",
-        undefined,
-        { ok: true, message: "Connected demo workspace." },
-      );
+      if (onLoginUrlReady) {
+        const url = await waitForLoginUrl(connectPromise);
+        if (url) {
+          setLoginUrl(url);
+          await onLoginUrlReady(url);
+        }
+      }
+      const result = await connectPromise;
+      if (!result.ok) {
+        throw result.error;
+      }
+      const report = result.report;
       if (!report.ok) {
         setOauthError(report.message);
         return;
@@ -1309,16 +1368,36 @@ function Onboarding({
     }
   }
 
+  async function startConnect() {
+    await runConnectFlow({ openBrowser: true });
+  }
+
   async function copyLoginLink() {
     setOauthError("");
     setLoginCopyMessage("");
-    const url =
-      loginUrl ||
-      (await callCommand<string | null>("notion_login_link", undefined, null).catch(() => null));
+    const mode = loginLinkFlowMode({
+      connectionReady: connectionReadyNow,
+      oauthInFlight,
+      loginUrl,
+    });
+
+    if (mode === "start-without-browser") {
+      await runConnectFlow({
+        openBrowser: false,
+        onLoginUrlReady: async (url) => {
+          copyText(url);
+          setLoginCopyMessage("Copied login link.");
+        },
+      });
+      return;
+    }
+
+    const url = loginUrl || (await waitForLoginUrl());
     if (!url) {
       setOauthError("The Notion login link is still being prepared. Try again in a moment.");
       return;
     }
+
     setLoginUrl(url);
     copyText(url);
     setLoginCopyMessage("Copied login link.");
@@ -1540,7 +1619,13 @@ function Onboarding({
               >
                 {connectionReadyNow ? "Continue" : oauthInFlight ? "Waiting for Notion" : "Connect Notion"}
               </PrimaryButton>
-              <SecondaryButton disabled={!oauthInFlight && !loginUrl} onClick={() => void copyLoginLink()}>
+              <SecondaryButton
+                disabled={copyLoginLinkDisabled({
+                  connectionReady: connectionReadyNow,
+                  oauthInFlight,
+                })}
+                onClick={() => void copyLoginLink()}
+              >
                 Copy login link
               </SecondaryButton>
             </div>
