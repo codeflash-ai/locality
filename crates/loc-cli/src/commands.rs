@@ -7230,15 +7230,6 @@ mod tests {
         let _ = fs::remove_dir_all(temp_root);
     }
 
-    #[cfg(target_os = "windows")]
-    fn unique_temp_path(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
-    }
-
     #[test]
     fn unresolved_windows_cloud_files_unregister_is_blocked_when_shared_mounts_exist() {
         let mounts = vec![
