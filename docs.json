@@ -18,6 +18,7 @@
         "icon": "rocket",
         "pages": [
           "docs/overview",
+          "docs/install",
           "docs/quickstart",
           "docs/filesystem-model"
         ]
