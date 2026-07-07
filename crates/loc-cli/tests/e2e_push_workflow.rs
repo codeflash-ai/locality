@@ -518,6 +518,140 @@ fn live_hydrated_page_remote_title_change_pull_reconciles_without_duplicate_proj
 }
 
 #[test]
+#[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_unhydrated_page_remote_title_change_refresh_reconciles_without_duplicate_projection() {
+    let env = LiveEnv::from_env();
+    let api = HttpNotionApi::new(live_notion_config());
+    let mut cleanup = LiveCleanup::new(api);
+    let parent = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live unhydrated rename parent {}", unique_suffix()),
+        vec![paragraph_child(
+            "Parent body before unhydrated child rename.",
+        )],
+    );
+    let original_child_title = format!("Locality live unhydrated child {}", unique_suffix());
+    let renamed_child_title = format!("Locality live unhydrated renamed {}", unique_suffix());
+    let child = cleanup.create_page(
+        &parent.id,
+        &original_child_title,
+        vec![paragraph_child(
+            "Child body should not be hydrated for this rename test.",
+        )],
+    );
+    let connector = NotionConnector::new(
+        live_notion_config().with_root_page_id(RemoteId::new(parent.id.clone())),
+    );
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    mount_virtual_workspace(&fixture, &mut store, &parent.id);
+    let content_root = fixture.content_root();
+    let mount_point_root = fixture.virtual_root_identifier();
+    refresh_virtual_fs_children(&mut store, &connector, &fixture.mount_id, &mount_point_root)
+        .expect("refresh mount point root");
+    let mount_point_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &mount_point_root,
+    )
+    .expect("list mount point root");
+    let parent_folder = find_virtual_folder(&mount_point_children.children, &parent.id);
+    refresh_virtual_fs_children(
+        &mut store,
+        &connector,
+        &fixture.mount_id,
+        &parent_folder.identifier,
+    )
+    .expect("refresh parent children");
+    let parent_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &parent_folder.identifier,
+    )
+    .expect("list parent children before rename");
+    let child_folder = find_virtual_folder(&parent_children.children, &child.id);
+    assert_eq!(child_folder.filename, slug_for_test(&original_child_title));
+    let child_entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(child.id.clone()))
+        .expect("get unhydrated live child")
+        .expect("unhydrated live child");
+    assert_eq!(child_entity.hydration, HydrationState::Stub);
+    assert!(
+        !content_root.join(&child_entity.path).exists(),
+        "child body should not be materialized before remote rename"
+    );
+
+    cleanup
+        .api
+        .update_page(
+            &child.id,
+            json!({
+                "properties": {
+                    "title": {
+                        "title": rich_text_json(&renamed_child_title)
+                    }
+                }
+            }),
+        )
+        .expect("rename unhydrated live child remotely");
+    wait_for_live_page_title(
+        &cleanup.api,
+        &child.id,
+        &renamed_child_title,
+        "live unhydrated remote title edit",
+    );
+
+    refresh_virtual_fs_children(
+        &mut store,
+        &connector,
+        &fixture.mount_id,
+        &parent_folder.identifier,
+    )
+    .expect("refresh parent children after remote child rename");
+    let refreshed_children = virtual_fs_children_with_content_root(
+        &store,
+        &content_root,
+        &fixture.mount_id,
+        &parent_folder.identifier,
+    )
+    .expect("list parent children after rename");
+    let matching_children = refreshed_children
+        .children
+        .iter()
+        .filter(|item| item.remote_id.as_deref() == Some(child.id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching_children.len(),
+        1,
+        "remote child rename should leave one virtual child item: {refreshed_children:#?}"
+    );
+    assert_eq!(
+        matching_children[0].filename,
+        slug_for_test(&renamed_child_title)
+    );
+    assert!(
+        refreshed_children
+            .children
+            .iter()
+            .all(|item| item.filename != slug_for_test(&original_child_title)),
+        "old unhydrated child projection should not remain as a duplicate: {refreshed_children:#?}"
+    );
+
+    let renamed_entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(child.id.clone()))
+        .expect("get renamed unhydrated live child")
+        .expect("renamed unhydrated live child");
+    assert_eq!(renamed_entity.title, renamed_child_title);
+    assert_eq!(renamed_entity.hydration, HydrationState::Stub);
+    assert!(
+        !content_root.join(&renamed_entity.path).exists(),
+        "child should remain unhydrated after remote title refresh"
+    );
+}
+
+#[test]
 fn mount_agent_guidance_matches_filesystem_workflow_and_does_not_dirty_status() {
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -6707,6 +6841,109 @@ fn scheduled_pull_large_workspace_stubs_metadata_and_queues_only_root_hydration(
         .expect("get scheduled child")
         .expect("scheduled child");
     assert_eq!(child.hydration, HydrationState::Stub);
+}
+
+#[test]
+fn scheduled_pull_remote_title_change_renames_unhydrated_stub_without_duplicate_projection() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("root-page")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount scheduled stub rename workspace");
+
+    let initial_source =
+        StaticScheduledPullSource::new(scheduled_tree_entries(&fixture.mount_id, 32));
+    let mounts = store.load_mounts().expect("load mounts");
+    let strategy = DefaultFetchScheduleStrategy;
+    let policy = HydrationPolicy::default();
+    let poll_tick = PullSchedulerTick {
+        poll_active: true,
+        poll_cold: true,
+    };
+    let mut queue = HydrationQueue::new();
+
+    let initial = reconcile_scheduled_pull(
+        &mut store,
+        &mut queue,
+        &mounts,
+        &poll_tick,
+        &initial_source,
+        &strategy,
+        &policy,
+    )
+    .expect("initial scheduled stub pull");
+    assert_eq!(initial.stubbed, 33, "{initial:#?}");
+    let original_stub = fixture.root.join("Root/Child 17/page.md");
+    assert!(original_stub.exists(), "initial child stub should exist");
+    let original = fs::read_to_string(&original_stub).expect("read original child stub");
+    assert!(
+        original.contains(CanonicalDocument::STUB_MARKER),
+        "{original}"
+    );
+    let child = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("child-17"))
+        .expect("get original child")
+        .expect("original child");
+    assert_eq!(child.hydration, HydrationState::Stub);
+
+    let mut renamed_entries = scheduled_tree_entries(&fixture.mount_id, 32);
+    let renamed_entry = renamed_entries
+        .iter_mut()
+        .find(|entry| entry.remote_id == RemoteId::new("child-17"))
+        .expect("child-17 entry");
+    renamed_entry.title = "Renamed Child 17".to_string();
+    renamed_entry.path = PathBuf::from("Root/Renamed Child 17/page.md");
+    renamed_entry.remote_edited_at = Some("2026-06-10T00:17:59.000Z".to_string());
+    let renamed_source = StaticScheduledPullSource::new(renamed_entries);
+
+    let renamed = reconcile_scheduled_pull(
+        &mut store,
+        &mut queue,
+        &mounts,
+        &poll_tick,
+        &renamed_source,
+        &strategy,
+        &policy,
+    )
+    .expect("scheduled stub remote title rename pull");
+    assert_eq!(renamed.stubbed, 33, "{renamed:#?}");
+
+    let renamed_stub = fixture.root.join("Root/Renamed Child 17/page.md");
+    assert!(renamed_stub.exists(), "renamed child stub should exist");
+    assert!(
+        !original_stub.exists(),
+        "old unhydrated stub projection should not remain as a duplicate"
+    );
+    let renamed_contents = fs::read_to_string(&renamed_stub).expect("read renamed child stub");
+    assert!(
+        renamed_contents.contains(CanonicalDocument::STUB_MARKER),
+        "{renamed_contents}"
+    );
+    assert!(
+        renamed_contents.contains("title: \"Renamed Child 17\""),
+        "{renamed_contents}"
+    );
+
+    let renamed_child = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("child-17"))
+        .expect("get renamed child")
+        .expect("renamed child");
+    assert_eq!(
+        renamed_child.path,
+        PathBuf::from("Root/Renamed Child 17/page.md")
+    );
+    assert_eq!(renamed_child.title, "Renamed Child 17");
+    assert_eq!(renamed_child.hydration, HydrationState::Stub);
 }
 
 #[test]
