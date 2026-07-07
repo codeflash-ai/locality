@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "dev:prepare": "node ./scripts/prepare-dev-sidecars.mjs",
+    "transcode:onboarding-demo": "bash ./scripts/transcode-onboarding-demo.sh",
     "build": "tsc && vite build",
     "test": "vitest",
     "build:mac": "tauri build --bundles dmg && bash ./scripts/postprocess-dmg-volume-icon.sh",

@@ -65,6 +65,7 @@ import {
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
+const onboardingDemoVideoUrl = import.meta.env.VITE_LOCALITY_ONBOARDING_DEMO_VIDEO_URL?.trim() || "";
 
 type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
@@ -1542,20 +1543,19 @@ function Onboarding({
       <section className="setup-window">
         <WindowChrome title="Locality Setup" meta={`${step} of 5`} />
         {step === 1 && (
-          <SetupContent side={<ProductLoopDemo />}>
+          <SetupContent variant="hero" side={<ProductLoopDemo />}>
             <div>
               <div className="eyebrow">Meet Locality</div>
-              <h1>Your work apps, as local files for agents.</h1>
+              <h1>Turn work apps into agent-ready files.</h1>
               <p>
-                Locality gives agents like Claude and Codex a safe local folder for tools like
-                Notion. Agents and humans can edit Markdown side by side, and you review what
-                changes before it updates the content in the connected app.
+                Locality mounts tools like Notion as a local folder. Agents edit Markdown you can
+                inspect, while Locality keeps the connected app in sync after review.
               </p>
             </div>
             <PrimaryButton onClick={() => setStep(2)}>Set Up Locality</PrimaryButton>
             <div className="onboarding-pill-row">
-              <span>Works in Finder</span>
-              <span>Agents edit Markdown</span>
+              <span>Finder-native files</span>
+              <span>Markdown edits</span>
               <span>Review before sync</span>
             </div>
           </SetupContent>
@@ -4970,12 +4970,28 @@ function ViewHeader({
 }
 
 function ProductLoopDemo() {
+  const [videoAvailable, setVideoAvailable] = useState(Boolean(onboardingDemoVideoUrl));
+
+  if (onboardingDemoVideoUrl && videoAvailable) {
+    return (
+      <div className="onboarding-video-demo">
+        <video
+          aria-label="Locality product demo"
+          autoPlay
+          loop
+          muted
+          playsInline
+          preload="auto"
+          onError={() => setVideoAvailable(false)}
+        >
+          <source src={onboardingDemoVideoUrl} type="video/mp4" />
+        </video>
+      </div>
+    );
+  }
+
   return (
     <div className="onboarding-product-demo">
-      <div className="demo-card-header">
-        <span>Product demo</span>
-        <strong>Ready</strong>
-      </div>
       <div className="demo-tile-grid">
         <div className="demo-tile">
           <div>
@@ -5184,13 +5200,13 @@ function SetupContent({
 }: {
   mark?: React.ReactNode;
   children: React.ReactNode;
-  variant?: "final" | "wide";
+  variant?: "final" | "hero" | "wide";
   side?: React.ReactNode;
 }) {
   if (side) {
     return (
       <div className="setup-scrollport">
-        <div className="setup-content split-setup">
+        <div className={`setup-content split-setup ${variant === "hero" ? "hero-setup" : ""}`}>
           <div className="setup-copy">
             {mark ? mark : null}
             {children}

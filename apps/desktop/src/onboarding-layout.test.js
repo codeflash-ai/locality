@@ -19,4 +19,19 @@ describe("onboarding layout styles", () => {
   it("allows the ready-screen prompt copy to wrap when the mount path is long", () => {
     expect(styles).toMatch(/\.agent-demo-command\s*\{[\s\S]*?overflow-wrap:\s*anywhere;/s);
   });
+
+  it("keeps the onboarding demo video in a stable native-looking frame", () => {
+    expect(styles).toMatch(/\.onboarding-video-demo\s*\{[\s\S]*?aspect-ratio:\s*143 \/ 90;/s);
+    expect(styles).toMatch(/\.onboarding-video-demo video\s*\{[\s\S]*?object-fit:\s*cover;/s);
+  });
+
+  it("keeps the first onboarding screen from overlapping at the native default width", () => {
+    expect(styles).toMatch(/\.setup-content\.hero-setup\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*390px\) minmax\(390px,\s*520px\);/s);
+    expect(styles).toMatch(/\.setup-content\.hero-setup\s*\{[\s\S]*?justify-content:\s*end;/s);
+    expect(styles).toMatch(/\.hero-setup \.setup-side\s*\{[\s\S]*?max-width:\s*520px;/s);
+    expect(styles).toMatch(
+      /@media \(min-width:\s*1120px\)\s*\{[\s\S]*?\.setup-content\.hero-setup\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*390px\) minmax\(560px,\s*clamp\(560px,\s*50vw,\s*720px\)\);/s,
+    );
+    expect(styles).toMatch(/@media \(min-width:\s*1120px\)\s*\{[\s\S]*?\.setup-content\.hero-setup\s*\{[\s\S]*?justify-content:\s*center;/s);
+  });
 });

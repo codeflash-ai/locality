@@ -228,10 +228,82 @@ p {
 
 .setup-content.split-setup {
   display: grid;
-  grid-template-columns: minmax(0, 0.95fr) minmax(360px, 0.85fr);
-  gap: 56px;
+  grid-template-columns: minmax(0, 0.9fr) minmax(400px, 0.9fr);
+  gap: 52px;
   align-items: center;
   justify-content: stretch;
+}
+
+.setup-content.hero-setup {
+  grid-template-columns: minmax(0, 390px) minmax(390px, 520px);
+  gap: 34px;
+  justify-content: end;
+  padding-right: 18px;
+  padding-left: 54px;
+}
+
+.hero-setup .setup-copy,
+.hero-setup h1,
+.hero-setup p {
+  max-width: 390px;
+}
+
+.hero-setup h1 {
+  font-size: 40px;
+}
+
+.hero-setup .setup-side {
+  justify-self: end;
+  width: 100%;
+  max-width: 520px;
+}
+
+@media (min-width: 1120px) {
+  .setup-content.hero-setup {
+    grid-template-columns: minmax(0, 390px) minmax(560px, clamp(560px, 50vw, 720px));
+    justify-content: center;
+    padding-right: 54px;
+    padding-left: 54px;
+  }
+
+  .hero-setup .setup-side {
+    max-width: clamp(560px, 50vw, 720px);
+  }
+}
+
+@media (max-width: 1000px) {
+  .setup-content.hero-setup {
+    grid-template-columns: minmax(0, 390px) minmax(0, 460px);
+    gap: 24px;
+    padding-right: 16px;
+    padding-left: 42px;
+  }
+
+  .hero-setup .setup-side {
+    max-width: 460px;
+  }
+}
+
+@media (max-width: 930px) {
+  .setup-content.hero-setup {
+    grid-template-columns: minmax(0, 350px) minmax(0, 400px);
+    padding-right: 14px;
+    padding-left: 32px;
+  }
+
+  .hero-setup .setup-copy,
+  .hero-setup h1,
+  .hero-setup p {
+    max-width: 350px;
+  }
+
+  .hero-setup h1 {
+    font-size: 38px;
+  }
+
+  .hero-setup .setup-side {
+    max-width: 400px;
+  }
 }
 
 .setup-copy {
@@ -726,12 +798,30 @@ p {
 
 .onboarding-product-demo {
   display: grid;
-  gap: 14px;
-  padding: 20px;
+  gap: 10px;
+  padding: 16px;
   border-radius: 20px;
   background: #121b28;
   color: #ffffff;
   box-shadow: 0 24px 58px rgba(18, 27, 40, 0.24);
+}
+
+.onboarding-video-demo {
+  overflow: hidden;
+  aspect-ratio: 143 / 90;
+  border: 1px solid rgba(18, 27, 40, 0.08);
+  border-radius: 20px;
+  background: #121b28;
+  box-shadow: 0 24px 58px rgba(18, 27, 40, 0.24);
+}
+
+.onboarding-video-demo video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scale(1.08);
+  transform-origin: center;
 }
 
 .demo-card-header {

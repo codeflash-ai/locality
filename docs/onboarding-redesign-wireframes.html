@@ -288,6 +288,15 @@
         gap: 10px;
       }
 
+      .product-video {
+        aspect-ratio: 143 / 90;
+        border-radius: 18px;
+        background:
+          linear-gradient(135deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0)),
+          #111827;
+        box-shadow: 0 24px 58px rgba(18, 27, 40, 0.24);
+      }
+
       .demo-object {
         display: grid;
         align-content: start;
@@ -728,66 +737,22 @@
         <section class="screen">
           <div class="copy">
             <div class="eyebrow">Meet Locality</div>
-            <h2>Your work apps, as local files for agents.</h2>
+            <h2>Turn work apps into agent-ready files.</h2>
             <p>
-              Locality gives agents like Claude and Codex a safe local folder for tools like
-              Notion. Agents and humans can edit Markdown side by side, and you review what
-              changes before it updates the content in the connected app.
+              Locality mounts tools like Notion as a local folder. Agents edit Markdown you can
+              inspect, while Locality keeps the connected app in sync after review.
             </p>
             <div class="button-row">
               <div class="primary">Set Up Locality</div>
             </div>
             <div class="proof-row">
-              <span class="pill">Works in Finder</span>
-              <span class="pill">Agents edit Markdown</span>
+              <span class="pill">Finder-native files</span>
+              <span class="pill">Markdown edits</span>
               <span class="pill">Review before sync</span>
             </div>
           </div>
           <aside class="demo-card">
-            <div class="demo-header">
-              <span>Product demo</span>
-              <b>Ready</b>
-            </div>
-            <div class="product-demo">
-              <div class="demo-object">
-                <header>
-                  <strong>Notion</strong>
-                  <span class="demo-badge">Connected</span>
-                </header>
-                <small>Launch Plan</small>
-              </div>
-              <div class="demo-arrow">↓</div>
-              <div class="demo-object">
-                <header>
-                  <strong>Local Markdown</strong>
-                  <span class="demo-badge">Editable</span>
-                </header>
-                <code>Locality/notion/Launch Plan/page.md</code>
-              </div>
-              <div class="demo-arrow">↓</div>
-              <div class="demo-object demo-review">
-                <header>
-                  <strong>Pending review</strong>
-                  <span class="demo-badge">Safe</span>
-                </header>
-                <div class="demo-review-line">
-                  <span>Edited intro paragraph</span>
-                  <span>1 block</span>
-                </div>
-                <div class="demo-review-line">
-                  <span>Updated launch checklist</span>
-                  <span>3 items</span>
-                </div>
-              </div>
-              <div class="demo-arrow">↓</div>
-              <div class="demo-object updated">
-                <header>
-                  <strong>Notion</strong>
-                  <span class="demo-badge">Updated</span>
-                </header>
-                <small>Launch Plan now reflects the approved Markdown edits.</small>
-              </div>
-            </div>
+            <div class="product-video"></div>
           </aside>
         </section>
       </article>

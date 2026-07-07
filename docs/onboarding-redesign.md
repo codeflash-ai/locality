@@ -64,30 +64,58 @@ Purpose: explain what Locality is before asking for Notion auth.
 Primary copy:
 
 ```text
-Your work apps, as local files for agents.
+Turn work apps into agent-ready files.
 
-Locality gives agents like Claude and Codex a safe local folder for tools like
-Notion. Agents and humans can edit Markdown side by side, and you review what
-changes before it updates the content in the connected app.
+Locality mounts tools like Notion as a local folder. Agents edit Markdown you
+can inspect, while Locality keeps the connected app in sync after review.
 ```
 
 Primary action: `Set Up Locality`
 
-Secondary surface: a compact visual product demo:
+Secondary surface: a compact autoplaying product video:
 
 ```text
 Notion page -> Locality/notion/page.md -> Pending review -> Notion updated
 ```
 
-This should feel like a tiny screenshot of the product, not a process diagram.
-The goal is to show the bridge from app content to local Markdown to reviewed
-sync, then back to updated app content, in one glance.
+This should feel like native product media, not an embedded player. The app
+loads the video from `VITE_LOCALITY_ONBOARDING_DEMO_VIDEO_URL`, which should be
+set to the hosted Azure asset URL. The installer must not package the media
+file. The source demo can be transcoded with:
+
+```bash
+cd apps/desktop
+npm run transcode:onboarding-demo -- /tmp/herolocality.m4v /tmp/herolocality-onboarding.mp4
+```
+
+Upload the generated MP4 to Azure Blob Storage, then set
+`VITE_LOCALITY_ONBOARDING_DEMO_VIDEO_URL` to:
+
+```text
+https://locvid0707134548.blob.core.windows.net/assets/onboarding/herolocality-onboarding-v1.mp4
+```
+
+The output is H.264 Main profile MP4, 30 fps, 960 px wide, no audio, and
+fast-start for streaming. The current Azure resource group is
+`locality-assets-rg`, storage account `locvid0707134548`, and container
+`assets`.
+
+Azure Front Door Standard was also provisioned as `locality-video-afd`, endpoint
+`locality-video-0707134548`, with a default hostname:
+
+```text
+https://locality-video-0707134548-cba8dpgpangmcger.z01.azurefd.net/assets/onboarding/herolocality-onboarding-v1.mp4
+```
+
+As of setup, the Blob URL returns `200` with `Content-Type: video/mp4`, while
+the Front Door URL returns an edge `404` with `x-cache: CONFIG_NOCACHE`.
+Use the Blob URL until the Front Door route deploys or is recreated.
 
 Support pills:
 
 ```text
-Works in Finder
-Agents edit Markdown
+Finder-native files
+Markdown edits
 Review before sync
 ```
 
@@ -308,7 +336,7 @@ Design notes:
 
 | Current | Proposed |
 | --- | --- |
-| Let your agents edit Notion as local files. | Your work apps, as local files for agents. |
+| Let your agents edit Notion as local files. | Turn work apps into agent-ready files. |
 | Where should your Notion files appear? | Creating your local folder. |
 | The Notion folder will include AGENTS.md and CLAUDE.md. | Locality adds agent guidance so tools know what is safe to edit. |
 | Open Notion Folder | Open Locality Folder |
