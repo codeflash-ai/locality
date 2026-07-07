@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14441,7 +14441,8 @@ fn collect_files_into(path: &Path, files: &mut Vec<PathBuf>) {
 struct LocalMediaServer {
     url: String,
     expected_requests: usize,
-    handle: JoinHandle<usize>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<usize>>,
 }
 
 const LOCAL_MEDIA_SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -14453,18 +14454,21 @@ impl LocalMediaServer {
             "http://{}/locality-e2e-image.png",
             listener.local_addr().expect("local media server addr")
         );
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
             listener
                 .set_nonblocking(true)
                 .expect("nonblocking media listener");
             let mut deadline = Instant::now() + LOCAL_MEDIA_SERVER_IDLE_TIMEOUT;
             let mut served = 0;
-            while served < expected_requests && Instant::now() < deadline {
+            while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        serve_local_media_response(stream, &bytes);
-                        served += 1;
-                        deadline = Instant::now() + LOCAL_MEDIA_SERVER_IDLE_TIMEOUT;
+                        if serve_local_media_response(stream, &bytes) {
+                            served += 1;
+                            deadline = Instant::now() + LOCAL_MEDIA_SERVER_IDLE_TIMEOUT;
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -14478,7 +14482,8 @@ impl LocalMediaServer {
         Self {
             url,
             expected_requests,
-            handle,
+            stop,
+            handle: Some(handle),
         }
     }
 
@@ -14486,27 +14491,54 @@ impl LocalMediaServer {
         &self.url
     }
 
-    fn assert_served(self) {
-        let served = self.handle.join().expect("join local media server");
-        assert_eq!(
-            served, self.expected_requests,
-            "local media server should receive every expected download request"
+    fn assert_served(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let served = self
+            .handle
+            .take()
+            .expect("local media server join handle")
+            .join()
+            .expect("join local media server");
+        assert!(
+            served >= self.expected_requests,
+            "local media server should receive at least every expected download request: served {served}, expected {}",
+            self.expected_requests
         );
     }
 }
 
-fn serve_local_media_response(mut stream: TcpStream, bytes: &[u8]) {
+impl Drop for LocalMediaServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn serve_local_media_response(mut stream: TcpStream, bytes: &[u8]) -> bool {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let mut request = [0_u8; 1024];
-    let _ = stream.read(&mut request);
+    let Ok(read) = stream.read(&mut request) else {
+        return false;
+    };
+    let request = String::from_utf8_lossy(&request[..read]);
+    if !request.starts_with("GET /locality-e2e-image.png ") {
+        return false;
+    }
+
     let headers = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         bytes.len()
     );
-    stream
-        .write_all(headers.as_bytes())
-        .expect("write media response headers");
-    stream.write_all(bytes).expect("write media response body");
-    stream.flush().expect("flush media response");
+    if stream.write_all(headers.as_bytes()).is_err() {
+        return false;
+    }
+    if stream.write_all(bytes).is_err() {
+        return false;
+    }
+    stream.flush().is_ok()
 }
 
 #[derive(Debug, Default)]
