@@ -106,11 +106,26 @@ where
     let mount = mount.clone();
     let relative_path = matched.relative_path;
     let source = source.scoped_to_mount(&mount);
+    let page_directory = page_directory_target(store, &mount, &relative_path)?;
     let refresh_bases =
         prepare_visible_projection_pull(store, state_root, &mount, &relative_path, &target_path)?;
 
-    let report = if should_pull_mount_root(&mount, &relative_path, &target_path) {
+    let report = if should_pull_mount_root(
+        &mount,
+        &relative_path,
+        &target_path,
+        page_directory.is_some(),
+    ) {
         pull_mount_root(store, &source, &mount, target_path.clone(), state_root)
+    } else if let Some(page_directory) = page_directory {
+        pull_page_directory_path(
+            store,
+            &source,
+            &mount,
+            page_directory,
+            target_path.clone(),
+            state_root,
+        )
     } else if let Some(report) = pull_virtual_directory_path(
         store,
         &source,
@@ -410,6 +425,132 @@ fn projection_has_missing_media(
         page_path,
         output_root,
     ))
+}
+
+#[derive(Debug)]
+struct PageDirectoryTarget {
+    page: EntityRecord,
+}
+
+fn page_directory_target<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Result<Option<PageDirectoryTarget>, PullError>
+where
+    S: EntityRepository,
+{
+    if relative_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+
+    let page_path = relative_path.join("page.md");
+    let Some(page) = store
+        .find_entity_by_path(&mount.mount_id, &page_path)
+        .map_err(PullError::Store)?
+    else {
+        return Ok(None);
+    };
+    if page.kind != EntityKind::Page {
+        return Ok(None);
+    }
+
+    Ok(Some(PageDirectoryTarget { page }))
+}
+
+fn pull_page_directory_path<S, Source>(
+    store: &mut S,
+    source: &Source,
+    mount: &MountConfig,
+    target: PageDirectoryTarget,
+    target_path: PathBuf,
+    state_root: Option<&Path>,
+) -> Result<PullReport, PullError>
+where
+    S: EntityRepository
+        + ShadowRepository
+        + locality_store::FreshnessStateRepository
+        + locality_store::RemoteObservationRepository,
+    Source: SourceAdapter,
+{
+    let PageDirectoryTarget { page } = target;
+    let mut hydrated = 0;
+    let mut skipped_dirty = 0;
+    let mut conflicts = Vec::new();
+
+    match hydrate_entity(store, source, mount, page.clone(), state_root)? {
+        HydrationOutcome::Hydrated | HydrationOutcome::MergedDirty => hydrated += 1,
+        HydrationOutcome::RemoteDeleted => {
+            return Ok(PullReport {
+                ok: true,
+                command: "pull".to_string(),
+                via: "cli".to_string(),
+                mount_id: mount.mount_id.0.clone(),
+                root: mount.root.display().to_string(),
+                target: target_path.display().to_string(),
+                enumerated: 0,
+                stubbed: 0,
+                hydrated: 0,
+                skipped_dirty: 0,
+                conflicts,
+            });
+        }
+        HydrationOutcome::SkippedDirty => skipped_dirty += 1,
+        HydrationOutcome::Conflicted(conflict) => {
+            skipped_dirty += 1;
+            conflicts.push(conflict);
+        }
+    }
+
+    let result = source
+        .list_children(ListChildrenRequest {
+            mount_id: mount.mount_id.clone(),
+            container: ChildContainer::PageChildren(page.remote_id.clone()),
+            parent_path: page_container_path(&page.path).to_path_buf(),
+        })
+        .map_err(PullError::Connector)?;
+    let mut enumerated = result.entries.len();
+    let mut child_page_ids = Vec::new();
+    for entry in result.entries {
+        let child_id = entry.remote_id.clone();
+        let is_page = entry.kind == EntityKind::Page;
+        let existing = store
+            .get_entity(&entry.mount_id, &entry.remote_id)
+            .map_err(PullError::Store)?;
+        let record = virtual_child_entity_record(entry, existing.as_ref());
+        store.save_entity(record).map_err(PullError::Store)?;
+        if is_page {
+            child_page_ids.push(child_id);
+        }
+    }
+
+    let mut visited = BTreeSet::new();
+    let recursive_report = hydrate_page_descendants(
+        store,
+        source,
+        mount,
+        child_page_ids,
+        state_root,
+        &mut visited,
+    )?;
+    enumerated += recursive_report.enumerated;
+    hydrated += recursive_report.hydrated;
+    skipped_dirty += recursive_report.skipped_dirty;
+    conflicts.extend(recursive_report.conflicts);
+
+    Ok(PullReport {
+        ok: skipped_dirty == 0,
+        command: "pull".to_string(),
+        via: "cli".to_string(),
+        mount_id: mount.mount_id.0.clone(),
+        root: mount.root.display().to_string(),
+        target: target_path.display().to_string(),
+        enumerated,
+        stubbed: 0,
+        hydrated,
+        skipped_dirty,
+        conflicts,
+    })
 }
 
 fn pull_virtual_directory_path<S, Source>(
@@ -1571,11 +1712,16 @@ fn write_assets(root: &Path, assets: &[HydratedAsset]) -> Result<(), PullError> 
     Ok(())
 }
 
-fn should_pull_mount_root(mount: &MountConfig, relative_path: &Path, target_path: &Path) -> bool {
+fn should_pull_mount_root(
+    mount: &MountConfig,
+    relative_path: &Path,
+    target_path: &Path,
+    page_directory_target: bool,
+) -> bool {
     if relative_path.as_os_str().is_empty() {
         return !mount.projection.uses_virtual_filesystem() || mount.remote_root_id.is_some();
     }
-    if mount.projection.uses_virtual_filesystem() {
+    if mount.projection.uses_virtual_filesystem() || page_directory_target {
         return false;
     }
 
