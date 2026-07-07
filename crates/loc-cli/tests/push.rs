@@ -31,10 +31,6 @@ use locality_core::push::{PushPipelineAction, PushPipelineResult, PushStage};
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
-use locality_notion::projection::{
-    NOTION_PRIVATE_ROOT_DIR, NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_DIR,
-    NOTION_WORKSPACE_ROOT_ID,
-};
 use locality_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
     MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore, VirtualMutationKind,
@@ -197,120 +193,6 @@ fn push_safe_plan_with_yes_stops_at_apply_boundary() {
     assert_eq!(report.pipeline_action, "proceed_to_apply");
     assert_eq!(report.action, "apply_not_implemented");
     assert_eq!(push_report_exit_code(&report), 5);
-}
-
-#[test]
-fn push_create_under_notion_private_root_plans_private_workspace_parent_scope() {
-    let fixture = PushFixture::new();
-    let store = fixture.store_with_notion_workspace_roots();
-    let path = fixture.write_raw(
-        "Private/Scratch Idea/page.md",
-        "---\ntitle: Scratch Idea\n---\nPrivate body.",
-    );
-
-    let report = run_push(&store, &path, PushOptions::default()).expect("push report");
-
-    assert!(!report.ok);
-    assert_eq!(report.action, "confirm_plan");
-    let plan = report.plan.expect("plan");
-    assert_eq!(
-        plan.affected_entities,
-        vec![NOTION_PRIVATE_ROOT_ID.to_string()]
-    );
-    let [operation] = plan.operations.as_slice() else {
-        panic!("expected one create operation");
-    };
-    let loc_cli::diff::PushOperationOutput::CreateEntity {
-        parent_id,
-        parent_scope,
-        title,
-        source_path,
-        ..
-    } = operation
-    else {
-        panic!("expected create operation");
-    };
-    assert_eq!(parent_id, NOTION_PRIVATE_ROOT_ID);
-    assert_eq!(parent_scope, "private_workspace");
-    assert_eq!(title, "Scratch Idea");
-    assert_eq!(source_path, "Private/Scratch Idea/page.md");
-}
-
-#[test]
-fn push_create_directly_under_notion_workspace_root_returns_ambiguity_validation() {
-    let fixture = PushFixture::new();
-    let store = fixture.store_with_notion_workspace_roots();
-    let path = fixture.write_raw(
-        "Workspace/New Team Page/page.md",
-        "---\ntitle: New Team Page\n---\nAmbiguous body.",
-    );
-
-    let report = run_push(
-        &store,
-        &path,
-        PushOptions {
-            assume_yes: true,
-            confirm_dangerous: false,
-        },
-    )
-    .expect("push report");
-
-    assert!(!report.ok);
-    assert_eq!(report.action, "fix_validation");
-    assert_eq!(
-        report.validation[0].code,
-        "notion_workspace_root_create_ambiguous"
-    );
-    assert!(
-        report.validation[0]
-            .message
-            .contains("New root workspace pages are ambiguous")
-    );
-    assert!(report.plan.is_none());
-}
-
-#[test]
-fn push_create_below_existing_page_under_workspace_uses_real_page_parent_scope() {
-    let fixture = PushFixture::new();
-    let mut store = fixture.store_with_notion_workspace_roots();
-    store
-        .save_entity(
-            EntityRecord::new(
-                fixture.mount_id.clone(),
-                RemoteId::new("shared-launch"),
-                EntityKind::Page,
-                "Shared Launch",
-                "Workspace/Shared Launch/page.md",
-            )
-            .with_hydration(HydrationState::Hydrated),
-        )
-        .expect("save shared page");
-    let path = fixture.write_raw(
-        "Workspace/Shared Launch/Follow-up/page.md",
-        "---\ntitle: Follow-up\n---\nChild body.",
-    );
-
-    let report = run_push(&store, &path, PushOptions::default()).expect("push report");
-
-    assert!(!report.ok);
-    assert_eq!(report.action, "confirm_plan");
-    let plan = report.plan.expect("plan");
-    assert_eq!(plan.affected_entities, vec!["shared-launch".to_string()]);
-    let [operation] = plan.operations.as_slice() else {
-        panic!("expected one create operation");
-    };
-    let loc_cli::diff::PushOperationOutput::CreateEntity {
-        parent_id,
-        parent_scope,
-        title,
-        ..
-    } = operation
-    else {
-        panic!("expected create operation");
-    };
-    assert_eq!(parent_id, "shared-launch");
-    assert_eq!(parent_scope, "remote");
-    assert_eq!(title, "Follow-up");
 }
 
 #[test]
@@ -922,35 +804,6 @@ impl PushFixture {
     fn read_only_store(&self) -> InMemoryStateStore {
         let mut store = InMemoryStateStore::new();
         seed_store(&mut store, self, true);
-        store
-    }
-
-    fn store_with_notion_workspace_roots(&self) -> InMemoryStateStore {
-        let mut store = self.store();
-        store
-            .save_entity(
-                EntityRecord::new(
-                    self.mount_id.clone(),
-                    RemoteId::new(NOTION_PRIVATE_ROOT_ID),
-                    EntityKind::Directory,
-                    NOTION_PRIVATE_ROOT_DIR,
-                    NOTION_PRIVATE_ROOT_DIR,
-                )
-                .with_hydration(HydrationState::Virtual),
-            )
-            .expect("save private root");
-        store
-            .save_entity(
-                EntityRecord::new(
-                    self.mount_id.clone(),
-                    RemoteId::new(NOTION_WORKSPACE_ROOT_ID),
-                    EntityKind::Directory,
-                    NOTION_WORKSPACE_ROOT_DIR,
-                    NOTION_WORKSPACE_ROOT_DIR,
-                )
-                .with_hydration(HydrationState::Virtual),
-            )
-            .expect("save workspace root");
         store
     }
 

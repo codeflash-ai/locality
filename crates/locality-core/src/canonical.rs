@@ -52,6 +52,7 @@ pub struct LocalityMetadata {
     pub entity_type: Option<EntityKind>,
     pub raw_entity_type: Option<String>,
     pub parent: Option<RemoteId>,
+    pub private: bool,
     pub synced_at: Option<String>,
     pub remote_edited_at: Option<String>,
 }
@@ -409,6 +410,7 @@ struct RawLocalityMetadata {
     #[serde(rename = "type")]
     entity_type: Option<String>,
     parent: Option<String>,
+    private: Option<bool>,
     synced_at: Option<String>,
     remote_edited_at: Option<String>,
 }
@@ -427,6 +429,7 @@ impl RawLocalityMetadata {
                 .parent
                 .filter(|parent| !parent.is_empty())
                 .map(RemoteId::new),
+            private: self.private.unwrap_or(false),
             synced_at: self.synced_at.filter(|value| !value.is_empty()),
             remote_edited_at: self.remote_edited_at.filter(|value| !value.is_empty()),
         }

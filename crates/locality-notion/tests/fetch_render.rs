@@ -18,10 +18,6 @@ use locality_notion::dto::{
     SyncedFromDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto,
     UniqueIdPropertyDto, UrlBlockDto, VerificationPropertyDto,
 };
-use locality_notion::projection::{
-    NOTION_PRIVATE_ROOT_DIR, NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_DIR,
-    NOTION_WORKSPACE_ROOT_ID,
-};
 use locality_notion::{NotionConfig, NotionConnector};
 use serde_json::json;
 
@@ -538,6 +534,94 @@ fn render_unsupported_block_as_directive_without_consuming_native_shadow_id() {
         rendered.shadow.blocks[0].kind,
         MarkdownBlockKind::Directive { .. }
     ));
+}
+
+#[test]
+fn render_notion_unsupported_block_as_labeled_directive() {
+    let bundle = locality_notion::dto::NotionPageBundle {
+        page: page("page-1", "Unsupported"),
+        blocks: vec![BlockTreeDto {
+            block: unsupported_block("unsupported-1", "unsupported"),
+            children: Vec::new(),
+        }],
+    };
+
+    let rendered = locality_notion::render::render_page_bundle(&bundle).expect("render");
+
+    assert_eq!(
+        rendered.document.body,
+        "::loc{id=unsupported-1 type=unsupported title=\"Unsupported Notion block\"}\n"
+    );
+    assert_eq!(rendered.shadow.blocks.len(), 1);
+    assert_eq!(
+        rendered.shadow.blocks[0].remote_id,
+        RemoteId::new("unsupported-1")
+    );
+    assert!(matches!(
+        rendered.shadow.blocks[0].kind,
+        MarkdownBlockKind::Directive { .. }
+    ));
+}
+
+#[test]
+fn render_subtype_only_unsupported_artifacts_as_empty_markdown() {
+    let raw = serde_json::to_vec(&json!({
+        "page": page("page-1", "Unsupported Artifacts"),
+        "blocks": [
+            {
+                "block": rich_text_block("paragraph-1", "paragraph", "Before"),
+                "children": [],
+            },
+            {
+                "block": {
+                    "id": "copy-indicator-1",
+                    "type": "unsupported",
+                    "unsupported": { "block_type": "copy_indicator" }
+                },
+                "children": [],
+            },
+            {
+                "block": {
+                    "id": "button-1",
+                    "type": "unsupported",
+                    "unsupported": { "block_type": "button" }
+                },
+                "children": [],
+            },
+            {
+                "block": {
+                    "id": "alias-1",
+                    "type": "unsupported",
+                    "unsupported": { "block_type": "alias" }
+                },
+                "children": [],
+            },
+            {
+                "block": rich_text_block("paragraph-2", "paragraph", "After"),
+                "children": [],
+            },
+        ],
+    }))
+    .expect("raw bundle");
+    let native = locality_connector::NativeEntity {
+        remote_id: RemoteId::new("page-1"),
+        kind: "notion_page".to_string(),
+        raw,
+    };
+
+    let rendered = locality_notion::render::render_native_entity(&native).expect("render");
+
+    assert_eq!(rendered.document.body, "Before\n\nAfter\n");
+    assert!(!rendered.document.body.contains("::loc"));
+    assert_eq!(
+        rendered
+            .shadow
+            .blocks
+            .iter()
+            .map(|block| block.remote_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["paragraph-1", "paragraph-2"]
+    );
 }
 
 #[test]
@@ -1956,7 +2040,7 @@ fn enumerate_suffixes_every_colliding_sibling_name() {
 }
 
 #[test]
-fn list_children_returns_workspace_root_pages_without_flattening_observed_children() {
+fn list_children_returns_workspace_root_pages_without_nested_duplicates() {
     let api = FixtureNotionApi::workspace();
     let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
 
@@ -1969,49 +2053,12 @@ fn list_children_returns_workspace_root_pages_without_flattening_observed_childr
         .expect("list workspace root");
 
     assert_eq!(result.entries.len(), 2);
-    assert_eq!(
-        result.entries[0].remote_id,
-        RemoteId::new(NOTION_PRIVATE_ROOT_ID)
-    );
-    assert_eq!(result.entries[0].kind, EntityKind::Directory);
-    assert_eq!(result.entries[0].path, Path::new(NOTION_PRIVATE_ROOT_DIR));
-    assert_eq!(
-        result.entries[1].remote_id,
-        RemoteId::new(NOTION_WORKSPACE_ROOT_ID)
-    );
-    assert_eq!(result.entries[1].kind, EntityKind::Directory);
-    assert_eq!(result.entries[1].path, Path::new(NOTION_WORKSPACE_ROOT_DIR));
-
-    let result = connector
-        .list_children(ListChildrenRequest {
-            mount_id: MountId::new("notion-main"),
-            container: ChildContainer::SourceRoot(RemoteId::new(NOTION_WORKSPACE_ROOT_ID)),
-            parent_path: Path::new(NOTION_WORKSPACE_ROOT_DIR).to_path_buf(),
-        })
-        .expect("list workspace synthetic root");
-
-    assert_eq!(result.entries.len(), 2);
     assert_eq!(result.entries[0].remote_id, RemoteId::new("root-page"));
     assert_eq!(result.entries[0].kind, EntityKind::Page);
-    assert_eq!(
-        result.entries[0].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("page.md")
-    );
+    assert_eq!(result.entries[0].path, Path::new("root/page.md"));
     assert_eq!(result.entries[1].remote_id, RemoteId::new("root-db"));
     assert_eq!(result.entries[1].kind, EntityKind::Database);
-    assert_eq!(
-        result.entries[1].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR).join("tasks")
-    );
-    assert!(
-        result
-            .entries
-            .iter()
-            .all(|entry| entry.remote_id != RemoteId::new("nested-page")),
-        "searchable child pages with an observed parent must not be duplicated under Workspace/"
-    );
+    assert_eq!(result.entries[1].path, Path::new("tasks"));
 }
 
 #[test]
@@ -2080,50 +2127,48 @@ fn enumerate_shared_workspace_projects_nested_pages_and_database_rows_under_pare
         })
         .expect("enumerate workspace tree");
 
-    assert_eq!(entries.len(), 7);
-    assert_eq!(entries[0].path, Path::new(NOTION_PRIVATE_ROOT_DIR));
-    assert_eq!(entries[0].kind, EntityKind::Directory);
-    assert_eq!(entries[1].path, Path::new(NOTION_WORKSPACE_ROOT_DIR));
-    assert_eq!(entries[1].kind, EntityKind::Directory);
-    assert_eq!(
-        entries[2].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("page.md")
-    );
+    assert_eq!(entries.len(), 5);
+    assert_eq!(entries[0].path, Path::new("root/page.md"));
+    assert_eq!(entries[0].kind, EntityKind::Page);
+    assert_eq!(entries[1].path, Path::new("root/design-notes/page.md"));
+    assert_eq!(entries[1].kind, EntityKind::Page);
+    assert_eq!(entries[2].path, Path::new("root/toggle-child/page.md"));
     assert_eq!(entries[2].kind, EntityKind::Page);
-    assert_eq!(
-        entries[3].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("design-notes")
-            .join("page.md")
-    );
-    assert_eq!(entries[3].kind, EntityKind::Page);
+    assert_eq!(entries[3].path, Path::new("root/tasks"));
+    assert_eq!(entries[3].kind, EntityKind::Database);
     assert_eq!(
         entries[4].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("toggle-child")
-            .join("page.md")
+        Path::new("root/tasks/fix-login-bug/page.md")
     );
     assert_eq!(entries[4].kind, EntityKind::Page);
+}
+
+#[test]
+fn enumerate_shared_workspace_does_not_project_page_children_as_database_rows() {
+    let api =
+        FixtureNotionApi::workspace_database_row_with_page_child_also_returned_by_data_source();
+    let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
+
+    let entries = connector
+        .enumerate(EnumerateRequest {
+            mount_id: MountId::new("notion-main"),
+            cursor: None,
+        })
+        .expect("enumerate workspace tree");
+
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].path, Path::new("engineering-wiki"));
+    assert_eq!(entries[0].kind, EntityKind::Database);
     assert_eq!(
-        entries[5].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("tasks")
+        entries[1].path,
+        Path::new("engineering-wiki/standups-with-locality/page.md")
     );
-    assert_eq!(entries[5].kind, EntityKind::Database);
+    assert_eq!(entries[1].kind, EntityKind::Page);
     assert_eq!(
-        entries[6].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("tasks")
-            .join("fix-login-bug")
-            .join("page.md")
+        entries[2].path,
+        Path::new("engineering-wiki/standups-with-locality/2026-06-26/page.md")
     );
-    assert_eq!(entries[6].kind, EntityKind::Page);
+    assert_eq!(entries[2].kind, EntityKind::Page);
 }
 
 #[test]
@@ -2138,27 +2183,13 @@ fn enumerate_shared_workspace_keeps_shared_database_row_when_database_is_not_sha
         })
         .expect("enumerate shared orphan row");
 
-    assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].remote_id, RemoteId::new(NOTION_PRIVATE_ROOT_ID));
-    assert_eq!(entries[0].path, Path::new(NOTION_PRIVATE_ROOT_DIR));
-    assert_eq!(entries[0].kind, EntityKind::Directory);
+    assert_eq!(entries.len(), 1);
     assert_eq!(
-        entries[1].remote_id,
-        RemoteId::new(NOTION_WORKSPACE_ROOT_ID)
-    );
-    assert_eq!(entries[1].path, Path::new(NOTION_WORKSPACE_ROOT_DIR));
-    assert_eq!(entries[1].kind, EntityKind::Directory);
-    assert_eq!(
-        entries[2].remote_id,
+        entries[0].remote_id,
         RemoteId::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
     );
-    assert_eq!(
-        entries[2].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("shared-row")
-            .join("page.md")
-    );
-    assert_eq!(entries[2].kind, EntityKind::Page);
+    assert_eq!(entries[0].path, Path::new("shared-row/page.md"));
+    assert_eq!(entries[0].kind, EntityKind::Page);
 }
 
 #[test]
@@ -2587,6 +2618,79 @@ impl FixtureNotionApi {
         }
     }
 
+    fn workspace_database_row_with_page_child_also_returned_by_data_source() -> Self {
+        let database_id = "engineering-db";
+        let data_source_id = "engineering-ds";
+        let standups_id = "standups-page";
+        let standup_date_id = "standup-2026-06-26";
+        let standups = page_with_parent(
+            standups_id,
+            "Standups with Locality",
+            Some(ParentDto {
+                kind: "data_source_id".to_string(),
+                data_source_id: Some(data_source_id.to_string()),
+                database_id: Some(database_id.to_string()),
+                ..Default::default()
+            }),
+        );
+        let standup_date = page_with_parent(
+            standup_date_id,
+            "2026-06-26",
+            Some(ParentDto {
+                kind: "page_id".to_string(),
+                page_id: Some(standups_id.to_string()),
+                ..Default::default()
+            }),
+        );
+        let database = DatabaseDto {
+            id: database_id.to_string(),
+            parent: Some(ParentDto {
+                kind: "workspace".to_string(),
+                workspace: Some(true),
+                ..Default::default()
+            }),
+            title: vec![rich_text("Engineering Wiki")],
+            data_sources: vec![DataSourceSummaryDto {
+                id: data_source_id.to_string(),
+                name: Some("Engineering Wiki".to_string()),
+            }],
+            ..Default::default()
+        };
+        let data_source_pages = BTreeMap::from([(
+            (data_source_id.to_string(), None),
+            PaginatedListDto {
+                results: vec![standups.clone(), standup_date.clone()],
+                next_cursor: None,
+                has_more: false,
+            },
+        )]);
+        let children = BTreeMap::from([
+            (
+                (standups_id.to_string(), None),
+                PaginatedListDto {
+                    results: vec![child_page_block(standup_date_id, "2026-06-26")],
+                    next_cursor: None,
+                    has_more: false,
+                },
+            ),
+            (
+                (standup_date_id.to_string(), None),
+                PaginatedListDto::default(),
+            ),
+        ]);
+
+        Self {
+            pages: BTreeMap::from([
+                (standups.id.clone(), standups),
+                (standup_date.id.clone(), standup_date),
+            ]),
+            children,
+            databases: BTreeMap::from([(database.id.clone(), database)]),
+            data_sources: BTreeMap::new(),
+            data_source_pages,
+        }
+    }
+
     fn parent_with_child_boundaries() -> Self {
         let pages = BTreeMap::from([
             ("parent-page".to_string(), page("parent-page", "Parent")),
@@ -2774,7 +2878,6 @@ fn page_with_parent(id: &str, title: &str, parent: Option<ParentDto>) -> PageDto
         parent,
         created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
         last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
-        created_by: None,
         archived: false,
         in_trash: false,
         properties: BTreeMap::from([(

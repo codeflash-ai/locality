@@ -1,0 +1,136 @@
+---
+title: "CLI reference"
+description: "The essential loc commands for connection, mount, search, status, diff, pull, push, restore, diagnostics, and export."
+---
+
+`loc` is the supported command surface for humans, scripts, and agents.
+
+Use `--json` on commands when building tools or agent integrations.
+
+## Connect
+
+```bash
+loc connect notion --name notion-default
+loc connect google-docs --name google-docs-default
+loc connections
+loc connection show notion-default
+loc disconnect notion-default
+```
+
+Development token fallback for Notion:
+
+```bash
+echo "$NOTION_TOKEN" | loc connect notion --token-stdin --name notion-default
+```
+
+## Mount
+
+```bash
+loc mount notion <path> --workspace
+loc mount notion <path> --root-page <page-id>
+loc mount google-docs <path> --workspace-folder <name-or-id>
+```
+
+Common options:
+
+```bash
+--connection <id>
+--mount-id <id>
+--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files
+--read-only
+--json
+```
+
+Examples:
+
+```bash
+loc mount notion ~/Library/CloudStorage/Locality/notion-main --workspace --projection macos-file-provider
+loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection plain-files
+```
+
+## Find local content
+
+```bash
+loc search roadmap
+loc search "Launch Plan" --connector notion
+loc search "https://www.notion.so/..." --connector notion --json
+loc info <path>
+```
+
+`loc search` reads local metadata. It does not call the remote connector.
+
+## Sync review
+
+```bash
+loc status <path>
+loc diff <path>
+loc pull <path>
+loc push <path> -y
+```
+
+Use scoped paths. Prefer a single `page.md` or a small directory over broad workspace pushes.
+
+## Recovery
+
+```bash
+loc restore <path>
+loc restore <path> --force
+loc inspect <path>
+loc log <path>
+loc undo <push-id>
+```
+
+`restore` rewrites the local file from the last synced shadow. `undo` is only for journal-backed remote undo where the connector supports it.
+
+## Diagnostics
+
+```bash
+loc doctor
+loc daemon status
+loc daemon start
+loc daemon restart
+loc file-provider status notion-main
+loc file-provider restart notion-main
+loc file-provider open notion-main
+```
+
+`doctor` is read-only. It reports daemon, mount, provider, state store, and auth health without resetting user state.
+
+## Create local drafts
+
+```bash
+loc create page --title "Launch Plan" --parent <mounted-directory>
+```
+
+The page remains local until pushed or synced by Live Mode.
+
+## Template packs
+
+```bash
+loc templates list
+loc templates validate ./templates/packs/founder-proof-of-work
+loc templates new founder-proof-of-work ~/Locality/founder-proof
+loc templates apply founder-proof-of-work weekly-update --to <mounted-dir> --title "Week 28 Update"
+```
+
+Template packs write local files. They do not bypass review or push safety.
+
+## OKF export
+
+```bash
+loc okf export <mounted-path> --out <empty-dir>
+```
+
+OKF export is read-only with respect to the source app. It writes a separate portable Markdown bundle.
+
+## Development entrypoints
+
+From the repo:
+
+```bash
+make setup
+make dev-tauri
+make check
+make test
+make run-cli ARGS='status --json'
+```

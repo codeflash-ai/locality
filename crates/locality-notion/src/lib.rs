@@ -46,24 +46,10 @@ use crate::render::{
 pub struct NotionConfig {
     pub workspace_id: Option<String>,
     pub root_page_id: Option<locality_core::model::RemoteId>,
-    pub private_workspace_create_auth_mode: PrivateWorkspaceCreateAuthMode,
     /// Resolved bearer token from a provider connection. Never log this field.
     pub token: Option<String>,
     /// Environment variable or future keychain key used to find the bearer token.
     pub token_key: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrivateWorkspaceCreateAuthMode {
-    Allow,
-    Reject,
-    ProbeTokenSubject,
-}
-
-impl Default for PrivateWorkspaceCreateAuthMode {
-    fn default() -> Self {
-        Self::Allow
-    }
 }
 
 impl std::fmt::Debug for NotionConfig {
@@ -71,10 +57,6 @@ impl std::fmt::Debug for NotionConfig {
         f.debug_struct("NotionConfig")
             .field("workspace_id", &self.workspace_id)
             .field("root_page_id", &self.root_page_id)
-            .field(
-                "private_workspace_create_auth_mode",
-                &self.private_workspace_create_auth_mode,
-            )
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("token_key", &self.token_key)
             .finish()
@@ -86,7 +68,6 @@ impl Default for NotionConfig {
         Self {
             workspace_id: None,
             root_page_id: None,
-            private_workspace_create_auth_mode: PrivateWorkspaceCreateAuthMode::Allow,
             token: None,
             token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
         }
@@ -101,14 +82,6 @@ impl NotionConfig {
 
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
-        self
-    }
-
-    pub fn with_private_workspace_create_auth_mode(
-        mut self,
-        mode: PrivateWorkspaceCreateAuthMode,
-    ) -> Self {
-        self.private_workspace_create_auth_mode = mode;
         self
     }
 }
@@ -291,11 +264,7 @@ impl Connector for NotionConnector {
     }
 
     fn apply(&self, request: ApplyPlanRequest<'_>) -> LocalityResult<ApplyPlanResult> {
-        apply_plan(
-            self.api.as_ref(),
-            self.config.private_workspace_create_auth_mode,
-            request,
-        )
+        apply_plan(self.api.as_ref(), request)
     }
 
     fn apply_undo(&self, request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {

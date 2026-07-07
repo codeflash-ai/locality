@@ -1,0 +1,91 @@
+---
+title: "Sync safety"
+description: "Understand pending changes, remote drift, conflicts, Live Mode, restore, and diagnostics."
+---
+
+Locality is designed to protect the remote app from accidental writes.
+
+## The three trees
+
+Every tracked file is compared across three states:
+
+- **remote tree**: current source-app state;
+- **local tree**: current mounted file state;
+- **synced tree**: the last state accepted by both sides.
+
+This lets Locality distinguish clean files, local edits, remote updates, and diverged files.
+
+## Common states
+
+| State | Meaning | Usual next action |
+| --- | --- | --- |
+| `all_synced` | Local and remote match the synced shadow. | Keep working. |
+| `stub` | Locality knows the object, but the body is not hydrated. | Open it or run `loc pull <path>`. |
+| `pending_local_changes` | Local file changed and has not been pushed. | Run `loc diff <path>`. |
+| `remote_update_available` | Remote changed while local file is clean. | Run `loc pull <path>`. |
+| `review_needed` | Local and remote both changed, or state needs attention. | Inspect before push or pull. |
+| `conflicted` | Conflict markers or an unsafe merge state exist. | Resolve the file, then diff again. |
+
+## Review before push
+
+Use a narrow path:
+
+```bash
+loc status <path>
+loc diff <path>
+loc push <path> -y
+```
+
+Use `--confirm` only when Locality reports a destructive guardrail and you have reviewed the plan:
+
+```bash
+loc push <path> --confirm
+```
+
+## Pull before push
+
+If the remote changed first:
+
+```bash
+loc pull <path>
+loc diff <path>
+loc push <path> -y
+```
+
+If Locality writes inline conflict markers, edit the file to the intended final content and remove every marker line before pushing.
+
+## Restore local file
+
+Restore rewrites the local file from the last synced shadow. It does not call Notion or Google Docs.
+
+```bash
+loc restore <path>
+```
+
+Use it when local edits should be discarded. Use `--force` only for a known conflicted file that you intentionally want to reset.
+
+## Live Mode
+
+Live Mode can handle safe background sync, but it is not fully autonomous.
+
+It should:
+
+- pull clean remote updates;
+- push safe local edits;
+- keep using the same push guardrails;
+- pause for conflicts, destructive plans, unsupported operations, remote drift that needs review, or anything ambiguous.
+
+It should not hide meaningful conflicts from the user.
+
+## Diagnostics
+
+Start with:
+
+```bash
+loc doctor
+loc status <path>
+loc info <path>
+loc daemon status
+```
+
+On virtual filesystem mounts, a visible file and the daemon cache can drift if the platform provider missed a callback. Scoped `loc status`, `loc diff`, and `loc push` try to reconcile the visible file before planning.

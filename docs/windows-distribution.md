@@ -66,6 +66,30 @@ login item; removes Locality-managed terminal command shims; and removes
 Locality-managed agent guidance and MCP `loc` entries. It does not delete
 user-visible mount folders.
 
+For destructive local test-machine cleanup from a source checkout, use:
+
+```powershell
+make clean-start-plan
+make clean-start
+```
+
+On Windows, `make clean-start-plan` runs `scripts/clean-start.ps1` without
+mutating state. `make clean-start` passes `-Yes`; the script stops Locality
+desktop, CLI, daemon, and Cloud Files helper processes, runs
+`Locality.exe --prepare-uninstall` or `locality-desktop.exe --prepare-uninstall`
+from the install directory when available, removes the per-user login item and
+Locality-managed `loc.cmd` shims, resets Locality Windows Cloud Files
+registrations, and deletes the Locality install/state directory plus the default
+user-visible mount folder at `%USERPROFILE%\Locality`. If stale Cloud Files
+placeholders survive provider teardown and normal deletion fails, the script
+temporarily detaches `CldFlt` from the mount volume, removes the mount folder,
+and reattaches the filter before continuing. That fallback is destructive,
+machine-local, and may require an elevated shell. By default the install and
+state directory is `%LOCALAPPDATA%\Locality`; pass `-StateDir` or `-InstallDir`
+when validating a non-default install layout. Pass `-KeepCredentials` for
+install-state testing that should not invoke the credential-clearing uninstall
+hook.
+
 Because the current-user install directory is also the default Locality state
 root, **Reset Local State** removes metadata, caches, provider state, logs, and
 SQLite state from this folder while preserving the installed desktop executable,

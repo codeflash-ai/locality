@@ -2,7 +2,7 @@ use locality_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, PushId, PushOperationId,
 };
 use locality_core::model::{MountId, RemoteId};
-use locality_core::planner::{CreateParentScope, PushOperation, PushPlan};
+use locality_core::planner::{PushOperation, PushPlan};
 use locality_core::shadow::ShadowDocument;
 use locality_core::undo::{UndoOperation, UndoPlanStatus, plan_journal_undo};
 
@@ -301,7 +301,7 @@ fn create_entity_reverses_to_archive_created_entity_when_effect_is_journaled() {
     let mut entry = journal_entry(vec![PushOperation::CreateEntity {
         parent_id: RemoteId::new("page-1"),
         parent_kind: None,
-        parent_scope: CreateParentScope::Remote,
+        parent_workspace: false,
         title: "New page".to_string(),
         properties: Default::default(),
         body: String::new(),

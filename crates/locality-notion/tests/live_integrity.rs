@@ -8,7 +8,7 @@ use locality_connector::{ApplyPlanRequest, Connector, FetchRequest};
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::journal::{PushId, PushOperationId};
 use locality_core::model::{MountId, RemoteId};
-use locality_core::planner::{CreateParentScope, PropertyValue, PushOperation, PushPlan};
+use locality_core::planner::{PropertyValue, PushOperation, PushPlan};
 use locality_notion::NotionConnector;
 use locality_notion::client::{
     DEFAULT_NOTION_API_BASE_URL, DEFAULT_NOTION_VERSION, notion_http_client,
@@ -347,7 +347,7 @@ fn live_database_row_property_create_edit_verify_integrity() {
         vec![PushOperation::CreateEntity {
             parent_id: database_id.clone(),
             parent_kind: Some(locality_core::model::EntityKind::Database),
-            parent_scope: CreateParentScope::Remote,
+            parent_workspace: false,
             title: "Locality created row".to_string(),
             properties: BTreeMap::from([
                 (

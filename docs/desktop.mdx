@@ -1,0 +1,102 @@
+---
+title: "Desktop app"
+description: "Use the Locality desktop app for onboarding, mounts, files, pending changes, and Live Mode."
+---
+
+The desktop app is the fastest path for humans. It handles connection setup, workspace mounting, Finder access, pending changes, and Live Mode.
+
+<Note>
+  Placeholder for desktop walkthrough video: connect Notion, open the mounted folder, locate a page, review pending changes, and toggle Live Mode for one file.
+</Note>
+
+## First run
+
+The intended first session is:
+
+<Steps>
+  <Step title="Connect a source">
+    Start with Notion. OAuth opens in the browser and lets you choose the pages or workspace content Locality can access.
+  </Step>
+  <Step title="Create a mount">
+    Locality creates a local folder for the connected workspace and registers the native file provider when needed.
+  </Step>
+  <Step title="Open the folder">
+    The primary action is opening the mounted folder. From there, files are available to Finder, editors, terminals, and agents.
+  </Step>
+  <Step title="Find one file">
+    Paste a Notion URL or search by title/path. Locality should make the target local path ready instead of waiting for a full workspace sync.
+  </Step>
+</Steps>
+
+## Home
+
+Home should answer four questions:
+
+- which sources are connected;
+- which folders are mounted;
+- which files need attention;
+- where to paste a page URL or search for a file.
+
+The most useful actions are:
+
+- open mounted folder;
+- copy path;
+- reveal in Finder;
+- locate page;
+- review pending changes.
+
+## Mounts and Files
+
+Mounts and Files are closely related, but they answer different jobs.
+
+- **Mounts** are connected workspaces and their local roots.
+- **Files** are the current local targets a user or agent may work on.
+
+The clean product path is to keep mount setup small and make file access prominent: recent files, searched files, copied paths, pending files, and conflicted files should be easy to reach from the same area.
+
+## Pending changes
+
+Pending changes are local edits that can affect the remote app.
+
+The desktop pending screen should make the next action obvious:
+
+- review plan;
+- push safe changes;
+- pull remote update;
+- restore local file;
+- open file;
+- copy path.
+
+Avoid presenting `undo` as a general safety button after a push. Use `undo push` only where journal-backed remote undo is actually available and still relevant.
+
+## Live Mode
+
+Live Mode is the desktop background sync loop.
+
+Use it when users want clean hydrated pages checked for remote changes and safe local edits pushed continuously. Keep it conservative:
+
+- push only safe plans;
+- pull clean remote updates;
+- pause for conflicts, unsupported operations, destructive changes, or review-required plans;
+- scope controls per file or active target when possible.
+
+Agents should not run routine push/pull commands after every edit when Live Mode is handling the file. They should inspect status only when Locality reports attention needed.
+
+## Diagnostics
+
+Start with:
+
+```bash
+loc doctor
+loc daemon status
+loc file-provider status notion-main
+loc status <path>
+```
+
+On macOS, remember there are three relevant layers:
+
+- the CloudStorage-visible folder;
+- the File Provider content cache;
+- Locality daemon state.
+
+If those disagree, restart the provider and check status before deleting any visible files.

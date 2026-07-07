@@ -1,0 +1,138 @@
+---
+title: "Best practices"
+description: "Practical recommendations for getting reliable human and agent workflows from Locality."
+keywords: ["best practices", "agents", "notion", "google docs", "sync", "live mode", "review"]
+---
+
+Use Locality like a local workspace over a remote source of truth. The fastest workflows are narrow, path-based, and reviewable.
+
+## Start with one real workspace
+
+Mount the workspace or page tree where work actually happens.
+
+```bash
+loc mount notion ~/Library/CloudStorage/Locality/notion-main --workspace --projection macos-file-provider
+```
+
+Then use search or the desktop locate input to find the specific file:
+
+```bash
+loc search "Launch Plan" --connector notion
+```
+
+Avoid creating many one-off mounts for individual pages unless you are testing or isolating a small project.
+
+## Give agents exact file targets
+
+Agents perform better with concrete paths than broad app instructions.
+
+```text
+Edit this file:
+~/Library/CloudStorage/Locality/notion-main/go-to-market/launch-plan/page.md
+
+Preserve Locality frontmatter and block directives.
+Run `loc diff` when done.
+Do not push until I approve.
+```
+
+This keeps the task inspectable and avoids accidental broad edits.
+
+## Keep edits scoped
+
+Prefer commands on one file or a small directory:
+
+```bash
+loc status <page.md>
+loc diff <page.md>
+loc push <page.md> -y
+```
+
+Broad workspace pushes are harder to review and easier to misinterpret.
+
+## Preserve identity metadata
+
+Do not edit generated Locality identity fields unless the task is explicitly about identity or migration.
+
+Leave these alone unless you know why they must change:
+
+- `loc:` frontmatter;
+- `::loc{...}` directives;
+- `_schema.yaml`;
+- `AGENTS.md`;
+- `CLAUDE.md`.
+
+Those fields let Locality map Markdown back to the correct remote object.
+
+## Use Live Mode for routine safe sync
+
+Live Mode is useful when a file is clean, hydrated, and actively being edited.
+
+Expect it to pause for:
+
+- conflicts;
+- unsupported operations;
+- destructive changes;
+- remote drift that needs review;
+- connector or provider errors.
+
+When Live Mode pauses, inspect the narrow path:
+
+```bash
+loc status <path>
+loc diff <path>
+```
+
+## Pull remote changes before pushing stale work
+
+If Locality reports `remote_update_available`, pull the file before pushing:
+
+```bash
+loc pull <path>
+loc diff <path>
+loc push <path> -y
+```
+
+If conflict markers appear, resolve the file to the final intended content and remove every marker line before pushing.
+
+## Diagnose before deleting visible files
+
+On macOS File Provider and other virtual projections, the visible file, provider cache, and daemon state can drift.
+
+Before deleting or moving a suspicious folder:
+
+```bash
+loc info <path>
+loc status <path>
+loc doctor
+```
+
+If the tracked path moved, check whether the old visible path has local-only edits before removing it.
+
+## Use OKF export for portable context
+
+Export when an agent, search system, or review process needs a clean portable bundle instead of live app access.
+
+```bash
+loc okf export ~/Library/CloudStorage/Locality/notion-main/engineering-wiki --out ~/Desktop/engineering-wiki-okf
+```
+
+OKF export is read-only with respect to the remote app.
+
+## Keep the review loop simple
+
+The most reliable loop is:
+
+<Steps>
+  <Step title="Find">
+    Search or locate the target file.
+  </Step>
+  <Step title="Edit">
+    Human or agent edits mounted Markdown.
+  </Step>
+  <Step title="Review">
+    Run `loc status` and `loc diff` on the narrow path.
+  </Step>
+  <Step title="Sync">
+    Push safe changes or let Live Mode handle the file when appropriate.
+  </Step>
+</Steps>

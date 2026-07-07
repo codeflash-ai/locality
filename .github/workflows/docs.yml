@@ -1,0 +1,54 @@
+name: docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/docs.yml"
+      - ".mintignore"
+      - "Makefile"
+      - "docs.json"
+      - "llms.txt"
+      - "docs/**/*.mdx"
+      - "scripts/mintlify-docs.sh"
+  pull_request:
+    paths:
+      - ".github/workflows/docs.yml"
+      - ".mintignore"
+      - "Makefile"
+      - "docs.json"
+      - "llms.txt"
+      - "docs/**/*.mdx"
+      - "scripts/mintlify-docs.sh"
+  workflow_dispatch:
+
+jobs:
+  mintlify:
+    name: Mintlify docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check docs navigation
+        shell: bash
+        run: |
+          jq empty docs.json
+          missing=0
+          while IFS= read -r page; do
+            if [ ! -f "$page.mdx" ]; then
+              echo "::error file=docs.json::Missing navigation page $page.mdx"
+              missing=1
+            fi
+          done < <(jq -r '.. | .pages? // empty | .[]? | strings' docs.json)
+          exit "$missing"
+
+      - name: Validate Mintlify build
+        run: make docs-validate
+
+      - name: Check docs links
+        run: make docs-broken-links

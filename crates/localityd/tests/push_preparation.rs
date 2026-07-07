@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-use locality_core::planner::{CreateParentScope, PropertyValue, PushOperation};
+use locality_core::planner::{PropertyValue, PushOperation};
 use locality_core::push::PushPipelineAction;
 use locality_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use locality_core::validation::ValidationReport;
@@ -1008,11 +1008,91 @@ fn prepare_push_plans_virtual_create_under_mount_remote_root() {
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("workspace-folder"),
             parent_kind: Some(EntityKind::Directory),
-            parent_scope: CreateParentScope::Remote,
+            parent_workspace: false,
             title: "Scratch Hydration".to_string(),
             properties: BTreeMap::new(),
             body: "Created through Locality.\n".to_string(),
             source_path: PathBuf::from("Scratch Hydration/page.md"),
+        }]
+    );
+}
+
+#[test]
+fn prepare_push_plans_notion_private_create_with_workspace_parent() {
+    let fixture = PrepareFixture::new();
+    let store = fixture.store("notion");
+    let path = fixture.write_raw(
+        "Private Draft/page.md",
+        "---\nloc:\n  private: true\ntitle: Private Draft\n---\nPrivate body.\n",
+    );
+
+    let prepared =
+        prepare_push(&store, &job(path), None, &LocalSourceValidator).expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    let plan = prepared.pipeline.plan.expect("plan");
+    assert_eq!(plan.affected_entities, Vec::<RemoteId>::new());
+    match &plan.operations[0] {
+        PushOperation::CreateEntity {
+            parent_id,
+            parent_kind,
+            parent_workspace,
+            title,
+            body,
+            source_path,
+            ..
+        } => {
+            assert_eq!(parent_id, &RemoteId::new("workspace"));
+            assert_eq!(parent_kind, &None);
+            assert!(*parent_workspace);
+            assert_eq!(title, "Private Draft");
+            assert_eq!(body, "Private body.\n");
+            assert_eq!(source_path, &PathBuf::from("Private Draft/page.md"));
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[test]
+fn prepare_push_plans_virtual_notion_private_create_without_parent_remote_id() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("notion");
+    let source_path = Path::new("Private Root Draft/page.md");
+    let cache_path = fixture.write_virtual_page(
+        source_path.to_str().expect("source path"),
+        "---\nloc:\n  private: true\ntitle: Private Root Draft\n---\nPrivate body.\n",
+    );
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:private-root-draft",
+            None,
+            source_path.to_str().expect("source path"),
+            cache_path,
+        ))
+        .expect("save mutation");
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join(source_path)),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    let plan = prepared.pipeline.plan.expect("plan");
+    assert_eq!(plan.affected_entities, Vec::<RemoteId>::new());
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new("workspace"),
+            parent_kind: None,
+            parent_workspace: true,
+            title: "Private Root Draft".to_string(),
+            properties: BTreeMap::new(),
+            body: "Private body.\n".to_string(),
+            source_path: source_path.to_path_buf(),
         }]
     );
 }

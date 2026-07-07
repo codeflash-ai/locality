@@ -18,8 +18,9 @@ use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountI
 use locality_notion::client::NotionApi;
 use locality_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DataSourcePropertyDto, DataSourceSummaryDto,
-    DatabaseDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto, RichTextBlockDto,
-    RichTextDto, SelectOptionDto, SelectPropertySchemaDto, TextRichTextDto, TitleBlockDto,
+    DatabaseDto, PageDto, PageListDto, PagePropertyDto, PaginatedListDto, ParentDto,
+    RichTextBlockDto, RichTextDto, SelectOptionDto, SelectPropertySchemaDto, TextRichTextDto,
+    TitleBlockDto,
 };
 use locality_notion::{NotionConfig, NotionConnector};
 use locality_store::{
@@ -808,6 +809,68 @@ fn pull_virtual_mount_accepts_mount_point_directory_as_root_target() {
 }
 
 #[test]
+fn pull_workspace_virtual_mount_root_lists_immediate_children_without_recursive_enumeration() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("loc-cli-pull-workspace-root-state");
+    let mut store = InMemoryStateStore::new();
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: None,
+            connection_id: None,
+            read_only: false,
+            projection: ProjectionMode::LinuxFuse,
+        },
+    )
+    .expect("mount workspace");
+    let connector = NotionConnector::with_api(
+        NotionConfig::default(),
+        Arc::new(WorkspaceRootOnlyNotionApi),
+    );
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture.root.clone(),
+        Some(&state_root),
+    )
+    .expect("pull workspace virtual root");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 2);
+    assert_eq!(report.hydrated, 0);
+    assert_eq!(report.stubbed, 0);
+    assert!(
+        store
+            .find_entity_by_path(&fixture.mount_id, &PathBuf::from("workspace-home/page.md"))
+            .expect("find root page")
+            .is_some()
+    );
+    assert!(
+        store
+            .find_entity_by_path(&fixture.mount_id, &PathBuf::from("tasks"))
+            .expect("find root database")
+            .is_some()
+    );
+    assert!(
+        store
+            .find_entity_by_path(&fixture.mount_id, &PathBuf::from("nested-child/page.md"))
+            .expect("find nested child")
+            .is_none()
+    );
+    assert!(
+        !virtual_fs_content_root(&state_root, &fixture.mount_id)
+            .join("workspace-home/page.md")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
 fn pull_virtual_file_accepts_mount_point_directory_target() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("loc-cli-pull-state");
@@ -962,6 +1025,99 @@ fn pull_file_provider_page_directory_materializes_visible_child_pages() {
             .expect("read visible child")
             .contains("Nested child body.")
     );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn pull_file_provider_page_directory_reconciles_visible_child_edit_before_hydration() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("loc-cli-pull-visible-directory-reconcile-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::WindowsCloudFiles);
+    let connector = fixture.connector_with_nested_child("Roadmap");
+    run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
+        .expect("pull virtual root");
+
+    run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture
+            .mount_point_root()
+            .join("roadmap")
+            .join("design-notes"),
+        Some(&state_root),
+    )
+    .expect("hydrate visible page directory");
+
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let visible_child = fixture
+        .mount_point_root()
+        .join("roadmap")
+        .join("design-notes")
+        .join("appendix")
+        .join("page.md");
+    fs::write(
+        &visible_child,
+        concat!(
+            "---\n",
+            "loc:\n",
+            "  id: 99999999999999999999999999999999\n",
+            "  type: page\n",
+            "  synced_at: now\n",
+            "  remote_edited_at: now\n",
+            "title: Appendix\n",
+            "---\n",
+            "Local visible appendix edit.\n",
+        ),
+    )
+    .expect("missed visible child edit");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture
+            .mount_point_root()
+            .join("roadmap")
+            .join("design-notes"),
+        Some(&state_root),
+    )
+    .expect("pull visible page directory with dirty child");
+
+    assert!(!report.ok);
+    assert_eq!(report.skipped_dirty, 1);
+    assert_eq!(report.hydrated, 1);
+    assert!(report.conflicts.is_empty());
+    let visible = fs::read_to_string(&visible_child).expect("read visible child");
+    assert!(
+        visible.contains("Local visible appendix edit."),
+        "{visible}"
+    );
+    assert!(
+        !visible.contains("Nested child body."),
+        "visible edit was overwritten: {visible}"
+    );
+    let cached = fs::read_to_string(
+        content_root
+            .join("roadmap")
+            .join("design-notes")
+            .join("appendix")
+            .join("page.md"),
+    )
+    .expect("read cached child");
+    assert!(cached.contains("Local visible appendix edit."), "{cached}");
+    assert!(
+        !cached.contains("Nested child body."),
+        "cache edit was overwritten: {cached}"
+    );
+    let child = store
+        .find_entity_by_path(
+            &fixture.mount_id,
+            &PathBuf::from("roadmap/design-notes/appendix/page.md"),
+        )
+        .expect("find child")
+        .expect("child entity");
+    assert_eq!(child.hydration, HydrationState::Dirty);
 
     let _ = fs::remove_dir_all(state_root);
 }
@@ -1974,6 +2130,158 @@ impl Drop for PullFixture {
     }
 }
 
+#[derive(Debug)]
+struct WorkspaceRootOnlyNotionApi;
+
+impl NotionApi for WorkspaceRootOnlyNotionApi {
+    fn retrieve_page(&self, page_id: &str) -> locality_core::LocalityResult<PageDto> {
+        match page_id {
+            "workspace-root-page" => Ok(page_with_parent(
+                "workspace-root-page",
+                "Workspace Home",
+                workspace_parent(),
+            )),
+            "nested-child" => Ok(page_with_parent(
+                "nested-child",
+                "Nested Child",
+                page_parent("workspace-root-page"),
+            )),
+            other => Err(locality_core::LocalityError::InvalidState(format!(
+                "unexpected page retrieval for {other}"
+            ))),
+        }
+    }
+
+    fn retrieve_database(&self, database_id: &str) -> locality_core::LocalityResult<DatabaseDto> {
+        if database_id == "workspace-root-db" {
+            return Ok(workspace_root_database());
+        }
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "unexpected database retrieval for {database_id}"
+        )))
+    }
+
+    fn retrieve_data_source(
+        &self,
+        data_source_id: &str,
+    ) -> locality_core::LocalityResult<DataSourceDto> {
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "workspace root pull should not retrieve data source {data_source_id}"
+        )))
+    }
+
+    fn query_data_source(
+        &self,
+        data_source_id: &str,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<PageListDto> {
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "workspace root pull should not query data source {data_source_id}"
+        )))
+    }
+
+    fn retrieve_block_children(
+        &self,
+        block_id: &str,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        Err(locality_core::LocalityError::InvalidState(format!(
+            "workspace root pull should not recursively list children for {block_id}"
+        )))
+    }
+
+    fn search_pages(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<PageListDto> {
+        Ok(PaginatedListDto {
+            results: vec![
+                page_with_parent("workspace-root-page", "Workspace Home", workspace_parent()),
+                page_with_parent(
+                    "nested-child",
+                    "Nested Child",
+                    page_parent("workspace-root-page"),
+                ),
+            ],
+            next_cursor: None,
+            has_more: false,
+        })
+    }
+
+    fn search_databases(
+        &self,
+        _start_cursor: Option<&str>,
+    ) -> locality_core::LocalityResult<locality_notion::dto::DatabaseListDto> {
+        Ok(PaginatedListDto {
+            results: vec![workspace_root_database()],
+            next_cursor: None,
+            has_more: false,
+        })
+    }
+
+    fn update_block(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockDto> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "workspace root fixture update block",
+        ))
+    }
+
+    fn append_block_children(
+        &self,
+        _block_id: &str,
+        _body: serde_json::Value,
+    ) -> locality_core::LocalityResult<BlockListDto> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "workspace root fixture append block children",
+        ))
+    }
+
+    fn delete_block(&self, _block_id: &str) -> locality_core::LocalityResult<BlockDto> {
+        Err(locality_core::LocalityError::NotImplemented(
+            "workspace root fixture delete block",
+        ))
+    }
+}
+
+fn workspace_root_database() -> DatabaseDto {
+    DatabaseDto {
+        id: "workspace-root-db".to_string(),
+        parent: Some(workspace_parent()),
+        title: vec![rich_text("Tasks")],
+        data_sources: vec![DataSourceSummaryDto {
+            id: "workspace-root-db-source".to_string(),
+            name: Some("Tasks".to_string()),
+        }],
+        last_edited_time: Some("2026-06-11T00:00:00.000Z".to_string()),
+        ..Default::default()
+    }
+}
+
+fn page_with_parent(id: &str, title: &str, parent: ParentDto) -> PageDto {
+    let mut page = page(id, title, "2026-06-11T00:00:00.000Z");
+    page.parent = Some(parent);
+    page
+}
+
+fn workspace_parent() -> ParentDto {
+    ParentDto {
+        kind: "workspace".to_string(),
+        workspace: Some(true),
+        ..Default::default()
+    }
+}
+
+fn page_parent(page_id: &str) -> ParentDto {
+    ParentDto {
+        kind: "page_id".to_string(),
+        page_id: Some(page_id.to_string()),
+        ..Default::default()
+    }
+}
+
 fn unique_temp_path(prefix: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique = SystemTime::now()
@@ -2381,7 +2689,6 @@ fn page(id: &str, title: &str, last_edited_time: &str) -> PageDto {
         parent: None,
         created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
         last_edited_time: Some(last_edited_time.to_string()),
-        created_by: None,
         archived: false,
         in_trash: false,
         properties: BTreeMap::from([(

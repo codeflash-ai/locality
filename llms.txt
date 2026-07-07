@@ -1,0 +1,41 @@
+# Locality
+
+> Locality mounts apps such as Notion and Google Docs as local Markdown files so humans, editors, and agents can read, edit, review, and sync work safely.
+
+## Read first
+
+- [Overview](docs/overview.mdx): Product model, core surfaces, and safety model.
+- [Install Locality](docs/install.mdx): OS-specific install paths, GitHub release assets, verification, and updates.
+- [Quickstart](docs/quickstart.mdx): Install, connect, mount, edit, diff, and push.
+- [Filesystem model](docs/filesystem-model.mdx): How pages, databases, documents, stubs, media, and frontmatter map to files.
+
+## Human workflows
+
+- [Desktop app](docs/desktop.mdx): Onboarding, mounts, files, pending changes, and Live Mode.
+- [Best practices](docs/best-practices.mdx): Recommendations for reliable human and agent workflows.
+- [Use cases](docs/use-cases.mdx): Engineering wiki updates, meeting notes, content operations, database workflows, OKF export, and safe agent handoff.
+- [Sync safety](docs/sync-safety.mdx): Pending changes, remote drift, conflicts, restore, and diagnostics.
+
+## Agent workflows
+
+- [Use with agents](docs/agents.mdx): Agent contract, prompts, Live Mode behavior, and MCP fallback.
+
+Agent rule summary:
+
+- edit mounted Markdown directly;
+- preserve Locality frontmatter, block identity directives, `_schema.yaml`, `AGENTS.md`, and `CLAUDE.md`;
+- use `loc status` and `loc diff` for inspection;
+- do not push unless the user explicitly asks or Live Mode has a safe path;
+- prefer scoped paths over broad workspace commands.
+
+## Reference
+
+- [CLI reference](docs/cli-reference.mdx): Essential `loc` command surface.
+- [Notion connector](docs/connectors/notion.mdx): Notion projection, databases, supported writes, and common errors.
+- [Google Docs connector](docs/connectors/google-docs.mdx): Google Docs projection, supported content, and limits.
+- [OKF export](docs/okf-export.mdx): Export mounted content as portable Open Knowledge Format bundles.
+
+## Operations
+
+- [Troubleshooting](docs/troubleshooting.mdx): Provider drift, stale paths, connector errors, conflicts, Live Mode pauses, and build mismatches.
+- [Development](docs/development.mdx): Repo setup, desktop dev, checks, daemon, File Provider, publish commands, and docs preview.
