@@ -731,12 +731,20 @@ fn collect_database_row_projections(
     database: &DatabaseDto,
 ) -> LocalityResult<Vec<ProjectedChild>> {
     let mut rows = Vec::new();
+    let data_source_ids = database
+        .data_sources
+        .iter()
+        .map(|data_source| data_source.id.as_str())
+        .collect::<BTreeSet<_>>();
     for data_source in &database.data_sources {
         let mut cursor = None;
 
         loop {
             let page = api.query_data_source(&data_source.id, cursor.as_deref())?;
             for row in page.results {
+                if !is_database_row_for_database(&row, database, &data_source_ids) {
+                    continue;
+                }
                 let title = page_title(&row);
                 rows.push(ProjectedChild::Page { page: row, title });
             }
@@ -754,6 +762,36 @@ fn collect_database_row_projections(
     }
 
     Ok(rows)
+}
+
+fn is_database_row_for_database(
+    page: &PageDto,
+    database: &DatabaseDto,
+    data_source_ids: &BTreeSet<&str>,
+) -> bool {
+    let Some(parent) = page.parent.as_ref() else {
+        return true;
+    };
+
+    if parent
+        .data_source_id
+        .as_deref()
+        .is_some_and(|data_source_id| data_source_ids.contains(data_source_id))
+    {
+        return true;
+    }
+
+    if parent
+        .database_id
+        .as_deref()
+        .is_some_and(|database_id| database_id == database.id)
+    {
+        return true;
+    }
+
+    matches!(parent.kind.as_str(), "data_source_id" | "database_id")
+        && parent.data_source_id.is_none()
+        && parent.database_id.is_none()
 }
 
 fn page_entry(mount_id: MountId, page: &PageDto, title: String, path: PathBuf) -> TreeEntry {
