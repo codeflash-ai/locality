@@ -12,6 +12,7 @@
 ## Human workflows
 
 - [Desktop app](docs/desktop.mdx): Onboarding, mounts, files, pending changes, and Live Mode.
+- [Best practices](docs/best-practices.mdx): Recommendations for reliable human and agent workflows.
 - [Use cases](docs/use-cases.mdx): Engineering wiki updates, meeting notes, content operations, database workflows, OKF export, and safe agent handoff.
 - [Sync safety](docs/sync-safety.mdx): Pending changes, remote drift, conflicts, restore, and diagnostics.
 

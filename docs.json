@@ -11,6 +11,28 @@
   "icons": {
     "library": "lucide"
   },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/codeflash-ai/locality",
+        "icon": "github"
+      },
+      {
+        "label": "Releases",
+        "href": "https://github.com/codeflash-ai/locality/releases",
+        "icon": "download"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Install Locality",
+      "href": "/docs/install"
+    }
+  },
+  "contextual": {
+    "options": ["copy"]
+  },
   "navigation": {
     "groups": [
       {
@@ -29,6 +51,7 @@
         "pages": [
           "docs/desktop",
           "docs/agents",
+          "docs/best-practices",
           "docs/sync-safety",
           "docs/use-cases"
         ]
@@ -49,6 +72,26 @@
         "pages": [
           "docs/troubleshooting",
           "docs/development"
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/codeflash-ai/locality"
+    },
+    "links": [
+      {
+        "label": "Product",
+        "items": [
+          {
+            "label": "Install",
+            "href": "/docs/install"
+          },
+          {
+            "label": "GitHub Releases",
+            "href": "https://github.com/codeflash-ai/locality/releases"
+          }
         ]
       }
     ]
