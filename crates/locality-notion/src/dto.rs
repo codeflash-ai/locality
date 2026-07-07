@@ -29,8 +29,6 @@ pub struct PageDto {
     #[serde(default)]
     pub last_edited_time: Option<String>,
     #[serde(default)]
-    pub created_by: Option<UserMentionDto>,
-    #[serde(default)]
     pub archived: bool,
     #[serde(default)]
     pub in_trash: bool,

@@ -10,7 +10,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc profiles [--json]`
 - `loc connection show <id> [--json]`
 - `loc disconnect <id> [--json]`
-- `loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
+- `loc mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `loc daemon status [--json]`
 - `loc info [path] [--json]`
@@ -320,29 +320,9 @@ path into Notion creation without bypassing the explicit push model.
 
 ## Initial `loc mount` and `loc pull`
 
-`loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>]` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Use `--workspace` for a workspace-level Notion mount, or `--root-page <page-id>` to mount below one Notion page. Existing guidance files are preserved. In virtual projections, the shared Locality root lists mount-point folders named from the mount path, and the guidance appears inside that mount-point folder, for example `/Locality/notion-main/AGENTS.md` and `/Locality/notion-main/CLAUDE.md`. With one active Notion connection, mount auto-assigns it. With multiple active Notion connections, pass `--connection <id>`. When `--mount-id` is omitted, Locality uses the default `notion-main` only if it is unused or already belongs to the same source; otherwise it derives a stable mount id from the connection or remote root so another workspace mount is added instead of replacing the existing one. Existing mounts without `connection_id` continue to work through the legacy `NOTION_TOKEN` fallback.
+`loc mount notion <path> --root-page <page-id> [--connection <id>]` creates the local root directory, writes concise source-specific mount guidance to `AGENTS.md`, creates a `CLAUDE.md` alias for agents that read that filename, and stores a mount record in SQLite. Existing guidance files are preserved. In virtual projections, the shared Locality root lists mount-point folders named from the mount path, and the guidance appears inside that mount-point folder, for example `/Locality/notion-main/AGENTS.md` and `/Locality/notion-main/CLAUDE.md`. With one active Notion connection, mount auto-assigns it. With multiple active Notion connections, pass `--connection <id>`. When `--mount-id` is omitted, Locality uses the default `notion-main` only if it is unused or already belongs to the same source; otherwise it derives a stable mount id from the connection or remote root so another workspace mount is added instead of replacing the existing one. Existing mounts without `connection_id` continue to work through the legacy `NOTION_TOKEN` fallback.
 
-Workspace Notion mounts use the access granted to the connected integration and
-expose two synthetic directories under the mount-point root: `Private/` and
-`Workspace/`. When the connection exposes a user owner, accessible top-level
-workspace pages created by that owner or by that user's bot appear under
-`Private/`; this is derived from the direct workspace parent plus those creator
-IDs. Existing accessible top-level workspace or team pages and databases appear
-under `Workspace/`, along with searchable accessible objects that Locality
-cannot safely place under an observed parent. Create private top-level pages
-under `Private/`; direct creation under `Workspace/` is rejected because parent
-selection is ambiguous. Create child pages inside an existing page directory.
-
-Example private page draft under a workspace mount:
-
-```bash
-loc pull ~/Locality/notion-main
-loc create page --title "Launch Plan" --parent ~/Locality/notion-main/Private
-```
-
-After `Private/` is visible, this creates
-`~/Locality/notion-main/Private/Launch Plan/page.md`; push or Live Mode then
-creates a private workspace page in Notion.
+Workspace Notion mounts use the access granted to the connected integration. If the integration is granted pages from multiple Notion teamspaces, Locality enumerates those accessible top-level pages and databases together under the mount-point root. Locality does not currently create separate teamspace grouping folders.
 
 Projection choices are platform-specific. Linux binaries accept `plain-files` and
 `linux-fuse`; macOS binaries accept `plain-files` and `macos-file-provider`;
@@ -416,32 +396,7 @@ Windows it removes the Cloud Files sync-root registration; use `stop` first when
 you only want to stop the runtime. `list` and `reset` target the platform helper
 for the current host.
 
-`loc pull <mount-root>` starts from the mount mode. For `--root-page` Notion
-mounts, it enumerates the configured page. For `--workspace` mounts, it
-enumerates the Locality synthetic roots, places accessible top-level workspace
-pages created by the connection owner or that user's bot under `Private/` when
-that owner is known, lists shared top-level pages, databases, and searchable
-accessible objects that Locality cannot safely place under an observed parent
-under `Workspace/`, and uses `Private/` for local private drafts without
-treating the mount root as a Notion page.
-
-For plain-file mounts, pull writes stub Markdown files for projected pages,
-creates directories for projected databases, writes database `_schema.yaml`
-files, and enumerates database row stubs with property frontmatter. On
-`--root-page` mounts it also hydrates the configured page, downloads file-like
-media for that page under `.loc/media/`, and persists that page's Synced Tree
-shadow snapshot. It checks already-hydrated enumerated pages for local
-`.loc/media` links whose files are missing and rehydrates only those pages so
-deleted media can be downloaded again when the remote file is still available.
-
-For virtual filesystem mounts, pull leaves unhydrated entries online-only and
-only writes content when hydration is requested. Pulling a virtual Notion
-database directory refreshes its row listing and `_schema.yaml`; when the
-database has 5 or fewer rows, it also hydrates clean row `page.md` files so
-small databases are immediately editable. `loc pull <page-file>` hydrates one
-known entity and downloads its file-like media. Pull refuses to overwrite a
-hydrated file if its body no longer matches the Synced Tree shadow, returning a
-dirty skip instead.
+`loc pull <mount-root>` enumerates the configured Notion root page. For plain-file mounts it writes stub Markdown files for projected pages, creates directories for projected databases, writes database `_schema.yaml` files, enumerates database row stubs with property frontmatter, hydrates the root page, downloads file-like media under `.loc/media/`, and persists the root page Synced Tree shadow snapshot. It also checks already-hydrated enumerated pages for local `.loc/media` links whose files are missing and rehydrates only those pages so deleted media can be downloaded again when the remote file is still available. For virtual filesystem mounts it leaves unhydrated entries online-only and only writes content when hydration is requested. Pulling a virtual Notion database directory refreshes its row listing and `_schema.yaml`; when the database has 5 or fewer rows, it also hydrates clean row `page.md` files so small databases are immediately editable. `loc pull <page-file>` hydrates one known entity and downloads its file-like media. Pull refuses to overwrite a hydrated file if its body no longer matches the Synced Tree shadow, returning a dirty skip instead.
 
 The JSON report includes `via`, `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts. `via` is `daemon` when the Unix socket handled the job and `cli` when the command executed directly.
 

@@ -174,7 +174,6 @@ impl NotionConnectionProbe for HttpNotionConnectionProbe {
         let api = HttpNotionApi::new(NotionConfig {
             workspace_id: None,
             root_page_id: None,
-            private_workspace_create_auth_mode: Default::default(),
             token: Some(token.to_string()),
             token_key: DEFAULT_NOTION_TOKEN_ENV.to_string(),
         });

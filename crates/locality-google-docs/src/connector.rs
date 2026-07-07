@@ -219,11 +219,6 @@ impl Connector for GoogleDocsConnector {
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
         let parent_id = match request.container {
             locality_connector::ChildContainer::Root => self.workspace_folder_id()?.0.clone(),
-            locality_connector::ChildContainer::SourceRoot(_) => {
-                return Err(LocalityError::Unsupported(
-                    "google docs source-root child containers",
-                ));
-            }
             locality_connector::ChildContainer::PageChildren(remote_id)
             | locality_connector::ChildContainer::DatabaseRows(remote_id) => remote_id.0,
         };
@@ -3028,7 +3023,7 @@ mod tests {
     };
     use locality_core::journal::{PushId, PushOperationId};
     use locality_core::model::{EntityKind, MountId, RemoteId};
-    use locality_core::planner::{CreateParentScope, PushOperation, PushPlan};
+    use locality_core::planner::{PushOperation, PushPlan};
     use locality_core::push::RemotePrecondition;
 
     use super::{
@@ -5072,7 +5067,6 @@ mod tests {
             vec![PushOperation::CreateEntity {
                 parent_id: RemoteId::new("workspace"),
                 parent_kind: Some(EntityKind::Directory),
-                parent_scope: CreateParentScope::Remote,
                 title: "Local Shape Create".to_string(),
                 properties: BTreeMap::new(),
                 body: "# Local Shape Create\n\nIntro paragraph\n".to_string(),
@@ -5126,7 +5120,6 @@ mod tests {
             vec![PushOperation::CreateEntity {
                 parent_id: RemoteId::new("workspace"),
                 parent_kind: Some(EntityKind::Directory),
-                parent_scope: CreateParentScope::Remote,
                 title: "Local Shape Create".to_string(),
                 properties: BTreeMap::new(),
                 body: "# Local Shape Create\n\nIntro with **Bold** and *Italic*.\n\n## Section Two\n\n- Bullet alpha\n\n1. Number alpha\n".to_string(),
@@ -5691,7 +5684,6 @@ mod tests {
             vec![PushOperation::CreateEntity {
                 parent_id: RemoteId::new("workspace"),
                 parent_kind: Some(EntityKind::Directory),
-                parent_scope: CreateParentScope::Remote,
                 title: "Scratch Hydration".to_string(),
                 properties: BTreeMap::new(),
                 body: "Created locally.\n".to_string(),
@@ -5731,7 +5723,6 @@ mod tests {
             vec![PushOperation::CreateEntity {
                 parent_id: RemoteId::new("workspace"),
                 parent_kind: Some(EntityKind::Directory),
-                parent_scope: CreateParentScope::Remote,
                 title: "Scratch Hydration".to_string(),
                 properties: BTreeMap::new(),
                 body: "Created locally.\n".to_string(),

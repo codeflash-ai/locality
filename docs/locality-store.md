@@ -44,11 +44,6 @@
   migration history, connector state, and projection state tables.
 - SQLite migrates pre-shared-root `linux_fuse` and `windows_cloud_files`
   projection layout state to mount-point roots under the shared projection root.
-- SQLite tracks the Notion workspace-root layout with
-  `projection:notion_workspace_roots`; missing or older same-schema state repairs
-  workspace-level Notion mounts by inserting synthetic `Private` and `Workspace`
-  directory entities and moving stale root-level workspace paths under
-  `Workspace/`.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
@@ -81,11 +76,6 @@ Shadow blocks, journal plans, journal preimages, and journal apply effects are J
 - Bump a `state_components` version when the stored meaning of JSON, paths,
   shadows, journals, virtual mutations, auth bindings, connector state, or
   projection state changes without a table-shape change.
-- Prefer connector-specific projection-layout components for connector-specific
-  path semantics. `projection:notion_workspace_roots` owns the Notion
-  workspace-level `Private/` and `Workspace/` roots and repairs only Notion
-  workspace mounts; root-page Notion mounts and non-Notion mounts must not be
-  rewritten by that repair.
 - Mark rebuildable components as `required = 0` and `rebuildable = 1`; stale
   rebuildable state should be repaired or regenerated instead of forcing a
   reset.

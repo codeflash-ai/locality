@@ -10,7 +10,7 @@ use locality_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, PushId, PushOperationId,
 };
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-use locality_core::planner::{CreateParentScope, PushOperation, PushPlan};
+use locality_core::planner::{PushOperation, PushPlan};
 use locality_core::shadow::ShadowDocument;
 use locality_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult};
 use locality_core::{LocalityError, LocalityResult};
@@ -112,7 +112,6 @@ fn log_filters_created_entity_journal_by_created_path() {
     let operation = PushOperation::CreateEntity {
         parent_id: RemoteId::new("page-1"),
         parent_kind: Some(EntityKind::Page),
-        parent_scope: CreateParentScope::Remote,
         title: "New child".to_string(),
         properties: Default::default(),
         body: "Created child.".to_string(),

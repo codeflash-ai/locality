@@ -13,7 +13,6 @@ use locality_core::path_projection::{
     is_page_document_path, page_container_path, page_document_path, page_listing_parent_path,
 };
 use locality_core::{LocalityError, LocalityResult};
-use locality_notion::projection::{is_notion_private_root_id, is_notion_workspace_root_id};
 use locality_store::{
     EntityRecord, EntityRepository, FreshnessStateRepository, MountConfig, MountRepository,
     ProjectionMode, ShadowRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
@@ -462,14 +461,9 @@ where
 
     let result = connector.list_children(ListChildrenRequest {
         mount_id: mount.mount_id.clone(),
-        container: container.clone(),
-        parent_path: parent_path.clone(),
+        container,
+        parent_path,
     })?;
-    let returned_remote_ids = result
-        .entries
-        .iter()
-        .map(|entry| entry.remote_id.clone())
-        .collect::<BTreeSet<_>>();
 
     let mut saved = 0;
     let mut changed = false;
@@ -484,105 +478,8 @@ where
         store.save_entity(record).map_err(LocalityError::from)?;
         saved += 1;
     }
-    let rehomed_remote_ids = rehome_clean_children_moved_to_sibling_source_roots(
-        store,
-        connector,
-        &mount,
-        &entities,
-        &container,
-        &parent_path,
-        &returned_remote_ids,
-        &mut saved,
-        &mut changed,
-    )?;
-    for entity in entities.iter().filter(|entity| {
-        entity_listing_parent_path(entity) == parent_path
-            && !returned_remote_ids.contains(&entity.remote_id)
-            && !rehomed_remote_ids.contains(&entity.remote_id)
-            && refreshed_child_can_be_pruned(entity)
-    }) {
-        store
-            .delete_entity(&mount.mount_id, &entity.remote_id)
-            .map_err(LocalityError::from)?;
-        changed = true;
-    }
 
     Ok(VirtualFsRefreshChildrenReport { saved, changed })
-}
-
-fn rehome_clean_children_moved_to_sibling_source_roots<S, C>(
-    store: &mut S,
-    connector: &C,
-    mount: &MountConfig,
-    entities: &[EntityRecord],
-    container: &ChildContainer,
-    parent_path: &Path,
-    returned_remote_ids: &BTreeSet<RemoteId>,
-    saved: &mut usize,
-    changed: &mut bool,
-) -> LocalityResult<BTreeSet<RemoteId>>
-where
-    S: EntityRepository,
-    C: Connector + ?Sized,
-{
-    let ChildContainer::SourceRoot(current_source_root_id) = container else {
-        return Ok(BTreeSet::new());
-    };
-    let stale_clean_remote_ids = entities
-        .iter()
-        .filter(|entity| {
-            entity_listing_parent_path(entity) == parent_path
-                && !returned_remote_ids.contains(&entity.remote_id)
-                && refreshed_child_can_be_pruned(entity)
-        })
-        .map(|entity| entity.remote_id.clone())
-        .collect::<BTreeSet<_>>();
-    if stale_clean_remote_ids.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-
-    let sibling_source_roots = entities
-        .iter()
-        .filter(|entity| {
-            entity.kind == EntityKind::Directory
-                && entity.remote_id != *current_source_root_id
-                && (is_notion_private_root_entity(mount, entity)
-                    || is_notion_workspace_root_entity(mount, entity))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut rehomed_remote_ids = BTreeSet::new();
-    for sibling_root in sibling_source_roots {
-        let result = connector.list_children(ListChildrenRequest {
-            mount_id: mount.mount_id.clone(),
-            container: ChildContainer::SourceRoot(sibling_root.remote_id.clone()),
-            parent_path: sibling_root.path.clone(),
-        })?;
-        for entry in result.entries {
-            if !stale_clean_remote_ids.contains(&entry.remote_id) {
-                continue;
-            }
-            let existing = store
-                .get_entity(&entry.mount_id, &entry.remote_id)
-                .map_err(LocalityError::from)?;
-            let record = refreshed_entity_record(entry, existing.as_ref());
-            if existing.as_ref() != Some(&record) {
-                *changed = true;
-            }
-            rehomed_remote_ids.insert(record.remote_id.clone());
-            store.save_entity(record).map_err(LocalityError::from)?;
-            *saved += 1;
-        }
-    }
-
-    Ok(rehomed_remote_ids)
-}
-
-fn refreshed_child_can_be_pruned(entity: &EntityRecord) -> bool {
-    !matches!(
-        entity.hydration,
-        HydrationState::Dirty | HydrationState::Conflicted
-    )
 }
 
 pub fn virtual_fs_children_refresh_needed<S>(
@@ -1556,10 +1453,6 @@ fn create_parent_remote_id(
         .ok_or_else(|| missing_identifier(parent_identifier))?;
     match entity.kind {
         EntityKind::Page | EntityKind::Database => Ok(remote_id),
-        EntityKind::Directory if is_notion_private_root_entity(mount, entity) => Ok(remote_id),
-        EntityKind::Directory if is_notion_workspace_root_entity(mount, entity) => {
-            Err(notion_workspace_root_create_error())
-        }
         EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => {
             Err(LocalityError::Unsupported(
                 "new virtual filesystem files must be created inside a page or database directory",
@@ -2446,28 +2339,8 @@ fn child_container_for_identifier(
     Ok(match entity.kind {
         EntityKind::Page => Some(ChildContainer::PageChildren(remote_id)),
         EntityKind::Database => Some(ChildContainer::DatabaseRows(remote_id)),
-        EntityKind::Directory
-            if is_notion_private_root_entity(mount, entity)
-                || is_notion_workspace_root_entity(mount, entity) =>
-        {
-            Some(ChildContainer::SourceRoot(remote_id))
-        }
         EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => None,
     })
-}
-
-fn is_notion_private_root_entity(mount: &MountConfig, entity: &EntityRecord) -> bool {
-    mount.connector == "notion" && is_notion_private_root_id(&entity.remote_id)
-}
-
-fn is_notion_workspace_root_entity(mount: &MountConfig, entity: &EntityRecord) -> bool {
-    mount.connector == "notion" && is_notion_workspace_root_id(&entity.remote_id)
-}
-
-fn notion_workspace_root_create_error() -> LocalityError {
-    LocalityError::Unsupported(
-        "New root workspace pages are ambiguous because Notion does not expose a stable teamspace parent through this API. Create under Private/ for a private page, or create below an existing page that Locality can use as the parent.",
-    )
 }
 
 fn refreshed_entity_record(
@@ -2704,23 +2577,18 @@ impl ProviderIndex {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use locality_connector::{
-        ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, ChildContainer,
-        Connector, ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest,
-        ListChildrenRequest, ListChildrenResult, NativeEntity, ParsedEntity,
+        ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
+        ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
+        ListChildrenResult, NativeEntity, ParsedEntity,
     };
     use locality_core::{
         LocalityError,
         freshness::FreshnessTier,
         hydration::HydrationRequest,
         model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry},
-    };
-    use locality_notion::projection::{
-        NOTION_PRIVATE_ROOT_DIR, NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_DIR,
-        NOTION_WORKSPACE_ROOT_ID,
     };
     use locality_store::{
         EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
@@ -3092,203 +2960,6 @@ mod tests {
     }
 
     #[test]
-    fn refresh_source_root_prunes_clean_children_no_longer_returned_by_connector() {
-        let mount_id = MountId::new("notion-main");
-        let mut store = InMemoryStateStore::new();
-        store
-            .save_mount(virtual_mount(&mount_id))
-            .expect("save mount");
-        store
-            .save_entity(notion_synthetic_root_entity(
-                &mount_id,
-                locality_notion::projection::NOTION_WORKSPACE_ROOT_ID,
-                locality_notion::projection::NOTION_WORKSPACE_ROOT_DIR,
-                locality_notion::projection::NOTION_WORKSPACE_ROOT_DIR,
-            ))
-            .expect("save workspace root");
-        store
-            .save_entity(EntityRecord::new(
-                mount_id.clone(),
-                RemoteId::new("old-child"),
-                EntityKind::Page,
-                "Old Child",
-                "Workspace/old-child/page.md",
-            ))
-            .expect("save stale flattened child");
-
-        let connector = StaticChildrenConnector {
-            entries: vec![TreeEntry {
-                mount_id: mount_id.clone(),
-                remote_id: RemoteId::new("root-page"),
-                kind: EntityKind::Page,
-                title: "Root Page".to_string(),
-                path: "Workspace/root-page/page.md".into(),
-                hydration: HydrationState::Stub,
-                content_hash: None,
-                remote_edited_at: None,
-                stub_frontmatter: None,
-            }],
-            expected_parent_path: PathBuf::from("Workspace"),
-        };
-
-        let saved = refresh_virtual_fs_children(
-            &mut store,
-            &connector,
-            &mount_id,
-            locality_notion::projection::NOTION_WORKSPACE_ROOT_ID,
-        )
-        .expect("refresh workspace source root");
-
-        assert_eq!(saved.saved, 1);
-        assert!(saved.changed);
-        assert!(
-            store
-                .get_entity(&mount_id, &RemoteId::new("old-child"))
-                .expect("get stale child")
-                .is_none(),
-            "stale clean children from the refreshed source root should be removed"
-        );
-        let report = virtual_fs_children(
-            &store,
-            &mount_id,
-            locality_notion::projection::NOTION_WORKSPACE_ROOT_ID,
-        )
-        .expect("workspace children");
-        assert_eq!(report.children.len(), 1);
-        assert_eq!(report.children[0].identifier, "children:root-page");
-    }
-
-    #[test]
-    fn refresh_source_root_keeps_dirty_children_no_longer_returned_by_connector() {
-        let mount_id = MountId::new("notion-main");
-        let mut store = InMemoryStateStore::new();
-        store
-            .save_mount(virtual_mount(&mount_id))
-            .expect("save mount");
-        store
-            .save_entity(notion_synthetic_root_entity(
-                &mount_id,
-                locality_notion::projection::NOTION_WORKSPACE_ROOT_ID,
-                locality_notion::projection::NOTION_WORKSPACE_ROOT_DIR,
-                locality_notion::projection::NOTION_WORKSPACE_ROOT_DIR,
-            ))
-            .expect("save workspace root");
-        store
-            .save_entity(
-                EntityRecord::new(
-                    mount_id.clone(),
-                    RemoteId::new("dirty-child"),
-                    EntityKind::Page,
-                    "Dirty Child",
-                    "Workspace/dirty-child/page.md",
-                )
-                .with_hydration(HydrationState::Dirty),
-            )
-            .expect("save dirty child");
-
-        let connector = StaticChildrenConnector {
-            entries: Vec::new(),
-            expected_parent_path: PathBuf::from("Workspace"),
-        };
-
-        let saved = refresh_virtual_fs_children(
-            &mut store,
-            &connector,
-            &mount_id,
-            locality_notion::projection::NOTION_WORKSPACE_ROOT_ID,
-        )
-        .expect("refresh workspace source root");
-
-        assert_eq!(saved.saved, 0);
-        assert!(!saved.changed);
-        assert!(
-            store
-                .get_entity(&mount_id, &RemoteId::new("dirty-child"))
-                .expect("get dirty child")
-                .is_some(),
-            "dirty children must remain available for conflict/review handling"
-        );
-    }
-
-    #[test]
-    fn refresh_source_root_rehomes_clean_child_moved_to_sibling_source_root() {
-        let mount_id = MountId::new("notion-main");
-        let mut store = InMemoryStateStore::new();
-        store
-            .save_mount(virtual_mount(&mount_id))
-            .expect("save mount");
-        store
-            .save_entity(notion_synthetic_root_entity(
-                &mount_id,
-                NOTION_PRIVATE_ROOT_ID,
-                NOTION_PRIVATE_ROOT_DIR,
-                NOTION_PRIVATE_ROOT_DIR,
-            ))
-            .expect("save private root");
-        store
-            .save_entity(notion_synthetic_root_entity(
-                &mount_id,
-                NOTION_WORKSPACE_ROOT_ID,
-                NOTION_WORKSPACE_ROOT_DIR,
-                NOTION_WORKSPACE_ROOT_DIR,
-            ))
-            .expect("save workspace root");
-        store
-            .save_entity(EntityRecord::new(
-                mount_id.clone(),
-                RemoteId::new("scratchpad"),
-                EntityKind::Page,
-                "Scratchpad",
-                "Workspace/scratchpad/page.md",
-            ))
-            .expect("save old workspace child");
-
-        let connector = SourceRootChildrenConnector {
-            entries_by_source_root: BTreeMap::from([
-                (NOTION_WORKSPACE_ROOT_ID.to_string(), Vec::new()),
-                (
-                    NOTION_PRIVATE_ROOT_ID.to_string(),
-                    vec![TreeEntry {
-                        mount_id: mount_id.clone(),
-                        remote_id: RemoteId::new("scratchpad"),
-                        kind: EntityKind::Page,
-                        title: "Scratchpad".to_string(),
-                        path: "Private/scratchpad/page.md".into(),
-                        hydration: HydrationState::Stub,
-                        content_hash: None,
-                        remote_edited_at: None,
-                        stub_frontmatter: None,
-                    }],
-                ),
-            ]),
-        };
-
-        let saved = refresh_virtual_fs_children(
-            &mut store,
-            &connector,
-            &mount_id,
-            NOTION_WORKSPACE_ROOT_ID,
-        )
-        .expect("refresh workspace source root");
-
-        assert_eq!(saved.saved, 1);
-        assert!(saved.changed);
-        let scratchpad = store
-            .get_entity(&mount_id, &RemoteId::new("scratchpad"))
-            .expect("get scratchpad")
-            .expect("scratchpad should be rehomed, not pruned");
-        assert_eq!(scratchpad.path, PathBuf::from("Private/scratchpad/page.md"));
-
-        let workspace = virtual_fs_children(&store, &mount_id, NOTION_WORKSPACE_ROOT_ID)
-            .expect("workspace children");
-        assert!(workspace.children.is_empty());
-        let private = virtual_fs_children(&store, &mount_id, NOTION_PRIVATE_ROOT_ID)
-            .expect("private children");
-        assert_eq!(private.children.len(), 1);
-        assert_eq!(private.children[0].identifier, "children:scratchpad");
-    }
-
-    #[test]
     fn refresh_database_children_moves_existing_row_into_database_directory() {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
@@ -3465,96 +3136,6 @@ mod tests {
     struct StaticChildrenConnector {
         entries: Vec<TreeEntry>,
         expected_parent_path: PathBuf,
-    }
-
-    struct SourceRootChildrenConnector {
-        entries_by_source_root: BTreeMap<String, Vec<TreeEntry>>,
-    }
-
-    impl Connector for SourceRootChildrenConnector {
-        fn kind(&self) -> ConnectorKind {
-            ConnectorKind("test")
-        }
-
-        fn capabilities(&self) -> ConnectorCapabilities {
-            ConnectorCapabilities {
-                supports_lazy_child_enumeration: true,
-                ..ConnectorCapabilities::default()
-            }
-        }
-
-        fn enumerate(
-            &self,
-            _request: EnumerateRequest,
-        ) -> locality_core::LocalityResult<Vec<TreeEntry>> {
-            Ok(Vec::new())
-        }
-
-        fn list_children(
-            &self,
-            request: ListChildrenRequest,
-        ) -> locality_core::LocalityResult<ListChildrenResult> {
-            let ChildContainer::SourceRoot(source_root_id) = request.container else {
-                return Err(LocalityError::InvalidState(
-                    "expected source root children request".to_string(),
-                ));
-            };
-            Ok(ListChildrenResult {
-                entries: self
-                    .entries_by_source_root
-                    .get(source_root_id.as_str())
-                    .cloned()
-                    .unwrap_or_default(),
-            })
-        }
-
-        fn fetch(&self, request: FetchRequest) -> locality_core::LocalityResult<NativeEntity> {
-            let _ = request;
-            Err(locality_core::LocalityError::NotImplemented(
-                "fixture fetch",
-            ))
-        }
-
-        fn render(
-            &self,
-            _entity: &NativeEntity,
-        ) -> locality_core::LocalityResult<CanonicalDocument> {
-            Err(locality_core::LocalityError::NotImplemented(
-                "fixture render",
-            ))
-        }
-
-        fn parse(
-            &self,
-            _document: &CanonicalDocument,
-        ) -> locality_core::LocalityResult<ParsedEntity> {
-            Err(locality_core::LocalityError::NotImplemented(
-                "fixture parse",
-            ))
-        }
-
-        fn check_concurrency(
-            &self,
-            _request: ApplyPlanRequest<'_>,
-        ) -> locality_core::LocalityResult<()> {
-            Ok(())
-        }
-
-        fn apply(
-            &self,
-            _request: ApplyPlanRequest<'_>,
-        ) -> locality_core::LocalityResult<ApplyPlanResult> {
-            Err(locality_core::LocalityError::NotImplemented(
-                "fixture apply",
-            ))
-        }
-
-        fn apply_undo(
-            &self,
-            _request: ApplyUndoRequest<'_>,
-        ) -> locality_core::LocalityResult<ApplyUndoResult> {
-            Err(locality_core::LocalityError::NotImplemented("fixture undo"))
-        }
     }
 
     impl Connector for StaticChildrenConnector {
@@ -4032,110 +3613,6 @@ mod tests {
                 .expect("list mutations")
                 .len(),
             1
-        );
-
-        let _ = std::fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn notion_private_synthetic_root_accepts_pending_page_directory_create() {
-        let mount_id = MountId::new("notion-main");
-        let state_root = temp_root("loc-virtual-fs-notion-private-root-create");
-        let content_root = state_root.join("content/notion-main/files");
-        let mut store = InMemoryStateStore::new();
-        store
-            .save_mount(
-                MountConfig::new(mount_id.clone(), "notion", "/tmp/loc/notion")
-                    .projection(ProjectionMode::LinuxFuse),
-            )
-            .expect("save mount");
-        store
-            .save_entity(notion_synthetic_root_entity(
-                &mount_id,
-                NOTION_PRIVATE_ROOT_ID,
-                NOTION_PRIVATE_ROOT_DIR,
-                NOTION_PRIVATE_ROOT_DIR,
-            ))
-            .expect("save private root");
-
-        let created = create_virtual_fs_directory(
-            &mut store,
-            &content_root,
-            &mount_id,
-            NOTION_PRIVATE_ROOT_ID,
-            "Scratch Idea",
-        )
-        .expect("create under private root");
-
-        assert!(created.identifier.starts_with("children:local:"));
-        assert_eq!(created.item.path, "Private/Scratch Idea");
-        assert_eq!(
-            std::fs::read(content_root.join("Private/Scratch Idea/page.md"))
-                .expect("read pending private page cache"),
-            b""
-        );
-        let mutation = store
-            .list_virtual_mutations(&mount_id)
-            .expect("list mutations")
-            .pop()
-            .expect("pending create");
-        assert_eq!(
-            mutation.projected_path,
-            Path::new("Private/Scratch Idea/page.md")
-        );
-        assert_eq!(
-            mutation.parent_remote_id.as_ref().map(|id| id.as_str()),
-            Some(NOTION_PRIVATE_ROOT_ID)
-        );
-
-        let _ = std::fs::remove_dir_all(state_root);
-    }
-
-    #[test]
-    fn notion_workspace_synthetic_root_rejects_pending_page_directory_create() {
-        let mount_id = MountId::new("notion-main");
-        let state_root = temp_root("loc-virtual-fs-notion-workspace-root-create");
-        let content_root = state_root.join("content/notion-main/files");
-        let mut store = InMemoryStateStore::new();
-        store
-            .save_mount(
-                MountConfig::new(mount_id.clone(), "notion", "/tmp/loc/notion")
-                    .projection(ProjectionMode::LinuxFuse),
-            )
-            .expect("save mount");
-        store
-            .save_entity(notion_synthetic_root_entity(
-                &mount_id,
-                NOTION_WORKSPACE_ROOT_ID,
-                NOTION_WORKSPACE_ROOT_DIR,
-                NOTION_WORKSPACE_ROOT_DIR,
-            ))
-            .expect("save workspace root");
-
-        let error = create_virtual_fs_directory(
-            &mut store,
-            &content_root,
-            &mount_id,
-            NOTION_WORKSPACE_ROOT_ID,
-            "New Team Page",
-        )
-        .expect_err("workspace root create must be rejected");
-
-        assert!(
-            error
-                .to_string()
-                .contains("New root workspace pages are ambiguous")
-        );
-        assert!(
-            store
-                .list_virtual_mutations(&mount_id)
-                .expect("list mutations")
-                .is_empty()
-        );
-        assert!(
-            !content_root
-                .join("Workspace/New Team Page/page.md")
-                .exists()
         );
 
         let _ = std::fs::remove_dir_all(state_root);
@@ -4646,22 +4123,6 @@ mod tests {
     fn virtual_mount(mount_id: &MountId) -> MountConfig {
         MountConfig::new(mount_id.clone(), "notion", "/tmp/loc/notion")
             .projection(ProjectionMode::LinuxFuse)
-    }
-
-    fn notion_synthetic_root_entity(
-        mount_id: &MountId,
-        remote_id: &str,
-        title: &str,
-        path: &str,
-    ) -> EntityRecord {
-        EntityRecord::new(
-            mount_id.clone(),
-            RemoteId::new(remote_id),
-            EntityKind::Directory,
-            title,
-            path,
-        )
-        .with_hydration(HydrationState::Virtual)
     }
 
     fn temp_root(prefix: &str) -> PathBuf {

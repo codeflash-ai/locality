@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-use locality_core::planner::{CreateParentScope, PropertyValue, PushOperation};
+use locality_core::planner::{PropertyValue, PushOperation};
 use locality_core::push::PushPipelineAction;
 use locality_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use locality_core::validation::ValidationReport;
@@ -1008,7 +1008,6 @@ fn prepare_push_plans_virtual_create_under_mount_remote_root() {
         vec![PushOperation::CreateEntity {
             parent_id: RemoteId::new("workspace-folder"),
             parent_kind: Some(EntityKind::Directory),
-            parent_scope: CreateParentScope::Remote,
             title: "Scratch Hydration".to_string(),
             properties: BTreeMap::new(),
             body: "Created through Locality.\n".to_string(),

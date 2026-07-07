@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use locality_core::LocalityError;
 use locality_core::model::RemoteId;
 use locality_core::planner::{
-    CreateParentScope, GuardrailDecision, PlanDegradation, PlanDegradationKind, PlanSummary,
-    PropertyValue, PushOperation, PushPlan,
+    GuardrailDecision, PlanDegradation, PlanDegradationKind, PlanSummary, PropertyValue,
+    PushOperation, PushPlan,
 };
 use locality_core::push::{PushApproval, PushPipelineAction, PushPipelineResult, PushStage};
 use locality_core::shadow::ShadowDocument;
@@ -371,21 +371,12 @@ pub enum PushOperationOutput {
     },
     CreateEntity {
         parent_id: String,
-        parent_scope: String,
         title: String,
         keys: Vec<String>,
         properties: Vec<PropertyUpdateOutput>,
         body: String,
         source_path: String,
     },
-}
-
-fn create_parent_scope_name(scope: &CreateParentScope) -> &'static str {
-    match scope {
-        CreateParentScope::Remote => "remote",
-        CreateParentScope::PrivateWorkspace => "private_workspace",
-        CreateParentScope::WorkspaceRoot => "workspace_root",
-    }
 }
 
 impl From<PushOperation> for PushOperationOutput {
@@ -443,7 +434,6 @@ impl From<PushOperation> for PushOperationOutput {
             },
             PushOperation::CreateEntity {
                 parent_id,
-                parent_scope,
                 title,
                 properties,
                 body,
@@ -451,7 +441,6 @@ impl From<PushOperation> for PushOperationOutput {
                 ..
             } => Self::CreateEntity {
                 parent_id: parent_id.0,
-                parent_scope: create_parent_scope_name(&parent_scope).to_string(),
                 title,
                 keys: properties.keys().cloned().collect(),
                 properties: properties

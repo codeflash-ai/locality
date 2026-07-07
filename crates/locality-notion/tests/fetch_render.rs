@@ -18,10 +18,6 @@ use locality_notion::dto::{
     SyncedFromDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto,
     UniqueIdPropertyDto, UrlBlockDto, VerificationPropertyDto,
 };
-use locality_notion::projection::{
-    NOTION_PRIVATE_ROOT_DIR, NOTION_PRIVATE_ROOT_ID, NOTION_WORKSPACE_ROOT_DIR,
-    NOTION_WORKSPACE_ROOT_ID,
-};
 use locality_notion::{NotionConfig, NotionConnector};
 use serde_json::json;
 
@@ -1956,7 +1952,7 @@ fn enumerate_suffixes_every_colliding_sibling_name() {
 }
 
 #[test]
-fn list_children_returns_workspace_root_pages_without_flattening_observed_children() {
+fn list_children_returns_workspace_root_pages_without_nested_duplicates() {
     let api = FixtureNotionApi::workspace();
     let connector = NotionConnector::with_api(NotionConfig::default(), Arc::new(api));
 
@@ -1969,49 +1965,12 @@ fn list_children_returns_workspace_root_pages_without_flattening_observed_childr
         .expect("list workspace root");
 
     assert_eq!(result.entries.len(), 2);
-    assert_eq!(
-        result.entries[0].remote_id,
-        RemoteId::new(NOTION_PRIVATE_ROOT_ID)
-    );
-    assert_eq!(result.entries[0].kind, EntityKind::Directory);
-    assert_eq!(result.entries[0].path, Path::new(NOTION_PRIVATE_ROOT_DIR));
-    assert_eq!(
-        result.entries[1].remote_id,
-        RemoteId::new(NOTION_WORKSPACE_ROOT_ID)
-    );
-    assert_eq!(result.entries[1].kind, EntityKind::Directory);
-    assert_eq!(result.entries[1].path, Path::new(NOTION_WORKSPACE_ROOT_DIR));
-
-    let result = connector
-        .list_children(ListChildrenRequest {
-            mount_id: MountId::new("notion-main"),
-            container: ChildContainer::SourceRoot(RemoteId::new(NOTION_WORKSPACE_ROOT_ID)),
-            parent_path: Path::new(NOTION_WORKSPACE_ROOT_DIR).to_path_buf(),
-        })
-        .expect("list workspace synthetic root");
-
-    assert_eq!(result.entries.len(), 2);
     assert_eq!(result.entries[0].remote_id, RemoteId::new("root-page"));
     assert_eq!(result.entries[0].kind, EntityKind::Page);
-    assert_eq!(
-        result.entries[0].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("page.md")
-    );
+    assert_eq!(result.entries[0].path, Path::new("root/page.md"));
     assert_eq!(result.entries[1].remote_id, RemoteId::new("root-db"));
     assert_eq!(result.entries[1].kind, EntityKind::Database);
-    assert_eq!(
-        result.entries[1].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR).join("tasks")
-    );
-    assert!(
-        result
-            .entries
-            .iter()
-            .all(|entry| entry.remote_id != RemoteId::new("nested-page")),
-        "searchable child pages with an observed parent must not be duplicated under Workspace/"
-    );
+    assert_eq!(result.entries[1].path, Path::new("tasks"));
 }
 
 #[test]
@@ -2080,50 +2039,20 @@ fn enumerate_shared_workspace_projects_nested_pages_and_database_rows_under_pare
         })
         .expect("enumerate workspace tree");
 
-    assert_eq!(entries.len(), 7);
-    assert_eq!(entries[0].path, Path::new(NOTION_PRIVATE_ROOT_DIR));
-    assert_eq!(entries[0].kind, EntityKind::Directory);
-    assert_eq!(entries[1].path, Path::new(NOTION_WORKSPACE_ROOT_DIR));
-    assert_eq!(entries[1].kind, EntityKind::Directory);
-    assert_eq!(
-        entries[2].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("page.md")
-    );
+    assert_eq!(entries.len(), 5);
+    assert_eq!(entries[0].path, Path::new("root/page.md"));
+    assert_eq!(entries[0].kind, EntityKind::Page);
+    assert_eq!(entries[1].path, Path::new("root/design-notes/page.md"));
+    assert_eq!(entries[1].kind, EntityKind::Page);
+    assert_eq!(entries[2].path, Path::new("root/toggle-child/page.md"));
     assert_eq!(entries[2].kind, EntityKind::Page);
-    assert_eq!(
-        entries[3].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("design-notes")
-            .join("page.md")
-    );
-    assert_eq!(entries[3].kind, EntityKind::Page);
+    assert_eq!(entries[3].path, Path::new("root/tasks"));
+    assert_eq!(entries[3].kind, EntityKind::Database);
     assert_eq!(
         entries[4].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("toggle-child")
-            .join("page.md")
+        Path::new("root/tasks/fix-login-bug/page.md")
     );
     assert_eq!(entries[4].kind, EntityKind::Page);
-    assert_eq!(
-        entries[5].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("tasks")
-    );
-    assert_eq!(entries[5].kind, EntityKind::Database);
-    assert_eq!(
-        entries[6].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("root")
-            .join("tasks")
-            .join("fix-login-bug")
-            .join("page.md")
-    );
-    assert_eq!(entries[6].kind, EntityKind::Page);
 }
 
 #[test]
@@ -2138,27 +2067,13 @@ fn enumerate_shared_workspace_keeps_shared_database_row_when_database_is_not_sha
         })
         .expect("enumerate shared orphan row");
 
-    assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].remote_id, RemoteId::new(NOTION_PRIVATE_ROOT_ID));
-    assert_eq!(entries[0].path, Path::new(NOTION_PRIVATE_ROOT_DIR));
-    assert_eq!(entries[0].kind, EntityKind::Directory);
+    assert_eq!(entries.len(), 1);
     assert_eq!(
-        entries[1].remote_id,
-        RemoteId::new(NOTION_WORKSPACE_ROOT_ID)
-    );
-    assert_eq!(entries[1].path, Path::new(NOTION_WORKSPACE_ROOT_DIR));
-    assert_eq!(entries[1].kind, EntityKind::Directory);
-    assert_eq!(
-        entries[2].remote_id,
+        entries[0].remote_id,
         RemoteId::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
     );
-    assert_eq!(
-        entries[2].path,
-        Path::new(NOTION_WORKSPACE_ROOT_DIR)
-            .join("shared-row")
-            .join("page.md")
-    );
-    assert_eq!(entries[2].kind, EntityKind::Page);
+    assert_eq!(entries[0].path, Path::new("shared-row/page.md"));
+    assert_eq!(entries[0].kind, EntityKind::Page);
 }
 
 #[test]
@@ -2774,7 +2689,6 @@ fn page_with_parent(id: &str, title: &str, parent: Option<ParentDto>) -> PageDto
         parent,
         created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
         last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
-        created_by: None,
         archived: false,
         in_trash: false,
         properties: BTreeMap::from([(
