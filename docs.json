@@ -1,0 +1,34 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "luma",
+  "name": "Locality",
+  "description": "Locality mounts apps like Notion and Google Docs as local files for humans, editors, and agents.",
+  "colors": {
+    "primary": "#0F766E",
+    "light": "#14B8A6",
+    "dark": "#0F766E"
+  },
+  "icons": {
+    "library": "lucide"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Start",
+        "icon": "rocket",
+        "pages": [
+          "docs/overview",
+          "docs/quickstart",
+          "docs/filesystem-model"
+        ]
+      },
+      {
+        "group": "Use Locality",
+        "icon": "folder-sync",
+        "pages": [
+          "docs/desktop"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,80 @@
+---
+title: "Locality"
+description: "Mount apps as local files so humans and agents can read, edit, review, and sync work safely."
+---
+
+Locality turns apps such as Notion and Google Docs into local folders of Markdown files.
+
+Humans get normal files, Finder, editors, diffs, and review flows. Agents get the interface they already understand: paths, folders, `grep`, Markdown, and explicit commands for status, diff, pull, and push.
+
+<Note>
+  Placeholder for launch demo video: mount a Notion workspace, copy a local path into an agent, edit `page.md`, review the diff, and push back to Notion.
+</Note>
+
+## What Locality is for
+
+Use Locality when the source of truth lives in an app, but the work is easier as files:
+
+- update a Notion engineering wiki with an agent;
+- review content changes before they touch the remote app;
+- let agents inspect a workspace with file tools instead of slow UI actions;
+- export mounted knowledge into portable Markdown or OKF bundles;
+- keep app permissions, remote identity, and sync safety outside the agent prompt.
+
+## The core idea
+
+Remote objects become filesystem objects.
+
+```text
+Notion page              local directory
+Notion page body         page.md
+Notion child page        child directory with page.md
+Notion database          directory with _schema.yaml and row pages
+Google Docs document     directory with page.md
+Google Drive folder      local directory
+```
+
+Locality keeps the remote app as the system of record. Local edits stay pending until they are reviewed, pushed, or synced through Live Mode when the plan is safe.
+
+## Why this works for agents
+
+Agents are strongest when the task can be expressed through files:
+
+- find relevant content with path search and `grep`;
+- edit Markdown directly;
+- compare changes with `loc diff`;
+- leave work pending for a human review;
+- push only when explicitly asked or when Live Mode safely handles it.
+
+This keeps the agent workflow concrete. The agent does not need to invent API calls, manage OAuth, or reason about app-specific block formats.
+
+## Product surfaces
+
+<Columns cols={2}>
+  <Card title="Desktop app" icon="monitor">
+    Connect accounts, mount workspaces, open folders, locate pages, review pending changes, and manage Live Mode.
+  </Card>
+  <Card title="CLI" icon="terminal">
+    Use `loc` for connection, mount, status, diff, pull, push, restore, diagnostics, and OKF export.
+  </Card>
+  <Card title="Mounted folders" icon="folder">
+    Work directly in the local folder. Pages are directories, content lives in `page.md`, and database schemas live in `_schema.yaml`.
+  </Card>
+  <Card title="Agent guidance" icon="bot">
+    Locality installs concise instructions for supported local agents and writes mount-local guidance files.
+  </Card>
+</Columns>
+
+## Safety model
+
+Locality separates three states:
+
+- **remote tree**: what the source app currently has;
+- **local tree**: what exists in the mounted files;
+- **synced tree**: the last accepted state shared by both.
+
+That model lets Locality detect pending local edits, remote drift, clean fast-forwards, and conflicts before updating the remote app.
+
+<Tip>
+  For a first workflow, start with a small Notion page, edit `page.md`, run `loc diff`, then push with `loc push <path> -y` when the plan looks right.
+</Tip>

@@ -1,0 +1,125 @@
+---
+title: "Quickstart"
+description: "Install Locality, connect a source, mount it locally, and push a reviewed edit."
+---
+
+This guide shows the shortest useful path: connect Notion, mount it as files, edit one page, review the diff, and push.
+
+<Note>
+  Placeholder for setup screenshot: connected source, mounted folder path, and pending changes panel.
+</Note>
+
+## 1. Install
+
+On macOS with Homebrew:
+
+```bash
+brew tap codeflash-ai/tap
+brew install --cask loc
+```
+
+Update an existing install:
+
+```bash
+brew update
+brew upgrade --cask loc
+```
+
+On Debian or Ubuntu:
+
+```bash
+curl -fsSL https://codeflash-ai.github.io/locality/apt/codeflash-loc.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-loc.gpg
+echo "deb [signed-by=/usr/share/keyrings/codeflash-loc.gpg] https://codeflash-ai.github.io/locality/apt stable main" | sudo tee /etc/apt/sources.list.d/loc.list >/dev/null
+sudo apt update
+sudo apt install loc
+```
+
+On Fedora, RHEL, or compatible distributions:
+
+```bash
+sudo curl -fsSL -o /etc/yum.repos.d/loc.repo https://codeflash-ai.github.io/locality/rpm/loc.repo
+sudo dnf install loc
+```
+
+## 2. Connect Notion
+
+```bash
+loc connect notion --name notion-default
+```
+
+The browser flow asks which Notion pages or workspaces Locality can access. Locality can only mount content shared with the integration.
+
+For local development or CI with a Notion token:
+
+```bash
+echo "$NOTION_TOKEN" | loc connect notion --token-stdin --name notion-default
+```
+
+## 3. Mount a workspace
+
+On macOS desktop builds, the app usually creates and opens the File Provider folder for you. The user-visible folder is reported by the app and by `loc file-provider open`.
+
+CLI workspace mount:
+
+```bash
+loc mount notion ~/Library/CloudStorage/Locality/notion-main --workspace --projection macos-file-provider
+loc file-provider register notion-main
+loc file-provider open notion-main
+```
+
+Plain-file mount for development or scripts:
+
+```bash
+loc mount notion ~/Locality/notion-main --workspace --projection plain-files
+loc pull ~/Locality/notion-main
+```
+
+## 4. Find a page
+
+Use the desktop search or the CLI metadata search:
+
+```bash
+loc search "Launch Plan" --connector notion
+loc search "https://www.notion.so/..." --connector notion
+```
+
+Open the returned `page.md` in an editor or pass the path to an agent.
+
+## 5. Edit and review
+
+Edit the mounted Markdown file:
+
+```text
+~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md
+```
+
+Check what Locality sees:
+
+```bash
+loc status ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md
+loc diff ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md
+```
+
+Push a safe reviewed plan:
+
+```bash
+loc push ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md -y
+```
+
+If the remote changed first, pull before pushing:
+
+```bash
+loc pull ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md
+loc diff ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md
+loc push ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md -y
+```
+
+## 6. Use Live Mode when appropriate
+
+Live Mode is the desktop background sync loop. When enabled, Locality can pull clean remote updates and push safe local edits without asking an agent to run `loc pull` or `loc push` after every small edit.
+
+Keep Live Mode conservative:
+
+- use it for safe, ordinary Markdown edits;
+- expect it to pause for conflicts, destructive plans, unsupported operations, and review-required changes;
+- use `loc status` and the desktop pending changes view when it pauses.
