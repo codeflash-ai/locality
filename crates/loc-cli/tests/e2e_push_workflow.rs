@@ -5582,7 +5582,7 @@ fn virtual_projection_modes_page_directory_pull_recursively_hydrates_descendant_
             "{projection:?}: {directory_pull:#?}"
         );
         assert_eq!(
-            directory_pull.hydrated, 2,
+            directory_pull.hydrated, 3,
             "{projection:?}: {directory_pull:#?}"
         );
         assert_eq!(
