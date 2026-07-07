@@ -848,36 +848,30 @@ fn pull_virtual_page_directory_recursively_hydrates_child_pages() {
     run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
         .expect("pull virtual root");
     let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
-    store
-        .save_entity(EntityRecord::new(
-            fixture.mount_id.clone(),
-            RemoteId::new("directory-shadow"),
-            EntityKind::Directory,
-            "Roadmap",
-            "roadmap",
-        ))
-        .expect("save page directory shadow");
 
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        fixture.mount_point_root().join("roadmap"),
+        fixture
+            .mount_point_root()
+            .join("roadmap")
+            .join("design-notes"),
         Some(&state_root),
     )
     .expect("pull virtual page directory");
 
     assert!(report.ok);
-    assert_eq!(report.enumerated, 3);
+    assert_eq!(report.enumerated, 1);
     assert_eq!(report.hydrated, 2);
     assert_eq!(report.stubbed, 0);
-    let child = store
+    let target = store
         .find_entity_by_path(
             &fixture.mount_id,
             &PathBuf::from("roadmap/design-notes/page.md"),
         )
-        .expect("find child")
-        .expect("child entity");
-    assert_eq!(child.hydration, HydrationState::Hydrated);
+        .expect("find target")
+        .expect("target entity");
+    assert_eq!(target.hydration, HydrationState::Hydrated);
     let nested = store
         .find_entity_by_path(
             &fixture.mount_id,
@@ -892,6 +886,23 @@ fn pull_virtual_page_directory_recursively_hydrates_child_pages() {
             .join("design-notes")
             .join("page.md")
             .exists()
+    );
+    assert!(
+        content_root
+            .join("roadmap")
+            .join("design-notes")
+            .join("page.md")
+            .exists()
+    );
+    assert!(
+        fs::read_to_string(
+            content_root
+                .join("roadmap")
+                .join("design-notes")
+                .join("page.md"),
+        )
+        .expect("read target page")
+        .contains("Child body.")
     );
     assert!(
         content_root
@@ -918,38 +929,106 @@ fn pull_file_provider_page_directory_materializes_visible_child_pages() {
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        fixture.mount_point_root().join("roadmap"),
+        fixture
+            .mount_point_root()
+            .join("roadmap")
+            .join("design-notes"),
         Some(&state_root),
     )
     .expect("pull visible page directory");
 
     assert!(report.ok);
     assert_eq!(report.hydrated, 2);
-    let visible_child = fixture
+    let visible_target = fixture
         .mount_point_root()
         .join("roadmap")
         .join("design-notes")
         .join("page.md");
-    let visible_nested = fixture
+    assert!(visible_target.exists());
+    assert!(
+        fs::read_to_string(&visible_target)
+            .expect("read visible target")
+            .contains("Child body.")
+    );
+    let visible_child = fixture
         .mount_point_root()
         .join("roadmap")
         .join("design-notes")
         .join("appendix")
         .join("page.md");
     assert!(visible_child.exists());
-    assert!(visible_nested.exists());
     assert!(
         fs::read_to_string(&visible_child)
             .expect("read visible child")
-            .contains("Child body.")
-    );
-    assert!(
-        fs::read_to_string(&visible_nested)
-            .expect("read visible nested child")
             .contains("Nested child body.")
     );
 
     let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
+fn pull_plain_files_page_directory_hydrates_target_and_descendants() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+    let connector = fixture.connector_with_nested_child("Roadmap");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull plain-files root");
+
+    let target_page_path = fixture
+        .root
+        .join("roadmap")
+        .join("design-notes")
+        .join("page.md");
+    let initial_target = fs::read_to_string(&target_page_path).expect("read initial target stub");
+    assert!(
+        initial_target.contains(CanonicalDocument::STUB_MARKER),
+        "{initial_target}"
+    );
+
+    let report = run_pull(
+        &mut store,
+        &connector,
+        fixture.root.join("roadmap").join("design-notes"),
+    )
+    .expect("pull plain-files page directory");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 1);
+    assert_eq!(report.hydrated, 2);
+
+    let target = store
+        .find_entity_by_path(
+            &fixture.mount_id,
+            &PathBuf::from("roadmap/design-notes/page.md"),
+        )
+        .expect("find target")
+        .expect("target entity");
+    assert_eq!(target.hydration, HydrationState::Hydrated);
+    let nested = store
+        .find_entity_by_path(
+            &fixture.mount_id,
+            &PathBuf::from("roadmap/design-notes/appendix/page.md"),
+        )
+        .expect("find nested")
+        .expect("nested entity");
+    assert_eq!(nested.hydration, HydrationState::Hydrated);
+    assert!(
+        fs::read_to_string(&target_page_path)
+            .expect("read hydrated target")
+            .contains("Child body.")
+    );
+    assert!(
+        fs::read_to_string(
+            fixture
+                .root
+                .join("roadmap")
+                .join("design-notes")
+                .join("appendix")
+                .join("page.md"),
+        )
+        .expect("read hydrated appendix")
+        .contains("Nested child body.")
+    );
 }
 
 #[test]

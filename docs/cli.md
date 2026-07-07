@@ -438,8 +438,10 @@ For virtual filesystem mounts, pull leaves unhydrated entries online-only and
 only writes content when hydration is requested. Pulling a virtual Notion
 database directory refreshes its row listing and `_schema.yaml`; when the
 database has 5 or fewer rows, it also hydrates clean row `page.md` files so
-small databases are immediately editable. `loc pull <page-file>` hydrates one
-known entity and downloads its file-like media. Pull refuses to overwrite a
+small databases are immediately editable. `loc pull <page-directory>` hydrates
+that directory's own `page.md` and recursively refreshes child page
+directories below it across projection modes. `loc pull <page-file>` hydrates
+one known entity and downloads its file-like media. Pull refuses to overwrite a
 hydrated file if its body no longer matches the Synced Tree shadow, returning a
 dirty skip instead.
 
