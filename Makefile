@@ -220,6 +220,18 @@ dev-desktop: ## Start the Vite desktop frontend dev server.
 preview-desktop: ## Preview the built desktop frontend.
 	$(DESKTOP_NPM) run preview
 
+.PHONY: docs-dev
+docs-dev: ## Start the Mintlify docs preview from an isolated docs workspace.
+	scripts/mintlify-docs.sh dev
+
+.PHONY: docs-validate
+docs-validate: ## Validate the Mintlify docs build.
+	scripts/mintlify-docs.sh validate
+
+.PHONY: docs-broken-links
+docs-broken-links: ## Check Mintlify docs links from an isolated docs workspace.
+	scripts/mintlify-docs.sh broken-links
+
 .PHONY: dev-tauri
 dev-tauri: ## Start the Tauri desktop app in development mode.
 	$(DESKTOP_NPM) run tauri -- dev

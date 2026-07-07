@@ -102,15 +102,23 @@ Do not publish a build that failed relevant checks.
 
 The published docs use Mintlify with `docs.json` at the repo root. Public pages are `docs/*.mdx`; older internal design notes remain in `docs/*.md` and are hidden unless added to navigation.
 
-Preview with the Mintlify CLI from the repository root:
+Preview from an isolated docs workspace:
 
 ```bash
-npx mintlify@latest dev
+make docs-dev
 ```
 
-Check navigation paths before committing:
+Validate before committing:
+
+```bash
+make docs-validate
+```
+
+Check navigation paths directly when editing `docs.json`:
 
 ```bash
 jq empty docs.json
 for p in $(jq -r '.. | .pages? // empty | .[]? | strings' docs.json); do test -f "$p.mdx" || echo "missing $p.mdx"; done
 ```
+
+The isolated docs workspace avoids Mintlify scanning internal repository files that are not part of the published site.
