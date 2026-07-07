@@ -478,6 +478,11 @@ struct CreatePageArgs {
         help = "Existing parent directory where the page should be created. Defaults to the current directory."
     )]
     parent: Option<String>,
+    #[arg(
+        long,
+        help = "Create the page as a Notion workspace-private page on push."
+    )]
+    private: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -869,6 +874,7 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     args.push("page".to_string());
                     push_flag_value(&mut args, "--title", &options.title);
                     push_optional_flag_value(&mut args, "--parent", options.parent.as_deref());
+                    push_flag(&mut args, "--private", options.private);
                 }
             }
         }
@@ -2489,7 +2495,7 @@ fn create_page(args: &[String], json: bool) -> i32 {
         );
     };
     let state_root = default_state_root();
-    let store = match SqliteStateStore::open(state_root) {
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
         Ok(store) => store,
         Err(error) => {
             return command_error(
@@ -2502,8 +2508,10 @@ fn create_page(args: &[String], json: bool) -> i32 {
     let options = CreatePageOptions {
         title,
         parent: flag_value(args, "--parent").map(PathBuf::from),
+        private: has_flag(args, "--private"),
+        state_root: Some(state_root),
     };
-    match run_create_page(&store, options) {
+    match run_create_page(&mut store, options) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -3903,6 +3911,9 @@ fn print_create_page_report(report: &CreatePageReport) {
     println!("created {}", report.path);
     println!("  title: {}", report.title);
     println!("  mount: {}", report.mount_id);
+    if report.private {
+        println!("  notion parent: workspace private");
+    }
     println!("  next:");
     for next in &report.next {
         println!("    {next}");
@@ -5595,9 +5606,12 @@ fn create_command_error(json: bool, error: CreateError) -> i32 {
         CreateError::CurrentDir { .. }
         | CreateError::InvalidTitle(_)
         | CreateError::MountNotFound(_)
+        | CreateError::PrivateUnsupported { .. }
         | CreateError::ReadOnlyMount { .. }
         | CreateError::TargetExists(_) => EXIT_USAGE,
-        CreateError::Store(_) | CreateError::WriteFile { .. } => EXIT_INTERNAL,
+        CreateError::Store(_)
+        | CreateError::VirtualStateRootRequired
+        | CreateError::WriteFile { .. } => EXIT_INTERNAL,
     };
     command_error(
         json,
@@ -6507,6 +6521,7 @@ mod tests {
                     "Create a page directory",
                     "--title",
                     "--parent",
+                    "--private",
                 ],
             ),
             (

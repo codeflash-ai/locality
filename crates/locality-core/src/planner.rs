@@ -87,6 +87,8 @@ pub enum PushOperation {
         parent_id: RemoteId,
         #[serde(default)]
         parent_kind: Option<EntityKind>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        parent_workspace: bool,
         title: String,
         #[serde(default)]
         properties: BTreeMap<String, PropertyValue>,
@@ -95,6 +97,10 @@ pub enum PushOperation {
         #[serde(default)]
         source_path: std::path::PathBuf,
     },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

@@ -347,6 +347,7 @@ fn live_database_row_property_create_edit_verify_integrity() {
         vec![PushOperation::CreateEntity {
             parent_id: database_id.clone(),
             parent_kind: Some(locality_core::model::EntityKind::Database),
+            parent_workspace: false,
             title: "Locality created row".to_string(),
             properties: BTreeMap::from([
                 (

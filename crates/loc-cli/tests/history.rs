@@ -112,6 +112,7 @@ fn log_filters_created_entity_journal_by_created_path() {
     let operation = PushOperation::CreateEntity {
         parent_id: RemoteId::new("page-1"),
         parent_kind: Some(EntityKind::Page),
+        parent_workspace: false,
         title: "New child".to_string(),
         properties: Default::default(),
         body: "Created child.".to_string(),

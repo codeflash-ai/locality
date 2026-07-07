@@ -708,10 +708,16 @@ fn apply_plan(
             }
             PushOperation::CreateEntity {
                 parent_id,
+                parent_workspace,
                 title,
                 body,
                 ..
             } => {
+                if *parent_workspace {
+                    return Err(LocalityError::Unsupported(
+                        "google docs connector cannot create workspace-private pages",
+                    ));
+                }
                 let created = drive.create_file(DriveCreateFileRequest::google_doc(
                     title,
                     parent_id.0.clone(),
@@ -5067,6 +5073,7 @@ mod tests {
             vec![PushOperation::CreateEntity {
                 parent_id: RemoteId::new("workspace"),
                 parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
                 title: "Local Shape Create".to_string(),
                 properties: BTreeMap::new(),
                 body: "# Local Shape Create\n\nIntro paragraph\n".to_string(),
@@ -5120,6 +5127,7 @@ mod tests {
             vec![PushOperation::CreateEntity {
                 parent_id: RemoteId::new("workspace"),
                 parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
                 title: "Local Shape Create".to_string(),
                 properties: BTreeMap::new(),
                 body: "# Local Shape Create\n\nIntro with **Bold** and *Italic*.\n\n## Section Two\n\n- Bullet alpha\n\n1. Number alpha\n".to_string(),
@@ -5684,6 +5692,7 @@ mod tests {
             vec![PushOperation::CreateEntity {
                 parent_id: RemoteId::new("workspace"),
                 parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
                 title: "Scratch Hydration".to_string(),
                 properties: BTreeMap::new(),
                 body: "Created locally.\n".to_string(),
@@ -5723,6 +5732,7 @@ mod tests {
             vec![PushOperation::CreateEntity {
                 parent_id: RemoteId::new("workspace"),
                 parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
                 title: "Scratch Hydration".to_string(),
                 properties: BTreeMap::new(),
                 body: "Created locally.\n".to_string(),

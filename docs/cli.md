@@ -16,7 +16,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc info [path] [--json]`
 - `loc status [path] [--json]`
 - `loc search <query> [--connector <connector>] [--limit <n>] [--json]`
-- `loc create page --title <title> [--parent <dir>] [--json]`
+- `loc create page --title <title> [--parent <dir>] [--private] [--json]`
 - `loc templates list|validate|new|apply [args] [--json]`
 - `loc okf export <path> --out <dir> [--json]`
 - `loc inspect <path> [--json]`
@@ -202,10 +202,10 @@ review or hydration requirements before reading file content.
 
 ## Local Draft Creation
 
-`loc create page --title <title> [--parent <dir>]` creates the local filesystem
-shape for a new page and does not call a remote connector. The parent directory
-must be inside a registered Locality mount and must be writable. When `--parent`
-is omitted, the current directory is used.
+`loc create page --title <title> [--parent <dir>] [--private]` creates the
+local filesystem shape for a new page and does not call a remote connector. The
+parent directory must be inside a registered Locality mount and must be
+writable. When `--parent` is omitted, the current directory is used.
 
 For Notion mounts, the title determines the page directory name and the
 containing directory determines the remote parent:
@@ -219,6 +219,17 @@ creates:
 ```text
 ~/Library/CloudStorage/Locality/notion/go-to-market/Launch Plan/page.md
 ```
+
+For Notion mounts, `--private` marks the draft so `loc push` creates it with a
+workspace parent, which Notion places in the user's Private section:
+
+```bash
+loc create page --title "Scratchpad" --private --parent ~/Library/CloudStorage/Locality/notion
+```
+
+The flag is only valid for Notion mounts. Internal Notion integrations may still
+be rejected by Notion during push because workspace-private page creation
+requires a user-associated token.
 
 with only new-page frontmatter:
 

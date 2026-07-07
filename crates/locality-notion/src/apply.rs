@@ -279,6 +279,7 @@ pub fn apply_plan(
                     PushOperation::CreateEntity {
                         parent_id,
                         parent_kind,
+                        parent_workspace,
                         title,
                         properties,
                         body,
@@ -288,6 +289,7 @@ pub fn apply_plan(
                             api,
                             parent_id,
                             parent_kind.as_ref(),
+                            *parent_workspace,
                             title,
                             properties,
                             body,
@@ -297,7 +299,8 @@ pub fn apply_plan(
                         if !changed_remote_ids.contains(&created_id) {
                             changed_remote_ids.push(created_id.clone());
                         }
-                        if matches!(parent_kind, Some(locality_core::model::EntityKind::Page))
+                        if !parent_workspace
+                            && matches!(parent_kind, Some(locality_core::model::EntityKind::Page))
                             && !changed_remote_ids.contains(parent_id)
                         {
                             changed_remote_ids.push(parent_id.clone());
@@ -546,7 +549,11 @@ fn create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId> {
     operations
         .iter()
         .filter_map(|operation| match operation {
-            PushOperation::CreateEntity { parent_id, .. } => Some(parent_id.clone()),
+            PushOperation::CreateEntity {
+                parent_id,
+                parent_workspace,
+                ..
+            } if !parent_workspace => Some(parent_id.clone()),
             _ => None,
         })
         .collect()
@@ -569,8 +576,11 @@ fn database_create_parent_ids(operations: &[PushOperation]) -> BTreeSet<RemoteId
             PushOperation::CreateEntity {
                 parent_id,
                 parent_kind,
+                parent_workspace,
                 ..
-            } if !matches!(parent_kind, Some(locality_core::model::EntityKind::Page)) => {
+            } if !parent_workspace
+                && !matches!(parent_kind, Some(locality_core::model::EntityKind::Page)) =>
+            {
                 Some(parent_id.clone())
             }
             _ => None,
@@ -1178,10 +1188,30 @@ fn create_page_body(
     api: &dyn NotionApi,
     parent_id: &RemoteId,
     parent_kind: Option<&locality_core::model::EntityKind>,
+    parent_workspace: bool,
     title: &str,
     properties: &BTreeMap<String, PropertyValue>,
     body: &str,
 ) -> LocalityResult<Value> {
+    if parent_workspace {
+        let mut request = json!({
+            "parent": {
+                "type": "workspace",
+                "workspace": true,
+            },
+            "properties": {
+                "title": {
+                    "title": rich_text(title),
+                }
+            },
+        });
+        let children = create_page_children(body)?;
+        if !children.is_empty() {
+            request["children"] = Value::Array(children);
+        }
+        return Ok(request);
+    }
+
     if matches!(parent_kind, Some(locality_core::model::EntityKind::Page)) {
         let mut request = json!({
             "parent": {

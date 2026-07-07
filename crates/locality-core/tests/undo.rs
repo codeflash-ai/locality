@@ -301,6 +301,7 @@ fn create_entity_reverses_to_archive_created_entity_when_effect_is_journaled() {
     let mut entry = journal_entry(vec![PushOperation::CreateEntity {
         parent_id: RemoteId::new("page-1"),
         parent_kind: None,
+        parent_workspace: false,
         title: "New page".to_string(),
         properties: Default::default(),
         body: String::new(),
