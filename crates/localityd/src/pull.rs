@@ -107,8 +107,14 @@ where
     let relative_path = matched.relative_path;
     let source = source.scoped_to_mount(&mount);
     let page_directory = page_directory_target(store, &mount, &relative_path)?;
-    let refresh_bases =
-        prepare_visible_projection_pull(store, state_root, &mount, &relative_path, &target_path)?;
+    let refresh_bases = prepare_visible_projection_pull(
+        store,
+        state_root,
+        &mount,
+        &relative_path,
+        &target_path,
+        page_directory.is_some(),
+    )?;
 
     let report = if should_pull_mount_root(
         &mount,
@@ -162,6 +168,7 @@ fn prepare_visible_projection_pull<S>(
     mount: &MountConfig,
     relative_path: &Path,
     target_path: &Path,
+    is_page_directory_target: bool,
 ) -> Result<Vec<ProjectionRefreshBase>, PullError>
 where
     S: MountRepository
@@ -180,7 +187,10 @@ where
     ) {
         return Ok(Vec::new());
     }
-    if mount.projection.uses_virtual_filesystem() && !is_page_document_path(relative_path) {
+    if mount.projection.uses_virtual_filesystem()
+        && !is_page_document_path(relative_path)
+        && !is_page_directory_target
+    {
         return Ok(Vec::new());
     }
 
@@ -3429,6 +3439,138 @@ mod tests {
                 .get_entity(&fixture.mount_id, &root_id)
                 .expect("read root page")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn page_directory_pull_reconciles_visible_child_edit_before_hydration() {
+        let fixture = PullFixture::new();
+        let state_root = fixture.root.join("state");
+        let content_root =
+            crate::virtual_fs::virtual_fs_content_root(&state_root, &fixture.mount_id);
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "notion", fixture.root.clone())
+            .projection(ProjectionMode::WindowsCloudFiles);
+        store.save_mount(mount).expect("save mount");
+
+        let parent_id = RemoteId::new("parent-page");
+        let child_id = RemoteId::new("child-page");
+        let parent_path = PathBuf::from("Roadmap/page.md");
+        let child_path = PathBuf::from("Roadmap/Child/page.md");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    parent_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    parent_path.clone(),
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save parent");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    child_id.clone(),
+                    EntityKind::Page,
+                    "Child",
+                    child_path.clone(),
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save child");
+
+        let parent_frontmatter = format!(
+            "loc:\n  id: {}\n  type: page\ntitle: Roadmap\n",
+            parent_id.0
+        );
+        let child_frontmatter = format!("loc:\n  id: {}\n  type: page\ntitle: Child\n", child_id.0);
+        let parent_document = render_canonical_markdown(&CanonicalDocument::new(
+            parent_frontmatter.clone(),
+            "Parent body.\n",
+        ));
+        let old_child_document = render_canonical_markdown(&CanonicalDocument::new(
+            child_frontmatter.clone(),
+            "Original child body.\n",
+        ));
+        let visible_child_document = render_canonical_markdown(&CanonicalDocument::new(
+            child_frontmatter.clone(),
+            "Original child body.\n\nVisible local edit.\n",
+        ));
+
+        std::fs::create_dir_all(content_root.join("Roadmap/Child")).expect("content dirs");
+        std::fs::create_dir_all(fixture.root.join("Roadmap/Child")).expect("visible dirs");
+        std::fs::write(content_root.join(&parent_path), &parent_document).expect("parent cache");
+        std::fs::write(content_root.join(&child_path), &old_child_document).expect("child cache");
+        std::fs::write(fixture.root.join(&child_path), &visible_child_document)
+            .expect("visible child");
+
+        store
+            .save_shadow(
+                &fixture.mount_id,
+                ShadowDocument::from_synced_body(
+                    parent_id.clone(),
+                    "Parent body.\n",
+                    6,
+                    [RemoteId::new("parent-block")],
+                )
+                .expect("parent shadow")
+                .with_frontmatter(parent_frontmatter),
+            )
+            .expect("save parent shadow");
+        store
+            .save_shadow(
+                &fixture.mount_id,
+                ShadowDocument::from_synced_body(
+                    child_id.clone(),
+                    "Original child body.\n",
+                    6,
+                    [RemoteId::new("child-block")],
+                )
+                .expect("child shadow")
+                .with_frontmatter(child_frontmatter),
+            )
+            .expect("save child shadow");
+
+        let source = FakePullSource::new(
+            Vec::new(),
+            vec![
+                hydrated_entity(&parent_id, "Roadmap", "Parent body.\n", Vec::new()),
+                hydrated_entity(&child_id, "Child", "Remote child drift.\n", Vec::new()),
+            ],
+        )
+        .with_child_entries(vec![tree_entry(
+            &fixture.mount_id,
+            &child_id,
+            "Child",
+            "Roadmap/Child/page.md",
+            HydrationState::Hydrated,
+        )]);
+
+        let report = super::run_pull_with_state_root(
+            &mut store,
+            &source,
+            fixture.root.join("Roadmap"),
+            Some(&state_root),
+        )
+        .expect("pull page directory");
+
+        assert_eq!(report.skipped_dirty, 1);
+        let cached_child = std::fs::read_to_string(content_root.join(&child_path))
+            .expect("read child cache after pull");
+        assert!(
+            cached_child.contains("Visible local edit."),
+            "{cached_child}"
+        );
+        assert!(
+            cached_child.contains("Remote child drift."),
+            "{cached_child}"
+        );
+        assert!(
+            locality_core::conflict::has_unresolved_conflict_markers(&cached_child),
+            "{cached_child}"
         );
     }
 
