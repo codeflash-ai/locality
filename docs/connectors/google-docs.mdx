@@ -1,0 +1,68 @@
+---
+title: "Google Docs connector"
+description: "How Google Docs and Drive folders map into Locality."
+---
+
+The Google Docs connector mounts a configured Google Drive workspace folder.
+
+## Connect
+
+```bash
+loc connect google-docs --name google-docs-default
+```
+
+## Mount
+
+```bash
+loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection plain-files
+loc pull ~/Locality/google-docs-main
+```
+
+`--workspace-folder` accepts a folder name, ID, or folder URL.
+
+## Projection
+
+```text
+google-docs-main/
+  planning/
+    launch-brief/
+      page.md
+  product/
+    roadmap/
+      page.md
+```
+
+- Drive folders become directories;
+- Google Docs documents become page directories with `page.md`;
+- non-Google-Docs Drive files are ignored by the V1 connector.
+
+## Supported content
+
+The renderer supports common document shapes:
+
+- paragraphs and headings;
+- bold, italic, underline, and strikethrough;
+- links;
+- bullets and numbered lists;
+- simple tables.
+
+Unsupported structures render as `::loc{...}` directives and can block lossy pushes.
+
+## Push behavior
+
+Locality uses the same review path as Notion:
+
+```bash
+loc status <path>
+loc diff <path>
+loc push <path> -y
+```
+
+After push, Locality fetches the accepted remote state and reconciles the local Markdown and shadow state.
+
+## Current limits
+
+- Google Sheets and Slides are not projected by this connector.
+- Binary Drive files are ignored.
+- Comments, suggestions, and rich unsupported Docs structures are not editable through V1.
+- Enumeration stays scoped to the configured workspace folder.

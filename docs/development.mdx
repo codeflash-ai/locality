@@ -1,0 +1,116 @@
+---
+title: "Development"
+description: "Build, run, test, and validate Locality from this repository."
+---
+
+Use the root `Makefile` for normal development.
+
+## Setup
+
+```bash
+make setup
+```
+
+This installs desktop and OAuth service npm dependencies.
+
+## Desktop development
+
+Fresh-build Rust sidecars and start the Tauri desktop app:
+
+```bash
+make prepare-desktop-dev-sidecars
+make dev-tauri
+```
+
+Run the frontend only:
+
+```bash
+make dev-desktop
+```
+
+Build the packaged desktop app:
+
+```bash
+make build-tauri
+```
+
+## Rust and frontend checks
+
+```bash
+make check
+make test
+make lint
+make fmt
+```
+
+GitHub Actions parity:
+
+```bash
+make ci
+```
+
+## Run the CLI
+
+```bash
+make run-cli ARGS='status --json'
+make run-cli ARGS='doctor'
+```
+
+Or run the debug binary directly after build:
+
+```bash
+./target/debug/loc status
+```
+
+## Daemon development
+
+```bash
+make run-daemon
+./target/debug/loc daemon status
+./target/debug/loc daemon restart
+```
+
+The default state root is `~/.loc`. Use `LOCALITY_STATE_DIR` for isolated tests.
+
+## macOS File Provider development
+
+```bash
+make install-macos-file-provider
+./target/debug/loc file-provider status notion-main
+./target/debug/loc file-provider restart notion-main
+```
+
+For File Provider changes, verify the installed app, daemon, registered domain, and visible CloudStorage folder. A passing Rust build is not enough.
+
+## Publish commands
+
+Release commands are deliberate and should be run only for a release task:
+
+```bash
+make publish
+make publish-unnotarized
+make publish-linux
+make publish-windows
+make render-homebrew-cask
+make render-updater-manifest
+make render-linux-repositories
+```
+
+Do not publish a build that failed relevant checks.
+
+## Docs development
+
+The published docs use Mintlify with `docs.json` at the repo root. Public pages are `docs/*.mdx`; older internal design notes remain in `docs/*.md` and are hidden unless added to navigation.
+
+Preview with the Mintlify CLI from the repository root:
+
+```bash
+npx mintlify@latest dev
+```
+
+Check navigation paths before committing:
+
+```bash
+jq empty docs.json
+for p in $(jq -r '.. | .pages? // empty | .[]? | strings' docs.json); do test -f "$p.mdx" || echo "missing $p.mdx"; done
+```

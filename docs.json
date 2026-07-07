@@ -31,6 +31,24 @@
           "docs/sync-safety",
           "docs/use-cases"
         ]
+      },
+      {
+        "group": "Reference",
+        "icon": "terminal",
+        "pages": [
+          "docs/cli-reference",
+          "docs/connectors/notion",
+          "docs/connectors/google-docs",
+          "docs/okf-export"
+        ]
+      },
+      {
+        "group": "Operations",
+        "icon": "settings",
+        "pages": [
+          "docs/troubleshooting",
+          "docs/development"
+        ]
       }
     ]
   }

@@ -1,0 +1,22 @@
+# Keep Mintlify focused on the public docs surface.
+AGENTS.md
+Makefile
+Cargo.toml
+Cargo.lock
+package.json
+package-lock.json
+
+# Internal engineering notes stay in the repo but are not published.
+docs/**/*.md
+docs/**/*.html
+docs/desktop-renders/**
+docs/superpowers/**
+
+# Source, build, test, and packaging trees.
+apps/**
+crates/**
+platform/**
+scripts/**
+target/**
+templates/**
+tests/**

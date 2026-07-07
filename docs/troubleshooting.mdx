@@ -1,0 +1,120 @@
+---
+title: "Troubleshooting"
+description: "Diagnose provider drift, stale paths, connector errors, conflicts, and development build mismatches."
+---
+
+Start with read-only diagnostics:
+
+```bash
+loc doctor
+loc status <path>
+loc info <path>
+```
+
+## Path exists in Finder but Locality says missing
+
+On macOS File Provider mounts, three layers can disagree:
+
+- CloudStorage-visible file;
+- File Provider content cache;
+- Locality daemon state.
+
+Check the path Locality currently tracks:
+
+```bash
+loc info <path>
+loc status <path>
+```
+
+If the visible path is stale but the tracked path moved, do not delete the old folder until you confirm it has no local-only edits.
+
+Provider repair:
+
+```bash
+loc file-provider restart notion-main
+loc pull <tracked-path>
+```
+
+## `database` appears in the UI
+
+For Notion, `database` means a Notion database projected as a directory with `_schema.yaml` and row pages. It does not mean Locality's internal SQLite database.
+
+## Pasted URL returns a Notion 404
+
+If a non-Notion URL is pasted into a Notion-only locate or mount flow, the final path-like ID may be misread as a Notion page ID.
+
+Examples:
+
+- GitHub commit URL should not be sent to the Notion connector;
+- Google Docs URL should use the Google Docs connector;
+- Notion URL requires the page/database to be shared with the Locality integration.
+
+Fix: choose the correct connector, or share the Notion page with the integration and retry.
+
+## Conflict markers remain after editing
+
+Locality refuses to push while conflict marker lines remain.
+
+Search the file:
+
+```bash
+rg '^(<<<<<<<|=======|>>>>>>>)' <path>
+```
+
+Resolve to the intended final content, remove every marker line, then run:
+
+```bash
+loc diff <path>
+loc push <path> -y
+```
+
+## Live Mode paused
+
+Live Mode pauses when it cannot safely sync in the background.
+
+Check:
+
+```bash
+loc status <path>
+loc diff <path>
+```
+
+Common causes:
+
+- local and remote both changed;
+- unsupported operation;
+- destructive guardrail;
+- unresolved conflict markers;
+- connector auth problem;
+- provider cache drift.
+
+## Development build mismatch
+
+If the desktop app reports a running daemon build that does not match the bundled daemon, stop old runtimes and rebuild sidecars:
+
+```bash
+./target/debug/loc daemon stop
+make prepare-desktop-dev-sidecars
+make dev-tauri
+```
+
+If a stale packaged daemon is still running, check:
+
+```bash
+loc daemon status
+ps aux | rg 'localityd|locality-desktop|loc '
+```
+
+Stop the stale process before launching a fresh dev app.
+
+## Before deleting files
+
+Run:
+
+```bash
+loc status <path>
+loc info <path>
+loc diff <path>
+```
+
+Delete or reset only after you know whether the file is tracked, dirty, conflicted, or stale visible provider state.
