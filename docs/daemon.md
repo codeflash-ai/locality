@@ -118,10 +118,14 @@ make clean-start
 On macOS, it stops the desktop app, daemon, and File Provider extension;
 unregisters File Provider domains; removes safe Locality mount roots such as
 `~/Documents/Locality`, `~/Library/CloudStorage/Locality`, and
-`~/Library/CloudStorage/Locality-*`; deletes `~/.loc`; removes the installed
-`/Applications/Locality.app`; and deletes Locality connection credentials from
-the keychain. Run `scripts/clean-start.sh --yes --keep-credentials` when
-testing app install state without clearing OAuth/PAT credentials.
+`~/Library/CloudStorage/Locality-*`; deletes `~/.loc`; removes Locality app
+bundles from both `/Applications/Locality.app` and
+`~/Applications/Locality.app`; removes Locality-specific File Provider
+persistence under
+`~/Library/Application Support/FileProvider/ai.codeflash.locality.Locality.FileProvider`;
+and deletes Locality connection credentials from the keychain. Run
+`scripts/clean-start.sh --yes --keep-credentials` when testing app install state
+without clearing OAuth/PAT credentials.
 
 On Windows, `make clean-start-plan` dispatches to `scripts/clean-start.ps1` in
 dry-run mode. `make clean-start` stops Locality desktop, CLI, daemon, and Cloud

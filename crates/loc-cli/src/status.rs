@@ -414,6 +414,22 @@ where
     })
 }
 
+pub(crate) fn scoped_mount_ids_for_status_target<S>(
+    store: &S,
+    mount_id: Option<&MountId>,
+    target: Option<&Path>,
+) -> Result<Vec<MountId>, StatusError>
+where
+    S: MountRepository + EntityRepository + VirtualMutationRepository,
+{
+    let mounts = store.load_mounts().map_err(StatusError::Store)?;
+    let scopes = resolve_scopes(store, &mounts, mount_id, target)?;
+    Ok(scopes
+        .into_iter()
+        .map(|scope| scope.mount.mount_id)
+        .collect())
+}
+
 fn status_live_mode_for_mount<S>(
     store: &S,
     mount_id: &MountId,
