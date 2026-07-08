@@ -693,9 +693,14 @@ fn claude_desktop_mcp_server_json() -> Value {
 }
 
 fn loc_cli_command() -> String {
-    if let Ok(current) = env::current_exe()
-        && let Some(parent) = current.parent()
-    {
+    if let Ok(current) = env::current_exe() {
+        return loc_cli_command_for_current_exe(&current);
+    }
+    "loc".to_string()
+}
+
+fn loc_cli_command_for_current_exe(current: &Path) -> String {
+    if let Some(parent) = current.parent() {
         let sibling = parent.join(binary_name("loc"));
         if sibling.is_file() {
             return sibling.display().to_string();
@@ -1127,14 +1132,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_claude_desktop_mcp_command_prefers_installed_loc_exe() {
-        let current_exe = env::current_exe().expect("current exe");
-        let bin_dir = current_exe.parent().expect("current exe parent");
+        let bin_dir = temp_root("loc-agent-guidance-windows-current-exe-bin");
         let loc_exe = bin_dir.join("loc.exe");
         fs::write(&loc_exe, "").expect("write test loc.exe");
+        let current_exe = bin_dir.join("locality.exe");
 
-        let command = loc_cli_command();
+        let command = loc_cli_command_for_current_exe(&current_exe);
 
-        let _ = fs::remove_file(&loc_exe);
+        let _ = fs::remove_dir_all(bin_dir);
 
         assert_eq!(command, loc_exe.display().to_string());
     }
