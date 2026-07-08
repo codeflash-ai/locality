@@ -4,7 +4,13 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "docs/**"
+      - "docs-site/**"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "docs-site/**"
 
 jobs:
   oauth-service:
