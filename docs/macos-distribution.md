@@ -71,6 +71,18 @@ daemon. If the daemon does not report the same build ID as the app bundle, or if
 it is old enough not to report build metadata, the app stops it and starts the
 embedded `Contents/MacOS/localityd` from the current app bundle.
 
+Direct-download builds also check the Tauri updater manifest on launch. The
+macOS release workflow points packaged apps at
+`https://github.com/codeflash-ai/locality/releases/latest/download/latest-macos.json`.
+The app checks that manifest in the background, downloads an available updater
+archive without blocking startup, and shows the restart/install action in the
+desktop sidebar when the main window is visible. If Locality is running in the
+background with no visible main window, the downloaded update can install and
+relaunch automatically. The app also schedules a native relaunch fallback before
+the updater install begins so LaunchServices opens the updated `.app` even if
+the old process exits during installer handoff. The relaunch runs the same
+`localityd` build validation described above before normal desktop work resumes.
+
 During onboarding, the desktop app also verifies the terminal command. For DMG
 installs it creates or refreshes `/usr/local/bin/loc` as a symlink to the
 embedded `Contents/MacOS/loc`, prompting for administrator permission only when

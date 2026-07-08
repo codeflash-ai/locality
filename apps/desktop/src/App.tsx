@@ -62,6 +62,22 @@ import {
   mountOnboardingSupplementaryNote,
   type WorkspaceMountOnboardingReport,
 } from "./onboarding-mount";
+import {
+  availableUpdateStatus,
+  downloadedUpdateMessage,
+  emptyUpdateStatus,
+  installingUpdateMessage,
+  nextUpdateDownloadProgress,
+  updateDownloadMessage,
+  updateErrorMessage,
+  updateInstallActionDisabled,
+  updateInstallActionLabel,
+  updateNoticeVisible,
+  updateSidebarSubtitle,
+  updateSidebarTitle,
+  updateStatusLabel,
+  type UpdateStatus,
+} from "./updater";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
@@ -244,11 +260,10 @@ type InstallStateReview = {
   currentBuildId: string;
 };
 
-type UpdateStatus = {
-  state: "idle" | "checking" | "available" | "installing" | "current" | "error";
-  message: string;
-  update: Update | null;
-  version?: string;
+type AppUpdateCheckOptions = {
+  silent?: boolean;
+  autoDownload?: boolean;
+  installWhenHidden?: boolean;
 };
 
 type FileDetailReport = {
@@ -741,19 +756,6 @@ function useMountLiveModeController(
   };
 }
 
-function emptyUpdateStatus(): UpdateStatus {
-  return { state: "idle", message: "", update: null };
-}
-
-function updaterErrorMessage(error: unknown) {
-  const message = errorMessage(error);
-  const lower = message.toLowerCase();
-  if (lower.includes("updater") && (lower.includes("config") || lower.includes("endpoint"))) {
-    return "Updates are not configured for this build.";
-  }
-  return message;
-}
-
 function useNotionSearchResults(query: string, enabled = true) {
   const [results, setResults] = useState<LocatedItem[]>([]);
   const [searching, setSearching] = useState(false);
@@ -818,8 +820,14 @@ export default function App() {
     initialRoute === "#onboarding-ready" ? 5 : 1,
   );
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>(emptyUpdateStatus);
+  const updateStatusRef = useRef<UpdateStatus>(updateStatus);
+  const updateOperationRef = useRef<Promise<void> | null>(null);
   const refreshSnapshotPromise = useRef<Promise<void> | null>(null);
   const refreshSnapshotQueued = useRef(false);
+
+  useEffect(() => {
+    updateStatusRef.current = updateStatus;
+  }, [updateStatus]);
 
   async function loadDesktopSnapshot() {
     const nextSnapshot = await callCommand<DesktopSnapshot>("desktop_snapshot", undefined, sampleSnapshot);
@@ -848,52 +856,150 @@ export default function App() {
     return promise;
   }
 
-  async function checkForAppUpdate(options: { silent?: boolean } = {}) {
-    if (appStoreDistribution) {
-      if (!options.silent) {
-        setUpdateStatus({
-          state: "current",
-          message: "Updates are managed by the Mac App Store.",
-          update: null,
-        });
-      }
-      return;
+  async function checkForAppUpdate(options: AppUpdateCheckOptions = {}) {
+    if (updateOperationRef.current) {
+      return updateOperationRef.current;
     }
 
-    if (!isTauriRuntime()) {
-      if (!options.silent) {
-        setUpdateStatus({
-          state: "error",
-          message: "Updates are available in the packaged app.",
-          update: null,
-        });
-      }
-      return;
-    }
-
-    if (!options.silent) {
-      setUpdateStatus({ state: "checking", message: "Checking for updates.", update: null });
-    }
-
-    try {
-      const update = await check();
-      if (!update) {
+    const operation = (async () => {
+      if (appStoreDistribution) {
         if (!options.silent) {
-          setUpdateStatus({ state: "current", message: "Locality is up to date.", update: null });
+          setUpdateStatus({
+            state: "current",
+            message: "Updates are managed by the Mac App Store.",
+            update: null,
+          });
         }
         return;
       }
 
+      if (!isTauriRuntime()) {
+        if (!options.silent) {
+          setUpdateStatus({
+            state: "error",
+            message: "Updates are available in the packaged app.",
+            update: null,
+          });
+        }
+        return;
+      }
+
+      if (!options.silent) {
+        setUpdateStatus({ state: "checking", message: "Checking for updates.", update: null });
+      }
+
+      try {
+        const update = await check();
+        if (!update) {
+          if (!options.silent) {
+            setUpdateStatus({ state: "current", message: "Locality is up to date.", update: null });
+          }
+          return;
+        }
+
+        setUpdateStatus(availableUpdateStatus(update));
+        if (options.autoDownload) {
+          await downloadAppUpdate(update, {
+            installWhenHidden: options.installWhenHidden ?? false,
+          });
+        }
+      } catch (error) {
+        if (!options.silent || updateStatusRef.current.state !== "idle") {
+          setUpdateStatus({ state: "error", message: updateErrorMessage(error), update: null });
+        }
+      }
+    })();
+
+    updateOperationRef.current = operation;
+    try {
+      await operation;
+    } finally {
+      if (updateOperationRef.current === operation) {
+        updateOperationRef.current = null;
+      }
+    }
+  }
+
+  async function downloadAppUpdate(
+    update: Update,
+    options: { installWhenHidden?: boolean } = {},
+  ) {
+    let progress: UpdateStatus["progress"] = undefined;
+    setUpdateStatus({
+      state: "downloading",
+      message: updateDownloadMessage(update.version, progress),
+      update,
+      version: update.version,
+      progress,
+    });
+
+    await update.download((event) => {
+      progress = nextUpdateDownloadProgress(progress, event);
       setUpdateStatus({
-        state: "available",
-        message: `Locality ${update.version} is ready to install.`,
+        state: "downloading",
+        message:
+          event.event === "Finished"
+            ? downloadedUpdateMessage(update.version)
+            : updateDownloadMessage(update.version, progress),
         update,
         version: update.version,
+        progress,
+      });
+    });
+
+    setUpdateStatus({
+      state: "downloaded",
+      message: downloadedUpdateMessage(update.version),
+      update,
+      version: update.version,
+      progress,
+    });
+
+    if (options.installWhenHidden && !(await mainWindowVisible())) {
+      await installDownloadedAppUpdate(update);
+    }
+  }
+
+  async function mainWindowVisible() {
+    try {
+      return await getCurrentWindow().isVisible();
+    } catch {
+      return true;
+    }
+  }
+
+  async function installDownloadedAppUpdate(update: Update) {
+    setUpdateStatus({
+      state: "installing",
+      message: installingUpdateMessage(update.version),
+      update,
+      version: update.version,
+    });
+    const relaunchFallback = await scheduleUpdateRelaunchFallback();
+    if (!relaunchFallback.ok) {
+      console.warn(relaunchFallback.message);
+    }
+    await update.install();
+    setUpdateStatus({
+      state: "installing",
+      message: "Restarting Locality to finish the update.",
+      update: null,
+      version: update.version,
+    });
+    await relaunch();
+  }
+
+  async function scheduleUpdateRelaunchFallback(): Promise<ActionReport> {
+    try {
+      return await callCommand<ActionReport>("schedule_update_relaunch", undefined, {
+        ok: false,
+        message: "Relaunch fallback is only available in the packaged app.",
       });
     } catch (error) {
-      if (!options.silent) {
-        setUpdateStatus({ state: "error", message: updaterErrorMessage(error), update: null });
-      }
+      return {
+        ok: false,
+        message: `Could not schedule relaunch fallback: ${errorMessage(error)}`,
+      };
     }
   }
 
@@ -916,28 +1022,35 @@ export default function App() {
       return;
     }
 
-    setUpdateStatus((current) => ({
-      ...current,
-      state: "installing",
-      message: current.version ? `Installing Locality ${current.version}.` : "Installing update.",
-    }));
+    if (updateOperationRef.current) {
+      await updateOperationRef.current;
+    }
 
-    try {
-      const update = updateStatus.update ?? (await check());
-      if (!update) {
-        setUpdateStatus({ state: "current", message: "Locality is up to date.", update: null });
-        return;
+    const operation = (async () => {
+      try {
+        const current = updateStatusRef.current;
+        const update = current.update ?? (await check());
+        if (!update) {
+          setUpdateStatus({ state: "current", message: "Locality is up to date.", update: null });
+          return;
+        }
+
+        if (current.state !== "downloaded" || current.update !== update) {
+          await downloadAppUpdate(update);
+        }
+        await installDownloadedAppUpdate(update);
+      } catch (error) {
+        setUpdateStatus({ state: "error", message: updateErrorMessage(error), update: null });
       }
-      await update.downloadAndInstall();
-      setUpdateStatus({
-        state: "installing",
-        message: "Restarting Locality to finish the update.",
-        update: null,
-        version: update.version,
-      });
-      await relaunch();
-    } catch (error) {
-      setUpdateStatus({ state: "error", message: updaterErrorMessage(error), update: null });
+    })();
+
+    updateOperationRef.current = operation;
+    try {
+      await operation;
+    } finally {
+      if (updateOperationRef.current === operation) {
+        updateOperationRef.current = null;
+      }
     }
   }
 
@@ -986,8 +1099,12 @@ export default function App() {
     }
 
     const timer = window.setTimeout(() => {
-      void checkForAppUpdate({ silent: true });
-    }, 5000);
+      void checkForAppUpdate({
+        silent: true,
+        autoDownload: true,
+        installWhenHidden: true,
+      });
+    }, 1500);
 
     return () => window.clearTimeout(timer);
   }, []);
@@ -1115,7 +1232,6 @@ export default function App() {
       updateStatus={updateStatus}
       onCheckForUpdate={checkForAppUpdate}
       onInstallUpdate={installAppUpdate}
-      onDismissUpdate={() => setUpdateStatus(emptyUpdateStatus())}
       appStoreDistribution={appStoreDistribution}
       onResetComplete={() => {
         setOnboardingInitialStep(1);
@@ -1825,7 +1941,6 @@ function MainShell({
   updateStatus,
   onCheckForUpdate,
   onInstallUpdate,
-  onDismissUpdate,
   appStoreDistribution,
   onResetComplete,
 }: {
@@ -1834,9 +1949,8 @@ function MainShell({
   onViewChange: (view: AppView) => void;
   onRefresh: () => Promise<void>;
   updateStatus: UpdateStatus;
-  onCheckForUpdate: (options?: { silent?: boolean }) => Promise<void>;
+  onCheckForUpdate: (options?: AppUpdateCheckOptions) => Promise<void>;
   onInstallUpdate: () => Promise<void>;
-  onDismissUpdate: () => void;
   appStoreDistribution: boolean;
   onResetComplete: () => void;
 }) {
@@ -1935,6 +2049,10 @@ function MainShell({
               Settings
             </SidebarButton>
           </nav>
+          <SidebarUpdateNotice
+            status={updateStatus}
+            onInstall={onInstallUpdate}
+          />
           <div className="sidebar-status">
             <button
               className="status-button"
@@ -1949,12 +2067,6 @@ function MainShell({
         </aside>
 
         <section className="content">
-          <UpdateBanner
-            status={updateStatus}
-            onInstall={onInstallUpdate}
-            onDismiss={onDismissUpdate}
-            onSettings={() => onViewChange("settings")}
-          />
           {view === "home" && (
             <HomeView
               snapshot={snapshot}
@@ -2027,45 +2139,36 @@ function MainShell({
   );
 }
 
-function UpdateBanner({
+function SidebarUpdateNotice({
   status,
   onInstall,
-  onDismiss,
-  onSettings,
 }: {
   status: UpdateStatus;
   onInstall: () => Promise<void>;
-  onDismiss: () => void;
-  onSettings: () => void;
 }) {
-  if (status.state !== "available" && status.state !== "installing") {
+  if (!updateNoticeVisible(status)) {
     return null;
   }
 
-  const installing = status.state === "installing";
+  const disabled = updateInstallActionDisabled(status);
+  const title = updateSidebarTitle(status);
+  const subtitle = updateSidebarSubtitle(status);
   return (
-    <div className="update-banner">
-      <div>
-        <strong>{status.version ? `Locality ${status.version} available` : "Locality update available"}</strong>
-        <p>{status.message}</p>
-      </div>
-      <div className="update-banner-actions">
-        <SecondaryButton compact onClick={onSettings}>
-          Settings
-        </SecondaryButton>
-        <PrimaryButton
-          compact
-          icon={installing ? <Loader2 className="spin-icon" /> : <Download />}
-          disabled={installing}
-          onClick={() => void onInstall()}
-        >
-          {installing ? "Installing" : "Install"}
-        </PrimaryButton>
-        <button className="update-dismiss" aria-label="Dismiss update notice" onClick={onDismiss}>
-          Dismiss
-        </button>
-      </div>
-    </div>
+    <button
+      type="button"
+      className="sidebar-update"
+      disabled={disabled}
+      aria-label={status.version ? `${title}, version ${status.version}` : title}
+      onClick={() => void onInstall()}
+    >
+      <span className="sidebar-update-copy">
+        <strong>{title}</strong>
+        <small>{subtitle}</small>
+      </span>
+      <span className="sidebar-update-arrow" aria-hidden="true">
+        <ChevronRight />
+      </span>
+    </button>
   );
 }
 
@@ -3592,7 +3695,7 @@ function SettingsView({
   onHome: () => void;
   onRefresh: () => Promise<void>;
   updateStatus: UpdateStatus;
-  onCheckForUpdate: (options?: { silent?: boolean }) => Promise<void>;
+  onCheckForUpdate: (options?: AppUpdateCheckOptions) => Promise<void>;
   onInstallUpdate: () => Promise<void>;
   appStoreDistribution: boolean;
   onResetComplete: () => void;
@@ -3610,12 +3713,10 @@ function SettingsView({
   const runtimeStopped = snapshot.health.state === "runtime_stopped";
   const runtimeNeedsRepair = daemonStopped || runtimeStopped;
   const checkingForUpdate = updateStatus.state === "checking";
-  const installingUpdate = updateStatus.state === "installing";
-  const updateAvailable = updateStatus.state === "available" || updateStatus.state === "installing";
+  const installActionDisabled = updateInstallActionDisabled(updateStatus);
+  const updateAvailable = updateNoticeVisible(updateStatus);
   const updateChannelLabel = appStoreDistribution ? "Mac App Store" : "GitHub Releases";
-  const updateStatusLabel = appStoreDistribution
-    ? "Managed by the App Store"
-    : updateStatus.message || "Ready";
+  const updateStatusValue = updateStatusLabel(updateStatus, appStoreDistribution);
 
   useEffect(() => {
     setLocalSettings(snapshot.settings);
@@ -3806,7 +3907,7 @@ function SettingsView({
           <SettingRow title="Channel" value={updateChannelLabel} />
           <SettingRow
             title="Status"
-            value={updateStatusLabel}
+            value={updateStatusValue}
           />
           {updateStatus.version && <SettingRow title="Available version" value={updateStatus.version} />}
           {!appStoreDistribution && (
@@ -3814,18 +3915,22 @@ function SettingsView({
               <SecondaryButton
                 compact
                 icon={checkingForUpdate ? <Loader2 className="spin-icon" /> : <RefreshCw />}
-                disabled={checkingForUpdate || installingUpdate}
+                disabled={checkingForUpdate || updateAvailable}
                 onClick={() => void onCheckForUpdate()}
               >
                 {checkingForUpdate ? "Checking" : "Check"}
               </SecondaryButton>
               <PrimaryButton
                 compact
-                icon={installingUpdate ? <Loader2 className="spin-icon" /> : <Download />}
-                disabled={!updateAvailable || checkingForUpdate || installingUpdate}
+                icon={
+                  updateStatus.state === "downloading" || updateStatus.state === "installing"
+                    ? <Loader2 className="spin-icon" />
+                    : <Download />
+                }
+                disabled={!updateAvailable || installActionDisabled}
                 onClick={() => void onInstallUpdate()}
               >
-                {installingUpdate ? "Installing" : "Install"}
+                {updateInstallActionLabel(updateStatus)}
               </PrimaryButton>
             </div>
           )}

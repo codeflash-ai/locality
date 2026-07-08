@@ -8,7 +8,7 @@ use std::io;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{
     Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -2865,6 +2865,26 @@ fn quit_completely(app: AppHandle) -> ActionReport {
     }
 }
 
+#[tauri::command]
+async fn schedule_update_relaunch() -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(schedule_update_relaunch_blocking).await {
+        Ok(Ok(message)) => ActionReport { ok: true, message },
+        Ok(Err(message)) => ActionReport { ok: false, message },
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Could not schedule relaunch: {error}"),
+        },
+    }
+}
+
+fn schedule_update_relaunch_blocking() -> Result<String, String> {
+    let pid = std::process::id();
+    let executable = env::current_exe()
+        .map_err(|error| format!("Could not resolve Locality executable: {error}"))?;
+    schedule_relaunch_after_process_exit(pid, &executable)?;
+    Ok("Locality relaunch scheduled.".to_string())
+}
+
 fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let state_root = default_state_root();
     let store = SqliteStateStore::open(state_root.clone()).map_err(|error| error.to_string())?;
@@ -5593,6 +5613,88 @@ fn open_in_file_manager(path: &Path) -> Result<(), String> {
 
     command.spawn().map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn schedule_relaunch_after_process_exit(pid: u32, executable: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let target =
+            macos_app_bundle_for_exe(executable).unwrap_or_else(|| executable.to_path_buf());
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; sleep 0.3; exec /usr/bin/open -n \"$2\"",
+            )
+            .arg("locality-update-relaunch")
+            .arg(pid.to_string())
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not schedule macOS relaunch: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = "$ErrorActionPreference = 'SilentlyContinue'; \
+            Wait-Process -Id ([int]$args[0]); \
+            Start-Sleep -Milliseconds 300; \
+            Start-Process -FilePath $args[1]";
+        Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-WindowStyle")
+            .arg("Hidden")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(script)
+            .arg(pid.to_string())
+            .arg(executable)
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not schedule Windows relaunch: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = env::var_os("APPIMAGE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| executable.to_path_buf());
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; sleep 0.3; exec \"$2\"")
+            .arg("locality-update-relaunch")
+            .arg(pid.to_string())
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not schedule Linux relaunch: {error}"))?;
+        return Ok(());
+    }
+}
+
+fn macos_app_bundle_for_exe(executable: &Path) -> Option<PathBuf> {
+    let macos_dir = executable.parent()?;
+    if macos_dir.file_name()? != "MacOS" {
+        return None;
+    }
+    let contents_dir = macos_dir.parent()?;
+    if contents_dir.file_name()? != "Contents" {
+        return None;
+    }
+    let app_dir = contents_dir.parent()?;
+    if app_dir.extension()? != "app" {
+        return None;
+    }
+    Some(app_dir.to_path_buf())
 }
 
 fn open_path_in_vs_code(path: &Path) -> Result<(), String> {
@@ -9550,19 +9652,20 @@ mod tests {
         live_mode_remote_pull_candidates, live_mode_remote_pull_scan_is_due_for_key,
         live_mode_should_reconcile_local_target_for_key, live_mode_target,
         live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
-        macos_file_provider_mount_root_health_error, mark_mount_live_mode_syncing,
-        mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
-        parse_daemon_build_info_json, pending_changes_from_status,
-        prepare_existing_workspace_mount_for_remount, preserve_mount_pending_local_changes,
-        pull_error_message, pull_report_message, push_action_message,
-        record_current_install_marker, record_desktop_activity, record_mount_live_mode_tick_result,
-        refresh_visible_target_from_cache, reset_to_remote_message, sample_live_mode_status,
-        sample_snapshot, screen_bounds_for_anchor_from_monitors, shell_single_quote,
-        should_hide_tray_popover, should_prioritize_located_result,
-        state_event_path_requires_refresh, state_event_path_wakes_live_mode,
-        summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
-        tray_popover_anchor, tray_popover_position, unsupported_notion_locator_url_message,
-        validate_mount_root, virtual_projection_prefetch_container_identifiers,
+        macos_app_bundle_for_exe, macos_file_provider_mount_root_health_error,
+        mark_mount_live_mode_syncing, mount_has_pending_local_changes,
+        mount_has_unfinished_journals, notion_id_from_url, parse_daemon_build_info_json,
+        pending_changes_from_status, prepare_existing_workspace_mount_for_remount,
+        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
+        push_action_message, record_current_install_marker, record_desktop_activity,
+        record_mount_live_mode_tick_result, refresh_visible_target_from_cache,
+        reset_to_remote_message, sample_live_mode_status, sample_snapshot,
+        screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
+        should_prioritize_located_result, state_event_path_requires_refresh,
+        state_event_path_wakes_live_mode, summarize_virtual_projection_children,
+        terminal_cli_link_state, tray_icon_image, tray_popover_anchor, tray_popover_position,
+        unsupported_notion_locator_url_message, validate_mount_root,
+        virtual_projection_prefetch_container_identifiers,
         virtual_projection_refresh_signal_identifiers,
         virtual_projection_waits_for_mount_point_children_before_registration,
         wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
@@ -9582,6 +9685,24 @@ mod tests {
     #[test]
     fn desktop_state_root_absolutizes_relative_fallbacks() {
         assert!(super::absolute_state_root(PathBuf::from(".loc")).is_absolute());
+    }
+
+    #[test]
+    fn macos_app_bundle_for_exe_resolves_bundle_root() {
+        let executable =
+            PathBuf::from("/Applications/Locality.app/Contents/MacOS/locality-desktop");
+
+        assert_eq!(
+            macos_app_bundle_for_exe(&executable),
+            Some(PathBuf::from("/Applications/Locality.app"))
+        );
+    }
+
+    #[test]
+    fn macos_app_bundle_for_exe_ignores_plain_executables() {
+        let executable = PathBuf::from("/usr/local/bin/locality-desktop");
+
+        assert_eq!(macos_app_bundle_for_exe(&executable), None);
     }
 
     #[test]
@@ -13561,6 +13682,7 @@ fn main() {
             set_desktop_setting,
             hide_menubar,
             quit_completely,
+            schedule_update_relaunch,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Locality desktop app");

@@ -47,6 +47,30 @@ setup flow.
 - Technical depth on demand: advanced state, logs, and diagnostics should exist,
   but not dominate first-run or tray surfaces.
 
+## App Updates
+
+Direct-download desktop builds use the Tauri updater against the GitHub Release
+manifest configured at build time. The release workflows publish platform-specific
+manifests named `latest-macos.json`, `latest-windows.json`, and
+`latest-linux.json`, and the packaged app checks the relevant manifest on launch.
+
+Update checks must not block startup. When a new version is available, the app
+downloads it in the background. If the main window is visible, Locality shows the
+download/update state in the left sidebar and leaves the restart/install action
+to the user. If the app is running without a visible main window, the background
+download may install and relaunch Locality automatically. Manual checks in
+Settings use the same check, download, install, and relaunch path. Before the
+installer handoff, the app schedules a native relaunch fallback so the installed
+app opens again even if the updater closes the old process before the JavaScript
+restart call completes.
+
+Every app launch, including the launch after an updater relaunch, must validate
+the local runtime before normal desktop work. The backend should probe the bundled
+`localityd` sidecar with `--build-info`, compare it to the running daemon, restart
+stale or metadata-less daemons, reload mounts, and refresh virtual projection
+runtimes. This keeps the app, sidecars, and daemon on the same installed build
+after an auto-update.
+
 ## First-Run Onboarding
 
 The first-run flow should be a compact wizard with a single primary path.
