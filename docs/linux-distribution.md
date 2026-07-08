@@ -131,6 +131,12 @@ The separate `.github/workflows/release-notes.yml` workflow generates the
 GitHub Release body with Codex from the commits since the previous reachable
 `v*` tag. Platform workflows create only a placeholder body when the release
 does not exist yet.
+Release creation is staged as prerelease and non-latest. The separate
+`.github/workflows/release-finalize.yml` workflow promotes the release to latest
+only after macOS, Linux, and Windows workflows have completed successfully and
+all expected public download assets are present. Until then,
+`/releases/latest/download/...` URLs continue to resolve to the previous complete
+release.
 
 The workflow still renders date-and-commit package files inside the APT/RPM
 repositories deployed to GitHub Pages, but it does not upload those duplicate

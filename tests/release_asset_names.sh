@@ -6,8 +6,10 @@ MACOS_WORKFLOW="${ROOT}/.github/workflows/release-macos.yml"
 WINDOWS_WORKFLOW="${ROOT}/.github/workflows/release-windows.yml"
 LINUX_WORKFLOW="${ROOT}/.github/workflows/release-linux.yml"
 RELEASE_NOTES_WORKFLOW="${ROOT}/.github/workflows/release-notes.yml"
+RELEASE_FINALIZE_WORKFLOW="${ROOT}/.github/workflows/release-finalize.yml"
 UPDATER_SCRIPT="${ROOT}/scripts/render-tauri-updater-manifest.sh"
 RELEASE_NOTES_SCRIPT="${ROOT}/scripts/render-release-notes.sh"
+RELEASE_FINALIZE_SCRIPT="${ROOT}/scripts/finalize-github-release.sh"
 
 fail() {
   printf 'release asset names test: %s\n' "$*" >&2
@@ -69,6 +71,19 @@ grep -F -q 'CODEX_CONFIG_TOML: ${{ secrets.CODEX_CONFIG_TOML }}' "${RELEASE_NOTE
   || fail "release notes workflow must expose Codex config to release notes"
 grep -F -q 'AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}' "${RELEASE_NOTES_WORKFLOW}" \
   || fail "release notes workflow must expose Azure OpenAI key to release notes"
+if grep -F -q -- '--latest=true' "${MACOS_WORKFLOW}" "${WINDOWS_WORKFLOW}" "${LINUX_WORKFLOW}" "${RELEASE_NOTES_WORKFLOW}"; then
+  fail "release workflows must not mark incomplete releases as latest"
+fi
+grep -F -q 'scripts/finalize-github-release.sh' "${RELEASE_FINALIZE_WORKFLOW}" \
+  || fail "release finalizer workflow must run the release finalizer script"
+grep -F -q -- '--latest=true' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer script must be the only release path that marks releases latest"
+grep -F -q 'Locality_Mac.dmg' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer must require the stable macOS download asset"
+grep -F -q 'Locality_Linux.AppImage' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer must require stable Linux download assets"
+grep -F -q 'Locality_Windows.exe' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer must require the stable Windows download asset"
 if grep -F -q 'scripts/render-release-notes.sh' "${MACOS_WORKFLOW}" "${WINDOWS_WORKFLOW}" "${LINUX_WORKFLOW}"; then
   fail "platform release workflows must not run Codex release-note generation"
 fi
@@ -77,6 +92,7 @@ if grep -F -q -- '--generate-notes' "${MACOS_WORKFLOW}" "${WINDOWS_WORKFLOW}" "$
 fi
 
 [[ -x "${RELEASE_NOTES_SCRIPT}" ]] || fail "release notes renderer must be executable"
+[[ -x "${RELEASE_FINALIZE_SCRIPT}" ]] || fail "release finalizer must be executable"
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-release-asset-names.XXXXXX")"
 cleanup() {

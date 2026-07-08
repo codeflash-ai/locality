@@ -354,8 +354,8 @@ jobs:
             $createArgs += @("--prerelease", "--latest=false")
             $editArgs += @("--prerelease=true", "--latest=false")
           } else {
-            $createArgs += @("--latest=true")
-            $editArgs += @("--prerelease=false", "--latest=true")
+            $createArgs += @("--prerelease", "--latest=false")
+            $editArgs += @("--prerelease=true", "--latest=false")
           }
           gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -eq 0) {
