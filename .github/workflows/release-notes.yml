@@ -65,12 +65,13 @@ jobs:
           fi
           echo "APP_VERSION=${version}" >> "${GITHUB_ENV}"
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Install Codex CLI
-        env:
-          CODEX_NON_INTERACTIVE: "1"
-        run: |
-          curl -fsSL https://chatgpt.com/codex/install.sh | sh
-          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+        run: npm install --global @openai/codex@0.143.0
 
       - name: Generate release notes
         env:

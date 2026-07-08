@@ -55,6 +55,8 @@ grep -F -q -- '--notes "Release assets are still being published."' "${LINUX_WOR
 
 grep -F -q 'scripts/render-release-notes.sh' "${RELEASE_NOTES_WORKFLOW}" \
   || fail "release notes workflow must generate LLM release notes"
+grep -F -q 'npm install --global @openai/codex@0.143.0' "${RELEASE_NOTES_WORKFLOW}" \
+  || fail "release notes workflow must install Codex from npm"
 grep -F -q -- '--notes-file "${release_notes_file}"' "${RELEASE_NOTES_WORKFLOW}" \
   || fail "release notes workflow must publish generated release notes"
 grep -F -q 'CODEX_CONFIG_TOML: ${{ secrets.CODEX_CONFIG_TOML }}' "${RELEASE_NOTES_WORKFLOW}" \
