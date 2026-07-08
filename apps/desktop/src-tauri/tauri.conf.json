@@ -57,17 +57,18 @@
         "MacOS/localityd": "macos/localityd"
       },
       "dmg": {
+        "background": "assets/dmg-background.png",
         "windowSize": {
-          "width": 660,
-          "height": 420
+          "width": 760,
+          "height": 440
         },
         "appPosition": {
-          "x": 180,
-          "y": 190
+          "x": 210,
+          "y": 240
         },
         "applicationFolderPosition": {
-          "x": 480,
-          "y": 190
+          "x": 550,
+          "y": 240
         }
       }
     },

@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 DMG="${1:-}"
 ICON="${ROOT}/apps/desktop/src-tauri/icons/dmg-icon.icns"
+APPLICATIONS_ICON="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/ApplicationsFolderIcon.icns"
+APPLICATIONS_ICON_X=550
+APPLICATIONS_ICON_Y=240
 
 if [[ -z "${DMG}" ]]; then
   DMG="$(find "${ROOT}/target/release/bundle/dmg" -maxdepth 1 -type f \( -name 'Locality_*.dmg' -o -name 'LOCALITY_*.dmg' \) | sort | tail -n 1)"
@@ -34,6 +37,26 @@ trap cleanup EXIT
 hdiutil convert "${DMG}" -format UDRW -o "${RW_DMG}" -quiet
 mkdir -p "${MOUNTPOINT}"
 hdiutil attach "${RW_DMG}" -readwrite -noverify -noautoopen -mountpoint "${MOUNTPOINT}" -quiet
+
+if [[ -L "${MOUNTPOINT}/Applications" ]]; then
+  rm "${MOUNTPOINT}/Applications"
+  osascript >/dev/null <<OSA
+set mountFolder to POSIX file "${MOUNTPOINT}" as alias
+tell application "Finder"
+  make new alias file to POSIX file "/Applications" at mountFolder with properties {name:"Applications"}
+  set position of item "Applications" of mountFolder to {${APPLICATIONS_ICON_X}, ${APPLICATIONS_ICON_Y}}
+end tell
+OSA
+fi
+if [[ -f "${MOUNTPOINT}/Applications" && -f "${APPLICATIONS_ICON}" ]]; then
+  applications_icon_copy="${TMPDIR}/ApplicationsFolderIcon.icns"
+  applications_icon_resource="${TMPDIR}/ApplicationsFolderIcon.rsrc"
+  cp "${APPLICATIONS_ICON}" "${applications_icon_copy}"
+  sips -i "${applications_icon_copy}" >/dev/null
+  DeRez -only icns "${applications_icon_copy}" >"${applications_icon_resource}"
+  Rez -append "${applications_icon_resource}" -o "${MOUNTPOINT}/Applications"
+  SetFile -a C "${MOUNTPOINT}/Applications"
+fi
 
 cp "${ICON}" "${MOUNTPOINT}/.VolumeIcon.icns"
 if command -v SetFile >/dev/null 2>&1; then

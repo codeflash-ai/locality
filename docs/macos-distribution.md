@@ -43,7 +43,10 @@ That script builds `loc`, `localityd`, and the Swift File Provider extension, st
 under `apps/desktop/src-tauri/macos/`, and Tauri copies those files into the
 final app bundle. After the Tauri DMG is created, `build-tauri` runs
 `apps/desktop/scripts/postprocess-dmg-volume-icon.sh` so the mounted installer
-volume uses a disk-style Locality icon instead of the application icon.
+volume uses a disk-style Locality icon instead of the application icon. The DMG
+also carries a Finder background and icon layout that presents `Locality.app` on
+the left, the Applications folder on the right, and install guidance for dragging
+Locality into Applications.
 
 Expected local artifacts:
 
