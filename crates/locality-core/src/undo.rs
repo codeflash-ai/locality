@@ -221,6 +221,16 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                     ),
                 ));
             }
+            PushOperation::MoveEntity { entity_id, .. } => {
+                unsupported.push(UnsupportedUndoOperation::new(
+                    operation_index,
+                    "move_entity_missing_entity_preimage",
+                    format!(
+                        "cannot restore moved entity `{}` until entity metadata preimages are journaled",
+                        entity_id.0
+                    ),
+                ));
+            }
             PushOperation::CreateEntity { .. } => {
                 match find_created_entity_effect(entry, operation_index) {
                     Some(entity_id) => {

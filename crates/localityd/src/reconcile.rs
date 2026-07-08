@@ -4,7 +4,8 @@
 //! a strategy decides what to fetch for a mount, and this module executes that
 //! decision by enumerating, refreshing local projections, and queueing hydration.
 
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
@@ -178,24 +179,34 @@ where
         report.mounts_polled += 1;
         report.enumerated += entries.len();
 
+        let remote_move_plan = remote_move_plan(store, mount, &entries)?;
         for entry in &entries {
             let existing = store.get_entity(&entry.mount_id, &entry.remote_id)?;
             let observed_at = observation_timestamp();
             record_remote_observation(store, entry, existing.as_ref(), &observed_at)?;
-            let entity_plan = strategy.entity_plan(EntityFetchSchedule {
-                mount,
-                entry,
-                existing: existing.as_ref(),
-                page_count,
-                tick,
-                policy,
-            });
+            let preserve_existing_path = remote_move_plan.should_preserve(&entry.remote_id);
+            let entity_plan = if preserve_existing_path {
+                EntityFetchPlan::default()
+            } else {
+                strategy.entity_plan(EntityFetchSchedule {
+                    mount,
+                    entry,
+                    existing: existing.as_ref(),
+                    page_count,
+                    tick,
+                    policy,
+                })
+            };
 
-            let record = merged_entity_record(entry, existing.as_ref());
+            let record = merged_entity_record(entry, existing.as_ref(), preserve_existing_path);
+            let projected_entry = TreeEntry {
+                path: record.path.clone(),
+                ..entry.clone()
+            };
             store.save_entity(record)?;
-            rename_projection_if_needed(mount, existing.as_ref(), entry)?;
+            rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
 
-            match refresh_projection(source, mount, entry, state_root)? {
+            match refresh_projection(source, mount, &projected_entry, state_root)? {
                 ProjectionWrite::Stub => report.stubbed += 1,
                 ProjectionWrite::Schema => report.schemas_written += 1,
                 ProjectionWrite::None => {}
@@ -204,8 +215,8 @@ where
             if let Some(reason) = entity_plan.queue_hydration {
                 hydration.queue(HydrationRequest::new(
                     mount.mount_id.clone(),
-                    entry.remote_id.clone(),
-                    mount.root.join(&entry.path),
+                    projected_entry.remote_id.clone(),
+                    mount.root.join(&projected_entry.path),
                     HydrationState::Hydrated,
                     reason,
                 ))?;
@@ -288,11 +299,21 @@ enum ProjectionWrite {
     None,
 }
 
-fn merged_entity_record(entry: &TreeEntry, existing: Option<&EntityRecord>) -> EntityRecord {
+fn merged_entity_record(
+    entry: &TreeEntry,
+    existing: Option<&EntityRecord>,
+    preserve_existing_path: bool,
+) -> EntityRecord {
     let mut record = EntityRecord::from(entry.clone());
 
     if let Some(existing) = existing {
+        if preserve_existing_path {
+            record.path = existing.path.clone();
+        }
         record.hydration = existing.hydration.clone();
+        if preserve_existing_path && record.hydration.can_transition_to(&HydrationState::Dirty) {
+            record.hydration = HydrationState::Dirty;
+        }
         record.content_hash = existing.content_hash.clone();
         if remote_precondition_belongs_to_shadow(existing) {
             record.remote_edited_at = existing.remote_edited_at.clone();
@@ -300,6 +321,113 @@ fn merged_entity_record(entry: &TreeEntry, existing: Option<&EntityRecord>) -> E
     }
 
     record
+}
+
+#[derive(Debug, Default)]
+struct RemoteMovePlan {
+    preserve_remote_ids: BTreeSet<RemoteId>,
+}
+
+impl RemoteMovePlan {
+    fn should_preserve(&self, remote_id: &RemoteId) -> bool {
+        self.preserve_remote_ids.contains(remote_id)
+    }
+}
+
+#[derive(Debug)]
+struct BlockedProjectionMove {
+    source_root: PathBuf,
+    destination_root: PathBuf,
+}
+
+fn remote_move_plan<S>(
+    store: &S,
+    mount: &MountConfig,
+    entries: &[TreeEntry],
+) -> LocalityResult<RemoteMovePlan>
+where
+    S: EntityRepository,
+{
+    let existing_entities = store.list_entities(&mount.mount_id)?;
+    let existing_by_remote_id = existing_entities
+        .iter()
+        .map(|entity| (entity.remote_id.clone(), entity))
+        .collect::<BTreeMap<_, _>>();
+    let mut blocked_moves = Vec::new();
+
+    for entry in entries {
+        let Some(existing) = existing_by_remote_id.get(&entry.remote_id) else {
+            continue;
+        };
+        if existing.path == entry.path {
+            continue;
+        }
+
+        let source_root = projection_subtree_path(&existing.kind, &existing.path);
+        if scheduled_move_subtree_is_dirty(&existing_entities, &source_root) {
+            blocked_moves.push(BlockedProjectionMove {
+                source_root,
+                destination_root: projection_subtree_path(&entry.kind, &entry.path),
+            });
+        }
+    }
+
+    let mut preserve_remote_ids = BTreeSet::new();
+    for entry in entries {
+        let Some(existing) = existing_by_remote_id.get(&entry.remote_id) else {
+            continue;
+        };
+        if should_preserve_for_blocked_move(existing, entry, &blocked_moves) {
+            preserve_remote_ids.insert(entry.remote_id.clone());
+        }
+    }
+
+    Ok(RemoteMovePlan {
+        preserve_remote_ids,
+    })
+}
+
+fn scheduled_move_subtree_is_dirty(existing_entities: &[EntityRecord], source_root: &Path) -> bool {
+    existing_entities.iter().any(|entity| {
+        path_in_projection_subtree(
+            &projection_subtree_path(&entity.kind, &entity.path),
+            source_root,
+        ) && matches!(
+            entity.hydration,
+            HydrationState::Dirty | HydrationState::Conflicted
+        )
+    })
+}
+
+fn should_preserve_for_blocked_move(
+    existing: &EntityRecord,
+    entry: &TreeEntry,
+    blocked_moves: &[BlockedProjectionMove],
+) -> bool {
+    if existing.path == entry.path {
+        return false;
+    }
+
+    let existing_root = projection_subtree_path(&existing.kind, &existing.path);
+    let entry_root = projection_subtree_path(&entry.kind, &entry.path);
+    blocked_moves.iter().any(|blocked| {
+        path_in_projection_subtree(&existing_root, &blocked.source_root)
+            && path_in_projection_subtree(&entry_root, &blocked.destination_root)
+    })
+}
+
+fn projection_subtree_path(kind: &EntityKind, path: &Path) -> PathBuf {
+    match kind {
+        EntityKind::Page => page_container_path(path),
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_) => path.to_path_buf(),
+    }
+}
+
+fn path_in_projection_subtree(path: &Path, subtree: &Path) -> bool {
+    subtree.as_os_str().is_empty() || path == subtree || path.starts_with(subtree)
 }
 
 fn refresh_projection<Source>(

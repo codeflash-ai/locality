@@ -4,7 +4,7 @@
 //! real file tree. Mount-root pulls enumerate the remote projection and write
 //! stubs; page-file pulls hydrate one entity and persist its shadow snapshot.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use locality_connector::{ChildContainer, EnumerateRequest, ListChildrenRequest};
@@ -288,23 +288,29 @@ where
             cursor: None,
         })
         .map_err(PullError::Connector)?;
+    let remote_move_plan = remote_move_plan(store, mount, &entries, state_root)?;
     let mut stubbed = 0;
 
     for entry in &entries {
         let existing = store
             .get_entity(&entry.mount_id, &entry.remote_id)
             .map_err(PullError::Store)?;
-        let record = merged_entity_record(entry, existing.as_ref());
+        let preserve_existing_path = remote_move_plan.should_preserve(&entry.remote_id);
+        let record = merged_entity_record(entry, existing.as_ref(), preserve_existing_path);
+        let projected_entry = TreeEntry {
+            path: record.path.clone(),
+            ..entry.clone()
+        };
         store.save_entity(record).map_err(PullError::Store)?;
-        rename_projection_if_needed(mount, existing.as_ref(), entry)?;
-        if write_stub_if_needed(source, mount, entry, state_root)? {
+        rename_projection_if_needed(mount, existing.as_ref(), &projected_entry)?;
+        if write_stub_if_needed(source, mount, &projected_entry, state_root)? {
             stubbed += 1;
         }
     }
 
     let mut hydrated = 0;
-    let mut skipped_dirty = 0;
-    let mut conflicts = Vec::new();
+    let mut skipped_dirty = remote_move_plan.conflicts.len();
+    let mut conflicts = remote_move_plan.conflicts.clone();
     if let Some(root_entry) = entries
         .first()
         .filter(|entry| should_hydrate_mount_root_entry(mount, entry))
@@ -318,13 +324,15 @@ where
                     remote_id: root_entry.remote_id.clone(),
                 })
             })?;
-        match hydrate_entity(store, source, mount, root_entity, state_root)? {
-            HydrationOutcome::Hydrated | HydrationOutcome::MergedDirty => hydrated += 1,
-            HydrationOutcome::RemoteDeleted => {}
-            HydrationOutcome::SkippedDirty => skipped_dirty += 1,
-            HydrationOutcome::Conflicted(conflict) => {
-                skipped_dirty += 1;
-                conflicts.push(conflict);
+        if !remote_move_plan.should_preserve(&root_entry.remote_id) {
+            match hydrate_entity(store, source, mount, root_entity, state_root)? {
+                HydrationOutcome::Hydrated | HydrationOutcome::MergedDirty => hydrated += 1,
+                HydrationOutcome::RemoteDeleted => {}
+                HydrationOutcome::SkippedDirty => skipped_dirty += 1,
+                HydrationOutcome::Conflicted(conflict) => {
+                    skipped_dirty += 1;
+                    conflicts.push(conflict);
+                }
             }
         }
     }
@@ -920,11 +928,26 @@ where
     })
 }
 
-fn merged_entity_record(entry: &TreeEntry, existing: Option<&EntityRecord>) -> EntityRecord {
+fn merged_entity_record(
+    entry: &TreeEntry,
+    existing: Option<&EntityRecord>,
+    preserve_existing_path: bool,
+) -> EntityRecord {
     let mut record = EntityRecord::from(entry.clone());
 
     if let Some(existing) = existing {
+        if preserve_existing_path
+            || matches!(
+                existing.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        {
+            record.path = existing.path.clone();
+        }
         record.hydration = existing.hydration.clone();
+        if preserve_existing_path && record.hydration.can_transition_to(&HydrationState::Dirty) {
+            record.hydration = HydrationState::Dirty;
+        }
         record.content_hash = existing.content_hash.clone();
         if remote_precondition_belongs_to_shadow(existing) {
             record.remote_edited_at = existing.remote_edited_at.clone();
@@ -932,6 +955,164 @@ fn merged_entity_record(entry: &TreeEntry, existing: Option<&EntityRecord>) -> E
     }
 
     record
+}
+
+#[derive(Debug, Default)]
+struct RemoteMovePlan {
+    preserve_remote_ids: BTreeSet<RemoteId>,
+    conflicts: Vec<PullConflict>,
+}
+
+impl RemoteMovePlan {
+    fn should_preserve(&self, remote_id: &RemoteId) -> bool {
+        self.preserve_remote_ids.contains(remote_id)
+    }
+}
+
+#[derive(Debug)]
+struct BlockedProjectionMove {
+    source_root: PathBuf,
+    destination_root: PathBuf,
+}
+
+fn remote_move_plan<S>(
+    store: &S,
+    mount: &MountConfig,
+    entries: &[TreeEntry],
+    state_root: Option<&Path>,
+) -> Result<RemoteMovePlan, PullError>
+where
+    S: EntityRepository + ShadowRepository,
+{
+    let existing_entities = store
+        .list_entities(&mount.mount_id)
+        .map_err(PullError::Store)?;
+    let existing_by_remote_id = existing_entities
+        .iter()
+        .map(|entity| (entity.remote_id.clone(), entity))
+        .collect::<BTreeMap<_, _>>();
+    let mut blocked_moves = Vec::new();
+    let mut conflict_ids = BTreeSet::new();
+    let mut conflicts = Vec::new();
+
+    for entry in entries {
+        let Some(existing) = existing_by_remote_id.get(&entry.remote_id) else {
+            continue;
+        };
+        if existing.path == entry.path {
+            continue;
+        }
+
+        let source_root = projection_subtree_path(&existing.kind, &existing.path);
+        let destination_root = projection_subtree_path(&entry.kind, &entry.path);
+        let blockers =
+            remote_move_blockers(store, mount, state_root, &existing_entities, &source_root)?;
+        if blockers.is_empty() {
+            continue;
+        }
+
+        blocked_moves.push(BlockedProjectionMove {
+            source_root,
+            destination_root,
+        });
+        for blocker in blockers {
+            if conflict_ids.insert(blocker.remote_id.clone()) {
+                conflicts.push(pull_conflict(mount, blocker));
+            }
+        }
+    }
+
+    let mut preserve_remote_ids = BTreeSet::new();
+    for entry in entries {
+        let Some(existing) = existing_by_remote_id.get(&entry.remote_id) else {
+            continue;
+        };
+        if should_preserve_for_blocked_move(existing, entry, &blocked_moves) {
+            preserve_remote_ids.insert(entry.remote_id.clone());
+        }
+    }
+
+    Ok(RemoteMovePlan {
+        preserve_remote_ids,
+        conflicts,
+    })
+}
+
+fn remote_move_blockers<'a, S>(
+    store: &S,
+    mount: &MountConfig,
+    state_root: Option<&Path>,
+    existing_entities: &'a [EntityRecord],
+    source_root: &Path,
+) -> Result<Vec<&'a EntityRecord>, PullError>
+where
+    S: ShadowRepository,
+{
+    let mut blockers = Vec::new();
+    for entity in existing_entities {
+        let candidate_root = projection_subtree_path(&entity.kind, &entity.path);
+        if !path_in_projection_subtree(&candidate_root, source_root) {
+            continue;
+        }
+        if can_move_local_projection(store, mount, state_root, entity)? {
+            continue;
+        }
+        blockers.push(entity);
+    }
+    Ok(blockers)
+}
+
+fn can_move_local_projection<S>(
+    store: &S,
+    mount: &MountConfig,
+    state_root: Option<&Path>,
+    entity: &EntityRecord,
+) -> Result<bool, PullError>
+where
+    S: ShadowRepository,
+{
+    if matches!(
+        entity.hydration,
+        HydrationState::Dirty | HydrationState::Conflicted
+    ) {
+        return Ok(false);
+    }
+    if entity.kind != EntityKind::Page {
+        return Ok(true);
+    }
+    let path = projection_content_path(state_root, mount, &entity.path)?;
+    can_replace_file(store, mount, entity, &path)
+}
+
+fn should_preserve_for_blocked_move(
+    existing: &EntityRecord,
+    entry: &TreeEntry,
+    blocked_moves: &[BlockedProjectionMove],
+) -> bool {
+    if existing.path == entry.path {
+        return false;
+    }
+
+    let existing_root = projection_subtree_path(&existing.kind, &existing.path);
+    let entry_root = projection_subtree_path(&entry.kind, &entry.path);
+    blocked_moves.iter().any(|blocked| {
+        path_in_projection_subtree(&existing_root, &blocked.source_root)
+            && path_in_projection_subtree(&entry_root, &blocked.destination_root)
+    })
+}
+
+fn projection_subtree_path(kind: &EntityKind, path: &Path) -> PathBuf {
+    match kind {
+        EntityKind::Page => page_container_path(path),
+        EntityKind::Database
+        | EntityKind::Directory
+        | EntityKind::Asset
+        | EntityKind::Unknown(_) => path.to_path_buf(),
+    }
+}
+
+fn path_in_projection_subtree(path: &Path, subtree: &Path) -> bool {
+    subtree.as_os_str().is_empty() || path == subtree || path.starts_with(subtree)
 }
 
 fn write_stub_if_needed<Source>(

@@ -314,6 +314,7 @@ pub struct PlanSummaryOutput {
     pub blocks_archived: usize,
     pub entities_created: usize,
     pub entities_archived: usize,
+    pub entities_moved: usize,
     pub properties_updated: usize,
 }
 
@@ -328,6 +329,7 @@ impl From<PlanSummary> for PlanSummaryOutput {
             blocks_archived: value.blocks_archived,
             entities_created: value.entities_created,
             entities_archived: value.entities_archived,
+            entities_moved: value.entities_moved,
             properties_updated: value.properties_updated,
         }
     }
@@ -368,6 +370,13 @@ pub enum PushOperationOutput {
         entity_id: String,
         keys: Vec<String>,
         properties: Vec<PropertyUpdateOutput>,
+    },
+    MoveEntity {
+        entity_id: String,
+        new_parent_id: String,
+        new_parent_kind: locality_core::model::EntityKind,
+        new_title: String,
+        projected_path: String,
     },
     CreateEntity {
         parent_id: String,
@@ -437,6 +446,19 @@ impl From<PushOperation> for PushOperationOutput {
                         value: PropertyValueOutput::from(value),
                     })
                     .collect(),
+            },
+            PushOperation::MoveEntity {
+                entity_id,
+                new_parent_id,
+                new_parent_kind,
+                new_title,
+                projected_path,
+            } => Self::MoveEntity {
+                entity_id: entity_id.0,
+                new_parent_id: new_parent_id.0,
+                new_parent_kind,
+                new_title,
+                projected_path: locality_platform::logical_path_display(&projected_path),
             },
             PushOperation::CreateEntity {
                 parent_id,

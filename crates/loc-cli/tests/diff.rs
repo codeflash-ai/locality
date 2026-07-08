@@ -1052,6 +1052,7 @@ impl OperationOutputExt for loc_cli::diff::PushOperationOutput {
             Self::ArchiveBlock { .. } => "archive_block",
             Self::ArchiveEntity { .. } => "archive_entity",
             Self::UpdateProperties { .. } => "update_properties",
+            Self::MoveEntity { .. } => "move_entity",
             Self::CreateEntity { .. } => "create_entity",
             Self::UpdateMedia { .. } => "update_media",
         }

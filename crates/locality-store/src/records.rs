@@ -248,6 +248,7 @@ pub struct EntityRecord {
 #[serde(rename_all = "snake_case")]
 pub enum VirtualMutationKind {
     Create,
+    Move,
     Rename,
     Delete,
 }

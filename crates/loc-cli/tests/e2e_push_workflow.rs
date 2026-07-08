@@ -5792,7 +5792,7 @@ fn virtual_projection_modes_surface_pending_create_rename_delete_in_status_and_d
             .as_ref()
             .unwrap_or_else(|| panic!("{projection:?}: missing pending rename plan"));
         assert_eq!(
-            rename_plan.summary.properties_updated, 1,
+            rename_plan.summary.entities_moved, 1,
             "{projection:?}: {rename_plan:#?}"
         );
         assert_eq!(
@@ -10437,12 +10437,12 @@ fn live_virtual_page_directory_rename_updates_remote_title_and_reconciles() {
     let renamed_page_path = fixture.root.join(&renamed.item.path).join("page.md");
 
     let pending = store
-        .get_virtual_mutation(&fixture.mount_id, &format!("rename:{}", child.id))
-        .expect("get rename mutation")
-        .expect("rename mutation");
+        .get_virtual_mutation(&fixture.mount_id, &format!("move:{}", child.id))
+        .expect("get move mutation")
+        .expect("move mutation");
     assert_eq!(
         pending.mutation_kind,
-        locality_store::VirtualMutationKind::Rename
+        locality_store::VirtualMutationKind::Move
     );
     assert_eq!(pending.title, renamed_child_title);
 

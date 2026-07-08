@@ -207,6 +207,7 @@ impl Connector for NotionConnector {
             PushOperationKind::ArchiveBlock,
             PushOperationKind::ArchiveEntity,
             PushOperationKind::UpdateProperties,
+            PushOperationKind::MoveEntity,
             PushOperationKind::CreateEntity,
         ]
         .into_iter()

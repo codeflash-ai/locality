@@ -1332,6 +1332,17 @@ where
                         validator,
                     );
                 }
+                VirtualMutationKind::Move => {
+                    return prepare_pending_scope(
+                        store,
+                        job,
+                        state_root,
+                        absolute_path,
+                        mount,
+                        relative_path,
+                        validator,
+                    );
+                }
                 VirtualMutationKind::Rename => {}
             }
         }
@@ -1817,6 +1828,20 @@ where
     }))
 }
 
+fn move_parent_entity_for_mutation<S>(
+    store: &S,
+    mount: &MountConfig,
+    mutation: &VirtualMutationRecord,
+) -> Result<EntityRecord, PushPrepareError>
+where
+    S: EntityRepository,
+{
+    if let Some(parent_id) = mutation.parent_remote_id.as_ref() {
+        return pending_create_parent_entity(store, mount, parent_id);
+    }
+    required_parent_entity(store, mount, &mutation.projected_path)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_pending_create_from_parsed<Validator>(
     job: &PushJob,
@@ -2002,7 +2027,7 @@ where
                     validator,
                 );
             }
-            VirtualMutationKind::Rename => {
+            VirtualMutationKind::Move | VirtualMutationKind::Rename => {
                 let remote_id = mutation.target_remote_id.clone().ok_or_else(|| {
                     PushPrepareError::Core(LocalityError::InvalidState(format!(
                         "pending rename `{}` is missing a target remote id",
@@ -2025,12 +2050,13 @@ where
                         .load_shadow(&mount.mount_id, &remote_id)
                         .map_err(PushPrepareError::Store)?,
                 );
-                operations.push(PushOperation::UpdateProperties {
+                let parent = move_parent_entity_for_mutation(store, &mount, mutation)?;
+                operations.push(PushOperation::MoveEntity {
                     entity_id: remote_id.clone(),
-                    properties: BTreeMap::from([(
-                        "title".to_string(),
-                        locality_core::planner::PropertyValue::String(mutation.title.clone()),
-                    )]),
+                    new_parent_id: parent.remote_id,
+                    new_parent_kind: parent.kind,
+                    new_title: mutation.title.clone(),
+                    projected_path: mutation.projected_path.clone(),
                 });
                 affected.push(remote_id);
             }
@@ -2505,6 +2531,39 @@ where
                         )
                         .map_err(LocalityError::from)?;
                     reconciled_remote_ids.push(entity_id.clone());
+                }
+                JournalApplyEffect::MovedEntity {
+                    operation_index,
+                    entity_id,
+                    ..
+                } => {
+                    let Some(PushOperation::MoveEntity {
+                        new_title,
+                        projected_path,
+                        ..
+                    }) = request.plan.operations.get(*operation_index)
+                    else {
+                        continue;
+                    };
+                    if let Some(mut entity) = self
+                        .store
+                        .get_entity(request.mount_id, entity_id)
+                        .map_err(LocalityError::from)?
+                    {
+                        entity.title = new_title.clone();
+                        entity.path = projected_path.clone();
+                        self.store
+                            .save_entity(entity)
+                            .map_err(LocalityError::from)?;
+                    }
+                    for local_id in [
+                        format!("move:{}", entity_id.0),
+                        format!("rename:{}", entity_id.0),
+                    ] {
+                        self.store
+                            .delete_virtual_mutation(request.mount_id, &local_id)
+                            .map_err(LocalityError::from)?;
+                    }
                 }
                 _ => {}
             }

@@ -1425,6 +1425,37 @@ fn pull_mount_root_renames_existing_projection_when_remote_title_changes() {
 }
 
 #[test]
+fn pull_mount_root_keeps_dirty_projection_in_place_when_remote_title_changes() {
+    let fixture = PullFixture::new();
+    let mut store = InMemoryStateStore::new();
+    fixture.mount(&mut store);
+
+    run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
+    fs::write(
+        fixture.root_file("roadmap"),
+        "---\nloc:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal dirty body.\n",
+    )
+    .expect("dirty root page");
+
+    let report = run_pull(&mut store, &fixture.connector("Strategy"), &fixture.root)
+        .expect("pull renamed dirty root");
+
+    assert!(!report.ok, "{report:#?}");
+    assert!(fixture.root_file("roadmap").exists());
+    assert!(!fixture.root_file("strategy").exists());
+
+    let root_entity = store
+        .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
+        .expect("get root entity")
+        .expect("root entity");
+    assert_eq!(root_entity.path, PathBuf::from("roadmap/page.md"));
+    assert!(matches!(
+        root_entity.hydration,
+        HydrationState::Dirty | HydrationState::Conflicted
+    ));
+}
+
+#[test]
 fn pull_mount_root_renames_existing_child_when_duplicate_title_appears() {
     let fixture = PullFixture::new();
     let mut store = InMemoryStateStore::new();

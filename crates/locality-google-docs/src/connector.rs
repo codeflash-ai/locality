@@ -200,6 +200,7 @@ impl Connector for GoogleDocsConnector {
             PushOperationKind::ArchiveBlock,
             PushOperationKind::ArchiveEntity,
             PushOperationKind::UpdateProperties,
+            PushOperationKind::MoveEntity,
             PushOperationKind::CreateEntity,
         ]
         .into_iter()
@@ -363,6 +364,7 @@ fn plan_changes_only_document_body(plan: &PushPlan, remote_id: &RemoteId) -> boo
                 return false;
             }
             PushOperation::UpdateProperties { entity_id, .. }
+            | PushOperation::MoveEntity { entity_id, .. }
             | PushOperation::ArchiveEntity { entity_id }
                 if entity_id == remote_id =>
             {
@@ -705,6 +707,30 @@ fn apply_plan(
                         keys: vec!["title".to_string()],
                     });
                 }
+            }
+            PushOperation::MoveEntity {
+                entity_id,
+                new_parent_id,
+                new_title,
+                ..
+            } => {
+                let file = drive.get_file(entity_id.as_str())?;
+                let remove_parents = file.parents.join(",");
+                drive.update_file(
+                    entity_id.as_str(),
+                    DriveUpdateFileRequest::move_and_rename(
+                        new_title,
+                        new_parent_id.0.clone(),
+                        remove_parents,
+                    ),
+                )?;
+                changed.insert(entity_id.clone());
+                effects.push(JournalApplyEffect::MovedEntity {
+                    operation_id,
+                    operation_index: index,
+                    entity_id: entity_id.clone(),
+                    parent_id: new_parent_id.clone(),
+                });
             }
             PushOperation::CreateEntity {
                 parent_id,
@@ -5766,6 +5792,60 @@ mod tests {
             .expect("rollback trash");
         assert_eq!(update.0, "created-doc");
         assert_eq!(update.1.trashed, Some(true));
+    }
+
+    #[test]
+    fn apply_move_entity_renames_and_replaces_drive_parent() {
+        let drive = Arc::new(
+            FakeDrive::default()
+                .with_file(doc_file("doc-1", "Launch Brief", "folder-old"))
+                .with_file(folder("folder-new", "Archive", "workspace")),
+        );
+        let connector = GoogleDocsConnector::with_apis(
+            GoogleDocsConfig::new("token"),
+            drive.clone(),
+            Arc::new(FakeDocs::default()),
+        );
+        let plan = PushPlan::new(
+            vec![RemoteId::new("doc-1")],
+            vec![PushOperation::MoveEntity {
+                entity_id: RemoteId::new("doc-1"),
+                new_parent_id: RemoteId::new("folder-new"),
+                new_parent_kind: EntityKind::Directory,
+                new_title: "Archived Brief".to_string(),
+                projected_path: PathBuf::from("Archive/Archived Brief/page.md"),
+            }],
+        );
+        let push_id = PushId("push-1".to_string());
+        let op_ids = vec![PushOperationId::for_operation(
+            &push_id,
+            0,
+            &plan.operations[0],
+        )];
+
+        let result = connector
+            .apply(ApplyPlanRequest {
+                push_id: &push_id,
+                mount_id: &MountId::new("google-docs-main"),
+                plan: &plan,
+                operation_ids: &op_ids,
+                remote_preconditions: &[],
+                local_root: None,
+            })
+            .expect("apply move entity");
+
+        assert_eq!(result.changed_remote_ids, vec![RemoteId::new("doc-1")]);
+        assert_eq!(result.effects.len(), 1);
+        let update = drive
+            .last_update
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("move update");
+        assert_eq!(update.0, "doc-1");
+        assert_eq!(update.1.name.as_deref(), Some("Archived Brief"));
+        assert_eq!(update.1.add_parents.as_deref(), Some("folder-new"));
+        assert_eq!(update.1.remove_parents.as_deref(), Some("folder-old"));
     }
 
     #[test]

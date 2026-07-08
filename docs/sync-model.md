@@ -277,10 +277,12 @@ Remote changed, local pending, user pushes:
   Preflight detects divergence, hydrates remote, and requires merge/review.
 
 Remote moved/deleted, local clean:
-  Apply move/delete or tombstone.
+  Apply move/delete or tombstone. For a move, the projected subtree moves as one
+  logical unit.
 
 Remote moved/deleted, local pending:
-  Mark review needed.
+  Mark review needed. Do not move dirty local content automatically; leave the
+  affected subtree in place until the user reviews or resolves it.
 ```
 
 Use a lightweight working-copy lease:

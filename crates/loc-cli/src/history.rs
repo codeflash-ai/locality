@@ -624,6 +624,7 @@ fn apply_effect_matches_remote(effect: &JournalApplyEffect, remote_id: &RemoteId
     match effect {
         JournalApplyEffect::ArchivedEntity { entity_id, .. }
         | JournalApplyEffect::UpdatedProperties { entity_id, .. }
+        | JournalApplyEffect::MovedEntity { entity_id, .. }
         | JournalApplyEffect::CreatedEntity { entity_id, .. } => entity_id == remote_id,
         JournalApplyEffect::UpdatedBlock { .. }
         | JournalApplyEffect::CreatedBlock { .. }

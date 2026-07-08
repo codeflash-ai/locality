@@ -280,7 +280,7 @@ fn plan_missing_target_conflicts(
                     repair: None,
                 });
             }
-            VirtualMutationKind::Rename => {
+            VirtualMutationKind::Move | VirtualMutationKind::Rename => {
                 let Some(remote_id) = mutation.target_remote_id.as_ref() else {
                     plan.push_conflict(ProjectionStateDiagnostic {
                         code: "pending_rename_missing_target".to_string(),
@@ -360,7 +360,7 @@ fn plan_lossless_repairs(
                     );
                 }
             }
-            VirtualMutationKind::Rename => {
+            VirtualMutationKind::Move | VirtualMutationKind::Rename => {
                 let Some(remote_id) = mutation.target_remote_id.as_ref() else {
                     continue;
                 };
@@ -593,6 +593,7 @@ impl ProjectionStateFacts {
 fn mutation_kind_name(kind: &VirtualMutationKind) -> &'static str {
     match kind {
         VirtualMutationKind::Create => "create",
+        VirtualMutationKind::Move => "move",
         VirtualMutationKind::Rename => "rename",
         VirtualMutationKind::Delete => "delete",
     }

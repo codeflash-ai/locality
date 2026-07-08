@@ -85,10 +85,12 @@ impl DriveCreateFileRequest {
 pub struct DriveUpdateFileRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub parents: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trashed: Option<bool>,
+    #[serde(skip)]
+    pub add_parents: Option<String>,
+    #[serde(skip)]
+    pub remove_parents: Option<String>,
 }
 
 impl DriveUpdateFileRequest {
@@ -101,7 +103,20 @@ impl DriveUpdateFileRequest {
 
     pub fn move_to(parent_id: impl Into<String>) -> Self {
         Self {
-            parents: vec![parent_id.into()],
+            add_parents: Some(parent_id.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn move_and_rename(
+        name: impl Into<String>,
+        add_parent_id: impl Into<String>,
+        remove_parent_ids: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: Some(name.into()),
+            add_parents: Some(add_parent_id.into()),
+            remove_parents: Some(remove_parent_ids.into()),
             ..Self::default()
         }
     }
@@ -178,9 +193,10 @@ mod tests {
             serde_json::to_value(rename).expect("rename"),
             serde_json::json!({ "name": "Renamed" })
         );
+        assert_eq!(move_file.add_parents.as_deref(), Some("folder-2"));
         assert_eq!(
             serde_json::to_value(move_file).expect("move"),
-            serde_json::json!({ "parents": ["folder-2"] })
+            serde_json::json!({})
         );
         assert_eq!(
             serde_json::to_value(trash).expect("trash"),
