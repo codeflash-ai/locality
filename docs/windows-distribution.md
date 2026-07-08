@@ -195,6 +195,11 @@ GitHub Release body with Codex from the commits since the previous reachable
 `v*` tag. Platform workflows create only a placeholder body when the release
 does not exist yet.
 
+Azure Artifact Signing uses GitHub OIDC. The Azure federated credentials must
+allow the tag-triggered workflow subject, preferably for all release tags such
+as `repo:codeflash-ai/locality:ref:refs/tags/v*`. Without that tag subject, the
+signing login fails before packaging starts.
+
 Required repository secrets:
 
 - `TAURI_UPDATER_PUBKEY`: public updater signing key.

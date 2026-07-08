@@ -35,6 +35,12 @@ grep -F -q 'UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/windows/Local
   || fail "Windows updater manifest must point at the standard installer asset"
 grep -F -q -- '"--notes", "Release assets are still being published."' "${WINDOWS_WORKFLOW}" \
   || fail "Windows release workflow must create only placeholder release notes"
+grep -F -q '  push:' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows release workflow must stay unified with tag-triggered releases"
+grep -F -q '    tags:' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows release workflow must keep a tag trigger"
+grep -F -q '      - "v*"' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows release workflow must run for v* release tags"
 
 grep -F -q 'Locality_Linux_v${APP_VERSION}.deb' "${LINUX_WORKFLOW}" \
   || fail "Linux release workflow must publish Locality_Linux_v<version>.deb"
