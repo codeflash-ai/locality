@@ -1999,15 +1999,15 @@ fn enumerate_projects_root_page_tree_to_stable_paths() {
         .expect("enumerate");
 
     assert_eq!(entries.len(), 4);
-    assert_eq!(entries[0].path, Path::new("roadmap/page.md"));
+    assert_eq!(entries[0].path, Path::new("Roadmap/page.md"));
     assert_eq!(entries[0].kind, EntityKind::Page);
-    assert_eq!(entries[1].path, Path::new("roadmap/design-notes/page.md"));
+    assert_eq!(entries[1].path, Path::new("Roadmap/Design Notes/page.md"));
     assert_eq!(entries[1].kind, EntityKind::Page);
-    assert_eq!(entries[2].path, Path::new("roadmap/tasks"));
+    assert_eq!(entries[2].path, Path::new("Roadmap/Tasks"));
     assert_eq!(entries[2].kind, EntityKind::Database);
     assert_eq!(
         entries[3].path,
-        Path::new("roadmap/tasks/fix-login-bug/page.md")
+        Path::new("Roadmap/Tasks/Fix login bug/page.md")
     );
     assert_eq!(entries[3].kind, EntityKind::Page);
 }
@@ -2029,13 +2029,13 @@ fn enumerate_suffixes_every_colliding_sibling_name() {
         .expect("enumerate");
 
     assert_eq!(entries.len(), 5);
-    assert_eq!(entries[0].path, Path::new("root/page.md"));
-    assert_eq!(entries[1].path, Path::new("root/notes bbbbbb/page.md"));
-    assert_eq!(entries[2].path, Path::new("root/notes cccccc/page.md"));
-    assert_eq!(entries[3].path, Path::new("root/notes dddddd"));
+    assert_eq!(entries[0].path, Path::new("Root/page.md"));
+    assert_eq!(entries[1].path, Path::new("Root/Notes bbbbbb/page.md"));
+    assert_eq!(entries[2].path, Path::new("Root/Notes cccccc/page.md"));
+    assert_eq!(entries[3].path, Path::new("Root/Notes dddddd"));
     assert_eq!(
         entries[4].path,
-        Path::new("root/notes dddddd/fix-login/page.md")
+        Path::new("Root/Notes dddddd/Fix login/page.md")
     );
 }
 
@@ -2055,10 +2055,10 @@ fn list_children_returns_workspace_root_pages_without_nested_duplicates() {
     assert_eq!(result.entries.len(), 2);
     assert_eq!(result.entries[0].remote_id, RemoteId::new("root-page"));
     assert_eq!(result.entries[0].kind, EntityKind::Page);
-    assert_eq!(result.entries[0].path, Path::new("root/page.md"));
+    assert_eq!(result.entries[0].path, Path::new("Root/page.md"));
     assert_eq!(result.entries[1].remote_id, RemoteId::new("root-db"));
     assert_eq!(result.entries[1].kind, EntityKind::Database);
-    assert_eq!(result.entries[1].path, Path::new("tasks"));
+    assert_eq!(result.entries[1].path, Path::new("Tasks"));
 }
 
 #[test]
@@ -2074,17 +2074,17 @@ fn list_children_fetches_one_page_container_without_hydrating_descendants() {
         .list_children(ListChildrenRequest {
             mount_id: MountId::new("notion-main"),
             container: ChildContainer::PageChildren(root_page_id),
-            parent_path: Path::new("roadmap").to_path_buf(),
+            parent_path: Path::new("Roadmap").to_path_buf(),
         })
         .expect("list page children");
 
     assert_eq!(result.entries.len(), 2);
     assert_eq!(
         result.entries[0].path,
-        Path::new("roadmap/design-notes/page.md")
+        Path::new("Roadmap/Design Notes/page.md")
     );
     assert_eq!(result.entries[0].kind, EntityKind::Page);
-    assert_eq!(result.entries[1].path, Path::new("roadmap/tasks"));
+    assert_eq!(result.entries[1].path, Path::new("Roadmap/Tasks"));
     assert_eq!(result.entries[1].kind, EntityKind::Database);
 }
 
@@ -2103,14 +2103,14 @@ fn list_children_fetches_database_rows_under_database_directory() {
             container: ChildContainer::DatabaseRows(RemoteId::new(
                 "cccccccccccccccccccccccccccccccc",
             )),
-            parent_path: Path::new("roadmap/tasks").to_path_buf(),
+            parent_path: Path::new("Roadmap/Tasks").to_path_buf(),
         })
         .expect("list database rows");
 
     assert_eq!(result.entries.len(), 1);
     assert_eq!(
         result.entries[0].path,
-        Path::new("roadmap/tasks/fix-login-bug/page.md")
+        Path::new("Roadmap/Tasks/Fix login bug/page.md")
     );
     assert_eq!(result.entries[0].kind, EntityKind::Page);
 }
@@ -2128,17 +2128,17 @@ fn enumerate_shared_workspace_projects_nested_pages_and_database_rows_under_pare
         .expect("enumerate workspace tree");
 
     assert_eq!(entries.len(), 5);
-    assert_eq!(entries[0].path, Path::new("root/page.md"));
+    assert_eq!(entries[0].path, Path::new("Root/page.md"));
     assert_eq!(entries[0].kind, EntityKind::Page);
-    assert_eq!(entries[1].path, Path::new("root/design-notes/page.md"));
+    assert_eq!(entries[1].path, Path::new("Root/Design Notes/page.md"));
     assert_eq!(entries[1].kind, EntityKind::Page);
-    assert_eq!(entries[2].path, Path::new("root/toggle-child/page.md"));
+    assert_eq!(entries[2].path, Path::new("Root/Toggle Child/page.md"));
     assert_eq!(entries[2].kind, EntityKind::Page);
-    assert_eq!(entries[3].path, Path::new("root/tasks"));
+    assert_eq!(entries[3].path, Path::new("Root/Tasks"));
     assert_eq!(entries[3].kind, EntityKind::Database);
     assert_eq!(
         entries[4].path,
-        Path::new("root/tasks/fix-login-bug/page.md")
+        Path::new("Root/Tasks/Fix login bug/page.md")
     );
     assert_eq!(entries[4].kind, EntityKind::Page);
 }
@@ -2157,16 +2157,16 @@ fn enumerate_shared_workspace_does_not_project_page_children_as_database_rows() 
         .expect("enumerate workspace tree");
 
     assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].path, Path::new("engineering-wiki"));
+    assert_eq!(entries[0].path, Path::new("Engineering Wiki"));
     assert_eq!(entries[0].kind, EntityKind::Database);
     assert_eq!(
         entries[1].path,
-        Path::new("engineering-wiki/standups-with-locality/page.md")
+        Path::new("Engineering Wiki/Standups with Locality/page.md")
     );
     assert_eq!(entries[1].kind, EntityKind::Page);
     assert_eq!(
         entries[2].path,
-        Path::new("engineering-wiki/standups-with-locality/2026-06-26/page.md")
+        Path::new("Engineering Wiki/Standups with Locality/2026-06-26/page.md")
     );
     assert_eq!(entries[2].kind, EntityKind::Page);
 }
@@ -2188,7 +2188,7 @@ fn enumerate_shared_workspace_keeps_shared_database_row_when_database_is_not_sha
         entries[0].remote_id,
         RemoteId::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
     );
-    assert_eq!(entries[0].path, Path::new("shared-row/page.md"));
+    assert_eq!(entries[0].path, Path::new("Shared Row/page.md"));
     assert_eq!(entries[0].kind, EntityKind::Page);
 }
 

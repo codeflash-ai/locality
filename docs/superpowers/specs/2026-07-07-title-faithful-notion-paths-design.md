@@ -11,8 +11,9 @@ filesystem allows. A remote page titled `Cycle Planning` should appear as
 
 - Preserve spaces, casing, punctuation, and Unicode in projected Notion path
   segments when those characters are representable as a local filename.
-- Replace only characters that cannot safely live in a path segment: `/`, `\`,
-  NUL, and ASCII control characters.
+- Replace only characters that cannot safely live in a supported projection path
+  segment: `/`, `\`, Windows-reserved filename characters (`:`, `*`, `?`, `"`,
+  `<`, `>`, `|`), NUL, and ASCII control characters.
 - Trim leading/trailing whitespace and trailing dots from the projected segment
   so paths are usable across the supported projection modes.
 - Fall back to `Untitled` when the title has no representable filename content.
@@ -36,7 +37,9 @@ The helper should:
 1. Iterate the Notion title as Unicode scalar values.
 2. Preserve normal characters exactly.
 3. Replace invalid path-segment characters with a single visible separator,
-   using `-` for each invalid run.
+   using `-` for each invalid run. Invalid characters include Windows-reserved
+   filename characters because Windows Cloud Files is a supported projection
+   mode.
 4. Trim surrounding whitespace and trailing dots after replacement.
 5. Return `Untitled` when the resulting segment is empty.
 

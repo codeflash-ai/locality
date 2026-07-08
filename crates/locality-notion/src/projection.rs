@@ -925,30 +925,42 @@ fn allocate_child_paths(
 ) -> Vec<ProjectedChildWithPath> {
     let bases = children
         .iter()
-        .map(|child| slugify_title(child.title()))
+        .map(|child| projected_title_stem(child.title()))
+        .collect::<Vec<_>>();
+    let base_collision_keys = bases
+        .iter()
+        .map(|base| projected_path_collision_key(Path::new(base)))
         .collect::<Vec<_>>();
     let mut base_counts = BTreeMap::new();
-    for base in &bases {
-        *base_counts.entry(base.clone()).or_insert(0usize) += 1;
+    for key in &base_collision_keys {
+        *base_counts.entry(key.clone()).or_insert(0usize) += 1;
     }
 
     let mut paths = (0..children.len()).map(|_| None).collect::<Vec<_>>();
     let mut suffix_groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, child) in children.iter().enumerate() {
         let base = &bases[index];
+        let base_collision_key = &base_collision_keys[index];
         let clean = projection_reservation(parent_dir, child.kind(), base);
-        if base_counts.get(base).copied().unwrap_or_default() == 1
+        if base_counts
+            .get(base_collision_key)
+            .copied()
+            .unwrap_or_default()
+            == 1
             && projection_available(used_paths, &clean)
         {
             paths[index] = Some(reserve_projection(used_paths, clean));
         } else {
-            suffix_groups.entry(base.clone()).or_default().push(index);
+            suffix_groups
+                .entry(base_collision_key.clone())
+                .or_default()
+                .push(index);
         }
     }
 
-    for (base, indexes) in suffix_groups {
+    for (_collision_key, indexes) in suffix_groups {
         for (index, path) in
-            allocate_suffixed_group(parent_dir, &children, &indexes, &base, used_paths)
+            allocate_suffixed_group(parent_dir, &children, &bases, &indexes, used_paths)
         {
             paths[index] = Some(path);
         }
@@ -967,8 +979,8 @@ fn allocate_child_paths(
 fn allocate_suffixed_group(
     parent_dir: &Path,
     children: &[ProjectedChild],
+    bases: &[String],
     indexes: &[usize],
-    base: &str,
     used_paths: &mut BTreeSet<PathBuf>,
 ) -> Vec<(usize, PathBuf)> {
     for short_len in [6, 8, 10, 12, 32] {
@@ -978,12 +990,13 @@ fn allocate_suffixed_group(
 
         for index in indexes {
             let child = &children[*index];
+            let base = &bases[*index];
             let stem = suffixed_stem(base, child.remote_id(), short_len);
             let projection = projection_reservation(parent_dir, child.kind(), &stem);
             if projection
                 .reserved
                 .iter()
-                .any(|path| used_paths.contains(path) || staged.contains(path))
+                .any(|path| path_collides(used_paths, path) || path_collides(&staged, path))
             {
                 available = false;
                 break;
@@ -1010,7 +1023,7 @@ fn allocate_single_path(
     remote_id: &str,
     used_paths: &mut BTreeSet<PathBuf>,
 ) -> PathBuf {
-    let base = slugify_title(title);
+    let base = projected_title_stem(title);
     let clean = projection_reservation(parent_dir, kind, &base);
     if projection_available(used_paths, &clean) {
         return reserve_projection(used_paths, clean);
@@ -1088,7 +1101,7 @@ fn projection_available(
     projection
         .reserved
         .iter()
-        .all(|path| !used_paths.contains(path))
+        .all(|path| !path_collides(used_paths, path))
 }
 
 fn reserve_projection(
@@ -1101,33 +1114,56 @@ fn reserve_projection(
     projection.path
 }
 
+fn path_collides(used_paths: &BTreeSet<PathBuf>, candidate: &Path) -> bool {
+    if used_paths.contains(candidate) {
+        return true;
+    }
+    let candidate_key = projected_path_collision_key(candidate);
+    used_paths
+        .iter()
+        .any(|used| projected_path_collision_key(used) == candidate_key)
+}
+
+fn projected_path_collision_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
 fn suffixed_stem(base: &str, remote_id: &str, short_len: usize) -> String {
     format!("{} {}", base, short_id(remote_id, short_len))
 }
 
-fn slugify_title(title: &str) -> String {
-    let mut slug = String::new();
-    let mut previous_dash = false;
+fn projected_title_stem(title: &str) -> String {
+    let mut stem = String::new();
+    let mut previous_replacement = false;
 
-    for ch in title.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            previous_dash = false;
-        } else if !previous_dash && !slug.is_empty() {
-            slug.push('-');
-            previous_dash = true;
+    for ch in title.chars() {
+        if is_invalid_path_segment_char(ch) {
+            if !previous_replacement {
+                stem.push('-');
+                previous_replacement = true;
+            }
+        } else {
+            stem.push(ch);
+            previous_replacement = false;
         }
     }
 
-    while slug.ends_with('-') {
-        slug.pop();
-    }
+    let stem = stem
+        .trim_start()
+        .trim_end_matches(|ch: char| ch.is_whitespace() || ch == '.')
+        .to_string();
 
-    if slug.is_empty() {
-        "untitled".to_string()
-    } else {
-        slug
+    if stem.is_empty() {
+        return "Untitled".to_string();
     }
+    stem
+}
+
+fn is_invalid_path_segment_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+    ) || ch.is_control()
 }
 
 fn short_id(remote_id: &str, len: usize) -> String {
@@ -1158,8 +1194,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ProjectedChild, allocate_child_paths, allocate_page_path, resolve_page_path_entries,
-        slugify_title,
+        ProjectedChild, allocate_child_paths, allocate_page_path, projected_title_stem,
+        resolve_page_path_entries,
     };
     use locality_core::model::{MountId, RemoteId};
     use locality_core::path_projection::PAGE_DOCUMENT_FILENAME;
@@ -1172,9 +1208,26 @@ mod tests {
     };
 
     #[test]
-    fn slugifies_titles_for_stable_paths() {
-        assert_eq!(slugify_title("Roadmap 2026!"), "roadmap-2026");
-        assert_eq!(slugify_title("..."), "untitled");
+    fn title_stem_preserves_representable_title_text() {
+        assert_eq!(projected_title_stem("Roadmap 2026!"), "Roadmap 2026!");
+        assert_eq!(projected_title_stem("Cycle Planning"), "Cycle Planning");
+        assert_eq!(projected_title_stem("  Cycle Planning  "), "Cycle Planning");
+        assert_eq!(projected_title_stem("Café/Notes"), "Café-Notes");
+        assert_eq!(projected_title_stem("/Cycle Planning/"), "-Cycle Planning-");
+        assert_eq!(projected_title_stem("Launch Plan."), "Launch Plan");
+        assert_eq!(projected_title_stem("  Launch Plan .  "), "Launch Plan");
+        assert_eq!(projected_title_stem("...\n\t"), "...-");
+        assert_eq!(projected_title_stem("."), "Untitled");
+        assert_eq!(projected_title_stem(".."), "Untitled");
+        assert_eq!(projected_title_stem(""), "Untitled");
+    }
+
+    #[test]
+    fn title_stem_replaces_windows_reserved_filename_characters() {
+        assert_eq!(
+            projected_title_stem(r#"Q&A: Launch? "Alpha" <Beta>|*"#),
+            "Q&A- Launch- -Alpha- -Beta-"
+        );
     }
 
     #[test]
@@ -1183,13 +1236,13 @@ mod tests {
         let first = allocate_page_path(Path::new(""), "Roadmap", "abcdef123456", &mut used);
         let second = allocate_page_path(Path::new(""), "Roadmap", "abcdef999999", &mut used);
 
-        assert_eq!(first, Path::new("roadmap").join(PAGE_DOCUMENT_FILENAME));
+        assert_eq!(first, Path::new("Roadmap").join(PAGE_DOCUMENT_FILENAME));
         assert_eq!(
             second,
-            Path::new("roadmap abcdef").join(PAGE_DOCUMENT_FILENAME)
+            Path::new("Roadmap abcdef").join(PAGE_DOCUMENT_FILENAME)
         );
-        assert!(used.contains(Path::new("roadmap")));
-        assert!(used.contains(Path::new("roadmap.md")));
+        assert!(used.contains(Path::new("Roadmap")));
+        assert!(used.contains(Path::new("Roadmap.md")));
     }
 
     #[test]
@@ -1206,10 +1259,10 @@ mod tests {
 
         assert_eq!(
             paths[0].path,
-            Path::new("roadmap").join(PAGE_DOCUMENT_FILENAME)
+            Path::new("Roadmap").join(PAGE_DOCUMENT_FILENAME)
         );
-        assert!(used.contains(Path::new("roadmap")));
-        assert!(used.contains(Path::new("roadmap.md")));
+        assert!(used.contains(Path::new("Roadmap")));
+        assert!(used.contains(Path::new("Roadmap.md")));
     }
 
     #[test]
@@ -1224,7 +1277,7 @@ mod tests {
                 },
                 ProjectedChild::Page {
                     page: page("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                    title: "Roadmap!".to_string(),
+                    title: "Roadmap".to_string(),
                 },
             ],
             &mut used,
@@ -1232,10 +1285,51 @@ mod tests {
 
         assert_eq!(
             paths[0].path,
-            Path::new("roadmap aaaaaa").join(PAGE_DOCUMENT_FILENAME)
+            Path::new("Roadmap aaaaaa").join(PAGE_DOCUMENT_FILENAME)
         );
         assert_eq!(
             paths[1].path,
+            Path::new("Roadmap bbbbbb").join(PAGE_DOCUMENT_FILENAME)
+        );
+    }
+
+    #[test]
+    fn sibling_projection_suffixes_case_only_title_collision() {
+        let mut used = BTreeSet::new();
+        let paths = allocate_child_paths(
+            Path::new(""),
+            vec![
+                ProjectedChild::Page {
+                    page: page("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    title: "Roadmap".to_string(),
+                },
+                ProjectedChild::Page {
+                    page: page("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                    title: "roadmap".to_string(),
+                },
+            ],
+            &mut used,
+        );
+
+        assert_eq!(
+            paths[0].path,
+            Path::new("Roadmap aaaaaa").join(PAGE_DOCUMENT_FILENAME)
+        );
+        assert_eq!(
+            paths[1].path,
+            Path::new("roadmap bbbbbb").join(PAGE_DOCUMENT_FILENAME)
+        );
+    }
+
+    #[test]
+    fn path_projection_suffixes_case_only_existing_path_collision() {
+        let mut used = BTreeSet::new();
+        let first = allocate_page_path(Path::new(""), "Roadmap", "aaaaaaaa", &mut used);
+        let second = allocate_page_path(Path::new(""), "roadmap", "bbbbbbbb", &mut used);
+
+        assert_eq!(first, Path::new("Roadmap").join(PAGE_DOCUMENT_FILENAME));
+        assert_eq!(
+            second,
             Path::new("roadmap bbbbbb").join(PAGE_DOCUMENT_FILENAME)
         );
     }
@@ -1260,9 +1354,9 @@ mod tests {
 
         assert_eq!(
             paths[0].path,
-            Path::new("tasks aaaaaa").join(PAGE_DOCUMENT_FILENAME)
+            Path::new("Tasks aaaaaa").join(PAGE_DOCUMENT_FILENAME)
         );
-        assert_eq!(paths[1].path, Path::new("tasks cccccc"));
+        assert_eq!(paths[1].path, Path::new("Tasks cccccc"));
     }
 
     #[test]
@@ -1285,11 +1379,11 @@ mod tests {
 
         assert_eq!(
             paths[0].path,
-            Path::new("roadmap abcdef11").join(PAGE_DOCUMENT_FILENAME)
+            Path::new("Roadmap abcdef11").join(PAGE_DOCUMENT_FILENAME)
         );
         assert_eq!(
             paths[1].path,
-            Path::new("roadmap abcdef22").join(PAGE_DOCUMENT_FILENAME)
+            Path::new("Roadmap abcdef22").join(PAGE_DOCUMENT_FILENAME)
         );
     }
 
@@ -1313,11 +1407,11 @@ mod tests {
 
         assert_eq!(
             paths[0].path,
-            Path::new("roadmap pageon").join(PAGE_DOCUMENT_FILENAME)
+            Path::new("Roadmap pageon").join(PAGE_DOCUMENT_FILENAME)
         );
         assert_eq!(
             paths[1].path,
-            Path::new("roadmap pagetw").join(PAGE_DOCUMENT_FILENAME)
+            Path::new("Roadmap pagetw").join(PAGE_DOCUMENT_FILENAME)
         );
     }
 
@@ -1368,14 +1462,14 @@ mod tests {
 
         assert_eq!(
             resolved.path,
-            Path::new("engineering-wiki")
-                .join("standups-with-locality")
+            Path::new("Engineering Wiki")
+                .join("Standups with Locality")
                 .join("2026-06-26")
                 .join(PAGE_DOCUMENT_FILENAME)
         );
         assert_ne!(
             resolved.path,
-            Path::new("engineering-wiki")
+            Path::new("Engineering Wiki")
                 .join("2026-06-26")
                 .join(PAGE_DOCUMENT_FILENAME)
         );
@@ -1426,8 +1520,8 @@ mod tests {
 
         assert_eq!(
             resolved.path,
-            Path::new("launch-root")
-                .join("longer-technical-launch-post")
+            Path::new("Launch Root")
+                .join("Longer Technical Launch Post")
                 .join(PAGE_DOCUMENT_FILENAME)
         );
     }

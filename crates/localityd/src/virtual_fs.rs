@@ -2990,7 +2990,7 @@ mod tests {
                 remote_id: RemoteId::new("row-1"),
                 kind: EntityKind::Page,
                 title: "Fix login bug".to_string(),
-                path: "Root/Tasks/fix-login-bug/page.md".into(),
+                path: "Root/Tasks/Fix login bug/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
@@ -3008,14 +3008,14 @@ mod tests {
             .get_entity(&mount_id, &RemoteId::new("row-1"))
             .expect("get row")
             .expect("row");
-        assert_eq!(row.path, PathBuf::from("Root/Tasks/fix-login-bug/page.md"));
+        assert_eq!(row.path, PathBuf::from("Root/Tasks/Fix login bug/page.md"));
         let children = virtual_fs_children(&store, &mount_id, "database-1").expect("children");
         assert!(
             children
                 .children
                 .iter()
                 .any(|child| child.identifier == "children:row-1"
-                    && child.path == "Root/Tasks/fix-login-bug")
+                    && child.path == "Root/Tasks/Fix login bug")
         );
     }
 
@@ -3053,7 +3053,7 @@ mod tests {
                 remote_id: RemoteId::new("row-1"),
                 kind: EntityKind::Page,
                 title: "Fix login bug".to_string(),
-                path: "Root/Tasks/fix-login-bug/page.md".into(),
+                path: "Root/Tasks/Fix login bug/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
@@ -3110,7 +3110,7 @@ mod tests {
                 remote_id: RemoteId::new("row-1"),
                 kind: EntityKind::Page,
                 title: "Fix login bug".to_string(),
-                path: "Root/Tasks/fix-login-bug/page.md".into(),
+                path: "Root/Tasks/Fix login bug/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
@@ -3128,7 +3128,7 @@ mod tests {
             .get_entity(&mount_id, &RemoteId::new("row-1"))
             .expect("get row")
             .expect("row");
-        assert_eq!(row.path, PathBuf::from("Root/Tasks/fix-login-bug/page.md"));
+        assert_eq!(row.path, PathBuf::from("Root/Tasks/Fix login bug/page.md"));
         assert_eq!(row.hydration, HydrationState::Stub);
         assert_eq!(row.content_hash, None);
     }
