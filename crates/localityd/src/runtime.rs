@@ -2632,8 +2632,9 @@ fn signal_macos_file_provider_enumerator_impl(
     let Some(helper) = macos_file_provider_helper_path() else {
         return Err("locality-file-providerctl was not found".to_string());
     };
-    let _ = (mount_id, container_identifier);
-    run_macos_file_provider_helper_action(&helper, "signal", "working-set")
+    let identifier =
+        file_provider::macos_file_provider_item_identifier(mount_id, container_identifier);
+    run_macos_file_provider_helper_action(&helper, "signal", &identifier)
 }
 
 #[cfg(target_os = "macos")]
@@ -4847,6 +4848,24 @@ mod tests {
         });
 
         assert_eq!(runtime.child_refreshes.debug_requests(10), vec![request]);
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn stale_child_refresh_target_completes_without_requeue_error() {
+        let state_root = temp_runtime_root("runtime-stale-child-refresh-target");
+        seed_virtual_mount(&state_root);
+
+        let report = DefaultRuntimeJobRunner
+            .run_virtual_fs_refresh_children(
+                state_root.clone(),
+                "notion-main".to_string(),
+                "children:old-access-page".to_string(),
+            )
+            .expect("stale child refresh should be a no-op");
+
+        assert_eq!(report, VirtualFsRefreshChildrenReport::default());
 
         let _ = std::fs::remove_dir_all(state_root);
     }

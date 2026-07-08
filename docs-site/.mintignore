@@ -1,0 +1,4 @@
+# Public Mintlify docs live in this directory.
+# Keep future drafts and internal notes out of the published site.
+drafts/**
+internal/**

@@ -267,14 +267,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
         run: |
-          create_args=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "Locality ${APP_VERSION}" --generate-notes)
+          create_args=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "Locality ${APP_VERSION}" --notes "Release assets are still being published.")
           edit_args=(--repo "${GITHUB_REPOSITORY}" --title "Locality ${APP_VERSION}")
           if [[ "${PRERELEASE}" == "true" ]]; then
             create_args+=(--prerelease --latest=false)
             edit_args+=(--prerelease=true --latest=false)
           else
-            create_args+=(--latest=true)
-            edit_args+=(--prerelease=false --latest=true)
+            create_args+=(--prerelease --latest=false)
+            edit_args+=(--prerelease=true --latest=false)
           fi
           if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release edit "${RELEASE_TAG}" "${edit_args[@]}"

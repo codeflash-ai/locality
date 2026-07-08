@@ -43,7 +43,10 @@ That script builds `loc`, `localityd`, and the Swift File Provider extension, st
 under `apps/desktop/src-tauri/macos/`, and Tauri copies those files into the
 final app bundle. After the Tauri DMG is created, `build-tauri` runs
 `apps/desktop/scripts/postprocess-dmg-volume-icon.sh` so the mounted installer
-volume uses a disk-style Locality icon instead of the application icon.
+volume uses a disk-style Locality icon instead of the application icon. The DMG
+also carries a Finder background and icon layout that presents `Locality.app` on
+the left, the Applications folder on the right, and install guidance for dragging
+Locality into Applications.
 
 Expected local artifacts:
 
@@ -70,6 +73,20 @@ The desktop app also checks the running `localityd` build metadata before reusin
 daemon. If the daemon does not report the same build ID as the app bundle, or if
 it is old enough not to report build metadata, the app stops it and starts the
 embedded `Contents/MacOS/localityd` from the current app bundle.
+
+Direct-download builds also check the Tauri updater manifest on launch. The
+macOS release workflow points packaged apps at
+`https://github.com/codeflash-ai/locality/releases/latest/download/latest-macos.json`.
+The app checks that manifest in the background, downloads an available updater
+archive without blocking startup, and shows the restart/install action in the
+desktop sidebar when the main window is visible. If Locality is running in the
+background with no visible main window, the downloaded update can install and
+relaunch automatically only after the daemon debug queue reports no active or
+queued work and Live Mode is not syncing. The app also schedules a native
+relaunch fallback before the updater install begins so LaunchServices opens the
+updated `.app` even if the old process exits during installer handoff. The
+relaunch runs the same `localityd` build validation described above before
+normal desktop work resumes.
 
 During onboarding, the desktop app also verifies the terminal command. For DMG
 installs it creates or refreshes `/usr/local/bin/loc` as a symlink to the
@@ -277,10 +294,17 @@ GitHub-hosted `macos-15` arm64 runner, builds the notarized DMG, produces the
 signed updater archive, renders `latest-macos.json`, renders `loc.rb`, creates
 or updates the GitHub Release, uploads the public DMG as
 `Locality_Mac_v<version>.dmg`, also uploads the stable latest-download alias
-`Locality_Mac.dmg`, and optionally pushes the cask to the Homebrew tap. It
-shares a release concurrency group with the
-Linux workflow so both workflows can target the same tag without racing while
-creating or updating the GitHub Release.
+`Locality_Mac.dmg`, and optionally pushes the cask to the Homebrew tap. The
+separate `.github/workflows/release-notes.yml` workflow generates the GitHub
+Release body with Codex from the commits since the previous `v*` tag. Platform
+workflows create only a placeholder body when the release does not exist yet, so
+asset publication can proceed before the notes workflow finishes.
+Release creation is staged as prerelease and non-latest. The separate
+`.github/workflows/release-finalize.yml` workflow promotes the release to latest
+only after macOS, Linux, and Windows workflows have completed successfully and
+all expected public download assets are present. Until then,
+`/releases/latest/download/...` URLs continue to resolve to the previous complete
+release.
 
 Required repository secrets:
 
@@ -293,6 +317,10 @@ Required repository secrets:
 - `TAURI_UPDATER_PUBKEY`: public updater signing key.
 - `TAURI_SIGNING_PRIVATE_KEY`: private updater signing key.
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: updater key password, if one was set.
+
+The companion release-notes workflow requires `CODEX_CONFIG_TOML` plus the
+provider credential it references. For the Azure OpenAI setup, that means
+`AZURE_OPENAI_API_KEY`.
 
 Optional repository secret:
 

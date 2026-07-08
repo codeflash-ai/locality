@@ -5,6 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MAKEFILE="${ROOT}/Makefile"
 PUBLISH_SCRIPT="${ROOT}/scripts/publish-macos.sh"
 HOMEBREW_SCRIPT="${ROOT}/scripts/render-homebrew-cask.sh"
+TAURI_CONF="${ROOT}/apps/desktop/src-tauri/tauri.conf.json"
+DMG_BACKGROUND="${ROOT}/apps/desktop/src-tauri/assets/dmg-background.png"
 
 fail() {
   printf 'macos publish config test: %s\n' "$*" >&2
@@ -40,6 +42,19 @@ grep -q 'dmg_status="unnotarized"' "${PUBLISH_SCRIPT}" \
   || fail "unnotarized artifacts must be named distinctly"
 grep -q 'dmg_status="notarized"' "${PUBLISH_SCRIPT}" \
   || fail "notarized artifacts must keep the notarized naming suffix"
+grep -q 'make new alias file to POSIX file "/Applications"' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
+  || fail "DMG postprocess must replace the Applications symlink with a Finder alias"
+
+[[ -f "${DMG_BACKGROUND}" ]] \
+  || fail "DMG installer background asset is missing"
+jq -e '.bundle.macOS.dmg.background == "assets/dmg-background.png"' "${TAURI_CONF}" >/dev/null \
+  || fail "DMG must use the instructional installer background"
+jq -e '.bundle.macOS.dmg.windowSize.width >= 720 and .bundle.macOS.dmg.windowSize.height >= 420' "${TAURI_CONF}" >/dev/null \
+  || fail "DMG window must leave room for standard install instructions"
+jq -e '.bundle.macOS.dmg.appPosition.x < .bundle.macOS.dmg.applicationFolderPosition.x' "${TAURI_CONF}" >/dev/null \
+  || fail "DMG app icon must stay left of the Applications shortcut"
+jq -e '.bundle.macOS.dmg.appPosition.y == .bundle.macOS.dmg.applicationFolderPosition.y' "${TAURI_CONF}" >/dev/null \
+  || fail "DMG app and Applications icons should be horizontally aligned"
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-macos-publish-config.XXXXXX")"
 cleanup() {

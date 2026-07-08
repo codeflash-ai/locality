@@ -1,0 +1,785 @@
+---
+title: "CLI reference"
+description: "Developer-friendly reference for loc commands, arguments, workflows, JSON output, sync review, daemon control, and virtual filesystem providers."
+keywords: ["cli", "loc", "reference", "commands", "notion", "google docs", "sync", "daemon", "file provider", "fuse"]
+---
+
+`loc` is the supported command surface for Locality. Use it to connect sources,
+register mounts, inspect local sync state, review remote write plans, push
+approved edits, and operate the background daemon and virtual filesystem
+providers.
+
+Most developer and agent workflows should stay path-scoped:
+
+```bash
+loc status <path>
+loc diff <path>
+loc push <path> -y
+```
+
+Use `--json` on commands when integrating with scripts, agents, tests, or MCP
+tools. Help output is always text, even when `--json` is present.
+
+```bash
+loc --help
+loc mount notion --help
+loc push --json <path> -y
+```
+
+## Command map
+
+| Task | Commands | Use when |
+| --- | --- | --- |
+| Connect accounts | `connect`, `connections`, `profiles`, `connection show`, `disconnect` | You need to authenticate Notion or Google Docs and inspect saved connection metadata. |
+| Register local files | `mount notion`, `mount google-docs`, `file-provider register`, `pull` | You want a remote workspace to appear as local Markdown. |
+| Navigate mounted content | `search`, `info`, `status`, `inspect` | You need to find content or understand what Locality knows about a path. |
+| Review sync state | `status`, `diff`, `pull`, `push`, `restore`, `log`, `undo` | You are deciding whether to update local files or write local edits back to the source. |
+| Run background services | `daemon`, `file-provider`, `doctor` | You are using Live Mode, macOS File Provider, Linux FUSE, or Windows Cloud Files. |
+| Create local content | `create page`, `templates`, `okf export` | You want safe local drafts, local workflow packs, or a portable export. |
+| Integrate tools | `mcp`, `--json` | You are building agent or automation surfaces over Locality. |
+
+## Conventions
+
+### Paths and scope
+
+Commands that accept a path resolve it through the registered Locality mount
+table. Prefer the narrowest useful path: a single `page.md`, one page directory,
+or a small subtree. Broad workspace-level `diff` and `push` commands are harder
+to review.
+
+When a path is optional, Locality uses the current working directory when it is
+inside a mount. Outside a mount, commands such as `loc status` report registered
+mounts in the active state directory.
+
+### `--json`
+
+`--json` is global:
+
+```bash
+loc --json status <path>
+loc status <path> --json
+```
+
+JSON output is intended for tools. It does not include OAuth tokens, refresh
+tokens, personal access tokens, client secrets, or credential-store references.
+
+### State directory
+
+Production state defaults to `~/.loc`. For isolated development and tests, use
+`LOCALITY_STATE_DIR` or daemon flags such as `--state-dir <path>`.
+
+### Projection modes
+
+Projection support depends on the host platform:
+
+| Platform | Supported values |
+| --- | --- |
+| macOS | `plain-files`, `macos-file-provider` |
+| Linux | `plain-files`, `linux-fuse` |
+| Windows | `plain-files`, `windows-cloud-files` |
+
+`plain-files` writes normal files during `loc pull`. The virtual projection
+modes list online-only content through the platform provider and materialize file
+bodies on open or explicit pull.
+
+## Connect sources
+
+### `loc connect notion`
+
+Connect a Notion workspace and save a reusable connection.
+
+```bash
+loc connect notion [--name <id>] [--token-stdin] [--no-browser] [--direct-oauth] [--broker-url <url>] [--redirect-uri <uri>]
+```
+
+Use this before mounting Notion. The default path uses Locality's OAuth broker,
+opens a browser, and stores credentials in the local credential store. Locality
+can mount only pages and workspaces shared with the Notion integration.
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `--name <id>` | Connection id to save. Runtime default is `notion-default` when no active Notion connection exists; pass an explicit name for reproducible setup. |
+| `--token-stdin` | Read a Notion integration token from stdin. Useful for local development and CI. |
+| `--no-browser` | Print the OAuth URL instead of opening it. Useful for remote shells. |
+| `--direct-oauth` | Use direct OAuth credentials from the environment instead of the broker. Developer path only. |
+| `--broker-url <url>` | Override the OAuth broker base URL. |
+| `--redirect-uri <uri>` | Override the local callback URI. |
+
+Examples:
+
+```bash
+loc connect notion --name notion-default
+loc connect notion --name work --no-browser
+echo "$NOTION_TOKEN" | loc connect notion --token-stdin --name notion-ci
+```
+
+### `loc connect google-docs`
+
+Connect Google Docs through the Locality OAuth broker.
+
+```bash
+loc connect google-docs [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>]
+```
+
+Use this before mounting a Google Drive workspace folder that contains Google
+Docs. Non-Google-Docs Drive files are ignored by the Google Docs connector.
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `--name <id>` | Connection id to save. Runtime default is `google-docs-default` when no active Google Docs connection exists; pass an explicit name for reproducible setup. |
+| `--no-browser` | Print the OAuth URL instead of opening it. |
+| `--broker-url <url>` | Override the OAuth broker base URL. |
+| `--redirect-uri <uri>` | Override the local callback URI. |
+
+Example:
+
+```bash
+loc connect google-docs --name google-docs-default
+```
+
+### Inspect and remove connections
+
+```bash
+loc connections
+loc profiles
+loc connection show <id>
+loc disconnect <id>
+```
+
+Use `connections` to list saved account connections. Use `profiles` to list
+connector auth profiles and capabilities. Use `connection show` for one
+connection's metadata. These commands never print secrets.
+
+`disconnect` deletes the credential and marks the connection revoked. It does
+not remove mounts; affected mounts will report auth or revoked-connection
+problems until you reconnect or remount.
+
+## Mount sources
+
+### `loc mount notion`
+
+Register Notion content at a local path.
+
+```bash
+loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection <mode>] [--read-only]
+```
+
+Use `--workspace` for all Notion content shared with the integration. Use
+`--root-page <page-id>` when you want one page tree instead of the whole
+accessible workspace.
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `<path>` | Local directory to register as the mount. |
+| `--workspace` | Mount all accessible Notion workspace content shared with the integration. |
+| `--root-page <page-id>` | Mount one Notion page tree. Mutually exclusive with `--workspace`. |
+| `--connection <id>` | Use a specific saved connection. Required when Locality cannot choose safely. |
+| `--mount-id <id>` | Stable id for scripts, provider commands, logs, and status output. |
+| `--projection <mode>` | `plain-files`, `macos-file-provider`, `linux-fuse`, or `windows-cloud-files`, depending on platform. |
+| `--read-only` | Register the mount as read-only and block push operations. |
+
+Examples:
+
+```bash
+loc mount notion ~/Library/CloudStorage/Locality/notion-main --workspace --projection macos-file-provider
+loc mount notion ~/Locality/notion-page --root-page <page-id> --projection plain-files
+loc mount notion ~/Locality/company --workspace --connection notion-company --mount-id notion-company
+```
+
+After a virtual mount, register or open the platform provider:
+
+```bash
+loc file-provider register notion-main
+loc file-provider open notion-main
+```
+
+For a plain-file mount, pull once to write the local projection:
+
+```bash
+loc pull ~/Locality/notion-page
+```
+
+### `loc mount google-docs`
+
+Register Google Docs content under a Drive workspace folder.
+
+```bash
+loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection <mode>] [--read-only]
+```
+
+Use this when a Google Drive folder is the workspace boundary for Locality. The
+folder can be specified by name, id, or folder URL.
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `<path>` | Local directory to register as the mount. |
+| `--workspace-folder <name-or-id>` | Google Drive folder name, folder id, or folder URL. |
+| `--connection <id>` | Saved Google Docs connection to use. |
+| `--mount-id <id>` | Stable mount id. Defaults to a Google Docs mount id when safe. |
+| `--projection <mode>` | Platform-specific projection mode. |
+| `--read-only` | Block push operations for this mount. |
+
+Examples:
+
+```bash
+loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection plain-files
+loc mount google-docs ~/Locality/google-docs-main --workspace-folder <folder-id> --connection google-docs-default
+loc pull ~/Locality/google-docs-main
+```
+
+## Find and inspect content
+
+### `loc search`
+
+Search local mount metadata without contacting remote sources.
+
+```bash
+loc search <query...> [--connector <connector>] [--limit <n>] [--all]
+```
+
+Use search for navigation, desktop typeahead, agent path lookup, and source URL
+resolution. It reads local SQLite metadata only, so it is fast and safe but may
+not know about the newest remote changes until a pull, daemon refresh, or
+freshness check has run.
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `<query...>` | Title, path fragment, remote id, or source URL. Multi-word queries are accepted. |
+| `--connector <connector>` | Limit results to one connector, such as `notion` or `google-docs`. |
+| `--limit <n>` | Maximum number of results. Defaults to `10`. |
+| `--all` | Include stale, disconnected, or inactive mount access. |
+
+Examples:
+
+```bash
+loc search roadmap
+loc search "Launch Plan" --connector notion
+loc search "https://www.notion.so/..." --connector notion --json
+```
+
+### `loc info`
+
+Show source, mount, entity, child, and journal context for a path using local
+state only.
+
+```bash
+loc info [path]
+```
+
+Use `info` when you need to answer "what is this file connected to?" without
+hydrating content or calling the remote connector. It is useful before deleting
+or moving suspicious files in a mount.
+
+Examples:
+
+```bash
+loc info .
+loc info ~/Locality/notion-main/engineering/page.md --json
+```
+
+### `loc status`
+
+Show local sync state for one path, the current mount scope, or all mounts.
+
+```bash
+loc status [path]
+```
+
+Use status before and after edits. It reports stubs, dirty files, conflicts,
+missing projections, pending journals, failed journals, remote-update metadata
+already observed by the daemon, and read-only state. It does not call remote
+connectors itself.
+
+Examples:
+
+```bash
+loc status
+loc status <page.md>
+loc status ~/Locality/notion-main --json
+```
+
+Common states:
+
+| State | Meaning | Usual next command |
+| --- | --- | --- |
+| `all_synced` | Local, remote, and synced shadow are aligned. | Keep working. |
+| `stub` | Locality knows the object, but the body is not hydrated. | `loc pull <path>` |
+| `pending_local_changes` | Local file changed and needs review. | `loc diff <path>` |
+| `remote_update_available` | Remote moved while the local file is clean. | `loc pull <path>` |
+| `review_needed` | Local and remote state both need attention. | `loc inspect <path>` |
+| `conflicted` | Conflict markers or conflicted state exist. | Resolve, then `loc diff <path>` |
+
+### `loc inspect`
+
+Explain local and remote sync state for one path.
+
+```bash
+loc inspect <path>
+```
+
+Use inspect when status says remote state may have changed and you need a more
+authoritative explanation before choosing pull, push, or manual merge. Unlike
+`status`, `inspect` may call the remote connector. It is read-only: it does not
+rewrite local files, update shadows, or mutate the remote source.
+
+Example:
+
+```bash
+loc inspect ~/Locality/notion-main/roadmap/page.md --json
+```
+
+### `loc doctor`
+
+Run read-only diagnostics for daemon, state store, mounts, providers, projection
+support, and auth.
+
+```bash
+loc doctor
+```
+
+Use doctor when a mount is not appearing, a daemon/provider seems stopped, auth
+is failing, or you want a broad health report. It reports suggested recovery
+commands but does not initialize state, write credentials, start daemons,
+register providers, or reset anything.
+
+Example:
+
+```bash
+loc doctor --json
+```
+
+## Review and sync
+
+### `loc pull`
+
+Pull remote content into the local projection.
+
+```bash
+loc pull <path>
+```
+
+Use pull to hydrate stubs, refresh a page or subtree, update clean files after
+remote changes, or write a plain-file mount after registration. Pull refuses to
+overwrite dirty hydrated content. On virtual filesystem mounts, it updates
+daemon/cache state and materialized visible files only when they are still clean
+relative to the synced shadow.
+
+Examples:
+
+```bash
+loc pull ~/Locality/notion-main
+loc pull ~/Locality/notion-main/engineering/roadmap/page.md
+loc pull <path> --json
+```
+
+### `loc diff`
+
+Preview the remote write plan for local changes.
+
+```bash
+loc diff <path>
+```
+
+Use diff before every explicit push. It parses the mounted Markdown, compares it
+with the synced shadow, validates Locality metadata, detects unresolved conflict
+markers, and shows the connector-neutral operations that `push` would attempt.
+It does not mutate local files or remote content.
+
+Examples:
+
+```bash
+loc diff <page.md>
+loc diff ~/Locality/notion-main/engineering --json
+```
+
+### `loc push`
+
+Push local changes back to the remote source.
+
+```bash
+loc push <path> [-y|--yes] [--confirm]
+```
+
+Use push only after reviewing `loc diff` or when Live Mode has paused and asks
+for a manual decision. The push pipeline runs the same validation and planning
+as `diff`, then uses a journaled connector apply path.
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `<path>` | File or directory scope to push. Prefer a narrow path. |
+| `-y`, `--yes` | Approve safe non-empty plans without prompting. Use for reviewed automation. |
+| `--confirm` | Approve plans that trip destructive-change guardrails. Use only after reviewing the plan. |
+
+Examples:
+
+```bash
+loc push <page.md> -y
+loc push <path> --confirm
+loc push <path> --json -y
+```
+
+If the remote changed first, pull before pushing:
+
+```bash
+loc pull <path>
+loc diff <path>
+loc push <path> -y
+```
+
+If the file contains conflict markers, edit it to the intended final content,
+remove every marker line, then run `loc diff` again.
+
+### `loc restore`
+
+Restore a local file from the last synced shadow.
+
+```bash
+loc restore <path> [--force]
+```
+
+Use restore when local edits should be discarded. It rewrites the local file from
+Locality's last synced snapshot and does not call Notion or Google Docs. Failed
+push journals remain in the audit log.
+
+`--force` allows restoring a file marked conflicted. Use it only when you have
+chosen to discard local conflict content.
+
+Examples:
+
+```bash
+loc restore <page.md>
+loc restore <page.md> --force
+```
+
+### `loc log`
+
+List push journal entries.
+
+```bash
+loc log [path]
+```
+
+Use log to inspect previous push attempts, failed journals, and journal ids for
+undo. With a path, Locality filters to entries that touched that entity or scope.
+
+Examples:
+
+```bash
+loc log
+loc log <page.md> --json
+```
+
+### `loc undo`
+
+Undo a reconciled push using its journal id.
+
+```bash
+loc undo <push-id>
+```
+
+Use undo for journal-backed recovery where the connector supports the reverse
+operations. It is not a generic remote history browser. Failed or partially
+applying journals may be unsafe to undo automatically.
+
+Example:
+
+```bash
+loc log <page.md>
+loc undo <push-id>
+```
+
+## Create local drafts and exports
+
+### `loc create page`
+
+Create a local page draft in a mounted Locality folder.
+
+```bash
+loc create page --title <title> [--parent <dir>] [--private]
+```
+
+Use this to create the filesystem shape for a new page without calling the
+remote connector. The containing directory determines the remote parent when the
+draft is pushed. When `--parent` is omitted, Locality uses the current
+directory.
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `--title <title>` | Title for the new page and the generated folder/file name. Required. |
+| `--parent <dir>` | Existing mounted directory where the page should be created. |
+| `--private` | For Notion, create as a workspace-private page on push when the token supports it. |
+
+Example:
+
+```bash
+loc create page --title "Launch Plan" --parent ~/Locality/notion-main/go-to-market
+loc diff ~/Locality/notion-main/go-to-market/Launch\ Plan/page.md
+loc push ~/Locality/notion-main/go-to-market/Launch\ Plan/page.md -y
+```
+
+### `loc templates`
+
+Manage local-first template packs.
+
+```bash
+loc templates list
+loc templates validate <path>
+loc templates new <pack> <path> [--force]
+loc templates apply <pack> <template> --to <dir> [--title <title>] [--force]
+```
+
+Use templates for repeatable local workflows, such as progress logs or draft
+documents. Template commands write local files only. They do not connect sources,
+mount workspaces, bypass diff review, or push remote changes.
+
+Key forms:
+
+| Command | Use when |
+| --- | --- |
+| `loc templates list` | You want bundled pack ids. |
+| `loc templates validate <path>` | You are developing or reviewing a pack. |
+| `loc templates new <pack> <path>` | You want a complete local workspace from a pack. |
+| `loc templates apply <pack> <template> --to <dir>` | You want one generated draft in an existing local or mounted folder. |
+
+Examples:
+
+```bash
+loc templates list
+loc templates validate ./templates/packs/founder-proof-of-work
+loc templates new founder-proof-of-work ~/Locality/founder-proof
+loc templates apply founder-proof-of-work weekly-update --to ~/Locality/notion-main --title "Week 28 Update"
+```
+
+### `loc okf export`
+
+Export mounted content as an Open Knowledge Format bundle.
+
+```bash
+loc okf export <path> --out <dir>
+```
+
+Use OKF export when an agent, search pipeline, or review process needs a
+portable Markdown bundle instead of live mounted files. The command reads the
+source projection and writes a separate output directory. It is read-only with
+respect to Locality state and the remote source.
+
+`--out <dir>` must point to an empty output directory.
+
+Example:
+
+```bash
+loc okf export ~/Locality/notion-main/engineering-wiki --out ~/Desktop/engineering-wiki-okf
+```
+
+## Daemon and virtual filesystem providers
+
+### `loc daemon`
+
+Start, stop, reload, restart, or inspect the background `localityd` process.
+
+```bash
+loc daemon start [--session] [--launchd] [--localityd-bin <path>] [--state-dir <path>] [--tcp-addr <address-or-off>] [--include-env <KEY>]
+loc daemon stop [--state-dir <path>] [--tcp-addr <address-or-off>]
+loc daemon status [--state-dir <path>] [--tcp-addr <address-or-off>]
+loc daemon reload [--state-dir <path>] [--tcp-addr <address-or-off>]
+loc daemon restart [--session] [--launchd] [--localityd-bin <path>] [--state-dir <path>] [--tcp-addr <address-or-off>] [--include-env <KEY>]
+```
+
+Use the daemon for Live Mode, virtual filesystems, background hydration,
+freshness checks, and managed provider workflows.
+
+Subcommands:
+
+| Command | Use when |
+| --- | --- |
+| `start` | Start `localityd` under the platform process manager or a detached session. |
+| `stop` | Stop the managed daemon. |
+| `status` | Check manager state, IPC reachability, watched mounts, and queue counts. |
+| `reload` | Ask a running daemon to reconcile watches with the current mount table. |
+| `restart` | Stop then start the daemon after config or binary changes. |
+
+Key arguments:
+
+| Argument | Meaning |
+| --- | --- |
+| `--session` | Run as a detached session process. Useful for development and non-macOS hosts. |
+| `--launchd` | Use launchd. macOS only. |
+| `--localityd-bin <path>` | Launch a specific daemon binary. |
+| `--state-dir <path>` | Use an isolated Locality state directory. |
+| `--tcp-addr <address-or-off>` | Configure daemon TCP IPC, for example `127.0.0.1:8758`, or pass `off` where TCP can be disabled. Required on Windows. |
+| `--include-env <KEY>` | Pass one environment variable into the managed daemon. Repeatable. |
+
+Examples:
+
+```bash
+loc daemon start
+loc daemon status --json
+loc daemon reload
+loc daemon restart --session --localityd-bin ./target/debug/localityd
+```
+
+### `loc file-provider`
+
+Manage the platform virtual filesystem provider for a mount.
+
+```bash
+loc file-provider register <mount-id-or-path>
+loc file-provider start <mount-id-or-path>
+loc file-provider run <mount-id-or-path>
+loc file-provider stop <mount-id-or-path>
+loc file-provider status <mount-id-or-path>
+loc file-provider restart <mount-id-or-path>
+loc file-provider open <mount-id-or-path>
+loc file-provider unregister <mount-id-or-path>
+loc file-provider list
+loc file-provider reset
+```
+
+Use this command with `macos-file-provider`, `linux-fuse`, and
+`windows-cloud-files` projection modes. The target can be a mount id such as
+`notion-main` or a path inside a mount.
+
+Subcommands:
+
+| Command | Use when |
+| --- | --- |
+| `register` | Register, repair, or re-register the platform provider for a mount. |
+| `start` | Start the background provider runtime when the platform needs one. |
+| `run` | Run the Windows Cloud Files provider in the foreground for debugging. |
+| `stop` | Stop the provider runtime without necessarily unregistering the mount. |
+| `status` | Inspect provider registration, runtime state, daemon reachability, and logs. |
+| `restart` | Stop and start the provider runtime. |
+| `open` | Open the user-visible mount folder. |
+| `unregister` | Remove provider registration for the mount. On Linux, this removes the systemd user service. |
+| `list` | List provider domains or registrations known to the platform helper. |
+| `reset` | Reset provider registration state for recovery or development. |
+
+Examples:
+
+```bash
+loc file-provider register notion-main
+loc file-provider status notion-main --json
+loc file-provider restart ~/Locality/notion-main
+loc file-provider open notion-main
+```
+
+Platform notes:
+
+| Platform | Provider behavior |
+| --- | --- |
+| macOS | Uses the signed Locality File Provider helper from the app bundle. `LOCALITY_FILE_PROVIDERCTL` can override the helper during development. |
+| Linux | Uses `locality-fuse` and a user `systemd` service for the shared FUSE root. `LOCALITY_FUSE_BIN` can override the helper during development. |
+| Windows | Uses Cloud Files sync-root registration and a `locality-cloud-files.exe` provider runtime. `LOCALITY_CLOUD_FILES_BIN` can override the helper during development. |
+
+## Tool integration and development
+
+### `loc mcp`
+
+Run the Locality MCP stdio server.
+
+```bash
+loc mcp
+```
+
+Use this from an MCP client configuration. It speaks over stdin/stdout and is
+not meant to be run as an interactive shell command.
+
+### `loc config`
+
+Reserved for future configuration commands.
+
+```bash
+loc config
+```
+
+The current CLI exposes the command, but it prints `not implemented yet`.
+
+### Development entrypoints
+
+From a source checkout:
+
+```bash
+make setup
+make dev-tauri
+make check
+make test
+make run-cli ARGS='status --json'
+```
+
+For isolated command tests:
+
+```bash
+LOCALITY_STATE_DIR="$(mktemp -d)" ./target/debug/loc status --json
+```
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success, including some no-op commands. |
+| `1` | Internal, I/O, store, connector, auth, credential, daemon, or rate-limit failure. |
+| `2` | Usage error. |
+| `3` | Validation or diagnostic error. |
+| `4` | Confirmation, guardrail, or read-only policy required. |
+| `5` | Unsupported or intentionally unimplemented connector boundary. |
+
+## Common workflows
+
+### Connect, mount, pull, edit, push
+
+```bash
+loc connect notion --name notion-default
+loc mount notion ~/Locality/notion-main --workspace --projection plain-files --connection notion-default
+loc pull ~/Locality/notion-main
+
+$EDITOR ~/Locality/notion-main/engineering/roadmap/page.md
+
+loc status ~/Locality/notion-main/engineering/roadmap/page.md
+loc diff ~/Locality/notion-main/engineering/roadmap/page.md
+loc push ~/Locality/notion-main/engineering/roadmap/page.md -y
+```
+
+### Use a virtual projection
+
+```bash
+loc daemon start
+loc mount notion ~/Locality/notion-main --workspace --projection linux-fuse
+loc file-provider register notion-main
+loc file-provider open notion-main
+loc file-provider status notion-main
+```
+
+Use `macos-file-provider` on macOS and `windows-cloud-files` on Windows.
+
+### Recover from unwanted local edits
+
+```bash
+loc status <page.md>
+loc diff <page.md>
+loc restore <page.md>
+loc status <page.md>
+```
+
+### Diagnose a paused or unhealthy mount
+
+```bash
+loc doctor
+loc daemon status
+loc file-provider status <mount-id-or-path>
+loc status <path>
+loc info <path>
+```

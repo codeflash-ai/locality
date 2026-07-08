@@ -1,0 +1,99 @@
+name: release notes
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish notes for, for example v0.1.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-notes-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release-notes:
+    name: Generate GitHub Release notes
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release tag is current main
+        run: |
+          git fetch --force --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          main_commit="$(git rev-parse "origin/main^{commit}")"
+          if [[ "${tag_commit}" != "${main_commit}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} must point at current origin/main (${main_commit}); got ${tag_commit}."
+            exit 1
+          fi
+          echo "Release tag ${RELEASE_TAG} points at current origin/main (${main_commit})."
+
+      - name: Verify tag matches app version
+        run: |
+          version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' apps/desktop/src-tauri/tauri.conf.json | head -n 1)"
+          if [[ -z "${version}" ]]; then
+            echo "::error::Could not read Tauri app version."
+            exit 1
+          fi
+          expected="v${version}"
+          if [[ "${RELEASE_TAG}" != "${expected}" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} does not match app version ${version}; expected ${expected}."
+            exit 1
+          fi
+          echo "APP_VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Codex CLI
+        run: npm install --global @openai/codex@0.143.0
+
+      - name: Generate release notes
+        env:
+          CODEX_CONFIG_TOML: ${{ secrets.CODEX_CONFIG_TOML }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+        run: RELEASE_NOTES_OUTPUT=target/release/release-notes.md scripts/render-release-notes.sh
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_notes_file="target/release/release-notes.md"
+          create_args=(--repo "${GITHUB_REPOSITORY}" --verify-tag --title "Locality ${APP_VERSION}" --notes-file "${release_notes_file}")
+          edit_args=(--repo "${GITHUB_REPOSITORY}" --title "Locality ${APP_VERSION}" --notes-file "${release_notes_file}")
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            create_args+=(--prerelease --latest=false)
+            edit_args+=(--prerelease=true --latest=false)
+          else
+            create_args+=(--prerelease --latest=false)
+          fi
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" "${edit_args[@]}"
+          else
+            gh release create "${RELEASE_TAG}" "${create_args[@]}"
+          fi

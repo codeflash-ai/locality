@@ -98,9 +98,28 @@ make render-linux-repositories
 
 Do not publish a build that failed relevant checks.
 
+The dedicated `.github/workflows/release-notes.yml` workflow generates the
+GitHub Release body with `scripts/render-release-notes.sh`. The script compares
+`RELEASE_TAG` with the previous reachable `v*` tag, sends the commit range and
+diff summary to `codex exec`, and writes `target/release/release-notes.md` for
+`gh release create/edit --notes-file`. GitHub's PR-only generated notes are
+intentionally not used because direct commits to `main` are common. Platform
+release workflows only publish assets; if they create the release first, the
+notes workflow later replaces the placeholder body.
+
+GitHub Actions needs `CODEX_CONFIG_TOML` plus the provider credential named by
+that config. The current Azure OpenAI setup uses `AZURE_OPENAI_API_KEY`. Those
+secrets are passed only to the release-notes step.
+
+Validate the plumbing locally with:
+
+```bash
+make test-release-notes
+```
+
 ## Docs development
 
-The published docs use Mintlify with `docs.json` at the repo root. Public pages are `docs/*.mdx`; older internal design notes remain in `docs/*.md` and are hidden unless added to navigation.
+The published docs use Mintlify from the repository's `docs-site/` directory. Internal engineering notes stay in `docs/`.
 
 Preview from an isolated docs workspace:
 
@@ -121,11 +140,18 @@ make docs-validate
 make docs-broken-links
 ```
 
-Check navigation paths directly when editing `docs.json`:
+The docs helper pins the Mintlify CLI version for deterministic local and CI behavior. Override it only when intentionally testing a CLI upgrade:
 
 ```bash
+MINTLIFY_PACKAGE=mintlify@latest make docs-validate
+```
+
+Check navigation paths directly when editing `docs-site/docs.json`:
+
+```bash
+cd docs-site
 jq empty docs.json
 for p in $(jq -r '.. | .pages? // empty | .[]? | strings' docs.json); do test -f "$p.mdx" || echo "missing $p.mdx"; done
 ```
 
-The isolated docs workspace avoids Mintlify scanning internal repository files that are not part of the published site.
+Keeping the Mintlify root in `docs-site/` avoids mixing public docs with internal design notes.

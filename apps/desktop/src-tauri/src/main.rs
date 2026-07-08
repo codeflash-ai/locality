@@ -8,7 +8,7 @@ use std::io;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{
     Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
@@ -89,7 +89,8 @@ use localityd::media::{document_with_absolute_media_hrefs, update_hydrated_media
 use localityd::push::execute_auto_save_push_job_with_content_root;
 use localityd::runtime::repair_clean_remote_deleted_projections;
 use localityd::source::{
-    ResolvedSource, resolve_source_for_mount_id, resolve_source_for_path, source_display_name,
+    ResolvedSource, SourceAdapter, resolve_source_for_mount_id, resolve_source_for_path,
+    source_display_name,
 };
 #[cfg(target_os = "macos")]
 use localityd::virtual_fs::materialize_virtual_fs_item_with_content_root;
@@ -1249,7 +1250,10 @@ async fn locate_notion_page(url: String) -> Result<LocatedItem, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let query = url.trim();
         if query.is_empty() {
-            return Err("Paste a Notion page URL or search your local Notion index.".to_string());
+            return Err(
+                "Paste a Notion page or database URL, or search your local Notion index."
+                    .to_string(),
+            );
         }
 
         locate_notion_query(query)
@@ -2865,6 +2869,26 @@ fn quit_completely(app: AppHandle) -> ActionReport {
     }
 }
 
+#[tauri::command]
+async fn schedule_update_relaunch() -> ActionReport {
+    match tauri::async_runtime::spawn_blocking(schedule_update_relaunch_blocking).await {
+        Ok(Ok(message)) => ActionReport { ok: true, message },
+        Ok(Err(message)) => ActionReport { ok: false, message },
+        Err(error) => ActionReport {
+            ok: false,
+            message: format!("Could not schedule relaunch: {error}"),
+        },
+    }
+}
+
+fn schedule_update_relaunch_blocking() -> Result<String, String> {
+    let pid = std::process::id();
+    let executable = env::current_exe()
+        .map_err(|error| format!("Could not resolve Locality executable: {error}"))?;
+    schedule_relaunch_after_process_exit(pid, &executable)?;
+    Ok("Locality relaunch scheduled.".to_string())
+}
+
 fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let state_root = default_state_root();
     let store = SqliteStateStore::open(state_root.clone()).map_err(|error| error.to_string())?;
@@ -4057,7 +4081,7 @@ fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
         if notion_id_from_url(query).is_some() {
             notion_access_miss_message()
         } else {
-            "No local Notion page matched that search yet. Try a page title, path fragment, or Notion URL."
+            "No local Notion page or database matched that search yet. Try a title, path fragment, or Notion URL."
                 .to_string()
         }
     })?;
@@ -4076,7 +4100,7 @@ fn unsupported_notion_locator_url_message(query: &str) -> Option<String> {
         None => format!("`{host}`"),
     };
     Some(format!(
-        "That looks like a {source} URL. This field opens Notion pages only; paste a Notion page URL, page title, or mounted Notion path."
+        "That looks like a {source} URL. This field opens Notion pages and databases only; paste a Notion page or database URL, title, or mounted Notion path."
     ))
 }
 
@@ -4105,7 +4129,7 @@ fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
         .filter(|mount| mount.connector == "notion")
         .collect::<Vec<_>>();
     if mounts.is_empty() {
-        return Err("Create a Notion folder before locating pages.".to_string());
+        return Err("Create a Notion folder before locating pages or databases.".to_string());
     }
 
     let credentials = open_credential_store(&state_root);
@@ -4122,7 +4146,7 @@ fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
         let ResolvedSource::Notion(connector) = source else {
             continue;
         };
-        match connector.resolve_page_path_entries(mount.mount_id.clone(), &remote_id) {
+        match connector.resolve_object_path_entries(mount.mount_id.clone(), &remote_id) {
             Ok(entries)
                 if entries
                     .iter()
@@ -4133,7 +4157,7 @@ fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
             }
             Ok(_) => {
                 last_error = Some(format!(
-                    "Notion page `{}` was not returned while resolving its parent hierarchy.",
+                    "Notion object `{}` was not returned while resolving its parent hierarchy.",
                     remote_id.0
                 ));
             }
@@ -4216,7 +4240,7 @@ fn exact_located_entity_record(
 
 fn notion_access_miss_message() -> String {
     let Ok(store) = SqliteStateStore::open(default_state_root()) else {
-        return "That Notion page is outside the selected Notion access for this mount. Use Change Notion Access to select the page or teamspace, then sync the workspace.".to_string();
+        return "That Notion page or database is outside the selected Notion access for this mount. Use Change Notion Access to select the page, database, or teamspace, then sync the workspace.".to_string();
     };
     let mounts = store.load_mounts().unwrap_or_default();
     let connections = store.list_connections().unwrap_or_default();
@@ -4259,7 +4283,7 @@ fn notion_access_miss_message_from_parts(
         .map(|url| format!(" Open the mounted root ({url}) to confirm the current access scope."))
         .unwrap_or_default();
     format!(
-        "That Notion page is outside the selected Notion access for workspace `{workspace}`. Current mount access: `{access_scope}`.{root_hint} Use Change Notion Access to select this page or the correct teamspace, then sync the workspace."
+        "That Notion page or database is outside the selected Notion access for workspace `{workspace}`. Current mount access: `{access_scope}`.{root_hint} Use Change Notion Access to select this page, database, or the correct teamspace, then sync the workspace."
     )
 }
 
@@ -4336,7 +4360,7 @@ fn search_notion_results(query: &str, limit: usize) -> Result<Vec<SearchResult>,
         .filter(|mount| mount.connector == "notion")
         .collect::<Vec<_>>();
     if mounts.is_empty() {
-        return Err("Create a Notion mount point before locating pages.".to_string());
+        return Err("Create a Notion mount point before locating pages or databases.".to_string());
     }
 
     Ok(run_search_with_access_roots(
@@ -5593,6 +5617,88 @@ fn open_in_file_manager(path: &Path) -> Result<(), String> {
 
     command.spawn().map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn schedule_relaunch_after_process_exit(pid: u32, executable: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let target =
+            macos_app_bundle_for_exe(executable).unwrap_or_else(|| executable.to_path_buf());
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; sleep 0.3; exec /usr/bin/open -n \"$2\"",
+            )
+            .arg("locality-update-relaunch")
+            .arg(pid.to_string())
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not schedule macOS relaunch: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = "$ErrorActionPreference = 'SilentlyContinue'; \
+            Wait-Process -Id ([int]$args[0]); \
+            Start-Sleep -Milliseconds 300; \
+            Start-Process -FilePath $args[1]";
+        Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-WindowStyle")
+            .arg("Hidden")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(script)
+            .arg(pid.to_string())
+            .arg(executable)
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not schedule Windows relaunch: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = env::var_os("APPIMAGE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| executable.to_path_buf());
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg("while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; sleep 0.3; exec \"$2\"")
+            .arg("locality-update-relaunch")
+            .arg(pid.to_string())
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Could not schedule Linux relaunch: {error}"))?;
+        return Ok(());
+    }
+}
+
+fn macos_app_bundle_for_exe(executable: &Path) -> Option<PathBuf> {
+    let macos_dir = executable.parent()?;
+    if macos_dir.file_name()? != "MacOS" {
+        return None;
+    }
+    let contents_dir = macos_dir.parent()?;
+    if contents_dir.file_name()? != "Contents" {
+        return None;
+    }
+    let app_dir = contents_dir.parent()?;
+    if app_dir.extension()? != "app" {
+        return None;
+    }
+    Some(app_dir.to_path_buf())
 }
 
 fn open_path_in_vs_code(path: &Path) -> Result<(), String> {
@@ -7099,7 +7205,7 @@ fn activate_virtual_projection_mount(
     }
     ensure_virtual_projection_runtime(state_root, mount)?;
     signal_virtual_projection_refresh(mount);
-    verify_virtual_projection_mount_root(mount)?;
+    recover_virtual_projection_mount_root_if_needed(state_root, mount)?;
     desktop_log(
         "info",
         "file_provider.activate_finished",
@@ -7111,9 +7217,14 @@ fn activate_virtual_projection_mount(
     Ok(())
 }
 
-fn verify_virtual_projection_mount_root(mount: &MountConfig) -> Result<(), String> {
+fn recover_virtual_projection_mount_root_if_needed(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
     match mount.projection {
-        ProjectionMode::MacosFileProvider => verify_macos_file_provider_mount_root(mount),
+        ProjectionMode::MacosFileProvider => {
+            recover_macos_file_provider_mount_root_if_needed(state_root, mount)
+        }
         ProjectionMode::LinuxFuse
         | ProjectionMode::PlainFiles
         | ProjectionMode::WindowsCloudFiles => Ok(()),
@@ -7130,8 +7241,101 @@ fn virtual_projection_waits_for_mount_point_children_before_registration(
 }
 
 #[cfg(target_os = "macos")]
-fn verify_macos_file_provider_mount_root(mount: &MountConfig) -> Result<(), String> {
+fn recover_macos_file_provider_mount_root_if_needed(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<(), String> {
+    let expected_child_count =
+        expected_virtual_projection_mount_point_child_count(state_root, mount)?;
     let root = mount_access_root(mount);
+    let details = evaluate_macos_file_provider_mount_root(&root)?;
+
+    let Some(reason) =
+        macos_file_provider_mount_root_recovery_reason(&root, &details, Some(expected_child_count))
+    else {
+        return Ok(());
+    };
+
+    desktop_log(
+        "warn",
+        "file_provider.recover_started",
+        format!(
+            "recovering macOS File Provider domain for mount `{}` after activation: {reason}",
+            mount.mount_id.0
+        ),
+    );
+    reset_macos_file_provider_domain(&reason)?;
+    register_macos_virtual_projection(&mount.mount_id.0, &mount.root.display().to_string())?;
+    macos_file_provider_domain_url(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+        .map_err(|error| {
+            format!(
+                "Could not open macOS File Provider domain after recovery for `{}`: {}",
+                mount.mount_id.0,
+                error.message()
+            )
+        })?;
+    prefetch_virtual_projection_root(state_root, mount)?;
+    ensure_virtual_projection_runtime(state_root, mount)?;
+    signal_virtual_projection_refresh(mount);
+
+    wait_for_macos_file_provider_mount_root_recovery(&root, expected_child_count)?;
+
+    desktop_log(
+        "info",
+        "file_provider.recover_finished",
+        format!(
+            "recovered macOS File Provider domain for mount `{}`",
+            mount.mount_id.0
+        ),
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_macos_file_provider_mount_root_recovery(
+    root: &Path,
+    expected_child_count: usize,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+
+    loop {
+        let reason = match evaluate_macos_file_provider_mount_root(root) {
+            Ok(details) => match macos_file_provider_mount_root_recovery_reason(
+                root,
+                &details,
+                Some(expected_child_count),
+            ) {
+                Some(reason) => reason,
+                None => return Ok(()),
+            },
+            Err(error) => error,
+        };
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "macOS File Provider recovery did not produce a healthy mount root `{}`: {reason}",
+                root.display()
+            ));
+        }
+        std::thread::sleep(VIRTUAL_PROJECTION_SOURCE_READY_POLL);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn expected_virtual_projection_mount_point_child_count(
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<usize, String> {
+    let report = load_virtual_projection_children_report(
+        state_root,
+        &mount.mount_id.0,
+        &mount_point_identifier(mount),
+    )?;
+    Ok(report.children.len())
+}
+
+#[cfg(target_os = "macos")]
+fn evaluate_macos_file_provider_mount_root(root: &Path) -> Result<String, String> {
     let output = Command::new("/usr/bin/fileproviderctl")
         .arg("evaluate")
         .arg(&root)
@@ -7152,10 +7356,19 @@ fn verify_macos_file_provider_mount_root(mount: &MountConfig) -> Result<(), Stri
             details.trim()
         ));
     }
-    if let Some(error) = macos_file_provider_mount_root_health_error(&root, &details) {
-        return Err(error);
-    }
-    Ok(())
+    Ok(details)
+}
+
+#[cfg(target_os = "macos")]
+fn reset_macos_file_provider_domain(reason: &str) -> Result<(), String> {
+    run_macos_file_provider_helper("reset", Vec::new())
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Could not reset macOS File Provider domain while recovering from `{reason}`: {}",
+                error.message()
+            )
+        })
 }
 
 fn macos_file_provider_mount_root_health_error(root: &Path, details: &str) -> Option<String> {
@@ -7168,8 +7381,48 @@ fn macos_file_provider_mount_root_health_error(root: &Path, details: &str) -> Op
     None
 }
 
+fn macos_file_provider_mount_root_recovery_reason(
+    root: &Path,
+    details: &str,
+    expected_child_count: Option<usize>,
+) -> Option<String> {
+    if let Some(error) = macos_file_provider_mount_root_health_error(root, details) {
+        return Some(error);
+    }
+
+    let expected_child_count = expected_child_count?;
+    let actual_child_count = macos_file_provider_child_item_count(details)?;
+    if actual_child_count != expected_child_count {
+        return Some(format!(
+            "The macOS File Provider mount root `{}` reports {} visible child item{} but Locality has {} current child item{}.",
+            root.display(),
+            actual_child_count,
+            if actual_child_count == 1 { "" } else { "s" },
+            expected_child_count,
+            if expected_child_count == 1 { "" } else { "s" },
+        ));
+    }
+
+    None
+}
+
+fn macos_file_provider_child_item_count(details: &str) -> Option<usize> {
+    let (_, after_label) = details.split_once("childItemCount")?;
+    let (_, after_equals) = after_label.split_once('=')?;
+    after_equals
+        .trim_start()
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 #[cfg(not(target_os = "macos"))]
-fn verify_macos_file_provider_mount_root(_mount: &MountConfig) -> Result<(), String> {
+fn recover_macos_file_provider_mount_root_if_needed(
+    _state_root: &Path,
+    _mount: &MountConfig,
+) -> Result<(), String> {
     Ok(())
 }
 
@@ -7912,7 +8165,11 @@ fn signal_virtual_projection_refresh(mount: &MountConfig) {
 
 fn virtual_projection_refresh_signal_identifiers(mount: &MountConfig) -> Vec<String> {
     if mount.projection == ProjectionMode::MacosFileProvider {
-        return vec!["working-set".to_string()];
+        return vec![
+            ROOT_CONTAINER_IDENTIFIER.to_string(),
+            mount_point_identifier(mount),
+            "working-set".to_string(),
+        ];
     }
     vec![
         ROOT_CONTAINER_IDENTIFIER.to_string(),
@@ -7926,7 +8183,7 @@ fn signal_virtual_projection_container(
 ) -> Result<(), String> {
     match mount.projection {
         ProjectionMode::MacosFileProvider => {
-            signal_macos_virtual_projection(&mount.mount_id.0, container_identifier)
+            refresh_macos_virtual_projection(&mount.mount_id.0, container_identifier)
         }
         ProjectionMode::LinuxFuse
         | ProjectionMode::PlainFiles
@@ -7935,16 +8192,39 @@ fn signal_virtual_projection_container(
 }
 
 #[cfg(target_os = "macos")]
+fn refresh_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(), String> {
+    if identifier == "working-set" {
+        return signal_macos_virtual_projection(mount_id, identifier);
+    }
+
+    reimport_macos_virtual_projection(mount_id, identifier)
+        .or_else(|_| signal_macos_virtual_projection(mount_id, identifier))
+}
+
+#[cfg(target_os = "macos")]
 fn signal_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(), String> {
     let provider_identifier = if identifier == "working-set" {
         "working-set".to_string()
     } else {
-        macos_file_provider_item_identifier(mount_id, identifier)
+        daemon_file_provider::macos_file_provider_item_identifier(mount_id, identifier)
     };
     run_macos_file_provider_refresh_action("signal", &provider_identifier).map_err(
         |signal_error| {
             format!(
                 "Could not refresh macOS File Provider for `{identifier}`: signal failed: {signal_error}"
+            )
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn reimport_macos_virtual_projection(mount_id: &str, identifier: &str) -> Result<(), String> {
+    let provider_identifier =
+        daemon_file_provider::macos_file_provider_item_identifier(mount_id, identifier);
+    run_macos_file_provider_refresh_action("reimport", &provider_identifier).map_err(
+        |reimport_error| {
+            format!(
+                "Could not refresh macOS File Provider for `{identifier}`: reimport failed: {reimport_error}"
             )
         },
     )
@@ -7968,49 +8248,8 @@ fn run_macos_file_provider_refresh_action(
     .map_err(|error| error.message().to_string())
 }
 
-#[cfg(target_os = "macos")]
-fn macos_file_provider_item_identifier(mount_id: &str, identifier: &str) -> String {
-    if identifier == ROOT_CONTAINER_IDENTIFIER {
-        return ROOT_CONTAINER_IDENTIFIER.to_string();
-    }
-    format!(
-        "m:{}:{}",
-        macos_file_provider_encode_identifier_component(mount_id),
-        macos_file_provider_encode_identifier_component(identifier)
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn macos_file_provider_encode_identifier_component(value: &str) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let bytes = value.as_bytes();
-    let mut output = String::with_capacity((bytes.len() * 4).div_ceil(3));
-    let mut index = 0;
-    while index < bytes.len() {
-        let first = bytes[index];
-        let second = bytes.get(index + 1).copied();
-        let third = bytes.get(index + 2).copied();
-
-        output.push(TABLE[(first >> 2) as usize] as char);
-        output.push(
-            TABLE[(((first & 0b0000_0011) << 4) | second.unwrap_or(0) >> 4) as usize] as char,
-        );
-        if let Some(second) = second {
-            output.push(
-                TABLE[(((second & 0b0000_1111) << 2) | third.unwrap_or(0) >> 6) as usize] as char,
-            );
-        }
-        if let Some(third) = third {
-            output.push(TABLE[(third & 0b0011_1111) as usize] as char);
-        }
-
-        index += 3;
-    }
-    output
-}
-
 #[cfg(not(target_os = "macos"))]
-fn signal_macos_virtual_projection(_mount_id: &str, _identifier: &str) -> Result<(), String> {
+fn refresh_macos_virtual_projection(_mount_id: &str, _identifier: &str) -> Result<(), String> {
     Ok(())
 }
 
@@ -8328,6 +8567,15 @@ fn refresh_notion_mount_after_connect(
     }
 
     clear_mount_cached_projection(store, state_root, &mount.mount_id)?;
+    let credentials = open_credential_store(state_root);
+    let connector = resolve_source_for_mount_id(store, credentials.as_ref(), &mount.mount_id)
+        .map_err(|error| {
+            format!(
+                "Could not prepare the refreshed Notion access: {}",
+                error.message()
+            )
+        })?;
+    refresh_mount_root_after_access_change(store, &connector, state_root, &mount)?;
     reload_daemon_mounts(state_root)?;
 
     let projection_warning = if mount.projection.uses_virtual_filesystem() {
@@ -8362,6 +8610,24 @@ fn refresh_notion_mount_after_connect(
         message.push_str(&warning);
     }
     Ok(message)
+}
+
+fn refresh_mount_root_after_access_change<Source>(
+    store: &mut SqliteStateStore,
+    source: &Source,
+    state_root: &Path,
+    mount: &MountConfig,
+) -> Result<PullReport, String>
+where
+    Source: SourceAdapter + Clone,
+{
+    run_pull_with_state_root(store, source, mount.root.clone(), Some(state_root)).map_err(|error| {
+        format!(
+            "Could not populate the refreshed Notion access for `{}`: {}",
+            mount.root.display(),
+            error.message()
+        )
+    })
 }
 
 fn connection_metadata_changed(
@@ -8824,6 +9090,21 @@ fn clear_mount_cached_projection(
     state_root: &Path,
     mount_id: &MountId,
 ) -> Result<(), String> {
+    let mount = store
+        .get_mount(mount_id)
+        .map_err(|error| format!("Could not inspect cached Notion mount: {error}"))?;
+    let cached_entities = if mount.is_some() {
+        store
+            .list_entities(mount_id)
+            .map_err(|error| format!("Could not inspect cached Notion items: {error}"))?
+    } else {
+        Vec::new()
+    };
+
+    if let Some(mount) = mount.as_ref() {
+        clear_visible_projection_paths(mount, &cached_entities)?;
+    }
+
     store
         .clear_mount_source_state(mount_id)
         .map_err(|error| format!("Could not clear cached Notion mount state: {error}"))?;
@@ -8838,6 +9119,128 @@ fn clear_mount_cached_projection(
         })?;
     }
 
+    Ok(())
+}
+
+fn clear_visible_projection_paths(
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+) -> Result<(), String> {
+    if mount.projection == ProjectionMode::MacosFileProvider {
+        return Ok(());
+    }
+
+    let mut removals = BTreeSet::new();
+    for root in daemon_file_provider::mount_access_roots(mount) {
+        for entity in entities {
+            for relative_path in visible_projection_cleanup_paths(entity) {
+                let path = safe_visible_projection_path(&root, &relative_path)?;
+                removals.insert((root.clone(), path));
+            }
+        }
+    }
+
+    let mut removals = removals.into_iter().collect::<Vec<_>>();
+    removals.sort_by(|(_, left), (_, right)| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| right.cmp(left))
+    });
+
+    for (root, path) in removals {
+        remove_visible_projection_path(&root, &path)?;
+    }
+
+    Ok(())
+}
+
+fn visible_projection_cleanup_paths(entity: &EntityRecord) -> Vec<PathBuf> {
+    match entity.kind {
+        EntityKind::Database => vec![entity.path.join("_schema.yaml"), entity.path.clone()],
+        EntityKind::Directory => vec![entity.path.clone()],
+        EntityKind::Page | EntityKind::Asset | EntityKind::Unknown(_) => vec![entity.path.clone()],
+    }
+}
+
+fn safe_visible_projection_path(root: &Path, relative_path: &Path) -> Result<PathBuf, String> {
+    if relative_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(format!(
+            "Could not clear visible projection path with unsafe cached path `{}`.",
+            relative_path.display()
+        ));
+    }
+    Ok(root.join(relative_path))
+}
+
+fn remove_visible_projection_path(root: &Path, path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect visible stale Notion file `{}`: {error}",
+                path.display()
+            ));
+        }
+    };
+
+    if metadata.is_dir() {
+        match fs::remove_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "Could not remove visible stale Notion folder `{}`: {error}",
+                    path.display()
+                ));
+            }
+        }
+        prune_empty_visible_projection_parents(root, path.parent())?;
+    } else {
+        fs::remove_file(path).map_err(|error| {
+            format!(
+                "Could not remove visible stale Notion file `{}`: {error}",
+                path.display()
+            )
+        })?;
+        prune_empty_visible_projection_parents(root, path.parent())?;
+    }
+
+    Ok(())
+}
+
+fn prune_empty_visible_projection_parents(
+    root: &Path,
+    mut current: Option<&Path>,
+) -> Result<(), String> {
+    while let Some(directory) = current {
+        if directory == root || !directory.starts_with(root) {
+            break;
+        }
+        match fs::remove_dir(directory) {
+            Ok(()) => current = directory.parent(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                current = directory.parent();
+            }
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => break,
+            Err(error) => {
+                return Err(format!(
+                    "Could not remove empty stale Notion folder `{}`: {error}",
+                    directory.display()
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -9511,7 +9914,7 @@ fn env_first(keys: &[&str]) -> Option<String> {
 mod tests {
     use super::LiveModeRemoteDriftMerge;
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9539,30 +9942,33 @@ mod tests {
     use super::{
         ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, MonitorScreenBounds,
         PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState, activity_timestamp,
-        clear_mount_cached_projection, clear_state_root_contents, conflict_preview,
-        connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
-        diff_report_message, exact_located_entity_record, exact_notion_entry_matches,
-        failed_push_summary, has_unresolved_conflict_markers, hydration_after_editor_write,
-        inspect_install_state, install_terminal_cli_link_at,
+        clear_mount_cached_projection, clear_state_root_contents, clear_visible_projection_paths,
+        conflict_preview, connection_metadata_changed, current_daemon_build_id,
+        current_desktop_build_id, diff_report_message, exact_located_entity_record,
+        exact_notion_entry_matches, failed_push_summary, has_unresolved_conflict_markers,
+        hydration_after_editor_write, inspect_install_state, install_terminal_cli_link_at,
         install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
         is_unsupported_schema_version_message, live_mode_local_reconcile_targets_for_mount_at,
         live_mode_merge_remote_drift_markdown, live_mode_remote_check_page_budget_for_rate,
         live_mode_remote_pull_candidates, live_mode_remote_pull_scan_is_due_for_key,
         live_mode_should_reconcile_local_target_for_key, live_mode_target,
         live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
-        macos_file_provider_mount_root_health_error, mark_mount_live_mode_syncing,
+        macos_app_bundle_for_exe, macos_file_provider_child_item_count,
+        macos_file_provider_mount_root_health_error,
+        macos_file_provider_mount_root_recovery_reason, mark_mount_live_mode_syncing,
         mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
         parse_daemon_build_info_json, pending_changes_from_status,
         prepare_existing_workspace_mount_for_remount, preserve_mount_pending_local_changes,
         pull_error_message, pull_report_message, push_action_message,
         record_current_install_marker, record_desktop_activity, record_mount_live_mode_tick_result,
-        refresh_visible_target_from_cache, reset_to_remote_message, sample_live_mode_status,
-        sample_snapshot, screen_bounds_for_anchor_from_monitors, shell_single_quote,
-        should_hide_tray_popover, should_prioritize_located_result,
-        state_event_path_requires_refresh, state_event_path_wakes_live_mode,
-        summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
-        tray_popover_anchor, tray_popover_position, unsupported_notion_locator_url_message,
-        validate_mount_root, virtual_projection_prefetch_container_identifiers,
+        refresh_mount_root_after_access_change, refresh_visible_target_from_cache,
+        reset_to_remote_message, sample_live_mode_status, sample_snapshot,
+        screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
+        should_prioritize_located_result, state_event_path_requires_refresh,
+        state_event_path_wakes_live_mode, summarize_virtual_projection_children,
+        terminal_cli_link_state, tray_icon_image, tray_popover_anchor, tray_popover_position,
+        unsupported_notion_locator_url_message, validate_mount_root,
+        virtual_projection_prefetch_container_identifiers,
         virtual_projection_refresh_signal_identifiers,
         virtual_projection_waits_for_mount_point_children_before_registration,
         wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
@@ -9585,6 +9991,24 @@ mod tests {
     }
 
     #[test]
+    fn macos_app_bundle_for_exe_resolves_bundle_root() {
+        let executable =
+            PathBuf::from("/Applications/Locality.app/Contents/MacOS/locality-desktop");
+
+        assert_eq!(
+            macos_app_bundle_for_exe(&executable),
+            Some(PathBuf::from("/Applications/Locality.app"))
+        );
+    }
+
+    #[test]
+    fn macos_app_bundle_for_exe_ignores_plain_executables() {
+        let executable = PathBuf::from("/usr/local/bin/locality-desktop");
+
+        assert_eq!(macos_app_bundle_for_exe(&executable), None);
+    }
+
+    #[test]
     fn notion_access_miss_message_names_selected_scope() {
         let message = super::notion_access_miss_message_from_parts(
             "Synergy Labs",
@@ -9594,7 +10018,7 @@ mod tests {
 
         assert!(message.contains("workspace `Synergy Labs`"));
         assert!(message.contains("Current mount access: `Product Teamspace`"));
-        assert!(message.contains("select this page or the correct teamspace"));
+        assert!(message.contains("select this page, database, or the correct teamspace"));
         assert!(message.contains("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972"));
     }
 
@@ -10824,7 +11248,7 @@ mod tests {
         .expect("unsupported URL message");
 
         assert!(message.contains("GitHub"));
-        assert!(message.contains("Notion pages only"));
+        assert!(message.contains("Notion pages and databases only"));
     }
 
     #[test]
@@ -11403,7 +11827,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_projection_refresh_signals_macos_file_provider_working_set() {
+    fn virtual_projection_refresh_signals_macos_file_provider_visible_containers() {
         let mount = MountConfig::new(
             MountId::new("notion-main"),
             "notion",
@@ -11413,7 +11837,11 @@ mod tests {
 
         assert_eq!(
             virtual_projection_refresh_signal_identifiers(&mount),
-            vec!["working-set".to_string()]
+            vec![
+                "root".to_string(),
+                "mount:notion-main".to_string(),
+                "working-set".to_string(),
+            ]
         );
     }
 
@@ -11507,6 +11935,63 @@ mod tests {
                 .expect("local upload error should be rejected");
 
         assert!(error.contains("local-upload error state"));
+    }
+
+    #[test]
+    fn macos_file_provider_recovery_reason_detects_child_count_mismatch() {
+        let details = r#"
+            fileproviderItems = (
+              {
+                childItemCount = 4;
+                displayName = notion;
+                itemIdentifier = "m:bm90aW9uLW1haW4:bW91bnQ6bm90aW9uLW1haW4";
+              }
+            );
+        "#;
+
+        let reason = macos_file_provider_mount_root_recovery_reason(
+            Path::new("/tmp/Locality/notion"),
+            details,
+            Some(11),
+        )
+        .expect("child-count mismatch should trigger recovery");
+
+        assert!(reason.contains("reports 4 visible child items"));
+        assert!(reason.contains("Locality has 11 current child items"));
+    }
+
+    #[test]
+    fn macos_file_provider_recovery_reason_accepts_matching_child_count() {
+        let details = r#"
+            fileproviderItems = (
+              {
+                childItemCount = 11;
+                displayName = notion;
+                itemIdentifier = "m:bm90aW9uLW1haW4:bW91bnQ6bm90aW9uLW1haW4";
+              }
+            );
+        "#;
+
+        assert_eq!(
+            macos_file_provider_mount_root_recovery_reason(
+                Path::new("/tmp/Locality/notion"),
+                details,
+                Some(11),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_child_item_count_parses_evaluate_output() {
+        assert_eq!(
+            macos_file_provider_child_item_count("childItemCount = 11;\nfilename = notion;"),
+            Some(11)
+        );
+        assert_eq!(
+            macos_file_provider_child_item_count("filename = notion;"),
+            None
+        );
     }
 
     #[test]
@@ -11751,6 +12236,123 @@ mod tests {
         assert!(preserved.directory.join(relative_path).exists());
     }
 
+    #[derive(Clone)]
+    struct FakeAccessRefreshSource {
+        entries: Vec<TreeEntry>,
+    }
+
+    impl FakeAccessRefreshSource {
+        fn new(entries: Vec<TreeEntry>) -> Self {
+            Self { entries }
+        }
+    }
+
+    impl locality_connector::Connector for FakeAccessRefreshSource {
+        fn kind(&self) -> locality_connector::ConnectorKind {
+            locality_connector::ConnectorKind("fake-access-refresh")
+        }
+
+        fn capabilities(&self) -> locality_connector::ConnectorCapabilities {
+            locality_connector::ConnectorCapabilities::default()
+        }
+
+        fn supported_push_operations(&self) -> BTreeSet<locality_core::planner::PushOperationKind> {
+            BTreeSet::new()
+        }
+
+        fn enumerate(
+            &self,
+            _request: locality_connector::EnumerateRequest,
+        ) -> locality_core::LocalityResult<Vec<TreeEntry>> {
+            Ok(self.entries.clone())
+        }
+
+        fn list_children(
+            &self,
+            request: locality_connector::ListChildrenRequest,
+        ) -> locality_core::LocalityResult<locality_connector::ListChildrenResult> {
+            match request.container {
+                locality_connector::ChildContainer::Root => {
+                    Ok(locality_connector::ListChildrenResult {
+                        entries: self.entries.clone(),
+                    })
+                }
+                locality_connector::ChildContainer::PageChildren(_)
+                | locality_connector::ChildContainer::DatabaseRows(_) => {
+                    Ok(locality_connector::ListChildrenResult::default())
+                }
+            }
+        }
+
+        fn fetch(
+            &self,
+            _request: locality_connector::FetchRequest,
+        ) -> locality_core::LocalityResult<locality_connector::NativeEntity> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fake access refresh fetch",
+            ))
+        }
+
+        fn render(
+            &self,
+            _entity: &locality_connector::NativeEntity,
+        ) -> locality_core::LocalityResult<CanonicalDocument> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fake access refresh render",
+            ))
+        }
+
+        fn parse(
+            &self,
+            _document: &CanonicalDocument,
+        ) -> locality_core::LocalityResult<locality_connector::ParsedEntity> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fake access refresh parse",
+            ))
+        }
+
+        fn check_concurrency(
+            &self,
+            _request: locality_connector::ApplyPlanRequest<'_>,
+        ) -> locality_core::LocalityResult<()> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fake access refresh check concurrency",
+            ))
+        }
+
+        fn apply(
+            &self,
+            _request: locality_connector::ApplyPlanRequest<'_>,
+        ) -> locality_core::LocalityResult<locality_connector::ApplyPlanResult> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fake access refresh apply",
+            ))
+        }
+
+        fn apply_undo(
+            &self,
+            _request: locality_connector::ApplyUndoRequest<'_>,
+        ) -> locality_core::LocalityResult<locality_connector::ApplyUndoResult> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fake access refresh apply undo",
+            ))
+        }
+    }
+
+    impl localityd::hydration::HydrationSource for FakeAccessRefreshSource {
+        fn fetch_render(
+            &self,
+            _request: &locality_core::hydration::HydrationRequest,
+        ) -> locality_core::LocalityResult<localityd::hydration::HydratedEntity> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fake access refresh hydrate",
+            ))
+        }
+    }
+
+    impl localityd::source::SourcePushValidator for FakeAccessRefreshSource {}
+    impl localityd::source::SourceAdapter for FakeAccessRefreshSource {}
+
     #[test]
     fn workspace_remount_preserves_pending_changes_and_clears_stale_cache() {
         let temp = TestTempDir::new("workspace-remount-clears-stale-cache");
@@ -11771,10 +12373,19 @@ mod tests {
         store
             .save_mount(
                 MountConfig::new(mount_id.clone(), "notion", &mount_root)
-                    .projection(ProjectionMode::MacosFileProvider),
+                    .projection(ProjectionMode::LinuxFuse),
             )
             .expect("save mount");
         store.save_entity(entity).expect("save dirty entity");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("old-folder"),
+                EntityKind::Directory,
+                "Old access folder",
+                "engineering-wiki/old-access-folder",
+            ))
+            .expect("save stale directory entity");
         store
             .save_shadow(
                 &mount_id,
@@ -11793,6 +12404,12 @@ mod tests {
         fs::create_dir_all(content_path.parent().expect("content parent"))
             .expect("create content parent");
         fs::write(&content_path, "pending local body\n").expect("write content cache");
+        let visible_path = mount_root.join(relative_path);
+        fs::create_dir_all(visible_path.parent().expect("visible parent"))
+            .expect("create visible parent");
+        fs::write(&visible_path, "stale visible body\n").expect("write visible stale file");
+        let stale_empty_child = mount_root.join("engineering-wiki/old-access-folder");
+        fs::create_dir_all(&stale_empty_child).expect("create stale visible folder");
 
         let preserved =
             prepare_existing_workspace_mount_for_remount(&mut store, temp.path(), &mount_id)
@@ -11813,6 +12430,90 @@ mod tests {
             "stale page paths must not survive a workspace remount"
         );
         assert!(!localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id).exists());
+        assert!(
+            !visible_path.exists(),
+            "stale materialized files from the previous access scope must not remain visible"
+        );
+        assert!(
+            !stale_empty_child.exists(),
+            "empty stale folders from the previous access scope must not remain visible"
+        );
+
+        let new_remote_id = RemoteId::new("new-page");
+        let new_relative_path = Path::new("latest-access/page.md");
+        let refreshed_mount = store
+            .get_mount(&mount_id)
+            .expect("get refreshed mount")
+            .expect("mount remains after access refresh");
+        let source = FakeAccessRefreshSource::new(vec![TreeEntry {
+            mount_id: mount_id.clone(),
+            remote_id: new_remote_id.clone(),
+            kind: EntityKind::Page,
+            title: "Latest access page".to_string(),
+            path: new_relative_path.to_path_buf(),
+            hydration: HydrationState::Stub,
+            content_hash: None,
+            remote_edited_at: Some("2026-07-08T00:00:00.000Z".to_string()),
+            stub_frontmatter: None,
+        }]);
+
+        let report = refresh_mount_root_after_access_change(
+            &mut store,
+            &source,
+            temp.path(),
+            &refreshed_mount,
+        )
+        .expect("populate refreshed access");
+
+        assert_eq!(report.enumerated, 1);
+        assert!(
+            store
+                .find_entity_by_path(&mount_id, new_relative_path)
+                .expect("find latest entity")
+                .is_some(),
+            "access refresh should populate entities from the newly granted access"
+        );
+        let children = localityd::virtual_fs::virtual_fs_children(
+            &store,
+            &mount_id,
+            &super::mount_point_identifier(&refreshed_mount),
+        )
+        .expect("list refreshed virtual children");
+        assert!(
+            children
+                .children
+                .iter()
+                .any(|child| child.filename == "latest-access"),
+            "virtual provider children should include the newly granted access"
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_remount_does_not_delete_visible_placeholders_directly() {
+        let temp = TestTempDir::new("workspace-remount-keeps-file-provider-placeholders");
+        let mount_id = MountId::new("notion-main");
+        let mount_root = temp.path().join("notion");
+        let relative_path = Path::new("engineering-wiki/2026-06-26/page.md");
+        let mount = MountConfig::new(mount_id.clone(), "notion", &mount_root)
+            .projection(ProjectionMode::MacosFileProvider);
+        let entity = EntityRecord::new(
+            mount_id,
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "2026-06-26",
+            relative_path,
+        );
+        let visible_path = mount_root.join(relative_path);
+        fs::create_dir_all(visible_path.parent().expect("visible parent"))
+            .expect("create visible parent");
+        fs::write(&visible_path, "visible provider placeholder\n").expect("write visible");
+
+        clear_visible_projection_paths(&mount, &[entity]).expect("clear visible projection paths");
+
+        assert!(
+            visible_path.exists(),
+            "macOS File Provider placeholders should be refreshed through provider reimport, not deleted through the CloudStorage filesystem"
+        );
     }
 
     #[test]
@@ -13561,6 +14262,7 @@ fn main() {
             set_desktop_setting,
             hide_menubar,
             quit_completely,
+            schedule_update_relaunch,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Locality desktop app");

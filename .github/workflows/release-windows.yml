@@ -348,14 +348,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $createArgs = @("release", "create", $env:RELEASE_TAG, "--repo", $env:GITHUB_REPOSITORY, "--verify-tag", "--title", "Locality $env:APP_VERSION", "--generate-notes")
+          $createArgs = @("release", "create", $env:RELEASE_TAG, "--repo", $env:GITHUB_REPOSITORY, "--verify-tag", "--title", "Locality $env:APP_VERSION", "--notes", "Release assets are still being published.")
           $editArgs = @("release", "edit", $env:RELEASE_TAG, "--repo", $env:GITHUB_REPOSITORY, "--title", "Locality $env:APP_VERSION")
           if ($env:PRERELEASE -eq "true") {
             $createArgs += @("--prerelease", "--latest=false")
             $editArgs += @("--prerelease=true", "--latest=false")
           } else {
-            $createArgs += @("--latest=true")
-            $editArgs += @("--prerelease=false", "--latest=true")
+            $createArgs += @("--prerelease", "--latest=false")
+            $editArgs += @("--prerelease=true", "--latest=false")
           }
           gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -eq 0) {

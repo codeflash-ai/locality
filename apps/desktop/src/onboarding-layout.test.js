@@ -34,4 +34,15 @@ describe("onboarding layout styles", () => {
     );
     expect(styles).toMatch(/@media \(min-width:\s*1120px\)\s*\{[\s\S]*?\.setup-content\.hero-setup\s*\{[\s\S]*?justify-content:\s*center;/s);
   });
+
+  it("keeps connector onboarding cards from overlapping the copy column", () => {
+    expect(styles).toMatch(
+      /\.setup-content\.split-setup\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*0\.95fr\) minmax\(340px,\s*0\.85fr\);[\s\S]*?gap:\s*40px;/s,
+    );
+    expect(styles).toMatch(/\.setup-copy\s*\{[\s\S]*?width:\s*100%;/s);
+    expect(styles).toMatch(
+      /\.setup-content\.split-setup \.setup-copy h1,\s*\.setup-content\.split-setup \.setup-copy p\s*\{[\s\S]*?max-width:\s*100%;/s,
+    );
+    expect(styles).toMatch(/\.onboarding-pill-row\s*\{[\s\S]*?flex-wrap:\s*wrap;/s);
+  });
 });

@@ -5,7 +5,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MACOS_WORKFLOW="${ROOT}/.github/workflows/release-macos.yml"
 WINDOWS_WORKFLOW="${ROOT}/.github/workflows/release-windows.yml"
 LINUX_WORKFLOW="${ROOT}/.github/workflows/release-linux.yml"
+RELEASE_NOTES_WORKFLOW="${ROOT}/.github/workflows/release-notes.yml"
+RELEASE_FINALIZE_WORKFLOW="${ROOT}/.github/workflows/release-finalize.yml"
 UPDATER_SCRIPT="${ROOT}/scripts/render-tauri-updater-manifest.sh"
+RELEASE_NOTES_SCRIPT="${ROOT}/scripts/render-release-notes.sh"
+RELEASE_FINALIZE_SCRIPT="${ROOT}/scripts/finalize-github-release.sh"
 
 fail() {
   printf 'release asset names test: %s\n' "$*" >&2
@@ -22,6 +26,8 @@ grep -F -q 'HOMEBREW_DMG: target/release/github-assets/Locality_Mac_v${{ env.APP
   || fail "macOS Homebrew cask must point at the standard DMG asset"
 grep -F -q 'UPDATER_MACOS_AARCH64_ARTIFACT: target/release/github-assets/Locality_Mac_Updater_v${{ env.APP_VERSION }}.app.tar.gz' "${MACOS_WORKFLOW}" \
   || fail "macOS updater manifest must point at the standard updater asset"
+grep -F -q -- '--notes "Release assets are still being published."' "${MACOS_WORKFLOW}" \
+  || fail "macOS release workflow must create only placeholder release notes"
 
 grep -F -q 'Locality_Windows_v$env:APP_VERSION.exe' "${WINDOWS_WORKFLOW}" \
   || fail "Windows release workflow must publish Locality_Windows_v<version>.exe"
@@ -29,6 +35,14 @@ grep -F -q 'Locality_Windows.exe' "${WINDOWS_WORKFLOW}" \
   || fail "Windows release workflow must publish a stable Locality_Windows.exe alias"
 grep -F -q 'UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/windows/Locality_Windows_v${{ env.APP_VERSION }}.exe' "${WINDOWS_WORKFLOW}" \
   || fail "Windows updater manifest must point at the standard installer asset"
+grep -F -q -- '"--notes", "Release assets are still being published."' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows release workflow must create only placeholder release notes"
+grep -F -q '  push:' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows release workflow must stay unified with tag-triggered releases"
+grep -F -q '    tags:' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows release workflow must keep a tag trigger"
+grep -F -q '      - "v*"' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows release workflow must run for v* release tags"
 
 grep -F -q 'Locality_Linux_v${APP_VERSION}.deb' "${LINUX_WORKFLOW}" \
   || fail "Linux release workflow must publish Locality_Linux_v<version>.deb"
@@ -44,6 +58,41 @@ grep -F -q 'Locality_Linux.AppImage' "${LINUX_WORKFLOW}" \
   || fail "Linux release workflow must publish a stable Locality_Linux.AppImage alias"
 grep -F -q 'UPDATER_LINUX_X86_64_ARTIFACT: target/release/github-assets/Locality_Linux_v${{ env.APP_VERSION }}.AppImage' "${LINUX_WORKFLOW}" \
   || fail "Linux updater manifest must point at the standard AppImage asset"
+grep -F -q -- '--notes "Release assets are still being published."' "${LINUX_WORKFLOW}" \
+  || fail "Linux release workflow must create only placeholder release notes"
+
+grep -F -q 'scripts/render-release-notes.sh' "${RELEASE_NOTES_WORKFLOW}" \
+  || fail "release notes workflow must generate LLM release notes"
+grep -F -q 'npm install --global @openai/codex@0.143.0' "${RELEASE_NOTES_WORKFLOW}" \
+  || fail "release notes workflow must install Codex from npm"
+grep -F -q -- '--notes-file "${release_notes_file}"' "${RELEASE_NOTES_WORKFLOW}" \
+  || fail "release notes workflow must publish generated release notes"
+grep -F -q 'CODEX_CONFIG_TOML: ${{ secrets.CODEX_CONFIG_TOML }}' "${RELEASE_NOTES_WORKFLOW}" \
+  || fail "release notes workflow must expose Codex config to release notes"
+grep -F -q 'AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}' "${RELEASE_NOTES_WORKFLOW}" \
+  || fail "release notes workflow must expose Azure OpenAI key to release notes"
+if grep -F -q -- '--latest=true' "${MACOS_WORKFLOW}" "${WINDOWS_WORKFLOW}" "${LINUX_WORKFLOW}" "${RELEASE_NOTES_WORKFLOW}"; then
+  fail "release workflows must not mark incomplete releases as latest"
+fi
+grep -F -q 'scripts/finalize-github-release.sh' "${RELEASE_FINALIZE_WORKFLOW}" \
+  || fail "release finalizer workflow must run the release finalizer script"
+grep -F -q -- '--latest=true' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer script must be the only release path that marks releases latest"
+grep -F -q 'Locality_Mac.dmg' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer must require the stable macOS download asset"
+grep -F -q 'Locality_Linux.AppImage' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer must require stable Linux download assets"
+grep -F -q 'Locality_Windows.exe' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer must require the stable Windows download asset"
+if grep -F -q 'scripts/render-release-notes.sh' "${MACOS_WORKFLOW}" "${WINDOWS_WORKFLOW}" "${LINUX_WORKFLOW}"; then
+  fail "platform release workflows must not run Codex release-note generation"
+fi
+if grep -F -q -- '--generate-notes' "${MACOS_WORKFLOW}" "${WINDOWS_WORKFLOW}" "${LINUX_WORKFLOW}" "${RELEASE_NOTES_WORKFLOW}"; then
+  fail "release workflows must not use GitHub-generated release notes"
+fi
+
+[[ -x "${RELEASE_NOTES_SCRIPT}" ]] || fail "release notes renderer must be executable"
+[[ -x "${RELEASE_FINALIZE_SCRIPT}" ]] || fail "release finalizer must be executable"
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/loc-release-asset-names.XXXXXX")"
 cleanup() {

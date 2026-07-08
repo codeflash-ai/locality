@@ -190,11 +190,31 @@ latest-windows.json
 SHA256SUMS-windows
 ```
 
+The separate `.github/workflows/release-notes.yml` workflow generates the
+GitHub Release body with Codex from the commits since the previous reachable
+`v*` tag. Platform workflows create only a placeholder body when the release
+does not exist yet.
+Release creation is staged as prerelease and non-latest. The separate
+`.github/workflows/release-finalize.yml` workflow promotes the release to latest
+only after macOS, Linux, and Windows workflows have completed successfully and
+all expected public download assets are present. Until then,
+`/releases/latest/download/...` URLs continue to resolve to the previous complete
+release.
+
+Azure Artifact Signing uses GitHub OIDC. The Azure federated credentials must
+allow the tag-triggered workflow subject, preferably for all release tags such
+as `repo:codeflash-ai/locality:ref:refs/tags/v*`. Without that tag subject, the
+signing login fails before packaging starts.
+
 Required repository secrets:
 
 - `TAURI_UPDATER_PUBKEY`: public updater signing key.
 - `TAURI_SIGNING_PRIVATE_KEY`: private updater signing key.
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: updater key password, if one was set.
+
+The companion release-notes workflow requires `CODEX_CONFIG_TOML` plus the
+provider credential it references. For the Azure OpenAI setup, that means
+`AZURE_OPENAI_API_KEY`.
 
 Optional repository secrets for Authenticode signing:
 
