@@ -1249,7 +1249,10 @@ async fn locate_notion_page(url: String) -> Result<LocatedItem, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let query = url.trim();
         if query.is_empty() {
-            return Err("Paste a Notion page URL or search your local Notion index.".to_string());
+            return Err(
+                "Paste a Notion page or database URL, or search your local Notion index."
+                    .to_string(),
+            );
         }
 
         locate_notion_query(query)
@@ -4077,7 +4080,7 @@ fn locate_notion_query(query: &str) -> Result<LocatedItem, String> {
         if notion_id_from_url(query).is_some() {
             notion_access_miss_message()
         } else {
-            "No local Notion page matched that search yet. Try a page title, path fragment, or Notion URL."
+            "No local Notion page or database matched that search yet. Try a title, path fragment, or Notion URL."
                 .to_string()
         }
     })?;
@@ -4096,7 +4099,7 @@ fn unsupported_notion_locator_url_message(query: &str) -> Option<String> {
         None => format!("`{host}`"),
     };
     Some(format!(
-        "That looks like a {source} URL. This field opens Notion pages only; paste a Notion page URL, page title, or mounted Notion path."
+        "That looks like a {source} URL. This field opens Notion pages and databases only; paste a Notion page or database URL, title, or mounted Notion path."
     ))
 }
 
@@ -4125,7 +4128,7 @@ fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
         .filter(|mount| mount.connector == "notion")
         .collect::<Vec<_>>();
     if mounts.is_empty() {
-        return Err("Create a Notion folder before locating pages.".to_string());
+        return Err("Create a Notion folder before locating pages or databases.".to_string());
     }
 
     let credentials = open_credential_store(&state_root);
@@ -4142,7 +4145,7 @@ fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
         let ResolvedSource::Notion(connector) = source else {
             continue;
         };
-        match connector.resolve_page_path_entries(mount.mount_id.clone(), &remote_id) {
+        match connector.resolve_object_path_entries(mount.mount_id.clone(), &remote_id) {
             Ok(entries)
                 if entries
                     .iter()
@@ -4153,7 +4156,7 @@ fn prepare_exact_notion_url_path(query: &str) -> Result<(), String> {
             }
             Ok(_) => {
                 last_error = Some(format!(
-                    "Notion page `{}` was not returned while resolving its parent hierarchy.",
+                    "Notion object `{}` was not returned while resolving its parent hierarchy.",
                     remote_id.0
                 ));
             }
@@ -4236,7 +4239,7 @@ fn exact_located_entity_record(
 
 fn notion_access_miss_message() -> String {
     let Ok(store) = SqliteStateStore::open(default_state_root()) else {
-        return "That Notion page is outside the selected Notion access for this mount. Use Change Notion Access to select the page or teamspace, then sync the workspace.".to_string();
+        return "That Notion page or database is outside the selected Notion access for this mount. Use Change Notion Access to select the page, database, or teamspace, then sync the workspace.".to_string();
     };
     let mounts = store.load_mounts().unwrap_or_default();
     let connections = store.list_connections().unwrap_or_default();
@@ -4279,7 +4282,7 @@ fn notion_access_miss_message_from_parts(
         .map(|url| format!(" Open the mounted root ({url}) to confirm the current access scope."))
         .unwrap_or_default();
     format!(
-        "That Notion page is outside the selected Notion access for workspace `{workspace}`. Current mount access: `{access_scope}`.{root_hint} Use Change Notion Access to select this page or the correct teamspace, then sync the workspace."
+        "That Notion page or database is outside the selected Notion access for workspace `{workspace}`. Current mount access: `{access_scope}`.{root_hint} Use Change Notion Access to select this page, database, or the correct teamspace, then sync the workspace."
     )
 }
 
@@ -4356,7 +4359,7 @@ fn search_notion_results(query: &str, limit: usize) -> Result<Vec<SearchResult>,
         .filter(|mount| mount.connector == "notion")
         .collect::<Vec<_>>();
     if mounts.is_empty() {
-        return Err("Create a Notion mount point before locating pages.".to_string());
+        return Err("Create a Notion mount point before locating pages or databases.".to_string());
     }
 
     Ok(run_search_with_access_roots(
@@ -9715,7 +9718,7 @@ mod tests {
 
         assert!(message.contains("workspace `Synergy Labs`"));
         assert!(message.contains("Current mount access: `Product Teamspace`"));
-        assert!(message.contains("select this page or the correct teamspace"));
+        assert!(message.contains("select this page, database, or the correct teamspace"));
         assert!(message.contains("https://www.notion.so/37b3ac0ebb88802cbcf4d53c9cfc4972"));
     }
 
@@ -10945,7 +10948,7 @@ mod tests {
         .expect("unsupported URL message");
 
         assert!(message.contains("GitHub"));
-        assert!(message.contains("Notion pages only"));
+        assert!(message.contains("Notion pages and databases only"));
     }
 
     #[test]

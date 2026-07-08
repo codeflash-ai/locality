@@ -149,16 +149,48 @@ pub fn resolve_page_path_entries(
     root_page_id: Option<&RemoteId>,
     page_id: &RemoteId,
 ) -> LocalityResult<Vec<TreeEntry>> {
-    let mut resolver = ExactPathResolver {
+    let mut resolver = exact_path_resolver(api, mount_id, root_page_id);
+    resolver.resolve_page(page_id.as_str())?;
+    Ok(resolver.entries)
+}
+
+pub fn resolve_notion_object_path_entries(
+    api: &dyn NotionApi,
+    mount_id: MountId,
+    root_page_id: Option<&RemoteId>,
+    object_id: &RemoteId,
+) -> LocalityResult<Vec<TreeEntry>> {
+    let mut page_resolver = exact_path_resolver(api, mount_id.clone(), root_page_id);
+    match page_resolver.resolve_page(object_id.as_str()) {
+        Ok(_) => return Ok(page_resolver.entries),
+        Err(page_error) => {
+            let mut database_resolver = exact_path_resolver(api, mount_id, root_page_id);
+            database_resolver
+                .resolve_database(object_id.as_str())
+                .map(|_| database_resolver.entries)
+                .map_err(|database_error| {
+                    LocalityError::InvalidState(format!(
+                        "notion object `{}` could not be resolved as page ({page_error}) or database ({database_error})",
+                        object_id.as_str()
+                    ))
+                })
+        }
+    }
+}
+
+fn exact_path_resolver<'a>(
+    api: &'a dyn NotionApi,
+    mount_id: MountId,
+    root_page_id: Option<&'a RemoteId>,
+) -> ExactPathResolver<'a> {
+    ExactPathResolver {
         api,
         mount_id,
         root_page_id,
         resolved: BTreeMap::new(),
         resolving: BTreeSet::new(),
         entries: Vec::new(),
-    };
-    resolver.resolve_page(page_id.as_str())?;
-    Ok(resolver.entries)
+    }
 }
 
 struct ExactPathResolver<'a> {
@@ -1158,10 +1190,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ProjectedChild, allocate_child_paths, allocate_page_path, resolve_page_path_entries,
-        slugify_title,
+        ProjectedChild, allocate_child_paths, allocate_page_path,
+        resolve_notion_object_path_entries, resolve_page_path_entries, slugify_title,
     };
-    use locality_core::model::{MountId, RemoteId};
+    use locality_core::model::{EntityKind, MountId, RemoteId};
     use locality_core::path_projection::PAGE_DOCUMENT_FILENAME;
     use locality_core::{LocalityError, LocalityResult};
 
@@ -1430,6 +1462,35 @@ mod tests {
                 .join("longer-technical-launch-post")
                 .join(PAGE_DOCUMENT_FILENAME)
         );
+    }
+
+    #[test]
+    fn exact_object_resolution_accepts_database_ids() {
+        let api = FakeNotionApi::new().with_database(database_with_title(
+            "engineering-db",
+            "Engineering Wiki",
+            workspace_parent(),
+            vec![DataSourceSummaryDto {
+                id: "engineering-ds".to_string(),
+                name: Some("Engineering Wiki".to_string()),
+            }],
+        ));
+
+        let entries = resolve_notion_object_path_entries(
+            &api,
+            MountId::new("notion-main"),
+            None,
+            &RemoteId::new("engineering-db"),
+        )
+        .expect("resolve exact database hierarchy");
+
+        let resolved = entries
+            .iter()
+            .find(|entry| entry.remote_id.as_str() == "engineering-db")
+            .expect("resolved target database entry");
+
+        assert_eq!(resolved.kind, EntityKind::Database);
+        assert_eq!(resolved.path, Path::new("engineering-wiki"));
     }
 
     #[test]

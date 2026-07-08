@@ -13649,7 +13649,7 @@ fn desktop_style_locate_notion_url_path(
     let mut last_error = "unknown error".to_string();
     let mut resolved_entries = None;
     for _ in 0..8 {
-        match connector.resolve_page_path_entries(mount_id.clone(), &remote_id) {
+        match connector.resolve_object_path_entries(mount_id.clone(), &remote_id) {
             Ok(entries) => {
                 resolved_entries = Some(entries);
                 break;

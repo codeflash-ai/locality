@@ -83,6 +83,13 @@ fn notion_id_parser_rejects_non_notion_urls_with_hex_suffixes() {
         Some("37b3ac0ebb88802cbcf4d53c9cfc4972")
     );
     assert_eq!(
+        notion_id_from_url(
+            "https://app.notion.com/p/codeflash/4614fba49bdf45e0a0064f91dca082f1?v=9cc7553907744e2f8fb7bfcccf9d0ddd",
+        )
+        .as_deref(),
+        Some("4614fba49bdf45e0a0064f91dca082f1")
+    );
+    assert_eq!(
         notion_id_from_url("37b3ac0e-bb88-802c-bcf4-d53c9cfc4972").as_deref(),
         Some("37b3ac0ebb88802cbcf4d53c9cfc4972")
     );
