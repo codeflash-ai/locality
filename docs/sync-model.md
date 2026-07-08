@@ -515,9 +515,9 @@ Current local-only implementation:
   and mount-point containers are queued when virtual mounts are primed, and
   directory enumeration queues an interactive refresh only for the requested
   container so user-opened listings are brought current promptly. Successful
-  child refreshes do not recursively enqueue discovered
-  folder containers; deeper folders are refreshed when opened, pulled, or
-  explicitly hinted by remote-change flows.
+  child refreshes queue discovered folder containers at background priority so
+  mount-time indexing can continue traversing the tree without blocking
+  interactive directory opens.
 - Relay/webhook delivery remains intentionally unimplemented; Stage 10 only
   improves local scheduling and connector contracts.
 
