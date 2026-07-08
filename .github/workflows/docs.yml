@@ -6,20 +6,14 @@ on:
       - main
     paths:
       - ".github/workflows/docs.yml"
-      - ".mintignore"
       - "Makefile"
-      - "docs.json"
-      - "llms.txt"
-      - "docs/**/*.mdx"
+      - "docs-site/**"
       - "scripts/mintlify-docs.sh"
   pull_request:
     paths:
       - ".github/workflows/docs.yml"
-      - ".mintignore"
       - "Makefile"
-      - "docs.json"
-      - "llms.txt"
-      - "docs/**/*.mdx"
+      - "docs-site/**"
       - "scripts/mintlify-docs.sh"
   workflow_dispatch:
 
@@ -36,6 +30,7 @@ jobs:
 
       - name: Check docs navigation
         shell: bash
+        working-directory: docs-site
         run: |
           jq empty docs.json
           missing=0

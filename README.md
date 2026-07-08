@@ -85,7 +85,8 @@ Common targets:
 - `crates/locality-notion`: first-party Notion connector with live page/block reads, database row projection, schema rendering, narrow block writes, and supported page-property writes.
 - `crates/locality-store`: state-store abstraction and SQLite implementation.
 - `templates/mount/AGENTS.md`: generated mount guidance template for coding agents.
-- `docs/`: design notes split by implementation surface.
+- `docs/`: internal engineering notes and implementation design references.
+- `docs-site/`: public Mintlify documentation site.
 
 ## Current status
 

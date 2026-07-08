@@ -1,0 +1,7 @@
+# Locality Internal Docs
+
+This directory contains internal engineering notes, design docs, plans, diagnostics, and implementation references for the Locality repository.
+
+The public Mintlify documentation site lives in `../docs-site/`.
+
+Use this directory for repo-facing documentation that helps contributors understand architecture, sync behavior, platform internals, release implementation, and design history. Use `../docs-site/` for user-facing docs that should be published.
