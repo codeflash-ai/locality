@@ -98,6 +98,25 @@ make render-linux-repositories
 
 Do not publish a build that failed relevant checks.
 
+The dedicated `.github/workflows/release-notes.yml` workflow generates the
+GitHub Release body with `scripts/render-release-notes.sh`. The script compares
+`RELEASE_TAG` with the previous reachable `v*` tag, sends the commit range and
+diff summary to `codex exec`, and writes `target/release/release-notes.md` for
+`gh release create/edit --notes-file`. GitHub's PR-only generated notes are
+intentionally not used because direct commits to `main` are common. Platform
+release workflows only publish assets; if they create the release first, the
+notes workflow later replaces the placeholder body.
+
+GitHub Actions needs `CODEX_CONFIG_TOML` plus the provider credential named by
+that config. The current Azure OpenAI setup uses `AZURE_OPENAI_API_KEY`. Those
+secrets are passed only to the release-notes step.
+
+Validate the plumbing locally with:
+
+```bash
+make test-release-notes
+```
+
 ## Docs development
 
 The published docs use Mintlify from the repository's `docs-site/` directory. Internal engineering notes stay in `docs/`.

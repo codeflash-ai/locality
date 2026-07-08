@@ -291,10 +291,11 @@ GitHub-hosted `macos-15` arm64 runner, builds the notarized DMG, produces the
 signed updater archive, renders `latest-macos.json`, renders `loc.rb`, creates
 or updates the GitHub Release, uploads the public DMG as
 `Locality_Mac_v<version>.dmg`, also uploads the stable latest-download alias
-`Locality_Mac.dmg`, and optionally pushes the cask to the Homebrew tap. It
-shares a release concurrency group with the
-Linux workflow so both workflows can target the same tag without racing while
-creating or updating the GitHub Release.
+`Locality_Mac.dmg`, and optionally pushes the cask to the Homebrew tap. The
+separate `.github/workflows/release-notes.yml` workflow generates the GitHub
+Release body with Codex from the commits since the previous `v*` tag. Platform
+workflows create only a placeholder body when the release does not exist yet, so
+asset publication can proceed before the notes workflow finishes.
 
 Required repository secrets:
 
@@ -307,6 +308,10 @@ Required repository secrets:
 - `TAURI_UPDATER_PUBKEY`: public updater signing key.
 - `TAURI_SIGNING_PRIVATE_KEY`: private updater signing key.
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: updater key password, if one was set.
+
+The companion release-notes workflow requires `CODEX_CONFIG_TOML` plus the
+provider credential it references. For the Azure OpenAI setup, that means
+`AZURE_OPENAI_API_KEY`.
 
 Optional repository secret:
 

@@ -127,6 +127,10 @@ curl -L -o /tmp/loc.deb https://github.com/codeflash-ai/locality/releases/latest
 The GitHub Release also includes the versioned public aliases
 `Locality_Linux_v<version>.deb`, `Locality_Linux_v<version>.rpm`, and
 `Locality_Linux_v<version>.AppImage` for users who want the exact release asset.
+The separate `.github/workflows/release-notes.yml` workflow generates the
+GitHub Release body with Codex from the commits since the previous reachable
+`v*` tag. Platform workflows create only a placeholder body when the release
+does not exist yet.
 
 The workflow still renders date-and-commit package files inside the APT/RPM
 repositories deployed to GitHub Pages, but it does not upload those duplicate
@@ -151,6 +155,10 @@ Required repository secrets:
 - `LINUX_REPO_GPG_PRIVATE_KEY`: ASCII-armored GPG private key used to sign APT
   and RPM repository metadata.
 - `LINUX_REPO_GPG_PASSPHRASE`: passphrase for that key, if any.
+
+The companion release-notes workflow requires `CODEX_CONFIG_TOML` plus the
+provider credential it references. For the Azure OpenAI setup, that means
+`AZURE_OPENAI_API_KEY`.
 
 Repository publishing also requires GitHub Pages configured to deploy from
 GitHub Actions.
@@ -226,9 +234,9 @@ AppImage install command:
 mkdir -p ~/.local/bin && curl -L -o ~/.local/bin/Locality.AppImage https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.AppImage && chmod +x ~/.local/bin/Locality.AppImage
 ```
 
-The workflow shares the same release concurrency group as the macOS workflow so
-both jobs can target one tag without racing while creating or updating the
-GitHub Release.
+The Linux workflow can publish assets before the release-notes workflow
+finishes. In that case the GitHub Release body starts as a short placeholder and
+is replaced when `.github/workflows/release-notes.yml` completes.
 
 Release a new Linux package by updating the app version, committing the change,
 tagging that commit, and pushing the tag:

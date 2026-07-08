@@ -190,11 +190,20 @@ latest-windows.json
 SHA256SUMS-windows
 ```
 
+The separate `.github/workflows/release-notes.yml` workflow generates the
+GitHub Release body with Codex from the commits since the previous reachable
+`v*` tag. Platform workflows create only a placeholder body when the release
+does not exist yet.
+
 Required repository secrets:
 
 - `TAURI_UPDATER_PUBKEY`: public updater signing key.
 - `TAURI_SIGNING_PRIVATE_KEY`: private updater signing key.
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: updater key password, if one was set.
+
+The companion release-notes workflow requires `CODEX_CONFIG_TOML` plus the
+provider credential it references. For the Azure OpenAI setup, that means
+`AZURE_OPENAI_API_KEY`.
 
 Optional repository secrets for Authenticode signing:
 
