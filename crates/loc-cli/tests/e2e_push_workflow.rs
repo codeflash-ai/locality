@@ -16,7 +16,7 @@ use loc_cli::connect::{
     run_connect_google_docs_broker_oauth, run_connect_notion_broker_oauth, run_connection_show,
     run_connections, run_profiles,
 };
-use loc_cli::diff::{run_diff, run_diff_with_state_root};
+use loc_cli::diff::{PushOperationOutput, run_diff, run_diff_with_state_root};
 use loc_cli::history::{LogOptions, UndoOperationOutput, run_log, run_undo, run_undo_with_applier};
 use loc_cli::inspect::{InspectOptions, run_inspect};
 use loc_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
@@ -59,7 +59,7 @@ use locality_google_docs::{
 use locality_notion::client::{HttpNotionApi, NotionApi};
 use locality_notion::dto::{
     BlockDto, BlockListDto, DataSourceDto, DatabaseDto, NotionPageBundle, PageDto, PageListDto,
-    PagePropertyDto, PaginatedListDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
+    PagePropertyDto, PaginatedListDto, ParentDto, RichTextBlockDto, RichTextDto, SelectOptionDto,
     SyncedBlockDto, SyncedFromDto, TextRichTextDto, TitleBlockDto,
 };
 use locality_notion::media::resolve_media_href_with_content_root;
@@ -5834,6 +5834,204 @@ fn virtual_projection_modes_surface_pending_create_rename_delete_in_status_and_d
             "{projection:?}: pending create deletion should collapse without leaving a mutation"
         );
     }
+}
+
+#[test]
+fn virtual_page_directory_move_push_then_move_back_push_reconciles() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::with_page_and_blocks(
+        page("page-child", "Child"),
+        vec![paragraph_block("child-block", "Child body.")],
+    ));
+    let connector = NotionConnector::with_api(
+        NotionConfig::default().with_root_page_id(RemoteId::new("page-home")),
+        api.clone(),
+    );
+    mount_virtual_workspace(&fixture, &mut store, "page-home");
+    seed_virtual_page(
+        &mut store,
+        &fixture,
+        "page-home",
+        "Home",
+        "Home/page.md",
+        "Home body.",
+    );
+    seed_virtual_page(
+        &mut store,
+        &fixture,
+        "page-archive",
+        "Archive",
+        "Archive/page.md",
+        "Archive body.",
+    );
+    seed_virtual_page(
+        &mut store,
+        &fixture,
+        "page-child",
+        "Child",
+        "Home/Child/page.md",
+        "Child body.",
+    );
+    let content_root = fixture.content_root();
+
+    let moved_to_archive = rename_virtual_fs_item(
+        &mut store,
+        &content_root,
+        &fixture.mount_id,
+        "children:page-child",
+        "children:page-archive",
+        "Child",
+    )
+    .expect("move child page under archive");
+    assert_eq!(moved_to_archive.item.path, "Archive/Child");
+    let archive_page_path = fixture.root.join("Archive/Child/page.md");
+    let archive_diff =
+        run_diff_with_state_root(&store, &archive_page_path, Some(&fixture.state_root))
+            .expect("diff pending move to archive");
+    assert!(archive_diff.ok, "{archive_diff:#?}");
+    let archive_plan = archive_diff.plan.as_ref().expect("archive move plan");
+    assert_eq!(archive_plan.summary.entities_moved, 1, "{archive_plan:#?}");
+    assert_eq!(
+        archive_plan.operations,
+        vec![PushOperationOutput::MoveEntity {
+            entity_id: "page-child".to_string(),
+            new_parent_id: "page-archive".to_string(),
+            new_parent_kind: EntityKind::Page,
+            new_title: "Child".to_string(),
+            projected_path: "Archive/Child/page.md".to_string(),
+        }],
+        "{archive_plan:#?}"
+    );
+
+    let archive_push = run_push_with_daemon_at_state_root(
+        &mut store,
+        &connector,
+        &archive_page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        Some(&fixture.state_root),
+    )
+    .expect("push move to archive");
+    assert!(archive_push.ok, "{archive_push:#?}");
+    assert_eq!(archive_push.action, "reconciled", "{archive_push:#?}");
+    assert_eq!(
+        archive_push.changed_remote_ids,
+        vec!["page-child".to_string()]
+    );
+    assert!(
+        store
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list mutations after archive move")
+            .is_empty(),
+        "archive move push should clear pending mutations"
+    );
+    assert!(
+        !content_root.join("Home/Child/page.md").exists(),
+        "archive move should leave no stale page.md at the original location"
+    );
+
+    let moved_home = rename_virtual_fs_item(
+        &mut store,
+        &content_root,
+        &fixture.mount_id,
+        "children:page-child",
+        "children:page-home",
+        "Child",
+    )
+    .expect("move child page back home");
+    assert_eq!(moved_home.item.path, "Home/Child");
+    let home_page_path = fixture.root.join("Home/Child/page.md");
+    let home_diff = run_diff_with_state_root(&store, &home_page_path, Some(&fixture.state_root))
+        .expect("diff pending move back home");
+    assert!(home_diff.ok, "{home_diff:#?}");
+    let home_plan = home_diff.plan.as_ref().expect("home move plan");
+    assert_eq!(home_plan.summary.entities_moved, 1, "{home_plan:#?}");
+    assert_eq!(
+        home_plan.operations,
+        vec![PushOperationOutput::MoveEntity {
+            entity_id: "page-child".to_string(),
+            new_parent_id: "page-home".to_string(),
+            new_parent_kind: EntityKind::Page,
+            new_title: "Child".to_string(),
+            projected_path: "Home/Child/page.md".to_string(),
+        }],
+        "{home_plan:#?}"
+    );
+
+    let home_push = run_push_with_daemon_at_state_root(
+        &mut store,
+        &connector,
+        &home_page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        Some(&fixture.state_root),
+    )
+    .expect("push move back home");
+    assert!(home_push.ok, "{home_push:#?}");
+    assert_eq!(home_push.action, "reconciled", "{home_push:#?}");
+    assert_eq!(home_push.changed_remote_ids, vec!["page-child".to_string()]);
+    assert!(
+        store
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list mutations after home move")
+            .is_empty(),
+        "home move push should clear pending mutations"
+    );
+    assert!(
+        !content_root.join("Archive/Child/page.md").exists(),
+        "move back should leave no stale page.md at the intermediate location"
+    );
+    let entity = store
+        .get_entity(&fixture.mount_id, &RemoteId::new("page-child"))
+        .expect("get moved child entity")
+        .expect("moved child entity");
+    assert_eq!(entity.path, PathBuf::from("Home/Child/page.md"));
+    assert_eq!(entity.hydration, HydrationState::Hydrated);
+    let clean_status = run_status(
+        &store,
+        StatusOptions {
+            path: Some(home_page_path),
+            state_root: Some(fixture.state_root.clone()),
+            ..StatusOptions::default()
+        },
+    )
+    .expect("status after move back");
+    assert!(clean_status.clean, "{clean_status:#?}");
+
+    let move_calls = api
+        .calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .filter_map(|call| match call {
+            WriteCall::MovePage { page_id, parent } => Some((page_id.clone(), parent.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        move_calls,
+        vec![
+            (
+                "page-child".to_string(),
+                json!({
+                    "type": "page_id",
+                    "page_id": "page-archive",
+                }),
+            ),
+            (
+                "page-child".to_string(),
+                json!({
+                    "type": "page_id",
+                    "page_id": "page-home",
+                }),
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -15411,6 +15609,37 @@ impl NotionApi for MutableNotionApi {
         Ok(page.clone())
     }
 
+    fn move_page(&self, page_id: &str, parent: Value) -> locality_core::LocalityResult<PageDto> {
+        self.calls.lock().expect("calls").push(WriteCall::MovePage {
+            page_id: page_id.to_string(),
+            parent: parent.clone(),
+        });
+        let mut page = self.page.lock().expect("page");
+        if page.id != page_id {
+            return Err(locality_core::LocalityError::InvalidState(format!(
+                "missing page {page_id}"
+            )));
+        }
+        page.parent = Some(ParentDto {
+            kind: parent
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            page_id: parent
+                .get("page_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            data_source_id: parent
+                .get("data_source_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            ..ParentDto::default()
+        });
+        page.last_edited_time = Some("2026-06-10T00:00:01.000Z".to_string());
+        Ok(page.clone())
+    }
+
     fn update_block(&self, block_id: &str, body: Value) -> locality_core::LocalityResult<BlockDto> {
         self.calls.lock().expect("calls").push(WriteCall::Update {
             block_id: block_id.to_string(),
@@ -15614,6 +15843,10 @@ enum WriteCall {
     Move {
         block_id: String,
         after: Option<String>,
+    },
+    MovePage {
+        page_id: String,
+        parent: Value,
     },
     Delete {
         block_id: String,

@@ -109,6 +109,10 @@ file_pull="$tmp_root/file-pull.json"
 push_output="$tmp_root/push.json"
 push_child_output="$tmp_root/push-child.json"
 pull_after_child_create="$tmp_root/pull-after-child-create.json"
+push_move_parent_output="$tmp_root/push-move-parent.json"
+pull_after_move_parent_create="$tmp_root/pull-after-move-parent-create.json"
+push_move_out_output="$tmp_root/push-move-out.json"
+push_move_back_output="$tmp_root/push-move-back.json"
 push_rename_output="$tmp_root/push-rename.json"
 push_delete_output="$tmp_root/push-delete.json"
 pull_after_push="$tmp_root/pull-after-push.json"
@@ -119,6 +123,7 @@ restore_needed=0
 scratch_created=0
 scratch_page_id=""
 created_child_page_id=""
+created_move_parent_page_id=""
 step="initializing"
 
 notion_api() {
@@ -269,6 +274,28 @@ if title != expected:
 PY
 }
 
+assert_remote_page_parent() {
+  local remote_page_id="$1"
+  local expected_parent_id="$2"
+  notion_api GET "pages/$remote_page_id" >"$remote_page_response"
+  python3 - "$remote_page_response" "$(compact_notion_page_id "$expected_parent_id")" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+page = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = sys.argv[2]
+parent = page.get("parent") or {}
+parent_id = parent.get("page_id") or parent.get("database_id") or parent.get("data_source_id")
+if not parent_id:
+    raise SystemExit(f"remote Notion page did not include a page/database parent: {page}")
+compact = re.sub(r"-", "", parent_id).lower()
+if compact != expected:
+    raise SystemExit(f"remote Notion page parent was {parent_id!r}, expected {expected!r}")
+PY
+}
+
 assert_notion_page_archived() {
   local remote_page_id="$1"
   notion_api GET "pages/$remote_page_id" >"$remote_page_response"
@@ -325,6 +352,22 @@ on_error() {
     echo "pull-after-child-create output:" >&2
     cat "$pull_after_child_create" >&2
   fi
+  if [[ -s "$push_move_parent_output" ]]; then
+    echo "push-move-parent output:" >&2
+    cat "$push_move_parent_output" >&2
+  fi
+  if [[ -s "$pull_after_move_parent_create" ]]; then
+    echo "pull-after-move-parent-create output:" >&2
+    cat "$pull_after_move_parent_create" >&2
+  fi
+  if [[ -s "$push_move_out_output" ]]; then
+    echo "push-move-out output:" >&2
+    cat "$push_move_out_output" >&2
+  fi
+  if [[ -s "$push_move_back_output" ]]; then
+    echo "push-move-back output:" >&2
+    cat "$push_move_back_output" >&2
+  fi
   if [[ -s "$push_rename_output" ]]; then
     echo "push-rename output:" >&2
     cat "$push_rename_output" >&2
@@ -363,6 +406,11 @@ cleanup() {
     archive_body="$tmp_root/archive-child-page.json"
     printf '{"archived":true}\n' >"$archive_body"
     notion_api PATCH "pages/$created_child_page_id" "$archive_body" >/dev/null 2>&1
+  fi
+  if [[ -n "$created_move_parent_page_id" ]]; then
+    archive_body="$tmp_root/archive-move-parent-page.json"
+    printf '{"archived":true}\n' >"$archive_body"
+    notion_api PATCH "pages/$created_move_parent_page_id" "$archive_body" >/dev/null 2>&1
   fi
   if mountpoint -q "$LOCALITY_ROOT"; then
     fusermount3 -uz "$LOCALITY_ROOT" >/dev/null 2>&1
@@ -490,6 +538,14 @@ assert_status_contains() {
   fi
 }
 
+assert_path_absent() {
+  local path="$1"
+  if [[ -e "$path" ]]; then
+    echo "expected path to be absent: $path" >&2
+    return 1
+  fi
+}
+
 step="creating temp directories"
 mkdir -p "$state_root" "$LOCALITY_ROOT" "$NOTION_MOUNT"
 
@@ -611,6 +667,54 @@ env -u NOTION_TOKEN -u NOTION_AT LOCALITY_STATE_DIR="$state_root" \
 step="locating reconciled child page file"
 child_page="$(wait_for_page_file_by_remote_id "$created_child_page_id" "$parent_dir")"
 child_dir="$(dirname "$child_page")"
+
+move_parent_title="Locality live FUSE move target $unique"
+move_parent_marker="Linux FUSE move target $unique"
+move_parent_dir="$parent_dir/$move_parent_title"
+move_parent_page="$move_parent_dir/page.md"
+step="creating move target parent page directory through FUSE"
+mkdir "$move_parent_dir"
+printf -- '---\ntitle: "%s"\n---\n# Move target\n\n%s\n' "$move_parent_title" "$move_parent_marker" >"$move_parent_page"
+assert_status_contains "$move_parent_page" '"pending_virtual_create"'
+
+step="pushing move target parent page"
+env -u NOTION_TOKEN -u NOTION_AT LOCALITY_DAEMON_DISABLE=1 LOCALITY_STATE_DIR="$state_root" \
+  "$loc_bin" push "$move_parent_page" -y --json >"$push_move_parent_output"
+created_move_parent_page_id="$(created_remote_id_from_push "$push_move_parent_output" "$page_id")"
+assert_remote_page_title "$created_move_parent_page_id" "$move_parent_title"
+
+step="pulling parent after move target creation"
+env -u NOTION_TOKEN -u NOTION_AT LOCALITY_STATE_DIR="$state_root" \
+  "$loc_bin" pull "$parent_dir" --json >"$pull_after_move_parent_create"
+step="locating reconciled move target and child page files"
+move_parent_page="$(wait_for_page_file_by_remote_id "$created_move_parent_page_id" "$parent_dir")"
+move_parent_dir="$(dirname "$move_parent_page")"
+child_page="$(wait_for_page_file_by_remote_id "$created_child_page_id" "$parent_dir")"
+child_dir="$(dirname "$child_page")"
+
+step="moving child page directory under another page through FUSE"
+mv "$child_dir" "$move_parent_dir/"
+moved_child_dir="$move_parent_dir/$child_title"
+moved_child_page="$moved_child_dir/page.md"
+assert_status_contains "$moved_child_page" '"pending_virtual_rename"'
+
+step="pushing child page move out"
+env -u NOTION_TOKEN -u NOTION_AT LOCALITY_DAEMON_DISABLE=1 LOCALITY_STATE_DIR="$state_root" \
+  "$loc_bin" push "$moved_child_page" -y --json >"$push_move_out_output"
+assert_remote_page_parent "$created_child_page_id" "$created_move_parent_page_id"
+assert_path_absent "$child_dir"
+
+step="moving child page directory back to its original parent through FUSE"
+mv "$moved_child_dir" "$parent_dir/"
+child_dir="$parent_dir/$child_title"
+child_page="$child_dir/page.md"
+assert_status_contains "$child_page" '"pending_virtual_rename"'
+
+step="pushing child page move back"
+env -u NOTION_TOKEN -u NOTION_AT LOCALITY_DAEMON_DISABLE=1 LOCALITY_STATE_DIR="$state_root" \
+  "$loc_bin" push "$child_page" -y --json >"$push_move_back_output"
+assert_remote_page_parent "$created_child_page_id" "$page_id"
+assert_path_absent "$moved_child_dir"
 
 renamed_child_title="Locality live FUSE renamed child $unique"
 renamed_child_dir="$parent_dir/$renamed_child_title"

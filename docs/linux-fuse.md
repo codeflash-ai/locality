@@ -82,9 +82,9 @@ LOCALITY_LIVE_NOTION_VFS_PUSH_PULL=1 tests/live_notion_vfs_push_pull.sh
 When `LOCALITY_NOTION_PAGE_ID` or `NOTION_PAGE_ID` is not set, the script creates
 and archives its own scratch page under `LOCALITY_NOTION_LIVE_PARENT_PAGE`. It
 seeds an isolated test connection through `loc connect notion --token-stdin`,
-then runs the FUSE mount, pull, edit, push, child create, child rename, and child
-delete/archive path with token environment variables removed from `loc` and
-`localityd`.
+then runs the FUSE mount, pull, edit, push, child create, child parent move out
+and back with Unix `mv`, child rename, and child delete/archive path with token
+environment variables removed from `loc` and `localityd`.
 
 The `notion-live-e2e` GitHub Actions workflow runs this script on
 `ubuntu-latest` when the live Notion environment is configured. That job seeds
