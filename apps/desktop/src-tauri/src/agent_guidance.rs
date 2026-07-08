@@ -913,12 +913,34 @@ fn claude_desktop_config_dir(home: &Path) -> PathBuf {
 
 #[cfg(windows)]
 fn claude_desktop_detected(home: &Path) -> bool {
-    path_exists(claude_desktop_config_dir(home))
+    path_exists(claude_desktop_config_dir(home)) || windows_claude_desktop_app_exists(home)
 }
 
 #[cfg(not(windows))]
 fn claude_desktop_detected(home: &Path) -> bool {
     mac_app_exists(home, "Claude.app")
+}
+
+#[cfg(windows)]
+fn windows_claude_desktop_app_exists(home: &Path) -> bool {
+    let local_appdata = env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData/Local"));
+    path_exists(local_appdata.join("Programs/Claude/Claude.exe"))
+        || windows_claude_desktop_msix_package_exists(&local_appdata)
+}
+
+#[cfg(windows)]
+fn windows_claude_desktop_msix_package_exists(local_appdata: &Path) -> bool {
+    fs::read_dir(local_appdata.join("Packages"))
+        .ok()
+        .is_some_and(|entries| {
+            entries.flatten().any(|entry| {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                name.starts_with("claude_") || name.starts_with("anthropic.claude")
+            })
+        })
 }
 
 fn warp_state_exists(home: &Path) -> bool {
@@ -989,6 +1011,9 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn skill_mentions_mount_and_review_workflow() {
@@ -1098,22 +1123,7 @@ mod tests {
         let appdata = temp.join("AppData/Roaming");
         fs::create_dir_all(appdata.join("Claude")).expect("create Claude appdata");
 
-        let previous = env::var_os("APPDATA");
-        // SAFETY: This unit test temporarily points APPDATA at its private temp
-        // directory, then restores the previous value before returning.
-        unsafe {
-            env::set_var("APPDATA", &appdata);
-        }
-
-        let specs = mcp_target_specs(&temp);
-        // SAFETY: Restores APPDATA after the scoped test mutation above.
-        unsafe {
-            if let Some(previous) = previous {
-                env::set_var("APPDATA", previous);
-            } else {
-                env::remove_var("APPDATA");
-            }
-        }
+        let specs = mcp_target_specs_with_windows_appdata(&temp, &appdata, None);
 
         let spec = specs
             .iter()
@@ -1127,6 +1137,97 @@ mod tests {
         assert!(spec.detected);
 
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_claude_desktop_mcp_detects_installed_app_without_roaming_config() {
+        let temp = temp_root("loc-agent-guidance-windows-claude-desktop-installed");
+        let appdata = temp.join("AppData/Roaming");
+        let localappdata = temp.join("AppData/Local");
+        let claude_exe = localappdata.join("Programs/Claude/Claude.exe");
+        fs::create_dir_all(claude_exe.parent().expect("claude exe parent"))
+            .expect("create Claude install dir");
+        fs::write(&claude_exe, "").expect("write Claude.exe");
+
+        let specs = mcp_target_specs_with_windows_appdata(&temp, &appdata, Some(&localappdata));
+
+        let spec = specs
+            .iter()
+            .find(|spec| spec.agent == "Claude Desktop MCP")
+            .expect("Claude Desktop MCP target");
+
+        assert_eq!(
+            spec.path,
+            temp.join("AppData/Roaming/Claude/claude_desktop_config.json")
+        );
+        assert!(spec.detected);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_claude_desktop_mcp_detects_msix_package_without_roaming_config() {
+        let temp = temp_root("loc-agent-guidance-windows-claude-desktop-msix");
+        let appdata = temp.join("AppData/Roaming");
+        let localappdata = temp.join("AppData/Local");
+        fs::create_dir_all(localappdata.join("Packages/Claude_pzs8sxrjxfjjc"))
+            .expect("create Claude MSIX package dir");
+
+        let specs = mcp_target_specs_with_windows_appdata(&temp, &appdata, Some(&localappdata));
+
+        let spec = specs
+            .iter()
+            .find(|spec| spec.agent == "Claude Desktop MCP")
+            .expect("Claude Desktop MCP target");
+
+        assert_eq!(
+            spec.path,
+            temp.join("AppData/Roaming/Claude/claude_desktop_config.json")
+        );
+        assert!(spec.detected);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(windows)]
+    fn mcp_target_specs_with_windows_appdata(
+        home: &Path,
+        appdata: &Path,
+        localappdata: Option<&Path>,
+    ) -> Vec<McpTargetSpec> {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let previous_appdata = env::var_os("APPDATA");
+        let previous_localappdata = env::var_os("LOCALAPPDATA");
+        // SAFETY: This unit test temporarily points APPDATA and LOCALAPPDATA at
+        // private temp directories, then restores the previous values before
+        // returning.
+        unsafe {
+            env::set_var("APPDATA", appdata);
+            if let Some(localappdata) = localappdata {
+                env::set_var("LOCALAPPDATA", localappdata);
+            }
+        }
+
+        let specs = mcp_target_specs(home);
+        // SAFETY: Restores APPDATA and LOCALAPPDATA after the scoped test
+        // mutation above.
+        unsafe {
+            if let Some(previous) = previous_appdata {
+                env::set_var("APPDATA", previous);
+            } else {
+                env::remove_var("APPDATA");
+            }
+            if localappdata.is_some() {
+                if let Some(previous) = previous_localappdata {
+                    env::set_var("LOCALAPPDATA", previous);
+                } else {
+                    env::remove_var("LOCALAPPDATA");
+                }
+            }
+        }
+        specs
     }
 
     #[cfg(windows)]
