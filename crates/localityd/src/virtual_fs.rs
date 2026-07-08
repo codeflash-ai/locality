@@ -492,7 +492,11 @@ where
 {
     let mount = require_virtual_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(LocalityError::from)?;
-    let _ = container_path(&mount, &entities, &[], container_identifier)?;
+    match container_path(&mount, &entities, &[], container_identifier) {
+        Ok(_) => {}
+        Err(error) if is_missing_identifier_error(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    }
 
     child_container_for_identifier(&mount, &entities, container_identifier)
         .map(|container| container.is_some())
@@ -2427,6 +2431,15 @@ fn missing_identifier(identifier: &str) -> LocalityError {
     LocalityError::InvalidState(format!(
         "virtual filesystem item `{identifier}` is not present in daemon state"
     ))
+}
+
+fn is_missing_identifier_error(error: &LocalityError) -> bool {
+    matches!(
+        error,
+        LocalityError::InvalidState(message)
+            if message.starts_with("virtual filesystem item `")
+                && message.ends_with("` is not present in daemon state")
+    )
 }
 
 fn parent_path(path: &Path) -> &Path {

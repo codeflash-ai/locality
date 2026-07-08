@@ -30,6 +30,7 @@ use crate::virtual_fs;
 use crate::virtual_fs::{
     mount_point_directory_name, mount_point_identifier, virtual_projection_mount_point,
 };
+use crate::virtual_projection::wrap_identifier;
 
 pub use crate::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport as FileProviderChildrenReport,
@@ -64,6 +65,13 @@ pub struct FileProviderDomainChildrenReport {
 pub struct FileProviderDomainChild {
     pub mount_id: String,
     pub item: FileProviderItem,
+}
+
+pub fn macos_file_provider_item_identifier(mount_id: &str, identifier: &str) -> String {
+    if identifier == ROOT_CONTAINER_IDENTIFIER {
+        return ROOT_CONTAINER_IDENTIFIER.to_string();
+    }
+    wrap_identifier(&MountId::new(mount_id), identifier)
 }
 
 pub fn file_provider_domain_children<S>(
@@ -1559,6 +1567,18 @@ mod tests {
             assert_eq!(virtual_projection_mount_point(&mount), root);
             assert!(mount_access_roots(&mount).contains(&root));
         }
+    }
+
+    #[test]
+    fn macos_file_provider_item_identifier_wraps_shared_domain_containers() {
+        assert_eq!(
+            macos_file_provider_item_identifier("notion-main", ROOT_CONTAINER_IDENTIFIER),
+            ROOT_CONTAINER_IDENTIFIER
+        );
+        assert_eq!(
+            macos_file_provider_item_identifier("notion-main", "mount:notion-main"),
+            "m:bm90aW9uLW1haW4:bW91bnQ6bm90aW9uLW1haW4"
+        );
     }
 
     #[test]
