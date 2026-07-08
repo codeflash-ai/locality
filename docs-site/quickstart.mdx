@@ -92,28 +92,28 @@ Open the returned `page.md` in an editor or pass the path to an agent.
 Edit the mounted Markdown file:
 
 ```text
-~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md
+~/Library/CloudStorage/Locality/notion-main/Engineering Wiki/Launch Plan/page.md
 ```
 
 Check what Locality sees:
 
 ```bash
-loc status ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md
-loc diff ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md
+loc status "$HOME/Library/CloudStorage/Locality/notion-main/Engineering Wiki/Launch Plan/page.md"
+loc diff "$HOME/Library/CloudStorage/Locality/notion-main/Engineering Wiki/Launch Plan/page.md"
 ```
 
 Push a safe reviewed plan:
 
 ```bash
-loc push ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md -y
+loc push "$HOME/Library/CloudStorage/Locality/notion-main/Engineering Wiki/Launch Plan/page.md" -y
 ```
 
 If the remote changed first, pull before pushing:
 
 ```bash
-loc pull ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md
-loc diff ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md
-loc push ~/Library/CloudStorage/Locality/notion-main/engineering-wiki/launch-plan/page.md -y
+loc pull "$HOME/Library/CloudStorage/Locality/notion-main/Engineering Wiki/Launch Plan/page.md"
+loc diff "$HOME/Library/CloudStorage/Locality/notion-main/Engineering Wiki/Launch Plan/page.md"
+loc push "$HOME/Library/CloudStorage/Locality/notion-main/Engineering Wiki/Launch Plan/page.md" -y
 ```
 
 ## 6. Use Live Mode when appropriate

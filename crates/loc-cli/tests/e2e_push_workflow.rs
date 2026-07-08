@@ -6922,7 +6922,7 @@ fn notion_remote_observation_surfaces_remote_update_without_hydrating_blocks() {
     );
     assert_eq!(
         result.remote.observed_path.as_deref(),
-        Some("observed-remote-rename/page.md"),
+        Some("Observed Remote Rename/page.md"),
         "{result:#?}"
     );
 }

@@ -138,7 +138,7 @@ The first Notion apply path is intentionally conservative:
 - supported writable block forms: paragraphs, headings 1-4, bulleted list items, numbered list items, to-dos, quotes, callouts, code fences, dividers, display equations, existing stable-width/header-mode tables including cell edits, row appends, and trailing row deletes, existing bookmark/embed URL blocks, existing URL-backed media blocks, existing local image/video/file/pdf/audio media blocks, and new local media block appends;
 - supported rich-text spans: bold, italic, strikethrough, underline, code, external links, inline equations, Notion page links, database links whose target ID matches a rendered database mention, explicit `@page(...)` page mentions, explicit `@database(...)` database mentions, explicit `@date(...)` date mentions, explicit `@user(...)` user mentions, legacy `loc://` page links, and unchanged preimage mentions such as dates/users;
 - supported page property writes: title, rich text with the same inline Markdown parser used by page bodies, number, select, status, multi-select, checkbox, date, URL, email, phone, external file URLs, explicit people user IDs, and explicit relation page IDs;
-- new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `slug/page.md` path, using `slug shortid/page.md` only when a sibling name collision requires it;
+- new row creation accepts a new Markdown file under a projected database directory, uses the file's `title` as the row title, maps supported frontmatter properties through the live data source schema, creates initial children from directly supported Markdown blocks, and then reconciles the created page into its stable `Exact Row Title/page.md` path, using `Exact Row Title shortid/page.md` only when a sibling name collision requires it;
 - unsupported write forms fail before API mutation, including table width or header-mode changes, detected non-trailing table row deletes, page/database creation outside database-row files, computed/read-only properties, local media uploads larger than the 20 MB direct-upload limit, multi-data-source row creation, and rich inline shapes that cannot be represented by the current Markdown parser;
 - appends use Notion's current position object, with `start` for prepends and `after_block` for inserts after a known block;
 - directive block moves use the same append positioning, then archive the old
@@ -171,7 +171,7 @@ When Locality writes a Notion page into a local projection, media blocks with `e
 ```text
 .loc/
   media/
-    roadmap/
+    Roadmap/
       image-0123456789ab.png
       video-abcdef1234567890.mp4
 ```
@@ -180,31 +180,35 @@ The media tree mirrors the Notion page directory under the reserved `.loc/` name
 
 ## Path Projection
 
-Root-page mounts use a stable directory shape: `slugified-title/page.md`.
-When two siblings normalize to the same slug, all colliding siblings use a short
-remote ID suffix such as `slugified-title aaaaaa/page.md`. The suffix lengthens
+Root-page mounts use a stable directory shape based on the remote title:
+`Exact Page Title/page.md`. Locality preserves spaces, casing, punctuation, and
+Unicode when the local filesystem can represent them. Characters that cannot
+safely live in a path segment are minimally replaced. When two siblings project
+to the same filesystem-equivalent path, all colliding siblings use a short
+remote ID suffix such as `Exact Page Title aaaaaa/page.md`. The suffix lengthens
 only when needed to keep sibling names unique.
 
 Each Notion page is a directory. The page body lives in `page.md`; sibling entries in the same directory are child Notion content:
 
 ```text
-roadmap/
+Roadmap/
   page.md
-  design-notes/
+  Design Notes/
     page.md
-  tasks/
+  Tasks/
 ```
 
-The remote ID remains the identity. The title slug can change without changing identity.
+The remote ID remains the identity. The projected title path can change without
+changing identity.
 
 Database blocks project as directories. Each data source under the database contributes row pages directly inside that directory, and `_schema.yaml` mirrors the current property schema with stable property IDs, types, and select/status option names.
 
 ```text
-roadmap/
+Roadmap/
   page.md
-  tasks/
+  Tasks/
     _schema.yaml
-    fix-login-bug/
+    Fix login bug/
       page.md
 ```
 
