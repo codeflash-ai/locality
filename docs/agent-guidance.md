@@ -6,7 +6,7 @@ Locality installs a small agent guidance pack during desktop onboarding so local
 
 | Agent | Install target | Status |
 | --- | --- | --- |
-| Claude Code / Claude Desktop / Claude Cowork | `~/.claude/skills/locality/SKILL.md`, `~/.claude.json`, and Claude Desktop MCP config when present | Automatic when Claude is detected. |
+| Claude Code / Claude Desktop / Claude Cowork | `~/.claude/skills/locality/SKILL.md`, `~/.claude.json`, and Claude Desktop MCP config when present (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows) | Automatic when Claude is detected. |
 | Codex | `~/.codex/skills/locality/SKILL.md` and `~/.codex/config.toml` | Automatic when Codex is detected. |
 | Warp | `~/.agents/skills/locality/SKILL.md` | Automatic when Warp is detected. Warp also reads project rules such as `AGENTS.md` and `WARP.md`; Locality keeps mount-point-local `AGENTS.md` under `/Locality/notion-main`. |
 | OpenCode | `~/.agents/skills/locality/SKILL.md` | Automatic when OpenCode is detected. |

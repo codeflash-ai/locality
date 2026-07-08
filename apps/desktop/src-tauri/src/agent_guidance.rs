@@ -261,9 +261,9 @@ fn mcp_target_specs(home: &Path) -> Vec<McpTargetSpec> {
         },
         McpTargetSpec {
             agent: "Claude Desktop MCP",
-            path: home.join("Library/Application Support/Claude/claude_desktop_config.json"),
+            path: claude_desktop_config_path(home),
             kind: McpInstallKind::ClaudeDesktopJson,
-            detected: mac_app_exists(home, "Claude.app"),
+            detected: claude_desktop_detected(home),
             detail: "Configured the local Locality MCP fallback for Claude Desktop.",
         },
         McpTargetSpec {
@@ -696,12 +696,23 @@ fn loc_cli_command() -> String {
     if let Ok(current) = env::current_exe()
         && let Some(parent) = current.parent()
     {
-        let sibling = parent.join("loc");
+        let sibling = parent.join(binary_name("loc"));
         if sibling.is_file() {
             return sibling.display().to_string();
         }
     }
     "loc".to_string()
+}
+
+fn binary_name(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("{name}.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_string()
+    }
 }
 
 fn read_json_config(path: &Path) -> Result<Value, String> {
@@ -877,6 +888,34 @@ fn mac_app_exists(home: &Path, app_name: &str) -> bool {
         || path_exists(home.join("Applications").join(app_name))
 }
 
+fn claude_desktop_config_path(home: &Path) -> PathBuf {
+    claude_desktop_config_dir(home).join("claude_desktop_config.json")
+}
+
+#[cfg(windows)]
+fn claude_desktop_config_dir(home: &Path) -> PathBuf {
+    env::var_os("APPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData/Roaming"))
+        .join("Claude")
+}
+
+#[cfg(not(windows))]
+fn claude_desktop_config_dir(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/Claude")
+}
+
+#[cfg(windows)]
+fn claude_desktop_detected(home: &Path) -> bool {
+    path_exists(claude_desktop_config_dir(home))
+}
+
+#[cfg(not(windows))]
+fn claude_desktop_detected(home: &Path) -> bool {
+    mac_app_exists(home, "Claude.app")
+}
+
 fn warp_state_exists(home: &Path) -> bool {
     path_exists(home.join("Library/Application Support/dev.warp.Warp-Stable"))
         || path_exists(home.join("Library/Application Support/Warp"))
@@ -1045,6 +1084,59 @@ mod tests {
         assert!(gh_copilot_extension_exists(&temp));
 
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_claude_desktop_mcp_uses_roaming_appdata_config() {
+        let temp = temp_root("loc-agent-guidance-windows-claude-desktop");
+        let appdata = temp.join("AppData/Roaming");
+        fs::create_dir_all(appdata.join("Claude")).expect("create Claude appdata");
+
+        let previous = env::var_os("APPDATA");
+        // SAFETY: This unit test temporarily points APPDATA at its private temp
+        // directory, then restores the previous value before returning.
+        unsafe {
+            env::set_var("APPDATA", &appdata);
+        }
+
+        let specs = mcp_target_specs(&temp);
+        // SAFETY: Restores APPDATA after the scoped test mutation above.
+        unsafe {
+            if let Some(previous) = previous {
+                env::set_var("APPDATA", previous);
+            } else {
+                env::remove_var("APPDATA");
+            }
+        }
+
+        let spec = specs
+            .iter()
+            .find(|spec| spec.agent == "Claude Desktop MCP")
+            .expect("Claude Desktop MCP target");
+
+        assert_eq!(
+            spec.path,
+            temp.join("AppData/Roaming/Claude/claude_desktop_config.json")
+        );
+        assert!(spec.detected);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_claude_desktop_mcp_command_prefers_installed_loc_exe() {
+        let current_exe = env::current_exe().expect("current exe");
+        let bin_dir = current_exe.parent().expect("current exe parent");
+        let loc_exe = bin_dir.join("loc.exe");
+        fs::write(&loc_exe, "").expect("write test loc.exe");
+
+        let command = loc_cli_command();
+
+        let _ = fs::remove_file(&loc_exe);
+
+        assert_eq!(command, loc_exe.display().to_string());
     }
 
     #[test]
