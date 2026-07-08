@@ -21,6 +21,12 @@ export type UpdateStatus = {
   progress?: UpdateDownloadProgress;
 };
 
+export type UpdateQueueStatus = {
+  active: unknown[];
+  sections: Array<{ total: number }>;
+  liveMode?: { state?: string | null } | null;
+};
+
 export function emptyUpdateStatus(): UpdateStatus {
   return { state: "idle", message: "", update: null };
 }
@@ -141,4 +147,12 @@ export function updateSidebarSubtitle(status: UpdateStatus) {
     return `${version} · ${percent}%`;
   }
   return version;
+}
+
+export function queueIdleForAutoUpdateInstall(status: UpdateQueueStatus) {
+  return (
+    status.active.length === 0 &&
+    status.sections.every((section) => section.total === 0) &&
+    status.liveMode?.state !== "syncing"
+  );
 }

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   downloadedUpdateMessage,
   nextUpdateDownloadProgress,
+  queueIdleForAutoUpdateInstall,
   updateDownloadMessage,
   updateDownloadPercent,
   updateInstallActionDisabled,
@@ -79,5 +80,39 @@ describe("updater status helpers", () => {
 
     expect(updateSidebarTitle(status)).toBe("Downloading update");
     expect(updateSidebarSubtitle(status)).toBe("v0.1.6 · 25%");
+  });
+
+  it("allows automatic update install only when daemon work is idle", () => {
+    expect(
+      queueIdleForAutoUpdateInstall({
+        active: [],
+        sections: [{ total: 0 }, { total: 0 }],
+        liveMode: { state: "active" },
+      }),
+    ).toBe(true);
+
+    expect(
+      queueIdleForAutoUpdateInstall({
+        active: [{ kind: "hydrate" }],
+        sections: [{ total: 0 }],
+        liveMode: { state: "active" },
+      }),
+    ).toBe(false);
+
+    expect(
+      queueIdleForAutoUpdateInstall({
+        active: [],
+        sections: [{ total: 2 }],
+        liveMode: { state: "active" },
+      }),
+    ).toBe(false);
+
+    expect(
+      queueIdleForAutoUpdateInstall({
+        active: [],
+        sections: [{ total: 0 }],
+        liveMode: { state: "syncing" },
+      }),
+    ).toBe(false);
   });
 });

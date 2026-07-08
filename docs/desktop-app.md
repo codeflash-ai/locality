@@ -58,11 +58,12 @@ Update checks must not block startup. When a new version is available, the app
 downloads it in the background. If the main window is visible, Locality shows the
 download/update state in the left sidebar and leaves the restart/install action
 to the user. If the app is running without a visible main window, the background
-download may install and relaunch Locality automatically. Manual checks in
-Settings use the same check, download, install, and relaunch path. Before the
-installer handoff, the app schedules a native relaunch fallback so the installed
-app opens again even if the updater closes the old process before the JavaScript
-restart call completes.
+download may install and relaunch Locality automatically only when the daemon
+debug queue reports no active or queued work and Live Mode is not syncing.
+Manual checks in Settings use the same check, download, install, and relaunch
+path. Before the installer handoff, the app schedules a native relaunch fallback
+so the installed app opens again even if the updater closes the old process
+before the JavaScript restart call completes.
 
 Every app launch, including the launch after an updater relaunch, must validate
 the local runtime before normal desktop work. The backend should probe the bundled

@@ -75,6 +75,7 @@ import {
   updateNoticeVisible,
   updateSidebarSubtitle,
   updateSidebarTitle,
+  queueIdleForAutoUpdateInstall,
   updateStatusLabel,
   type UpdateStatus,
 } from "./updater";
@@ -955,8 +956,21 @@ export default function App() {
       progress,
     });
 
-    if (options.installWhenHidden && !(await mainWindowVisible())) {
+    if (options.installWhenHidden && (await autoInstallUpdateAllowed())) {
       await installDownloadedAppUpdate(update);
+    }
+  }
+
+  async function autoInstallUpdateAllowed() {
+    if (await mainWindowVisible()) {
+      return false;
+    }
+    try {
+      const queue = await callCommand<DebugQueueStatus>("debug_notion_queue_status");
+      return queueIdleForAutoUpdateInstall(queue);
+    } catch (error) {
+      console.warn(`Skipping automatic update install: ${errorMessage(error)}`);
+      return false;
     }
   }
 

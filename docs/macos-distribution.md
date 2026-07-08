@@ -78,10 +78,12 @@ The app checks that manifest in the background, downloads an available updater
 archive without blocking startup, and shows the restart/install action in the
 desktop sidebar when the main window is visible. If Locality is running in the
 background with no visible main window, the downloaded update can install and
-relaunch automatically. The app also schedules a native relaunch fallback before
-the updater install begins so LaunchServices opens the updated `.app` even if
-the old process exits during installer handoff. The relaunch runs the same
-`localityd` build validation described above before normal desktop work resumes.
+relaunch automatically only after the daemon debug queue reports no active or
+queued work and Live Mode is not syncing. The app also schedules a native
+relaunch fallback before the updater install begins so LaunchServices opens the
+updated `.app` even if the old process exits during installer handoff. The
+relaunch runs the same `localityd` build validation described above before
+normal desktop work resumes.
 
 During onboarding, the desktop app also verifies the terminal command. For DMG
 installs it creates or refreshes `/usr/local/bin/loc` as a symlink to the
