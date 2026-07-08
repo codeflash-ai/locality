@@ -512,9 +512,12 @@ Current local-only implementation:
   metrics so future UI/diagnostics can observe sync pressure without exposing
   hydration internals in the normal product UI.
 - Workspace virtual metadata discovery also uses bounded daemon workers. Root
-  and mount-point containers are queued when virtual mounts are primed, and each
-  successful child refresh durably queues newly discovered folder containers so
-  large workspaces can continue enumeration after daemon restarts.
+  and mount-point containers are queued when virtual mounts are primed, and
+  directory enumeration queues an interactive refresh only for the requested
+  container so user-opened listings are brought current promptly. Successful
+  child refreshes do not recursively enqueue discovered
+  folder containers; deeper folders are refreshed when opened, pulled, or
+  explicitly hinted by remote-change flows.
 - Relay/webhook delivery remains intentionally unimplemented; Stage 10 only
   improves local scheduling and connector contracts.
 

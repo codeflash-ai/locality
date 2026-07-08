@@ -68,9 +68,9 @@ use crate::scheduler::{PullScheduler, PullSchedulerTick};
 use crate::shadow_match::parsed_matches_shadow;
 use crate::source::{ResolvedSourceSet, resolve_source_for_mount_id, resolve_source_for_path};
 use crate::virtual_fs::{
-    MOUNT_POINT_PREFIX, ROOT_CONTAINER_IDENTIFIER, VirtualFsItemKind,
-    VirtualFsRefreshChildrenReport, commit_virtual_fs_write, create_virtual_fs_directory,
-    create_virtual_fs_file, materialize_virtual_fs_guidance_with_content_root,
+    MOUNT_POINT_PREFIX, ROOT_CONTAINER_IDENTIFIER, VirtualFsRefreshChildrenReport,
+    commit_virtual_fs_write, create_virtual_fs_directory, create_virtual_fs_file,
+    materialize_virtual_fs_guidance_with_content_root,
     materialize_virtual_fs_item_with_content_root, mount_point_identifier,
     refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
     virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
@@ -1620,12 +1620,6 @@ impl RuntimeState {
                     if report.changed {
                         self.signal_macos_file_provider_container(&mount_id, &container_identifier);
                     }
-                    self.queue_child_refresh_descendants(
-                        &mount_id,
-                        &container_identifier,
-                        depth,
-                        priority,
-                    );
                 }
                 Err(error) => {
                     self.record_metadata_discovery_failure(
@@ -2089,59 +2083,6 @@ impl RuntimeState {
                 *completed_priority = (*completed_priority).max(priority);
             })
             .or_insert(priority);
-    }
-
-    fn queue_child_refresh_descendants(
-        &mut self,
-        mount_id: &str,
-        container_identifier: &str,
-        parent_depth: u32,
-        parent_priority: ChildRefreshPriority,
-    ) {
-        let child_containers = match self
-            .child_container_identifiers(mount_id, container_identifier)
-        {
-            Ok(child_containers) => child_containers,
-            Err(error) => {
-                eprintln!(
-                    "localityd could not inspect refreshed virtual filesystem children for `{mount_id}:{container_identifier}`: {error}"
-                );
-                return;
-            }
-        };
-        for child_container in child_containers {
-            self.queue_child_refresh(
-                mount_id.to_string(),
-                child_container,
-                parent_priority,
-                parent_depth.saturating_add(1),
-            );
-        }
-    }
-
-    fn child_container_identifiers(
-        &self,
-        mount_id: &str,
-        container_identifier: &str,
-    ) -> locality_core::LocalityResult<Vec<String>> {
-        let store =
-            SqliteStateStore::open(self.config.state_root.clone()).map_err(LocalityError::from)?;
-        let mount_id = MountId::new(mount_id);
-        let content_root = virtual_fs_content_root(&self.config.state_root, &mount_id);
-        let report = virtual_fs_children_with_content_root(
-            &store,
-            &content_root,
-            &mount_id,
-            container_identifier,
-        )?;
-
-        Ok(report
-            .children
-            .into_iter()
-            .filter(|child| child.kind == VirtualFsItemKind::Folder)
-            .filter(|child| child.identifier != container_identifier)
-            .map(|child| child.identifier)
-            .collect())
     }
 
     fn delete_hydration_job(&self, request: &HydrationRequest) {
@@ -4560,10 +4501,10 @@ mod tests {
 
     use super::{
         ActiveChildRefresh, ActiveRuntimeJob, ChildRefreshPriority, ChildRefreshQueue,
-        ChildRefreshRequest, DefaultRuntimeJobRunner, JobCompletion, RemoteDiscoveryHint,
-        RuntimeJobRunner, RuntimeState, execute_file_event, execute_observe_entity_job,
-        observable_remote_identifier, remote_fast_forward_discovery_hints,
-        repair_clean_remote_deleted_projections,
+        ChildRefreshRequest, DaemonRequest, DefaultRuntimeJobRunner, JobCompletion,
+        RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState, execute_file_event,
+        execute_observe_entity_job, observable_remote_identifier,
+        remote_fast_forward_discovery_hints, repair_clean_remote_deleted_projections,
     };
 
     #[test]
@@ -4670,6 +4611,39 @@ mod tests {
     }
 
     #[test]
+    fn file_provider_children_queues_interactive_metadata_discovery() {
+        let state_root = temp_runtime_root("runtime-file-provider-children-interactive-discovery");
+        seed_virtual_mount(&state_root);
+        let mut runtime = runtime_state_for_root(state_root.clone());
+        runtime.active_job = Some(test_active_job());
+
+        let (respond_to, response) = std::sync::mpsc::channel();
+        runtime.handle_request(
+            DaemonRequest::FileProviderChildren {
+                mount_id: "notion-main".to_string(),
+                container_identifier: "mount:notion-main".to_string(),
+            },
+            respond_to,
+        );
+
+        assert!(response.recv().expect("children response").ok);
+        let requests = runtime.child_refreshes.debug_requests(10);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].container_identifier, "mount:notion-main");
+        assert_eq!(requests[0].priority, ChildRefreshPriority::Interactive);
+
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("open store")
+            .list_metadata_discovery_jobs()
+            .expect("list discovery");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].container_identifier, "mount:notion-main");
+        assert_eq!(jobs[0].priority, MetadataDiscoveryPriority::Interactive);
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
     fn metadata_discovery_jobs_do_not_reload_when_background_sync_disabled() {
         let state_root = temp_runtime_root("runtime-metadata-discovery-background-disabled");
         seed_virtual_mount(&state_root);
@@ -4745,7 +4719,7 @@ mod tests {
                 .upsert_metadata_discovery_job(metadata_discovery_job(
                     "children:page-1",
                     MetadataDiscoveryPriority::Background,
-                    1,
+                    0,
                 ))
                 .expect("queue discovery");
         }
@@ -4754,7 +4728,7 @@ mod tests {
         runtime.handle_completion(JobCompletion::VirtualFsRefreshChildren {
             mount_id: "notion-main".to_string(),
             container_identifier: "children:page-1".to_string(),
-            depth: 1,
+            depth: 0,
             priority: ChildRefreshPriority::Background,
             result: Ok(VirtualFsRefreshChildrenReport::default()),
         });
@@ -4780,7 +4754,7 @@ mod tests {
                 .upsert_metadata_discovery_job(metadata_discovery_job(
                     "children:page-1",
                     MetadataDiscoveryPriority::Background,
-                    1,
+                    0,
                 ))
                 .expect("queue discovery");
         }
@@ -4789,7 +4763,7 @@ mod tests {
         runtime.handle_completion(JobCompletion::VirtualFsRefreshChildren {
             mount_id: "notion-main".to_string(),
             container_identifier: "children:page-1".to_string(),
-            depth: 1,
+            depth: 0,
             priority: ChildRefreshPriority::Background,
             result: Err(LocalityError::InvalidState("rate limited".to_string())),
         });
@@ -4818,7 +4792,7 @@ mod tests {
                 .upsert_metadata_discovery_job(metadata_discovery_job(
                     "children:page-1",
                     MetadataDiscoveryPriority::Background,
-                    1,
+                    0,
                 ))
                 .expect("queue discovery");
         }
@@ -4827,7 +4801,7 @@ mod tests {
             mount_id: "notion-main".to_string(),
             container_identifier: "children:page-1".to_string(),
             priority: ChildRefreshPriority::Background,
-            depth: 1,
+            depth: 0,
         };
         let popped = runtime
             .child_refreshes
