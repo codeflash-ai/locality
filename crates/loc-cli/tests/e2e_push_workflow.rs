@@ -11305,11 +11305,14 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
         &fixture.mount_id,
         &existing_child_url,
     );
-    assert!(
-        existing_child_path
-            .to_string_lossy()
-            .contains(&slug_for_test(&existing_child_title)),
-        "existing child pretty URL should locate to its projected page.md path: {existing_child_path:?}"
+    let existing_child_dir_name = existing_child_path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned());
+    assert_eq!(
+        existing_child_dir_name.as_deref(),
+        Some(existing_child_title.as_str()),
+        "existing child pretty URL should locate to its title-faithful projected page.md path: {existing_child_path:?}"
     );
 
     let child_title = format!("Locality live located child {}", unique_suffix());
