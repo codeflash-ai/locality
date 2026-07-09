@@ -1432,7 +1432,7 @@ fn pull_mount_root_keeps_dirty_projection_in_place_when_remote_title_changes() {
 
     run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
     fs::write(
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
         "---\nloc:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal dirty body.\n",
     )
     .expect("dirty root page");
@@ -1441,14 +1441,14 @@ fn pull_mount_root_keeps_dirty_projection_in_place_when_remote_title_changes() {
         .expect("pull renamed dirty root");
 
     assert!(!report.ok, "{report:#?}");
-    assert!(fixture.root_file("roadmap").exists());
-    assert!(!fixture.root_file("strategy").exists());
+    assert!(fixture.root_file("Roadmap").exists());
+    assert!(!fixture.root_file("Strategy").exists());
 
     let root_entity = store
         .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
         .expect("get root entity")
         .expect("root entity");
-    assert_eq!(root_entity.path, PathBuf::from("roadmap/page.md"));
+    assert_eq!(root_entity.path, PathBuf::from("Roadmap/page.md"));
     assert!(matches!(
         root_entity.hydration,
         HydrationState::Dirty | HydrationState::Conflicted
