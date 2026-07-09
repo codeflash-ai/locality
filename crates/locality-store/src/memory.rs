@@ -593,7 +593,7 @@ impl MetadataDiscoveryJobRepository for InMemoryStateStore {
         let key = Self::metadata_discovery_job_key(&job.mount_id, &job.container_identifier);
         if let Some(existing) = self.metadata_discovery_jobs.get_mut(&key) {
             existing.priority = existing.priority.max(job.priority);
-            existing.depth = existing.depth.min(job.depth);
+            existing.depth = job.depth;
             existing.updated_at = job.updated_at;
         } else {
             self.metadata_discovery_jobs.insert(key, job);

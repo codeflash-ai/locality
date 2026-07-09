@@ -526,6 +526,20 @@ where
         .map(|container| container.is_some())
 }
 
+pub fn virtual_fs_container_depth<S>(
+    store: &S,
+    mount_id: &MountId,
+    container_identifier: &str,
+) -> LocalityResult<u32>
+where
+    S: MountRepository + EntityRepository,
+{
+    let mount = require_virtual_mount(store, mount_id)?;
+    let entities = store.list_entities(mount_id).map_err(LocalityError::from)?;
+    let path = container_path(&mount, &entities, &[], container_identifier)?;
+    Ok(u32::try_from(path.components().count()).unwrap_or(u32::MAX))
+}
+
 pub fn materialize_virtual_fs_item<S, Source>(
     store: &mut S,
     source: &Source,

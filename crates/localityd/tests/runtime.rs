@@ -1220,30 +1220,30 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
         SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, ROOT_CONTAINER_IDENTIFIER),
     );
     simulation.release(root_refresh);
-    let [page_a1_refresh, page_b_refresh] = simulation.expect_started_set([
-        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "children:page-a1"),
-        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "children:page-b"),
-    ]);
-
-    simulation.advance_to(
-        90,
-        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-a1"),
-    );
-    simulation.release(page_a1_refresh);
-    simulation.expect_no_start();
+    let page_b_refresh = simulation.expect_started(SchedulerExpectedStart::new(
+        SchedulerOpKind::RefreshChildren,
+        "children:page-b",
+    ));
 
     simulation.advance_to(
         100,
         SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-b"),
     );
     simulation.release(page_b_refresh);
-    let page_b1_refresh = simulation.expect_started(SchedulerExpectedStart::new(
-        SchedulerOpKind::RefreshChildren,
-        "children:page-b1",
-    ));
+    let [page_a1_refresh, page_b1_refresh] = simulation.expect_started_set([
+        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "children:page-a1"),
+        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "children:page-b1"),
+    ]);
 
     simulation.advance_to(
         110,
+        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-a1"),
+    );
+    simulation.release(page_a1_refresh);
+    simulation.expect_no_start();
+
+    simulation.advance_to(
+        120,
         SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-b1"),
     );
     simulation.release(page_b1_refresh);
@@ -1259,8 +1259,8 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
         SchedulerTimelineEntry::new(10, SchedulerOpKind::RefreshChildren, "children:page-a"),
         SchedulerTimelineEntry::new(20, SchedulerOpKind::FileProviderRead, "page-open"),
         SchedulerTimelineEntry::new(50, SchedulerOpKind::Pull, "ManualSync.md"),
-        SchedulerTimelineEntry::new(80, SchedulerOpKind::RefreshChildren, "children:page-a1"),
         SchedulerTimelineEntry::new(80, SchedulerOpKind::RefreshChildren, "children:page-b"),
+        SchedulerTimelineEntry::new(100, SchedulerOpKind::RefreshChildren, "children:page-a1"),
         SchedulerTimelineEntry::new(100, SchedulerOpKind::RefreshChildren, "children:page-b1"),
     ]);
     simulation.shutdown();
