@@ -4635,6 +4635,244 @@ fn auto_save_safe_update_reconciles_and_destructive_update_blocks_before_journal
 }
 
 #[test]
+fn cli_live_mode_toggles_file_auto_save_enrollment() {
+    let fixture = E2eFixture::new();
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).expect("open state");
+    let api = Arc::new(MutableNotionApi::with_blocks(vec![paragraph_block(
+        "cli-live-mode-block",
+        "CLI Live Mode paragraph.",
+    )]));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api);
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live-mode CLI fixture");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull live-mode CLI page");
+
+    let page_path = fixture.page_file();
+    let page_arg = page_path.display().to_string();
+    let relative_path = page_path
+        .strip_prefix(&fixture.root)
+        .expect("page is under mount root")
+        .to_path_buf();
+    store
+        .save_auto_save_enrollment(
+            AutoSaveEnrollmentRecord::new(
+                fixture.mount_id.clone(),
+                relative_path.clone(),
+                AutoSaveOrigin::UserEnabled,
+                "unix_ms:1",
+            )
+            .paused_remote_changed("remote changed before enabling", "unix_ms:2"),
+        )
+        .expect("seed paused enrollment");
+    drop(store);
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let enabled = loc_json_ok(loc_command(loc, &fixture.state_root).args([
+        "live-mode",
+        "on",
+        &page_arg,
+        "--json",
+    ]));
+    assert_eq!(enabled.value["ok"], true, "{enabled:#?}");
+    assert_eq!(enabled.value["command"], "live_mode", "{enabled:#?}");
+    assert_eq!(enabled.value["action"], "enabled", "{enabled:#?}");
+    assert_eq!(
+        enabled.value["mount_id"],
+        fixture.mount_id.as_str(),
+        "{enabled:#?}"
+    );
+    assert_eq!(
+        enabled.value["relative_path"],
+        relative_path.display().to_string(),
+        "{enabled:#?}"
+    );
+    assert_eq!(enabled.value["remote_id"], "page-1", "{enabled:#?}");
+    assert_eq!(enabled.value["enabled"], true, "{enabled:#?}");
+    assert_eq!(enabled.value["state"], "active", "{enabled:#?}");
+    assert_eq!(enabled.value["origin"], "user_enabled", "{enabled:#?}");
+    assert_eq!(enabled.value["reason"], Value::Null, "{enabled:#?}");
+
+    let store = SqliteStateStore::open(fixture.state_root.clone()).expect("reopen state");
+    let enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, &relative_path)
+        .expect("load enrollment")
+        .expect("enrollment");
+    assert!(enrollment.enabled, "{enrollment:#?}");
+    assert_eq!(enrollment.state, AutoSaveState::Active);
+    assert_eq!(enrollment.origin, AutoSaveOrigin::UserEnabled);
+    assert_eq!(enrollment.last_reason, None);
+    assert_eq!(enrollment.remote_id, Some(RemoteId::new("page-1")));
+    drop(store);
+
+    let status = loc_json_ok(loc_command(loc, &fixture.state_root).args([
+        "live-mode",
+        "status",
+        &page_arg,
+        "--json",
+    ]));
+    assert_eq!(status.value["ok"], true, "{status:#?}");
+    assert_eq!(status.value["action"], "status", "{status:#?}");
+    assert_eq!(status.value["enabled"], true, "{status:#?}");
+    assert_eq!(status.value["state"], "active", "{status:#?}");
+
+    let disabled = loc_json_ok(loc_command(loc, &fixture.state_root).args([
+        "live-mode",
+        "off",
+        &page_arg,
+        "--json",
+    ]));
+    assert_eq!(disabled.value["ok"], true, "{disabled:#?}");
+    assert_eq!(disabled.value["action"], "disabled", "{disabled:#?}");
+    assert_eq!(disabled.value["enabled"], false, "{disabled:#?}");
+    assert_eq!(disabled.value["state"], "active", "{disabled:#?}");
+    assert_eq!(disabled.value["origin"], "user_enabled", "{disabled:#?}");
+
+    let store = SqliteStateStore::open(fixture.state_root.clone()).expect("reopen state");
+    let enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, &relative_path)
+        .expect("load disabled enrollment")
+        .expect("disabled enrollment");
+    assert!(!enrollment.enabled, "{enrollment:#?}");
+    assert_eq!(enrollment.state, AutoSaveState::Active);
+    assert_eq!(enrollment.origin, AutoSaveOrigin::UserEnabled);
+    assert_eq!(enrollment.last_reason, None);
+}
+
+#[test]
+fn cli_live_mode_page_directory_targets_known_page_document_without_materialized_directory() {
+    let fixture = E2eFixture::new();
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).expect("open state");
+    fs::create_dir_all(&fixture.root).expect("mount root");
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live-mode page directory fixture");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap/page.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save page entity");
+    drop(store);
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let page_dir = fixture.root.join("Roadmap");
+    let page_dir_arg = page_dir.display().to_string();
+    let expected_page_path = fixture.root.join("Roadmap/page.md");
+    let expected_relative_path = PathBuf::from("Roadmap/page.md");
+    let enabled = loc_json_ok(loc_command(loc, &fixture.state_root).args([
+        "live-mode",
+        "on",
+        &page_dir_arg,
+        "--json",
+    ]));
+
+    assert_eq!(enabled.value["ok"], true, "{enabled:#?}");
+    assert_eq!(
+        enabled.value["path"],
+        expected_page_path.display().to_string()
+    );
+    assert_eq!(
+        enabled.value["relative_path"],
+        expected_relative_path.display().to_string(),
+        "{enabled:#?}"
+    );
+    assert_eq!(enabled.value["remote_id"], "page-1", "{enabled:#?}");
+
+    let store = SqliteStateStore::open(fixture.state_root.clone()).expect("reopen state");
+    assert!(
+        store
+            .get_auto_save_enrollment(&fixture.mount_id, Path::new("Roadmap"))
+            .expect("load wrong path enrollment")
+            .is_none(),
+        "page directory target must not enroll the container path"
+    );
+    let enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, &expected_relative_path)
+        .expect("load page document enrollment")
+        .expect("page document enrollment");
+    assert!(enrollment.enabled, "{enrollment:#?}");
+    assert_eq!(enrollment.remote_id, Some(RemoteId::new("page-1")));
+}
+
+#[test]
+fn cli_live_mode_rejects_mount_directory_without_page_file() {
+    let fixture = E2eFixture::new();
+    let mut store = SqliteStateStore::open(fixture.state_root.clone()).expect("open state");
+    fs::create_dir_all(&fixture.root).expect("mount root");
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live-mode directory fixture");
+    drop(store);
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let root_arg = fixture.root.display().to_string();
+    let rejected = loc_json_with_exit(
+        loc_command(loc, &fixture.state_root).args(["live-mode", "on", &root_arg, "--json"]),
+        2,
+    );
+    assert_eq!(rejected.value["ok"], false, "{rejected:#?}");
+    assert_eq!(rejected.value["command"], "live_mode", "{rejected:#?}");
+    assert_eq!(
+        rejected.value["code"], "unsupported_target",
+        "{rejected:#?}"
+    );
+    assert!(
+        rejected.value["message"]
+            .as_str()
+            .expect("message")
+            .contains("not a file or known page directory"),
+        "{rejected:#?}"
+    );
+
+    let store = SqliteStateStore::open(fixture.state_root.clone()).expect("reopen state");
+    assert!(
+        store
+            .list_auto_save_enrollments(&fixture.mount_id)
+            .expect("list enrollments")
+            .is_empty(),
+        "directory rejection must not create an enrollment"
+    );
+}
+
+#[test]
 fn mount_pull_directive_move_pushes_copy_archive_and_status_clean() {
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -8072,6 +8310,150 @@ fn live_cli_binary_uses_stored_credential_and_pushes_scratch_page() {
         !revoked_show.stdout.contains("secret_ref"),
         "revoked connection show JSON leaked credential storage internals"
     );
+}
+
+#[test]
+#[ignore = "requires Notion credentials in ~/.loc credentials and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_cli_live_mode_enables_file_auto_save_without_immediate_push() {
+    let env = LiveEnv::from_env();
+    let source_connection_id =
+        std::env::var(LIVE_CONNECTION_ENV).unwrap_or_else(|_| "notion-default".to_string());
+    let stored_secret =
+        live_notion_secret_from_default_store(&source_connection_id).expect("stored credential");
+    let access_token =
+        notion_access_token_from_secret(&stored_secret).expect("stored access token");
+    let api = HttpNotionApi::new(NotionConfig::default().with_token(access_token.clone()));
+    let mut cleanup = LiveCleanup::new(api);
+    let base = "Original paragraph for CLI Live Mode e2e.";
+    let marker = format!("Locality live CLI Live Mode edit {}", unique_suffix());
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live CLI Live Mode {}", unique_suffix()),
+        vec![paragraph_child(base)],
+    );
+
+    let fixture = E2eFixture::new();
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let connection_id = ConnectionId::new("stored-live-notion-live-mode");
+    seed_cli_live_connection(&fixture.state_root, &connection_id, &stored_secret);
+
+    let mount = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("mount")
+            .arg("notion")
+            .arg(&fixture.root)
+            .arg("--root-page")
+            .arg(&scratch.id)
+            .arg("--connection")
+            .arg(connection_id.as_str())
+            .arg("--mount-id")
+            .arg(fixture.mount_id.as_str())
+            .arg("--projection")
+            .arg("plain-files")
+            .arg("--json"),
+    );
+    assert_eq!(mount.value["ok"], true, "{mount:#?}");
+
+    let pull = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("pull")
+            .arg(&fixture.root)
+            .arg("--json"),
+    );
+    assert_eq!(pull.value["ok"], true, "{pull:#?}");
+
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read CLI Live Mode page");
+    assert!(original.contains(base), "{original}");
+    fs::write(&page_path, original.replace(base, &marker)).expect("write Live Mode local edit");
+
+    let enable = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("live-mode")
+            .arg("on")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(enable.value["ok"], true, "{enable:#?}");
+    assert_eq!(enable.value["command"], "live_mode", "{enable:#?}");
+    assert_eq!(enable.value["action"], "enabled", "{enable:#?}");
+    assert_eq!(
+        compact_notion_id(enable.value["remote_id"].as_str().expect("remote id")),
+        compact_notion_id(&scratch.id),
+        "{enable:#?}"
+    );
+    assert_eq!(enable.value["enabled"], true, "{enable:#?}");
+    assert_eq!(enable.value["state"], "active", "{enable:#?}");
+
+    let relative_path = page_path
+        .strip_prefix(&fixture.root)
+        .expect("page is under mount root")
+        .to_path_buf();
+    let state_after_enable =
+        SqliteStateStore::open(fixture.state_root.clone()).expect("open live-mode state");
+    let enrollment = state_after_enable
+        .get_auto_save_enrollment(&fixture.mount_id, &relative_path)
+        .expect("load live enrollment")
+        .expect("live enrollment");
+    assert!(enrollment.enabled, "{enrollment:#?}");
+    assert_eq!(enrollment.state, AutoSaveState::Active);
+    assert_eq!(enrollment.origin, AutoSaveOrigin::UserEnabled);
+    assert_eq!(enrollment.last_reason, None);
+    assert_eq!(
+        compact_notion_id(
+            enrollment
+                .remote_id
+                .as_ref()
+                .expect("enrollment remote id")
+                .as_str()
+        ),
+        compact_notion_id(&scratch.id)
+    );
+    drop(state_after_enable);
+
+    let connector = NotionConnector::new(NotionConfig::default().with_token(access_token.clone()));
+    let remote_after_enable = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(
+        remote_after_enable.contains(base),
+        "enabling file Live Mode must not push existing local edits:\n{remote_after_enable}"
+    );
+    assert!(
+        !remote_after_enable.contains(&marker),
+        "enabling file Live Mode must not write the marker remotely:\n{remote_after_enable}"
+    );
+
+    let mut store =
+        SqliteStateStore::open(fixture.state_root.clone()).expect("open live auto-save state");
+    let auto_save = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: page_path.clone(),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &connector,
+        Some(&fixture.state_root),
+    )
+    .expect("execute live auto-save push");
+    assert_eq!(auto_save.action, PushJobAction::Reconciled);
+    assert!(auto_save.error.is_none(), "{auto_save:#?}");
+
+    let remote_after_auto_save = render_live_page(&connector, &scratch.id, &page_path);
+    assert!(
+        remote_after_auto_save.contains(&marker),
+        "auto-save should push marker to Notion:\n{remote_after_auto_save}"
+    );
+
+    let disable = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("live-mode")
+            .arg("off")
+            .arg(&page_path)
+            .arg("--json"),
+    );
+    assert_eq!(disable.value["ok"], true, "{disable:#?}");
+    assert_eq!(disable.value["action"], "disabled", "{disable:#?}");
+    assert_eq!(disable.value["enabled"], false, "{disable:#?}");
 }
 
 #[test]

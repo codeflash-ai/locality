@@ -15,6 +15,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc daemon status [--json]`
 - `loc info [path] [--json]`
 - `loc status [path] [--json]`
+- `loc live-mode on|off|status <file> [--json]`
 - `loc search <query> [--connector <connector>] [--limit <n>] [--json]`
 - `loc create page --title <title> [--parent <dir>] [--private] [--json]`
 - `loc templates list|validate|new|apply [args] [--json]`
@@ -265,6 +266,51 @@ JSON output is stable enough for agents:
 
 With Live Mode enabled, the same pending local create can sync automatically
 unless Locality requires review.
+
+## File Live Mode
+
+`loc live-mode on <file>` enables Live Mode for one mounted file. The command
+updates Locality's durable per-file auto-save enrollment and does not contact the
+remote connector or push existing dirty content. After it is enabled, the daemon
+can auto-push later safe edits to that file through the same conservative
+auto-save path used by desktop Live Mode.
+
+Examples:
+
+```bash
+loc live-mode on ~/Library/CloudStorage/Locality/notion-main/Roadmap/page.md
+loc live-mode status ~/Library/CloudStorage/Locality/notion-main/Roadmap/page.md --json
+loc live-mode off ~/Library/CloudStorage/Locality/notion-main/Roadmap/page.md
+```
+
+When enabling or disabling, Locality resolves the path inside a registered mount,
+records the current remote id when the file is already known locally, resets any
+paused or blocked auto-save state to `active`, and clears the previous reason.
+Passing a page directory resolves to that page's `page.md` when the page entity is
+known. Read-only mounts reject `live-mode on` because auto-save would be unable
+to push.
+
+JSON output uses the stable command name `live_mode`:
+
+```json
+{
+  "ok": true,
+  "command": "live_mode",
+  "action": "enabled",
+  "path": "/Users/alice/Library/CloudStorage/Locality/notion-main/Roadmap/page.md",
+  "mount_id": "notion-main",
+  "connector": "notion",
+  "relative_path": "Roadmap/page.md",
+  "remote_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "enabled": true,
+  "state": "active",
+  "origin": "user_enabled",
+  "reason": null
+}
+```
+
+`loc live-mode status <file>` is read-only. If no file enrollment exists, it
+reports `enabled: false` and `state: "off"`.
 
 ## OKF Export
 
