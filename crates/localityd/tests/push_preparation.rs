@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use locality_core::LocalityError;
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::PushOperation;
 use locality_core::push::PushPipelineAction;
@@ -1150,6 +1151,56 @@ fn prepare_push_plans_notion_private_create_with_workspace_parent() {
             assert_eq!(source_path, &PathBuf::from("Private Draft/page.md"));
         }
         operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[test]
+fn prepare_push_direct_root_create_on_notion_reports_actionable_error() {
+    let fixture = PrepareFixture::new();
+    let store = fixture.store("notion");
+    let path = fixture.write_raw(
+        "Daily Practice/page.md",
+        "---\ntitle: Daily Practice\n---\nPlan body.\n",
+    );
+
+    let error = prepare_push(&store, &job(path), None, &LocalSourceValidator)
+        .expect_err("root create without --private should be rejected");
+
+    match error {
+        PushPrepareError::Core(LocalityError::InvalidState(message)) => {
+            assert!(
+                message.contains("does not support creating"),
+                "unexpected message: {message}"
+            );
+            assert!(
+                message.contains("--private"),
+                "expected a --private hint for notion mounts: {message}"
+            );
+        }
+        other => panic!("expected an actionable InvalidState error, got {other:?}"),
+    }
+}
+
+#[test]
+fn prepare_push_direct_root_create_reports_missing_remote_root_id() {
+    let fixture = PrepareFixture::new();
+    let store = fixture.store("google-docs");
+    let path = fixture.write_raw(
+        "Daily Practice/page.md",
+        "---\ntitle: Daily Practice\n---\nPlan body.\n",
+    );
+
+    let error = prepare_push(&store, &job(path), None, &LocalSourceValidator)
+        .expect_err("root create without a remote root id should be rejected");
+
+    match error {
+        PushPrepareError::Core(LocalityError::InvalidState(message)) => {
+            assert!(
+                message.contains("no known remote root id"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected an actionable InvalidState error, got {other:?}"),
     }
 }
 

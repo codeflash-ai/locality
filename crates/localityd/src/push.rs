@@ -2916,10 +2916,60 @@ where
         return Ok(parent);
     }
 
+    if let Some(error) = direct_source_root_create_diagnostic(mount, relative_path) {
+        return Err(error);
+    }
+
     Err(PushPrepareError::Store(StoreError::EntityPathMissing {
         mount_id: mount.mount_id.clone(),
         path: relative_path.to_path_buf(),
     }))
+}
+
+/// Explains why a direct (non-private) create at the mount root has no parent
+/// to attach to, instead of surfacing the generic "path was not found in
+/// mount" store error. `loc create page --parent <mount-root>` happily writes
+/// a local draft for any connector, but connectors such as Notion have no
+/// concept of an anonymous root page: a page must either live under an
+/// existing page/database or be created explicitly as a workspace ("private")
+/// page. Without this, the unsupported case surfaced late, at push time, as a
+/// confusing `EntityPathMissing` error that gave no indication of what to do.
+fn direct_source_root_create_diagnostic(
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Option<PushPrepareError> {
+    if !is_direct_source_root_create_path(relative_path) {
+        return None;
+    }
+
+    let descriptor = source_descriptor(&mount.connector);
+    if descriptor.source_root_create_parent_kind().is_none() {
+        let hint = if mount.connector == "notion" {
+            " Pass --private to `loc create page` to create it as a workspace page instead."
+        } else {
+            ""
+        };
+        return Some(PushPrepareError::Core(LocalityError::InvalidState(
+            format!(
+                "`{connector}` does not support creating `{path}` directly at the mount root; create it under an existing page or database directory.{hint}",
+                connector = mount.connector,
+                path = relative_path.display(),
+            ),
+        )));
+    }
+
+    if mount.remote_root_id.is_none() {
+        return Some(PushPrepareError::Core(LocalityError::InvalidState(
+            format!(
+                "mount `{mount_id}` has no known remote root id, so `{path}` cannot be created at the mount root; reconnect or re-mount `{connector}` to refresh mount metadata.",
+                mount_id = mount.mount_id.0,
+                path = relative_path.display(),
+                connector = mount.connector,
+            ),
+        )));
+    }
+
+    None
 }
 
 fn source_root_create_parent_entity(
