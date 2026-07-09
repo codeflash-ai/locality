@@ -56,8 +56,9 @@ starting `localityd` to disable the daemon-hosted MCP endpoint, or set
 `LOCALITY_MCP_ADDR=<host:port>` to move it.
 
 On Windows, the desktop installer detects both the current MSIX Claude Desktop
-package and the legacy per-user EXE install before writing
-`%APPDATA%\Claude\claude_desktop_config.json`.
+package and the legacy per-user EXE install before writing the config path that
+install uses: the package-local Roaming path for MSIX installs, or
+`%APPDATA%\Claude\claude_desktop_config.json` for legacy installs.
 
 ## Onboarding UX
 
