@@ -276,6 +276,42 @@ pub fn apply_plan(
                             keys: properties.keys().cloned().collect(),
                         });
                     }
+                    PushOperation::MoveEntity {
+                        entity_id,
+                        new_parent_id,
+                        new_parent_kind,
+                        new_title,
+                        ..
+                    } => {
+                        let current_page = current_page(&bundles, entity_id)?;
+                        let moved_page = if page_parent_matches_requested(
+                            api,
+                            current_page,
+                            new_parent_id,
+                            new_parent_kind,
+                        )? {
+                            current_page.clone()
+                        } else {
+                            let parent =
+                                move_page_parent_body(api, new_parent_id, new_parent_kind)?;
+                            api.move_page(entity_id.as_str(), parent)?
+                        };
+                        let properties = BTreeMap::from([(
+                            "title".to_string(),
+                            PropertyValue::String(new_title.clone()),
+                        )]);
+                        let body = update_properties_body(&moved_page, &properties)?;
+                        api.update_page(entity_id.as_str(), body)?;
+                        if !changed_remote_ids.contains(entity_id) {
+                            changed_remote_ids.push(entity_id.clone());
+                        }
+                        effects.push(JournalApplyEffect::MovedEntity {
+                            operation_id: request.operation_ids[operation_index].clone(),
+                            operation_index,
+                            entity_id: entity_id.clone(),
+                            parent_id: new_parent_id.clone(),
+                        });
+                    }
                     PushOperation::CreateEntity {
                         parent_id,
                         parent_kind,
@@ -1251,6 +1287,66 @@ fn create_page_body(
     }
 
     Ok(request)
+}
+
+fn move_page_parent_body(
+    api: &dyn NotionApi,
+    parent_id: &RemoteId,
+    parent_kind: &locality_core::model::EntityKind,
+) -> LocalityResult<Value> {
+    if matches!(parent_kind, locality_core::model::EntityKind::Page) {
+        return Ok(json!({
+            "type": "page_id",
+            "page_id": parent_id.0,
+        }));
+    }
+
+    if matches!(parent_kind, locality_core::model::EntityKind::Database) {
+        let database = api.retrieve_database(parent_id.as_str())?;
+        let [data_source] = database.data_sources.as_slice() else {
+            return Err(LocalityError::Unsupported(
+                "moving Notion pages into a database requires exactly one data source",
+            ));
+        };
+        return Ok(json!({
+            "type": "data_source_id",
+            "data_source_id": data_source.id,
+        }));
+    }
+
+    Err(LocalityError::Unsupported(
+        "Notion pages can only be moved into page or database parents",
+    ))
+}
+
+fn page_parent_matches_requested(
+    api: &dyn NotionApi,
+    page: &PageDto,
+    parent_id: &RemoteId,
+    parent_kind: &locality_core::model::EntityKind,
+) -> LocalityResult<bool> {
+    let Some(parent) = page.parent.as_ref() else {
+        return Ok(false);
+    };
+
+    if matches!(parent_kind, locality_core::model::EntityKind::Page) {
+        return Ok(parent.page_id.as_deref() == Some(parent_id.as_str()));
+    }
+
+    if matches!(parent_kind, locality_core::model::EntityKind::Database) {
+        if parent.database_id.as_deref() == Some(parent_id.as_str()) {
+            return Ok(true);
+        }
+        let database = api.retrieve_database(parent_id.as_str())?;
+        let [data_source] = database.data_sources.as_slice() else {
+            return Err(LocalityError::Unsupported(
+                "moving Notion pages into a database requires exactly one data source",
+            ));
+        };
+        return Ok(parent.data_source_id.as_deref() == Some(data_source.id.as_str()));
+    }
+
+    Ok(false)
 }
 
 fn create_properties_body(

@@ -1188,7 +1188,11 @@ fn projected_title_stem(title: &str) -> String {
     if stem.is_empty() {
         return "Untitled".to_string();
     }
-    stem
+    if is_windows_reserved_device_basename(&stem) {
+        format!("{stem}-page")
+    } else {
+        stem
+    }
 }
 
 fn is_invalid_path_segment_char(ch: char) -> bool {
@@ -1196,6 +1200,25 @@ fn is_invalid_path_segment_char(ch: char) -> bool {
         ch,
         '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
     ) || ch.is_control()
+}
+
+fn is_windows_reserved_device_basename(stem: &str) -> bool {
+    let basename = stem
+        .split_once('.')
+        .map_or(stem, |(basename, _)| basename)
+        .trim_end_matches(|ch: char| ch.is_whitespace() || ch == '.');
+    let upper = basename.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN" | "CONOUT"
+    ) || upper
+        .strip_prefix("COM")
+        .and_then(|suffix| suffix.parse::<u8>().ok())
+        .is_some_and(|number| (1..=9).contains(&number))
+        || upper
+            .strip_prefix("LPT")
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .is_some_and(|number| (1..=9).contains(&number))
 }
 
 fn short_id(remote_id: &str, len: usize) -> String {
@@ -1260,6 +1283,14 @@ mod tests {
             projected_title_stem(r#"Q&A: Launch? "Alpha" <Beta>|*"#),
             "Q&A- Launch- -Alpha- -Beta-"
         );
+    }
+
+    #[test]
+    fn title_stem_sanitizes_windows_reserved_device_basenames() {
+        assert_eq!(projected_title_stem("CON"), "CON-page");
+        assert_eq!(projected_title_stem("AUX.txt"), "AUX.txt-page");
+        assert_eq!(projected_title_stem("lpt1.md"), "lpt1.md-page");
+        assert_eq!(projected_title_stem("COM10"), "COM10");
     }
 
     #[test]

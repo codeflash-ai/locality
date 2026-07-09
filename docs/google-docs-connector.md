@@ -74,12 +74,16 @@ Local changes use the existing shadow and push planner flow. The connector maps
 operations to:
 
 - Docs `documents.batchUpdate` for body edits
-- Drive `files.update` for title, parent, and trash operations
+- Drive `files.update` for title, parent move, and trash operations
 - Drive `files.create` for new Google Docs and folders
 
 Body updates use `writeControl.requiredRevisionId` when a synced Docs revision
 is available. After apply, Locality re-fetches accepted remote state and
 reconciles local Markdown and shadows.
+
+Page-directory renames and parent moves plan as `move_entity`. The Google Docs
+connector applies them with Drive metadata updates, replacing the old parent
+with the new folder parent and updating the document name when needed.
 
 Failed Google Docs creates now trash the just-created Drive file when body
 insertion fails, preventing partial empty remote documents.

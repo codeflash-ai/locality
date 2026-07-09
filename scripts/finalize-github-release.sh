@@ -23,6 +23,7 @@ required_workflows=(
   "release macOS"
   "release Linux"
   "release Windows"
+  "release notes"
 )
 
 for workflow in "${required_workflows[@]}"; do

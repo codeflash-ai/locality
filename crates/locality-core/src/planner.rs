@@ -83,6 +83,13 @@ pub enum PushOperation {
         #[serde(default)]
         properties: BTreeMap<String, PropertyValue>,
     },
+    MoveEntity {
+        entity_id: RemoteId,
+        new_parent_id: RemoteId,
+        new_parent_kind: EntityKind,
+        new_title: String,
+        projected_path: std::path::PathBuf,
+    },
     CreateEntity {
         parent_id: RemoteId,
         #[serde(default)]
@@ -114,6 +121,7 @@ pub enum PushOperationKind {
     ArchiveBlock,
     ArchiveEntity,
     UpdateProperties,
+    MoveEntity,
     CreateEntity,
 }
 
@@ -128,11 +136,12 @@ impl PushOperationKind {
             Self::ArchiveBlock => "archive_block",
             Self::ArchiveEntity => "archive_entity",
             Self::UpdateProperties => "update_properties",
+            Self::MoveEntity => "move_entity",
             Self::CreateEntity => "create_entity",
         }
     }
 
-    pub fn all() -> [Self; 9] {
+    pub fn all() -> [Self; 10] {
         [
             Self::UpdateBlock,
             Self::ReplaceBlock,
@@ -142,6 +151,7 @@ impl PushOperationKind {
             Self::ArchiveBlock,
             Self::ArchiveEntity,
             Self::UpdateProperties,
+            Self::MoveEntity,
             Self::CreateEntity,
         ]
     }
@@ -158,6 +168,7 @@ impl PushOperation {
             Self::ArchiveBlock { .. } => PushOperationKind::ArchiveBlock,
             Self::ArchiveEntity { .. } => PushOperationKind::ArchiveEntity,
             Self::UpdateProperties { .. } => PushOperationKind::UpdateProperties,
+            Self::MoveEntity { .. } => PushOperationKind::MoveEntity,
             Self::CreateEntity { .. } => PushOperationKind::CreateEntity,
         }
     }
@@ -175,6 +186,8 @@ pub struct PlanSummary {
     pub blocks_archived: usize,
     pub entities_created: usize,
     pub entities_archived: usize,
+    #[serde(default)]
+    pub entities_moved: usize,
     pub properties_updated: usize,
 }
 
@@ -194,6 +207,7 @@ impl PlanSummary {
                 PushOperation::UpdateProperties { properties, .. } => {
                     summary.properties_updated += properties.len();
                 }
+                PushOperation::MoveEntity { .. } => summary.entities_moved += 1,
                 PushOperation::CreateEntity { .. } => summary.entities_created += 1,
             }
         }

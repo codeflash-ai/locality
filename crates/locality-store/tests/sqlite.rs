@@ -120,7 +120,7 @@ fn sqlite_store_seeds_state_compatibility_components() {
             (
                 "durable:virtual_mutations".to_string(),
                 "durable_json".to_string(),
-                1,
+                2,
                 1,
                 1,
                 0,

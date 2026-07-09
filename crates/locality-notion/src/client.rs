@@ -127,6 +127,10 @@ pub trait NotionApi: std::fmt::Debug + Send + Sync {
         let _ = (page_id, body);
         Err(LocalityError::NotImplemented("update Notion page"))
     }
+    fn move_page(&self, page_id: &str, parent: serde_json::Value) -> LocalityResult<PageDto> {
+        let _ = (page_id, parent);
+        Err(LocalityError::NotImplemented("move Notion page"))
+    }
     fn create_page(&self, body: serde_json::Value) -> LocalityResult<PageDto> {
         let _ = body;
         Err(LocalityError::NotImplemented("create Notion page"))
@@ -891,6 +895,13 @@ impl NotionApi for HttpNotionApi {
 
     fn update_page(&self, page_id: &str, body: serde_json::Value) -> LocalityResult<PageDto> {
         self.patch_json(&format!("/v1/pages/{page_id}"), body)
+    }
+
+    fn move_page(&self, page_id: &str, parent: serde_json::Value) -> LocalityResult<PageDto> {
+        self.post_json(
+            &format!("/v1/pages/{page_id}/move"),
+            json!({ "parent": parent }),
+        )
     }
 
     fn create_page(&self, body: serde_json::Value) -> LocalityResult<PageDto> {

@@ -28,6 +28,11 @@ grep -F -q 'UPDATER_MACOS_AARCH64_ARTIFACT: target/release/github-assets/Localit
   || fail "macOS updater manifest must point at the standard updater asset"
 grep -F -q -- '--notes "Release assets are still being published."' "${MACOS_WORKFLOW}" \
   || fail "macOS release workflow must create only placeholder release notes"
+grep -F -q 'create_args+=(--prerelease --latest=false)' "${MACOS_WORKFLOW}" \
+  || fail "macOS stable placeholder release creation must not promote latest before release notes"
+if grep -F -q 'edit_args+=(--prerelease=false --latest=true)' "${MACOS_WORKFLOW}"; then
+  fail "macOS platform release edits must not promote latest with placeholder notes"
+fi
 
 grep -F -q 'Locality_Windows_v$env:APP_VERSION.exe' "${WINDOWS_WORKFLOW}" \
   || fail "Windows release workflow must publish Locality_Windows_v<version>.exe"
@@ -37,6 +42,11 @@ grep -F -q 'UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/windows/Local
   || fail "Windows updater manifest must point at the standard installer asset"
 grep -F -q -- '"--notes", "Release assets are still being published."' "${WINDOWS_WORKFLOW}" \
   || fail "Windows release workflow must create only placeholder release notes"
+grep -F -q '$createArgs += @("--prerelease", "--latest=false")' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows stable placeholder release creation must not promote latest before release notes"
+if grep -F -q '$editArgs += @("--prerelease=false", "--latest=true")' "${WINDOWS_WORKFLOW}"; then
+  fail "Windows platform release edits must not promote latest with placeholder notes"
+fi
 grep -F -q '  push:' "${WINDOWS_WORKFLOW}" \
   || fail "Windows release workflow must stay unified with tag-triggered releases"
 grep -F -q '    tags:' "${WINDOWS_WORKFLOW}" \
@@ -60,6 +70,11 @@ grep -F -q 'UPDATER_LINUX_X86_64_ARTIFACT: target/release/github-assets/Locality
   || fail "Linux updater manifest must point at the standard AppImage asset"
 grep -F -q -- '--notes "Release assets are still being published."' "${LINUX_WORKFLOW}" \
   || fail "Linux release workflow must create only placeholder release notes"
+grep -F -q 'create_args+=(--prerelease --latest=false)' "${LINUX_WORKFLOW}" \
+  || fail "Linux stable placeholder release creation must not promote latest before release notes"
+if grep -F -q 'edit_args+=(--prerelease=false --latest=true)' "${LINUX_WORKFLOW}"; then
+  fail "Linux platform release edits must not promote latest with placeholder notes"
+fi
 
 grep -F -q 'scripts/render-release-notes.sh' "${RELEASE_NOTES_WORKFLOW}" \
   || fail "release notes workflow must generate LLM release notes"
@@ -76,6 +91,8 @@ if grep -F -q -- '--latest=true' "${MACOS_WORKFLOW}" "${WINDOWS_WORKFLOW}" "${LI
 fi
 grep -F -q 'scripts/finalize-github-release.sh' "${RELEASE_FINALIZE_WORKFLOW}" \
   || fail "release finalizer workflow must run the release finalizer script"
+grep -F -q '"release notes"' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer must wait for generated release notes before latest promotion"
 grep -F -q -- '--latest=true' "${RELEASE_FINALIZE_SCRIPT}" \
   || fail "release finalizer script must be the only release path that marks releases latest"
 grep -F -q 'Locality_Mac.dmg' "${RELEASE_FINALIZE_SCRIPT}" \

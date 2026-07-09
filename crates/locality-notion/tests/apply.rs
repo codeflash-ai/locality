@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -16,9 +16,9 @@ use locality_notion::dto::{
     BlockDto, BlockListDto, CodeBlockDto, ColorOnlyBlockDto, DataSourceDto, DataSourcePropertyDto,
     DataSourceSummaryDto, DatabaseDto, DateMentionDto, EquationBlockDto, ExternalFileDto,
     FileBlockDto, IdRefDto, LinkDto, LinkToPageBlockDto, MentionRichTextDto, PageDto, PageListDto,
-    PagePropertyDto, PaginatedListDto, RichTextAnnotationsDto, RichTextBlockDto, RichTextDto,
-    SelectOptionDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto, ToDoBlockDto,
-    UrlBlockDto,
+    PagePropertyDto, PaginatedListDto, ParentDto, RichTextAnnotationsDto, RichTextBlockDto,
+    RichTextDto, SelectOptionDto, TableBlockDto, TableRowBlockDto, TextRichTextDto, TitleBlockDto,
+    ToDoBlockDto, UrlBlockDto,
 };
 use locality_notion::{NotionConfig, NotionConnector};
 use serde_json::{Value, json};
@@ -4193,6 +4193,127 @@ fn apply_creates_database_row_with_properties_and_children() {
 }
 
 #[test]
+fn apply_moves_page_then_updates_title() {
+    let api = Arc::new(RecordingNotionApi::with_page_properties(
+        "2026-06-10T00:00:00.000Z",
+        BTreeMap::from([("Name".to_string(), page_property("title"))]),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::MoveEntity {
+            entity_id: RemoteId::new("page-1"),
+            new_parent_id: RemoteId::new("page-parent"),
+            new_parent_kind: EntityKind::Page,
+            new_title: "Moved Page".to_string(),
+            projected_path: PathBuf::from("Parent/Moved Page/page.md"),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply move");
+
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    assert_eq!(result.effects.len(), 1);
+    let writes = api.writes.lock().expect("writes").clone();
+    assert_eq!(
+        writes,
+        vec![
+            WriteCall::MovePage {
+                page_id: "page-1".to_string(),
+                parent: json!({
+                    "type": "page_id",
+                    "page_id": "page-parent",
+                }),
+            },
+            WriteCall::UpdatePage {
+                page_id: "page-1".to_string(),
+                body: json!({
+                    "properties": {
+                        "Name": {
+                            "title": rich_text_json("Moved Page"),
+                        },
+                    },
+                }),
+            },
+        ]
+    );
+}
+
+#[test]
+fn apply_rename_only_move_entity_skips_notions_same_parent_move() {
+    let api = Arc::new(RecordingNotionApi::with_page_and_children(
+        PageDto {
+            id: "page-1".to_string(),
+            parent: Some(ParentDto {
+                kind: "page_id".to_string(),
+                page_id: Some("page-parent".to_string()),
+                ..Default::default()
+            }),
+            created_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+            last_edited_time: Some("2026-06-10T00:00:00.000Z".to_string()),
+            archived: false,
+            in_trash: false,
+            properties: BTreeMap::from([("Name".to_string(), page_property("title"))]),
+        },
+        rich_text("Old title body."),
+    ));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let plan = PushPlan::new(
+        vec![RemoteId::new("page-1")],
+        vec![PushOperation::MoveEntity {
+            entity_id: RemoteId::new("page-1"),
+            new_parent_id: RemoteId::new("page-parent"),
+            new_parent_kind: EntityKind::Page,
+            new_title: "Renamed Page".to_string(),
+            projected_path: PathBuf::from("Parent/Renamed Page/page.md"),
+        }],
+    );
+    let push_id = PushId("push-1".to_string());
+    let operation_ids = operation_ids(&push_id, &plan);
+    let mount_id = MountId::new("notion-main");
+
+    let result = connector
+        .apply(ApplyPlanRequest {
+            push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &plan,
+            operation_ids: &operation_ids,
+            remote_preconditions: &[],
+            local_root: None,
+        })
+        .expect("apply rename-only move entity");
+
+    assert_eq!(result.changed_remote_ids, vec![RemoteId::new("page-1")]);
+    assert_eq!(result.effects.len(), 1);
+    let writes = api.writes.lock().expect("writes").clone();
+    assert_eq!(
+        writes,
+        vec![WriteCall::UpdatePage {
+            page_id: "page-1".to_string(),
+            body: json!({
+                "properties": {
+                    "Name": {
+                        "title": rich_text_json("Renamed Page"),
+                    },
+                },
+            }),
+        }]
+    );
+}
+
+#[test]
 fn apply_rejects_legacy_property_update_without_values() {
     let api = Arc::new(RecordingNotionApi::with_page_properties(
         "2026-06-10T00:00:00.000Z",
@@ -4491,6 +4612,17 @@ impl NotionApi for RecordingNotionApi {
         Ok(self.page.clone())
     }
 
+    fn move_page(&self, page_id: &str, parent: Value) -> LocalityResult<PageDto> {
+        self.writes
+            .lock()
+            .expect("writes")
+            .push(WriteCall::MovePage {
+                page_id: page_id.to_string(),
+                parent,
+            });
+        Ok(self.page.clone())
+    }
+
     fn create_page(&self, body: Value) -> LocalityResult<PageDto> {
         self.writes
             .lock()
@@ -4586,6 +4718,10 @@ enum WriteCall {
     UpdatePage {
         page_id: String,
         body: Value,
+    },
+    MovePage {
+        page_id: String,
+        parent: Value,
     },
     CreatePage {
         body: Value,

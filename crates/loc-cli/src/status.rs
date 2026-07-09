@@ -351,7 +351,9 @@ where
             .filter(|mutation| {
                 matches!(
                     mutation.mutation_kind,
-                    VirtualMutationKind::Delete | VirtualMutationKind::Rename
+                    VirtualMutationKind::Delete
+                        | VirtualMutationKind::Move
+                        | VirtualMutationKind::Rename
                 )
             })
             .filter_map(|mutation| mutation.target_remote_id.clone())
@@ -837,6 +839,10 @@ fn classify_virtual_mutation(
         VirtualMutationKind::Create => {
             ("pending_virtual_create", "file is pending remote creation")
         }
+        VirtualMutationKind::Move => (
+            "pending_virtual_rename",
+            "file move is pending remote update",
+        ),
         VirtualMutationKind::Rename => (
             "pending_virtual_rename",
             "file rename is pending remote update",

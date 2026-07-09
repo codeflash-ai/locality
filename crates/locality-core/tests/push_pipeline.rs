@@ -4,6 +4,7 @@ use locality_core::canonical::{ParsedCanonicalDocument, parse_canonical_markdown
 use locality_core::model::RemoteId;
 use locality_core::planner::{
     GuardrailDecision, GuardrailPolicy, PlanDegradationKind, PropertyValue, PushOperation,
+    PushOperationKind,
 };
 use locality_core::push::{
     PushApproval, PushPipelineAction, PushPipelineRequest, PushStage, plan_push_pipeline,
@@ -284,6 +285,40 @@ fn legacy_property_update_operation_json_stays_readable() {
             properties: BTreeMap::new(),
         }
     );
+}
+
+#[test]
+fn move_entity_operation_json_and_summary_are_stable() {
+    let operation = PushOperation::MoveEntity {
+        entity_id: RemoteId::new("page-child"),
+        new_parent_id: RemoteId::new("page-parent"),
+        new_parent_kind: locality_core::model::EntityKind::Page,
+        new_title: "Renamed Child".to_string(),
+        projected_path: "Parent/Renamed Child/page.md".into(),
+    };
+    let json = serde_json::to_value(&operation).expect("serialize move entity");
+
+    assert_eq!(
+        json,
+        json!({
+            "type": "move_entity",
+            "entity_id": "page-child",
+            "new_parent_id": "page-parent",
+            "new_parent_kind": "page",
+            "new_title": "Renamed Child",
+            "projected_path": "Parent/Renamed Child/page.md",
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<PushOperation>(json).expect("deserialize move entity"),
+        operation
+    );
+    let plan =
+        locality_core::planner::PushPlan::new(vec![RemoteId::new("page-child")], vec![operation]);
+
+    assert_eq!(PushOperationKind::MoveEntity.as_str(), "move_entity");
+    assert_eq!(plan.summary.entities_moved, 1);
+    assert_eq!(plan.summary.properties_updated, 0);
 }
 
 fn request<'a>(

@@ -118,7 +118,7 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:virtual_mutations",
         component_kind: "durable_json",
-        current_version: 1,
+        current_version: 2,
         min_reader_version: 1,
         required: true,
         rebuildable: false,
@@ -2583,6 +2583,9 @@ fn remap_apply_effect_operation_index(
             operation_index, ..
         }
         | JournalApplyEffect::UpdatedProperties {
+            operation_index, ..
+        }
+        | JournalApplyEffect::MovedEntity {
             operation_index, ..
         }
         | JournalApplyEffect::CreatedEntity {

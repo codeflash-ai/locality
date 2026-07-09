@@ -29,9 +29,9 @@ I/O.
 
 Capabilities are explicit connector-neutral booleans. The current contract
 tracks block updates, databases, OAuth, cheap remote observation, lazy child
-enumeration, media download, undo, and future batch observation. Hosts should use
-capabilities for scheduling and preflight decisions, not for bypassing
-authoritative push concurrency checks.
+enumeration, media download, entity moves, undo, and future batch observation.
+Hosts should use capabilities for scheduling and preflight decisions, not for
+bypassing authoritative push concurrency checks.
 
 Apply requests include the core `push_id`, mount ID, approved push plan, and deterministic operation IDs aligned with `plan.operations`. Connectors should use those operation IDs as source-side idempotency keys for block-level API calls when the source supports idempotent writes.
 
@@ -53,4 +53,9 @@ Undo requests include the target push ID, mount ID, and a connector-neutral comp
 
 `locality-notion` is the first connector. It owns Notion-specific block mapping, database schema translation, OAuth/API behavior, and conversion between Notion payloads and the canonical Locality document model.
 
-The current Notion slice is live-capable for reads and narrow writes: it retrieves page metadata, recursively fetches paginated block children, enumerates root-page descendants and database rows into stable projected paths, stores native JSON bundles, renders canonical Markdown plus shadow snapshots, writes `_schema.yaml` for databases, applies simple block update/append/archive plans, updates supported page properties, and creates new database rows from new Markdown files. Reverse apply is available for the supported block/entity effects recorded in the journal.
+The current Notion slice is live-capable for reads and narrow writes: it retrieves page metadata, recursively fetches paginated block children, enumerates root-page descendants and database rows into stable projected paths, stores native JSON bundles, renders canonical Markdown plus shadow snapshots, writes `_schema.yaml` for databases, applies simple block update/append/archive plans, moves pages between supported parents, updates supported page properties, and creates new database rows from new Markdown files. Reverse apply is available for the supported block/entity effects recorded in the journal.
+
+Page-directory renames and parent changes are represented as the connector-neutral
+`move_entity` push operation. Connectors that support it should update the
+remote parent and title as one logical operation and return a moved-entity
+journal effect so reconcile can fetch the entity at its final projected path.

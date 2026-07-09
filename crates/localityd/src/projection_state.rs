@@ -43,7 +43,6 @@ pub enum ProjectionStateRepairKind {
     ClearRedundantPendingCreate,
     ClearOrphanPendingDelete,
     ClearStalePendingDelete,
-    ClearRedundantPendingRename,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,7 +279,7 @@ fn plan_missing_target_conflicts(
                     repair: None,
                 });
             }
-            VirtualMutationKind::Rename => {
+            VirtualMutationKind::Move | VirtualMutationKind::Rename => {
                 let Some(remote_id) = mutation.target_remote_id.as_ref() else {
                     plan.push_conflict(ProjectionStateDiagnostic {
                         code: "pending_rename_missing_target".to_string(),
@@ -360,33 +359,14 @@ fn plan_lossless_repairs(
                     );
                 }
             }
-            VirtualMutationKind::Rename => {
+            VirtualMutationKind::Move | VirtualMutationKind::Rename => {
                 let Some(remote_id) = mutation.target_remote_id.as_ref() else {
                     continue;
                 };
-                let Some(entity) = facts.entities_by_id.get(remote_id) else {
+                if !facts.entities_by_id.contains_key(remote_id) {
                     continue;
                 };
-                if entity.path == mutation.projected_path
-                    && entity.title == mutation.title
-                    && !plan.has_conflict_for_local_id(&mutation.local_id)
-                {
-                    plan.push_repair(
-                        ProjectionStateRepair {
-                            mount_id: mount.mount_id.clone(),
-                            local_id: mutation.local_id.clone(),
-                        },
-                        ProjectionStateDiagnostic {
-                            code: "redundant_pending_rename".to_string(),
-                            path: mutation.projected_path.clone(),
-                            local_id: Some(mutation.local_id.clone()),
-                            remote_id: Some(remote_id.0.clone()),
-                            message: "pending rename is already reflected in local entity state"
-                                .to_string(),
-                            repair: Some(ProjectionStateRepairKind::ClearRedundantPendingRename),
-                        },
-                    );
-                } else if let Some(colliding) = facts.entities_by_path.get(&mutation.projected_path)
+                if let Some(colliding) = facts.entities_by_path.get(&mutation.projected_path)
                     && colliding.remote_id != *remote_id
                 {
                     plan.push_conflict(ProjectionStateDiagnostic {
@@ -593,6 +573,7 @@ impl ProjectionStateFacts {
 fn mutation_kind_name(kind: &VirtualMutationKind) -> &'static str {
     match kind {
         VirtualMutationKind::Create => "create",
+        VirtualMutationKind::Move => "move",
         VirtualMutationKind::Rename => "rename",
         VirtualMutationKind::Delete => "delete",
     }
@@ -1011,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_clears_redundant_rename_when_entity_already_has_projected_path_and_title() {
+    fn reconcile_keeps_pending_rename_when_entity_already_has_projected_path_and_title() {
         let fixture = Fixture::new();
         let mut store = fixture.store();
         fixture.entity_with_title(&mut store, "page-1", "Renamed", "Renamed/page.md");
@@ -1027,13 +1008,13 @@ mod tests {
             reconcile_projection_state_for_target(&mut store, Some(&fixture.state_root), None)
                 .expect("reconcile state");
 
-        assert_eq!(report.repaired, 1, "{report:#?}");
+        assert_eq!(report.repaired, 0, "{report:#?}");
         assert_eq!(report.conflicts, 0, "{report:#?}");
         assert!(
             store
                 .get_virtual_mutation(&fixture.mount_id, "rename:page-1")
                 .expect("load mutation")
-                .is_none()
+                .is_some()
         );
     }
 

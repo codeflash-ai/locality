@@ -447,6 +447,100 @@ fn scheduled_pull_renames_existing_projection_when_remote_title_changes() {
     assert_eq!(child_entity.path, PathBuf::from("Vision/Child/page.md"));
 }
 
+#[test]
+fn scheduled_pull_keeps_dirty_projection_in_place_when_remote_title_changes() {
+    let root = temp_root("scheduled-pull-dirty-rename");
+    let mount_id = MountId::new("notion-main");
+    let mount = MountConfig::new(mount_id.clone(), "notion", root.clone())
+        .with_remote_root_id(RemoteId::new("root-page"));
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount).expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("root-page"),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            )
+            .with_hydration(HydrationState::Dirty)
+            .with_remote_edited_at("2026-06-10T00:00:00Z"),
+        )
+        .expect("save dirty root entity");
+    store
+        .save_entity(
+            EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("child-page"),
+                EntityKind::Page,
+                "Child",
+                "Home/Child/page.md",
+            )
+            .with_hydration(HydrationState::Stub)
+            .with_remote_edited_at("2026-06-10T00:00:00Z"),
+        )
+        .expect("save child entity");
+    std::fs::create_dir_all(root.join("Home/Child")).expect("create initial tree");
+    std::fs::write(
+        root.join("Home/page.md"),
+        "---\nloc:\n  id: root-page\n  type: page\n  synced_at: old\n  remote_edited_at: old\ntitle: Home\n---\nLocal dirty body.\n",
+    )
+    .expect("write dirty root");
+    std::fs::write(root.join("Home/Child/page.md"), "child stub").expect("write child");
+    let mut source = FakeScheduledPullSource::default();
+    source.insert_entries(
+        &mount_id,
+        vec![
+            page_entry(
+                &mount_id,
+                "root-page",
+                "Vision",
+                "Vision/page.md",
+                "2026-06-11T00:00:00Z",
+            ),
+            page_entry(
+                &mount_id,
+                "child-page",
+                "Child",
+                "Vision/Child/page.md",
+                "2026-06-11T00:00:00Z",
+            ),
+        ],
+    );
+    let mut supervisor = supervisor_with_store(store);
+
+    supervisor.start().expect("start supervisor");
+    let report = supervisor
+        .advance_and_execute_scheduled_pull(
+            AdvanceScheduledPullJob::new(Duration::ZERO),
+            &source,
+            &DefaultFetchScheduleStrategy,
+        )
+        .expect("dirty rename scheduled pull");
+
+    assert_eq!(report.stubbed, 0);
+    assert_eq!(report.queued_hydrations, 0);
+    assert!(root.join("Home/page.md").exists());
+    assert!(root.join("Home/Child/page.md").exists());
+    assert!(!root.join("Vision/page.md").exists());
+    assert!(!root.join("Vision/Child/page.md").exists());
+
+    let root_entity = supervisor
+        .store()
+        .get_entity(&mount_id, &RemoteId::new("root-page"))
+        .expect("get root entity")
+        .expect("root entity");
+    assert_eq!(root_entity.path, PathBuf::from("Home/page.md"));
+    assert_eq!(root_entity.hydration, HydrationState::Dirty);
+    let child_entity = supervisor
+        .store()
+        .get_entity(&mount_id, &RemoteId::new("child-page"))
+        .expect("get child entity")
+        .expect("child entity");
+    assert_eq!(child_entity.path, PathBuf::from("Home/Child/page.md"));
+}
+
 fn supervisor_with_mounts(
     mounts: impl IntoIterator<Item = MountConfig>,
 ) -> DaemonSupervisor<InMemoryStateStore, RecordingWatcher, HydrationQueue> {

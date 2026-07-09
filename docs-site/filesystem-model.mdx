@@ -20,6 +20,26 @@ Engineering Wiki/
 
 A child page lives inside its parent page directory. The containing directory determines the remote parent. Do not infer the remote parent from title search results.
 
+## Moves and renames
+
+Moving a page directory is the filesystem way to change the remote parent.
+Renaming the directory changes the title. A single `mv` can do both:
+
+```text
+engineering-wiki/roadmap/page.md
+go-to-market/launch-plan/page.md
+```
+
+Locality records that as one pending entity move, not as unrelated delete and
+create operations. For connectors that support entity moves, push applies the
+parent change and final title through the connector's native move/update APIs
+and then reconciles the page at its final path.
+
+When a remote rename or parent move is observed, Locality moves clean local
+projections atomically. If any local file in the affected subtree is dirty or
+conflicted, Locality leaves that subtree in place and reports review needed
+instead of moving pending local work.
+
 ## Databases
 
 A Notion database is projected as a directory.

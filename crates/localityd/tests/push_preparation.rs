@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
-use locality_core::planner::{PropertyValue, PushOperation};
+use locality_core::planner::PushOperation;
 use locality_core::push::PushPipelineAction;
 use locality_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use locality_core::validation::ValidationReport;
@@ -861,14 +861,114 @@ fn prepare_push_plans_pending_page_directory_rename_under_parent_scope() {
 
     assert_eq!(
         plan.operations,
-        vec![PushOperation::UpdateProperties {
+        vec![PushOperation::MoveEntity {
             entity_id: RemoteId::new("page-child"),
-            properties: BTreeMap::from([(
-                "title".to_string(),
-                PropertyValue::String("Renamed Child".to_string()),
-            )]),
+            new_parent_id: RemoteId::new("page-parent"),
+            new_parent_kind: EntityKind::Page,
+            new_title: "Renamed Child".to_string(),
+            projected_path: PathBuf::from("Home/Renamed Child/page.md"),
         }]
     );
+    assert_eq!(plan.summary.entities_moved, 1);
+}
+
+#[test]
+fn prepare_push_plans_pending_page_directory_move_as_move_entity() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.virtual_store("notion");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("page-home"),
+            EntityKind::Page,
+            "Home",
+            "Home/page.md",
+        ))
+        .expect("save home page");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("page-archive"),
+            EntityKind::Page,
+            "Archive",
+            "Archive/page.md",
+        ))
+        .expect("save archive page");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-child"),
+                EntityKind::Page,
+                "Moved Child",
+                "Archive/Moved Child/page.md",
+            )
+            .with_hydration(HydrationState::Dirty),
+        )
+        .expect("save moved child page");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-child"),
+                "Child body.",
+                8,
+                [RemoteId::new("block-child")],
+            )
+            .expect("shadow")
+            .with_frontmatter(
+                "loc:\n  id: page-child\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Child\"\n",
+            ),
+        )
+        .expect("save child shadow");
+    fixture.write_virtual_page(
+        "Archive/Moved Child/page.md",
+        "---\nloc:\n  id: page-child\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: \"Moved Child\"\n---\nChild body.",
+    );
+    fs::create_dir_all(fixture.root.join("Archive")).expect("visible archive dir");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:page-child".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(RemoteId::new("page-child")),
+            parent_remote_id: Some(RemoteId::new("page-archive")),
+            original_path: Some(PathBuf::from("Home/Child/page.md")),
+            projected_path: PathBuf::from("Archive/Moved Child/page.md"),
+            title: "Moved Child".to_string(),
+            content_path: Some(
+                virtual_fs_content_path(
+                    &fixture.state_root,
+                    &fixture.mount_id,
+                    Path::new("Archive/Moved Child/page.md"),
+                )
+                .expect("content path"),
+            ),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            updated_at: "2026-06-12T00:00:00Z".to_string(),
+        })
+        .expect("save move mutation");
+
+    let prepared = prepare_push(
+        &store,
+        &job(fixture.root.join("Archive")),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare parent scope move");
+    let plan = prepared.pipeline.plan.expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![PushOperation::MoveEntity {
+            entity_id: RemoteId::new("page-child"),
+            new_parent_id: RemoteId::new("page-archive"),
+            new_parent_kind: EntityKind::Page,
+            new_title: "Moved Child".to_string(),
+            projected_path: PathBuf::from("Archive/Moved Child/page.md"),
+        }]
+    );
+    assert_eq!(plan.summary.entities_moved, 1);
 }
 
 #[test]

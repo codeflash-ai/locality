@@ -226,10 +226,17 @@ impl GoogleDriveApi for HttpGoogleApiClient {
         file_id: &str,
         request: DriveUpdateFileRequest,
     ) -> LocalityResult<DriveFile> {
+        let mut query = vec![("fields".to_string(), DRIVE_FILE_FIELDS.to_string())];
+        if let Some(add_parents) = request.add_parents.clone() {
+            query.push(("addParents".to_string(), add_parents));
+        }
+        if let Some(remove_parents) = request.remove_parents.clone() {
+            query.push(("removeParents".to_string(), remove_parents));
+        }
         self.patch_json(
             format!("{}/files/{file_id}", self.drive_base_url),
             &request,
-            vec![("fields".to_string(), DRIVE_FILE_FIELDS.to_string())],
+            query,
         )
     }
 }
