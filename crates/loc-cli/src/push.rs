@@ -11,8 +11,9 @@ use locality_core::journal::{JournalStatus, JournalStore};
 use locality_core::model::{EntityKind, RemoteId};
 use locality_core::push::{PushApproval, PushExecutionAction, PushExecutionResult};
 use locality_store::{
-    EntityRepository, FreshnessStateRepository, JournalRepository, MountLiveModeRepository,
-    MountRepository, RemoteObservationRepository, ShadowRepository, VirtualMutationRepository,
+    AutoSaveRepository, EntityRepository, FreshnessStateRepository, JournalRepository,
+    MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
+    VirtualMutationRepository,
 };
 use localityd::execution::{PushJob, PushJobError, PushJobReport};
 use localityd::file_provider;
@@ -73,6 +74,7 @@ where
         + JournalStore
         + RemoteObservationRepository
         + FreshnessStateRepository
+        + AutoSaveRepository
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
@@ -94,6 +96,7 @@ where
         + JournalStore
         + RemoteObservationRepository
         + FreshnessStateRepository
+        + AutoSaveRepository
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
