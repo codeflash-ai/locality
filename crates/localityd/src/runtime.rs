@@ -72,7 +72,7 @@ use crate::virtual_fs::{
     VirtualFsRefreshChildrenReport, commit_virtual_fs_write, create_virtual_fs_directory,
     create_virtual_fs_file, materialize_virtual_fs_guidance_with_content_root,
     materialize_virtual_fs_item_with_content_root, mount_point_identifier,
-    refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
+    refresh_virtual_fs_children_with_content_root, rename_virtual_fs_item, trash_virtual_fs_item,
     virtual_fs_children_refresh_needed, virtual_fs_children_with_content_root,
     virtual_fs_content_root, virtual_fs_item_with_content_root,
 };
@@ -653,7 +653,14 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let credentials = open_credential_store(&state_root);
         let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id)
             .map_err(LocalityError::from)?;
-        refresh_virtual_fs_children(&mut store, &connector, &mount_id, &container_identifier)
+        let content_root = virtual_fs_content_root(&state_root, &mount_id);
+        refresh_virtual_fs_children_with_content_root(
+            &mut store,
+            &connector,
+            &content_root,
+            &mount_id,
+            &container_identifier,
+        )
     }
 
     fn run_virtual_fs_materialize(

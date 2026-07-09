@@ -253,8 +253,10 @@ is itself a virtual mount and gives macOS/Linux adapters one stable byte source.
 Scheduled reconciliation skips writing placeholder Markdown files for virtual
 filesystem projection modes such as `macos_file_provider` and `linux_fuse`; it
 updates durable entity state, queues policy hydration, and caches database
-`_schema.yaml` files under daemon-owned content storage. Plain-file mounts still
-use the fallback watcher path below.
+`_schema.yaml` files under daemon-owned content storage. Lazy virtual database
+directory refreshes use the same cache location so File Provider/FUSE directory
+listings can expose row folders and `_schema.yaml` together. Plain-file mounts
+still use the fallback watcher path below.
 
 ## File Watching
 

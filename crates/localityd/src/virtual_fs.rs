@@ -482,6 +482,30 @@ where
     Ok(VirtualFsRefreshChildrenReport { saved, changed })
 }
 
+pub fn refresh_virtual_fs_children_with_content_root<S, C>(
+    store: &mut S,
+    connector: &C,
+    content_root: &Path,
+    mount_id: &MountId,
+    container_identifier: &str,
+) -> LocalityResult<VirtualFsRefreshChildrenReport>
+where
+    S: MountRepository + EntityRepository,
+    C: Connector + HydrationSource + ?Sized,
+{
+    let mut report = refresh_virtual_fs_children(store, connector, mount_id, container_identifier)?;
+    if refresh_database_schema_cache_for_container(
+        store,
+        connector,
+        content_root,
+        mount_id,
+        container_identifier,
+    )? {
+        report.changed = true;
+    }
+    Ok(report)
+}
+
 pub fn virtual_fs_children_refresh_needed<S>(
     store: &S,
     mount_id: &MountId,
@@ -1479,6 +1503,58 @@ fn schema_item_for_container(
     Ok(path
         .exists()
         .then(|| schema_item(mount, entity, Some(path))))
+}
+
+fn refresh_database_schema_cache_for_container<S, Source>(
+    store: &S,
+    source: &Source,
+    content_root: &Path,
+    mount_id: &MountId,
+    container_identifier: &str,
+) -> LocalityResult<bool>
+where
+    S: MountRepository + EntityRepository,
+    Source: HydrationSource + ?Sized,
+{
+    let mount = require_virtual_mount(store, mount_id)?;
+    if container_identifier == ROOT_CONTAINER_IDENTIFIER
+        || container_identifier == mount_point_identifier(&mount)
+        || container_identifier.starts_with(CHILDREN_PREFIX)
+        || container_identifier.starts_with(PATH_PREFIX)
+    {
+        return Ok(false);
+    }
+
+    let remote_id = RemoteId::new(container_identifier);
+    let Some(entity) = store
+        .get_entity(mount_id, &remote_id)
+        .map_err(LocalityError::from)?
+    else {
+        return Ok(false);
+    };
+    if entity.kind != EntityKind::Database {
+        return Ok(false);
+    }
+
+    let Some(schema) = source.fetch_database_schema_yaml(&entity.remote_id)? else {
+        return Ok(false);
+    };
+    let path = content_path_for_relative(content_root, &entity.path.join("_schema.yaml"))?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(LocalityError::Io(format!(
+                "failed to read database schema cache `{}`: {error}",
+                path.display()
+            )));
+        }
+    };
+    if existing.as_deref() == Some(schema.as_str()) {
+        return Ok(false);
+    }
+    write_binary_atomic(&path, schema.as_bytes())?;
+    Ok(true)
 }
 
 fn create_parent_remote_id(
@@ -2677,10 +2753,11 @@ mod tests {
         VirtualFsItemKind, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
         create_virtual_fs_directory, create_virtual_fs_file,
         materialize_virtual_fs_item_with_content_root, mount_point_identifier,
-        refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
-        validate_virtual_projection_root, virtual_fs_ancestor_container_identifiers,
-        virtual_fs_children, virtual_fs_children_with_content_root, virtual_fs_content_path,
-        virtual_fs_item, virtual_fs_item_with_content_root, virtual_projection_root,
+        refresh_virtual_fs_children, refresh_virtual_fs_children_with_content_root,
+        rename_virtual_fs_item, trash_virtual_fs_item, validate_virtual_projection_root,
+        virtual_fs_ancestor_container_identifiers, virtual_fs_children,
+        virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_item,
+        virtual_fs_item_with_content_root, virtual_projection_root,
     };
 
     #[test]
@@ -3053,6 +3130,7 @@ mod tests {
                 stub_frontmatter: None,
             }],
             expected_parent_path: PathBuf::new(),
+            database_schema: None,
         };
         let mount_point_root = mount_point_identifier(&mount);
 
@@ -3134,6 +3212,7 @@ mod tests {
                 stub_frontmatter: None,
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
+            database_schema: None,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -3154,6 +3233,95 @@ mod tests {
                 .any(|child| child.identifier == "children:row-1"
                     && child.path == "Root/Tasks/Fix login bug")
         );
+    }
+
+    #[test]
+    fn refresh_database_children_with_content_root_writes_schema_cache() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-refresh-database-schema-cache");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Tasks",
+                "Root/Tasks",
+            ))
+            .expect("save database");
+        let schema = "type: notion_database_schema\nproperties:\n  Name:\n    type: title\n";
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("row-1"),
+                kind: EntityKind::Page,
+                title: "Fix login bug".to_string(),
+                path: "Root/Tasks/Fix login bug/page.md".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::from("Root/Tasks"),
+            database_schema: Some((RemoteId::new("database-1"), schema.to_string())),
+        };
+
+        let saved = refresh_virtual_fs_children_with_content_root(
+            &mut store,
+            &connector,
+            &content_root,
+            &mount_id,
+            "database-1",
+        )
+        .expect("refresh database rows and schema");
+
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
+        assert_eq!(
+            std::fs::read_to_string(content_root.join("Root/Tasks/_schema.yaml"))
+                .expect("schema cache"),
+            schema
+        );
+        let children =
+            virtual_fs_children_with_content_root(&store, &content_root, &mount_id, "database-1")
+                .expect("children");
+        assert!(
+            children
+                .children
+                .iter()
+                .any(|child| child.identifier == "schema:database-1"
+                    && child.filename == "_schema.yaml"
+                    && child.kind == VirtualFsItemKind::File),
+            "schema file missing from database children: {:?}",
+            children.children
+        );
+        assert!(
+            children
+                .children
+                .iter()
+                .any(|child| child.identifier == "children:row-1"
+                    && child.filename == "Fix login bug"
+                    && child.kind == VirtualFsItemKind::Folder),
+            "row folder missing from database children: {:?}",
+            children.children
+        );
+
+        let saved_again = refresh_virtual_fs_children_with_content_root(
+            &mut store,
+            &connector,
+            &content_root,
+            &mount_id,
+            "database-1",
+        )
+        .expect("refresh unchanged database rows and schema");
+        assert_eq!(saved_again.saved, 1);
+        assert!(!saved_again.changed);
+
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
@@ -3197,6 +3365,7 @@ mod tests {
                 stub_frontmatter: None,
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
+            database_schema: None,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -3254,6 +3423,7 @@ mod tests {
                 stub_frontmatter: None,
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
+            database_schema: None,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -3273,6 +3443,7 @@ mod tests {
     struct StaticChildrenConnector {
         entries: Vec<TreeEntry>,
         expected_parent_path: PathBuf,
+        database_schema: Option<(RemoteId, String)>,
     }
 
     impl Connector for StaticChildrenConnector {
@@ -3353,6 +3524,28 @@ mod tests {
             _request: ApplyUndoRequest<'_>,
         ) -> locality_core::LocalityResult<ApplyUndoResult> {
             Err(locality_core::LocalityError::NotImplemented("fixture undo"))
+        }
+    }
+
+    impl HydrationSource for StaticChildrenConnector {
+        fn fetch_render(
+            &self,
+            _request: &HydrationRequest,
+        ) -> locality_core::LocalityResult<HydratedEntity> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fixture hydrate",
+            ))
+        }
+
+        fn fetch_database_schema_yaml(
+            &self,
+            database_id: &RemoteId,
+        ) -> locality_core::LocalityResult<Option<String>> {
+            Ok(self
+                .database_schema
+                .as_ref()
+                .filter(|(id, _)| id == database_id)
+                .map(|(_, schema)| schema.clone()))
         }
     }
 
@@ -4254,6 +4447,7 @@ mod tests {
             &StaticChildrenConnector {
                 entries: Vec::new(),
                 expected_parent_path: PathBuf::new(),
+                database_schema: None,
             },
             &mount_id,
             ROOT_CONTAINER_IDENTIFIER,
