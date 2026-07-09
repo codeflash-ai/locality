@@ -24,11 +24,13 @@ use locality_notion::oauth::{
     HttpNotionOAuthBrokerClient, HttpNotionOAuthClient, NotionOAuthBrokerStart,
 };
 use locality_store::{
-    ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileRepository,
-    EntityRepository, FreshnessStateRepository, JournalRepository, MountConfig, MountRepository,
-    ProjectionMode, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
-    VirtualMutationRepository, open_credential_store,
+    AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
+    ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
+    FreshnessStateRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
+    VirtualMutationRepository, open_credential_store, reset_locality_state_storage,
 };
+use localityd::autosave::auto_save_timestamp;
 use localityd::execution::PushJobReport;
 use localityd::file_provider as daemon_file_provider;
 use localityd::google_docs::resolve_google_docs_connector_for_mount;
@@ -146,6 +148,11 @@ enum LocalityCommand {
     Info(PathArg),
     #[command(about = "Show local sync state for mounts or paths")]
     Status(PathArg),
+    #[command(name = "live-mode", about = "Manage Live Mode for individual files")]
+    LiveMode {
+        #[command(subcommand)]
+        command: LiveModeCommand,
+    },
     #[command(about = "Run read-only diagnostics for daemon, mounts, providers, and auth")]
     Doctor,
     #[command(about = "Search local mount metadata without contacting remote sources")]
@@ -179,6 +186,8 @@ enum LocalityCommand {
     Log(PathArg),
     #[command(about = "Restore a local file from the last synced shadow")]
     Restore(RestoreCliArgs),
+    #[command(about = "Reset Locality local state and credentials")]
+    Reset(ResetArgs),
     #[command(about = "Configuration commands")]
     Config,
     #[command(about = "Run the Locality MCP stdio server")]
@@ -264,6 +273,15 @@ struct ConnectionShowArgs {
 struct DisconnectArgs {
     #[arg(value_name = "id", help = "Connection id to remove.")]
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct ResetArgs {
+    #[arg(
+        long,
+        help = "Confirm destructive reset of Locality local state and credentials."
+    )]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -422,6 +440,22 @@ struct PushArgs {
     yes: bool,
     #[arg(long, help = "Approve plans that trip destructive-change guardrails.")]
     confirm: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum LiveModeCommand {
+    #[command(about = "Enable Live Mode for a file")]
+    On(LiveModeFileArgs),
+    #[command(about = "Disable Live Mode for a file")]
+    Off(LiveModeFileArgs),
+    #[command(about = "Show Live Mode state for a file")]
+    Status(LiveModeFileArgs),
+}
+
+#[derive(Debug, Args)]
+struct LiveModeFileArgs {
+    #[arg(value_name = "file", help = "File inside a Locality mount.")]
+    file: String,
 }
 
 #[derive(Debug, Args)]
@@ -702,6 +736,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Mount { .. } => mount(&legacy_args[1..], json),
         LocalityCommand::Info(_) => info(&legacy_args[1..], json),
         LocalityCommand::Status(_) => status(&legacy_args[1..], json),
+        LocalityCommand::LiveMode { .. } => live_mode(&legacy_args[1..], json),
         LocalityCommand::Doctor => doctor(json),
         LocalityCommand::Search(_) => search(&legacy_args[1..], json),
         LocalityCommand::Create { .. } => create(&legacy_args[1..], json),
@@ -712,6 +747,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Push(_) => push(&legacy_args[1..], json),
         LocalityCommand::Diff(_) => diff(&legacy_args[1..], json),
         LocalityCommand::Restore(_) => restore(&legacy_args[1..], json),
+        LocalityCommand::Reset(_) => reset(&legacy_args[1..], json),
         LocalityCommand::Undo(_) => undo(&legacy_args[1..], json),
         LocalityCommand::Log(_) => log(&legacy_args[1..], json),
         LocalityCommand::Config => stub("config", json),
@@ -861,6 +897,23 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
             args.push("status".to_string());
             push_optional_positional(&mut args, options.path.as_deref());
         }
+        LocalityCommand::LiveMode { command } => {
+            args.push("live-mode".to_string());
+            match command {
+                LiveModeCommand::On(options) => {
+                    args.push("on".to_string());
+                    args.push(options.file.clone());
+                }
+                LiveModeCommand::Off(options) => {
+                    args.push("off".to_string());
+                    args.push(options.file.clone());
+                }
+                LiveModeCommand::Status(options) => {
+                    args.push("status".to_string());
+                    args.push(options.file.clone());
+                }
+            }
+        }
         LocalityCommand::Doctor => args.push("doctor".to_string()),
         LocalityCommand::Search(options) => {
             args.push("search".to_string());
@@ -946,6 +999,10 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
             args.push("restore".to_string());
             args.push(options.path.clone());
             push_flag(&mut args, "--force", options.force);
+        }
+        LocalityCommand::Reset(options) => {
+            args.push("reset".to_string());
+            push_flag(&mut args, "--yes", options.yes);
         }
         LocalityCommand::Config => args.push("config".to_string()),
         LocalityCommand::Mcp => args.push("mcp".to_string()),
@@ -1066,6 +1123,77 @@ fn doctor(json: bool) -> i32 {
         print_doctor_report(&report);
     }
     exit_code
+}
+
+fn reset(args: &[String], json: bool) -> i32 {
+    if first_positional(args).is_some() {
+        return command_error(
+            json,
+            CommandError::new("reset", "usage", "usage: loc reset --yes [--json]"),
+            EXIT_USAGE,
+        );
+    }
+    if !has_flag(args, "--yes") {
+        return command_error(
+            json,
+            CommandError::new(
+                "reset",
+                "confirmation_required",
+                "reset deletes Locality local state and credentials; rerun with --yes to confirm",
+            )
+            .with_suggested_command("loc reset --yes"),
+            EXIT_USAGE,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut warnings = Vec::new();
+    stop_daemon_for_reset(&state_root, &mut warnings);
+    reset_platform_projection_state_for_reset(&state_root, &mut warnings);
+    if let Err(error) = remove_desktop_support_state_for_reset() {
+        return command_error(
+            json,
+            CommandError::new("reset", "reset_failed", error),
+            EXIT_INTERNAL,
+        );
+    }
+
+    let storage = match reset_locality_state_storage(&state_root) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("reset", "reset_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    for error in &storage.credential_errors {
+        warnings.push(format!(
+            "could not delete a stored credential reference ({})",
+            error.code
+        ));
+    }
+
+    let report = ResetCommandReport {
+        ok: true,
+        command: "reset",
+        action: "reset",
+        state_root: storage.state_root,
+        deleted_credentials: storage.deleted_secret_refs.len(),
+        credential_errors: storage.credential_errors.len(),
+        removed_state_entries: storage.removed_state_entries,
+        preserved_state_entries: storage.preserved_state_entries,
+        warnings,
+        message: "Locality local state was reset. Local files were left in place.".to_string(),
+    };
+
+    if json {
+        print_json(&report);
+    } else {
+        print_reset_report(&report);
+    }
+    EXIT_SUCCESS
 }
 
 fn connect(args: &[String], json: bool) -> i32 {
@@ -1222,6 +1350,96 @@ fn connect(args: &[String], json: bool) -> i32 {
         }
         Err(error) => connect_command_error("connect", json, error),
     }
+}
+
+fn stop_daemon_for_reset(state_root: &Path, warnings: &mut Vec<String>) {
+    if std::env::var("LOCALITY_DAEMON_DISABLE").ok().as_deref() == Some("1") {
+        return;
+    }
+    let mut args = vec![
+        "stop".to_string(),
+        "--state-dir".to_string(),
+        state_root.display().to_string(),
+    ];
+    if let Ok(tcp_addr) = std::env::var("LOCALITY_DAEMON_TCP_ADDR")
+        && !tcp_addr.is_empty()
+    {
+        args.push("--tcp-addr".to_string());
+        args.push(tcp_addr);
+    }
+    if let Err(error) = run_daemon_control(&args) {
+        warnings.push(format!(
+            "could not stop localityd before reset: {}",
+            error.message()
+        ));
+    }
+}
+
+fn reset_platform_projection_state_for_reset(state_root: &Path, warnings: &mut Vec<String>) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = state_root;
+        if let Err(error) =
+            file_provider_helper::run_macos_file_provider_helper("reset", Vec::new())
+        {
+            warnings.push(format!(
+                "could not reset macOS File Provider domains: {}",
+                error.message()
+            ));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let args = vec![
+            "--state-dir".to_string(),
+            absolute_command_path(state_root).display().to_string(),
+        ];
+        if let Err(error) = file_provider_helper::run_windows_cloud_files_helper("reset", args) {
+            warnings.push(format!(
+                "could not reset Windows Cloud Files registrations: {}",
+                error.message()
+            ));
+        }
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = state_root;
+        let _ = warnings;
+    }
+}
+
+fn remove_desktop_support_state_for_reset() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = locality_platform::user_home().ok_or_else(|| "HOME is not set".to_string())?;
+        for path in [
+            home.join("Library/LaunchAgents/ai.codeflash.locality.localityd.plist"),
+            home.join("Library/Group Containers/C484HB7Q6S.group.ai.codeflash.locality"),
+            home.join("Library/Group Containers/group.ai.codeflash.locality"),
+            home.join("Library/Application Support/ai.codeflash.locality"),
+            home.join("Library/Caches/ai.codeflash.locality"),
+            home.join("Library/HTTPStorages/ai.codeflash.locality"),
+            home.join("Library/Saved Application State/ai.codeflash.locality.savedState"),
+        ] {
+            remove_path_if_exists(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_path_if_exists(path: &Path) -> Result<(), String> {
+    if !path.exists() && !path.is_symlink() {
+        return Ok(());
+    }
+    if path.is_dir() && !path.is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .map_err(|error| format!("Could not remove `{}`: {error}", path.display()))
 }
 
 fn connect_google_docs(args: &[String], json: bool) -> i32 {
@@ -2418,6 +2636,378 @@ fn status(args: &[String], json: bool) -> i32 {
         }
         Err(error) => status_command_error(json, error, state_root),
     }
+}
+
+fn live_mode(args: &[String], json: bool) -> i32 {
+    let Some(action_arg) = args.first() else {
+        return command_error(
+            json,
+            CommandError::new(
+                "live_mode",
+                "usage",
+                "usage: loc live-mode <on|off|status> <file> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+    let Some(file) = args.get(1) else {
+        return command_error(
+            json,
+            CommandError::new(
+                "live_mode",
+                "usage",
+                "usage: loc live-mode <on|off|status> <file> [--json]",
+            ),
+            EXIT_USAGE,
+        );
+    };
+
+    let action = match action_arg.as_str() {
+        "on" => LiveModeFileAction::Enable,
+        "off" => LiveModeFileAction::Disable,
+        "status" => LiveModeFileAction::Status,
+        _ => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "live_mode",
+                    "usage",
+                    "usage: loc live-mode <on|off|status> <file> [--json]",
+                ),
+                EXIT_USAGE,
+            );
+        }
+    };
+
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("live_mode", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    match run_file_live_mode(&mut store, Path::new(file), action) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_live_mode_file_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => live_mode_command_error(json, error),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveModeFileAction {
+    Enable,
+    Disable,
+    Status,
+}
+
+#[derive(Debug, Serialize)]
+struct LiveModeFileReport {
+    ok: bool,
+    command: &'static str,
+    action: &'static str,
+    path: String,
+    mount_id: String,
+    connector: String,
+    relative_path: String,
+    remote_id: Option<String>,
+    enabled: bool,
+    state: String,
+    origin: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug)]
+enum LiveModeFileError {
+    MountNotFound(PathBuf),
+    UnsupportedTarget(PathBuf),
+    ReadOnlyMount { mount_id: MountId },
+    Store(locality_store::StoreError),
+}
+
+impl LiveModeFileError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::MountNotFound(_) => "mount_not_found",
+            Self::UnsupportedTarget(_) => "unsupported_target",
+            Self::ReadOnlyMount { .. } => "read_only_mount",
+            Self::Store(_) => "store_error",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::MountNotFound(path) => {
+                format!("no Locality mount contains `{}`", path.display())
+            }
+            Self::UnsupportedTarget(path) => {
+                format!(
+                    "`{}` is not a file or known page directory in a Locality mount",
+                    path.display()
+                )
+            }
+            Self::ReadOnlyMount { mount_id } => {
+                format!(
+                    "mount `{}` is read-only; Live Mode cannot auto-push this file",
+                    mount_id.0
+                )
+            }
+            Self::Store(error) => error.to_string(),
+        }
+    }
+}
+
+impl From<locality_store::StoreError> for LiveModeFileError {
+    fn from(error: locality_store::StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+fn run_file_live_mode(
+    store: &mut SqliteStateStore,
+    target_path: &Path,
+    action: LiveModeFileAction,
+) -> Result<LiveModeFileReport, LiveModeFileError> {
+    let absolute_path = absolute_command_path(target_path);
+    let resolved = resolve_live_mode_file_path(store, &absolute_path)?;
+    let mount = resolved.mount;
+    let relative_path = resolved.relative_path;
+    if action == LiveModeFileAction::Enable && mount.read_only {
+        return Err(LiveModeFileError::ReadOnlyMount {
+            mount_id: mount.mount_id,
+        });
+    }
+
+    let existing = store.get_auto_save_enrollment(&mount.mount_id, &relative_path)?;
+    let entity = store.find_entity_by_path(&mount.mount_id, &relative_path)?;
+    let remote_id = entity.as_ref().map(|entity| entity.remote_id.clone());
+    let now = auto_save_timestamp();
+
+    let enrollment = match action {
+        LiveModeFileAction::Status => existing,
+        LiveModeFileAction::Enable | LiveModeFileAction::Disable => {
+            let origin = match existing.as_ref() {
+                Some(enrollment) => enrollment.origin.clone(),
+                None => auto_save_origin_for_cli_path(store, &mount.mount_id, &relative_path)?,
+            };
+            let mut enrollment = existing.unwrap_or_else(|| {
+                AutoSaveEnrollmentRecord::new(
+                    mount.mount_id.clone(),
+                    relative_path.clone(),
+                    origin,
+                    now.clone(),
+                )
+            });
+            enrollment.remote_id = remote_id.clone();
+            enrollment.enabled = action == LiveModeFileAction::Enable;
+            enrollment.state = AutoSaveState::Active;
+            enrollment.last_reason = None;
+            enrollment.updated_at = now;
+            store.save_auto_save_enrollment(enrollment.clone())?;
+            Some(enrollment)
+        }
+    };
+
+    Ok(live_mode_file_report(
+        action,
+        &resolved.access_root,
+        &mount,
+        &relative_path,
+        enrollment.as_ref(),
+        remote_id.as_ref(),
+    ))
+}
+
+#[derive(Debug)]
+struct ResolvedLiveModeFile {
+    mount: MountConfig,
+    access_root: PathBuf,
+    relative_path: PathBuf,
+}
+
+fn resolve_live_mode_file_path(
+    store: &SqliteStateStore,
+    absolute_path: &Path,
+) -> Result<ResolvedLiveModeFile, LiveModeFileError> {
+    let mounts = store.load_mounts()?;
+    let Some((mount, matched)) = daemon_file_provider::find_mount_for_path(&mounts, absolute_path)
+    else {
+        return Err(LiveModeFileError::MountNotFound(
+            absolute_path.to_path_buf(),
+        ));
+    };
+
+    let relative_path = matched.relative_path;
+    let direct_entity = store.find_entity_by_path(&mount.mount_id, &relative_path)?;
+    if direct_entity
+        .as_ref()
+        .is_some_and(|entity| entity.kind != EntityKind::Database)
+    {
+        return Ok(resolved_live_mode_file(
+            mount,
+            &matched.access_root,
+            relative_path,
+        ));
+    }
+
+    let page_relative_path = page_document_path(&relative_path);
+    if let Some(page_entity) = store.find_entity_by_path(&mount.mount_id, &page_relative_path)? {
+        return Ok(resolved_live_mode_file(
+            mount,
+            &matched.access_root,
+            page_entity.path,
+        ));
+    }
+
+    if absolute_path.is_file()
+        || store
+            .find_virtual_mutation_by_path(&mount.mount_id, &relative_path)?
+            .is_some()
+    {
+        return Ok(resolved_live_mode_file(
+            mount,
+            &matched.access_root,
+            relative_path,
+        ));
+    }
+
+    Err(LiveModeFileError::UnsupportedTarget(
+        absolute_path.to_path_buf(),
+    ))
+}
+
+fn resolved_live_mode_file(
+    mount: &MountConfig,
+    access_root: &Path,
+    relative_path: PathBuf,
+) -> ResolvedLiveModeFile {
+    ResolvedLiveModeFile {
+        mount: mount.clone(),
+        access_root: access_root.to_path_buf(),
+        relative_path,
+    }
+}
+
+fn auto_save_origin_for_cli_path(
+    store: &SqliteStateStore,
+    mount_id: &MountId,
+    relative_path: &Path,
+) -> Result<AutoSaveOrigin, LiveModeFileError> {
+    let virtual_create = store
+        .find_virtual_mutation_by_path(mount_id, relative_path)?
+        .is_some_and(|mutation| mutation.mutation_kind == VirtualMutationKind::Create);
+    let existing_entity = store
+        .find_entity_by_path(mount_id, relative_path)?
+        .is_some();
+
+    if virtual_create || !existing_entity {
+        Ok(AutoSaveOrigin::LocalityCreated)
+    } else {
+        Ok(AutoSaveOrigin::UserEnabled)
+    }
+}
+
+fn live_mode_file_report(
+    action: LiveModeFileAction,
+    access_root: &Path,
+    mount: &MountConfig,
+    relative_path: &Path,
+    enrollment: Option<&AutoSaveEnrollmentRecord>,
+    fallback_remote_id: Option<&RemoteId>,
+) -> LiveModeFileReport {
+    LiveModeFileReport {
+        ok: true,
+        command: "live_mode",
+        action: match action {
+            LiveModeFileAction::Enable => "enabled",
+            LiveModeFileAction::Disable => "disabled",
+            LiveModeFileAction::Status => "status",
+        },
+        path: live_mode_report_absolute_path(access_root, relative_path),
+        mount_id: mount.mount_id.0.clone(),
+        connector: mount.connector.clone(),
+        relative_path: relative_path.display().to_string(),
+        remote_id: enrollment
+            .and_then(|enrollment| enrollment.remote_id.as_ref())
+            .or(fallback_remote_id)
+            .map(|remote_id| remote_id.0.clone()),
+        enabled: enrollment.is_some_and(|enrollment| enrollment.enabled),
+        state: enrollment
+            .map(|enrollment| auto_save_state_name(&enrollment.state).to_string())
+            .unwrap_or_else(|| "off".to_string()),
+        origin: enrollment.map(|enrollment| auto_save_origin_name(&enrollment.origin).to_string()),
+        reason: enrollment.and_then(|enrollment| enrollment.last_reason.clone()),
+    }
+}
+
+fn auto_save_state_name(state: &AutoSaveState) -> &'static str {
+    match state {
+        AutoSaveState::Active => "active",
+        AutoSaveState::Blocked => "blocked",
+        AutoSaveState::PausedRemoteChanged => "paused_remote_changed",
+        AutoSaveState::PausedFailure => "paused_failure",
+    }
+}
+
+fn auto_save_origin_name(origin: &AutoSaveOrigin) -> &'static str {
+    match origin {
+        AutoSaveOrigin::LocalityCreated => "locality_created",
+        AutoSaveOrigin::UserEnabled => "user_enabled",
+    }
+}
+
+fn live_mode_report_absolute_path(access_root: &Path, relative_path: &Path) -> String {
+    let relative_display = relative_path.display().to_string();
+    if relative_display.is_empty() {
+        return access_root.display().to_string();
+    }
+    format!(
+        "{}{}{}",
+        access_root.display(),
+        std::path::MAIN_SEPARATOR,
+        relative_display
+    )
+}
+
+fn print_live_mode_file_report(report: &LiveModeFileReport) {
+    match report.action {
+        "enabled" => println!("Live Mode is on for {}.", report.path),
+        "disabled" => println!("Live Mode is off for {}.", report.path),
+        _ => {
+            let state = if report.enabled {
+                report.state.as_str()
+            } else {
+                "off"
+            };
+            println!("Live Mode for {}: {state}", report.path);
+            if let Some(reason) = report.reason.as_deref() {
+                println!("reason: {reason}");
+            }
+        }
+    }
+}
+
+fn live_mode_command_error(json: bool, error: LiveModeFileError) -> i32 {
+    let exit_code = match &error {
+        LiveModeFileError::MountNotFound(_) | LiveModeFileError::UnsupportedTarget(_) => EXIT_USAGE,
+        LiveModeFileError::ReadOnlyMount { .. } => 4,
+        LiveModeFileError::Store(_) => EXIT_INTERNAL,
+    };
+    command_error(
+        json,
+        CommandError::new("live_mode", error.code(), error.message()),
+        exit_code,
+    )
 }
 
 fn search(args: &[String], json: bool) -> i32 {
@@ -3747,6 +4337,27 @@ fn print_connection_show_report(report: &ConnectionShowReport) {
 
 fn print_disconnect_report(report: &DisconnectReport) {
     println!("disconnected {} ({})", report.connection_id, report.status);
+}
+
+fn print_reset_report(report: &ResetCommandReport) {
+    println!("{}", report.message);
+    println!("state root: {}", report.state_root);
+    println!("deleted credentials: {}", report.deleted_credentials);
+    if !report.removed_state_entries.is_empty() {
+        println!(
+            "removed state entries: {}",
+            report.removed_state_entries.join(", ")
+        );
+    }
+    if !report.preserved_state_entries.is_empty() {
+        println!(
+            "preserved state entries: {}",
+            report.preserved_state_entries.join(", ")
+        );
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
 }
 
 fn print_pull_report(report: &PullReport) {
@@ -6324,6 +6935,20 @@ struct CommandError {
 }
 
 #[derive(Serialize)]
+struct ResetCommandReport {
+    ok: bool,
+    command: &'static str,
+    action: &'static str,
+    state_root: String,
+    deleted_credentials: usize,
+    credential_errors: usize,
+    removed_state_entries: Vec<String>,
+    preserved_state_entries: Vec<String>,
+    warnings: Vec<String>,
+    message: String,
+}
+
+#[derive(Serialize)]
 struct FileProviderCommandReport {
     ok: bool,
     command: &'static str,
@@ -6408,7 +7033,13 @@ mod tests {
         let cases = vec![
             (
                 vec!["--help"],
-                vec!["Usage: loc", "Commands:", "push", "file-provider"],
+                vec![
+                    "Usage: loc",
+                    "Commands:",
+                    "push",
+                    "live-mode",
+                    "file-provider",
+                ],
             ),
             (
                 vec!["connect", "--help"],
@@ -6630,6 +7261,53 @@ mod tests {
                 ],
             ),
             (
+                vec!["live-mode", "--help"],
+                vec![
+                    "Usage: loc live-mode",
+                    "Manage Live Mode for individual files",
+                    "Commands:",
+                    "on",
+                    "off",
+                    "status",
+                ],
+            ),
+            (
+                vec!["live-mode", "on", "--help"],
+                vec![
+                    "Usage: loc live-mode on",
+                    "Enable Live Mode for a file",
+                    "file",
+                    "--json",
+                ],
+            ),
+            (
+                vec!["live-mode", "off", "--help"],
+                vec![
+                    "Usage: loc live-mode off",
+                    "Disable Live Mode for a file",
+                    "file",
+                    "--json",
+                ],
+            ),
+            (
+                vec!["live-mode", "status", "--help"],
+                vec![
+                    "Usage: loc live-mode status",
+                    "Show Live Mode state for a file",
+                    "file",
+                    "--json",
+                ],
+            ),
+            (
+                vec!["reset", "--help"],
+                vec![
+                    "Usage: loc reset",
+                    "Reset Locality local state",
+                    "--yes",
+                    "--json",
+                ],
+            ),
+            (
                 vec!["config", "--help"],
                 vec!["Usage: loc config", "Configuration commands", "--json"],
             ),
@@ -6741,6 +7419,19 @@ mod tests {
         assert_eq!(
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["push", "Roadmap.md", "--yes", "--confirm"]
+        );
+
+        let cli = parse_cli(["live-mode", "on", "Roadmap/page.md"]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["live-mode", "on", "Roadmap/page.md"]
+        );
+
+        let cli = parse_cli(["--json", "live-mode", "status", "Roadmap/page.md"]);
+        assert!(cli.json);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["live-mode", "status", "Roadmap/page.md"]
         );
 
         let cli = parse_cli([
@@ -6855,6 +7546,12 @@ mod tests {
         assert_eq!(
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["file-provider", "restart", "notion-main"]
+        );
+
+        let cli = parse_cli(["reset", "--yes"]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["reset", "--yes"]
         );
 
         let cli = parse_cli(["doctor"]);

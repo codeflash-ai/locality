@@ -15,6 +15,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc daemon status [--json]`
 - `loc info [path] [--json]`
 - `loc status [path] [--json]`
+- `loc live-mode on|off|status <file> [--json]`
 - `loc search <query> [--connector <connector>] [--limit <n>] [--json]`
 - `loc create page --title <title> [--parent <dir>] [--private] [--json]`
 - `loc templates list|validate|new|apply [args] [--json]`
@@ -26,6 +27,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc doctor [--json]`
 - `loc diff [path] [--json]`
 - `loc restore <path> [--force] [--json]`
+- `loc reset --yes [--json]`
 - `loc undo [push-id] [--json]`
 - `loc log [path] [--json]`
 - `loc config set <key=value>`
@@ -135,6 +137,21 @@ never includes credential values:
 
 `doctor` exits `0` for `ok` and `warning` reports, and exits `3` when any
 finding has `error` severity.
+
+## Reset
+
+`loc reset --yes [--json]` performs the same destructive local-state reset as the
+desktop **Reset Local State** developer action. It stops `localityd` when it can,
+resets platform provider registration state where the host supports it, deletes
+connector credentials referenced by Locality connections, and clears the Locality
+state root, including `state.sqlite3`, content caches, journals, provider
+runtime metadata, logs, and background sync state. It preserves user-visible
+mounted folders and documents.
+
+The command requires `--yes`; without it, `loc reset` returns
+`confirmation_required` and does not mutate state. JSON output reports counts and
+state-root entries, but does not include credential values or credential storage
+references.
 
 ## Local Search
 
@@ -273,6 +290,51 @@ JSON output is stable enough for agents:
 
 With Live Mode enabled, the same pending local create can sync automatically
 unless Locality requires review.
+
+## File Live Mode
+
+`loc live-mode on <file>` enables Live Mode for one mounted file. The command
+updates Locality's durable per-file auto-save enrollment and does not contact the
+remote connector or push existing dirty content. After it is enabled, the daemon
+can auto-push later safe edits to that file through the same conservative
+auto-save path used by desktop Live Mode.
+
+Examples:
+
+```bash
+loc live-mode on ~/Library/CloudStorage/Locality/notion-main/Roadmap/page.md
+loc live-mode status ~/Library/CloudStorage/Locality/notion-main/Roadmap/page.md --json
+loc live-mode off ~/Library/CloudStorage/Locality/notion-main/Roadmap/page.md
+```
+
+When enabling or disabling, Locality resolves the path inside a registered mount,
+records the current remote id when the file is already known locally, resets any
+paused or blocked auto-save state to `active`, and clears the previous reason.
+Passing a page directory resolves to that page's `page.md` when the page entity is
+known. Read-only mounts reject `live-mode on` because auto-save would be unable
+to push.
+
+JSON output uses the stable command name `live_mode`:
+
+```json
+{
+  "ok": true,
+  "command": "live_mode",
+  "action": "enabled",
+  "path": "/Users/alice/Library/CloudStorage/Locality/notion-main/Roadmap/page.md",
+  "mount_id": "notion-main",
+  "connector": "notion",
+  "relative_path": "Roadmap/page.md",
+  "remote_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "enabled": true,
+  "state": "active",
+  "origin": "user_enabled",
+  "reason": null
+}
+```
+
+`loc live-mode status <file>` is read-only. If no file enrollment exists, it
+reports `enabled: false` and `state: "off"`.
 
 ## OKF Export
 
@@ -413,7 +475,9 @@ override the helper binary path for development.
 virtual projection. On Linux it stops and removes the systemd user service. On
 Windows it removes the Cloud Files sync-root registration; use `stop` first when
 you only want to stop the runtime. `list` and `reset` target the platform helper
-for the current host.
+for the current host. `loc file-provider reset` only resets provider
+registration/runtime state; use `loc reset --yes` for a full Locality local-state
+and credential reset.
 
 `loc pull <mount-root>` starts from the mount mode. For `--root-page` Notion
 mounts, it enumerates the configured page. For `--workspace` mounts, it
