@@ -7467,7 +7467,7 @@ fn notion_remote_observation_surfaces_remote_update_without_hydrating_blocks() {
     );
     assert_eq!(
         result.remote.observed_path.as_deref(),
-        Some("observed-remote-rename/page.md"),
+        Some("Observed Remote Rename/page.md"),
         "{result:#?}"
     );
 }
@@ -11850,11 +11850,14 @@ fn live_locate_new_child_page_then_parent_pull_projects_virtual_directory() {
         &fixture.mount_id,
         &existing_child_url,
     );
-    assert!(
-        existing_child_path
-            .to_string_lossy()
-            .contains(&slug_for_test(&existing_child_title)),
-        "existing child pretty URL should locate to its projected page.md path: {existing_child_path:?}"
+    let existing_child_dir_name = existing_child_path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned());
+    assert_eq!(
+        existing_child_dir_name.as_deref(),
+        Some(existing_child_title.as_str()),
+        "existing child pretty URL should locate to its title-faithful projected page.md path: {existing_child_path:?}"
     );
 
     let child_title = format!("Locality live located child {}", unique_suffix());
@@ -14194,7 +14197,7 @@ fn desktop_style_locate_notion_url_path(
     let mut last_error = "unknown error".to_string();
     let mut resolved_entries = None;
     for _ in 0..8 {
-        match connector.resolve_page_path_entries(mount_id.clone(), &remote_id) {
+        match connector.resolve_object_path_entries(mount_id.clone(), &remote_id) {
             Ok(entries) => {
                 resolved_entries = Some(entries);
                 break;

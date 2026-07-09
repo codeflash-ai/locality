@@ -1,0 +1,40 @@
+name: release finalize
+
+on:
+  workflow_run:
+    workflows:
+      - release macOS
+      - release Linux
+      - release Windows
+      - release notes
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to finalize, for example v0.2.1"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-finalize-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    name: Promote complete release
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_branch }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+
+      - name: Finalize GitHub Release
+        run: scripts/finalize-github-release.sh

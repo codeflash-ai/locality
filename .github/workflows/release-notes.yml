@@ -90,8 +90,7 @@ jobs:
             create_args+=(--prerelease --latest=false)
             edit_args+=(--prerelease=true --latest=false)
           else
-            create_args+=(--latest=true)
-            edit_args+=(--prerelease=false --latest=true)
+            create_args+=(--prerelease --latest=false)
           fi
           if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release edit "${RELEASE_TAG}" "${edit_args[@]}"

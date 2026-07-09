@@ -10,9 +10,9 @@ Locality is built around one rule: if a task can be expressed as a file operatio
 Notion pages are directories. The body of the page is `page.md`.
 
 ```text
-engineering-wiki/
+Engineering Wiki/
   page.md
-  standups-with-locality/
+  Standups with Locality/
     page.md
     2026-07-02/
       page.md
@@ -45,11 +45,11 @@ instead of moving pending local work.
 A Notion database is projected as a directory.
 
 ```text
-content-calendar/
+Content Calendar/
   _schema.yaml
-  launch-post/
+  Launch Post/
     page.md
-  changelog-draft/
+  Changelog Draft/
     page.md
 ```
 
@@ -104,11 +104,11 @@ Downloaded media lives under `.loc/media/` at the projection root.
 notion-main/
   .loc/
     media/
-      engineering-wiki/
-        launch-plan/
+      Engineering Wiki/
+        Launch Plan/
           image-0123456789ab.png
-  engineering-wiki/
-    launch-plan/
+  Engineering Wiki/
+    Launch Plan/
       page.md
 ```
 
@@ -119,14 +119,14 @@ This keeps content directories readable while giving agents and editors stable l
 Create a new page with the CLI:
 
 ```bash
-loc create page --title "Launch Plan" --parent ~/Library/CloudStorage/Locality/notion-main/go-to-market
+loc create page --title "Launch Plan" --parent "$HOME/Library/CloudStorage/Locality/notion-main/Go To Market"
 ```
 
 Or manually create the directory shape:
 
 ```text
-go-to-market/
-  launch-plan/
+Go To Market/
+  Launch Plan/
     page.md
 ```
 

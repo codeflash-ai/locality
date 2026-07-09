@@ -482,6 +482,30 @@ where
     Ok(VirtualFsRefreshChildrenReport { saved, changed })
 }
 
+pub fn refresh_virtual_fs_children_with_content_root<S, C>(
+    store: &mut S,
+    connector: &C,
+    content_root: &Path,
+    mount_id: &MountId,
+    container_identifier: &str,
+) -> LocalityResult<VirtualFsRefreshChildrenReport>
+where
+    S: MountRepository + EntityRepository,
+    C: Connector + HydrationSource + ?Sized,
+{
+    let mut report = refresh_virtual_fs_children(store, connector, mount_id, container_identifier)?;
+    if refresh_database_schema_cache_for_container(
+        store,
+        connector,
+        content_root,
+        mount_id,
+        container_identifier,
+    )? {
+        report.changed = true;
+    }
+    Ok(report)
+}
+
 pub fn virtual_fs_children_refresh_needed<S>(
     store: &S,
     mount_id: &MountId,
@@ -492,10 +516,28 @@ where
 {
     let mount = require_virtual_mount(store, mount_id)?;
     let entities = store.list_entities(mount_id).map_err(LocalityError::from)?;
-    let _ = container_path(&mount, &entities, &[], container_identifier)?;
+    match container_path(&mount, &entities, &[], container_identifier) {
+        Ok(_) => {}
+        Err(error) if is_missing_identifier_error(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    }
 
     child_container_for_identifier(&mount, &entities, container_identifier)
         .map(|container| container.is_some())
+}
+
+pub fn virtual_fs_container_depth<S>(
+    store: &S,
+    mount_id: &MountId,
+    container_identifier: &str,
+) -> LocalityResult<u32>
+where
+    S: MountRepository + EntityRepository,
+{
+    let mount = require_virtual_mount(store, mount_id)?;
+    let entities = store.list_entities(mount_id).map_err(LocalityError::from)?;
+    let path = container_path(&mount, &entities, &[], container_identifier)?;
+    Ok(u32::try_from(path.components().count()).unwrap_or(u32::MAX))
 }
 
 pub fn materialize_virtual_fs_item<S, Source>(
@@ -870,8 +912,12 @@ where
     }
 
     let parent_path = container_path(&mount, &entities, &mutations, parent_identifier)?;
-    let parent_remote_id = create_parent_remote_id(&mount, &entities, parent_identifier)?;
     let projected_path = parent_path.join(filename);
+    if let Some(item) = existing_file_create_item(&mount, &entities, &mutations, &projected_path) {
+        return Ok(mutation_report_for_existing_item(mount_id, item));
+    }
+
+    let parent_remote_id = create_parent_remote_id(&mount, &entities, parent_identifier)?;
     ensure_virtual_path_available(store, mount_id, &projected_path)?;
     let path = content_path_for_relative(content_root, &projected_path)?;
     write_binary_atomic(&path, b"")?;
@@ -929,9 +975,13 @@ where
         .list_virtual_mutations(mount_id)
         .map_err(LocalityError::from)?;
     let parent_path = container_path(&mount, &entities, &mutations, parent_identifier)?;
-    let parent_remote_id = create_parent_remote_id(&mount, &entities, parent_identifier)?;
     let page_dir = parent_path.join(dirname);
     let projected_path = page_document_path(&page_dir);
+    if let Some(item) = existing_directory_create_item(&mount, &entities, &mutations, &page_dir) {
+        return Ok(mutation_report_for_existing_item(mount_id, item));
+    }
+
+    let parent_remote_id = create_parent_remote_id(&mount, &entities, parent_identifier)?;
     ensure_virtual_page_directory_available(store, mount_id, &page_dir, &projected_path)?;
     let path = content_path_for_relative(content_root, &projected_path)?;
     write_binary_atomic(&path, b"")?;
@@ -961,6 +1011,60 @@ where
         path: item.path.clone(),
         item,
     })
+}
+
+fn existing_file_create_item(
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+    mutations: &[VirtualMutationRecord],
+    projected_path: &Path,
+) -> Option<VirtualFsItem> {
+    let index = ProviderIndex::new(entities);
+    let deleted_remote_ids = pending_deleted_remote_ids(mutations);
+    entities
+        .iter()
+        .find(|entity| {
+            entity.path == projected_path && !deleted_remote_ids.contains(&entity.remote_id)
+        })
+        .map(|entity| entity_item(mount, entity, &index))
+}
+
+fn existing_directory_create_item(
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+    mutations: &[VirtualMutationRecord],
+    page_dir: &Path,
+) -> Option<VirtualFsItem> {
+    let index = ProviderIndex::new(entities);
+    let deleted_remote_ids = pending_deleted_remote_ids(mutations);
+    let page_path = page_document_path(page_dir);
+    entities
+        .iter()
+        .find(|entity| {
+            !deleted_remote_ids.contains(&entity.remote_id)
+                && ((entity.kind == EntityKind::Page && entity.path == page_path)
+                    || (matches!(entity.kind, EntityKind::Database | EntityKind::Directory)
+                        && entity.path == page_dir))
+        })
+        .map(|entity| {
+            if entity.kind == EntityKind::Page {
+                page_child_dir_item(mount, page_dir, &entity.remote_id, &index)
+            } else {
+                entity_item(mount, entity, &index)
+            }
+        })
+}
+
+fn mutation_report_for_existing_item(
+    mount_id: &MountId,
+    item: VirtualFsItem,
+) -> VirtualFsMutationReport {
+    VirtualFsMutationReport {
+        mount_id: mount_id.0.clone(),
+        identifier: item.identifier.clone(),
+        path: item.path.clone(),
+        item,
+    }
 }
 
 pub fn rename_virtual_fs_item<S>(
@@ -1396,6 +1500,58 @@ fn schema_item_for_container(
     Ok(path
         .exists()
         .then(|| schema_item(mount, entity, Some(path))))
+}
+
+fn refresh_database_schema_cache_for_container<S, Source>(
+    store: &S,
+    source: &Source,
+    content_root: &Path,
+    mount_id: &MountId,
+    container_identifier: &str,
+) -> LocalityResult<bool>
+where
+    S: MountRepository + EntityRepository,
+    Source: HydrationSource + ?Sized,
+{
+    let mount = require_virtual_mount(store, mount_id)?;
+    if container_identifier == ROOT_CONTAINER_IDENTIFIER
+        || container_identifier == mount_point_identifier(&mount)
+        || container_identifier.starts_with(CHILDREN_PREFIX)
+        || container_identifier.starts_with(PATH_PREFIX)
+    {
+        return Ok(false);
+    }
+
+    let remote_id = RemoteId::new(container_identifier);
+    let Some(entity) = store
+        .get_entity(mount_id, &remote_id)
+        .map_err(LocalityError::from)?
+    else {
+        return Ok(false);
+    };
+    if entity.kind != EntityKind::Database {
+        return Ok(false);
+    }
+
+    let Some(schema) = source.fetch_database_schema_yaml(&entity.remote_id)? else {
+        return Ok(false);
+    };
+    let path = content_path_for_relative(content_root, &entity.path.join("_schema.yaml"))?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(LocalityError::Io(format!(
+                "failed to read database schema cache `{}`: {error}",
+                path.display()
+            )));
+        }
+    };
+    if existing.as_deref() == Some(schema.as_str()) {
+        return Ok(false);
+    }
+    write_binary_atomic(&path, schema.as_bytes())?;
+    Ok(true)
 }
 
 fn create_parent_remote_id(
@@ -2515,6 +2671,15 @@ fn missing_identifier(identifier: &str) -> LocalityError {
     ))
 }
 
+fn is_missing_identifier_error(error: &LocalityError) -> bool {
+    matches!(
+        error,
+        LocalityError::InvalidState(message)
+            if message.starts_with("virtual filesystem item `")
+                && message.ends_with("` is not present in daemon state")
+    )
+}
+
 fn parent_path(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| *parent != Path::new(""))
@@ -2688,10 +2853,11 @@ mod tests {
         VirtualFsItemKind, VirtualFsMaterializeOutcome, commit_virtual_fs_write,
         create_virtual_fs_directory, create_virtual_fs_file,
         materialize_virtual_fs_item_with_content_root, mount_point_identifier,
-        refresh_virtual_fs_children, rename_virtual_fs_item, trash_virtual_fs_item,
-        validate_virtual_projection_root, virtual_fs_ancestor_container_identifiers,
-        virtual_fs_children, virtual_fs_children_with_content_root, virtual_fs_content_path,
-        virtual_fs_item, virtual_fs_item_with_content_root, virtual_projection_root,
+        refresh_virtual_fs_children, refresh_virtual_fs_children_with_content_root,
+        rename_virtual_fs_item, trash_virtual_fs_item, validate_virtual_projection_root,
+        virtual_fs_ancestor_container_identifiers, virtual_fs_children,
+        virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_item,
+        virtual_fs_item_with_content_root, virtual_projection_root,
     };
 
     #[test]
@@ -2940,6 +3106,68 @@ mod tests {
     }
 
     #[test]
+    fn database_children_with_schema_include_rows_and_schema_file() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-database-schema-children");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Sales CRM",
+                "sales-crm",
+            ))
+            .expect("save database");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("row-1"),
+                EntityKind::Page,
+                "Adrenaline",
+                "sales-crm/adrenaline/page.md",
+            ))
+            .expect("save row");
+        std::fs::create_dir_all(content_root.join("sales-crm")).expect("create schema parent");
+        std::fs::write(
+            content_root.join("sales-crm/_schema.yaml"),
+            "type: notion_database_schema\n",
+        )
+        .expect("write schema");
+
+        let report =
+            virtual_fs_children_with_content_root(&store, &content_root, &mount_id, "database-1")
+                .expect("list database children");
+
+        assert!(
+            report
+                .children
+                .iter()
+                .any(|child| child.identifier == "schema:database-1"
+                    && child.filename == "_schema.yaml"
+                    && child.kind == VirtualFsItemKind::File),
+            "schema file missing from database children: {:?}",
+            report.children
+        );
+        assert!(
+            report
+                .children
+                .iter()
+                .any(|child| child.identifier == "children:row-1"
+                    && child.filename == "adrenaline"
+                    && child.kind == VirtualFsItemKind::Folder),
+            "row folder missing from database children: {:?}",
+            report.children
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
     fn ancestor_container_identifiers_follow_virtual_page_path() {
         let mount_id = MountId::new("notion-main");
         let mut store = InMemoryStateStore::new();
@@ -3002,6 +3230,7 @@ mod tests {
                 stub_frontmatter: None,
             }],
             expected_parent_path: PathBuf::new(),
+            database_schema: None,
         };
         let mount_point_root = mount_point_identifier(&mount);
 
@@ -3076,13 +3305,14 @@ mod tests {
                 remote_id: RemoteId::new("row-1"),
                 kind: EntityKind::Page,
                 title: "Fix login bug".to_string(),
-                path: "Root/Tasks/fix-login-bug/page.md".into(),
+                path: "Root/Tasks/Fix login bug/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
                 stub_frontmatter: None,
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
+            database_schema: None,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -3094,15 +3324,104 @@ mod tests {
             .get_entity(&mount_id, &RemoteId::new("row-1"))
             .expect("get row")
             .expect("row");
-        assert_eq!(row.path, PathBuf::from("Root/Tasks/fix-login-bug/page.md"));
+        assert_eq!(row.path, PathBuf::from("Root/Tasks/Fix login bug/page.md"));
         let children = virtual_fs_children(&store, &mount_id, "database-1").expect("children");
         assert!(
             children
                 .children
                 .iter()
                 .any(|child| child.identifier == "children:row-1"
-                    && child.path == "Root/Tasks/fix-login-bug")
+                    && child.path == "Root/Tasks/Fix login bug")
         );
+    }
+
+    #[test]
+    fn refresh_database_children_with_content_root_writes_schema_cache() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-refresh-database-schema-cache");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Tasks",
+                "Root/Tasks",
+            ))
+            .expect("save database");
+        let schema = "type: notion_database_schema\nproperties:\n  Name:\n    type: title\n";
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("row-1"),
+                kind: EntityKind::Page,
+                title: "Fix login bug".to_string(),
+                path: "Root/Tasks/Fix login bug/page.md".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::from("Root/Tasks"),
+            database_schema: Some((RemoteId::new("database-1"), schema.to_string())),
+        };
+
+        let saved = refresh_virtual_fs_children_with_content_root(
+            &mut store,
+            &connector,
+            &content_root,
+            &mount_id,
+            "database-1",
+        )
+        .expect("refresh database rows and schema");
+
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
+        assert_eq!(
+            std::fs::read_to_string(content_root.join("Root/Tasks/_schema.yaml"))
+                .expect("schema cache"),
+            schema
+        );
+        let children =
+            virtual_fs_children_with_content_root(&store, &content_root, &mount_id, "database-1")
+                .expect("children");
+        assert!(
+            children
+                .children
+                .iter()
+                .any(|child| child.identifier == "schema:database-1"
+                    && child.filename == "_schema.yaml"
+                    && child.kind == VirtualFsItemKind::File),
+            "schema file missing from database children: {:?}",
+            children.children
+        );
+        assert!(
+            children
+                .children
+                .iter()
+                .any(|child| child.identifier == "children:row-1"
+                    && child.filename == "Fix login bug"
+                    && child.kind == VirtualFsItemKind::Folder),
+            "row folder missing from database children: {:?}",
+            children.children
+        );
+
+        let saved_again = refresh_virtual_fs_children_with_content_root(
+            &mut store,
+            &connector,
+            &content_root,
+            &mount_id,
+            "database-1",
+        )
+        .expect("refresh unchanged database rows and schema");
+        assert_eq!(saved_again.saved, 1);
+        assert!(!saved_again.changed);
+
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
@@ -3139,13 +3458,14 @@ mod tests {
                 remote_id: RemoteId::new("row-1"),
                 kind: EntityKind::Page,
                 title: "Fix login bug".to_string(),
-                path: "Root/Tasks/fix-login-bug/page.md".into(),
+                path: "Root/Tasks/Fix login bug/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
                 stub_frontmatter: None,
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
+            database_schema: None,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -3196,13 +3516,14 @@ mod tests {
                 remote_id: RemoteId::new("row-1"),
                 kind: EntityKind::Page,
                 title: "Fix login bug".to_string(),
-                path: "Root/Tasks/fix-login-bug/page.md".into(),
+                path: "Root/Tasks/Fix login bug/page.md".into(),
                 hydration: HydrationState::Stub,
                 content_hash: None,
                 remote_edited_at: None,
                 stub_frontmatter: None,
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
+            database_schema: None,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -3214,7 +3535,7 @@ mod tests {
             .get_entity(&mount_id, &RemoteId::new("row-1"))
             .expect("get row")
             .expect("row");
-        assert_eq!(row.path, PathBuf::from("Root/Tasks/fix-login-bug/page.md"));
+        assert_eq!(row.path, PathBuf::from("Root/Tasks/Fix login bug/page.md"));
         assert_eq!(row.hydration, HydrationState::Stub);
         assert_eq!(row.content_hash, None);
     }
@@ -3222,6 +3543,7 @@ mod tests {
     struct StaticChildrenConnector {
         entries: Vec<TreeEntry>,
         expected_parent_path: PathBuf,
+        database_schema: Option<(RemoteId, String)>,
     }
 
     impl Connector for StaticChildrenConnector {
@@ -3302,6 +3624,28 @@ mod tests {
             _request: ApplyUndoRequest<'_>,
         ) -> locality_core::LocalityResult<ApplyUndoResult> {
             Err(locality_core::LocalityError::NotImplemented("fixture undo"))
+        }
+    }
+
+    impl HydrationSource for StaticChildrenConnector {
+        fn fetch_render(
+            &self,
+            _request: &HydrationRequest,
+        ) -> locality_core::LocalityResult<HydratedEntity> {
+            Err(locality_core::LocalityError::NotImplemented(
+                "fixture hydrate",
+            ))
+        }
+
+        fn fetch_database_schema_yaml(
+            &self,
+            database_id: &RemoteId,
+        ) -> locality_core::LocalityResult<Option<String>> {
+            Ok(self
+                .database_schema
+                .as_ref()
+                .filter(|(id, _)| id == database_id)
+                .map(|(_, schema)| schema.clone()))
         }
     }
 
@@ -3699,6 +4043,89 @@ mod tests {
                 .expect("list mutations")
                 .len(),
             1
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn create_directory_reconciles_existing_database_folder() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-reconcile-existing-database-dir");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Sales CRM",
+                "sales-crm",
+            ))
+            .expect("save database");
+
+        let reconciled = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "mount:notion-main",
+            "sales-crm",
+        )
+        .expect("reconcile existing database directory");
+
+        assert_eq!(reconciled.identifier, "database-1");
+        assert_eq!(reconciled.item.filename, "sales-crm");
+        assert_eq!(reconciled.item.entity_kind, Some(EntityKind::Database));
+        assert_eq!(reconciled.item.kind, VirtualFsItemKind::Folder);
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn create_directory_reconciles_existing_page_folder() {
+        let mount_id = MountId::new("notion-main");
+        let state_root = temp_root("loc-virtual-fs-reconcile-existing-page-dir");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            ))
+            .expect("save page");
+
+        let reconciled = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "mount:notion-main",
+            "Home",
+        )
+        .expect("reconcile existing page directory");
+
+        assert_eq!(reconciled.identifier, "children:page-1");
+        assert_eq!(reconciled.item.filename, "Home");
+        assert_eq!(reconciled.item.kind, VirtualFsItemKind::Folder);
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
         );
 
         let _ = std::fs::remove_dir_all(state_root);
@@ -4217,6 +4644,7 @@ mod tests {
             &StaticChildrenConnector {
                 entries: Vec::new(),
                 expected_parent_path: PathBuf::new(),
+                database_schema: None,
             },
             &mount_id,
             ROOT_CONTAINER_IDENTIFIER,

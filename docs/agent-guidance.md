@@ -55,6 +55,10 @@ their MCP configs by the desktop installer. Set `LOCALITY_MCP_ADDR=off` before
 starting `localityd` to disable the daemon-hosted MCP endpoint, or set
 `LOCALITY_MCP_ADDR=<host:port>` to move it.
 
+On Windows, the desktop installer detects both the current MSIX Claude Desktop
+package and the legacy per-user EXE install before writing
+`%APPDATA%\Claude\claude_desktop_config.json`.
+
 ## Onboarding UX
 
 After the Notion mount is created, the desktop app runs the installer and shows which local agents were updated. The final onboarding screen also offers this suggested prompt:

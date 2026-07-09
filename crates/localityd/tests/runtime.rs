@@ -1091,7 +1091,7 @@ fn runtime_background_virtual_refreshes_walk_breadth_first() {
     let (refresh_tx, refresh_rx) = mpsc::channel();
     let runtime = DaemonRuntime::spawn_with_runner(
         config,
-        BreadthFirstRefreshRunner {
+        DescendantSeedingRefreshRunner {
             refresh_tx,
             mount_id,
         },
@@ -1137,10 +1137,6 @@ fn runtime_background_virtual_refreshes_walk_breadth_first() {
         max_position(&refreshed, [&page_a, &page_b])
             < min_position(&refreshed, [&page_a1, &page_b1]),
         "depth-2 containers must wait for depth-1 refreshes: {refreshed:?}"
-    );
-    assert!(
-        refresh_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-        "background refresh should stop after all discovered containers are drained"
     );
     runtime.shutdown();
 }
@@ -1210,10 +1206,7 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
     );
     simulation.release(manual_pull);
     simulation.assert_response_ok(pull);
-    let interactive_descendant = simulation.expect_started(SchedulerExpectedStart::new(
-        SchedulerOpKind::RefreshChildren,
-        "children:page-a1",
-    ));
+    simulation.expect_no_start();
 
     simulation.advance_to(
         70,
@@ -1233,25 +1226,27 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
     ));
 
     simulation.advance_to(
-        90,
+        100,
         SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-b"),
     );
     simulation.release(page_b_refresh);
-    let page_b_descendant = simulation.expect_started(SchedulerExpectedStart::new(
-        SchedulerOpKind::RefreshChildren,
-        "children:page-b1",
-    ));
+    let [page_a1_refresh, page_b1_refresh] = simulation.expect_started_set([
+        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "children:page-a1"),
+        SchedulerExpectedStart::new(SchedulerOpKind::RefreshChildren, "children:page-b1"),
+    ]);
 
     simulation.advance_to(
-        100,
+        110,
         SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-a1"),
     );
-    simulation.release(interactive_descendant);
+    simulation.release(page_a1_refresh);
+    simulation.expect_no_start();
+
     simulation.advance_to(
-        110,
+        120,
         SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "children:page-b1"),
     );
-    simulation.release(page_b_descendant);
+    simulation.release(page_b1_refresh);
     simulation.expect_no_start();
 
     simulation.assert_timeline([
@@ -1264,9 +1259,9 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
         SchedulerTimelineEntry::new(10, SchedulerOpKind::RefreshChildren, "children:page-a"),
         SchedulerTimelineEntry::new(20, SchedulerOpKind::FileProviderRead, "page-open"),
         SchedulerTimelineEntry::new(50, SchedulerOpKind::Pull, "ManualSync.md"),
-        SchedulerTimelineEntry::new(60, SchedulerOpKind::RefreshChildren, "children:page-a1"),
         SchedulerTimelineEntry::new(80, SchedulerOpKind::RefreshChildren, "children:page-b"),
-        SchedulerTimelineEntry::new(90, SchedulerOpKind::RefreshChildren, "children:page-b1"),
+        SchedulerTimelineEntry::new(100, SchedulerOpKind::RefreshChildren, "children:page-a1"),
+        SchedulerTimelineEntry::new(100, SchedulerOpKind::RefreshChildren, "children:page-b1"),
     ]);
     simulation.shutdown();
 }
@@ -2908,7 +2903,7 @@ struct RefreshRecordingRunner {
     refresh_tx: mpsc::Sender<(String, String)>,
 }
 
-struct BreadthFirstRefreshRunner {
+struct DescendantSeedingRefreshRunner {
     refresh_tx: mpsc::Sender<(String, String)>,
     mount_id: MountId,
 }
@@ -2988,7 +2983,7 @@ impl RuntimeJobRunner for RefreshRecordingRunner {
     }
 }
 
-impl RuntimeJobRunner for BreadthFirstRefreshRunner {
+impl RuntimeJobRunner for DescendantSeedingRefreshRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
         DaemonResponse::error("unexpected_pull", "pull should not run")
     }

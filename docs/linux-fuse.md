@@ -41,8 +41,9 @@ behavior as `macos_file_provider`.
 - `create`/`rename`/`unlink`: submit daemon-owned virtual mutations. New
   Markdown files are kept in the content cache until `loc push` creates the
   remote page or database row; local deletes become pending remote archives.
-- Database directories may expose a cached `_schema.yaml` file from scheduled
-  pull so row property validation does not need to read through the FUSE mount.
+- Database directories expose cached `_schema.yaml` files from scheduled pull or
+  lazy database refresh so row property validation does not need to read through
+  the FUSE mount.
 
 ## Smoke Test
 

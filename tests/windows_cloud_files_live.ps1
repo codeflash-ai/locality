@@ -142,19 +142,6 @@ function Normalize-NotionId {
     return $candidate
 }
 
-function ConvertTo-LocalitySlug {
-    param([string] $Title)
-    $builder = [System.Text.StringBuilder]::new()
-    foreach ($char in $Title.ToCharArray()) {
-        if ($char -match "[A-Za-z0-9]") {
-            [void] $builder.Append([char]::ToLowerInvariant($char))
-        } elseif ([char]::IsWhiteSpace($char) -or $char -eq "-" -or $char -eq "_") {
-            [void] $builder.Append("-")
-        }
-    }
-    return $builder.ToString().Trim("-")
-}
-
 function Write-Utf8NoBom {
     param(
         [string] $Path,
@@ -553,7 +540,7 @@ try {
     }
 
     $sourceRoot = $NotionMount
-    $pageDir = Join-Path $sourceRoot (ConvertTo-LocalitySlug $scratchTitle)
+    $pageDir = Join-Path $sourceRoot $scratchTitle
     $pageFile = Join-Path $pageDir "page.md"
     Write-Step "waiting for source root"
     Wait-ForCondition -Name "Cloud Files source root" -Condition {
@@ -600,7 +587,7 @@ try {
     Wait-ForStatusContains -Path $pageDir -Needle '"clean": true'
 
     $childTitle = "Locality Cloud Files child $unique"
-    $childDir = Join-Path $pageDir (ConvertTo-LocalitySlug $childTitle)
+    $childDir = Join-Path $pageDir $childTitle
     $childPage = Join-Path $childDir "page.md"
     $childMarker = "Windows Cloud Files created child $unique"
     Write-Step "creating child page directory"

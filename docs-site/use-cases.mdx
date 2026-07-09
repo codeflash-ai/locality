@@ -29,9 +29,9 @@ Mount standups, planning notes, or meeting recaps. Ask an agent to turn them int
 
 Good target files:
 
-- `standups-with-locality/2026-07-02/page.md`;
-- `product/planning/week-28/page.md`;
-- `go-to-market/launch-notes/page.md`.
+- `Standups with Locality/2026-07-02/page.md`;
+- `Product/Planning/Week 28/page.md`;
+- `Go To Market/Launch Notes/page.md`.
 
 Review with:
 
@@ -67,14 +67,14 @@ Useful examples:
 Create a new row as a page:
 
 ```bash
-loc create page --title "Launch FAQ" --parent ~/Library/CloudStorage/Locality/notion-main/content-calendar
+loc create page --title "Launch FAQ" --parent "$HOME/Library/CloudStorage/Locality/notion-main/Content Calendar"
 ```
 
 Then review and push:
 
 ```bash
-loc diff ~/Library/CloudStorage/Locality/notion-main/content-calendar/launch-faq/page.md
-loc push ~/Library/CloudStorage/Locality/notion-main/content-calendar/launch-faq/page.md -y
+loc diff "$HOME/Library/CloudStorage/Locality/notion-main/Content Calendar/Launch FAQ/page.md"
+loc push "$HOME/Library/CloudStorage/Locality/notion-main/Content Calendar/Launch FAQ/page.md" -y
 ```
 
 ## Portable knowledge bundles
@@ -82,7 +82,7 @@ loc push ~/Library/CloudStorage/Locality/notion-main/content-calendar/launch-faq
 Export mounted content into Open Knowledge Format when you want an offline, connector-neutral bundle.
 
 ```bash
-loc okf export ~/Library/CloudStorage/Locality/notion-main/engineering-wiki --out ~/Desktop/engineering-wiki-okf
+loc okf export "$HOME/Library/CloudStorage/Locality/notion-main/Engineering Wiki" --out "$HOME/Desktop/engineering-wiki-okf"
 ```
 
 Good uses:
@@ -98,7 +98,7 @@ Give the agent one mounted path, one job, and one review rule.
 
 ```text
 Target:
-~/Library/CloudStorage/Locality/notion-main/go-to-market/launch-plan/page.md
+~/Library/CloudStorage/Locality/notion-main/Go To Market/Launch Plan/page.md
 
 Task:
 Rewrite the rollout section for clarity and add an owner checklist.

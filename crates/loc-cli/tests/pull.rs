@@ -43,17 +43,17 @@ fn pull_mount_root_enumerates_stubs_and_hydrates_root_page() {
     assert_eq!(report.enumerated, 4);
     assert_eq!(report.stubbed, 3);
     assert_eq!(report.hydrated, 1);
-    assert!(fixture.root_file("roadmap").exists());
-    assert!(fixture.child_file("roadmap").exists());
+    assert!(fixture.root_file("Roadmap").exists());
+    assert!(fixture.child_file("Roadmap").exists());
     assert!(fixture.database_schema_file().exists());
     assert!(fixture.row_file().exists());
     assert!(
-        !fs::read_to_string(fixture.root_file("roadmap"))
+        !fs::read_to_string(fixture.root_file("Roadmap"))
             .expect("root file")
             .contains(locality_core::model::CanonicalDocument::STUB_MARKER)
     );
     assert!(
-        fs::read_to_string(fixture.child_file("roadmap"))
+        fs::read_to_string(fixture.child_file("Roadmap"))
             .expect("child file")
             .contains(locality_core::model::CanonicalDocument::STUB_MARKER)
     );
@@ -95,7 +95,7 @@ fn pull_fast_forward_refreshes_stale_remote_observation_for_status() {
                 fixture.canonical_root_page_id.clone(),
                 EntityKind::Page,
                 "Roadmap",
-                "roadmap/page.md",
+                "Roadmap/page.md",
                 "unix_ms:1",
             )
             .with_remote_version(RemoteVersion::new("2026-06-09T00:00:00.000Z")),
@@ -115,14 +115,14 @@ fn pull_fast_forward_refreshes_stale_remote_observation_for_status() {
     run_pull(
         &mut store,
         &fixture.connector_with("Roadmap", "Remote body.", "2026-06-11T00:00:00.000Z"),
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
     )
     .expect("fast-forward pull");
 
     let status = run_status(
         &store,
         StatusOptions {
-            path: Some(fixture.root_file("roadmap")),
+            path: Some(fixture.root_file("Roadmap")),
             ..StatusOptions::default()
         },
     )
@@ -152,13 +152,13 @@ fn pull_virtual_mount_writes_content_and_schema_to_daemon_cache() {
     assert!(report.ok);
     assert_eq!(report.stubbed, 0);
     assert_eq!(report.hydrated, 1);
-    assert!(!fixture.root_file("roadmap").exists());
+    assert!(!fixture.root_file("Roadmap").exists());
     let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
-    assert!(content_root.join("roadmap/page.md").exists());
+    assert!(content_root.join("Roadmap/page.md").exists());
     assert!(
         content_root
-            .join("roadmap")
-            .join("tasks")
+            .join("Roadmap")
+            .join("Tasks")
             .join("_schema.yaml")
             .exists()
     );
@@ -176,12 +176,12 @@ fn pull_virtual_file_target_does_not_stat_projection_path_as_directory() {
     run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
         .expect("pull virtual root");
 
-    fs::create_dir_all(fixture.root_file("roadmap")).expect("sentinel directory at VFS file path");
+    fs::create_dir_all(fixture.root_file("Roadmap")).expect("sentinel directory at VFS file path");
 
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
         Some(&state_root),
     )
     .expect("pull virtual file target");
@@ -231,7 +231,7 @@ fn pull_macos_file_provider_accepts_system_assigned_connector_roots() {
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        system_assigned_root.join("roadmap").join("page.md"),
+        system_assigned_root.join("Roadmap").join("page.md"),
         Some(&state_root),
     )
     .expect("pull through system-assigned file provider file");
@@ -240,7 +240,7 @@ fn pull_macos_file_provider_accepts_system_assigned_connector_roots() {
     assert_eq!(report.hydrated, 1);
     assert!(
         virtual_fs_content_root(&state_root, &fixture.mount_id)
-            .join("roadmap")
+            .join("Roadmap")
             .join("page.md")
             .exists()
     );
@@ -267,9 +267,9 @@ fn pull_macos_file_provider_reconciles_missed_visible_edit_before_refresh() {
         .expect("initial pull");
 
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
-        .join("roadmap")
+        .join("Roadmap")
         .join("page.md");
-    let visible_path = mount_root.join("roadmap").join("page.md");
+    let visible_path = mount_root.join("Roadmap").join("page.md");
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed visible replica");
@@ -317,9 +317,9 @@ fn pull_visible_provider_reconciles_missed_visible_edit_before_refresh() {
         .expect("initial pull");
 
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
-        .join("roadmap")
+        .join("Roadmap")
         .join("page.md");
-    let visible_path = mount_root.join("roadmap").join("page.md");
+    let visible_path = mount_root.join("Roadmap").join("page.md");
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed visible replica");
@@ -374,9 +374,9 @@ fn pull_macos_file_provider_refreshes_clean_visible_replica_after_conflict_pull(
     .expect("initial pull");
 
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
-        .join("roadmap")
+        .join("Roadmap")
         .join("page.md");
-    let visible_path = mount_root.join("roadmap").join("page.md");
+    let visible_path = mount_root.join("Roadmap").join("page.md");
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed clean visible replica");
@@ -441,9 +441,9 @@ fn pull_macos_file_provider_writes_conflict_markers_to_missed_visible_edit() {
     .expect("initial pull");
 
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
-        .join("roadmap")
+        .join("Roadmap")
         .join("page.md");
-    let visible_path = mount_root.join("roadmap").join("page.md");
+    let visible_path = mount_root.join("Roadmap").join("page.md");
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed visible replica");
@@ -506,9 +506,9 @@ fn pull_visible_provider_writes_conflict_markers_to_missed_visible_edit_after_re
     .expect("initial pull");
 
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
-        .join("roadmap")
+        .join("Roadmap")
         .join("page.md");
-    let visible_path = mount_root.join("roadmap").join("page.md");
+    let visible_path = mount_root.join("Roadmap").join("page.md");
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed visible replica");
@@ -572,9 +572,9 @@ fn pull_macos_file_provider_preserves_older_visible_replica_after_cache_fast_for
     .expect("initial pull");
 
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
-        .join("roadmap")
+        .join("Roadmap")
         .join("page.md");
-    let visible_path = mount_root.join("roadmap").join("page.md");
+    let visible_path = mount_root.join("Roadmap").join("page.md");
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed stale visible replica");
@@ -635,9 +635,9 @@ fn pull_macos_file_provider_preserves_older_visible_edit_after_cache_fast_forwar
     .expect("initial pull");
 
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
-        .join("roadmap")
+        .join("Roadmap")
         .join("page.md");
-    let visible_path = mount_root.join("roadmap").join("page.md");
+    let visible_path = mount_root.join("Roadmap").join("page.md");
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::write(
@@ -695,9 +695,9 @@ fn pull_windows_cloud_files_refreshes_clean_visible_replica_after_pull() {
     .expect("initial pull");
 
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
-        .join("roadmap")
+        .join("Roadmap")
         .join("page.md");
-    let visible_path = fixture.mount_point_root().join("roadmap").join("page.md");
+    let visible_path = fixture.mount_point_root().join("Roadmap").join("page.md");
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed clean visible replica");
@@ -741,9 +741,9 @@ fn pull_windows_cloud_files_refreshes_visible_empty_conflict_after_clean_merge()
     .expect("initial pull");
 
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
-        .join("roadmap")
+        .join("Roadmap")
         .join("page.md");
-    let visible_path = fixture.mount_point_root().join("roadmap").join("page.md");
+    let visible_path = fixture.mount_point_root().join("Roadmap").join("page.md");
     fs::create_dir_all(visible_path.parent().expect("visible parent"))
         .expect("create visible parent");
     fs::copy(&content_path, &visible_path).expect("seed visible replica");
@@ -801,7 +801,7 @@ fn pull_virtual_mount_accepts_mount_point_directory_as_root_target() {
     assert_eq!(report.stubbed, 0);
     assert!(
         virtual_fs_content_root(&state_root, &fixture.mount_id)
-            .join("roadmap/page.md")
+            .join("Roadmap/page.md")
             .exists()
     );
 
@@ -845,25 +845,25 @@ fn pull_workspace_virtual_mount_root_lists_immediate_children_without_recursive_
     assert_eq!(report.stubbed, 0);
     assert!(
         store
-            .find_entity_by_path(&fixture.mount_id, &PathBuf::from("workspace-home/page.md"))
+            .find_entity_by_path(&fixture.mount_id, &PathBuf::from("Workspace Home/page.md"))
             .expect("find root page")
             .is_some()
     );
     assert!(
         store
-            .find_entity_by_path(&fixture.mount_id, &PathBuf::from("tasks"))
+            .find_entity_by_path(&fixture.mount_id, &PathBuf::from("Tasks"))
             .expect("find root database")
             .is_some()
     );
     assert!(
         store
-            .find_entity_by_path(&fixture.mount_id, &PathBuf::from("nested-child/page.md"))
+            .find_entity_by_path(&fixture.mount_id, &PathBuf::from("Nested Child/page.md"))
             .expect("find nested child")
             .is_none()
     );
     assert!(
         !virtual_fs_content_root(&state_root, &fixture.mount_id)
-            .join("workspace-home/page.md")
+            .join("Workspace Home/page.md")
             .exists()
     );
 
@@ -883,7 +883,7 @@ fn pull_virtual_file_accepts_mount_point_directory_target() {
     let report = run_pull_with_state_root(
         &mut store,
         &connector,
-        fixture.mount_point_child_file("roadmap"),
+        fixture.mount_point_child_file("Roadmap"),
         Some(&state_root),
     )
     .expect("pull virtual mount point file target");
@@ -894,7 +894,7 @@ fn pull_virtual_file_accepts_mount_point_directory_target() {
     assert_eq!(report.stubbed, 0);
     assert!(
         virtual_fs_content_root(&state_root, &fixture.mount_id)
-            .join("roadmap/design-notes/page.md")
+            .join("Roadmap/Design Notes/page.md")
             .exists()
     );
 
@@ -917,8 +917,8 @@ fn pull_virtual_page_directory_recursively_hydrates_child_pages() {
         &connector,
         fixture
             .mount_point_root()
-            .join("roadmap")
-            .join("design-notes"),
+            .join("Roadmap")
+            .join("Design Notes"),
         Some(&state_root),
     )
     .expect("pull virtual page directory");
@@ -930,7 +930,7 @@ fn pull_virtual_page_directory_recursively_hydrates_child_pages() {
     let target = store
         .find_entity_by_path(
             &fixture.mount_id,
-            &PathBuf::from("roadmap/design-notes/page.md"),
+            &PathBuf::from("Roadmap/Design Notes/page.md"),
         )
         .expect("find target")
         .expect("target entity");
@@ -938,30 +938,30 @@ fn pull_virtual_page_directory_recursively_hydrates_child_pages() {
     let nested = store
         .find_entity_by_path(
             &fixture.mount_id,
-            &PathBuf::from("roadmap/design-notes/appendix/page.md"),
+            &PathBuf::from("Roadmap/Design Notes/Appendix/page.md"),
         )
         .expect("find nested child")
         .expect("nested child entity");
     assert_eq!(nested.hydration, HydrationState::Hydrated);
     assert!(
         content_root
-            .join("roadmap")
-            .join("design-notes")
+            .join("Roadmap")
+            .join("Design Notes")
             .join("page.md")
             .exists()
     );
     assert!(
         content_root
-            .join("roadmap")
-            .join("design-notes")
+            .join("Roadmap")
+            .join("Design Notes")
             .join("page.md")
             .exists()
     );
     assert!(
         fs::read_to_string(
             content_root
-                .join("roadmap")
-                .join("design-notes")
+                .join("Roadmap")
+                .join("Design Notes")
                 .join("page.md"),
         )
         .expect("read target page")
@@ -969,9 +969,9 @@ fn pull_virtual_page_directory_recursively_hydrates_child_pages() {
     );
     assert!(
         content_root
-            .join("roadmap")
-            .join("design-notes")
-            .join("appendix")
+            .join("Roadmap")
+            .join("Design Notes")
+            .join("Appendix")
             .join("page.md")
             .exists()
     );
@@ -994,8 +994,8 @@ fn pull_file_provider_page_directory_materializes_visible_child_pages() {
         &connector,
         fixture
             .mount_point_root()
-            .join("roadmap")
-            .join("design-notes"),
+            .join("Roadmap")
+            .join("Design Notes"),
         Some(&state_root),
     )
     .expect("pull visible page directory");
@@ -1004,8 +1004,8 @@ fn pull_file_provider_page_directory_materializes_visible_child_pages() {
     assert_eq!(report.hydrated, 2);
     let visible_target = fixture
         .mount_point_root()
-        .join("roadmap")
-        .join("design-notes")
+        .join("Roadmap")
+        .join("Design Notes")
         .join("page.md");
     assert!(visible_target.exists());
     assert!(
@@ -1015,9 +1015,9 @@ fn pull_file_provider_page_directory_materializes_visible_child_pages() {
     );
     let visible_child = fixture
         .mount_point_root()
-        .join("roadmap")
-        .join("design-notes")
-        .join("appendix")
+        .join("Roadmap")
+        .join("Design Notes")
+        .join("Appendix")
         .join("page.md");
     assert!(visible_child.exists());
     assert!(
@@ -1044,8 +1044,8 @@ fn pull_file_provider_page_directory_reconciles_visible_child_edit_before_hydrat
         &connector,
         fixture
             .mount_point_root()
-            .join("roadmap")
-            .join("design-notes"),
+            .join("Roadmap")
+            .join("Design Notes"),
         Some(&state_root),
     )
     .expect("hydrate visible page directory");
@@ -1053,9 +1053,9 @@ fn pull_file_provider_page_directory_reconciles_visible_child_edit_before_hydrat
     let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
     let visible_child = fixture
         .mount_point_root()
-        .join("roadmap")
-        .join("design-notes")
-        .join("appendix")
+        .join("Roadmap")
+        .join("Design Notes")
+        .join("Appendix")
         .join("page.md");
     fs::write(
         &visible_child,
@@ -1078,8 +1078,8 @@ fn pull_file_provider_page_directory_reconciles_visible_child_edit_before_hydrat
         &connector,
         fixture
             .mount_point_root()
-            .join("roadmap")
-            .join("design-notes"),
+            .join("Roadmap")
+            .join("Design Notes"),
         Some(&state_root),
     )
     .expect("pull visible page directory with dirty child");
@@ -1099,9 +1099,9 @@ fn pull_file_provider_page_directory_reconciles_visible_child_edit_before_hydrat
     );
     let cached = fs::read_to_string(
         content_root
-            .join("roadmap")
-            .join("design-notes")
-            .join("appendix")
+            .join("Roadmap")
+            .join("Design Notes")
+            .join("Appendix")
             .join("page.md"),
     )
     .expect("read cached child");
@@ -1113,7 +1113,7 @@ fn pull_file_provider_page_directory_reconciles_visible_child_edit_before_hydrat
     let child = store
         .find_entity_by_path(
             &fixture.mount_id,
-            &PathBuf::from("roadmap/design-notes/appendix/page.md"),
+            &PathBuf::from("Roadmap/Design Notes/Appendix/page.md"),
         )
         .expect("find child")
         .expect("child entity");
@@ -1132,8 +1132,8 @@ fn pull_plain_files_page_directory_hydrates_target_and_descendants() {
 
     let target_page_path = fixture
         .root
-        .join("roadmap")
-        .join("design-notes")
+        .join("Roadmap")
+        .join("Design Notes")
         .join("page.md");
     let initial_target = fs::read_to_string(&target_page_path).expect("read initial target stub");
     assert!(
@@ -1144,7 +1144,7 @@ fn pull_plain_files_page_directory_hydrates_target_and_descendants() {
     let report = run_pull(
         &mut store,
         &connector,
-        fixture.root.join("roadmap").join("design-notes"),
+        fixture.root.join("Roadmap").join("Design Notes"),
     )
     .expect("pull plain-files page directory");
 
@@ -1155,7 +1155,7 @@ fn pull_plain_files_page_directory_hydrates_target_and_descendants() {
     let target = store
         .find_entity_by_path(
             &fixture.mount_id,
-            &PathBuf::from("roadmap/design-notes/page.md"),
+            &PathBuf::from("Roadmap/Design Notes/page.md"),
         )
         .expect("find target")
         .expect("target entity");
@@ -1163,7 +1163,7 @@ fn pull_plain_files_page_directory_hydrates_target_and_descendants() {
     let nested = store
         .find_entity_by_path(
             &fixture.mount_id,
-            &PathBuf::from("roadmap/design-notes/appendix/page.md"),
+            &PathBuf::from("Roadmap/Design Notes/Appendix/page.md"),
         )
         .expect("find nested")
         .expect("nested entity");
@@ -1177,9 +1177,9 @@ fn pull_plain_files_page_directory_hydrates_target_and_descendants() {
         fs::read_to_string(
             fixture
                 .root
-                .join("roadmap")
-                .join("design-notes")
-                .join("appendix")
+                .join("Roadmap")
+                .join("Design Notes")
+                .join("Appendix")
                 .join("page.md"),
         )
         .expect("read hydrated appendix")
@@ -1198,7 +1198,7 @@ fn pull_virtual_file_conflict_reports_mount_point_directory_path() {
         .expect("initial pull");
 
     let content_path = virtual_fs_content_root(&state_root, &fixture.mount_id)
-        .join("roadmap")
+        .join("Roadmap")
         .join("page.md");
     fs::write(
         &content_path,
@@ -1215,7 +1215,7 @@ fn pull_virtual_file_conflict_reports_mount_point_directory_path() {
     entity.hydration = HydrationState::Dirty;
     store.save_entity(entity).expect("mark cache dirty");
 
-    let target = fixture.mount_point_root().join("roadmap").join("page.md");
+    let target = fixture.mount_point_root().join("Roadmap").join("page.md");
     let report = run_pull_with_state_root(
         &mut store,
         &fixture.connector_with(
@@ -1249,7 +1249,7 @@ fn pull_virtual_database_directory_hydrates_rows_when_under_limit() {
     run_pull_with_state_root(&mut store, &connector, &fixture.root, Some(&state_root))
         .expect("pull virtual root");
     let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
-    assert!(content_root.join("roadmap").join("tasks").is_dir());
+    assert!(content_root.join("Roadmap").join("Tasks").is_dir());
 
     let report = run_pull_with_state_root(
         &mut store,
@@ -1265,15 +1265,15 @@ fn pull_virtual_database_directory_hydrates_rows_when_under_limit() {
     assert_eq!(report.stubbed, 0);
     assert!(
         content_root
-            .join("roadmap")
-            .join("tasks")
+            .join("Roadmap")
+            .join("Tasks")
             .join("_schema.yaml")
             .exists()
     );
     let row = store
         .find_entity_by_path(
             &fixture.mount_id,
-            &PathBuf::from("roadmap/tasks/fix-login-bug/page.md"),
+            &PathBuf::from("Roadmap/Tasks/Fix login bug/page.md"),
         )
         .expect("find row")
         .expect("row entity");
@@ -1281,9 +1281,9 @@ fn pull_virtual_database_directory_hydrates_rows_when_under_limit() {
     assert_eq!(row.hydration, HydrationState::Hydrated);
     assert!(
         content_root
-            .join("roadmap")
-            .join("tasks")
-            .join("fix-login-bug")
+            .join("Roadmap")
+            .join("Tasks")
+            .join("Fix login bug")
             .join("page.md")
             .exists()
     );
@@ -1316,9 +1316,9 @@ fn pull_virtual_database_directory_leaves_rows_online_only_when_over_limit() {
     assert_eq!(report.stubbed, 0);
     assert!(
         !content_root
-            .join("roadmap")
-            .join("tasks")
-            .join("fix-login-bug")
+            .join("Roadmap")
+            .join("Tasks")
+            .join("Fix login bug")
             .join("page.md")
             .exists()
     );
@@ -1338,7 +1338,7 @@ fn pull_virtual_database_directory_keeps_dirty_row_at_local_path() {
     let row_id = store
         .find_entity_by_path(
             &fixture.mount_id,
-            &PathBuf::from("roadmap/tasks/fix-login-bug/page.md"),
+            &PathBuf::from("Roadmap/Tasks/Fix login bug/page.md"),
         )
         .expect("find original row")
         .expect("original row")
@@ -1385,11 +1385,11 @@ fn pull_file_skips_dirty_hydrated_file() {
     fixture.mount(&mut store);
     let connector = fixture.connector("Roadmap");
     run_pull(&mut store, &connector, &fixture.root).expect("initial pull");
-    fs::write(fixture.root_file("roadmap"), "---\nloc:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal edit.\n")
+    fs::write(fixture.root_file("Roadmap"), "---\nloc:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal edit.\n")
         .expect("dirty write");
 
     let report =
-        run_pull(&mut store, &connector, fixture.root_file("roadmap")).expect("pull dirty file");
+        run_pull(&mut store, &connector, fixture.root_file("Roadmap")).expect("pull dirty file");
 
     assert!(!report.ok);
     assert_eq!(report.hydrated, 0);
@@ -1405,23 +1405,23 @@ fn pull_mount_root_renames_existing_projection_when_remote_title_changes() {
 
     run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
 
-    assert!(fixture.root_file("roadmap").exists());
-    assert!(fixture.child_file("roadmap").exists());
+    assert!(fixture.root_file("Roadmap").exists());
+    assert!(fixture.child_file("Roadmap").exists());
 
     let report = run_pull(&mut store, &fixture.connector("Strategy"), &fixture.root)
         .expect("pull renamed root");
 
     assert!(report.ok);
-    assert!(fixture.root_file("strategy").exists());
-    assert!(fixture.child_file("strategy").exists());
-    assert!(!fixture.root_file("roadmap").exists());
-    assert!(!fixture.child_file("roadmap").exists());
+    assert!(fixture.root_file("Strategy").exists());
+    assert!(fixture.child_file("Strategy").exists());
+    assert!(!fixture.root_file("Roadmap").exists());
+    assert!(!fixture.child_file("Roadmap").exists());
 
     let root_entity = store
         .get_entity(&fixture.mount_id, &fixture.canonical_root_page_id)
         .expect("get root entity")
         .expect("root entity");
-    assert_eq!(root_entity.path, PathBuf::from("strategy/page.md"));
+    assert_eq!(root_entity.path, PathBuf::from("Strategy/page.md"));
 }
 
 #[test]
@@ -1462,7 +1462,7 @@ fn pull_mount_root_renames_existing_child_when_duplicate_title_appears() {
     fixture.mount(&mut store);
 
     run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
-    assert!(fixture.child_file("roadmap").exists());
+    assert!(fixture.child_file("Roadmap").exists());
 
     let report = run_pull(
         &mut store,
@@ -1472,9 +1472,9 @@ fn pull_mount_root_renames_existing_child_when_duplicate_title_appears() {
     .expect("pull duplicate child");
 
     assert!(report.ok);
-    assert!(fixture.colliding_child_file("roadmap", "bbbbbb").exists());
-    assert!(fixture.colliding_child_file("roadmap", "ffffff").exists());
-    assert!(!fixture.child_file("roadmap").exists());
+    assert!(fixture.colliding_child_file("Roadmap", "bbbbbb").exists());
+    assert!(fixture.colliding_child_file("Roadmap", "ffffff").exists());
+    assert!(!fixture.child_file("Roadmap").exists());
 
     let existing_child = store
         .get_entity(
@@ -1485,7 +1485,7 @@ fn pull_mount_root_renames_existing_child_when_duplicate_title_appears() {
         .expect("existing child entity");
     assert_eq!(
         existing_child.path,
-        PathBuf::from("roadmap/design-notes bbbbbb/page.md")
+        PathBuf::from("Roadmap/Design Notes bbbbbb/page.md")
     );
 }
 
@@ -1519,7 +1519,7 @@ fn pull_mount_root_renames_existing_database_row_when_duplicate_title_appears() 
         .expect("existing row entity");
     assert_eq!(
         existing_row.path,
-        PathBuf::from("roadmap/tasks/fix-login-bug eeeeee/page.md")
+        PathBuf::from("Roadmap/Tasks/Fix login bug eeeeee/page.md")
     );
 }
 
@@ -1533,7 +1533,7 @@ fn pull_mount_root_preserves_shadow_remote_timestamp_for_non_rehydrated_pages() 
     run_pull(
         &mut store,
         &fixture.connector("Roadmap"),
-        fixture.child_file("roadmap"),
+        fixture.child_file("Roadmap"),
     )
     .expect("hydrate child");
 
@@ -1576,7 +1576,7 @@ fn pull_file_removes_clean_stub_when_remote_is_not_found() {
     fixture.mount(&mut store);
     run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
     let child_id = RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    let child_path = fixture.child_file("roadmap");
+    let child_path = fixture.child_file("Roadmap");
     assert!(child_path.exists());
 
     let report = run_pull(
@@ -1605,7 +1605,7 @@ fn pull_file_writes_inline_conflict_markers_and_marks_conflicted_when_remote_cha
     fixture.mount(&mut store);
     run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
     fs::write(
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
         "---\nloc:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal edit.\n",
     )
     .expect("dirty write");
@@ -1613,7 +1613,7 @@ fn pull_file_writes_inline_conflict_markers_and_marks_conflicted_when_remote_cha
     let report = run_pull(
         &mut store,
         &fixture.connector_with("Roadmap", "Remote body.", "2026-06-11T00:00:00.000Z"),
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
     )
     .expect("pull conflicted file");
 
@@ -1623,13 +1623,13 @@ fn pull_file_writes_inline_conflict_markers_and_marks_conflicted_when_remote_cha
     assert_eq!(report.conflicts.len(), 1);
     assert_eq!(
         report.conflicts[0].path,
-        fixture.root_file("roadmap").display().to_string()
+        fixture.root_file("Roadmap").display().to_string()
     );
     assert_eq!(
         report.conflicts[0].remote_id,
         fixture.canonical_root_page_id.as_str()
     );
-    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("local file");
+    let contents = fs::read_to_string(fixture.root_file("Roadmap")).expect("local file");
     assert!(contents.contains("Local edit."));
     assert!(contents.contains("Remote body."));
     assert!(contents.contains(CONFLICT_LOCAL_MARKER));
@@ -1638,7 +1638,7 @@ fn pull_file_writes_inline_conflict_markers_and_marks_conflicted_when_remote_cha
     assert!(has_unresolved_conflict_markers(&contents));
     assert!(
         !fixture
-            .root_file("roadmap")
+            .root_file("Roadmap")
             .with_extension("remote.md")
             .exists()
     );
@@ -1664,7 +1664,7 @@ fn pull_file_leaves_inline_conflict_unchanged_when_remote_changes_again() {
     fixture.mount(&mut store);
     run_pull(&mut store, &fixture.connector("Roadmap"), &fixture.root).expect("initial pull");
     fs::write(
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
         "---\nloc:\n  id: aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n---\nLocal edit.\n",
     )
     .expect("dirty write");
@@ -1674,16 +1674,16 @@ fn pull_file_leaves_inline_conflict_unchanged_when_remote_changes_again() {
     run_pull(
         &mut store,
         &conflicted_connector,
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
     )
     .expect("pull conflicted file");
     let conflicted_contents =
-        fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
+        fs::read_to_string(fixture.root_file("Roadmap")).expect("conflict file");
 
     let report = run_pull(
         &mut store,
         &fixture.connector_with("Roadmap", "Remote body v2.", "2026-06-12T00:00:00.000Z"),
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
     )
     .expect("pull unresolved conflict");
 
@@ -1693,10 +1693,10 @@ fn pull_file_leaves_inline_conflict_unchanged_when_remote_changes_again() {
     assert_eq!(report.conflicts.len(), 1);
     assert_eq!(
         report.conflicts[0].path,
-        fixture.root_file("roadmap").display().to_string()
+        fixture.root_file("Roadmap").display().to_string()
     );
     assert_eq!(
-        fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file"),
+        fs::read_to_string(fixture.root_file("Roadmap")).expect("conflict file"),
         conflicted_contents
     );
     let entity = store
@@ -1719,7 +1719,7 @@ fn pull_file_refreshes_inline_conflict_when_same_remote_version_shadow_drifted()
     )
     .expect("initial pull");
     fs::write(
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
         concat!(
             "---\n",
             "loc:\n",
@@ -1750,7 +1750,7 @@ fn pull_file_refreshes_inline_conflict_when_same_remote_version_shadow_drifted()
     let report = run_pull(
         &mut store,
         &fixture.connector_with("Roadmap", "Remote body.\n\n---", version),
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
     )
     .expect("pull unresolved stale conflict");
 
@@ -1758,7 +1758,7 @@ fn pull_file_refreshes_inline_conflict_when_same_remote_version_shadow_drifted()
     assert_eq!(report.hydrated, 0);
     assert_eq!(report.skipped_dirty, 1);
     assert_eq!(report.conflicts.len(), 1);
-    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
+    let contents = fs::read_to_string(fixture.root_file("Roadmap")).expect("conflict file");
     assert!(contents.contains("Local edit."), "{contents}");
     assert!(contents.contains("Remote body.<br><br>---"), "{contents}");
     assert!(has_unresolved_conflict_markers(&contents), "{contents}");
@@ -1786,7 +1786,7 @@ fn pull_file_compacts_same_version_inline_conflict_when_shadow_is_current() {
         &fixture.root,
     )
     .expect("initial pull");
-    let current = fs::read_to_string(fixture.root_file("roadmap")).expect("initial file");
+    let current = fs::read_to_string(fixture.root_file("Roadmap")).expect("initial file");
     let body_start = current
         .match_indices("---\n")
         .nth(1)
@@ -1800,7 +1800,7 @@ fn pull_file_compacts_same_version_inline_conflict_when_shadow_is_current() {
         "Shared before.<br><br>Shared after.",
     );
     fs::write(
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
         format!(
             "{frontmatter}{CONFLICT_LOCAL_MARKER}\n{local_body}{CONFLICT_SEPARATOR_MARKER}\n{remote_body}{CONFLICT_REMOTE_MARKER}\n"
         ),
@@ -1817,13 +1817,13 @@ fn pull_file_compacts_same_version_inline_conflict_when_shadow_is_current() {
     let report = run_pull(
         &mut store,
         &fixture.connector_with("Roadmap", "Shared before.\n\n---\n\nShared after.", version),
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
     )
     .expect("pull same-version conflict");
 
     assert!(!report.ok);
     assert_eq!(report.conflicts.len(), 1);
-    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
+    let contents = fs::read_to_string(fixture.root_file("Roadmap")).expect("conflict file");
     assert_eq!(
         contents.matches(CONFLICT_LOCAL_MARKER).count(),
         1,
@@ -1858,9 +1858,9 @@ fn pull_file_cleans_same_version_empty_conflict_when_content_matches_remote() {
         &fixture.root,
     )
     .expect("initial pull");
-    let current = fs::read_to_string(fixture.root_file("roadmap")).expect("initial file");
+    let current = fs::read_to_string(fixture.root_file("Roadmap")).expect("initial file");
     fs::write(
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
         format!("{current}{CONFLICT_LOCAL_MARKER}\n{CONFLICT_SEPARATOR_MARKER}\n{CONFLICT_REMOTE_MARKER}\n"),
     )
     .expect("empty conflict file");
@@ -1875,7 +1875,7 @@ fn pull_file_cleans_same_version_empty_conflict_when_content_matches_remote() {
     let report = run_pull(
         &mut store,
         &fixture.connector_with("Roadmap", "Shared body.", version),
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
     )
     .expect("pull same-version empty conflict");
 
@@ -1883,7 +1883,7 @@ fn pull_file_cleans_same_version_empty_conflict_when_content_matches_remote() {
     assert_eq!(report.conflicts.len(), 0);
     assert_eq!(report.hydrated, 1);
     assert_eq!(report.skipped_dirty, 0);
-    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
+    let contents = fs::read_to_string(fixture.root_file("Roadmap")).expect("conflict file");
     assert_eq!(contents, current);
     assert!(!has_unresolved_conflict_markers(&contents), "{contents}");
 }
@@ -1901,7 +1901,7 @@ fn pull_file_refreshes_nested_inline_conflict_when_shadow_is_current() {
     )
     .expect("initial pull");
     fs::write(
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
         concat!(
             "---\n",
             "loc:\n",
@@ -1937,13 +1937,13 @@ fn pull_file_refreshes_nested_inline_conflict_when_shadow_is_current() {
     let report = run_pull(
         &mut store,
         &fixture.connector_with("Roadmap", "Remote body.\n\n---", version),
-        fixture.root_file("roadmap"),
+        fixture.root_file("Roadmap"),
     )
     .expect("pull nested stale conflict");
 
     assert!(!report.ok);
     assert_eq!(report.conflicts.len(), 1);
-    let contents = fs::read_to_string(fixture.root_file("roadmap")).expect("conflict file");
+    let contents = fs::read_to_string(fixture.root_file("Roadmap")).expect("conflict file");
     assert_eq!(
         contents.matches(CONFLICT_LOCAL_MARKER).count(),
         1,
@@ -2108,7 +2108,7 @@ impl PullFixture {
     fn child_file(&self, root_slug: &str) -> PathBuf {
         self.root
             .join(root_slug)
-            .join("design-notes")
+            .join("Design Notes")
             .join("page.md")
     }
 
@@ -2119,38 +2119,38 @@ impl PullFixture {
     fn mount_point_child_file(&self, root_slug: &str) -> PathBuf {
         self.mount_point_root()
             .join(root_slug)
-            .join("design-notes")
+            .join("Design Notes")
             .join("page.md")
     }
 
     fn database_schema_file(&self) -> PathBuf {
-        self.root.join("roadmap").join("tasks").join("_schema.yaml")
+        self.root.join("Roadmap").join("Tasks").join("_schema.yaml")
     }
 
     fn mount_point_database_dir(&self) -> PathBuf {
-        self.mount_point_root().join("roadmap").join("tasks")
+        self.mount_point_root().join("Roadmap").join("Tasks")
     }
 
     fn row_file(&self) -> PathBuf {
         self.root
-            .join("roadmap")
-            .join("tasks")
-            .join("fix-login-bug")
+            .join("Roadmap")
+            .join("Tasks")
+            .join("Fix login bug")
             .join("page.md")
     }
 
     fn colliding_child_file(&self, root_slug: &str, short_id: &str) -> PathBuf {
         self.root
             .join(root_slug)
-            .join(format!("design-notes {short_id}"))
+            .join(format!("Design Notes {short_id}"))
             .join("page.md")
     }
 
     fn colliding_row_file(&self, short_id: &str) -> PathBuf {
         self.root
-            .join("roadmap")
-            .join("tasks")
-            .join(format!("fix-login-bug {short_id}"))
+            .join("Roadmap")
+            .join("Tasks")
+            .join(format!("Fix login bug {short_id}"))
             .join("page.md")
     }
 }

@@ -804,7 +804,7 @@ impl MetadataDiscoveryJobRepository for SqliteStateStore {
             .transpose()?
             .map(|mut existing| {
                 existing.priority = existing.priority.max(job.priority);
-                existing.depth = existing.depth.min(job.depth);
+                existing.depth = job.depth;
                 existing.updated_at = job.updated_at.clone();
                 existing
             })

@@ -3,7 +3,7 @@ import Foundation
 import UniformTypeIdentifiers
 
 final class LocalityFileProviderItem: NSObject, NSFileProviderItem {
-  private static let metadataSchemaVersion = "metadata-v2"
+  private static let metadataSchemaVersion = "metadata-v3"
 
   let itemIdentifier: NSFileProviderItemIdentifier
   let parentItemIdentifier: NSFileProviderItemIdentifier
@@ -22,7 +22,11 @@ final class LocalityFileProviderItem: NSObject, NSFileProviderItem {
     self.filename = metadata.filename
     self.contentType = UTType(metadata.contentType) ?? .data
     if metadata.kind == "folder" {
-      self.capabilities = [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems]
+      if Self.allowsAddingSubItems(metadata) {
+        self.capabilities = [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems]
+      } else {
+        self.capabilities = [.allowsReading, .allowsContentEnumerating]
+      }
     } else if metadata.entityKind == "page" {
       self.capabilities = [.allowsReading, .allowsWriting, .allowsRenaming]
     } else {
@@ -47,9 +51,14 @@ final class LocalityFileProviderItem: NSObject, NSFileProviderItem {
         metadata.parentIdentifier ?? "",
         metadata.filename,
         metadata.kind,
+        metadata.entityKind ?? "",
       ])
     )
     super.init()
+  }
+
+  private static func allowsAddingSubItems(_ metadata: LocalityItemMetadata) -> Bool {
+    metadata.entityKind == "database" || metadata.identifier.hasPrefix("children:")
   }
 
   static func daemonIdentifier(_ identifier: NSFileProviderItemIdentifier) -> String {
