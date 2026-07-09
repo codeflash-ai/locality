@@ -1667,6 +1667,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         ensure_state_components_allow_schema_migration(connection, user_version)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
+        migrate_virtual_mutations_component_to_v2(connection)?;
         return Ok(());
     }
 
@@ -2137,6 +2138,13 @@ fn state_component_issue_allows_schema_migration(
             found: 1,
             current: WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION,
         } if component_id == "projection:windows_cloud_files"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found: 1,
+            current: 2,
+        } if component_id == "durable:virtual_mutations"
     ) || matches!(
         issue,
         StateCompatibilityIssue::MissingComponent { component_id }
@@ -2860,6 +2868,81 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
         WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION,
         MissingProjectionComponent::TreatAsV1,
     )
+}
+
+fn migrate_virtual_mutations_component_to_v2(connection: &Connection) -> StoreResult<()> {
+    migrate_state_component_to_current(connection, "durable:virtual_mutations")
+}
+
+fn migrate_state_component_to_current(
+    connection: &Connection,
+    component_id: &str,
+) -> StoreResult<()> {
+    create_state_management_tables(connection)?;
+    let definition = CURRENT_COMPONENT_DEFINITIONS
+        .iter()
+        .find(|definition| definition.component_id == component_id)
+        .expect("known state component definition");
+    let component = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = ?1",
+            params![component_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if let Some((component_version, min_reader_version)) = component {
+        if component_version > definition.current_version {
+            return Err(StoreError::StateCompatibility(format!(
+                "state component {component_id} version {component_version} is newer than supported version {}",
+                definition.current_version
+            )));
+        }
+        if min_reader_version > definition.current_version {
+            return Err(StoreError::StateCompatibility(format!(
+                "state component {component_id} requires reader version {min_reader_version}, but supported version is {}",
+                definition.current_version
+            )));
+        }
+        if component_version >= definition.current_version {
+            return Ok(());
+        }
+    }
+
+    let updated_at = unix_timestamp_string();
+    connection.execute(
+        "INSERT INTO state_components (
+            component_id,
+            component_kind,
+            version,
+            min_reader_version,
+            required,
+            rebuildable,
+            data_json,
+            updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(component_id) DO UPDATE SET
+            component_kind = excluded.component_kind,
+            version = excluded.version,
+            min_reader_version = excluded.min_reader_version,
+            required = excluded.required,
+            rebuildable = excluded.rebuildable,
+            data_json = excluded.data_json,
+            updated_at = excluded.updated_at",
+        params![
+            definition.component_id,
+            definition.component_kind,
+            definition.current_version,
+            definition.min_reader_version,
+            bool_to_int(definition.required),
+            bool_to_int(definition.rebuildable),
+            definition.data_json,
+            &updated_at,
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
