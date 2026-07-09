@@ -9,10 +9,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use locality_core::model::{EntityKind, RemoteId};
 use locality_core::path_projection::{PAGE_DOCUMENT_FILENAME, page_document_path};
 use locality_store::{
-    MountConfig, MountRepository, StoreError, VirtualMutationKind, VirtualMutationRecord,
-    VirtualMutationRepository,
+    EntityRecord, EntityRepository, MountConfig, MountRepository, StoreError, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
 use localityd::file_provider;
 use localityd::virtual_fs::virtual_fs_content_path;
@@ -46,7 +47,7 @@ pub fn run_create_page<S>(
     options: CreatePageOptions,
 ) -> Result<CreatePageReport, CreateError>
 where
-    S: MountRepository + VirtualMutationRepository,
+    S: EntityRepository + MountRepository + VirtualMutationRepository,
 {
     let title = normalized_title(&options.title)?;
     let parent = match options.parent {
@@ -83,12 +84,24 @@ where
     } else {
         format!("---\ntitle: {}\n---\n", yaml_double_quoted(&title))
     };
-    if options.private && mount.projection.uses_virtual_filesystem() {
+    if mount.projection.uses_virtual_filesystem() {
         let state_root = options
             .state_root
             .as_deref()
             .ok_or(CreateError::VirtualStateRootRequired)?;
-        stage_private_virtual_page(store, &mount, state_root, &page_dir, &body)?;
+        let parent_remote_id = if options.private {
+            None
+        } else {
+            Some(parent_remote_id_for_path(store, &mount, &parent)?)
+        };
+        stage_virtual_page(
+            store,
+            &mount,
+            state_root,
+            &page_dir,
+            &body,
+            parent_remote_id,
+        )?;
     } else {
         fs::create_dir_all(&page_dir).map_err(|error| CreateError::WriteFile {
             path: page_dir.clone(),
@@ -128,6 +141,7 @@ pub enum CreateError {
     InvalidTitle(String),
     MountNotFound(PathBuf),
     PrivateUnsupported { connector: String },
+    InvalidParent { path: PathBuf, message: String },
     ReadOnlyMount { mount_id: String },
     VirtualStateRootRequired,
     Store(StoreError),
@@ -142,6 +156,7 @@ impl CreateError {
             Self::InvalidTitle(_) => "invalid_title",
             Self::MountNotFound(_) => "mount_not_found",
             Self::PrivateUnsupported { .. } => "private_unsupported",
+            Self::InvalidParent { .. } => "invalid_parent",
             Self::ReadOnlyMount { .. } => "read_only_mount",
             Self::VirtualStateRootRequired => "virtual_state_root_required",
             Self::Store(_) => "store_error",
@@ -162,12 +177,14 @@ impl CreateError {
             Self::PrivateUnsupported { connector } => {
                 format!("--private is only supported for Notion mounts, not `{connector}`")
             }
+            Self::InvalidParent { path, message } => {
+                format!("cannot create page inside `{}`: {message}", path.display())
+            }
             Self::ReadOnlyMount { mount_id } => {
                 format!("mount `{mount_id}` is read-only and cannot accept new pages")
             }
             Self::VirtualStateRootRequired => {
-                "creating private pages in virtual mounts requires a Locality state directory"
-                    .to_string()
+                "creating pages in virtual mounts requires a Locality state directory".to_string()
             }
             Self::Store(error) => error.to_string(),
             Self::TargetExists(path) => {
@@ -180,12 +197,13 @@ impl CreateError {
     }
 }
 
-fn stage_private_virtual_page<S>(
+fn stage_virtual_page<S>(
     store: &mut S,
     mount: &MountConfig,
     state_root: &Path,
     page_dir: &Path,
     body: &str,
+    parent_remote_id: Option<RemoteId>,
 ) -> Result<(), CreateError>
 where
     S: VirtualMutationRepository,
@@ -220,7 +238,7 @@ where
             local_id: local_create_id(),
             mutation_kind: VirtualMutationKind::Create,
             target_remote_id: None,
-            parent_remote_id: None,
+            parent_remote_id,
             original_path: None,
             projected_path,
             title: page_dir
@@ -232,6 +250,46 @@ where
             updated_at: now,
         })
         .map_err(CreateError::Store)
+}
+
+fn parent_remote_id_for_path<S>(
+    store: &S,
+    mount: &MountConfig,
+    parent: &Path,
+) -> Result<RemoteId, CreateError>
+where
+    S: EntityRepository,
+{
+    let relative_parent = relative_path(mount, parent)?;
+    if relative_parent.as_os_str().is_empty() {
+        return Err(CreateError::InvalidParent {
+            path: parent.to_path_buf(),
+            message: "new pages must be created inside an existing page or database directory"
+                .to_string(),
+        });
+    }
+
+    let entities = store
+        .list_entities(&mount.mount_id)
+        .map_err(CreateError::Store)?;
+    parent_entity_for_path(&relative_parent, &entities)
+        .map(|entity| entity.remote_id.clone())
+        .ok_or_else(|| CreateError::InvalidParent {
+            path: parent.to_path_buf(),
+            message: "no existing page or database matches this parent directory".to_string(),
+        })
+}
+
+fn parent_entity_for_path<'a>(
+    relative_parent: &Path,
+    entities: &'a [EntityRecord],
+) -> Option<&'a EntityRecord> {
+    let parent_page_path = page_document_path(relative_parent);
+    entities.iter().find(|entity| match entity.kind {
+        EntityKind::Page => entity.path == parent_page_path,
+        EntityKind::Database => entity.path == relative_parent,
+        EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => false,
+    })
 }
 
 fn relative_path(mount: &MountConfig, path: &Path) -> Result<PathBuf, CreateError> {

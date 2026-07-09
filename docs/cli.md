@@ -204,8 +204,16 @@ review or hydration requirements before reading file content.
 
 `loc create page --title <title> [--parent <dir>] [--private]` creates the
 local filesystem shape for a new page and does not call a remote connector. The
-parent directory must be inside a registered Locality mount and must be
-writable. When `--parent` is omitted, the current directory is used.
+parent directory must be inside a registered writable Locality mount. For normal
+remote creates, the parent must be an existing projected page or database
+directory so Locality can preserve the "containing directory determines the
+remote parent" contract. When `--parent` is omitted, the current directory is
+used.
+
+On virtual projections such as macOS File Provider, Linux FUSE, and Windows
+Cloud Files, the visible mount may reject direct filesystem creation. `loc
+create page` stages the draft in Locality's content cache and records a pending
+virtual create instead; `loc diff` and `loc push` use that staged content.
 
 For Notion mounts, the title determines the page directory name and the
 containing directory determines the remote parent:
