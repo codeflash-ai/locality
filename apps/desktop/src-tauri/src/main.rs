@@ -449,7 +449,7 @@ struct InstallStateReview {
     current_build_id: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopInstallMarker {
     #[serde(default)]
@@ -992,16 +992,13 @@ async fn install_state_review() -> InstallStateReview {
 #[tauri::command]
 async fn acknowledge_install_state() -> ActionReport {
     match tauri::async_runtime::spawn_blocking(|| {
-        record_current_install_marker(&default_state_root())
+        acknowledge_install_state_at(&default_state_root())
     })
     .await
     .map_err(|error| format!("Install marker worker failed: {error}"))
     .and_then(|result| result)
     {
-        Ok(()) => ActionReport {
-            ok: true,
-            message: "Locality install state recorded.".to_string(),
-        },
+        Ok(report) => report,
         Err(message) => ActionReport { ok: false, message },
     }
 }
@@ -4581,6 +4578,42 @@ fn record_current_install_marker(state_root: &Path) -> Result<(), String> {
         .map_err(|error| format!("Could not serialize install marker: {error}"))?;
     fs::write(install_marker_path(state_root), contents)
         .map_err(|error| format!("Could not write install marker: {error}"))
+}
+
+fn acknowledge_install_state_at(state_root: &Path) -> Result<ActionReport, String> {
+    let previous_marker = load_install_marker(state_root).ok().flatten();
+    let should_refresh_guidance =
+        install_marker_requires_agent_guidance_refresh(previous_marker.as_ref());
+    record_current_install_marker(state_root)?;
+
+    let mut message = "Locality install state recorded.".to_string();
+    if should_refresh_guidance {
+        message.push(' ');
+        message.push_str(&install_or_upgrade_agent_guidance_message(state_root));
+    }
+
+    Ok(ActionReport { ok: true, message })
+}
+
+fn install_marker_requires_agent_guidance_refresh(marker: Option<&DesktopInstallMarker>) -> bool {
+    !matches!(marker, Some(marker) if *marker == current_install_marker())
+}
+
+fn install_or_upgrade_agent_guidance_message(state_root: &Path) -> String {
+    match refresh_agent_guidance_for_current_mount_at(state_root) {
+        Some(report) if report.ok => {
+            "Agent guidance was refreshed for the current mount.".to_string()
+        }
+        Some(report) => {
+            let failed = agent_guidance_failed_target_summary(&report);
+            if failed.is_empty() {
+                "Agent guidance refresh was attempted, but some targets failed.".to_string()
+            } else {
+                format!("Agent guidance refresh was attempted, but some targets failed: {failed}.")
+            }
+        }
+        None => "Agent guidance will be prepared after a mount is created.".to_string(),
+    }
 }
 
 fn current_install_marker() -> DesktopInstallMarker {
@@ -9957,12 +9990,13 @@ mod tests {
 
     use super::{
         ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, MonitorScreenBounds,
-        PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState, activity_timestamp,
-        clear_mount_cached_projection, clear_state_root_contents, clear_visible_projection_paths,
-        conflict_preview, connection_metadata_changed, current_daemon_build_id,
-        current_desktop_build_id, diff_report_message, exact_located_entity_record,
-        exact_notion_entry_matches, failed_push_summary, has_unresolved_conflict_markers,
-        hydration_after_editor_write, inspect_install_state, install_terminal_cli_link_at,
+        PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
+        acknowledge_install_state_at, activity_timestamp, clear_mount_cached_projection,
+        clear_state_root_contents, clear_visible_projection_paths, conflict_preview,
+        connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
+        diff_report_message, exact_located_entity_record, exact_notion_entry_matches,
+        failed_push_summary, has_unresolved_conflict_markers, hydration_after_editor_write,
+        inspect_install_state, install_terminal_cli_link_at,
         install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
         is_unsupported_schema_version_message, live_mode_local_reconcile_targets_for_mount_at,
         live_mode_merge_remote_drift_markdown, live_mode_remote_check_page_budget_for_rate,
@@ -13144,6 +13178,54 @@ mod tests {
     }
 
     #[test]
+    fn acknowledge_install_state_refreshes_agent_guidance_once_without_mount() {
+        let temp = TestTempDir::new("install-state-acknowledge-guidance");
+
+        let first = acknowledge_install_state_at(temp.path()).expect("acknowledge install state");
+        assert!(first.ok);
+        assert!(first.message.contains("Locality install state recorded."));
+        assert!(
+            first
+                .message
+                .contains("Agent guidance will be prepared after a mount is created.")
+        );
+        assert!(
+            !temp.path().join("state.sqlite3").exists(),
+            "agent guidance refresh should not create a state database when no mount exists"
+        );
+
+        let second = acknowledge_install_state_at(temp.path()).expect("acknowledge install state");
+        assert!(second.ok);
+        assert_eq!(second.message, "Locality install state recorded.");
+    }
+
+    #[test]
+    fn acknowledge_install_state_refreshes_agent_guidance_after_build_change() {
+        let temp = TestTempDir::new("install-state-acknowledge-upgrade-guidance");
+        record_current_install_marker(temp.path()).expect("record marker");
+        let old_marker = serde_json::json!({
+            "stateFormatVersion": DESKTOP_INSTALL_MARKER_VERSION,
+            "appVersion": env!("CARGO_PKG_VERSION"),
+            "appBuildId": "old-desktop-build",
+            "daemonBuildId": current_daemon_build_id(),
+        });
+        fs::write(
+            temp.path().join("desktop-install.json"),
+            serde_json::to_string_pretty(&old_marker).expect("serialize old marker"),
+        )
+        .expect("write old marker");
+
+        let report = acknowledge_install_state_at(temp.path()).expect("acknowledge install state");
+
+        assert!(report.ok);
+        assert!(
+            report
+                .message
+                .contains("Agent guidance will be prepared after a mount is created.")
+        );
+    }
+
+    #[test]
     fn install_state_does_not_prompt_for_legacy_marker_without_desktop_build_id() {
         let temp = TestTempDir::new("install-state-legacy-marker");
         fs::write(temp.path().join("state.sqlite3"), b"not a real sqlite db")
@@ -14283,7 +14365,6 @@ fn main() {
             start_state_change_watcher(app.app_handle().clone());
             start_live_mode_runner(app.app_handle().clone());
             start_windows_cloud_files_provider_supervisor();
-            start_agent_guidance_refresher();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -14341,16 +14422,6 @@ fn should_hide_tray_popover(window_label: &str, event: &tauri::WindowEvent) -> b
     window_label == "tray" && matches!(event, tauri::WindowEvent::Focused(false))
 }
 
-fn start_agent_guidance_refresher() {
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(30));
-        loop {
-            refresh_agent_guidance_best_effort();
-            std::thread::sleep(std::time::Duration::from_secs(10 * 60));
-        }
-    });
-}
-
 fn start_live_mode_runner(app: AppHandle) {
     std::thread::spawn(move || {
         let mut wake_generation = live_mode_wake_generation();
@@ -14403,25 +14474,33 @@ fn configure_main_window_chrome(app: &mut tauri::App) {
     }
 }
 
-fn refresh_agent_guidance_best_effort() {
-    let Some(mount_path) = agent_guidance_mount_path() else {
-        return;
-    };
+fn refresh_agent_guidance_for_current_mount_at(
+    state_root: &Path,
+) -> Option<AgentGuidanceInstallReport> {
+    let mount_path = agent_guidance_mount_path_at(state_root)?;
     let report = install_guidance_files(Some(&mount_path));
     if !report.ok {
-        let failed = report
-            .targets
-            .iter()
-            .filter(|target| target.status == "failed")
-            .map(|target| target.detail.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
+        let failed = agent_guidance_failed_target_summary(&report);
         eprintln!("loc desktop could not refresh agent guidance: {failed}");
     }
+    Some(report)
 }
 
-fn agent_guidance_mount_path() -> Option<String> {
-    let store = SqliteStateStore::open(default_state_root()).ok()?;
+fn agent_guidance_failed_target_summary(report: &AgentGuidanceInstallReport) -> String {
+    report
+        .targets
+        .iter()
+        .filter(|target| target.status == "failed")
+        .map(|target| target.detail.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn agent_guidance_mount_path_at(state_root: &Path) -> Option<String> {
+    if !state_root.join("state.sqlite3").exists() {
+        return None;
+    }
+    let store = SqliteStateStore::open(state_root.to_path_buf()).ok()?;
     let mounts = store.load_mounts().ok()?;
     let mount = choose_mount(&mounts)?;
     Some(display_path(&mount_access_root(&mount)))
