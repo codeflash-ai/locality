@@ -10,6 +10,14 @@ use locality_store::{
     MountLiveModeRepository,
 };
 
+pub fn auto_save_enrollment_is_active(enrollment: &AutoSaveEnrollmentRecord) -> bool {
+    enrollment.enabled
+        && !matches!(
+            enrollment.state,
+            AutoSaveState::PausedRemoteChanged | AutoSaveState::PausedFailure
+        )
+}
+
 pub fn auto_save_enabled_for_path<S>(
     store: &S,
     mount_id: &MountId,
@@ -25,13 +33,28 @@ where
         return Ok(None);
     };
 
-    if !enrollment.enabled {
+    if !auto_save_enrollment_is_active(&enrollment) {
         return Ok(None);
     }
-    if matches!(
-        enrollment.state,
-        AutoSaveState::PausedRemoteChanged | AutoSaveState::PausedFailure
-    ) {
+
+    Ok(Some(enrollment))
+}
+
+pub fn active_auto_save_enrollment_for_remote_id<S>(
+    store: &S,
+    mount_id: &MountId,
+    remote_id: &RemoteId,
+) -> LocalityResult<Option<AutoSaveEnrollmentRecord>>
+where
+    S: AutoSaveRepository,
+{
+    let Some(enrollment) = store
+        .find_auto_save_enrollment_by_remote_id(mount_id, remote_id)
+        .map_err(LocalityError::from)?
+    else {
+        return Ok(None);
+    };
+    if !auto_save_enrollment_is_active(&enrollment) {
         return Ok(None);
     }
 
