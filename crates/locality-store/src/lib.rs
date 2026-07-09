@@ -12,6 +12,7 @@ pub mod live_mode;
 pub mod memory;
 pub mod records;
 pub mod repository;
+pub mod reset;
 pub mod sqlite;
 
 pub use compatibility::{
@@ -42,5 +43,9 @@ pub use repository::{
     HydrationJobRepository, JournalRepository, MetadataDiscoveryJobRepository,
     MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
     VirtualMutationRepository,
+};
+pub use reset::{
+    LocalStateResetCredentialError, LocalStateResetError, LocalStateResetStorageReport,
+    connection_secret_refs, reset_locality_state_storage,
 };
 pub use sqlite::SqliteStateStore;

@@ -64,10 +64,10 @@ owned by SQLite schema and state-component migrations in `locality-store`; ordin
 upgrades should continue without a user-visible state step.
 
 A destructive reset remains available in the app under **Settings > Developer >
-Reset Local State** for explicit repair/debugging. The reset stops `localityd`,
-unregisters File Provider domains, removes Locality metadata/cache/support state, and
-clears connector credentials. It does not delete user-visible local folders or
-documents.
+Reset Local State** and from the terminal as `loc reset --yes` for explicit
+repair/debugging. The reset stops `localityd`, unregisters File Provider
+domains, removes Locality metadata/cache/support state, and clears connector
+credentials. It does not delete user-visible local folders or documents.
 
 The desktop app also checks the running `localityd` build metadata before reusing a
 daemon. If the daemon does not report the same build ID as the app bundle, or if

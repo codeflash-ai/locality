@@ -27,6 +27,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc doctor [--json]`
 - `loc diff [path] [--json]`
 - `loc restore <path> [--force] [--json]`
+- `loc reset --yes [--json]`
 - `loc undo [push-id] [--json]`
 - `loc log [path] [--json]`
 - `loc config set <key=value>`
@@ -136,6 +137,21 @@ never includes credential values:
 
 `doctor` exits `0` for `ok` and `warning` reports, and exits `3` when any
 finding has `error` severity.
+
+## Reset
+
+`loc reset --yes [--json]` performs the same destructive local-state reset as the
+desktop **Reset Local State** developer action. It stops `localityd` when it can,
+resets platform provider registration state where the host supports it, deletes
+connector credentials referenced by Locality connections, and clears the Locality
+state root, including `state.sqlite3`, content caches, journals, provider
+runtime metadata, logs, and background sync state. It preserves user-visible
+mounted folders and documents.
+
+The command requires `--yes`; without it, `loc reset` returns
+`confirmation_required` and does not mutate state. JSON output reports counts and
+state-root entries, but does not include credential values or credential storage
+references.
 
 ## Local Search
 
@@ -459,7 +475,9 @@ override the helper binary path for development.
 virtual projection. On Linux it stops and removes the systemd user service. On
 Windows it removes the Cloud Files sync-root registration; use `stop` first when
 you only want to stop the runtime. `list` and `reset` target the platform helper
-for the current host.
+for the current host. `loc file-provider reset` only resets provider
+registration/runtime state; use `loc reset --yes` for a full Locality local-state
+and credential reset.
 
 `loc pull <mount-root>` starts from the mount mode. For `--root-page` Notion
 mounts, it enumerates the configured page. For `--workspace` mounts, it

@@ -3532,6 +3532,104 @@ fn cli_connection_reports_and_disconnect_missing_credential_without_leaking_secr
     );
 }
 
+#[test]
+fn cli_reset_requires_yes_and_clears_isolated_state_without_deleting_visible_files() {
+    let fixture = E2eFixture::new();
+    fs::create_dir_all(&fixture.root).expect("create visible mount root");
+    fs::write(fixture.root.join("page.md"), b"user-visible content").expect("write visible file");
+    fs::create_dir_all(fixture.state_root.join("content/notion-main")).expect("create content");
+    fs::write(
+        fixture.state_root.join("content/notion-main/page.md"),
+        b"cached",
+    )
+    .expect("write cached content");
+
+    let mut store =
+        SqliteStateStore::open(fixture.state_root.clone()).expect("open reset test state");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: ConnectionId::new("reset-work"),
+            profile_id: None,
+            connector: "notion".to_string(),
+            display_name: "Reset Work".to_string(),
+            account_label: None,
+            workspace_id: None,
+            workspace_name: None,
+            auth_kind: "token".to_string(),
+            secret_ref: "connection:reset-work".to_string(),
+            scopes: vec![],
+            capabilities_json: "{}".to_string(),
+            status: "active".to_string(),
+            created_at: timestamp_string(),
+            updated_at: timestamp_string(),
+            expires_at: None,
+        })
+        .expect("save reset connection");
+    drop(store);
+
+    let credentials = FileCredentialStore::new(&fixture.state_root);
+    credentials
+        .put("connection:reset-work", "reset-secret")
+        .expect("write reset credential");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let rejected = loc_json_with_exit(
+        loc_command(loc, &fixture.state_root).args(["reset", "--json"]),
+        2,
+    );
+    assert_eq!(rejected.value["ok"], false, "{rejected:#?}");
+    assert_eq!(rejected.value["command"], "reset", "{rejected:#?}");
+    assert_eq!(
+        rejected.value["code"], "confirmation_required",
+        "{rejected:#?}"
+    );
+    assert!(fixture.state_root.join("state.sqlite3").exists());
+    assert_eq!(
+        credentials
+            .get("connection:reset-work")
+            .expect("credential should remain before confirmed reset"),
+        "reset-secret"
+    );
+
+    let reset =
+        loc_json_ok(loc_command(loc, &fixture.state_root).args(["reset", "--yes", "--json"]));
+    assert_eq!(reset.value["ok"], true, "{reset:#?}");
+    assert_eq!(reset.value["command"], "reset", "{reset:#?}");
+    assert_eq!(reset.value["action"], "reset", "{reset:#?}");
+    assert_eq!(
+        reset.value["state_root"],
+        fixture.state_root.display().to_string(),
+        "{reset:#?}"
+    );
+    assert!(
+        reset.value["deleted_credentials"].as_u64().expect("count") >= 1,
+        "{reset:#?}"
+    );
+    assert!(
+        !reset.stdout.contains("connection:reset-work"),
+        "reset report should not expose credential storage refs"
+    );
+    assert!(
+        !reset.stdout.contains("reset-secret"),
+        "reset report should not expose credential values"
+    );
+    assert!(
+        fs::read_dir(&fixture.state_root)
+            .expect("read reset state root")
+            .next()
+            .is_none(),
+        "confirmed reset should clear state root"
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("page.md")).expect("read visible file"),
+        b"user-visible content"
+    );
+    assert!(
+        credentials.get("connection:reset-work").is_err(),
+        "confirmed reset should delete connection credential"
+    );
+}
+
 struct MissingCredentialMount {
     fixture: E2eFixture,
     connection_id: ConnectionId,

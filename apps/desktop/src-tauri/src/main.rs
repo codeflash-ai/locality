@@ -76,7 +76,7 @@ use locality_store::{
     MountLiveModeStateChangeError, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
     VirtualMutationRecord, VirtualMutationRepository, is_live_mode_state_change_signal_path,
-    open_credential_store, save_mount_live_mode_and_publish_signal,
+    open_credential_store, reset_locality_state_storage, save_mount_live_mode_and_publish_signal,
 };
 use localityd::autosave::auto_save_timestamp;
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
@@ -4649,13 +4649,11 @@ fn install_marker_path(state_root: &Path) -> PathBuf {
 
 fn reset_locality_state_at(state_root: &Path) -> Result<(), String> {
     LOCAL_STATE_RESET_IN_PROGRESS.store(true, Ordering::Release);
-    let secret_refs = connection_secret_refs(state_root);
     let result = (|| {
         stop_daemon_for_reset(state_root);
         reset_platform_projection_state(state_root)?;
-        remove_connection_secrets(state_root, secret_refs);
         remove_desktop_support_state()?;
-        clear_state_root_contents(state_root)?;
+        reset_locality_state_storage(state_root).map_err(|error| error.to_string())?;
         Ok(())
     })();
     LOCAL_STATE_RESET_IN_PROGRESS.store(false, Ordering::Release);
@@ -4689,73 +4687,6 @@ fn prepare_locality_uninstall_at(state_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn clear_state_root_contents(state_root: &Path) -> Result<(), String> {
-    if !state_root.exists() {
-        fs::create_dir_all(state_root)
-            .map_err(|error| format!("Could not create Locality state folder: {error}"))?;
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(state_root)
-        .map_err(|error| format!("Could not inspect Locality state folder: {error}"))?
-    {
-        let entry =
-            entry.map_err(|error| format!("Could not inspect Locality state entry: {error}"))?;
-        if should_preserve_state_reset_entry(&entry.path()) {
-            continue;
-        }
-        remove_path_if_exists(&entry.path())?;
-    }
-    Ok(())
-}
-
-fn should_preserve_state_reset_entry(path: &Path) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "locality.exe"
-                | "locality-desktop.exe"
-                | "loc.exe"
-                | "localityd.exe"
-                | "locality-cloud-files.exe"
-                | "uninstall.exe"
-                | "bin"
-        )
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = path;
-        false
-    }
-}
-
-fn connection_secret_refs(state_root: &Path) -> Vec<String> {
-    let mut refs = vec![
-        "connection:notion-default".to_string(),
-        "connection:notion-main".to_string(),
-        "connection:notion-test".to_string(),
-    ];
-    if state_root.join("state.sqlite3").exists()
-        && let Ok(store) = SqliteStateStore::open(state_root.to_path_buf())
-        && let Ok(connections) = store.list_connections()
-    {
-        refs.extend(
-            connections
-                .into_iter()
-                .filter(|connection| !connection.secret_ref.is_empty())
-                .map(|connection| connection.secret_ref),
-        );
-    }
-    refs.sort();
-    refs.dedup();
-    refs
-}
-
 fn stop_daemon_for_reset(state_root: &Path) {
     if let Err(error) = run_daemon_control(&daemon_control_args_any_manager("stop", state_root)) {
         desktop_log(
@@ -4786,17 +4717,10 @@ fn reset_platform_projection_state(state_root: &Path) -> Result<(), String> {
     stop_windows_cloud_files_provider_supervisor(state_root)
 }
 
-fn remove_connection_secrets(state_root: &Path, secret_refs: Vec<String>) {
-    let credentials = open_credential_store(state_root);
-    for secret_ref in secret_refs {
-        if let Err(error) = credentials.delete(&secret_ref) {
-            desktop_log(
-                "warn",
-                "reset.credential_delete_failed",
-                format!("could not delete credential `{secret_ref}`: {error}"),
-            );
-        }
-    }
+fn clear_state_root_contents(state_root: &Path) -> Result<(), String> {
+    reset_locality_state_storage(state_root)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn remove_desktop_support_state() -> Result<(), String> {
@@ -4818,6 +4742,7 @@ fn remove_desktop_support_state() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn remove_path_if_exists(path: &Path) -> Result<(), String> {
     if !path.exists() && !path.is_symlink() {
         return Ok(());

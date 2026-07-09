@@ -28,7 +28,7 @@ use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
     FreshnessStateRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
-    VirtualMutationRepository, open_credential_store,
+    VirtualMutationRepository, open_credential_store, reset_locality_state_storage,
 };
 use localityd::autosave::auto_save_timestamp;
 use localityd::execution::PushJobReport;
@@ -186,6 +186,8 @@ enum LocalityCommand {
     Log(PathArg),
     #[command(about = "Restore a local file from the last synced shadow")]
     Restore(RestoreCliArgs),
+    #[command(about = "Reset Locality local state and credentials")]
+    Reset(ResetArgs),
     #[command(about = "Configuration commands")]
     Config,
     #[command(about = "Run the Locality MCP stdio server")]
@@ -271,6 +273,15 @@ struct ConnectionShowArgs {
 struct DisconnectArgs {
     #[arg(value_name = "id", help = "Connection id to remove.")]
     id: String,
+}
+
+#[derive(Debug, Args)]
+struct ResetArgs {
+    #[arg(
+        long,
+        help = "Confirm destructive reset of Locality local state and credentials."
+    )]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -736,6 +747,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::Push(_) => push(&legacy_args[1..], json),
         LocalityCommand::Diff(_) => diff(&legacy_args[1..], json),
         LocalityCommand::Restore(_) => restore(&legacy_args[1..], json),
+        LocalityCommand::Reset(_) => reset(&legacy_args[1..], json),
         LocalityCommand::Undo(_) => undo(&legacy_args[1..], json),
         LocalityCommand::Log(_) => log(&legacy_args[1..], json),
         LocalityCommand::Config => stub("config", json),
@@ -988,6 +1000,10 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
             args.push(options.path.clone());
             push_flag(&mut args, "--force", options.force);
         }
+        LocalityCommand::Reset(options) => {
+            args.push("reset".to_string());
+            push_flag(&mut args, "--yes", options.yes);
+        }
         LocalityCommand::Config => args.push("config".to_string()),
         LocalityCommand::Mcp => args.push("mcp".to_string()),
         LocalityCommand::FileProvider { command } => {
@@ -1107,6 +1123,77 @@ fn doctor(json: bool) -> i32 {
         print_doctor_report(&report);
     }
     exit_code
+}
+
+fn reset(args: &[String], json: bool) -> i32 {
+    if first_positional(args).is_some() {
+        return command_error(
+            json,
+            CommandError::new("reset", "usage", "usage: loc reset --yes [--json]"),
+            EXIT_USAGE,
+        );
+    }
+    if !has_flag(args, "--yes") {
+        return command_error(
+            json,
+            CommandError::new(
+                "reset",
+                "confirmation_required",
+                "reset deletes Locality local state and credentials; rerun with --yes to confirm",
+            )
+            .with_suggested_command("loc reset --yes"),
+            EXIT_USAGE,
+        );
+    }
+
+    let state_root = default_state_root();
+    let mut warnings = Vec::new();
+    stop_daemon_for_reset(&state_root, &mut warnings);
+    reset_platform_projection_state_for_reset(&state_root, &mut warnings);
+    if let Err(error) = remove_desktop_support_state_for_reset() {
+        return command_error(
+            json,
+            CommandError::new("reset", "reset_failed", error),
+            EXIT_INTERNAL,
+        );
+    }
+
+    let storage = match reset_locality_state_storage(&state_root) {
+        Ok(report) => report,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("reset", "reset_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    for error in &storage.credential_errors {
+        warnings.push(format!(
+            "could not delete a stored credential reference ({})",
+            error.code
+        ));
+    }
+
+    let report = ResetCommandReport {
+        ok: true,
+        command: "reset",
+        action: "reset",
+        state_root: storage.state_root,
+        deleted_credentials: storage.deleted_secret_refs.len(),
+        credential_errors: storage.credential_errors.len(),
+        removed_state_entries: storage.removed_state_entries,
+        preserved_state_entries: storage.preserved_state_entries,
+        warnings,
+        message: "Locality local state was reset. Local files were left in place.".to_string(),
+    };
+
+    if json {
+        print_json(&report);
+    } else {
+        print_reset_report(&report);
+    }
+    EXIT_SUCCESS
 }
 
 fn connect(args: &[String], json: bool) -> i32 {
@@ -1263,6 +1350,96 @@ fn connect(args: &[String], json: bool) -> i32 {
         }
         Err(error) => connect_command_error("connect", json, error),
     }
+}
+
+fn stop_daemon_for_reset(state_root: &Path, warnings: &mut Vec<String>) {
+    if std::env::var("LOCALITY_DAEMON_DISABLE").ok().as_deref() == Some("1") {
+        return;
+    }
+    let mut args = vec![
+        "stop".to_string(),
+        "--state-dir".to_string(),
+        state_root.display().to_string(),
+    ];
+    if let Ok(tcp_addr) = std::env::var("LOCALITY_DAEMON_TCP_ADDR")
+        && !tcp_addr.is_empty()
+    {
+        args.push("--tcp-addr".to_string());
+        args.push(tcp_addr);
+    }
+    if let Err(error) = run_daemon_control(&args) {
+        warnings.push(format!(
+            "could not stop localityd before reset: {}",
+            error.message()
+        ));
+    }
+}
+
+fn reset_platform_projection_state_for_reset(state_root: &Path, warnings: &mut Vec<String>) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = state_root;
+        if let Err(error) =
+            file_provider_helper::run_macos_file_provider_helper("reset", Vec::new())
+        {
+            warnings.push(format!(
+                "could not reset macOS File Provider domains: {}",
+                error.message()
+            ));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let args = vec![
+            "--state-dir".to_string(),
+            absolute_command_path(state_root).display().to_string(),
+        ];
+        if let Err(error) = file_provider_helper::run_windows_cloud_files_helper("reset", args) {
+            warnings.push(format!(
+                "could not reset Windows Cloud Files registrations: {}",
+                error.message()
+            ));
+        }
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = state_root;
+        let _ = warnings;
+    }
+}
+
+fn remove_desktop_support_state_for_reset() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = locality_platform::user_home().ok_or_else(|| "HOME is not set".to_string())?;
+        for path in [
+            home.join("Library/LaunchAgents/ai.codeflash.locality.localityd.plist"),
+            home.join("Library/Group Containers/C484HB7Q6S.group.ai.codeflash.locality"),
+            home.join("Library/Group Containers/group.ai.codeflash.locality"),
+            home.join("Library/Application Support/ai.codeflash.locality"),
+            home.join("Library/Caches/ai.codeflash.locality"),
+            home.join("Library/HTTPStorages/ai.codeflash.locality"),
+            home.join("Library/Saved Application State/ai.codeflash.locality.savedState"),
+        ] {
+            remove_path_if_exists(&path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_path_if_exists(path: &Path) -> Result<(), String> {
+    if !path.exists() && !path.is_symlink() {
+        return Ok(());
+    }
+    if path.is_dir() && !path.is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .map_err(|error| format!("Could not remove `{}`: {error}", path.display()))
 }
 
 fn connect_google_docs(args: &[String], json: bool) -> i32 {
@@ -2643,7 +2820,7 @@ fn run_file_live_mode(
 
     Ok(live_mode_file_report(
         action,
-        &resolved.absolute_path,
+        &resolved.access_root,
         &mount,
         &relative_path,
         enrollment.as_ref(),
@@ -2654,8 +2831,8 @@ fn run_file_live_mode(
 #[derive(Debug)]
 struct ResolvedLiveModeFile {
     mount: MountConfig,
+    access_root: PathBuf,
     relative_path: PathBuf,
-    absolute_path: PathBuf,
 }
 
 fn resolve_live_mode_file_path(
@@ -2684,14 +2861,11 @@ fn resolve_live_mode_file_path(
     }
 
     let page_relative_path = page_document_path(&relative_path);
-    if store
-        .find_entity_by_path(&mount.mount_id, &page_relative_path)?
-        .is_some()
-    {
+    if let Some(page_entity) = store.find_entity_by_path(&mount.mount_id, &page_relative_path)? {
         return Ok(resolved_live_mode_file(
             mount,
             &matched.access_root,
-            page_relative_path,
+            page_entity.path,
         ));
     }
 
@@ -2719,7 +2893,7 @@ fn resolved_live_mode_file(
 ) -> ResolvedLiveModeFile {
     ResolvedLiveModeFile {
         mount: mount.clone(),
-        absolute_path: access_root.join(&relative_path),
+        access_root: access_root.to_path_buf(),
         relative_path,
     }
 }
@@ -2745,7 +2919,7 @@ fn auto_save_origin_for_cli_path(
 
 fn live_mode_file_report(
     action: LiveModeFileAction,
-    absolute_path: &Path,
+    access_root: &Path,
     mount: &MountConfig,
     relative_path: &Path,
     enrollment: Option<&AutoSaveEnrollmentRecord>,
@@ -2759,7 +2933,7 @@ fn live_mode_file_report(
             LiveModeFileAction::Disable => "disabled",
             LiveModeFileAction::Status => "status",
         },
-        path: absolute_path.display().to_string(),
+        path: live_mode_report_absolute_path(access_root, relative_path),
         mount_id: mount.mount_id.0.clone(),
         connector: mount.connector.clone(),
         relative_path: relative_path.display().to_string(),
@@ -2790,6 +2964,19 @@ fn auto_save_origin_name(origin: &AutoSaveOrigin) -> &'static str {
         AutoSaveOrigin::LocalityCreated => "locality_created",
         AutoSaveOrigin::UserEnabled => "user_enabled",
     }
+}
+
+fn live_mode_report_absolute_path(access_root: &Path, relative_path: &Path) -> String {
+    let relative_display = relative_path.display().to_string();
+    if relative_display.is_empty() {
+        return access_root.display().to_string();
+    }
+    format!(
+        "{}{}{}",
+        access_root.display(),
+        std::path::MAIN_SEPARATOR,
+        relative_display
+    )
 }
 
 fn print_live_mode_file_report(report: &LiveModeFileReport) {
@@ -4150,6 +4337,27 @@ fn print_connection_show_report(report: &ConnectionShowReport) {
 
 fn print_disconnect_report(report: &DisconnectReport) {
     println!("disconnected {} ({})", report.connection_id, report.status);
+}
+
+fn print_reset_report(report: &ResetCommandReport) {
+    println!("{}", report.message);
+    println!("state root: {}", report.state_root);
+    println!("deleted credentials: {}", report.deleted_credentials);
+    if !report.removed_state_entries.is_empty() {
+        println!(
+            "removed state entries: {}",
+            report.removed_state_entries.join(", ")
+        );
+    }
+    if !report.preserved_state_entries.is_empty() {
+        println!(
+            "preserved state entries: {}",
+            report.preserved_state_entries.join(", ")
+        );
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
 }
 
 fn print_pull_report(report: &PullReport) {
@@ -6727,6 +6935,20 @@ struct CommandError {
 }
 
 #[derive(Serialize)]
+struct ResetCommandReport {
+    ok: bool,
+    command: &'static str,
+    action: &'static str,
+    state_root: String,
+    deleted_credentials: usize,
+    credential_errors: usize,
+    removed_state_entries: Vec<String>,
+    preserved_state_entries: Vec<String>,
+    warnings: Vec<String>,
+    message: String,
+}
+
+#[derive(Serialize)]
 struct FileProviderCommandReport {
     ok: bool,
     command: &'static str,
@@ -7077,6 +7299,15 @@ mod tests {
                 ],
             ),
             (
+                vec!["reset", "--help"],
+                vec![
+                    "Usage: loc reset",
+                    "Reset Locality local state",
+                    "--yes",
+                    "--json",
+                ],
+            ),
+            (
                 vec!["config", "--help"],
                 vec!["Usage: loc config", "Configuration commands", "--json"],
             ),
@@ -7315,6 +7546,12 @@ mod tests {
         assert_eq!(
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["file-provider", "restart", "notion-main"]
+        );
+
+        let cli = parse_cli(["reset", "--yes"]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["reset", "--yes"]
         );
 
         let cli = parse_cli(["doctor"]);
