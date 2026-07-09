@@ -899,6 +899,9 @@ fn claude_desktop_config_path(home: &Path) -> PathBuf {
 
 #[cfg(windows)]
 fn claude_desktop_config_dir(home: &Path) -> PathBuf {
+    if let Some(msix_root) = windows_claude_desktop_msix_package_root(home) {
+        return msix_root.join("LocalCache/Roaming/Claude");
+    }
     env::var_os("APPDATA")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -928,18 +931,30 @@ fn windows_claude_desktop_app_exists(home: &Path) -> bool {
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join("AppData/Local"));
     path_exists(local_appdata.join("Programs/Claude/Claude.exe"))
-        || windows_claude_desktop_msix_package_exists(&local_appdata)
+        || windows_claude_desktop_msix_package_root_in(&local_appdata).is_some()
 }
 
 #[cfg(windows)]
-fn windows_claude_desktop_msix_package_exists(local_appdata: &Path) -> bool {
+fn windows_claude_desktop_msix_package_root(home: &Path) -> Option<PathBuf> {
+    let local_appdata = env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData/Local"));
+    windows_claude_desktop_msix_package_root_in(&local_appdata)
+}
+
+#[cfg(windows)]
+fn windows_claude_desktop_msix_package_root_in(local_appdata: &Path) -> Option<PathBuf> {
     fs::read_dir(local_appdata.join("Packages"))
-        .ok()
-        .is_some_and(|entries| {
-            entries.flatten().any(|entry| {
-                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                name.starts_with("claude_") || name.starts_with("anthropic.claude")
-            })
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.starts_with("claude_") || name.starts_with("anthropic.claude") {
+                Some(entry.path())
+            } else {
+                None
+            }
         })
 }
 
@@ -1121,9 +1136,10 @@ mod tests {
     fn windows_claude_desktop_mcp_uses_roaming_appdata_config() {
         let temp = temp_root("loc-agent-guidance-windows-claude-desktop");
         let appdata = temp.join("AppData/Roaming");
+        let localappdata = temp.join("AppData/Local");
         fs::create_dir_all(appdata.join("Claude")).expect("create Claude appdata");
 
-        let specs = mcp_target_specs_with_windows_appdata(&temp, &appdata, None);
+        let specs = mcp_target_specs_with_windows_appdata(&temp, &appdata, Some(&localappdata));
 
         let spec = specs
             .iter()
@@ -1172,8 +1188,8 @@ mod tests {
         let temp = temp_root("loc-agent-guidance-windows-claude-desktop-msix");
         let appdata = temp.join("AppData/Roaming");
         let localappdata = temp.join("AppData/Local");
-        fs::create_dir_all(localappdata.join("Packages/Claude_pzs8sxrjxfjjc"))
-            .expect("create Claude MSIX package dir");
+        let msix_root = localappdata.join("Packages/Claude_pzs8sxrjxfjjc");
+        fs::create_dir_all(&msix_root).expect("create Claude MSIX package dir");
 
         let specs = mcp_target_specs_with_windows_appdata(&temp, &appdata, Some(&localappdata));
 
@@ -1184,7 +1200,7 @@ mod tests {
 
         assert_eq!(
             spec.path,
-            temp.join("AppData/Roaming/Claude/claude_desktop_config.json")
+            msix_root.join("LocalCache/Roaming/Claude/claude_desktop_config.json")
         );
         assert!(spec.detected);
 
