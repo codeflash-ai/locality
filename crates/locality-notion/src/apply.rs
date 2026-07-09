@@ -283,8 +283,19 @@ pub fn apply_plan(
                         new_title,
                         ..
                     } => {
-                        let parent = move_page_parent_body(api, new_parent_id, new_parent_kind)?;
-                        let moved_page = api.move_page(entity_id.as_str(), parent)?;
+                        let current_page = current_page(&bundles, entity_id)?;
+                        let moved_page = if page_parent_matches_requested(
+                            api,
+                            current_page,
+                            new_parent_id,
+                            new_parent_kind,
+                        )? {
+                            current_page.clone()
+                        } else {
+                            let parent =
+                                move_page_parent_body(api, new_parent_id, new_parent_kind)?;
+                            api.move_page(entity_id.as_str(), parent)?
+                        };
                         let properties = BTreeMap::from([(
                             "title".to_string(),
                             PropertyValue::String(new_title.clone()),
@@ -1306,6 +1317,36 @@ fn move_page_parent_body(
     Err(LocalityError::Unsupported(
         "Notion pages can only be moved into page or database parents",
     ))
+}
+
+fn page_parent_matches_requested(
+    api: &dyn NotionApi,
+    page: &PageDto,
+    parent_id: &RemoteId,
+    parent_kind: &locality_core::model::EntityKind,
+) -> LocalityResult<bool> {
+    let Some(parent) = page.parent.as_ref() else {
+        return Ok(false);
+    };
+
+    if matches!(parent_kind, locality_core::model::EntityKind::Page) {
+        return Ok(parent.page_id.as_deref() == Some(parent_id.as_str()));
+    }
+
+    if matches!(parent_kind, locality_core::model::EntityKind::Database) {
+        if parent.database_id.as_deref() == Some(parent_id.as_str()) {
+            return Ok(true);
+        }
+        let database = api.retrieve_database(parent_id.as_str())?;
+        let [data_source] = database.data_sources.as_slice() else {
+            return Err(LocalityError::Unsupported(
+                "moving Notion pages into a database requires exactly one data source",
+            ));
+        };
+        return Ok(parent.data_source_id.as_deref() == Some(data_source.id.as_str()));
+    }
+
+    Ok(false)
 }
 
 fn create_properties_body(
