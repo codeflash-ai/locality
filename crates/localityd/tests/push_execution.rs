@@ -155,6 +155,41 @@ fn auto_save_push_applies_safe_update_and_keeps_enrollment_active() {
 }
 
 #[test]
+fn manual_push_reactivates_paused_file_live_mode_after_conflict_resolution() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store("Old body.");
+    let mut enrollment = AutoSaveEnrollmentRecord::new(
+        fixture.mount_id.clone(),
+        "Roadmap.md",
+        AutoSaveOrigin::UserEnabled,
+        "1",
+    )
+    .paused_remote_changed("Notion changed externally", "2");
+    enrollment.remote_id = Some(fixture.remote_id.clone());
+    store
+        .save_auto_save_enrollment(enrollment)
+        .expect("save enrollment");
+    fixture.write_page("New body.");
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "New body."),
+    );
+
+    let report =
+        execute_push_job_with_content_root(&mut store, fixture.push_job(true), &source, None)
+            .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let enrollment = store
+        .get_auto_save_enrollment(&fixture.mount_id, Path::new("Roadmap.md"))
+        .expect("get enrollment")
+        .expect("enrollment");
+    assert_eq!(enrollment.state, AutoSaveState::Active);
+    assert_eq!(enrollment.last_reason, None);
+    assert_eq!(enrollment.remote_id, Some(fixture.remote_id.clone()));
+}
+
+#[test]
 fn auto_save_push_pauses_when_remote_changed_before_apply() {
     let fixture = PushFixture::new();
     let mut store = fixture.store("Old body.");

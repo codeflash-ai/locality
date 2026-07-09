@@ -82,6 +82,7 @@ where
         + JournalStore
         + RemoteObservationRepository
         + FreshnessStateRepository
+        + AutoSaveRepository
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
@@ -102,6 +103,7 @@ where
         + JournalStore
         + RemoteObservationRepository
         + FreshnessStateRepository
+        + AutoSaveRepository
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
@@ -116,7 +118,10 @@ where
     )?;
     repair_missing_database_schema_for_target(store, source, &job.target_path, state_root)?;
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
-    execute_prepared_push(store, source, prepared, state_root)
+    let relative_path = auto_save_relative_path(&prepared);
+    let report = execute_prepared_push(store, source, prepared, state_root)?;
+    reactivate_auto_save_after_successful_explicit_push(store, &report, &relative_path)?;
+    Ok(report)
 }
 
 pub fn execute_auto_save_push_job_with_content_root<S, Source>(
@@ -230,6 +235,46 @@ where
     }
 
     Ok(report)
+}
+
+fn reactivate_auto_save_after_successful_explicit_push<S>(
+    store: &mut S,
+    report: &PushJobReport,
+    relative_path: &Path,
+) -> LocalityResult<()>
+where
+    S: AutoSaveRepository,
+{
+    match report.action {
+        PushJobAction::Reconciled => {
+            let created_remote_id = created_entity_id(report).or_else(|| {
+                report
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| execution.changed_remote_ids.first().cloned())
+            });
+            let remote_id = created_remote_id.or_else(|| Some(report.entity_id.clone()));
+            mark_auto_save_active(
+                store,
+                &report.mount_id,
+                relative_path,
+                remote_id,
+                report.push_id.as_ref(),
+            )?;
+        }
+        PushJobAction::NotReady if report.pipeline.action == PushPipelineAction::Noop => {
+            mark_auto_save_active(
+                store,
+                &report.mount_id,
+                relative_path,
+                Some(report.entity_id.clone()),
+                report.push_id.as_ref(),
+            )?;
+        }
+        PushJobAction::NotReady | PushJobAction::Failed => {}
+    }
+
+    Ok(())
 }
 
 fn auto_save_failed_due_remote_change(report: &PushJobReport) -> bool {
