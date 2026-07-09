@@ -2845,20 +2845,24 @@ fn direct_source_root_create_diagnostic(
         } else {
             ""
         };
-        return Some(PushPrepareError::Core(LocalityError::InvalidState(format!(
-            "`{connector}` does not support creating `{path}` directly at the mount root; create it under an existing page or database directory.{hint}",
-            connector = mount.connector,
-            path = relative_path.display(),
-        ))));
+        return Some(PushPrepareError::Core(LocalityError::InvalidState(
+            format!(
+                "`{connector}` does not support creating `{path}` directly at the mount root; create it under an existing page or database directory.{hint}",
+                connector = mount.connector,
+                path = relative_path.display(),
+            ),
+        )));
     }
 
     if mount.remote_root_id.is_none() {
-        return Some(PushPrepareError::Core(LocalityError::InvalidState(format!(
-            "mount `{mount_id}` has no known remote root id, so `{path}` cannot be created at the mount root; reconnect or re-mount `{connector}` to refresh mount metadata.",
-            mount_id = mount.mount_id.0,
-            path = relative_path.display(),
-            connector = mount.connector,
-        ))));
+        return Some(PushPrepareError::Core(LocalityError::InvalidState(
+            format!(
+                "mount `{mount_id}` has no known remote root id, so `{path}` cannot be created at the mount root; reconnect or re-mount `{connector}` to refresh mount metadata.",
+                mount_id = mount.mount_id.0,
+                path = relative_path.display(),
+                connector = mount.connector,
+            ),
+        )));
     }
 
     None
