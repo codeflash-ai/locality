@@ -8744,6 +8744,10 @@ fn preserve_mount_pending_local_changes(
     state_root: &Path,
     mount_id: &MountId,
 ) -> Result<Option<PreservedLocalChanges>, String> {
+    let mount = store
+        .get_mount(mount_id)
+        .map_err(|error| format!("Could not inspect existing Notion mount: {error}"))?
+        .ok_or_else(|| format!("Could not find existing Notion mount `{}`.", mount_id.0))?;
     let pending_entities = store
         .list_entities(mount_id)
         .map_err(|error| format!("Could not inspect cached Notion items: {error}"))?
@@ -8778,12 +8782,12 @@ fn preserve_mount_pending_local_changes(
     let mut items = Vec::new();
     for entity in pending_entities {
         items.push(preserve_entity_local_change(
-            state_root, mount_id, &directory, entity,
+            state_root, &mount, &directory, entity,
         )?);
     }
     for mutation in pending_mutations {
         items.push(preserve_virtual_mutation_local_change(
-            state_root, mount_id, &directory, mutation,
+            state_root, &mount, &directory, mutation,
         )?);
     }
 
@@ -8821,11 +8825,11 @@ fn preserve_mount_pending_local_changes(
 
 fn preserve_entity_local_change(
     state_root: &Path,
-    mount_id: &MountId,
+    mount: &MountConfig,
     recovery_dir: &Path,
     entity: EntityRecord,
 ) -> Result<PreservedLocalChangeItem, String> {
-    let source_path = virtual_fs_content_path(state_root, mount_id, &entity.path).ok();
+    let source_path = preserved_local_change_source_path(state_root, mount, &entity.path);
     let preserved_path = copy_preserved_file(source_path.as_deref(), recovery_dir, &entity.path)?;
     Ok(PreservedLocalChangeItem {
         kind: "entity".to_string(),
@@ -8840,12 +8844,12 @@ fn preserve_entity_local_change(
 
 fn preserve_virtual_mutation_local_change(
     state_root: &Path,
-    mount_id: &MountId,
+    mount: &MountConfig,
     recovery_dir: &Path,
     mutation: VirtualMutationRecord,
 ) -> Result<PreservedLocalChangeItem, String> {
     let fallback_path =
-        virtual_fs_content_path(state_root, mount_id, &mutation.projected_path).ok();
+        preserved_local_change_source_path(state_root, mount, &mutation.projected_path);
     let source_path = mutation
         .content_path
         .clone()
@@ -8865,6 +8869,18 @@ fn preserve_virtual_mutation_local_change(
         source_path: source_path.map(|path| path.display().to_string()),
         preserved_path: preserved_path.map(|path| path.display().to_string()),
     })
+}
+
+fn preserved_local_change_source_path(
+    state_root: &Path,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Option<PathBuf> {
+    if mount.projection.uses_virtual_filesystem() {
+        virtual_fs_content_path(state_root, &mount.mount_id, relative_path).ok()
+    } else {
+        Some(mount.root.join(relative_path))
+    }
 }
 
 fn copy_preserved_file(
@@ -11870,6 +11886,59 @@ mod tests {
         assert!(store.list_journal().expect("list journals").is_empty());
         assert!(!localityd::virtual_fs::virtual_fs_content_root(temp.path(), &mount_id).exists());
         assert!(preserved.directory.join(relative_path).exists());
+    }
+
+    #[test]
+    fn plain_file_remount_preserves_visible_dirty_file_before_clearing_state() {
+        let temp = TestTempDir::new("plain-remount-preserves-visible-dirty-file");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-plain");
+        let mount_root = temp.path().join("notion");
+        let relative_path = Path::new("Team/Page/page.md");
+        let visible_path = mount_root.join(relative_path);
+        let visible_body = "---\ntitle: Page\n---\nplain visible edit\n";
+
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &mount_root)
+                    .projection(ProjectionMode::PlainFiles),
+            )
+            .expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id,
+                    EntityKind::Page,
+                    "Page",
+                    relative_path,
+                )
+                .with_hydration(HydrationState::Dirty),
+            )
+            .expect("save dirty entity");
+        fs::create_dir_all(visible_path.parent().expect("visible parent"))
+            .expect("create visible parent");
+        fs::write(&visible_path, visible_body).expect("write visible dirty edit");
+
+        let preserved =
+            prepare_existing_workspace_mount_for_remount(&mut store, temp.path(), &mount_id)
+                .expect("prepare remount")
+                .expect("preserved plain-file dirty edit");
+
+        let recovered = preserved.directory.join(relative_path);
+        assert_eq!(preserved.count, 1);
+        assert_eq!(
+            fs::read_to_string(&recovered).expect("read recovered dirty edit"),
+            visible_body
+        );
+        assert!(
+            store
+                .list_entities(&mount_id)
+                .expect("list entities")
+                .is_empty(),
+            "stale state should still be cleared after preserving the visible edit"
+        );
     }
 
     #[test]

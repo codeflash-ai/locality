@@ -1123,11 +1123,32 @@ fn slugify_title(title: &str) -> String {
         slug.pop();
     }
 
-    if slug.is_empty() {
+    let stem = if slug.is_empty() {
         "untitled".to_string()
     } else {
         slug
+    };
+
+    if is_windows_reserved_device_basename(&stem) {
+        format!("{stem}-page")
+    } else {
+        stem
     }
+}
+
+fn is_windows_reserved_device_basename(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN" | "CONOUT"
+    ) || upper
+        .strip_prefix("COM")
+        .and_then(|suffix| suffix.parse::<u8>().ok())
+        .is_some_and(|number| (1..=9).contains(&number))
+        || upper
+            .strip_prefix("LPT")
+            .and_then(|suffix| suffix.parse::<u8>().ok())
+            .is_some_and(|number| (1..=9).contains(&number))
 }
 
 fn short_id(remote_id: &str, len: usize) -> String {
@@ -1175,6 +1196,13 @@ mod tests {
     fn slugifies_titles_for_stable_paths() {
         assert_eq!(slugify_title("Roadmap 2026!"), "roadmap-2026");
         assert_eq!(slugify_title("..."), "untitled");
+    }
+
+    #[test]
+    fn slugifies_windows_reserved_device_names_to_safe_stems() {
+        assert_eq!(slugify_title("CON"), "con-page");
+        assert_eq!(slugify_title("AUX"), "aux-page");
+        assert_eq!(slugify_title("LPT1"), "lpt1-page");
     }
 
     #[test]
