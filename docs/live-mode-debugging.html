@@ -1,0 +1,682 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Mode: How It Works and How to Debug It</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f2;
+      --text: #1f2528;
+      --muted: #5e686d;
+      --line: #cdd3d5;
+      --panel: #ffffff;
+      --panel-2: #eef5f2;
+      --blue: #215f9a;
+      --green: #227245;
+      --yellow: #8b6412;
+      --red: #a33a32;
+      --ink: #121719;
+      --code: #10212b;
+      --code-bg: #e8edef;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+      letter-spacing: 0;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      background: #ffffff;
+    }
+
+    .wrap {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+      gap: 32px;
+      padding: 42px 0 34px;
+      align-items: center;
+    }
+
+    h1,
+    h2,
+    h3 {
+      color: var(--ink);
+      line-height: 1.15;
+      margin: 0;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      font-size: clamp(2rem, 5vw, 4.2rem);
+      max-width: 760px;
+    }
+
+    h2 {
+      font-size: clamp(1.55rem, 3vw, 2.2rem);
+      margin-bottom: 16px;
+    }
+
+    h3 {
+      font-size: 1.05rem;
+      margin-bottom: 8px;
+    }
+
+    p {
+      margin: 0 0 12px;
+    }
+
+    .lead {
+      max-width: 740px;
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+
+    .hero-note {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      padding: 18px;
+      border-radius: 8px;
+    }
+
+    .hero-note strong {
+      display: block;
+      color: var(--green);
+      margin-bottom: 6px;
+    }
+
+    main {
+      padding: 30px 0 60px;
+    }
+
+    section {
+      padding: 28px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .grid.two {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .card,
+    .box {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    .card p:last-child,
+    .box p:last-child {
+      margin-bottom: 0;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      margin-bottom: 10px;
+      background: #e8edef;
+      color: #2b3438;
+    }
+
+    .tag.green {
+      background: #dff0e5;
+      color: var(--green);
+    }
+
+    .tag.yellow {
+      background: #f6ebc8;
+      color: var(--yellow);
+    }
+
+    .tag.red {
+      background: #f3deda;
+      color: var(--red);
+    }
+
+    .tag.blue {
+      background: #dceafa;
+      color: var(--blue);
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 34px minmax(0, 1fr) 34px minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      margin: 16px 0;
+    }
+
+    .flow .step {
+      min-height: 118px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    .arrow {
+      color: var(--blue);
+      font-size: 1.8rem;
+      text-align: center;
+      font-weight: 700;
+    }
+
+    .callout {
+      border-left: 5px solid var(--blue);
+      background: #eef5fb;
+      padding: 14px 16px;
+      margin: 16px 0;
+      border-radius: 0 8px 8px 0;
+    }
+
+    .callout.warn {
+      border-left-color: var(--yellow);
+      background: #fbf4dc;
+    }
+
+    .callout.stop {
+      border-left-color: var(--red);
+      background: #f8e7e4;
+    }
+
+    ul,
+    ol {
+      margin: 0;
+      padding-left: 22px;
+    }
+
+    li {
+      margin: 8px 0;
+    }
+
+    code {
+      background: var(--code-bg);
+      color: var(--code);
+      border-radius: 5px;
+      padding: 2px 5px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      margin: 12px 0 0;
+      padding: 14px;
+      overflow-x: auto;
+      background: #162128;
+      color: #eaf2f3;
+      border-radius: 8px;
+      font-size: 0.92rem;
+      line-height: 1.45;
+    }
+
+    pre code {
+      background: transparent;
+      color: inherit;
+      padding: 0;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      display: table;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #eef1f2;
+      color: var(--ink);
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .timeline {
+      display: grid;
+      gap: 12px;
+    }
+
+    .timeline .item {
+      display: grid;
+      grid-template-columns: 130px minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    .when {
+      color: var(--blue);
+      font-weight: 800;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+
+    footer {
+      padding: 24px 0 38px;
+      color: var(--muted);
+    }
+
+    @media (max-width: 850px) {
+      .hero,
+      .grid,
+      .grid.two,
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      .arrow {
+        transform: rotate(90deg);
+      }
+
+      .timeline .item {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap hero">
+      <div>
+        <h1>Live Mode: How It Works and How to Debug It</h1>
+        <p class="lead">
+          This page explains Live Mode in plain English. It also explains what went wrong in this session,
+          what was fixed, and what to check when Live Mode feels slow or stuck.
+        </p>
+      </div>
+      <div class="hero-note">
+        <strong>Main idea</strong>
+        <p>
+          Live Mode is a background helper. It can push safe local edits to Notion and pull clean Notion edits
+          back to your file. It does not push every save blindly.
+        </p>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section>
+      <h2>The Three Copies</h2>
+      <p>Live Mode is easier to understand if you think about three copies of one page.</p>
+
+      <div class="flow">
+        <div class="step">
+          <span class="tag blue">Local file</span>
+          <h3>The file you edit</h3>
+          <p>This is your <code>page.md</code> file in the mounted Locality folder.</p>
+        </div>
+        <div class="arrow">&rarr;</div>
+        <div class="step">
+          <span class="tag green">Saved copy</span>
+          <h3>Locality's last safe copy</h3>
+          <p>Locality uses this to know what changed. In the code this is often called the shadow.</p>
+        </div>
+        <div class="arrow">&rarr;</div>
+        <div class="step">
+          <span class="tag yellow">Remote page</span>
+          <h3>The Notion page</h3>
+          <p>This is the source of truth outside your computer.</p>
+        </div>
+      </div>
+
+      <div class="callout">
+        <p><strong>Live Mode compares these copies.</strong> If only your local file changed, it may auto-push. If only Notion changed, it may auto-pull. If both changed, it pauses or creates conflict markers.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>What Live Mode Does</h2>
+      <div class="grid">
+        <div class="card">
+          <span class="tag green">Local to Notion</span>
+          <h3>Auto-push safe edits</h3>
+          <p>When you edit a file, the daemon marks it dirty. If the push plan is safe, Live Mode can push it to Notion.</p>
+        </div>
+        <div class="card">
+          <span class="tag green">Notion to local</span>
+          <h3>Auto-pull clean edits</h3>
+          <p>When Notion changes and the local file is clean, Live Mode can update the local file.</p>
+        </div>
+        <div class="card">
+          <span class="tag red">Safety</span>
+          <h3>Pause when risky</h3>
+          <p>Live Mode pauses for conflicts, large or destructive plans, unsupported edits, remote drift, or failed pushes.</p>
+        </div>
+      </div>
+
+      <div class="callout warn">
+        <p><strong>Important:</strong> Live Mode is not instant. It uses queues, rate limits, and safety checks. A short delay is normal. A long delay usually means the daemon is not running, the file is paused, or the page is not being checked often enough.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Local Edit Flow</h2>
+      <div class="flow">
+        <div class="step">
+          <span class="tag blue">1</span>
+          <h3>You save <code>page.md</code></h3>
+          <p>The OS or virtual filesystem sends a write event to Locality.</p>
+        </div>
+        <div class="arrow">&rarr;</div>
+        <div class="step">
+          <span class="tag blue">2</span>
+          <h3>Locality marks it dirty</h3>
+          <p>Status should show <code>pending_local_changes</code> or similar.</p>
+        </div>
+        <div class="arrow">&rarr;</div>
+        <div class="step">
+          <span class="tag blue">3</span>
+          <h3>Auto-save may push</h3>
+          <p>If Live Mode is enabled and the plan is safe, the daemon queues an auto-push.</p>
+        </div>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>What can stop it?</th>
+            <th>What it means</th>
+            <th>What to run</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Live Mode is off for the file</td>
+            <td>No file enrollment exists, or it is disabled.</td>
+            <td><code>loc live-mode status &lt;file&gt; --json</code></td>
+          </tr>
+          <tr>
+            <td>The plan needs review</td>
+            <td>The edit may be unsafe, unsupported, or destructive.</td>
+            <td><code>loc diff &lt;file&gt;</code></td>
+          </tr>
+          <tr>
+            <td>Remote changed too</td>
+            <td>Notion changed while local edits are waiting.</td>
+            <td><code>loc status &lt;file&gt;</code> then <code>loc inspect &lt;file&gt;</code></td>
+          </tr>
+          <tr>
+            <td>The daemon is not running</td>
+            <td>No background loop is processing jobs.</td>
+            <td><code>loc daemon status</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Remote Edit Flow</h2>
+      <div class="flow">
+        <div class="step">
+          <span class="tag yellow">1</span>
+          <h3>Notion changes</h3>
+          <p>Locality sees a new remote version during a cheap remote check.</p>
+        </div>
+        <div class="arrow">&rarr;</div>
+        <div class="step">
+          <span class="tag yellow">2</span>
+          <h3>Locality checks the local file</h3>
+          <p>If the local file is clean, it can fast-forward. If local work exists, it pauses or merges.</p>
+        </div>
+        <div class="arrow">&rarr;</div>
+        <div class="step">
+          <span class="tag yellow">3</span>
+          <h3>The file is updated</h3>
+          <p>The daemon hydrates the page through the normal queue and refreshes the visible file if it is safe.</p>
+        </div>
+      </div>
+
+      <div class="callout">
+        <p><strong>In the code:</strong> the cheap remote check is called freshness. The update job is called hydration. A Live Mode remote update uses <code>LiveModeRemoteFastForward</code>.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Common Problems</h2>
+      <div class="grid two">
+        <div class="card">
+          <span class="tag red">Paused</span>
+          <h3><code>paused_remote_changed</code></h3>
+          <p>Notion changed while Locality thought local work needed care. Run status and diff before pushing.</p>
+        </div>
+        <div class="card">
+          <span class="tag red">Blocked</span>
+          <h3><code>blocked</code></h3>
+          <p>The auto-save plan was not safe enough. You need to review it manually.</p>
+        </div>
+        <div class="card">
+          <span class="tag yellow">Slow remote updates</span>
+          <h3>Freshness is not hot</h3>
+          <p>The page may be checked only on the slower background path. File Live Mode should make this page active.</p>
+        </div>
+        <div class="card">
+          <span class="tag yellow">Missing child pages</span>
+          <h3>Children were not listed yet</h3>
+          <p>Workspace mounts do not scan all Notion on every tick. Child pages can appear after a child refresh or directory browse.</p>
+        </div>
+        <div class="card">
+          <span class="tag yellow">Notion lag</span>
+          <h3>Remote version changed, body not ready</h3>
+          <p>Notion can report a new edit time before all page blocks are ready. Locality retries instead of trusting a false clean state.</p>
+        </div>
+        <div class="card">
+          <span class="tag red">Wrong file path</span>
+          <h3>Path did not resolve to a known page</h3>
+          <p>Use the real mounted file. For Notion pages, the body file is usually <code>page.md</code> inside a page directory.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Debug Checklist</h2>
+      <p>Use this order. It avoids guessing.</p>
+
+      <ol>
+        <li>
+          <strong>Check that Live Mode is on for this file.</strong>
+          <pre><code>loc live-mode status "/path/to/page.md" --json</code></pre>
+        </li>
+        <li>
+          <strong>Check what Locality thinks about the file.</strong>
+          <pre><code>loc status "/path/to/page.md" --json</code></pre>
+          <p class="small">Look for <code>sync_state</code>, <code>hydration</code>, <code>issues</code>, and remote version fields.</p>
+        </li>
+        <li>
+          <strong>Check the daemon.</strong>
+          <pre><code>loc daemon status</code></pre>
+          <p class="small">Look at active jobs, pending hydrations, and pending freshness jobs.</p>
+        </li>
+        <li>
+          <strong>If local changes are waiting, review the plan.</strong>
+          <pre><code>loc diff "/path/to/page.md"</code></pre>
+        </li>
+        <li>
+          <strong>If remote changed, inspect the exact difference.</strong>
+          <pre><code>loc inspect "/path/to/page.md" --json</code></pre>
+        </li>
+        <li>
+          <strong>Only push manually when you mean to.</strong>
+          <pre><code>loc push "/path/to/page.md" -y</code></pre>
+          <p class="small">Agents should not run push after every edit when Live Mode is on.</p>
+        </li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>What Happened In This Session</h2>
+      <div class="timeline">
+        <div class="item">
+          <div class="when">Start</div>
+          <div>
+            <h3>We studied Live Mode first</h3>
+            <p>We read the Live Mode behavior, CLI code, daemon runtime code, tests, and docs. The important parts were auto-save enrollments, freshness jobs, hydration jobs, and status output.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <div class="when">Blocker 1</div>
+          <div>
+            <h3>Windows path test failed</h3>
+            <p>The test compared paths with different separators: Windows returned <code>Roadmap\page.md</code>, but the test expected <code>Roadmap/page.md</code>. The fix was to compare normalized paths instead of a mixed string.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <div class="when">Blocker 2</div>
+          <div>
+            <h3>A mounted directory had only <code>page.md</code> at first</h3>
+            <p>The page had child pages in Notion, but they were not in the local directory yet. This can happen because workspace virtual mounts do not scan all children immediately. Child pages appear after child refresh work runs or after the directory is browsed.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <div class="when">Blocker 3</div>
+          <div>
+            <h3>Local edits did not auto-push</h3>
+            <p>The file had Live Mode enabled, but file-level Live Mode only created an auto-save enrollment. Some daemon freshness behavior still only looked at mount-level Live Mode. So the page was not treated as an active Live Mode target.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <div class="when">Blocker 4</div>
+          <div>
+            <h3>Remote edits came back slowly</h3>
+            <p>Because the file-level enrollment was not used by the faster freshness path, remote checks could wait for slower background timing.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <div class="when">Blocker 5</div>
+          <div>
+            <h3>Clean remote changes paused auto-save</h3>
+            <p>The daemon paused the file when it saw a remote version change, even if the local file was clean and safe to update. That made the file look stuck in <code>paused_remote_changed</code>.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <div class="when">Fix</div>
+          <div>
+            <h3>PR #75 fixed the file-level path</h3>
+            <p>The fix made enabled file Live Mode enrollments active freshness targets. It also kept clean enrolled files active on remote drift and queued <code>LiveModeRemoteFastForward</code>. Dirty or conflicted files still pause.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <div class="when">Result</div>
+          <div>
+            <h3>Tests and CI passed</h3>
+            <p>Local tests passed, then CI passed on Linux, macOS, Windows, OAuth service, Local e2e behavior, and Linux FUSE e2e.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Quick Meaning Of States</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>State</th>
+            <th>Simple meaning</th>
+            <th>Usual next step</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>all_synced</code></td>
+            <td>Locality knows no local or remote change waiting.</td>
+            <td>No action.</td>
+          </tr>
+          <tr>
+            <td><code>checking_freshness</code></td>
+            <td>Locality is checking if Notion changed.</td>
+            <td>Wait a little, then check status again.</td>
+          </tr>
+          <tr>
+            <td><code>pending_local_changes</code></td>
+            <td>Your file changed and has not been pushed yet.</td>
+            <td>Use <code>loc diff</code>. Live Mode may push if safe.</td>
+          </tr>
+          <tr>
+            <td><code>remote_update_available</code></td>
+            <td>Notion changed and your local file looks clean.</td>
+            <td>Live Mode may fast-forward. Use <code>loc inspect</code> if unsure.</td>
+          </tr>
+          <tr>
+            <td><code>review_needed</code></td>
+            <td>Locality needs a person or agent to decide.</td>
+            <td>Run <code>loc diff</code> and <code>loc inspect</code>.</td>
+          </tr>
+          <tr>
+            <td><code>conflicted</code></td>
+            <td>There are conflict markers or a conflict state.</td>
+            <td>Edit the file to resolve it, then review and push.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Good Rules For Agents</h2>
+      <ul>
+        <li>Edit the mounted Markdown file directly.</li>
+        <li>Use <code>loc status</code> and <code>loc diff</code> to understand state.</li>
+        <li>Do not run <code>loc push</code> after every edit if Live Mode is on.</li>
+        <li>Run <code>loc push</code> only when the user asks, or when Live Mode paused and the plan is safe.</li>
+        <li>If both local and remote changed, do not force it. Inspect first.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <p>Created for Locality Live Mode debugging. Static HTML. No network needed.</p>
+    </div>
+  </footer>
+</body>
+</html>

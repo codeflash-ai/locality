@@ -541,6 +541,57 @@ fn workspace_virtual_mount_promotes_live_mode_active_page_to_immediate() {
 }
 
 #[test]
+fn workspace_virtual_mount_promotes_file_live_mode_enrollment_to_immediate_on_active_tick() {
+    let mount_id = MountId::new("notion-main");
+    let mount = workspace_virtual_mount(&mount_id, "workspace-file-live-mode-active");
+    let mut store = InMemoryStateStore::new();
+    store.save_mount(mount.clone()).expect("save mount");
+    save_workspace_page(
+        &mut store,
+        &mount_id,
+        "active-page",
+        "Active",
+        "Active.md",
+        HydrationState::Hydrated,
+    );
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                mount_id.clone(),
+                RemoteId::new("active-page"),
+                FreshnessTier::Warm,
+            )
+            .next_check_at("unix_ms:18446744073709551615"),
+        )
+        .expect("save deferred freshness");
+    let mut enrollment = AutoSaveEnrollmentRecord::new(
+        mount_id.clone(),
+        "Active.md",
+        AutoSaveOrigin::UserEnabled,
+        freshness_timestamp(),
+    );
+    enrollment.remote_id = Some(RemoteId::new("active-page"));
+    store
+        .save_auto_save_enrollment(enrollment)
+        .expect("save auto-save enrollment");
+
+    let jobs = workspace_virtual_freshness_jobs(
+        &store,
+        &[mount],
+        &PullSchedulerTick {
+            poll_active: true,
+            poll_cold: false,
+        },
+    )
+    .expect("workspace freshness jobs");
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].remote_id, Some(RemoteId::new("active-page")));
+    assert_eq!(jobs[0].reason, ChangeHintKind::FileOpened);
+    assert_eq!(jobs[0].tier, FreshnessTier::Immediate);
+}
+
+#[test]
 fn workspace_virtual_mount_caps_live_mode_active_pages_without_starving_other_freshness() {
     let mount_id = MountId::new("notion-main");
     let mount = workspace_virtual_mount(&mount_id, "workspace-live-mode-fairness");
