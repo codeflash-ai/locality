@@ -8572,6 +8572,174 @@ fn live_cli_binary_read_only_mount_blocks_push_without_remote_write() {
 }
 
 #[test]
+#[ignore = "requires Notion credentials in ~/.loc credentials and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_cli_create_page_on_virtual_mount_pushes_child_page() {
+    let env = LiveEnv::from_env();
+    let source_connection_id =
+        std::env::var(LIVE_CONNECTION_ENV).unwrap_or_else(|_| "notion-default".to_string());
+    let stored_secret =
+        live_notion_secret_from_default_store(&source_connection_id).expect("stored credential");
+    let access_token =
+        notion_access_token_from_secret(&stored_secret).expect("stored access token");
+    let api = HttpNotionApi::new(NotionConfig::default().with_token(access_token.clone()));
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live virtual create parent {}", unique_suffix()),
+        vec![paragraph_child("Parent body before virtual create.")],
+    );
+
+    let fixture = E2eFixture::new();
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let connection_id = ConnectionId::new("stored-live-notion-virtual-create");
+    seed_cli_live_connection(&fixture.state_root, &connection_id, &stored_secret);
+
+    let mount = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("mount")
+            .arg("notion")
+            .arg(&fixture.root)
+            .arg("--root-page")
+            .arg(&scratch.id)
+            .arg("--connection")
+            .arg(connection_id.as_str())
+            .arg("--mount-id")
+            .arg(fixture.mount_id.as_str())
+            .arg("--projection")
+            .arg("plain-files")
+            .arg("--json"),
+    );
+    assert_eq!(mount.value["ok"], true, "{mount:#?}");
+
+    let pull = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("pull")
+            .arg(&fixture.root)
+            .arg("--json"),
+    );
+    assert_eq!(pull.value["ok"], true, "{pull:#?}");
+
+    {
+        let mut store =
+            SqliteStateStore::open(fixture.state_root.clone()).expect("open live CLI state");
+        let mut mount = store
+            .get_mount(&fixture.mount_id)
+            .expect("get mount")
+            .expect("mounted workspace");
+        mount.projection = ProjectionMode::MacosFileProvider;
+        store.save_mount(mount).expect("save virtual projection");
+    }
+
+    let parent_page_path = fixture.page_file();
+    let parent_dir = parent_page_path
+        .parent()
+        .expect("parent page directory")
+        .to_path_buf();
+    set_directory_readonly(&parent_dir, true);
+
+    let child_title = format!("Locality live virtual child {}", unique_suffix());
+    let mut create_command = loc_command(loc, &fixture.state_root);
+    let output = create_command
+        .arg("create")
+        .arg("page")
+        .arg("--title")
+        .arg(&child_title)
+        .arg("--parent")
+        .arg(&parent_dir)
+        .arg("--json")
+        .output()
+        .expect("loc create page");
+    set_directory_readonly(&parent_dir, false);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "loc create page failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let create_value: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("failed to parse create JSON: {error}\n{stdout}"));
+    assert_eq!(create_value["ok"], true, "{create_value:#?}");
+    let child_page_path = PathBuf::from(
+        create_value["path"]
+            .as_str()
+            .expect("created page path in JSON"),
+    );
+    assert!(
+        !child_page_path.exists(),
+        "virtual create should not write into the visible provider projection"
+    );
+
+    let relative_child_path = child_page_path
+        .strip_prefix(&fixture.root)
+        .expect("created page under fixture root")
+        .to_path_buf();
+    let cached_body = format!(
+        "---\ntitle: \"{child_title}\"\n---\n# Created through loc create\n\nCreated through loc create on a virtual Notion mount.\n"
+    );
+    {
+        let store = SqliteStateStore::open(fixture.state_root.clone())
+            .expect("open state for virtual create");
+        let mutation = store
+            .find_virtual_mutation_by_path(&fixture.mount_id, &relative_child_path)
+            .expect("find virtual create mutation")
+            .expect("pending virtual create");
+        assert_eq!(
+            mutation
+                .parent_remote_id
+                .as_ref()
+                .map(|id| compact_notion_id(id.as_str())),
+            Some(compact_notion_id(&scratch.id)),
+            "{mutation:#?}"
+        );
+        let content_path = mutation.content_path.expect("pending create content path");
+        fs::write(content_path, cached_body).expect("write pending virtual content");
+    }
+
+    let status = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("status")
+            .arg(&child_page_path)
+            .arg("--json"),
+    );
+    assert_eq!(status.value["clean"], false, "{status:#?}");
+
+    let diff = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("diff")
+            .arg(&child_page_path)
+            .arg("--json"),
+    );
+    assert_eq!(diff.value["action"], "confirm_plan", "{diff:#?}");
+
+    let push = loc_json_ok(
+        loc_command(loc, &fixture.state_root)
+            .arg("push")
+            .arg(&child_page_path)
+            .arg("-y")
+            .arg("--json"),
+    );
+    assert_eq!(push.value["ok"], true, "{push:#?}");
+    assert_eq!(push.value["action"], "reconciled", "{push:#?}");
+    let created_page_id = push.value["changed_remote_ids"]
+        .as_array()
+        .expect("changed remote ids")
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|id| compact_notion_id(id) != compact_notion_id(&scratch.id))
+        .expect("created child page id")
+        .to_string();
+    cleanup.block_ids.push(created_page_id.clone());
+
+    let connector = NotionConnector::new(NotionConfig::default().with_token(access_token));
+    let child_markdown = render_live_markdown(&connector, &created_page_id, &child_page_path);
+    assert!(child_markdown.contains(&format!("title: \"{child_title}\"")));
+    assert!(
+        child_markdown.contains("Created through loc create on a virtual Notion mount."),
+        "{child_markdown}"
+    );
+}
+
+#[test]
 #[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_block_type_replace_pushes_and_reconciles_notion() {
     let env = LiveEnv::from_env();
@@ -14983,6 +15151,15 @@ fn loc_command(loc: &str, state_root: &Path) -> Command {
         .env("LOCALITY_DAEMON_DISABLE", "1")
         .env_remove(TOKEN_ENV);
     command
+}
+
+fn set_directory_readonly(path: &Path, readonly: bool) {
+    let mut permissions = fs::metadata(path)
+        .unwrap_or_else(|error| panic!("read permissions for {}: {error}", path.display()))
+        .permissions();
+    permissions.set_readonly(readonly);
+    fs::set_permissions(path, permissions)
+        .unwrap_or_else(|error| panic!("set permissions for {}: {error}", path.display()));
 }
 
 fn loc_json_ok(command: &mut Command) -> LocJsonOutput {

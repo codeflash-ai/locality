@@ -6017,6 +6017,7 @@ fn create_command_error(json: bool, error: CreateError) -> i32 {
     let exit_code = match &error {
         CreateError::CurrentDir { .. }
         | CreateError::InvalidTitle(_)
+        | CreateError::InvalidParent { .. }
         | CreateError::MountNotFound(_)
         | CreateError::PrivateUnsupported { .. }
         | CreateError::ReadOnlyMount { .. }

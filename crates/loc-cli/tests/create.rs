@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loc_cli::create::{CreateError, CreatePageOptions, run_create_page};
-use locality_core::model::{MountId, RemoteId};
+use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_store::{
-    InMemoryStateStore, MountConfig, MountRepository, ProjectionMode, SqliteStateStore,
-    VirtualMutationRepository,
+    EntityRecord, EntityRepository, InMemoryStateStore, MountConfig, MountRepository,
+    ProjectionMode, SqliteStateStore, VirtualMutationRepository,
 };
 use serde_json::Value;
 
@@ -137,6 +137,72 @@ fn cli_create_page_private_flag_writes_marker() {
     assert_eq!(
         fs::read_to_string(fixture.root.join("Private CLI Draft/page.md")).expect("page"),
         "---\nloc:\n  private: true\ntitle: \"Private CLI Draft\"\n---\n"
+    );
+}
+
+#[test]
+fn create_page_in_virtual_page_directory_stages_pending_create_without_visible_write() {
+    let fixture = CreateFixture::new("loc-create-page-virtual-page-dir");
+    let mut store = fixture.store_with_projection(ProjectionMode::MacosFileProvider, false);
+    seed_parent_page(&mut store, "parent-page", "Launch", "Launch/page.md");
+    fs::create_dir_all(fixture.root.join("Launch")).expect("visible parent directory");
+    let state_root = fixture.temp.path("state");
+
+    let report = run_create_page(
+        &mut store,
+        CreatePageOptions {
+            title: "Launch Plan".to_string(),
+            parent: Some(fixture.root.join("Launch")),
+            private: false,
+            state_root: Some(state_root.clone()),
+        },
+    )
+    .expect("create virtual page");
+
+    let projected_path = PathBuf::from("Launch/Launch Plan/page.md");
+    assert_eq!(
+        Path::new(&report.path),
+        fixture.root.join(&projected_path).as_path()
+    );
+    assert!(
+        !fixture.root.join("Launch/Launch Plan").exists(),
+        "virtual creates must stage content without writing into the visible projection"
+    );
+    let mutation = store
+        .find_virtual_mutation_by_path(&MountId::new("notion-main"), &projected_path)
+        .expect("find mutation")
+        .expect("pending create mutation");
+    assert_eq!(
+        mutation.parent_remote_id,
+        Some(RemoteId::new("parent-page"))
+    );
+    assert_eq!(mutation.projected_path, projected_path);
+    assert_eq!(
+        fs::read_to_string(mutation.content_path.expect("content path")).expect("content"),
+        "---\ntitle: \"Launch Plan\"\n---\n"
+    );
+}
+
+#[test]
+fn create_page_at_virtual_mount_root_requires_parent_for_remote_create() {
+    let fixture = CreateFixture::new("loc-create-page-virtual-root-parent");
+    let mut store = fixture.store_with_projection(ProjectionMode::MacosFileProvider, false);
+    let state_root = fixture.temp.path("state");
+
+    let error = run_create_page(
+        &mut store,
+        CreatePageOptions {
+            title: "Launch Plan".to_string(),
+            parent: Some(fixture.root.clone()),
+            private: false,
+            state_root: Some(state_root),
+        },
+    )
+    .expect_err("mount root is not a Notion page or database parent");
+
+    assert!(
+        matches!(error, CreateError::InvalidParent { ref path, .. } if path == &fixture.root),
+        "{error:#?}"
     );
 }
 
@@ -357,4 +423,16 @@ impl Drop for TestTempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn seed_parent_page(store: &mut InMemoryStateStore, remote_id: &str, title: &str, path: &str) {
+    store
+        .save_entity(EntityRecord::new(
+            MountId::new("notion-main"),
+            RemoteId::new(remote_id),
+            EntityKind::Page,
+            title,
+            path,
+        ))
+        .expect("save parent page entity");
 }

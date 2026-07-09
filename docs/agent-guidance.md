@@ -6,13 +6,13 @@ Locality installs a small agent guidance pack during desktop onboarding so local
 
 | Agent | Install target | Status |
 | --- | --- | --- |
-| Claude Code / Claude Desktop / Claude Cowork | `~/.claude/skills/locality/SKILL.md`, `~/.claude.json`, and Claude Desktop MCP config when present (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows) | Automatic when Claude is detected. |
-| Codex | `~/.codex/skills/locality/SKILL.md` and `~/.codex/config.toml` | Automatic when Codex is detected. |
-| Warp | `~/.agents/skills/locality/SKILL.md` | Automatic when Warp is detected. Warp also reads project rules such as `AGENTS.md` and `WARP.md`; Locality keeps mount-point-local `AGENTS.md` under `/Locality/notion-main`. |
-| OpenCode | `~/.agents/skills/locality/SKILL.md` | Automatic when OpenCode is detected. |
-| Gemini CLI | `~/.gemini/GEMINI.md` | Automatic managed section when Gemini is detected. |
-| Cline / Roo Code / Cursor / Windsurf / Zed | `~/.agents/AGENTS.md` plus `/Locality/notion-main/AGENTS.md`; Cursor and Windsurf also get global MCP config when present | Automatic fallback when one of these agents is detected. |
-| GitHub Copilot CLI | `~/.copilot/copilot-instructions.md`; Copilot MCP config when present | Automatic managed section when Copilot-capable local tooling is detected. |
+| Claude Code / Claude Desktop / Claude Cowork | `~/.claude/skills/locality/SKILL.md`, `~/.claude.json`, and Claude Desktop MCP config when present (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows) | Installed when the guidance installer runs and Claude is detected. |
+| Codex | `~/.codex/skills/locality/SKILL.md` and `~/.codex/config.toml` | Installed when the guidance installer runs and Codex is detected. |
+| Warp | `~/.agents/skills/locality/SKILL.md` | Installed when the guidance installer runs and Warp is detected. Warp also reads project rules such as `AGENTS.md` and `WARP.md`; Locality keeps mount-point-local `AGENTS.md` under `/Locality/notion-main`. |
+| OpenCode | `~/.agents/skills/locality/SKILL.md` | Installed when the guidance installer runs and OpenCode is detected. |
+| Gemini CLI | `~/.gemini/GEMINI.md` | Managed section installed when the guidance installer runs and Gemini is detected. |
+| Cline / Roo Code / Cursor / Windsurf / Zed | `~/.agents/AGENTS.md` plus `/Locality/notion-main/AGENTS.md`; Cursor and Windsurf also get global MCP config when present | Fallback installed when the guidance installer runs and one of these agents is detected. |
+| GitHub Copilot CLI | `~/.copilot/copilot-instructions.md`; Copilot MCP config when present | Managed section installed when the guidance installer runs and Copilot-capable local tooling is detected. |
 
 Locality does not edit opaque app databases. It only updates documented, file-backed
 agent instruction or MCP config files. Skill installs use the `locality` skill
@@ -68,6 +68,6 @@ Use Locality to edit my Notion workspace. Open the Notion files under ~/Library/
 ```
 
 Users can rerun the installer from Settings > Agent Instructions after installing
-a new local agent. The desktop app also refreshes agent guidance and MCP config
-periodically while it is running, so newly installed agents are picked up without
-another onboarding pass.
+a new local agent. The desktop app also runs the installer once after a new
+install or upgrade is acknowledged. It does not periodically scan or rewrite
+other apps' guidance files in the background.

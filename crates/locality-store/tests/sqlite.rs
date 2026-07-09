@@ -537,6 +537,48 @@ fn sqlite_store_does_not_rewrite_v2_linux_fuse_mount_point_roots() {
 }
 
 #[test]
+fn sqlite_store_migrates_virtual_mutations_component_v1_to_v2() {
+    let fixture = SqliteFixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1
+             WHERE component_id = 'durable:virtual_mutations'",
+            [],
+        )
+        .expect("downgrade virtual mutations component");
+    drop(connection);
+    drop(store);
+
+    let before =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect state");
+    assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+    assert_eq!(
+        before.issues,
+        vec![StateCompatibilityIssue::OlderComponent {
+            component_id: "durable:virtual_mutations".to_string(),
+            found: 1,
+            current: 2,
+        }]
+    );
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+    let version: i64 = connection
+        .query_row(
+            "SELECT version
+             FROM state_components
+             WHERE component_id = 'durable:virtual_mutations'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("virtual mutations component version");
+    assert_eq!(version, 2);
+}
+
+#[test]
 fn sqlite_store_v13_missing_linux_fuse_component_is_not_seeded_or_rewritten() {
     let fixture = SqliteFixture::new();
     let old_shared_root = fixture
