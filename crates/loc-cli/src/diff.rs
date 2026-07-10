@@ -213,7 +213,7 @@ pub struct DiffReport {
     pub unsupported: Vec<String>,
     pub message: Option<String>,
     pub suggested_fix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub readable_diff: Option<ReadableDiffOutput>,
     pub completed_stages: Vec<String>,
 }

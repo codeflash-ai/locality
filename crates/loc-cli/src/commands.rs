@@ -3829,7 +3829,13 @@ fn push(args: &[String], json: bool) -> i32 {
         let spinner_config =
             spinner_config_for_command("push", &target_label, json, stderr_is_terminal);
         let report = match with_terminal_spinner(spinner_config.clone(), || {
-            run_push_target_command(&mut store, &state_root, target.clone(), options.clone())
+            run_push_target_command(
+                &mut store,
+                &state_root,
+                target.clone(),
+                options.clone(),
+                None,
+            )
         }) {
             Ok(report) => report,
             Err(error) => {
@@ -3855,7 +3861,13 @@ fn push(args: &[String], json: bool) -> i32 {
                     let mut approved = options.clone();
                     approved.assume_yes = true;
                     match with_terminal_spinner(spinner_config, || {
-                        run_push_target_command(&mut store, &state_root, target.clone(), approved)
+                        run_push_target_command(
+                            &mut store,
+                            &state_root,
+                            target.clone(),
+                            approved,
+                            Some(&report),
+                        )
                     }) {
                         Ok(report) => report,
                         Err(error) => {
@@ -3993,9 +4005,19 @@ fn run_push_target_command(
     state_root: &Path,
     target_path: PathBuf,
     options: PushOptions,
+    expected_confirmation_preview: Option<&PushReport>,
 ) -> Result<PushReport, PushCommandError> {
     let preview = run_push_with_state_root(store, &target_path, options.clone(), Some(state_root))
         .map_err(PushCommandError::from_diff)?;
+    if let Some(expected) = expected_confirmation_preview {
+        if !push_confirmation_preview_matches_displayed(expected, &preview) {
+            return Err(PushCommandError::new(
+                "push_plan_changed",
+                "push plan changed after the confirmation preview; rerun `loc push` to review the current diff",
+                4,
+            ));
+        }
+    }
     if preview.pipeline_action != "proceed_to_apply" {
         return Ok(preview);
     }
@@ -4085,6 +4107,19 @@ fn push_preview_plan_matches(cli_preview: &PushReport, daemon_preview: &PushRepo
     cli_preview.validation == daemon_preview.validation
         && cli_preview.plan == daemon_preview.plan
         && cli_preview.guardrail == daemon_preview.guardrail
+}
+
+fn push_confirmation_preview_matches_displayed(
+    displayed: &PushReport,
+    refreshed: &PushReport,
+) -> bool {
+    displayed.path == refreshed.path
+        && displayed.mount_id == refreshed.mount_id
+        && displayed.entity_id == refreshed.entity_id
+        && displayed.validation == refreshed.validation
+        && displayed.plan == refreshed.plan
+        && displayed.guardrail == refreshed.guardrail
+        && displayed.readable_diff == refreshed.readable_diff
 }
 
 fn should_prompt_for_push_confirmation(
@@ -7156,9 +7191,10 @@ mod tests {
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
         print_push_confirmation_preview, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
-        pull_direct_fallback_error, should_prompt_for_push_confirmation,
-        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
-        status as run_status_command, validate_virtual_projection_registration, write_log_report,
+        pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
+        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
+        spinner_config_for_command, spinner_enabled, status as run_status_command,
+        validate_virtual_projection_registration, write_log_report,
     };
 
     #[test]
@@ -7866,6 +7902,31 @@ mod tests {
             rendered.contains("diff --locality a/Roadmap.md b/Roadmap.md"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn push_confirmation_preview_match_includes_readable_diff() {
+        let mut displayed = push_report("confirm_plan");
+        displayed.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n-Old\n+New\n".to_string(),
+        });
+        let mut refreshed = displayed.clone();
+        refreshed.action = "apply_not_implemented".to_string();
+        refreshed.pipeline_action = "proceed_to_apply".to_string();
+
+        assert!(push_confirmation_preview_matches_displayed(
+            &displayed, &refreshed
+        ));
+
+        refreshed.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n-Old\n+Different\n".to_string(),
+        });
+
+        assert!(!push_confirmation_preview_matches_displayed(
+            &displayed, &refreshed
+        ));
     }
 
     #[test]

@@ -311,6 +311,26 @@ fn diff_report_includes_readable_patch_for_existing_page_edit() {
 }
 
 #[test]
+fn diff_json_output_omits_readable_patch() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.\n");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph.\n"))
+        .expect("save shadow");
+
+    let report = run_diff(&store, &path).expect("diff report");
+    assert!(
+        report.readable_diff.is_some(),
+        "expected internal readable diff"
+    );
+
+    let json = serde_json::to_value(&report).expect("serialize report");
+
+    assert!(json.get("readable_diff").is_none(), "{json:#}");
+}
+
+#[test]
 fn diff_plans_local_image_media_byte_update_from_manifest() {
     let fixture = DiffFixture::new();
     let mut store = fixture.store();
@@ -517,6 +537,12 @@ fn diff_report_includes_readable_patch_for_created_entity() {
         "{}",
         readable.text
     );
+    assert!(
+        readable.text.contains("+title: New task"),
+        "{}",
+        readable.text
+    );
+    assert!(readable.text.contains("+Status: Todo"), "{}", readable.text);
     assert!(readable.text.contains("+# Notes"), "{}", readable.text);
     assert!(
         readable.text.contains("+Created locally."),

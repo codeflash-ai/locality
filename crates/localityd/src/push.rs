@@ -1334,7 +1334,7 @@ fn readable_diff_for_existing_entity(
 
 fn readable_diff_for_created_entity(
     source_path: &Path,
-    body: &str,
+    local_text: &str,
     pipeline: &PushPipelineResult,
 ) -> Option<locality_core::readable_diff::ReadableDiffOutput> {
     let plan = pipeline.plan.as_ref()?;
@@ -1344,7 +1344,7 @@ fn readable_diff_for_created_entity(
     locality_core::readable_diff::readable_diff_for_file(
         locality_platform::logical_path_display(source_path),
         None,
-        Some(body),
+        Some(local_text),
     )
 }
 
@@ -1662,8 +1662,8 @@ where
         },
         schema_validation,
     );
-    let readable_diff =
-        readable_diff_for_created_entity(&relative_path, &parsed.document.body, &pipeline);
+    let local_text = render_canonical_markdown(&parsed.document);
+    let readable_diff = readable_diff_for_created_entity(&relative_path, &local_text, &pipeline);
     Ok(PreparedPush {
         absolute_path,
         mount,
@@ -1997,8 +1997,9 @@ where
         },
         schema_validation,
     );
+    let local_text = render_canonical_markdown(&parsed.document);
     let readable_diff =
-        readable_diff_for_created_entity(&pending.projected_path, &parsed.document.body, &pipeline);
+        readable_diff_for_created_entity(&pending.projected_path, &local_text, &pipeline);
     Ok(PreparedPush {
         absolute_path,
         mount,
