@@ -32,6 +32,9 @@ const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const MATERIALIZE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const ROOT_PATH: &str = "/";
+const DIRECTORY_METADATA_FILENAME: &str = ".directory";
+const DIRECTORY_METADATA_IDENTIFIER: &str = "locality:shared-root-directory-metadata";
+const DIRECTORY_METADATA_CONTENT: &str = "[Desktop Entry]\nIcon=locality-mount-logo\n";
 const STAGING_HINT_MAX_BYTES: usize = 48;
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -245,6 +248,56 @@ fn stable_hex_hash(bytes: &[u8]) -> String {
 
 fn projection_root_identifier(mount_id: &str) -> String {
     format!("mount:{mount_id}")
+}
+
+fn directory_metadata_item() -> VirtualFsItem {
+    VirtualFsItem {
+        identifier: DIRECTORY_METADATA_IDENTIFIER.to_string(),
+        parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
+        filename: DIRECTORY_METADATA_FILENAME.to_string(),
+        kind: VirtualFsItemKind::File,
+        entity_kind: None,
+        remote_id: None,
+        path: DIRECTORY_METADATA_FILENAME.to_string(),
+        hydration: None,
+        content_type: "application/x-desktop".to_string(),
+        remote_edited_at: None,
+        materialized_path: None,
+        byte_size: Some(DIRECTORY_METADATA_CONTENT.len() as u64),
+    }
+}
+
+fn virtual_file_contents(identifier: &str) -> Option<&'static [u8]> {
+    match identifier {
+        DIRECTORY_METADATA_IDENTIFIER => Some(DIRECTORY_METADATA_CONTENT.as_bytes()),
+        _ => None,
+    }
+}
+
+fn is_shared_root_item(item: &VirtualFsItem) -> bool {
+    item.kind == VirtualFsItemKind::Folder
+        && item.identifier == ROOT_CONTAINER_IDENTIFIER
+        && item.path.is_empty()
+}
+
+fn directory_listing_items_for_parent(
+    parent_path: &Path,
+    parent: &VirtualFsItem,
+    children: Vec<VirtualFsItem>,
+) -> Vec<VirtualFsItem> {
+    let mut items = Vec::with_capacity(children.len() + 1);
+    if normalize_path(parent_path) == Path::new(ROOT_PATH) && is_shared_root_item(parent) {
+        items.push(directory_metadata_item());
+    }
+    items.extend(children);
+    items
+}
+
+fn read_virtual_bytes(identifier: &str, offset: u64, size: u32) -> Option<Bytes> {
+    let bytes = virtual_file_contents(identifier)?;
+    let start = offset.min(bytes.len() as u64) as usize;
+    let end = (start + size as usize).min(bytes.len());
+    Some(Bytes::copy_from_slice(&bytes[start..end]))
 }
 
 #[derive(Clone, Debug)]
@@ -715,6 +768,12 @@ where
         if path == Path::new(ROOT_PATH) {
             return self.root_item();
         }
+        if path == child_path(Path::new(ROOT_PATH), DIRECTORY_METADATA_FILENAME) {
+            let root = self.root_item()?;
+            if is_shared_root_item(&root) {
+                return Ok(directory_metadata_item());
+            }
+        }
         let cached = {
             self.cache
                 .lock()
@@ -997,6 +1056,20 @@ where
         if writable {
             ensure_writable_item(&item)?;
         }
+        if virtual_file_contents(&item.identifier).is_some() {
+            let fh = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            self.handles.lock().expect("fuse handles").insert(
+                fh,
+                OpenHandle {
+                    identifier: item.identifier,
+                    path: PathBuf::new(),
+                    writable: false,
+                    dirty: false,
+                    temp_path: None,
+                },
+            );
+            return Ok(ReplyOpen { fh, flags: 0 });
+        }
 
         let truncating = flags & libc::O_TRUNC as u32 != 0;
         let materialized = if truncating && writable {
@@ -1049,10 +1122,17 @@ where
         size: u32,
     ) -> FuseResult<ReplyData> {
         let file_path = if fh != 0 {
-            self.open_handle(fh)?.path
+            let handle = self.open_handle(fh)?;
+            if let Some(data) = read_virtual_bytes(&handle.identifier, offset, size) {
+                return Ok(ReplyData { data });
+            }
+            handle.path
         } else {
             let path = path.ok_or(FuseError::NotFound)?;
             let item = self.resolve_path(Path::new(path))?;
+            if let Some(data) = read_virtual_bytes(&item.identifier, offset, size) {
+                return Ok(ReplyData { data });
+            }
             self.materialized_path(&item)?
         };
         let bytes = std::fs::read(&file_path).map_err(|error| {
@@ -1328,7 +1408,7 @@ where
             offset: 2,
         });
         let mut cache = self.cache.lock().expect("fuse item cache");
-        for child in children.children {
+        for child in directory_listing_items_for_parent(&parent_path, &item, children.children) {
             let offset = entries.len() as i64 + 1;
             let kind = file_type(&child);
             entries.push(DirectoryEntry {
@@ -1397,7 +1477,7 @@ where
             attr_ttl: ATTR_TTL,
         });
         let mut cache = self.cache.lock().expect("fuse item cache");
-        for child in children.children {
+        for child in directory_listing_items_for_parent(&parent_path, &item, children.children) {
             let offset = entries.len() as i64 + 1;
             let kind = file_type(&child);
             let attr = attr_for_item(&child);
@@ -1463,6 +1543,9 @@ fn open_is_writable(flags: u32) -> bool {
 }
 
 fn ensure_writable_item(item: &VirtualFsItem) -> Result<(), FuseError> {
+    if item.identifier == DIRECTORY_METADATA_IDENTIFIER {
+        return Err(FuseError::ReadOnly);
+    }
     if item.identifier.starts_with("schema:") {
         return Err(FuseError::ReadOnly);
     }
@@ -1616,6 +1699,92 @@ mod tests {
 
         assert_eq!(attr.mtime, UNIX_EPOCH);
         assert_eq!(attr.ctime, UNIX_EPOCH);
+    }
+
+    #[test]
+    fn shared_root_readdir_items_include_directory_metadata() {
+        let root = shared_test_root_item();
+        let mount = test_named_item(
+            &projection_root_identifier("notion-main"),
+            "notion-main",
+            VirtualFsItemKind::Folder,
+        );
+
+        let items = directory_listing_items_for_parent(Path::new(ROOT_PATH), &root, vec![mount]);
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec![".directory", "notion-main"]
+        );
+        assert_eq!(items[0].identifier, DIRECTORY_METADATA_IDENTIFIER);
+    }
+
+    #[test]
+    fn directory_metadata_file_returns_exact_contents() {
+        assert_eq!(
+            virtual_file_contents(DIRECTORY_METADATA_IDENTIFIER),
+            Some(b"[Desktop Entry]\nIcon=locality-mount-logo\n".as_slice())
+        );
+
+        let item = directory_metadata_item();
+        assert_eq!(item.filename, ".directory");
+        assert_eq!(item.path, ".directory");
+        assert_eq!(
+            item.byte_size,
+            Some(DIRECTORY_METADATA_CONTENT.len() as u64)
+        );
+    }
+
+    #[test]
+    fn non_root_directories_do_not_get_directory_metadata() {
+        let mount_root = test_root_item();
+        let page_dir = test_named_item("children:page", "Page", VirtualFsItemKind::Folder);
+
+        assert_eq!(
+            directory_listing_items_for_parent(
+                Path::new(ROOT_PATH),
+                &mount_root,
+                vec![page_dir.clone()],
+            )
+            .iter()
+            .map(|item| item.filename.as_str())
+            .collect::<Vec<_>>(),
+            vec!["Page"]
+        );
+        assert_eq!(
+            directory_listing_items_for_parent(Path::new("/Page"), &page_dir, Vec::new()),
+            Vec::<VirtualFsItem>::new()
+        );
+    }
+
+    #[test]
+    fn shared_root_resolves_directory_metadata_without_daemon_child() {
+        let root = shared_test_root_item();
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: String::new(),
+                root: root.clone(),
+                children: BTreeMap::from([(ROOT_CONTAINER_IDENTIFIER.to_string(), Vec::new())]),
+                created_files: RefCell::new(Vec::new()),
+                created_item: None,
+                renamed: RefCell::new(Vec::new()),
+                trashed: RefCell::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([(PathBuf::from(ROOT_PATH), root)])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let item = fs
+            .resolve_path(Path::new("/.directory"))
+            .expect("resolve shared root metadata");
+
+        assert_eq!(item.identifier, DIRECTORY_METADATA_IDENTIFIER);
+        assert_eq!(item.filename, ".directory");
     }
 
     #[test]
@@ -2046,6 +2215,23 @@ mod tests {
     fn test_root_item() -> VirtualFsItem {
         VirtualFsItem {
             identifier: "mount:notion-main".to_string(),
+            parent_identifier: None,
+            filename: String::new(),
+            kind: VirtualFsItemKind::Folder,
+            entity_kind: None,
+            remote_id: None,
+            path: String::new(),
+            hydration: None,
+            content_type: "public.folder".to_string(),
+            remote_edited_at: None,
+            materialized_path: None,
+            byte_size: None,
+        }
+    }
+
+    fn shared_test_root_item() -> VirtualFsItem {
+        VirtualFsItem {
+            identifier: ROOT_CONTAINER_IDENTIFIER.to_string(),
             parent_identifier: None,
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,

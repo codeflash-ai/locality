@@ -7,6 +7,10 @@ PUBLISH_SCRIPT="${ROOT}/scripts/publish-macos.sh"
 HOMEBREW_SCRIPT="${ROOT}/scripts/render-homebrew-cask.sh"
 TAURI_CONF="${ROOT}/apps/desktop/src-tauri/tauri.conf.json"
 DMG_BACKGROUND="${ROOT}/apps/desktop/src-tauri/assets/dmg-background.png"
+MOUNT_LOGO_ICNS="${ROOT}/apps/desktop/src-tauri/icons/locality-mount-logo.icns"
+FILE_PROVIDER_BUILD_SCRIPT="${ROOT}/platform/macos/LocalityFileProvider/scripts/build-dev-bundle.sh"
+FILE_PROVIDER_HOST_PLIST="${ROOT}/platform/macos/LocalityFileProvider/App/Locality.Info.plist"
+FILE_PROVIDER_EXTENSION_PLIST="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityFileProvider.Info.plist"
 
 fail() {
   printf 'macos publish config test: %s\n' "$*" >&2
@@ -47,6 +51,20 @@ grep -q 'make new alias file to POSIX file "/Applications"' "${ROOT}/apps/deskto
 
 [[ -f "${DMG_BACKGROUND}" ]] \
   || fail "DMG installer background asset is missing"
+[[ -f "${MOUNT_LOGO_ICNS}" ]] \
+  || fail "mount root ICNS logo asset is missing"
+grep -q '<key>CFBundleIconFile</key>' "${FILE_PROVIDER_HOST_PLIST}" \
+  || fail "File Provider host plist must declare CFBundleIconFile"
+grep -q '<key>CFBundleIconFile</key>' "${FILE_PROVIDER_EXTENSION_PLIST}" \
+  || fail "File Provider extension plist must declare CFBundleIconFile"
+grep -q '<string>locality-mount-logo</string>' "${FILE_PROVIDER_HOST_PLIST}" \
+  || fail "File Provider host plist must use the mount logo icon"
+grep -q '<string>locality-mount-logo</string>' "${FILE_PROVIDER_EXTENSION_PLIST}" \
+  || fail "File Provider extension plist must use the mount logo icon"
+grep -F -q 'Contents/Resources/locality-mount-logo.icns' "${FILE_PROVIDER_BUILD_SCRIPT}" \
+  || fail "File Provider build must copy mount logo ICNS into bundle resources"
+jq -e '.bundle.macOS.files["Resources/locality-mount-logo.icns"] == "icons/locality-mount-logo.icns"' "${TAURI_CONF}" >/dev/null \
+  || fail "Tauri macOS host app must package the mount logo ICNS resource"
 jq -e '.bundle.macOS.dmg.background == "assets/dmg-background.png"' "${TAURI_CONF}" >/dev/null \
   || fail "DMG must use the instructional installer background"
 jq -e '.bundle.macOS.dmg.windowSize.width >= 720 and .bundle.macOS.dmg.windowSize.height >= 420' "${TAURI_CONF}" >/dev/null \

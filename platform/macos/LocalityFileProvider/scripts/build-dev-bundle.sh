@@ -2,9 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "${ROOT}/../../.." && pwd)"
 BUILD_ROOT="${ROOT}/.build/dev-bundle"
 APP="${BUILD_ROOT}/Locality.app"
 APPEX="${APP}/Contents/PlugIns/LocalityFileProvider.appex"
+MOUNT_LOGO_ICNS="${REPO_ROOT}/apps/desktop/src-tauri/icons/locality-mount-logo.icns"
 ARCH="$(uname -m)"
 TARGET="${ARCH}-apple-macos14.0"
 SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
@@ -12,11 +14,15 @@ SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
 rm -rf "${APP}" "${BUILD_ROOT}/Locality.app"
 mkdir -p \
   "${APP}/Contents/MacOS" \
+  "${APP}/Contents/Resources" \
   "${APP}/Contents/PlugIns" \
-  "${APPEX}/Contents/MacOS"
+  "${APPEX}/Contents/MacOS" \
+  "${APPEX}/Contents/Resources"
 
 cp "${ROOT}/App/Locality.Info.plist" "${APP}/Contents/Info.plist"
 cp "${ROOT}/App/LocalityFileProvider.Info.plist" "${APPEX}/Contents/Info.plist"
+cp "${MOUNT_LOGO_ICNS}" "${APP}/Contents/Resources/locality-mount-logo.icns"
+cp "${MOUNT_LOGO_ICNS}" "${APPEX}/Contents/Resources/locality-mount-logo.icns"
 
 swiftc \
   -target "${TARGET}" \

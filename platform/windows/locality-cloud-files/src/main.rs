@@ -14,6 +14,8 @@ const COMMAND_NAME: &str = "locality-cloud-files";
 const PROVIDER_ID: &str = "codeflash.ai.loc";
 const SYNC_ROOT_ID_PREFIX: &str = "codeflash.ai.loc!default!";
 const SHARED_SYNC_ROOT_COMPONENT: &str = "locality";
+const MOUNT_LOGO_ICON_FILE_NAME: &str = "locality-mount-logo.ico";
+const DESKTOP_INI_FILE_NAME: &str = "desktop.ini";
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 #[cfg(target_os = "windows")]
@@ -217,6 +219,11 @@ fn register(args: RegisterArgs) -> Result<CommandReport, HelperError> {
     let projection_root = provider_daemon_projection_root(&args.sync_root, &sync_root);
     let sync_root_id = sync_root_id_for_optional_mount(args.mount_id.as_deref(), &projection_root);
     let state_dir = prepare_directory(&args.state_dir, "create state dir")?;
+    if args.mount_id.is_none()
+        && let Some(icon_path) = installed_mount_logo_icon_path()
+    {
+        write_mount_logo_desktop_ini(&sync_root, &icon_path)?;
+    }
 
     register_cloud_filter_sync_root(
         &sync_root_id,
@@ -544,6 +551,75 @@ fn validate_absolute_directory_candidate(path: &Path, label: &str) -> Result<(),
 fn prepare_directory(path: &Path, context: &str) -> Result<PathBuf, HelperError> {
     std::fs::create_dir_all(path).map_err(|error| HelperError::io(context, error))?;
     Ok(canonical_or_original(path))
+}
+
+fn installed_mount_logo_icon_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .map(|exe| mount_logo_icon_path_for_exe(&exe))
+}
+
+fn mount_logo_icon_path_for_exe(exe: &Path) -> PathBuf {
+    exe.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(MOUNT_LOGO_ICON_FILE_NAME)
+}
+
+fn mount_logo_desktop_ini_contents(icon_path: &Path) -> String {
+    format!(
+        "[.ShellClassInfo]\r\nIconResource={},0\r\n",
+        icon_path.display()
+    )
+}
+
+fn write_mount_logo_desktop_ini(sync_root: &Path, icon_path: &Path) -> Result<(), HelperError> {
+    let desktop_ini = sync_root.join(DESKTOP_INI_FILE_NAME);
+    std::fs::write(&desktop_ini, mount_logo_desktop_ini_contents(icon_path))
+        .map_err(|error| HelperError::io("write mount root desktop.ini", error))?;
+    apply_mount_logo_desktop_ini_attributes(sync_root, &desktop_ini)
+}
+
+#[cfg(target_os = "windows")]
+fn apply_mount_logo_desktop_ini_attributes(
+    sync_root: &Path,
+    desktop_ini: &Path,
+) -> Result<(), HelperError> {
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
+        FILE_FLAGS_AND_ATTRIBUTES, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
+    };
+    use windows::core::PCWSTR;
+
+    fn add_attributes(
+        path: &Path,
+        attributes: FILE_FLAGS_AND_ATTRIBUTES,
+    ) -> Result<(), HelperError> {
+        let wide = wide_path(path);
+        let current = unsafe { GetFileAttributesW(PCWSTR::from_raw(wide.as_ptr())) };
+        if current == INVALID_FILE_ATTRIBUTES {
+            return Err(HelperError::new(
+                "io_error",
+                format!(
+                    "read mount logo attributes: {}",
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        let updated = FILE_FLAGS_AND_ATTRIBUTES(current | attributes.0);
+        unsafe { SetFileAttributesW(PCWSTR::from_raw(wide.as_ptr()), updated) }
+            .map_err(win32_error("set mount logo attributes"))
+    }
+
+    add_attributes(desktop_ini, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)?;
+    add_attributes(sync_root, FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_mount_logo_desktop_ini_attributes(
+    _sync_root: &Path,
+    _desktop_ini: &Path,
+) -> Result<(), HelperError> {
+    Ok(())
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
@@ -3782,6 +3858,58 @@ mod tests {
                 .join("cloud-files")
                 .join("notion%2Fmain")
         );
+    }
+
+    #[test]
+    fn mount_logo_desktop_ini_contents_use_installed_icon_path() {
+        let icon_path = Path::new(r"C:\Users\Ada\AppData\Local\Locality\locality-mount-logo.ico");
+
+        assert_eq!(
+            mount_logo_desktop_ini_contents(icon_path),
+            "[.ShellClassInfo]\r\nIconResource=C:\\Users\\Ada\\AppData\\Local\\Locality\\locality-mount-logo.ico,0\r\n"
+        );
+    }
+
+    #[test]
+    fn mount_logo_icon_path_uses_executable_directory() {
+        assert_eq!(
+            mount_logo_icon_path_for_exe(Path::new("/opt/Locality/locality-cloud-files")),
+            PathBuf::from("/opt/Locality/locality-mount-logo.ico")
+        );
+    }
+
+    #[test]
+    fn writing_mount_logo_desktop_ini_is_idempotent() {
+        let temp = unique_test_state_dir("mount-logo-desktop-ini");
+        let sync_root = temp.join("Locality");
+        std::fs::create_dir_all(&sync_root).expect("create sync root");
+        let icon_path = temp.join("locality-mount-logo.ico");
+
+        write_mount_logo_desktop_ini(&sync_root, &icon_path).expect("write desktop.ini");
+        write_mount_logo_desktop_ini(&sync_root, &icon_path).expect("rewrite desktop.ini");
+
+        assert_eq!(
+            std::fs::read_to_string(sync_root.join("desktop.ini")).expect("read desktop.ini"),
+            mount_logo_desktop_ini_contents(&icon_path)
+        );
+
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn mount_logo_desktop_ini_only_targets_shared_root() {
+        let temp = unique_test_state_dir("mount-logo-child-scope");
+        let sync_root = temp.join("Locality");
+        let child_mount = sync_root.join("notion-main");
+        std::fs::create_dir_all(&child_mount).expect("create child mount");
+        let icon_path = temp.join("locality-mount-logo.ico");
+
+        write_mount_logo_desktop_ini(&sync_root, &icon_path).expect("write desktop.ini");
+
+        assert!(sync_root.join("desktop.ini").is_file());
+        assert!(!child_mount.join("desktop.ini").exists());
+
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]

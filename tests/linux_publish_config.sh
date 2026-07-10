@@ -45,6 +45,13 @@ for binary in loc localityd locality-fuse; do
     || fail "RPM package must install ${binary} into /usr/bin"
 done
 
+[[ -f "${ROOT}/apps/desktop/src-tauri/icons/locality-mount-logo.png" ]] \
+  || fail "Linux mount root logo PNG asset is missing"
+[[ "$(json_value '.bundle.linux.deb.files["/usr/share/icons/hicolor/256x256/apps/locality-mount-logo.png"]' "${TAURI_CONF}")" == "icons/locality-mount-logo.png" ]] \
+  || fail "Debian package must install the mount root logo icon theme asset"
+[[ "$(json_value '.bundle.linux.rpm.files["/usr/share/icons/hicolor/256x256/apps/locality-mount-logo.png"]' "${TAURI_CONF}")" == "icons/locality-mount-logo.png" ]] \
+  || fail "RPM package must install the mount root logo icon theme asset"
+
 for dependency in fuse3 systemd; do
   json_value '.bundle.linux.deb.depends[]' "${TAURI_CONF}" | grep -qx "${dependency}" \
     || fail "Debian package must depend on ${dependency}"

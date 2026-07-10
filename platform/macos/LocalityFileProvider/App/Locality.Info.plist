@@ -4,10 +4,12 @@
 <dict>
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
-  <key>CFBundleExecutable</key>
-  <string>Locality</string>
-  <key>CFBundleIdentifier</key>
-  <string>ai.codeflash.locality.Locality</string>
+	<key>CFBundleExecutable</key>
+	<string>Locality</string>
+	<key>CFBundleIconFile</key>
+	<string>locality-mount-logo</string>
+	<key>CFBundleIdentifier</key>
+	<string>ai.codeflash.locality.Locality</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>

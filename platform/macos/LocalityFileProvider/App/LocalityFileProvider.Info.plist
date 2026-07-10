@@ -6,10 +6,12 @@
   <string>en</string>
   <key>CFBundleDisplayName</key>
   <string>Locality</string>
-  <key>CFBundleExecutable</key>
-  <string>LocalityFileProvider</string>
-  <key>CFBundleIdentifier</key>
-  <string>ai.codeflash.locality.Locality.FileProvider</string>
+	<key>CFBundleExecutable</key>
+	<string>LocalityFileProvider</string>
+	<key>CFBundleIconFile</key>
+	<string>locality-mount-logo</string>
+	<key>CFBundleIdentifier</key>
+	<string>ai.codeflash.locality.Locality.FileProvider</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
