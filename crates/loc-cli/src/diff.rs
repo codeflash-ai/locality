@@ -13,6 +13,7 @@ use locality_core::planner::{
     PushOperation, PushPlan,
 };
 use locality_core::push::{PushApproval, PushPipelineAction, PushPipelineResult, PushStage};
+use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationIssue;
 use locality_store::{
@@ -95,13 +96,14 @@ where
     let prepared = prepare_push(store, &job, state_root, &validator).map_err(DiffError::from)?;
     let entity_id = prepared.entity.remote_id.clone();
     let pipeline = prepared.pipeline.clone();
-    let report = DiffReport::from_pipeline(
+    let mut report = DiffReport::from_pipeline(
         options.command,
         prepared.absolute_path.clone(),
         &prepared.mount,
         entity_id.clone(),
         pipeline.clone(),
     );
+    report.readable_diff = prepared.readable_diff.clone();
     let shadow = prepared.shadows.first().cloned();
 
     Ok(PreviewArtifacts {
@@ -211,6 +213,8 @@ pub struct DiffReport {
     pub unsupported: Vec<String>,
     pub message: Option<String>,
     pub suggested_fix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readable_diff: Option<ReadableDiffOutput>,
     pub completed_stages: Vec<String>,
 }
 
@@ -242,6 +246,7 @@ impl DiffReport {
             unsupported,
             message,
             suggested_fix,
+            readable_diff: None,
             completed_stages: result
                 .completed_stages
                 .iter()

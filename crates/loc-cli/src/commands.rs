@@ -8352,6 +8352,7 @@ mod tests {
             unsupported: Vec::new(),
             message: None,
             suggested_fix: None,
+            readable_diff: None,
             completed_stages: Vec::new(),
         }
     }

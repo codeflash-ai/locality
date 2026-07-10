@@ -280,6 +280,37 @@ fn diff_reports_safe_plan_as_confirmation_needed() {
 }
 
 #[test]
+fn diff_report_includes_readable_patch_for_existing_page_edit() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.\n");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph.\n"))
+        .expect("save shadow");
+
+    let report = run_diff(&store, &path).expect("diff report");
+    let readable = report.readable_diff.expect("readable diff");
+
+    assert!(
+        readable
+            .text
+            .contains("diff --locality a/Roadmap.md b/Roadmap.md"),
+        "{}",
+        readable.text
+    );
+    assert!(
+        readable.text.contains("-Old paragraph."),
+        "{}",
+        readable.text
+    );
+    assert!(
+        readable.text.contains("+Changed paragraph."),
+        "{}",
+        readable.text
+    );
+}
+
+#[test]
 fn diff_plans_local_image_media_byte_update_from_manifest() {
     let fixture = DiffFixture::new();
     let mut store = fixture.store();
@@ -455,6 +486,43 @@ fn diff_plans_new_database_row_file_as_create_entity() {
         }
         operation => panic!("unexpected operation {operation:?}"),
     }
+}
+
+#[test]
+fn diff_report_includes_readable_patch_for_created_entity() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Tasks",
+        ))
+        .expect("save database");
+    fixture.write_tasks_schema();
+    let path = fixture.write_raw(
+        "Tasks/new-task.md",
+        "---\ntitle: New task\nStatus: Todo\n---\n# Notes\n\nCreated locally.\n",
+    );
+
+    let report = run_diff(&store, &path).expect("diff report");
+    let readable = report.readable_diff.expect("readable diff");
+
+    assert!(
+        readable
+            .text
+            .contains("diff --locality /dev/null b/Tasks/new-task.md"),
+        "{}",
+        readable.text
+    );
+    assert!(readable.text.contains("+# Notes"), "{}", readable.text);
+    assert!(
+        readable.text.contains("+Created locally."),
+        "{}",
+        readable.text
+    );
 }
 
 #[test]
