@@ -223,11 +223,15 @@
   .setnav a.on{background:var(--teal-wash);border-left-color:var(--teal);color:var(--teal);font-weight:600}
 
   .final-appshell{display:grid;grid-template-columns:172px minmax(0,1fr);min-height:480px}
+  .final-appshell.is-collapsed{grid-template-columns:56px minmax(0,1fr)}
   .app-global-nav{background:var(--wash);border-right:1px solid var(--line-soft);padding:12px 0;
     display:flex;flex-direction:column}
   .app-global-nav .logo{display:flex;align-items:center;gap:7px;font-weight:600;font-size:13px;padding:2px 14px 12px}
+  .app-global-nav .collapse-btn{margin:0 10px 10px;border:1px solid var(--line);background:var(--paper);
+    border-radius:6px;padding:4px 8px;font:11px var(--mono);color:var(--muted);cursor:pointer}
   .app-global-nav a{display:flex;align-items:center;gap:8px;padding:5px 14px;font-size:12px;color:var(--ink);
     text-decoration:none;border-left:2px solid transparent}
+  .app-global-nav .nav-ico{width:16px;text-align:center;flex:none}
   .app-global-nav a.on{background:var(--teal-wash);border-left-color:var(--teal);color:var(--teal);font-weight:600}
   .app-global-nav .cnt{margin-left:auto;background:var(--amber-wash);color:var(--amber);font-size:9.5px;
     font-weight:600;border-radius:99px;padding:0 6px}
@@ -235,8 +239,21 @@
     display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--muted)}
   .app-page{min-width:0;overflow:hidden}
   .app-page > .content:first-child{min-height:446px}
-  .subpage-banner{display:flex;align-items:center;gap:8px;padding:8px 18px;border-bottom:1px solid var(--line-soft);
+  .final-appshell.is-collapsed .app-global-nav{align-items:center;padding-left:0;padding-right:0}
+  .final-appshell.is-collapsed .app-global-nav .logo{justify-content:center;padding-left:0;padding-right:0}
+  .final-appshell.is-collapsed .app-global-nav .logo span:not(.aperture),
+  .final-appshell.is-collapsed .app-global-nav .nav-label,
+  .final-appshell.is-collapsed .app-global-nav .cnt,
+  .final-appshell.is-collapsed .app-global-nav .foot{display:none}
+  .final-appshell.is-collapsed .app-global-nav a{justify-content:center;width:100%;padding-left:0;padding-right:0}
+  .final-appshell.is-collapsed .app-global-nav .collapse-btn{width:34px;padding-left:0;padding-right:0}
+  .final-appshell.is-collapsed .app-global-nav .collapse-btn{font-size:0}
+  .final-appshell.is-collapsed .app-global-nav .collapse-btn::after{content:"›";font-size:13px}
+  .subpage-banner{display:grid;gap:4px;padding:8px 18px;border-bottom:1px solid var(--line-soft);
     background:var(--wash);font-size:12px;color:var(--muted)}
+  .crumbs{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .crumbs span{color:var(--faint)}
+  .entrypoints{font-size:11px;color:var(--muted)}
   .subpage-banner b{color:var(--ink);font-size:12.5px}
 
   .legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
@@ -263,7 +280,7 @@
   <nav class="decknav" aria-label="Screens">
     <div class="brand">
       <h1>Locality Desktop</h1>
-      <div class="sub">WIREFRAME DECK · v4 APP SHELL MAP</div>
+      <div class="sub">WIREFRAME DECK · v5 COLLAPSE + BREADCRUMBS</div>
     </div>
     <div class="ngroup">Onboarding</div>
     <button data-s="ob1" aria-current="true"><span class="k">1.1</span>Welcome</button>
@@ -470,8 +487,10 @@
     <!-- ============ 2.2 FILES ============ -->
     <section class="screen" id="files">
       <div class="shead"><h2>Files — unified browser</h2><span class="route">/files</span></div>
-      <p class="sdesc">A searchable file browser reached from Home search, source detail, or Review Center. Selected row's full path lives in the footer PathChip.</p>
-      <div class="frame" data-app-shell="home" data-app-title="Files browser" data-app-kind="subpage">
+      <p class="sdesc">A searchable file browser reached from Home search, recent files, source detail, Review Center file actions, or tray search. It is a subpage, not a primary sidebar item.</p>
+      <div class="frame" data-app-shell="home" data-app-title="Files browser" data-app-kind="subpage"
+        data-app-crumbs="Home|Files browser"
+        data-app-entry="Home search, Recent file row, Source detail > Open folder, Review Center > Open file, tray search">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Files</span></div>
         <div class="appshell" style="grid-template-columns:150px 1fr">
           <div class="snav">
@@ -608,7 +627,9 @@
     <section class="screen" id="review">
       <div class="shead"><h2>Push approval — final gate</h2><span class="route">/review/push (modal route)</span></div>
       <p class="sdesc">A modal over Review Center: Back/Esc pushes nothing and preserves selection. Deletions gate the push button behind an explicit checkbox.</p>
-      <div class="frame overlayed" data-app-shell="review" data-app-title="Push approval" data-app-kind="modal">
+      <div class="frame overlayed" data-app-shell="review" data-app-title="Push approval" data-app-kind="modal"
+        data-app-crumbs="Review Center|Push approval"
+        data-app-entry="Review Center > Approve selected, Review Center > approve file row">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Review Center</span></div>
         <div class="under" style="height:360px;background:var(--wash)"></div>
         <div class="modal">
@@ -637,7 +658,9 @@
     <section class="screen" id="problems">
       <div class="shead"><h2>Sync problems — resolution center</h2><span class="route">/problems</span></div>
       <p class="sdesc">OneDrive-style error center: each row states the item, the plain-language cause, and a primary fix action.</p>
-      <div class="frame" data-app-shell="review" data-app-title="Sync problems" data-app-kind="subpage">
+      <div class="frame" data-app-shell="review" data-app-title="Sync problems" data-app-kind="subpage"
+        data-app-crumbs="Review Center|Sync problems"
+        data-app-entry="Review Center status banner, failed push result, tray health row">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Problems</span></div>
         <div class="content" style="padding:18px 22px">
           <div style="display:flex;align-items:center;gap:8px;font-weight:600;font-size:14px;margin-bottom:14px">
@@ -668,7 +691,9 @@
     <section class="screen" id="conflict">
       <div class="shead"><h2>Conflict editor — three-pane</h2><span class="route">/review/:fileId</span></div>
       <p class="sdesc">Tower-style resolver: Local | editable Merged result | Remote, with click-to-take and markdown-aware auto-merge attempted first.</p>
-      <div class="frame" data-app-shell="review" data-app-title="Conflict editor" data-app-kind="subpage">
+      <div class="frame" data-app-shell="review" data-app-title="Conflict editor" data-app-kind="subpage"
+        data-app-crumbs="Review Center|Conflict editor"
+        data-app-entry="Review Center conflict row > Resolve, Sync problems > Resolve">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Resolve conflict — Auth.md</span></div>
         <div style="padding:14px 16px">
           <div style="display:flex;align-items:center;margin-bottom:10px">
@@ -699,7 +724,9 @@
     <section class="screen" id="activity">
       <div class="shead"><h2>Activity</h2><span class="route">/activity</span></div>
       <p class="sdesc">The History analog: an immutable, day-grouped log with expandable detail and Revert only when a safe reverse plan exists.</p>
-      <div class="frame" data-app-shell="settings" data-app-title="Activity log" data-app-kind="subpage">
+      <div class="frame" data-app-shell="settings" data-app-title="Activity log" data-app-kind="subpage"
+        data-app-crumbs="Settings|Activity log"
+        data-app-entry="Settings > Activity log, Home recent activity > View all, push success > View activity">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Activity</span></div>
         <div class="content" style="padding:18px 22px">
           <div class="sect-label" style="padding-left:0">Today</div>
@@ -843,7 +870,9 @@
     <section class="screen" id="srcdetail">
       <div class="shead"><h2>Source detail</h2><span class="route">/sources/:id</span></div>
       <p class="sdesc">Everything about one connected workspace: access, local files, mount health, and the danger zone — without crowding Home or Sources.</p>
-      <div class="frame" data-app-shell="sources" data-app-title="Source detail" data-app-kind="subpage">
+      <div class="frame" data-app-shell="sources" data-app-title="Source detail" data-app-kind="subpage"
+        data-app-crumbs="Sources|Notion - Acme Team"
+        data-app-entry="Sources card > Details, Home source health card, connector warning > Manage source">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Notion · Acme Team</span></div>
         <div class="content" style="padding:16px 22px">
           <div style="font-size:12px;margin-bottom:8px"><span class="linkish">← Sources</span></div>
@@ -890,7 +919,9 @@
     <section class="screen" id="locate">
       <div class="shead"><h2>Locate — results open</h2><span class="route">/locate?q=…</span></div>
       <p class="sdesc">Type a title → ranked suggestions with source badges and status. Paste a URL → resolves straight to the Located result.</p>
-      <div class="frame" data-app-shell="home" data-app-title="Locate results" data-app-kind="subpage">
+      <div class="frame" data-app-shell="home" data-app-title="Locate results" data-app-kind="subpage"
+        data-app-crumbs="Home|Locate results"
+        data-app-entry="Home locate field, tray search, keyboard shortcut /">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Home</span></div>
         <div class="content" style="padding:20px 24px;max-width:560px">
           <div class="h-min" style="margin-top:0">Locate a page</div>
@@ -946,7 +977,9 @@
     <section class="screen" id="agents">
       <div class="shead"><h2>Settings · Agents</h2><span class="route">/settings/agents</span></div>
       <p class="sdesc">Per-agent guidance status with one install/update action; the MCP fallback is surfaced as a configured capability, not jargon.</p>
-      <div class="frame" data-app-shell="settings" data-app-title="Settings · Agents" data-app-kind="subpage">
+      <div class="frame" data-app-shell="settings" data-app-title="Settings · Agents" data-app-kind="subpage"
+        data-app-crumbs="Settings|Agents"
+        data-app-entry="Settings sidebar > Agents, onboarding ready > Install guidance, Review Center row > Rule">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Settings</span></div>
         <div class="setshell">
           <div class="setnav">
@@ -1070,9 +1103,10 @@
     return `
       <nav class="app-global-nav" aria-label="App navigation">
         <div class="logo"><span class="aperture"></span>Locality</div>
+        <button class="collapse-btn" type="button" aria-expanded="true" aria-label="Collapse sidebar">Collapse</button>
         ${items.map(([id, icon, label, count]) => `
           <a href="#" class="${active === id ? 'on' : ''}">
-            <span>${icon}</span><span>${label}</span>${count ? `<span class="cnt">${count}</span>` : ''}
+            <span class="nav-ico">${icon}</span><span class="nav-label">${label}</span>${count ? `<span class="cnt">${count}</span>` : ''}
           </a>
         `).join('')}
         <div class="foot"><span class="chip c-synced">✓</span> Synced · 2m ago</div>
@@ -1129,7 +1163,18 @@
         const banner = document.createElement('div');
         banner.className = 'subpage-banner';
         const kind = frame.dataset.appKind === 'modal' ? 'Modal' : 'Subpage';
-        banner.innerHTML = `<b>${frame.dataset.appTitle || kind}</b><span>${kind} under ${appParentLabel(active)}</span>`;
+        const crumbs = (frame.dataset.appCrumbs || `${appParentLabel(active)}|${frame.dataset.appTitle || kind}`)
+          .split('|')
+          .map(part => part.trim())
+          .filter(Boolean);
+        const entry = frame.dataset.appEntry ? `<div class="entrypoints"><b>Reached from:</b> ${frame.dataset.appEntry}</div>` : '';
+        banner.innerHTML = `
+          <div class="crumbs" aria-label="Breadcrumbs">
+            ${crumbs.map((crumb, index) => `${index ? '<span>/</span>' : ''}<b>${crumb}</b>`).join('')}
+            <span class="chip ${frame.dataset.appKind === 'modal' ? 'c-review' : 'c-draft'}">${kind}</span>
+          </div>
+          ${entry}
+        `;
         page.appendChild(banner);
       }
 
@@ -1214,6 +1259,15 @@
     setNotesStatus('');
   }
   nav.forEach(b => b.addEventListener('click', () => show(b.dataset.s)));
+  document.addEventListener('click', e => {
+    const button = e.target.closest('.collapse-btn');
+    if (!button) return;
+    const shell = button.closest('.final-appshell');
+    const collapsed = shell.classList.toggle('is-collapsed');
+    button.textContent = collapsed ? 'Expand' : 'Collapse';
+    button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    button.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+  });
   document.getElementById('toggle-design-notes').addEventListener('click', e => {
     document.body.classList.toggle('hide-design-notes');
     e.currentTarget.textContent = document.body.classList.contains('hide-design-notes')
