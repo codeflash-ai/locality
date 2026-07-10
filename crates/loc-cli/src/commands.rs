@@ -183,7 +183,7 @@ enum LocalityCommand {
     #[command(about = "Undo a reconciled push using its journal entry")]
     Undo(UndoArgs),
     #[command(about = "List push journal entries")]
-    Log(PathArg),
+    Log(LogCliArgs),
     #[command(about = "Restore a local file from the last synced shadow")]
     Restore(RestoreCliArgs),
     #[command(about = "Reset Locality local state and credentials")]
@@ -462,6 +462,23 @@ struct LiveModeFileArgs {
 struct UndoArgs {
     #[arg(value_name = "push-id", help = "Push journal id to undo.")]
     push_id: String,
+}
+
+#[derive(Debug, Args)]
+struct LogCliArgs {
+    #[arg(value_name = "path", help = "Optional path to filter journal entries.")]
+    path: Option<String>,
+    #[arg(
+        long,
+        value_name = "push-id",
+        help = "Only show one push journal entry."
+    )]
+    push_id: Option<String>,
+    #[arg(
+        long,
+        help = "Print the readable diff when the log resolves to one journal entry."
+    )]
+    diff: bool,
 }
 
 #[derive(Debug, Args)]
@@ -994,6 +1011,8 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
         LocalityCommand::Log(options) => {
             args.push("log".to_string());
             push_optional_positional(&mut args, options.path.as_deref());
+            push_optional_flag_value(&mut args, "--push-id", options.push_id.as_deref());
+            push_flag(&mut args, "--diff", options.diff);
         }
         LocalityCommand::Restore(options) => {
             args.push("restore".to_string());
@@ -3624,8 +3643,25 @@ fn log(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let push_id = match flag_value(args, "--push-id") {
+        Some(push_id) => Some(PushId(push_id.to_string())),
+        None if has_flag(args, "--push-id") => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "log",
+                    "usage",
+                    "usage: loc log [path] [--push-id <push-id>] [--diff] [--json]",
+                ),
+                EXIT_USAGE,
+            );
+        }
+        None => None,
+    };
     let options = LogOptions {
         path: first_positional(args).map(PathBuf::from),
+        push_id,
+        include_diff: has_flag(args, "--diff"),
     };
 
     match run_log(&store, options) {
@@ -3796,7 +3832,13 @@ fn push(args: &[String], json: bool) -> i32 {
         let spinner_config =
             spinner_config_for_command("push", &target_label, json, stderr_is_terminal);
         let report = match with_terminal_spinner(spinner_config.clone(), || {
-            run_push_target_command(&mut store, &state_root, target.clone(), options.clone())
+            run_push_target_command(
+                &mut store,
+                &state_root,
+                target.clone(),
+                options.clone(),
+                None,
+            )
         }) {
             Ok(report) => report,
             Err(error) => {
@@ -3810,13 +3852,25 @@ fn push(args: &[String], json: bool) -> i32 {
             json,
             io::stdin().is_terminal(),
         ) {
-            print_diff_report_fields(&report.validation, report.plan.as_ref());
+            if let Err(error) = print_push_confirmation_preview(&report, &mut io::stdout()) {
+                return command_error(
+                    json,
+                    CommandError::new("push", "stdout_write_failed", error.to_string()),
+                    EXIT_INTERNAL,
+                );
+            }
             match prompt_for_push_confirmation(&mut io::stdin().lock(), &mut io::stdout()) {
                 Ok(true) => {
                     let mut approved = options.clone();
                     approved.assume_yes = true;
                     match with_terminal_spinner(spinner_config, || {
-                        run_push_target_command(&mut store, &state_root, target.clone(), approved)
+                        run_push_target_command(
+                            &mut store,
+                            &state_root,
+                            target.clone(),
+                            approved,
+                            Some(&report),
+                        )
                     }) {
                         Ok(report) => report,
                         Err(error) => {
@@ -3831,9 +3885,13 @@ fn push(args: &[String], json: bool) -> i32 {
                     return push_report_exit_code(&report);
                 }
                 Err(error) => {
+                    let code = match &error {
+                        PushConfirmationPromptError::Output(_) => "stdout_write_failed",
+                        PushConfirmationPromptError::Input(_) => "stdin_read_failed",
+                    };
                     return command_error(
                         json,
-                        CommandError::new("push", "stdin_read_failed", error.to_string()),
+                        CommandError::new("push", code, error.to_string()),
                         EXIT_INTERNAL,
                     );
                 }
@@ -3950,9 +4008,19 @@ fn run_push_target_command(
     state_root: &Path,
     target_path: PathBuf,
     options: PushOptions,
+    expected_confirmation_preview: Option<&PushReport>,
 ) -> Result<PushReport, PushCommandError> {
     let preview = run_push_with_state_root(store, &target_path, options.clone(), Some(state_root))
         .map_err(PushCommandError::from_diff)?;
+    if let Some(expected) = expected_confirmation_preview {
+        if !push_confirmation_preview_matches_displayed(expected, &preview) {
+            return Err(PushCommandError::new(
+                "push_plan_changed",
+                "push plan changed after the confirmation preview; rerun `loc push` to review the current diff",
+                4,
+            ));
+        }
+    }
     if preview.pipeline_action != "proceed_to_apply" {
         return Ok(preview);
     }
@@ -4041,7 +4109,21 @@ fn verify_daemon_push_plan_matches_cli_preview(
 fn push_preview_plan_matches(cli_preview: &PushReport, daemon_preview: &PushReport) -> bool {
     cli_preview.validation == daemon_preview.validation
         && cli_preview.plan == daemon_preview.plan
+        && cli_preview.readable_diff == daemon_preview.readable_diff
         && cli_preview.guardrail == daemon_preview.guardrail
+}
+
+fn push_confirmation_preview_matches_displayed(
+    displayed: &PushReport,
+    refreshed: &PushReport,
+) -> bool {
+    displayed.path == refreshed.path
+        && displayed.mount_id == refreshed.mount_id
+        && displayed.entity_id == refreshed.entity_id
+        && displayed.validation == refreshed.validation
+        && displayed.plan == refreshed.plan
+        && displayed.guardrail == refreshed.guardrail
+        && displayed.readable_diff == refreshed.readable_diff
 }
 
 fn should_prompt_for_push_confirmation(
@@ -4053,22 +4135,44 @@ fn should_prompt_for_push_confirmation(
     report.action == "confirm_plan" && !options.assume_yes && !json && stdin_is_terminal
 }
 
-fn prompt_for_push_confirmation<R, W>(input: &mut R, output: &mut W) -> io::Result<bool>
+#[derive(Debug)]
+enum PushConfirmationPromptError {
+    Output(io::Error),
+    Input(io::Error),
+}
+
+impl std::fmt::Display for PushConfirmationPromptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Output(error) | Self::Input(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+fn prompt_for_push_confirmation<R, W>(
+    input: &mut R,
+    output: &mut W,
+) -> Result<bool, PushConfirmationPromptError>
 where
     R: BufRead,
     W: Write,
 {
     loop {
-        write!(output, "Proceed with push? [y/N] ")?;
-        output.flush()?;
+        write!(output, "Proceed with push? [y/N] ").map_err(PushConfirmationPromptError::Output)?;
+        output
+            .flush()
+            .map_err(PushConfirmationPromptError::Output)?;
 
         let mut answer = String::new();
-        input.read_line(&mut answer)?;
+        input
+            .read_line(&mut answer)
+            .map_err(PushConfirmationPromptError::Input)?;
         match answer.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => return Ok(true),
             "" | "n" | "no" => return Ok(false),
             _ => {
-                writeln!(output, "Please answer y or n.")?;
+                writeln!(output, "Please answer y or n.")
+                    .map_err(PushConfirmationPromptError::Output)?;
             }
         }
     }
@@ -4151,23 +4255,37 @@ fn diff(args: &[String], json: bool) -> i32 {
 }
 
 fn print_log_report(report: &LogReport) {
+    let mut output = io::stdout();
+    let _ = write_log_report(report, &mut output);
+}
+
+fn write_log_report<W: Write>(report: &LogReport, output: &mut W) -> io::Result<()> {
     if report.entries.is_empty() {
-        println!("no journal entries");
-        return;
+        writeln!(output, "no journal entries")?;
+        return Ok(());
     }
 
+    let inline_diff = report.entries.len() == 1;
     for (index, entry) in report.entries.iter().enumerate() {
         if index > 0 {
-            println!();
+            writeln!(output)?;
         }
-        println!("push {}", entry.push_id);
-        println!("  status: {}", entry.status);
-        println!("  mount: {}", entry.mount_id);
-        println!("  entities: {}", entry.remote_ids.join(", "));
+        writeln!(output, "push {}", entry.push_id)?;
+        writeln!(output, "  status: {}", entry.status)?;
+        writeln!(output, "  mount: {}", entry.mount_id)?;
+        writeln!(output, "  entities: {}", entry.remote_ids.join(", "))?;
+        writeln!(output, "  author: {}", entry.author)?;
+        if let Some(created_at_unix_ms) = entry.created_at_unix_ms {
+            writeln!(output, "  created_at_unix_ms: {created_at_unix_ms}")?;
+        }
+        if let Some(previous_push_id) = &entry.previous_push_id {
+            writeln!(output, "  previous: {previous_push_id}")?;
+        }
         if let Some(failure) = &entry.failure {
-            println!("  failure: {failure}");
+            writeln!(output, "  failure: {failure}")?;
         }
-        println!(
+        writeln!(
+            output,
             "  summary: {} updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
             entry.plan_summary.blocks_updated,
             entry.plan_summary.blocks_replaced,
@@ -4175,9 +4293,16 @@ fn print_log_report(report: &LogReport) {
             entry.plan_summary.blocks_created,
             entry.plan_summary.blocks_moved,
             entry.plan_summary.blocks_archived
-        );
-        println!("  operations: {}", entry.operation_count);
+        )?;
+        writeln!(output, "  operations: {}", entry.operation_count)?;
+        if inline_diff {
+            write_readable_diff(output, entry.readable_diff.as_ref())?;
+        } else if entry.readable_diff.is_some() {
+            writeln!(output, "  diff: loc log --push-id {} --diff", entry.push_id)?;
+        }
     }
+
+    Ok(())
 }
 
 fn print_undo_report(report: &UndoReport) {
@@ -5525,31 +5650,56 @@ fn stub(command: &str, json: bool) -> i32 {
 
 fn print_diff_report(report: &crate::diff::DiffReport) {
     print_diff_report_fields(&report.validation, report.plan.as_ref());
+    print_readable_diff(report.readable_diff.as_ref());
+}
+
+fn print_push_confirmation_preview<W: Write>(
+    report: &PushReport,
+    output: &mut W,
+) -> io::Result<()> {
+    write_diff_report_fields(output, &report.validation, report.plan.as_ref())?;
+    write_readable_diff(output, report.readable_diff.as_ref())
 }
 
 fn print_diff_report_fields(
     validation: &[crate::diff::ValidationIssueOutput],
     plan: Option<&crate::diff::PushPlanOutput>,
 ) {
+    let mut output = io::stdout();
+    let _ = write_diff_report_fields(&mut output, validation, plan);
+}
+
+fn print_readable_diff(readable_diff: Option<&locality_core::readable_diff::ReadableDiffOutput>) {
+    let mut output = io::stdout();
+    let _ = write_readable_diff(&mut output, readable_diff);
+}
+
+fn write_diff_report_fields<W: Write>(
+    output: &mut W,
+    validation: &[crate::diff::ValidationIssueOutput],
+    plan: Option<&crate::diff::PushPlanOutput>,
+) -> io::Result<()> {
     if !validation.is_empty() {
         for issue in validation {
             match issue.line {
-                Some(line) => println!(
+                Some(line) => writeln!(
+                    output,
                     "{}:{}: {} ({})",
                     issue.file, line, issue.message, issue.code
-                ),
-                None => println!("{}: {} ({})", issue.file, issue.message, issue.code),
+                )?,
+                None => writeln!(output, "{}: {} ({})", issue.file, issue.message, issue.code)?,
             }
         }
-        return;
+        return Ok(());
     }
 
     let Some(plan) = plan else {
-        println!("no plan");
-        return;
+        writeln!(output, "no plan")?;
+        return Ok(());
     };
 
-    println!(
+    writeln!(
+        output,
         "{} block{} updated, {} replaced, {} media updated, {} block{} created, {} entit{} created, {} moved, {} block{} archived, {} entit{} archived",
         plan.summary.blocks_updated,
         plural(plan.summary.blocks_updated),
@@ -5572,7 +5722,25 @@ fn print_diff_report_fields(
         } else {
             "ies"
         }
-    );
+    )
+}
+
+fn write_readable_diff<W: Write>(
+    output: &mut W,
+    readable_diff: Option<&locality_core::readable_diff::ReadableDiffOutput>,
+) -> io::Result<()> {
+    let Some(readable_diff) = readable_diff else {
+        return Ok(());
+    };
+    if readable_diff.text.trim().is_empty() {
+        return Ok(());
+    }
+    writeln!(output)?;
+    write!(output, "{}", readable_diff.text)?;
+    if !readable_diff.text.ends_with('\n') {
+        writeln!(output)?;
+    }
+    Ok(())
 }
 
 fn read_connect_token(args: &[String], json: bool) -> Result<String, CommandError> {
@@ -6774,6 +6942,7 @@ fn takes_value(arg: &str) -> bool {
             | "--limit"
             | "--title"
             | "--parent"
+            | "--push-id"
     )
 }
 
@@ -6988,7 +7157,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{self, Cursor, Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7005,7 +7174,8 @@ mod tests {
         ShadowRepository, SqliteStateStore,
     };
 
-    use crate::diff::{DiffReport, GuardrailOutput};
+    use crate::diff::{DiffReport, GuardrailOutput, PlanSummaryOutput};
+    use crate::history::{JournalEntryOutput, LogReport};
     use crate::local_oauth::{local_redirect, parse_oauth_callback};
     use crate::push::PushReport;
     use crate::search::{SearchOptions, SearchReport};
@@ -7014,18 +7184,19 @@ mod tests {
     use super::resolve_mount_target;
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, FileProviderCommandReport,
-        VirtualProjectionRegistration, absolute_command_path,
+        PushConfirmationPromptError, VirtualProjectionRegistration, absolute_command_path,
         auto_registration_for_mounted_projection, default_mount_id_for_source,
         diff_report_exit_code, file_provider_list_lines, google_docs_oauth_broker_config,
         guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
         guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
-        projection_mode_for_target, projection_usage_options_for_target,
-        prompt_for_push_confirmation, pull_direct_fallback_error,
-        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        spinner_config_for_command, spinner_enabled, status as run_status_command,
-        validate_virtual_projection_registration,
+        print_push_confirmation_preview, projection_mode_for_target,
+        projection_usage_options_for_target, prompt_for_push_confirmation,
+        pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
+        push_preview_plan_matches, should_prompt_for_push_confirmation,
+        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
+        status as run_status_command, validate_virtual_projection_registration, write_log_report,
     };
 
     #[test]
@@ -7249,7 +7420,14 @@ mod tests {
             ),
             (
                 vec!["log", "--help"],
-                vec!["Usage: loc log", "List push journal", "path", "--json"],
+                vec![
+                    "Usage: loc log",
+                    "List push journal",
+                    "path",
+                    "--push-id",
+                    "--diff",
+                    "--json",
+                ],
             ),
             (
                 vec!["restore", "--help"],
@@ -7559,6 +7737,117 @@ mod tests {
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["doctor"]
         );
+
+        let cli = parse_cli(["log", "Roadmap.md", "--push-id", "push-1", "--diff"]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["log", "Roadmap.md", "--push-id", "push-1", "--diff"]
+        );
+    }
+
+    #[test]
+    fn log_report_writer_prints_metadata_and_readable_diff() {
+        let report = LogReport {
+            ok: true,
+            command: "log",
+            entries: vec![JournalEntryOutput {
+                push_id: "push-1".to_string(),
+                mount_id: "notion-main".to_string(),
+                remote_ids: vec!["page-1".to_string()],
+                status: "reconciled".to_string(),
+                failure: None,
+                author: "anonymous".to_string(),
+                previous_push_id: Some("push-0".to_string()),
+                created_at_unix_ms: Some(1_783_612_800_000),
+                readable_diff: Some(locality_core::readable_diff::ReadableDiffOutput {
+                    files: Vec::new(),
+                    text: "diff --locality a/Roadmap.md b/Roadmap.md\n".to_string(),
+                }),
+                preimage_count: 1,
+                apply_effect_count: 1,
+                plan_summary: PlanSummaryOutput {
+                    blocks_created: 0,
+                    blocks_updated: 1,
+                    blocks_replaced: 0,
+                    blocks_moved: 0,
+                    media_updated: 0,
+                    blocks_archived: 0,
+                    entities_created: 0,
+                    entities_archived: 0,
+                    entities_moved: 0,
+                    properties_updated: 0,
+                },
+                operation_count: 1,
+            }],
+        };
+        let mut output = Vec::new();
+
+        write_log_report(&report, &mut output).expect("write log report");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf8 output"),
+            "push push-1\n  status: reconciled\n  mount: notion-main\n  entities: page-1\n  author: anonymous\n  created_at_unix_ms: 1783612800000\n  previous: push-0\n  summary: 1 updated, 0 replaced, 0 media updated, 0 created, 0 moved, 0 archived\n  operations: 1\n\ndiff --locality a/Roadmap.md b/Roadmap.md\n"
+        );
+    }
+
+    #[test]
+    fn log_report_writer_omits_inline_diffs_for_multiple_entries() {
+        let entry = |push_id: &str, diff_text: &str| JournalEntryOutput {
+            push_id: push_id.to_string(),
+            mount_id: "notion-main".to_string(),
+            remote_ids: vec!["page-1".to_string()],
+            status: "reconciled".to_string(),
+            failure: None,
+            author: "anonymous".to_string(),
+            previous_push_id: None,
+            created_at_unix_ms: None,
+            readable_diff: Some(locality_core::readable_diff::ReadableDiffOutput {
+                files: Vec::new(),
+                text: diff_text.to_string(),
+            }),
+            preimage_count: 1,
+            apply_effect_count: 1,
+            plan_summary: PlanSummaryOutput {
+                blocks_created: 0,
+                blocks_updated: 1,
+                blocks_replaced: 0,
+                blocks_moved: 0,
+                media_updated: 0,
+                blocks_archived: 0,
+                entities_created: 0,
+                entities_archived: 0,
+                entities_moved: 0,
+                properties_updated: 0,
+            },
+            operation_count: 1,
+        };
+        let report = LogReport {
+            ok: true,
+            command: "log",
+            entries: vec![
+                entry("push-2", "diff --locality a/two.md b/two.md\n"),
+                entry("push-1", "diff --locality a/one.md b/one.md\n"),
+            ],
+        };
+        let mut output = Vec::new();
+
+        write_log_report(&report, &mut output).expect("write log report");
+        let rendered = String::from_utf8(output).expect("utf8 output");
+
+        assert!(rendered.contains("push push-2"), "{rendered}");
+        assert!(rendered.contains("push push-1"), "{rendered}");
+        assert!(
+            !rendered.contains("diff --locality"),
+            "multi-entry log should not inline diff bodies:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("diff: loc log --push-id push-2 --diff"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("diff: loc log --push-id push-1 --diff"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -7569,6 +7858,18 @@ mod tests {
     #[test]
     fn validation_diff_report_exits_with_validation_code() {
         assert_eq!(diff_report_exit_code(&report(false)), EXIT_VALIDATION);
+    }
+
+    #[test]
+    fn confirm_plan_diff_report_exits_successfully_when_clean() {
+        let mut report = report(true);
+        report.action = "confirm_plan".to_string();
+        report.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n".to_string(),
+        });
+
+        assert_eq!(diff_report_exit_code(&report), EXIT_SUCCESS);
     }
 
     #[test]
@@ -7609,6 +7910,22 @@ mod tests {
     }
 
     #[test]
+    fn push_confirmation_prompt_distinguishes_output_and_input_errors() {
+        let output_error =
+            prompt_for_push_confirmation(&mut Cursor::new(b"y\n"), &mut FailingWriter)
+                .expect_err("output error");
+        assert!(matches!(
+            output_error,
+            PushConfirmationPromptError::Output(_)
+        ));
+
+        let mut output = Vec::new();
+        let input_error =
+            prompt_for_push_confirmation(&mut FailingReader, &mut output).expect_err("input error");
+        assert!(matches!(input_error, PushConfirmationPromptError::Input(_)));
+    }
+
+    #[test]
     fn push_confirmation_prompt_is_only_for_interactive_safe_plans() {
         let options = crate::push::PushOptions {
             assume_yes: false,
@@ -7639,6 +7956,70 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn push_confirmation_preview_prints_readable_diff() {
+        let mut report = push_report("confirm_plan");
+        report.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n--- a/Roadmap.md\n+++ b/Roadmap.md\n"
+                .to_string(),
+        });
+
+        let mut output = Vec::new();
+        print_push_confirmation_preview(&report, &mut output).expect("preview");
+        let rendered = String::from_utf8(output).expect("utf8");
+
+        assert!(rendered.contains("0 blocks updated"), "{rendered}");
+        assert!(
+            rendered.contains("diff --locality a/Roadmap.md b/Roadmap.md"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn push_confirmation_preview_match_includes_readable_diff() {
+        let mut displayed = push_report("confirm_plan");
+        displayed.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n-Old\n+New\n".to_string(),
+        });
+        let mut refreshed = displayed.clone();
+        refreshed.action = "apply_not_implemented".to_string();
+        refreshed.pipeline_action = "proceed_to_apply".to_string();
+
+        assert!(push_confirmation_preview_matches_displayed(
+            &displayed, &refreshed
+        ));
+
+        refreshed.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n-Old\n+Different\n".to_string(),
+        });
+
+        assert!(!push_confirmation_preview_matches_displayed(
+            &displayed, &refreshed
+        ));
+    }
+
+    #[test]
+    fn daemon_push_preview_match_includes_readable_diff() {
+        let mut cli_preview = push_report("confirm_plan");
+        cli_preview.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n-Old\n+New\n".to_string(),
+        });
+        let mut daemon_preview = cli_preview.clone();
+
+        assert!(push_preview_plan_matches(&cli_preview, &daemon_preview));
+
+        daemon_preview.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n-Old\n+Different\n".to_string(),
+        });
+
+        assert!(!push_preview_plan_matches(&cli_preview, &daemon_preview));
     }
 
     #[test]
@@ -8344,6 +8725,7 @@ mod tests {
             entity_id: "page-1".to_string(),
             validation: Vec::new(),
             plan: None,
+            readable_diff: None,
             guardrail: GuardrailOutput {
                 decision: "proceed".to_string(),
                 reasons: Vec::new(),
@@ -8365,7 +8747,8 @@ mod tests {
             mount_id: "notion-main".to_string(),
             entity_id: "page-1".to_string(),
             validation: Vec::new(),
-            plan: None,
+            plan: Some(empty_push_plan()),
+            readable_diff: None,
             guardrail: GuardrailOutput {
                 decision: "proceed".to_string(),
                 reasons: Vec::new(),
@@ -8382,6 +8765,54 @@ mod tests {
             unsupported: Vec::new(),
             suggested_fix: None,
         }
+    }
+
+    fn empty_push_plan() -> crate::diff::PushPlanOutput {
+        crate::diff::PushPlanOutput {
+            summary: crate::diff::PlanSummaryOutput {
+                blocks_created: 0,
+                blocks_updated: 0,
+                blocks_replaced: 0,
+                blocks_moved: 0,
+                media_updated: 0,
+                blocks_archived: 0,
+                entities_created: 0,
+                entities_archived: 0,
+                entities_moved: 0,
+                properties_updated: 0,
+            },
+            affected_entities: Vec::new(),
+            operations: Vec::new(),
+            degradations: Vec::new(),
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("flush failed"))
+        }
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("read failed"))
+        }
+    }
+
+    impl io::BufRead for FailingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::other("read failed"))
+        }
+
+        fn consume(&mut self, _amt: usize) {}
     }
 
     fn empty_search_report(options: &SearchOptions) -> SearchReport {

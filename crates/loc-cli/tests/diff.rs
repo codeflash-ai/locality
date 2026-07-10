@@ -280,6 +280,57 @@ fn diff_reports_safe_plan_as_confirmation_needed() {
 }
 
 #[test]
+fn diff_report_includes_readable_patch_for_existing_page_edit() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.\n");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph.\n"))
+        .expect("save shadow");
+
+    let report = run_diff(&store, &path).expect("diff report");
+    let readable = report.readable_diff.expect("readable diff");
+
+    assert!(
+        readable
+            .text
+            .contains("diff --locality a/Roadmap.md b/Roadmap.md"),
+        "{}",
+        readable.text
+    );
+    assert!(
+        readable.text.contains("-Old paragraph."),
+        "{}",
+        readable.text
+    );
+    assert!(
+        readable.text.contains("+Changed paragraph."),
+        "{}",
+        readable.text
+    );
+}
+
+#[test]
+fn diff_json_output_omits_readable_patch() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.\n");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph.\n"))
+        .expect("save shadow");
+
+    let report = run_diff(&store, &path).expect("diff report");
+    assert!(
+        report.readable_diff.is_some(),
+        "expected internal readable diff"
+    );
+
+    let json = serde_json::to_value(&report).expect("serialize report");
+
+    assert!(json.get("readable_diff").is_none(), "{json:#}");
+}
+
+#[test]
 fn diff_plans_local_image_media_byte_update_from_manifest() {
     let fixture = DiffFixture::new();
     let mut store = fixture.store();
@@ -458,6 +509,49 @@ fn diff_plans_new_database_row_file_as_create_entity() {
 }
 
 #[test]
+fn diff_report_includes_readable_patch_for_created_entity() {
+    let fixture = DiffFixture::new();
+    let mut store = fixture.store();
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("database-1"),
+            EntityKind::Database,
+            "Tasks",
+            "Tasks",
+        ))
+        .expect("save database");
+    fixture.write_tasks_schema();
+    let path = fixture.write_raw(
+        "Tasks/new-task.md",
+        "---\ntitle: New task\nStatus: Todo\n---\n# Notes\n\nCreated locally.\n",
+    );
+
+    let report = run_diff(&store, &path).expect("diff report");
+    let readable = report.readable_diff.expect("readable diff");
+
+    assert!(
+        readable
+            .text
+            .contains("diff --locality /dev/null b/Tasks/new-task.md"),
+        "{}",
+        readable.text
+    );
+    assert!(
+        readable.text.contains("+title: New task"),
+        "{}",
+        readable.text
+    );
+    assert!(readable.text.contains("+Status: Todo"), "{}", readable.text);
+    assert!(readable.text.contains("+# Notes"), "{}", readable.text);
+    assert!(
+        readable.text.contains("+Created locally."),
+        "{}",
+        readable.text
+    );
+}
+
+#[test]
 fn diff_plans_new_database_row_page_document_as_create_entity() {
     let fixture = DiffFixture::new();
     let mut store = fixture.store();
@@ -553,6 +647,58 @@ fn diff_plain_text_summary_includes_entity_creates() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("1 entity created"), "{stdout}");
+}
+
+#[test]
+fn diff_plain_text_output_includes_readable_patch() {
+    let fixture = DiffFixture::new();
+    let state_root = fixture.root.join(".state");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open sqlite");
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph.\n"))
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .env("LOCALITY_STATE_DIR", &state_root)
+        .arg("diff")
+        .arg(&path)
+        .output()
+        .expect("run loc diff");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("1 block updated"), "{stdout}");
+    assert!(
+        stdout.contains("diff --locality a/Roadmap.md b/Roadmap.md"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("-Old paragraph."), "{stdout}");
+    assert!(stdout.contains("+Changed paragraph."), "{stdout}");
 }
 
 #[test]

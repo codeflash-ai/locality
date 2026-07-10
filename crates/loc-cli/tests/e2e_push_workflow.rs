@@ -182,6 +182,93 @@ fn mount_pull_mid_page_insert_push_and_status_clean() {
 }
 
 #[test]
+fn push_journals_link_consecutive_edits_for_same_page() {
+    let fixture = E2eFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let api = Arc::new(MutableNotionApi::new());
+    let connector = NotionConnector::with_api(NotionConfig::default(), api);
+
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: fixture.mount_id.clone(),
+            connector: "notion".to_string(),
+            root: fixture.root.clone(),
+            remote_root_id: Some(RemoteId::new("page-1")),
+            connection_id: Some(ConnectionId::new("work")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount");
+    run_pull(&mut store, &connector, &fixture.root).expect("pull");
+
+    let page_path = fixture.page_file();
+    let original = fs::read_to_string(&page_path).expect("read pulled page");
+    fs::write(
+        &page_path,
+        original.replace("First paragraph.", "First pushed paragraph."),
+    )
+    .expect("write first edit");
+    let first_push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("first push");
+    let first_push_id = PushId(first_push.push_id.expect("first push id"));
+
+    let after_first = fs::read_to_string(&page_path).expect("read first reconcile");
+    fs::write(
+        &page_path,
+        after_first.replace("First pushed paragraph.", "Second pushed paragraph."),
+    )
+    .expect("write second edit");
+    let second_push = run_push_with_daemon(
+        &mut store,
+        &connector,
+        &page_path,
+        PushOptions {
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+    )
+    .expect("second push");
+    let second_push_id = PushId(second_push.push_id.expect("second push id"));
+
+    let journals = store.list_journal().expect("journals");
+    let second = journals
+        .iter()
+        .find(|entry| entry.push_id == second_push_id)
+        .expect("second journal");
+    assert_eq!(second.metadata.previous_push_id, Some(first_push_id));
+    assert_eq!(second.metadata.author.display_name, "anonymous");
+    let readable = second
+        .readable_diff
+        .as_ref()
+        .expect("journal readable diff");
+    assert!(
+        readable.text.contains("diff --locality"),
+        "{}",
+        readable.text
+    );
+    assert!(
+        readable.text.contains("-First pushed paragraph."),
+        "{}",
+        readable.text
+    );
+    assert!(
+        readable.text.contains("+Second pushed paragraph."),
+        "{}",
+        readable.text
+    );
+}
+
+#[test]
 fn mount_agent_guidance_matches_filesystem_workflow_and_does_not_dirty_status() {
     let fixture = E2eFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -10861,6 +10948,7 @@ fn live_push_log_and_undo_restores_remote_content() {
         &store,
         LogOptions {
             path: Some(page_path.clone()),
+            ..LogOptions::default()
         },
     )
     .expect("log undo push");
@@ -10888,6 +10976,7 @@ fn live_push_log_and_undo_restores_remote_content() {
         &store,
         LogOptions {
             path: Some(page_path),
+            ..LogOptions::default()
         },
     )
     .expect("log reverted undo push");
@@ -11096,6 +11185,7 @@ fn live_undo_child_page_create_archives_remote_page() {
         &store,
         LogOptions {
             path: Some(child_page_path.clone()),
+            ..LogOptions::default()
         },
     )
     .expect("log child page create push");
@@ -11123,6 +11213,7 @@ fn live_undo_child_page_create_archives_remote_page() {
         &store,
         LogOptions {
             path: Some(child_page_path),
+            ..LogOptions::default()
         },
     )
     .expect("log reverted child page create push");
@@ -11216,6 +11307,7 @@ fn live_undo_database_row_create_archives_remote_row() {
         &store,
         LogOptions {
             path: Some(new_row_path.clone()),
+            ..LogOptions::default()
         },
     )
     .expect("log database row create push");
@@ -11252,6 +11344,7 @@ fn live_undo_database_row_create_archives_remote_row() {
         &store,
         LogOptions {
             path: Some(new_row_path),
+            ..LogOptions::default()
         },
     )
     .expect("log reverted database row create push");

@@ -29,6 +29,8 @@ use crate::diff::PlanSummaryOutput;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogOptions {
     pub path: Option<PathBuf>,
+    pub push_id: Option<PushId>,
+    pub include_diff: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -53,12 +55,19 @@ where
         entries.retain(|entry| entry_matches_filter(entry, &filter));
     }
 
+    if let Some(push_id) = &options.push_id {
+        entries.retain(|entry| &entry.push_id == push_id);
+    }
+
     entries.sort_by(|left, right| right.push_id.0.cmp(&left.push_id.0));
 
     Ok(LogReport {
         ok: true,
         command: "log",
-        entries: entries.into_iter().map(JournalEntryOutput::from).collect(),
+        entries: entries
+            .into_iter()
+            .map(|entry| JournalEntryOutput::from_entry(entry, options.include_diff))
+            .collect(),
     })
 }
 
@@ -101,7 +110,7 @@ where
                 action: "reverted_local_journal".to_string(),
                 message: "journal entry reverted before remote apply".to_string(),
                 changed_remote_ids: Vec::new(),
-                entry: Some(JournalEntryOutput::from(reverted)),
+                entry: Some(JournalEntryOutput::from_entry(reverted, false)),
                 undo_plan: None,
             })
         }
@@ -113,7 +122,7 @@ where
             action: "already_reverted".to_string(),
             message: "journal entry was already reverted".to_string(),
             changed_remote_ids: Vec::new(),
-            entry: Some(JournalEntryOutput::from(entry)),
+            entry: Some(JournalEntryOutput::from_entry(entry, false)),
             undo_plan: None,
         }),
         JournalStatus::Failed(_) if entry.apply_effects.is_empty() => {
@@ -132,7 +141,7 @@ where
                 message: "failed journal had no recorded remote effects and was marked reverted"
                     .to_string(),
                 changed_remote_ids: Vec::new(),
-                entry: Some(JournalEntryOutput::from(reverted)),
+                entry: Some(JournalEntryOutput::from_entry(reverted, false)),
                 undo_plan: None,
             })
         }
@@ -148,7 +157,7 @@ where
                 message: message.to_string(),
                 changed_remote_ids: Vec::new(),
                 undo_plan: Some(UndoPlanOutput::from(undo_plan)),
-                entry: Some(JournalEntryOutput::from(entry)),
+                entry: Some(JournalEntryOutput::from_entry(entry, false)),
             })
         }
         status => Ok(UndoReport {
@@ -159,7 +168,7 @@ where
             action: "undo_unsafe_journal_status".to_string(),
             message: undo_boundary_message(&status).to_string(),
             changed_remote_ids: Vec::new(),
-            entry: Some(JournalEntryOutput::from(entry)),
+            entry: Some(JournalEntryOutput::from_entry(entry, false)),
             undo_plan: None,
         }),
     }
@@ -212,7 +221,7 @@ where
             message: message.to_string(),
             changed_remote_ids: Vec::new(),
             undo_plan: Some(UndoPlanOutput::from(undo_plan)),
-            entry: Some(JournalEntryOutput::from(entry)),
+            entry: Some(JournalEntryOutput::from_entry(entry, false)),
         });
     }
 
@@ -237,7 +246,7 @@ where
                 message: error.to_string(),
                 changed_remote_ids: Vec::new(),
                 undo_plan: Some(UndoPlanOutput::from(undo_plan)),
-                entry: Some(JournalEntryOutput::from(entry)),
+                entry: Some(JournalEntryOutput::from_entry(entry, false)),
             });
         }
     };
@@ -263,7 +272,7 @@ where
             .map(|remote_id| remote_id.0)
             .collect(),
         undo_plan: Some(UndoPlanOutput::from(undo_plan)),
-        entry: Some(JournalEntryOutput::from(reverted)),
+        entry: Some(JournalEntryOutput::from_entry(reverted, false)),
     })
 }
 
@@ -394,16 +403,26 @@ pub struct JournalEntryOutput {
     pub remote_ids: Vec<String>,
     pub status: String,
     pub failure: Option<String>,
+    pub author: String,
+    pub previous_push_id: Option<String>,
+    pub created_at_unix_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readable_diff: Option<locality_core::readable_diff::ReadableDiffOutput>,
     pub preimage_count: usize,
     pub apply_effect_count: usize,
     pub plan_summary: PlanSummaryOutput,
     pub operation_count: usize,
 }
 
-impl From<JournalEntry> for JournalEntryOutput {
-    fn from(value: JournalEntry) -> Self {
+impl JournalEntryOutput {
+    pub fn from_entry(value: JournalEntry, include_diff: bool) -> Self {
         let (status, failure) = status_parts(value.status);
         let operation_count = value.plan.operations.len();
+        let readable_diff = if include_diff {
+            value.readable_diff
+        } else {
+            None
+        };
 
         Self {
             push_id: value.push_id.0,
@@ -415,11 +434,21 @@ impl From<JournalEntry> for JournalEntryOutput {
                 .collect(),
             status,
             failure,
+            author: value.metadata.author.display_name,
+            previous_push_id: value.metadata.previous_push_id.map(|push_id| push_id.0),
+            created_at_unix_ms: value.metadata.created_at_unix_ms,
+            readable_diff,
             preimage_count: value.preimages.len(),
             apply_effect_count: value.apply_effects.len(),
             plan_summary: PlanSummaryOutput::from(value.plan.summary),
             operation_count,
         }
+    }
+}
+
+impl From<JournalEntry> for JournalEntryOutput {
+    fn from(value: JournalEntry) -> Self {
+        Self::from_entry(value, false)
     }
 }
 
@@ -717,5 +746,127 @@ fn undo_plan_status_name(status: &UndoPlanStatus) -> &'static str {
         UndoPlanStatus::Complete => "complete",
         UndoPlanStatus::Partial => "partial",
         UndoPlanStatus::Blocked => "blocked",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use locality_core::journal::JournalMetadata;
+    use locality_core::model::{MountId, RemoteId};
+    use locality_core::planner::{PushOperation, PushPlan};
+    use locality_core::readable_diff::{
+        ReadableDiffFileOutput, ReadableDiffFileStatus, ReadableDiffOutput,
+    };
+    use locality_store::{InMemoryStateStore, JournalRepository};
+
+    #[test]
+    fn log_report_can_include_readable_diff_for_single_push() {
+        let mut store = InMemoryStateStore::new();
+        let expected_readable_diff =
+            readable_diff("Roadmap.md", "diff --locality a/Roadmap.md b/Roadmap.md\n");
+        store
+            .append_journal(
+                journal_entry("push-1")
+                    .with_metadata(JournalMetadata::anonymous(
+                        Some(PushId("push-0".to_string())),
+                        Some(1_783_612_800_000),
+                    ))
+                    .with_readable_diff(Some(expected_readable_diff.clone())),
+            )
+            .expect("append first journal");
+        store
+            .append_journal(
+                journal_entry("push-2")
+                    .with_readable_diff(Some(readable_diff("Roadmap.md", "ignored\n"))),
+            )
+            .expect("append second journal");
+
+        let report = run_log(
+            &store,
+            LogOptions {
+                path: None,
+                push_id: Some(PushId("push-1".to_string())),
+                include_diff: true,
+            },
+        )
+        .expect("log report with readable diff");
+
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].push_id, "push-1");
+        assert_eq!(report.entries[0].author, "anonymous");
+        assert_eq!(
+            report.entries[0].previous_push_id.as_deref(),
+            Some("push-0")
+        );
+        assert_eq!(
+            report.entries[0].created_at_unix_ms,
+            Some(1_783_612_800_000)
+        );
+        assert_eq!(
+            report.entries[0].readable_diff,
+            Some(expected_readable_diff)
+        );
+
+        let report = run_log(
+            &store,
+            LogOptions {
+                path: None,
+                push_id: Some(PushId("push-1".to_string())),
+                include_diff: false,
+            },
+        )
+        .expect("log report without readable diff");
+
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].push_id, "push-1");
+        assert_eq!(report.entries[0].readable_diff, None);
+    }
+
+    #[test]
+    fn undo_report_does_not_include_readable_diff() {
+        let mut store = InMemoryStateStore::new();
+        let mut entry = journal_entry("push-1")
+            .with_readable_diff(Some(readable_diff("Roadmap.md", "large diff\n")));
+        entry.status = JournalStatus::Prepared;
+        store.append_journal(entry).expect("append journal");
+
+        let report = run_undo(&mut store, "push-1").expect("undo report");
+
+        assert!(report.ok);
+        assert_eq!(
+            report.entry.expect("undo entry").readable_diff,
+            None,
+            "undo reports must not leak saved readable diffs"
+        );
+    }
+
+    fn journal_entry(push_id: &str) -> JournalEntry {
+        JournalEntry::new(
+            PushId(push_id.to_string()),
+            MountId::new("notion-main"),
+            vec![RemoteId::new("page-1")],
+            PushPlan::new(
+                vec![RemoteId::new("page-1")],
+                vec![PushOperation::UpdateBlock {
+                    block_id: RemoteId::new("page-1-paragraph-1"),
+                    content: "Updated paragraph.".to_string(),
+                }],
+            ),
+            JournalStatus::Reconciled,
+        )
+    }
+
+    fn readable_diff(path: &str, text: &str) -> ReadableDiffOutput {
+        ReadableDiffOutput {
+            files: vec![ReadableDiffFileOutput {
+                path: path.to_string(),
+                old_label: format!("a/{path}"),
+                new_label: format!("b/{path}"),
+                status: ReadableDiffFileStatus::Modified,
+                patch: text.to_string(),
+            }],
+            text: text.to_string(),
+        }
     }
 }

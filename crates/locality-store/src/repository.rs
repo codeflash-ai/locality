@@ -203,6 +203,32 @@ pub trait JournalRepository {
     fn get_journal(&self, push_id: &PushId) -> StoreResult<Option<JournalEntry>>;
     fn list_journal(&self) -> StoreResult<Vec<JournalEntry>>;
 
+    fn latest_journal_for_entities(
+        &self,
+        mount_id: &MountId,
+        remote_ids: &[RemoteId],
+    ) -> StoreResult<Option<PushId>> {
+        let mut latest: Option<JournalEntry> = None;
+        for journal in self.list_journal()? {
+            if journal.mount_id != *mount_id {
+                continue;
+            }
+            if matches!(journal.status, JournalStatus::Reverted) {
+                continue;
+            }
+            if !journal_touches_any_entity(&journal, remote_ids) {
+                continue;
+            }
+            if latest
+                .as_ref()
+                .is_none_or(|current| journal_is_newer(&journal, current))
+            {
+                latest = Some(journal);
+            }
+        }
+        Ok(latest.map(|journal| journal.push_id))
+    }
+
     fn latest_failed_journal_for_entity(
         &self,
         mount_id: &MountId,
@@ -228,5 +254,52 @@ pub trait JournalRepository {
         }
 
         Ok(latest.map(|(_, message)| message))
+    }
+}
+
+fn journal_touches_any_entity(journal: &JournalEntry, remote_ids: &[RemoteId]) -> bool {
+    journal
+        .remote_ids
+        .iter()
+        .any(|id| remote_ids.iter().any(|target| target == id))
+        || journal
+            .plan
+            .affected_entities
+            .iter()
+            .any(|id| remote_ids.iter().any(|target| target == id))
+        || journal
+            .apply_effects
+            .iter()
+            .any(|effect| apply_effect_touches_any_entity(effect, remote_ids))
+}
+
+fn apply_effect_touches_any_entity(effect: &JournalApplyEffect, remote_ids: &[RemoteId]) -> bool {
+    match effect {
+        JournalApplyEffect::ArchivedEntity { entity_id, .. }
+        | JournalApplyEffect::UpdatedProperties { entity_id, .. }
+        | JournalApplyEffect::MovedEntity { entity_id, .. }
+        | JournalApplyEffect::CreatedEntity { entity_id, .. } => {
+            remote_ids.iter().any(|target| target == entity_id)
+        }
+        JournalApplyEffect::UpdatedBlock { .. }
+        | JournalApplyEffect::CreatedBlock { .. }
+        | JournalApplyEffect::MovedBlock { .. }
+        | JournalApplyEffect::ArchivedBlock { .. } => false,
+    }
+}
+
+fn journal_is_newer(candidate: &JournalEntry, current: &JournalEntry) -> bool {
+    match (
+        candidate.metadata.created_at_unix_ms,
+        current.metadata.created_at_unix_ms,
+    ) {
+        (Some(candidate_created_at), Some(current_created_at)) => {
+            candidate_created_at > current_created_at
+                || (candidate_created_at == current_created_at
+                    && candidate.push_id.0 > current.push_id.0)
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => candidate.push_id.0 > current.push_id.0,
     }
 }

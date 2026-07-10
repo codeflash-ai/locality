@@ -29,7 +29,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc restore <path> [--force] [--json]`
 - `loc reset --yes [--json]`
 - `loc undo [push-id] [--json]`
-- `loc log [path] [--json]`
+- `loc log [path] [--push-id <push-id>] [--diff] [--json]`
 - `loc config set <key=value>`
 - `loc file-provider register|start|run|stop|status|restart|open|unregister|list|reset [target] [--json]`
 
@@ -668,6 +668,23 @@ The first diff implementation resolves a path through the store, reads the canon
 
 The production command path uses the SQLite store. A real diff requires persisted mount, entity, and shadow rows for the target path.
 
+## Diff And Edit Log
+
+`loc diff <path>` is the read-only review surface for local edits. It resolves
+the path through Locality state, compares the current Markdown projection against
+the synced shadow, and prints the planned connector mutations plus a readable
+unified diff when file content changed.
+
+`loc push <path>` uses the same planning path and, unless `-y`/`--yes` or
+`--confirm` already covers the plan, asks for explicit approval before applying
+remote mutations. Once a push is journaled, Locality stores linked edit metadata
+and the readable diff in the durable push journal.
+
+`loc log --diff` reads those journaled diffs back for audit and review. Use
+`--push-id <push-id> --diff` to show the readable diff for one push entry; when
+a human log view has multiple entries, Locality keeps the list compact and
+prints the command to inspect each entry's diff.
+
 ## Initial `loc push --json` Shape
 
 The push implementation runs the same path resolution, parsing, validation, diffing, and guardrail evaluation as `loc diff`. It refuses `unresolved_conflict_markers`; edit the file to the intended final content and remove every marker line before pushing. When the plan is approved, it enters the journaled connector-apply executor. It supports `-y`/`--yes` for safe plans and `--confirm` for dangerous plans.
@@ -759,7 +776,15 @@ daemon stopped
 
 ## Initial `loc log --json` Shape
 
-`loc log [path]` reads the durable push journal from the SQLite state store. Without a path it lists all journal entries; with a path it resolves the path through the mount/entity mapping and lists entries that touched that entity.
+`loc log [path] [--push-id <push-id>] [--diff]` reads the durable push journal
+from the SQLite state store. Without a path it lists all journal entries; with a
+path it resolves the path through the mount/entity mapping and lists entries
+that touched that entity. `--push-id` filters the path-scoped result to one push
+entry. By default, JSON and human output omit saved readable diffs so regular log
+calls stay compact. Pass `--diff` to include them in JSON. In human output,
+`--diff` prints the saved readable diff when the result has one entry; for
+multi-entry results it prints per-entry `loc log --push-id <push-id> --diff`
+hints instead of dumping every diff body.
 
 Each JSON entry includes:
 
@@ -768,12 +793,21 @@ Each JSON entry includes:
 - `remote_ids`;
 - `status`: `prepared`, `applying`, `applied`, `reconciled`, `reverted`, or `failed`;
 - `failure`: the failed status message when present;
+- `author`: the journal metadata display name, currently `anonymous`;
+- `previous_push_id`: the prior linked push id when recorded;
+- `created_at_unix_ms`: the journal creation timestamp when recorded;
 - `preimage_count`;
 - `apply_effect_count`;
 - `plan_summary`;
-- `operation_count`.
+- `operation_count`;
+- `readable_diff`: optional readable diff output, present only when `--diff` is
+  used and the journal entry stored a diff.
 
-Human output is a compact git-log-style list headed by `push <push-id>`.
+Human output is a compact git-log-style list headed by `push <push-id>`. It
+prints linked edit fields such as `author`, `created_at_unix_ms`, and `previous`
+when available. With `--diff`, one-entry output prints the saved readable diff
+text; multi-entry output prints a `diff: loc log --push-id <push-id> --diff`
+hint for each entry that has a saved diff.
 
 ## Initial `loc undo --json` Shape
 

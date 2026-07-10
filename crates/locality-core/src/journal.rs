@@ -7,11 +7,56 @@
 use crate::LocalityResult;
 use crate::model::{MountId, RemoteId};
 use crate::planner::{PushOperation, PushPlan};
+use crate::readable_diff::ReadableDiffOutput;
 use crate::shadow::ShadowDocument;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PushId(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalMetadata {
+    pub author: JournalAuthor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_push_id: Option<PushId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_unix_ms: Option<u128>,
+}
+
+impl Default for JournalMetadata {
+    fn default() -> Self {
+        Self {
+            author: JournalAuthor {
+                kind: JournalAuthorKind::Anonymous,
+                display_name: "anonymous".to_string(),
+            },
+            previous_push_id: None,
+            created_at_unix_ms: None,
+        }
+    }
+}
+
+impl JournalMetadata {
+    pub fn anonymous(previous_push_id: Option<PushId>, created_at_unix_ms: Option<u128>) -> Self {
+        Self {
+            previous_push_id,
+            created_at_unix_ms,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalAuthor {
+    pub kind: JournalAuthorKind,
+    pub display_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalAuthorKind {
+    Anonymous,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalEntry {
@@ -22,6 +67,10 @@ pub struct JournalEntry {
     pub preimages: Vec<JournalPreimage>,
     pub apply_effects: Vec<JournalApplyEffect>,
     pub status: JournalStatus,
+    #[serde(default)]
+    pub metadata: JournalMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readable_diff: Option<ReadableDiffOutput>,
 }
 
 impl JournalEntry {
@@ -40,6 +89,8 @@ impl JournalEntry {
             preimages: Vec::new(),
             apply_effects: Vec::new(),
             status,
+            metadata: JournalMetadata::default(),
+            readable_diff: None,
         }
     }
 
@@ -50,6 +101,16 @@ impl JournalEntry {
 
     pub fn with_apply_effects(mut self, apply_effects: Vec<JournalApplyEffect>) -> Self {
         self.apply_effects = apply_effects;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: JournalMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn with_readable_diff(mut self, readable_diff: Option<ReadableDiffOutput>) -> Self {
+        self.readable_diff = readable_diff;
         self
     }
 }
@@ -183,5 +244,61 @@ fn operation_kind(operation: &PushOperation) -> &'static str {
         PushOperation::UpdateProperties { .. } => "update_properties",
         PushOperation::MoveEntity { .. } => "move_entity",
         PushOperation::CreateEntity { .. } => "create_entity",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planner::{PlanSummary, PushPlan};
+    use crate::readable_diff::ReadableDiffOutput;
+
+    #[test]
+    fn new_journal_entries_default_to_anonymous_metadata() {
+        let entry = JournalEntry::new(
+            PushId("push-2".to_string()),
+            MountId::new("notion-main"),
+            vec![RemoteId::new("page-1")],
+            PushPlan {
+                summary: PlanSummary::default(),
+                affected_entities: vec![RemoteId::new("page-1")],
+                operations: Vec::new(),
+                degradations: Vec::new(),
+            },
+            JournalStatus::Prepared,
+        );
+
+        assert_eq!(entry.metadata.author.kind, JournalAuthorKind::Anonymous);
+        assert_eq!(entry.metadata.author.display_name, "anonymous");
+        assert_eq!(entry.metadata.previous_push_id, None);
+        assert_eq!(entry.metadata.created_at_unix_ms, None);
+        assert_eq!(entry.readable_diff, None);
+    }
+
+    #[test]
+    fn journal_entry_builders_set_metadata_and_readable_diff() {
+        let metadata = JournalMetadata::anonymous(Some(PushId("push-1".to_string())), Some(12_345));
+        let readable_diff = ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/page.md b/page.md\n".to_string(),
+        };
+
+        let entry = JournalEntry::new(
+            PushId("push-2".to_string()),
+            MountId::new("notion-main"),
+            vec![RemoteId::new("page-1")],
+            PushPlan {
+                summary: PlanSummary::default(),
+                affected_entities: vec![RemoteId::new("page-1")],
+                operations: Vec::new(),
+                degradations: Vec::new(),
+            },
+            JournalStatus::Prepared,
+        )
+        .with_metadata(metadata.clone())
+        .with_readable_diff(Some(readable_diff.clone()));
+
+        assert_eq!(entry.metadata, metadata);
+        assert_eq!(entry.readable_diff, Some(readable_diff));
     }
 }

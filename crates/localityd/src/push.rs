@@ -13,14 +13,16 @@ use locality_connector::{ApplyPlanRequest, ApplyPlanResult, Connector};
 
 use locality_core::canonical::{
     CanonicalParseError, CanonicalParseErrorKind, parse_canonical_markdown,
+    render_canonical_markdown,
 };
 use locality_core::conflict::unresolved_conflict_marker_line;
 use locality_core::diff::property_value_from_frontmatter;
 use locality_core::freshness::RemoteVersion;
 use locality_core::journal::{
-    JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
+    JournalApplyEffect, JournalEntry, JournalMetadata, JournalPreimage, JournalStatus,
+    JournalStore, PushId,
 };
-use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::path_projection::{
     is_page_document_path, page_container_path, page_document_path,
 };
@@ -169,6 +171,7 @@ where
             mount_id: prepared.mount.mount_id,
             entity_id: prepared.entity.remote_id,
             pipeline: prepared.pipeline,
+            readable_diff: prepared.readable_diff,
             action: PushJobAction::NotReady,
             execution: None,
             push_id: None,
@@ -309,12 +312,30 @@ where
         &prepared.entity,
         &prepared.pipeline,
     )?;
+    let remote_ids = prepared
+        .pipeline
+        .plan
+        .as_ref()
+        .map(|plan| plan.affected_entities.clone())
+        .unwrap_or_else(|| vec![prepared.entity.remote_id.clone()]);
+    let previous_push_id =
+        store.latest_journal_for_entities(&prepared.mount.mount_id, &remote_ids)?;
+    let created_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis());
+    let readable_diff = prepared.readable_diff.clone();
     let mut execution_request = PushExecutionRequest::new(
         push_id.clone(),
         prepared.mount.mount_id.clone(),
         prepared.pipeline.clone(),
     )
-    .with_remote_preconditions(remote_preconditions);
+    .with_remote_preconditions(remote_preconditions)
+    .with_metadata(JournalMetadata::anonymous(
+        previous_push_id,
+        created_at_unix_ms,
+    ))
+    .with_readable_diff(readable_diff.clone());
 
     if !prepared.shadows.is_empty() {
         execution_request = execution_request.with_preimages(
@@ -352,6 +373,7 @@ where
             mount_id: prepared.mount.mount_id,
             entity_id: prepared.entity.remote_id,
             pipeline: prepared.pipeline,
+            readable_diff: readable_diff.clone(),
             action: PushJobAction::from_execution(&result),
             push_id: Some(result.push_id.clone()),
             journal_status: result.journal_status.clone(),
@@ -363,6 +385,7 @@ where
             mount_id: prepared.mount.mount_id,
             entity_id: prepared.entity.remote_id,
             pipeline: prepared.pipeline,
+            readable_diff,
             action: PushJobAction::Failed,
             execution: None,
             push_id: Some(push_id.clone()),
@@ -1288,6 +1311,44 @@ pub struct PreparedPush {
     pub entity: EntityRecord,
     pub shadows: Vec<ShadowDocument>,
     pub pipeline: PushPipelineResult,
+    pub readable_diff: Option<locality_core::readable_diff::ReadableDiffOutput>,
+}
+
+fn readable_diff_for_existing_entity(
+    relative_path: &Path,
+    shadow: &ShadowDocument,
+    local_text: &str,
+    pipeline: &PushPipelineResult,
+) -> Option<locality_core::readable_diff::ReadableDiffOutput> {
+    let plan = pipeline.plan.as_ref()?;
+    if plan.operations.is_empty() {
+        return None;
+    }
+    let old = render_canonical_markdown(&CanonicalDocument::new(
+        shadow.frontmatter.clone(),
+        shadow.rendered_body.clone(),
+    ));
+    locality_core::readable_diff::readable_diff_for_file(
+        locality_platform::logical_path_display(relative_path),
+        Some(&old),
+        Some(local_text),
+    )
+}
+
+fn readable_diff_for_created_entity(
+    source_path: &Path,
+    local_text: &str,
+    pipeline: &PushPipelineResult,
+) -> Option<locality_core::readable_diff::ReadableDiffOutput> {
+    let plan = pipeline.plan.as_ref()?;
+    if plan.operations.is_empty() {
+        return None;
+    }
+    locality_core::readable_diff::readable_diff_for_file(
+        locality_platform::logical_path_display(source_path),
+        None,
+        Some(local_text),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1452,6 +1513,7 @@ where
             entity,
             shadows: Vec::new(),
             pipeline: validation_pipeline(unresolved_conflict_marker_issue(&relative_path, line)),
+            readable_diff: None,
         });
     }
 
@@ -1464,6 +1526,7 @@ where
                 entity,
                 shadows: Vec::new(),
                 pipeline: validation_pipeline(parse_error_issue(&relative_path, error)),
+                readable_diff: None,
             });
         }
     };
@@ -1484,6 +1547,7 @@ where
                 "frontmatter `loc.id` does not match the entity mapped to this path",
                 Some("restore the generated `loc.id` for this file before pushing".to_string()),
             )),
+            readable_diff: None,
         });
     }
 
@@ -1525,6 +1589,8 @@ where
     );
     validate_notion_pre_apply_semantics(&mount, &relative_path, &shadow, &mut pipeline);
     validate_google_docs_pre_apply_semantics(&mount, &relative_path, &shadow, &mut pipeline);
+    let readable_diff =
+        readable_diff_for_existing_entity(&relative_path, &shadow, &contents, &pipeline);
 
     Ok(PreparedPush {
         absolute_path,
@@ -1532,6 +1598,7 @@ where
         entity,
         shadows: vec![shadow],
         pipeline,
+        readable_diff,
     })
 }
 
@@ -1563,6 +1630,7 @@ where
             entity: parent,
             shadows: Vec::new(),
             pipeline: validation_pipeline(unresolved_conflict_marker_issue(&relative_path, line)),
+            readable_diff: None,
         });
     }
     let parsed = match parsed {
@@ -1574,6 +1642,7 @@ where
                 entity: parent,
                 shadows: Vec::new(),
                 pipeline: validation_pipeline(parse_error_issue(&relative_path, error)),
+                readable_diff: None,
             });
         }
     };
@@ -1596,12 +1665,15 @@ where
         },
         schema_validation,
     );
+    let local_text = render_canonical_markdown(&parsed.document);
+    let readable_diff = readable_diff_for_created_entity(&relative_path, &local_text, &pipeline);
     Ok(PreparedPush {
         absolute_path,
         mount,
         entity: parent,
         shadows: Vec::new(),
         pipeline,
+        readable_diff,
     })
 }
 
@@ -1783,6 +1855,7 @@ where
                         &pending.projected_path,
                         error,
                     )),
+                    readable_diff: None,
                 });
             }
         },
@@ -1803,6 +1876,7 @@ where
                 &pending.projected_path,
                 line,
             )),
+            readable_diff: None,
         });
     }
     prepare_pending_create_from_parsed(
@@ -1926,12 +2000,16 @@ where
         },
         schema_validation,
     );
+    let local_text = render_canonical_markdown(&parsed.document);
+    let readable_diff =
+        readable_diff_for_created_entity(&pending.projected_path, &local_text, &pipeline);
     Ok(PreparedPush {
         absolute_path,
         mount,
         entity: parent,
         shadows: Vec::new(),
         pipeline,
+        readable_diff,
     })
 }
 
@@ -2140,6 +2218,7 @@ where
                 PushStage::PlanAndConfirm,
             ],
         },
+        readable_diff: None,
     })
 }
 

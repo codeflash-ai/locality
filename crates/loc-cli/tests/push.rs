@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use loc_cli::push::{
-    PushOptions, push_report_exit_code, run_push, run_push_with_daemon,
+    PushOptions, PushReport, push_report_exit_code, run_push, run_push_with_daemon,
     run_push_with_daemon_at_state_root, select_push_targets,
 };
 use locality_connector::{
@@ -28,6 +28,7 @@ use locality_core::model::{
 };
 use locality_core::planner::{GuardrailDecision, PushOperation, PushPlan};
 use locality_core::push::{PushPipelineAction, PushPipelineResult, PushStage};
+use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
@@ -711,6 +712,22 @@ fn push_json_preview_uses_cli_diff_plan_when_running_daemon_has_stale_planner() 
 }
 
 #[test]
+fn daemon_push_report_preserves_readable_diff_for_cli_preview() {
+    let fixture = PushFixture::new();
+    let mut daemon_report =
+        stale_daemon_push_report(&fixture.root.join("Roadmap.md"), &fixture.mount_id);
+    let readable_diff = ReadableDiffOutput {
+        files: Vec::new(),
+        text: "diff --locality a/Roadmap.md b/Roadmap.md\n-Old\n+New\n".to_string(),
+    };
+    daemon_report.readable_diff = Some(readable_diff.clone());
+
+    let report = PushReport::from_daemon(daemon_report);
+
+    assert_eq!(report.readable_diff, Some(readable_diff));
+}
+
+#[test]
 fn approved_push_refuses_stale_daemon_plan_before_apply() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
@@ -1065,6 +1082,7 @@ fn stale_daemon_push_report(path: &Path, mount_id: &MountId) -> PushJobReport {
                 PushStage::PlanAndConfirm,
             ],
         },
+        readable_diff: None,
         action: PushJobAction::NotReady,
         execution: None,
         push_id: None,

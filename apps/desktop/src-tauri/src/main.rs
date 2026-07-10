@@ -13235,6 +13235,7 @@ mod tests {
             entity_id: "abc".to_string(),
             validation: Vec::new(),
             plan: None,
+            readable_diff: None,
             guardrail: loc_cli::diff::GuardrailOutput {
                 decision: "proceed".to_string(),
                 reasons: Vec::new(),
