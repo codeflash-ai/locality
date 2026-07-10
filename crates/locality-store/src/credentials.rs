@@ -154,7 +154,7 @@ const COMPAT_KEYCHAIN_SERVICES: [&str; 2] = [PRIMARY_KEYCHAIN_SERVICE, "afs"];
 #[cfg(target_os = "macos")]
 impl CredentialStore for KeychainCredentialStore {
     fn put(&self, secret_ref: &str, secret: &str) -> CredentialResult<()> {
-        let status = std::process::Command::new("security")
+        let output = std::process::Command::new("security")
             .args([
                 "add-generic-password",
                 "-a",
@@ -165,9 +165,9 @@ impl CredentialStore for KeychainCredentialStore {
                 secret,
                 "-U",
             ])
-            .status()
+            .output()
             .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
-        if status.success() {
+        if output.status.success() {
             Ok(())
         } else {
             Err(CredentialError::Unavailable(
@@ -193,7 +193,7 @@ impl CredentialStore for KeychainCredentialStore {
         for service in COMPAT_KEYCHAIN_SERVICES {
             let _ = std::process::Command::new("security")
                 .args(["delete-generic-password", "-a", secret_ref, "-s", service])
-                .status()
+                .output()
                 .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
         }
         Ok(())
