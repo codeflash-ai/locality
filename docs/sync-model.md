@@ -460,6 +460,11 @@ Current implementation:
   renders the same body, block tree, title, and properties as the previous
   Synced Tree shadow, Locality keeps the remote hint pending and retries instead
   of advancing the synced version into a false-clean state.
+- Active Live Mode pages can queue same-version content probes instead of relying
+  only on `last_edited_time`. After a Live Mode local push, Locality also treats
+  same-version Notion observations for that page as worth probing for 60 seconds.
+  This covers Notion timestamp coalescing, where a quick remote edit can leave
+  `last_edited_time` unchanged even though the rendered page body has changed.
 
 ### Stage 8: Remote Change Explanation
 

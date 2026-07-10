@@ -18,6 +18,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
 use loc_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
 use loc_cli::daemon::{DaemonRunState, run_daemon_control};
 use loc_cli::diff::{DiffReport, run_diff};
@@ -43,6 +45,8 @@ use loc_cli::search::{
     run_search_with_access_roots, source_url_host,
 };
 use loc_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
+#[cfg(test)]
+use locality_connector::ConnectorCapabilities;
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::conflict::{
     has_unresolved_conflict_markers, render_inline_conflict_markdown_with_base,
@@ -51,14 +55,16 @@ use locality_core::freshness::RemoteVersion;
 use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::journal::{JournalEntry, JournalStatus};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 use locality_notion::NotionConfig;
+#[cfg(test)]
+use locality_notion::NotionConnector;
 use locality_notion::client::notion_requests_per_second_setting;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 use locality_notion::client::{HttpNotionApi, NotionApi};
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 use locality_notion::dto::{BlockDto, RichTextBlockDto, RichTextDto};
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 use locality_notion::oauth::StoredNotionCredential;
 use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
@@ -78,6 +84,8 @@ use locality_store::{
     VirtualMutationRecord, VirtualMutationRepository, is_live_mode_state_change_signal_path,
     open_credential_store, reset_locality_state_storage, save_mount_live_mode_and_publish_signal,
 };
+#[cfg(test)]
+use locality_store::{ConnectorProfileId, ConnectorProfileRecord, ConnectorProfileRepository};
 use localityd::autosave::auto_save_timestamp;
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
 use localityd::hydration::HydrationSource;
@@ -1640,13 +1648,13 @@ fn live_mode_tick_blocking() -> ActionReport {
         };
     }
 
-    let report = live_mode_tick_blocking_inner();
+    let state_root = default_state_root();
+    let report = live_mode_tick_blocking_at_state_root(&state_root);
     LIVE_MODE_TICK_IN_PROGRESS.store(false, Ordering::Release);
     report
 }
 
-fn live_mode_tick_blocking_inner() -> ActionReport {
-    let state_root = default_state_root();
+fn live_mode_tick_blocking_at_state_root(state_root: &Path) -> ActionReport {
     let mount = match live_mode_enabled_mount(&state_root) {
         Ok(Some(mount)) => mount,
         Ok(None) => {
@@ -1685,7 +1693,7 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
         return ActionReport { ok: false, message };
     }
 
-    match load_desktop_snapshot() {
+    match load_desktop_snapshot_at_state_root(state_root) {
         Ok(mut snapshot) => {
             let remote_targets = if snapshot.pending_changes.is_empty()
                 && live_mode_remote_pull_scan_is_due(mount)
@@ -1711,7 +1719,7 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
                 }
             }
             if !remote_targets.is_empty() {
-                snapshot = match load_desktop_snapshot() {
+                snapshot = match load_desktop_snapshot_at_state_root(state_root) {
                     Ok(snapshot) => snapshot,
                     Err(message) => {
                         return ActionReport {
@@ -1734,7 +1742,7 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
                         format!("pushing `{}` from Live Mode", target.display()),
                     );
                     let started = Instant::now();
-                    match push_target_direct(target, false) {
+                    match push_target_direct_at_state_root(state_root, target, false) {
                         Ok(push_report) if push_report_exit_code(&push_report) == 0 => {
                             desktop_log(
                                 "info",
@@ -1766,7 +1774,7 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
                         }
                     }
                 },
-                live_mode_queue_remote_fast_forward,
+                |target| live_mode_queue_remote_fast_forward_at_state_root(state_root, target),
                 live_mode_merge_remote_drift_target,
             )
         }
@@ -2256,7 +2264,8 @@ where
         .filter(|entity| {
             let freshness = freshness_by_remote_id.get(&entity.remote_id);
             live_mode_target_is_recently_active(freshness, now_ms)
-                && live_mode_remote_check_is_due(freshness, now_ms)
+                && (freshness.is_some_and(|freshness| freshness.remote_hint_pending)
+                    || live_mode_remote_check_is_due(freshness, now_ms))
         })
         .map(|entity| LiveModeRemoteTarget {
             mount_id: mount.mount_id.clone(),
@@ -2486,12 +2495,18 @@ fn live_mode_should_reconcile_local_target_for_key(
     true
 }
 
-fn live_mode_queue_remote_fast_forward(target: &LiveModeRemoteTarget) -> Result<(), String> {
-    live_mode_send_daemon_queue_request(DaemonRequest::RemoteFastForward {
-        mount_id: target.mount_id.0.clone(),
-        remote_id: target.remote_id.0.clone(),
-        path: target.path.clone(),
-    })?;
+fn live_mode_queue_remote_fast_forward_at_state_root(
+    state_root: &Path,
+    target: &LiveModeRemoteTarget,
+) -> Result<(), String> {
+    live_mode_send_daemon_queue_request_at_state_root(
+        state_root,
+        DaemonRequest::RemoteFastForward {
+            mount_id: target.mount_id.0.clone(),
+            remote_id: target.remote_id.0.clone(),
+            path: target.path.clone(),
+        },
+    )?;
     desktop_log(
         "info",
         "live_mode_remote_fast_forward_queued",
@@ -2505,8 +2520,11 @@ fn live_mode_queue_remote_fast_forward(target: &LiveModeRemoteTarget) -> Result<
     Ok(())
 }
 
-fn live_mode_send_daemon_queue_request(request: DaemonRequest) -> Result<(), String> {
-    match send_request(&default_state_root(), &request) {
+fn live_mode_send_daemon_queue_request_at_state_root(
+    state_root: &Path,
+    request: DaemonRequest,
+) -> Result<(), String> {
+    match send_request(state_root, &request) {
         Ok(response) if response.ok => Ok(()),
         Ok(response) => {
             let message = response
@@ -2941,7 +2959,12 @@ fn schedule_update_relaunch_blocking() -> Result<String, String> {
 
 fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     let state_root = default_state_root();
-    let store = SqliteStateStore::open(state_root.clone()).map_err(|error| error.to_string())?;
+    load_desktop_snapshot_at_state_root(&state_root)
+}
+
+fn load_desktop_snapshot_at_state_root(state_root: &Path) -> Result<DesktopSnapshot, String> {
+    let store =
+        SqliteStateStore::open(state_root.to_path_buf()).map_err(|error| error.to_string())?;
     load_desktop_snapshot_from_store(&store, &state_root)
 }
 
@@ -9479,7 +9502,15 @@ fn reusable_notion_connection_id(store: &SqliteStateStore) -> Option<ConnectionI
 
 fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushReport, String> {
     let state_root = default_state_root();
-    let mut store = SqliteStateStore::open(state_root.clone())
+    push_target_direct_at_state_root(&state_root, target, confirm_dangerous)
+}
+
+fn push_target_direct_at_state_root(
+    state_root: &Path,
+    target: &Path,
+    confirm_dangerous: bool,
+) -> Result<PushReport, String> {
+    let mut store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
     let target = absolute_path(target)?;
     reconcile_desktop_projection_changes(&mut store, &state_root, Some(&target))?;
@@ -10206,12 +10237,11 @@ mod tests {
         virtual_projection_waits_for_mount_point_children_before_registration,
         wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(test)]
     use super::{
         LiveModeE2eCleanup, live_mode_e2e_append_local_marker, live_mode_e2e_append_remote_marker,
-        live_mode_e2e_notion_api, live_mode_e2e_page_id, live_mode_e2e_page_path,
-        live_mode_e2e_remote_text, live_mode_e2e_wait_until, live_mode_tick_blocking,
-        unique_suffix,
+        live_mode_e2e_context, live_mode_e2e_remote_text, live_mode_e2e_wait_until,
+        live_mode_tick_blocking_at_state_root, unique_suffix,
     };
     #[cfg(target_os = "windows")]
     use super::{
@@ -11030,24 +11060,14 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "requires LOCALITY_DESKTOP_LIVE_MODE_E2E=1, a scratch CloudStorage page path, and live Notion auth; mutates then cleans up the page"]
+    #[ignore = "requires live Notion credentials and LOCALITY_NOTION_LIVE_PARENT_PAGE, or LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE; mutates then cleans up scratch content"]
     fn live_mode_bidirectional_cloudstorage_markdown_e2e() {
-        assert_eq!(
-            std::env::var("LOCALITY_DESKTOP_LIVE_MODE_E2E").as_deref(),
-            Ok("1"),
-            "set LOCALITY_DESKTOP_LIVE_MODE_E2E=1 to confirm this live destructive test"
-        );
-        let page_path = live_mode_e2e_page_path();
-        assert!(
-            page_path
-                .to_string_lossy()
-                .contains("/Library/CloudStorage/"),
-            "LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE must be a CloudStorage-visible page.md path"
-        );
-        let page_id = live_mode_e2e_page_id(&page_path);
-        let api = live_mode_e2e_notion_api(&page_path);
+        let context = live_mode_e2e_context();
+        let page_path = context.page_path.clone();
+        let page_id = context.page_id.clone();
+        let api = context.api.clone();
+        let state_root = context.state_root.clone();
         let run_id = format!("locality-desktop-live-e2e-{}", unique_suffix());
         let cleanup = LiveModeE2eCleanup {
             api: api.clone(),
@@ -11056,7 +11076,7 @@ mod tests {
         };
 
         live_mode_e2e_wait_until("initial page is clean", || {
-            live_mode_tick_blocking().ok
+            live_mode_tick_blocking_at_state_root(&state_root).ok
                 && fs::read_to_string(&page_path)
                     .map(|contents| !contents.contains("<<<<<<<"))
                     .unwrap_or(false)
@@ -11066,7 +11086,7 @@ mod tests {
             let marker = format!("{run_id} local-to-cloud {index}");
             live_mode_e2e_append_local_marker(&page_path, &marker);
             live_mode_e2e_wait_until(&format!("local marker {index} reaches Notion"), || {
-                live_mode_tick_blocking().ok
+                live_mode_tick_blocking_at_state_root(&state_root).ok
                     && live_mode_e2e_remote_text(&api, &page_id).contains(&marker)
             });
         }
@@ -11075,9 +11095,9 @@ mod tests {
             let marker = format!("{run_id} cloud-to-local {index}");
             live_mode_e2e_append_remote_marker(&api, &page_id, &marker);
             live_mode_e2e_wait_until(
-                &format!("remote marker {index} reaches CloudStorage"),
+                &format!("remote marker {index} reaches the local file"),
                 || {
-                    live_mode_tick_blocking().ok
+                    live_mode_tick_blocking_at_state_root(&state_root).ok
                         && fs::read_to_string(&page_path)
                             .map(|contents| contents.contains(&marker))
                             .unwrap_or(false)
@@ -11086,8 +11106,8 @@ mod tests {
         }
 
         drop(cleanup);
-        live_mode_e2e_wait_until("cleanup reaches CloudStorage", || {
-            live_mode_tick_blocking().ok
+        live_mode_e2e_wait_until("cleanup reaches the local file", || {
+            live_mode_tick_blocking_at_state_root(&state_root).ok
                 && fs::read_to_string(&page_path)
                     .map(|contents| !contents.contains(&run_id))
                     .unwrap_or(false)
@@ -11512,6 +11532,48 @@ mod tests {
         let candidates = live_mode_remote_pull_candidates(&store, &mount).expect("candidates");
 
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn live_mode_remote_pull_candidates_include_pending_remote_hints_without_poll_delay() {
+        let mount_id = MountId::new("notion-main");
+        let mount = MountConfig::new(mount_id.clone(), "notion", "/tmp/Locality/notion");
+        let mut store = InMemoryStateStore::default();
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("hinted-page"),
+                    EntityKind::Page,
+                    "Hinted",
+                    "teamspace-home/hinted/page.md",
+                )
+                .with_hydration(HydrationState::Hydrated),
+            )
+            .expect("save hydrated page");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(
+                    mount_id,
+                    RemoteId::new("hinted-page"),
+                    FreshnessTier::Hot,
+                )
+                .opened_at(activity_timestamp())
+                .checked_at(activity_timestamp())
+                .remote_hint_pending(true),
+            )
+            .expect("save pending freshness");
+
+        let candidates = live_mode_remote_pull_candidates(&store, &mount).expect("candidates");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].remote_id, RemoteId::new("hinted-page"));
+        assert!(
+            candidates[0]
+                .path
+                .ends_with("teamspace-home/hinted/page.md")
+        );
     }
 
     #[test]
@@ -14271,24 +14333,67 @@ fn live_mode_target(path: &str) -> LiveModeRemoteTarget {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
+struct LiveModeE2eContext {
+    state_root: PathBuf,
+    page_path: PathBuf,
+    page_id: String,
+    api: HttpNotionApi,
+    scratch_page_id: Option<String>,
+    temp_root: Option<PathBuf>,
+    owns_daemon: bool,
+}
+
+#[cfg(test)]
+impl Drop for LiveModeE2eContext {
+    fn drop(&mut self) {
+        if self.owns_daemon {
+            let _ = run_daemon_control(&daemon_control_args_any_manager("stop", &self.state_root));
+        }
+        if let Some(page_id) = self.scratch_page_id.as_ref() {
+            let _ = self.api.delete_block(page_id);
+        }
+        if let Some(temp_root) = self.temp_root.as_ref() {
+            let _ = fs::remove_dir_all(temp_root);
+        }
+    }
+}
+
+#[cfg(test)]
 struct LiveModeE2eCleanup {
     api: HttpNotionApi,
     page_id: String,
     run_id: String,
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 impl Drop for LiveModeE2eCleanup {
     fn drop(&mut self) {
         let _ = live_mode_e2e_delete_marker_blocks(&self.api, &self.page_id, &self.run_id);
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
-fn live_mode_e2e_page_path() -> PathBuf {
-    let raw = std::env::var("LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE")
-        .expect("set LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE to a scratch CloudStorage page.md path");
+#[cfg(test)]
+fn live_mode_e2e_context() -> LiveModeE2eContext {
+    if let Ok(raw) = std::env::var("LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE")
+        && !raw.trim().is_empty()
+    {
+        let page_path = live_mode_e2e_expand_path(&raw);
+        return LiveModeE2eContext {
+            state_root: default_state_root(),
+            page_id: live_mode_e2e_page_id(&page_path),
+            api: live_mode_e2e_notion_api(&page_path),
+            page_path,
+            scratch_page_id: None,
+            temp_root: None,
+            owns_daemon: false,
+        };
+    }
+    live_mode_e2e_provision_scratch_context()
+}
+
+#[cfg(test)]
+fn live_mode_e2e_expand_path(raw: &str) -> PathBuf {
     let expanded = expand_tilde(&raw).unwrap_or_else(|_| PathBuf::from(raw));
     if expanded.is_absolute() {
         expanded
@@ -14297,14 +14402,224 @@ fn live_mode_e2e_page_path() -> PathBuf {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
+fn live_mode_e2e_provision_scratch_context() -> LiveModeE2eContext {
+    let token = live_mode_e2e_required_env("NOTION_TOKEN");
+    let parent_page_id = live_mode_e2e_notion_page_id_from_raw(&live_mode_e2e_required_env(
+        "LOCALITY_NOTION_LIVE_PARENT_PAGE",
+    ));
+    let api = HttpNotionApi::new(NotionConfig::default().with_token(token.clone()));
+    let title = format!("Locality desktop Live Mode e2e {}", unique_suffix());
+    let page = api
+        .create_page(serde_json::json!({
+            "parent": {
+                "type": "page_id",
+                "page_id": parent_page_id,
+            },
+            "properties": {
+                "title": {
+                    "title": [{
+                        "type": "text",
+                        "text": { "content": title }
+                    }]
+                }
+            },
+            "children": [{
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{
+                        "type": "text",
+                        "text": { "content": "Original paragraph for desktop Live Mode e2e." }
+                    }]
+                }
+            }]
+        }))
+        .expect("create desktop Live Mode scratch page");
+    let temp_root =
+        std::env::temp_dir().join(format!("locality-desktop-live-e2e-{}", unique_suffix()));
+    let state_root = temp_root.join(".loc");
+    let mount_root = temp_root.join("Locality").join("notion");
+    fs::create_dir_all(&state_root).expect("create live desktop state root");
+    fs::create_dir_all(&mount_root).expect("create live desktop mount root");
+
+    live_mode_e2e_seed_notion_connection(&state_root, &token);
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open live desktop state");
+    let mount_id = MountId::new("notion-main");
+    run_mount(
+        &mut store,
+        MountOptions {
+            mount_id: mount_id.clone(),
+            connector: "notion".to_string(),
+            root: mount_root.clone(),
+            remote_root_id: Some(RemoteId::new(page.id.clone())),
+            connection_id: Some(ConnectionId::new("notion-default")),
+            read_only: false,
+            projection: ProjectionMode::PlainFiles,
+        },
+    )
+    .expect("mount live desktop scratch page");
+    store
+        .save_mount_live_mode(MountLiveModeRecord::new(
+            mount_id,
+            true,
+            localityd::freshness::freshness_timestamp(),
+        ))
+        .expect("enable live mode for scratch mount");
+
+    let connector = NotionConnector::new(NotionConfig::default().with_token(token));
+    run_pull_with_state_root(
+        &mut store,
+        &connector,
+        mount_root.clone(),
+        Some(&state_root),
+    )
+    .expect("pull live desktop scratch page");
+    start_live_mode_e2e_daemon(&state_root);
+    let page_path = mount_root.join("page.md");
+    assert!(
+        page_path.exists(),
+        "live desktop scratch pull should materialize {}",
+        page_path.display()
+    );
+
+    LiveModeE2eContext {
+        state_root,
+        page_path,
+        page_id: page.id.clone(),
+        api,
+        scratch_page_id: Some(page.id),
+        temp_root: Some(temp_root),
+        owns_daemon: true,
+    }
+}
+
+#[cfg(test)]
+fn live_mode_e2e_notion_page_id_from_raw(raw: &str) -> String {
+    let compact = notion_id_from_url(raw).unwrap_or_else(|| raw.trim().replace('-', ""));
+    if compact.len() == 32 && compact.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &compact[0..8],
+            &compact[8..12],
+            &compact[12..16],
+            &compact[16..20],
+            &compact[20..32]
+        )
+    } else {
+        compact
+    }
+}
+
+#[cfg(test)]
+fn live_mode_e2e_required_env(key: &str) -> String {
+    std::env::var(key)
+        .map(|value| value.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "set {key} for live_mode_bidirectional_cloudstorage_markdown_e2e, or set LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE to an existing scratch page.md"
+            )
+        })
+}
+
+#[cfg(test)]
+fn live_mode_e2e_seed_notion_connection(state_root: &Path, token: &str) {
+    let now = localityd::freshness::freshness_timestamp();
+    let connection_id = ConnectionId::new("notion-default");
+    let profile_id = ConnectorProfileId::new(DEFAULT_NOTION_PROFILE_ID);
+    let secret_ref = format!("connection:{}", connection_id.as_str());
+    let credentials = open_credential_store(state_root);
+    credentials
+        .put(&secret_ref, token)
+        .expect("seed live desktop Notion credential");
+    let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open live state");
+    store
+        .save_connector_profile(ConnectorProfileRecord {
+            profile_id: profile_id.clone(),
+            connector: "notion".to_string(),
+            display_name: "Notion token auth".to_string(),
+            auth_kind: "token".to_string(),
+            scopes: vec![],
+            capabilities_json: live_mode_e2e_notion_capabilities_json(),
+            enabled_actions_json: "[\"read\",\"write\"]".to_string(),
+            connector_version: "notion.v1".to_string(),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+        .expect("seed live desktop connector profile");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id,
+            profile_id: Some(profile_id),
+            connector: "notion".to_string(),
+            display_name: "notion-default".to_string(),
+            account_label: None,
+            workspace_id: None,
+            workspace_name: None,
+            auth_kind: "token".to_string(),
+            secret_ref,
+            scopes: vec![],
+            capabilities_json: live_mode_e2e_notion_capabilities_json(),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .expect("seed live desktop connection");
+}
+
+#[cfg(test)]
+fn live_mode_e2e_notion_capabilities_json() -> String {
+    serde_json::to_string(&ConnectorCapabilities {
+        supports_block_updates: true,
+        supports_databases: true,
+        supports_oauth: true,
+        supports_remote_observation: true,
+        supports_lazy_child_enumeration: true,
+        supports_media_download: true,
+        supports_undo: true,
+        supports_batch_observation: false,
+    })
+    .expect("serialize Notion capabilities")
+}
+
+#[cfg(test)]
+fn start_live_mode_e2e_daemon(state_root: &Path) {
+    let mut args = daemon_control_args("start", state_root);
+    if !args.iter().any(|arg| arg == "--localityd-bin") {
+        if let Some(localityd_bin) = live_mode_e2e_localityd_bin() {
+            args.push("--localityd-bin".to_string());
+            args.push(localityd_bin.display().to_string());
+        }
+    }
+    let report = run_daemon_control(&args)
+        .unwrap_or_else(|error| panic!("start live desktop daemon: {}", error.message()));
+    assert_eq!(
+        report.state,
+        DaemonRunState::Running,
+        "live desktop daemon should start: {report:?}"
+    );
+}
+
+#[cfg(test)]
+fn live_mode_e2e_localityd_bin() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let debug_dir = exe.parent()?.parent()?;
+    let candidate = debug_dir.join("localityd");
+    candidate.exists().then_some(candidate)
+}
+
+#[cfg(test)]
 fn live_mode_e2e_page_id(page_path: &Path) -> String {
     if let Ok(page_id) = std::env::var("LOCALITY_DESKTOP_LIVE_MODE_E2E_PAGE_ID")
         && !page_id.trim().is_empty()
     {
         return page_id.trim().to_string();
     }
-    let contents = fs::read_to_string(page_path).expect("read CloudStorage page.md");
+    let contents = fs::read_to_string(page_path).expect("read live-mode page.md");
     locality_core::canonical::parse_canonical_markdown(&contents)
         .expect("parse Locality page.md frontmatter")
         .remote_id()
@@ -14313,7 +14628,7 @@ fn live_mode_e2e_page_id(page_path: &Path) -> String {
         .clone()
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn live_mode_e2e_notion_api(page_path: &Path) -> HttpNotionApi {
     if let Ok(token) = std::env::var("NOTION_TOKEN")
         && !token.trim().is_empty()
@@ -14327,7 +14642,7 @@ fn live_mode_e2e_notion_api(page_path: &Path) -> HttpNotionApi {
     localityd::notion::resolve_notion_connector_for_path(&store, credentials.as_ref(), page_path)
         .expect("resolve Notion connector from desktop auth");
     let (mount, _) =
-        resolve_desktop_mount_path(&store, page_path).expect("resolve CloudStorage mount path");
+        resolve_desktop_mount_path(&store, page_path).expect("resolve live-mode mount path");
     let connection = mount
         .connection_id
         .as_ref()
@@ -14360,7 +14675,7 @@ fn live_mode_e2e_notion_api(page_path: &Path) -> HttpNotionApi {
     HttpNotionApi::new(NotionConfig::default().with_token(token))
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn live_mode_e2e_append_local_marker(page_path: &Path, marker: &str) {
     let mut contents = fs::read_to_string(page_path).expect("read local page before edit");
     if !contents.ends_with('\n') {
@@ -14372,7 +14687,7 @@ fn live_mode_e2e_append_local_marker(page_path: &Path, marker: &str) {
     fs::write(page_path, contents).expect("write local live-mode marker");
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn live_mode_e2e_append_remote_marker(api: &HttpNotionApi, page_id: &str, marker: &str) {
     api.append_block_children(
         page_id,
@@ -14392,7 +14707,7 @@ fn live_mode_e2e_append_remote_marker(api: &HttpNotionApi, page_id: &str, marker
     .expect("append remote Notion marker");
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn live_mode_e2e_wait_until<F>(label: &str, mut condition: F)
 where
     F: FnMut() -> bool,
@@ -14411,7 +14726,7 @@ where
     panic!("{label} did not converge within {timeout}s");
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn live_mode_e2e_remote_text(api: &HttpNotionApi, page_id: &str) -> String {
     live_mode_e2e_remote_blocks(api, page_id)
         .iter()
@@ -14420,7 +14735,7 @@ fn live_mode_e2e_remote_text(api: &HttpNotionApi, page_id: &str) -> String {
         .join("\n")
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn live_mode_e2e_delete_marker_blocks(
     api: &HttpNotionApi,
     page_id: &str,
@@ -14435,7 +14750,7 @@ fn live_mode_e2e_delete_marker_blocks(
     Ok(())
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn live_mode_e2e_remote_blocks(api: &HttpNotionApi, page_id: &str) -> Vec<BlockDto> {
     let mut blocks = Vec::new();
     let mut cursor = None;
@@ -14452,7 +14767,7 @@ fn live_mode_e2e_remote_blocks(api: &HttpNotionApi, page_id: &str) -> Vec<BlockD
     blocks
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn live_mode_e2e_block_plain_text(block: &BlockDto) -> String {
     block
         .paragraph
@@ -14461,7 +14776,7 @@ fn live_mode_e2e_block_plain_text(block: &BlockDto) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn live_mode_e2e_rich_text_block_plain_text(block: &RichTextBlockDto) -> String {
     block
         .rich_text
@@ -14470,7 +14785,7 @@ fn live_mode_e2e_rich_text_block_plain_text(block: &RichTextBlockDto) -> String 
         .collect::<String>()
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn live_mode_e2e_rich_text_plain_text(text: &RichTextDto) -> String {
     if !text.plain_text.is_empty() {
         return text.plain_text.clone();
@@ -14481,7 +14796,7 @@ fn live_mode_e2e_rich_text_plain_text(text: &RichTextDto) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 fn unique_suffix() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)

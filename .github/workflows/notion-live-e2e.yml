@@ -95,7 +95,17 @@ jobs:
       - name: Install FUSE dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev pkg-config sqlite3
+          sudo apt-get install -y \
+            fuse3 \
+            libfuse3-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            sqlite3
       - name: Check live Notion secrets and FUSE device
         run: |
           missing=()
@@ -116,6 +126,12 @@ jobs:
           mkdir -p "$HOME/.loc/credentials"
           printf '%s' "$NOTION_TOKEN" > "$HOME/.loc/credentials/$secret_hex"
           chmod 600 "$HOME/.loc/credentials/$secret_hex"
+      - name: Run desktop Live Mode live e2e
+        env:
+          LOCALITY_DESKTOP_LIVE_MODE_E2E_TIMEOUT_SECS: "180"
+        run: |
+          cargo build -p localityd
+          cargo test -p locality-desktop live_mode_bidirectional_cloudstorage_markdown_e2e -- --ignored --exact --test-threads=1 --nocapture
       - name: Run Linux FUSE live Notion e2e from stored credential
         run: env -u NOTION_TOKEN -u NOTION_AT tests/live_notion_vfs_push_pull.sh
 

@@ -2005,6 +2005,40 @@ fn runtime_live_mode_remote_fast_forward_request_bypasses_recent_open_delay() {
 }
 
 #[test]
+fn runtime_live_mode_remote_fast_forward_request_delays_after_recent_local_change() {
+    let config = relay_config("remote-fast-forward-request-local-change");
+    let mount_root = temp_root("remote-fast-forward-request-local-change-mount");
+    seed_clean_remote_changed_page(&config.state_root, &mount_root);
+    mark_page_recently_changed(&config.state_root);
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        AutoFastForwardRunner {
+            hydrated: hydrated_tx,
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::RemoteFastForward {
+        mount_id: "notion-main".to_string(),
+        remote_id: "page-1".to_string(),
+        path: PathBuf::from("Roadmap.md"),
+    });
+
+    assert!(
+        response.ok,
+        "remote fast-forward request failed: {response:?}"
+    );
+    assert!(
+        hydrated_rx
+            .recv_timeout(Duration::from_millis(150))
+            .is_err(),
+        "recent local changes should delay live mode remote fast-forward"
+    );
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_queues_child_refresh_when_remote_fast_forward_discovers_child_link_diff() {
     let config = relay_config("remote-fast-forward-discovery");
     let mount_root = temp_root("remote-fast-forward-discovery-mount");
@@ -4180,6 +4214,20 @@ fn mark_page_recently_opened(state_root: &Path) {
         .expect("get freshness")
         .expect("freshness");
     freshness.last_opened_at = Some(freshness_timestamp());
+    store
+        .save_freshness_state(freshness)
+        .expect("save freshness");
+}
+
+fn mark_page_recently_changed(state_root: &Path) {
+    let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open store");
+    let mount_id = MountId::new("notion-main");
+    let remote_id = RemoteId::new("page-1");
+    let mut freshness = store
+        .get_freshness_state(&mount_id, &remote_id)
+        .expect("get freshness")
+        .expect("freshness");
+    freshness.last_local_change_at = Some(freshness_timestamp());
     store
         .save_freshness_state(freshness)
         .expect("save freshness");

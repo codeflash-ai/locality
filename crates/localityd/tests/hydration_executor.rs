@@ -209,6 +209,117 @@ fn live_mode_fast_forward_keeps_remote_hint_when_new_version_renders_same_tree()
 }
 
 #[test]
+fn live_mode_fast_forward_clears_remote_hint_when_same_version_renders_same_tree() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Hydrated);
+    let version = "2026-07-10T20:38:00.000Z";
+    let old = rendered_entity_with_sync("Old body.", version, version);
+    store
+        .save_shadow(&fixture.mount_id, old.shadow.clone())
+        .expect("save old shadow");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                locality_core::freshness::FreshnessTier::Immediate,
+            )
+            .remote_hint_pending(true),
+        )
+        .expect("save freshness");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    entity.remote_edited_at = Some(version.to_string());
+    entity.content_hash = Some(old.shadow.body_hash.clone());
+    store.save_entity(entity).expect("save entity");
+    fixture.write_markdown(&old.document);
+
+    let mut stale_render = rendered_entity_with_sync("Old body.", version, version);
+    stale_render.remote_edited_at = Some(version.to_string());
+    let source = FakeHydrationSource::with_entity("page-1", stale_render);
+    let mut request = fixture.request();
+    request.reason = HydrationReason::LiveModeRemoteFastForward;
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(request)
+        .expect("hydrate same-version live render");
+
+    assert_eq!(outcome, HydrationOutcome::Hydrated);
+    assert_eq!(
+        store
+            .load_shadow(&fixture.mount_id, &fixture.remote_id)
+            .expect("load shadow"),
+        old.shadow
+    );
+    assert!(
+        !store
+            .get_freshness_state(&fixture.mount_id, &fixture.remote_id)
+            .expect("get freshness")
+            .expect("freshness")
+            .remote_hint_pending
+    );
+}
+
+#[test]
+fn live_mode_fast_forward_keeps_same_version_hint_after_recent_local_change() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Hydrated);
+    let version = "2026-07-10T20:38:00.000Z";
+    let old = rendered_entity_with_sync("Old body.", version, version);
+    store
+        .save_shadow(&fixture.mount_id, old.shadow.clone())
+        .expect("save old shadow");
+    store
+        .save_freshness_state(
+            FreshnessStateRecord::new(
+                fixture.mount_id.clone(),
+                fixture.remote_id.clone(),
+                locality_core::freshness::FreshnessTier::Immediate,
+            )
+            .remote_hint_pending(true)
+            .local_change_at(localityd::freshness::freshness_timestamp()),
+        )
+        .expect("save freshness");
+    let mut entity = store
+        .get_entity(&fixture.mount_id, &fixture.remote_id)
+        .expect("get entity")
+        .expect("entity");
+    entity.remote_edited_at = Some(version.to_string());
+    entity.content_hash = Some(old.shadow.body_hash.clone());
+    store.save_entity(entity).expect("save entity");
+    fixture.write_markdown(&old.document);
+
+    let mut stale_render = rendered_entity_with_sync("Old body.", version, version);
+    stale_render.remote_edited_at = Some(version.to_string());
+    let source = FakeHydrationSource::with_entity("page-1", stale_render);
+    let mut request = fixture.request();
+    request.reason = HydrationReason::LiveModeRemoteFastForward;
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    let outcome = executor
+        .hydrate_request(request)
+        .expect("hydrate same-version live render");
+
+    assert_eq!(outcome, HydrationOutcome::Hydrated);
+    assert_eq!(
+        store
+            .load_shadow(&fixture.mount_id, &fixture.remote_id)
+            .expect("load shadow"),
+        old.shadow
+    );
+    assert!(
+        store
+            .get_freshness_state(&fixture.mount_id, &fixture.remote_id)
+            .expect("get freshness")
+            .expect("freshness")
+            .remote_hint_pending
+    );
+}
+
+#[test]
 fn executor_rehydrates_stale_dirty_file_when_projection_matches_shadow() {
     let fixture = HydrationFixture::new();
     let mut store = fixture.store(HydrationState::Dirty);

@@ -17,6 +17,8 @@ use locality_core::freshness::{
 use locality_core::model::HydrationState;
 use locality_store::{EntityRecord, FreshnessStateRecord, FreshnessStateRepository};
 
+pub(crate) const LIVE_MODE_POST_PUSH_SAME_VERSION_PROBE_WINDOW_MS: u64 = 60_000;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FreshnessQueue {
     jobs: BTreeMap<String, SyncJob>,
@@ -316,7 +318,7 @@ pub fn freshness_timestamp() -> String {
 }
 
 pub fn parse_freshness_timestamp(value: &str) -> Option<u64> {
-    value.strip_prefix("unix_ms:")?.parse().ok()
+    value.strip_prefix("unix_ms:").unwrap_or(value).parse().ok()
 }
 
 pub fn freshness_unix_ms() -> u64 {
@@ -371,7 +373,10 @@ mod tests {
     use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
     use locality_store::{EntityRecord, FreshnessStateRecord};
 
-    use super::{FreshnessQueue, optimized_freshness_decision, refresh_optimized_tier};
+    use super::{
+        FreshnessQueue, optimized_freshness_decision, parse_freshness_timestamp,
+        refresh_optimized_tier,
+    };
 
     #[test]
     fn queue_drains_urgent_and_cheap_jobs_within_budget() {
@@ -448,6 +453,13 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn parses_prefixed_and_raw_unix_ms_timestamps() {
+        assert_eq!(parse_freshness_timestamp("unix_ms:1234"), Some(1234));
+        assert_eq!(parse_freshness_timestamp("1234"), Some(1234));
+        assert_eq!(parse_freshness_timestamp("not-a-timestamp"), None);
     }
 
     #[test]

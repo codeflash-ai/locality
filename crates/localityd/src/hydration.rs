@@ -16,6 +16,9 @@ use locality_store::{
     RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, StoreError,
 };
 
+use crate::freshness::{
+    LIVE_MODE_POST_PUSH_SAME_VERSION_PROBE_WINDOW_MS, freshness_unix_ms, parse_freshness_timestamp,
+};
 use crate::media::{
     document_with_absolute_media_hrefs, render_document_with_absolute_media_hrefs,
     replace_hydrated_media_manifest, update_hydrated_media_manifest,
@@ -201,6 +204,18 @@ where
                 previous_shadow.as_ref(),
                 &rendered,
             )
+        {
+            self.keep_remote_hint_pending(&request.mount_id, &request.remote_id)?;
+            return Ok(HydrationOutcome::Hydrated);
+        }
+        if request.reason == HydrationReason::LiveModeRemoteFastForward
+            && self.same_version_live_mode_probe_should_continue(
+                &request.mount_id,
+                &request.remote_id,
+                &entity,
+                previous_shadow.as_ref(),
+                &rendered,
+            )?
         {
             self.keep_remote_hint_pending(&request.mount_id, &request.remote_id)?;
             return Ok(HydrationOutcome::Hydrated);
@@ -492,6 +507,38 @@ where
         self.store
             .save_freshness_state(freshness)
             .map_err(LocalityError::from)
+    }
+
+    fn same_version_live_mode_probe_should_continue(
+        &mut self,
+        mount_id: &MountId,
+        remote_id: &RemoteId,
+        entity: &EntityRecord,
+        previous_shadow: Option<&ShadowDocument>,
+        rendered: &HydratedEntity,
+    ) -> LocalityResult<bool> {
+        if !same_remote_version(entity, rendered)
+            || !render_matches_previous_shadow(previous_shadow, rendered)
+        {
+            return Ok(false);
+        }
+        let Some(freshness) = self
+            .store
+            .get_freshness_state(mount_id, remote_id)
+            .map_err(LocalityError::from)?
+        else {
+            return Ok(false);
+        };
+        let Some(last_local_change_at) = freshness.last_local_change_at.as_deref() else {
+            return Ok(false);
+        };
+        let Some(last_local_change_ms) = parse_freshness_timestamp(last_local_change_at) else {
+            return Ok(false);
+        };
+        let now_ms = freshness_unix_ms();
+        Ok(last_local_change_ms <= now_ms
+            && now_ms.saturating_sub(last_local_change_ms)
+                <= LIVE_MODE_POST_PUSH_SAME_VERSION_PROBE_WINDOW_MS)
     }
 
     fn reconcile_remote_not_found(
@@ -895,6 +942,13 @@ fn live_mode_remote_fast_forward_render_looks_stale(
     if rendered.remote_edited_at.as_deref() == entity.remote_edited_at.as_deref() {
         return false;
     }
+    render_matches_previous_shadow(previous_shadow, rendered)
+}
+
+fn render_matches_previous_shadow(
+    previous_shadow: Option<&ShadowDocument>,
+    rendered: &HydratedEntity,
+) -> bool {
     let Some(previous_shadow) = previous_shadow else {
         return false;
     };

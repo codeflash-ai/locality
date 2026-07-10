@@ -49,8 +49,9 @@ use crate::autosave::{
 use crate::execution::{DaemonEventReport, PushJob};
 use crate::file_provider::{self, FileProviderReadReport};
 use crate::freshness::{
-    FreshnessQueue, freshness_timestamp, freshness_unix_ms, optimized_freshness_decision,
-    parse_freshness_timestamp, record_file_opened, record_local_change,
+    FreshnessQueue, LIVE_MODE_POST_PUSH_SAME_VERSION_PROBE_WINDOW_MS, freshness_timestamp,
+    freshness_unix_ms, optimized_freshness_decision, parse_freshness_timestamp, record_file_opened,
+    record_local_change,
 };
 use crate::hydration::{
     HydrationEngine, HydrationExecutor, HydrationOutcome, HydrationPriority, HydrationQueue,
@@ -3035,19 +3036,19 @@ where
         return Ok(AutoFastForwardQueueDecision::Skip);
     }
 
-    if request.reason != HydrationReason::LiveModeRemoteFastForward {
-        let now = freshness_timestamp();
-        if let Some(next_eligible_at) = active_lease_until(&freshness, &now) {
-            return Ok(AutoFastForwardQueueDecision::Delay(
-                SyncJob::new(
-                    request.mount_id.clone(),
-                    Some(request.remote_id.clone()),
-                    SyncJobKind::ObserveEntity,
-                    ChangeHintKind::RemoteMaybeChanged,
-                )
-                .next_eligible_at(next_eligible_at),
-            ));
-        }
+    let now = freshness_timestamp();
+    if let Some(next_eligible_at) =
+        remote_fast_forward_active_lease_until(&freshness, &now, &request.reason)
+    {
+        return Ok(AutoFastForwardQueueDecision::Delay(
+            SyncJob::new(
+                request.mount_id.clone(),
+                Some(request.remote_id.clone()),
+                SyncJobKind::ObserveEntity,
+                ChangeHintKind::RemoteMaybeChanged,
+            )
+            .next_eligible_at(next_eligible_at),
+        ));
     }
 
     Ok(AutoFastForwardQueueDecision::Queue)
@@ -3066,23 +3067,44 @@ fn projection_content_path(
 }
 
 fn active_lease_until(freshness: &FreshnessStateRecord, now: &str) -> Option<String> {
+    active_lease_until_for_timestamps(
+        [
+            freshness.last_opened_at.as_deref(),
+            freshness.last_local_change_at.as_deref(),
+        ],
+        now,
+    )
+}
+
+fn remote_fast_forward_active_lease_until(
+    freshness: &FreshnessStateRecord,
+    now: &str,
+    reason: &HydrationReason,
+) -> Option<String> {
+    if *reason == HydrationReason::LiveModeRemoteFastForward {
+        return active_lease_until_for_timestamps([freshness.last_local_change_at.as_deref()], now);
+    }
+    active_lease_until(freshness, now)
+}
+
+fn active_lease_until_for_timestamps<'a>(
+    timestamps: impl IntoIterator<Item = Option<&'a str>>,
+    now: &str,
+) -> Option<String> {
     let now_ms = parse_unix_ms(now)?;
-    let active_until = [
-        freshness.last_opened_at.as_deref(),
-        freshness.last_local_change_at.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(parse_unix_ms)
-    .map(|timestamp| timestamp.saturating_add(AUTO_FAST_FORWARD_ACTIVE_LEASE_MS))
-    .filter(|active_until| *active_until > now_ms)
-    .max()?;
+    let active_until = timestamps
+        .into_iter()
+        .flatten()
+        .filter_map(parse_unix_ms)
+        .map(|timestamp| timestamp.saturating_add(AUTO_FAST_FORWARD_ACTIVE_LEASE_MS))
+        .filter(|active_until| *active_until > now_ms)
+        .max()?;
 
     Some(format!("unix_ms:{active_until}"))
 }
 
 fn parse_unix_ms(value: &str) -> Option<u64> {
-    value.strip_prefix("unix_ms:")?.parse().ok()
+    parse_freshness_timestamp(value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4172,9 +4194,18 @@ where
         }
     }
 
-    let remote_hint_pending = observed_remote_version_changed(existing.as_ref(), &observation);
+    let observed_remote_version_changed =
+        observed_remote_version_changed(existing.as_ref(), &observation);
+    let same_version_live_mode_probe_pending = same_version_live_mode_probe_pending(
+        store,
+        existing.as_ref(),
+        existing_freshness.as_ref(),
+        &observation,
+    )?;
+    let remote_hint_pending =
+        observed_remote_version_changed || same_version_live_mode_probe_pending;
     let observed_at = freshness_timestamp();
-    if remote_hint_pending
+    if observed_remote_version_changed
         && auto_save_should_pause_for_remote_change(existing.as_ref(), existing_freshness.as_ref())
     {
         pause_auto_save_for_remote_change(store, &job.mount_id, &remote_id)?;
@@ -4524,6 +4555,59 @@ where
         HydrationState::Hydrated,
         reason,
     )])
+}
+
+fn same_version_live_mode_probe_pending<S>(
+    store: &S,
+    existing: Option<&EntityRecord>,
+    freshness: Option<&FreshnessStateRecord>,
+    observation: &RemoteObservation,
+) -> locality_core::LocalityResult<bool>
+where
+    S: AutoSaveRepository + MountLiveModeRepository,
+{
+    let Some(entity) = existing else {
+        return Ok(false);
+    };
+    let Some(freshness) = freshness else {
+        return Ok(false);
+    };
+    if observation.deleted
+        || observation.kind != EntityKind::Page
+        || entity.hydration != HydrationState::Hydrated
+        || !observation_matches_synced_version(Some(entity), observation)
+        || !live_mode_remote_fast_forward_enabled(
+            store,
+            &observation.mount_id,
+            &observation.remote_id,
+        )?
+    {
+        return Ok(false);
+    }
+
+    let recent_local_change_probe =
+        freshness
+            .last_local_change_at
+            .as_deref()
+            .is_some_and(|last_local_change_at| {
+                timestamp_within_window(
+                    last_local_change_at,
+                    &freshness_timestamp(),
+                    LIVE_MODE_POST_PUSH_SAME_VERSION_PROBE_WINDOW_MS,
+                )
+            });
+    let active_live_mode_probe = freshness.tier == FreshnessTier::Immediate;
+    Ok(freshness.remote_hint_pending || recent_local_change_probe || active_live_mode_probe)
+}
+
+fn timestamp_within_window(timestamp: &str, now: &str, window_ms: u64) -> bool {
+    let Some(timestamp_ms) = parse_unix_ms(timestamp) else {
+        return false;
+    };
+    let Some(now_ms) = parse_unix_ms(now) else {
+        return false;
+    };
+    timestamp_ms <= now_ms && now_ms.saturating_sub(timestamp_ms) <= window_ms
 }
 
 fn auto_save_should_pause_for_remote_change(
@@ -5979,6 +6063,129 @@ mod tests {
             execute_observe_entity_job(&mut store, &connector, observe_job(&mount_id, &remote_id))
                 .expect("observe");
 
+        assert_eq!(report.queued_hydrations.len(), 1);
+        assert_eq!(
+            report.queued_hydrations[0].reason,
+            locality_core::hydration::HydrationReason::LiveModeRemoteFastForward
+        );
+    }
+
+    #[test]
+    fn remote_observation_queues_same_version_live_mode_probe_after_recent_local_change() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(
+                mount_id.clone(),
+                true,
+                "unix_ms:1",
+            ))
+            .expect("save live mode");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_remote_edited_at("remote-v1"),
+            )
+            .expect("entity");
+        let changed_at = super::freshness_timestamp();
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(mount_id.clone(), remote_id.clone(), FreshnessTier::Hot)
+                    .local_change_at(&changed_at),
+            )
+            .expect("freshness");
+        let connector = ObservingConnector {
+            observation: RemoteObservation {
+                mount_id: mount_id.clone(),
+                remote_id: remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Roadmap".to_string(),
+                parent_remote_id: None,
+                projected_path: "Roadmap.md".into(),
+                remote_version: Some(RemoteVersion::new("remote-v1")),
+                deleted: false,
+                raw_metadata_json: "{}".to_string(),
+            },
+        };
+
+        let report =
+            execute_observe_entity_job(&mut store, &connector, observe_job(&mount_id, &remote_id))
+                .expect("observe");
+
+        assert!(report.remote_hint_pending);
+        assert_eq!(report.queued_hydrations.len(), 1);
+        assert_eq!(
+            report.queued_hydrations[0].reason,
+            locality_core::hydration::HydrationReason::LiveModeRemoteFastForward
+        );
+        assert!(
+            store
+                .get_freshness_state(&mount_id, &remote_id)
+                .expect("get freshness")
+                .expect("freshness")
+                .remote_hint_pending
+        );
+    }
+
+    #[test]
+    fn remote_observation_queues_same_version_live_mode_probe_for_active_page() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(
+                mount_id.clone(),
+                true,
+                "unix_ms:1",
+            ))
+            .expect("save live mode");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Roadmap.md",
+                )
+                .with_hydration(HydrationState::Hydrated)
+                .with_remote_edited_at("remote-v1"),
+            )
+            .expect("entity");
+        store
+            .save_freshness_state(FreshnessStateRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                FreshnessTier::Immediate,
+            ))
+            .expect("freshness");
+        let connector = ObservingConnector {
+            observation: RemoteObservation {
+                mount_id: mount_id.clone(),
+                remote_id: remote_id.clone(),
+                kind: EntityKind::Page,
+                title: "Roadmap".to_string(),
+                parent_remote_id: None,
+                projected_path: "Roadmap.md".into(),
+                remote_version: Some(RemoteVersion::new("remote-v1")),
+                deleted: false,
+                raw_metadata_json: "{}".to_string(),
+            },
+        };
+
+        let report =
+            execute_observe_entity_job(&mut store, &connector, observe_job(&mount_id, &remote_id))
+                .expect("observe");
+
+        assert!(report.remote_hint_pending);
         assert_eq!(report.queued_hydrations.len(), 1);
         assert_eq!(
             report.queued_hydrations[0].reason,
