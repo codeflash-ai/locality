@@ -39,7 +39,7 @@
   .decknav button:hover{background:rgba(255,255,255,.05)}
   .decknav button[aria-current="true"]{background:rgba(255,255,255,.08);
     border-left-color:var(--teal);color:#fff;font-weight:500}
-  .decknav button .k{font-family:var(--mono);font-size:9.5px;color:var(--deck-dim);min-width:22px}
+  .decknav button .k{font-family:var(--mono);font-size:9.5px;color:var(--deck-dim);min-width:42px}
   .decknav button:focus-visible,.stage :focus-visible{outline:2px solid var(--teal);outline-offset:2px}
 
   .stage{padding:36px clamp(20px,4vw,56px) 80px;max-width:1060px}
@@ -96,6 +96,8 @@
   .btn-ghost{border-color:transparent;color:var(--teal)}
   .btn-sm{padding:2px 8px;font-size:11px;border-radius:5px}
   .linkish{color:var(--teal);font-size:12px}
+  [data-go]{cursor:pointer}
+  [data-go]:hover{filter:brightness(.98)}
 
   .chip{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;font-weight:500;
     padding:1px 7px;border-radius:99px;white-space:nowrap}
@@ -253,6 +255,8 @@
     background:var(--wash);font-size:12px;color:var(--muted)}
   .crumbs{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
   .crumbs span{color:var(--faint)}
+  .crumb-link{border:0;background:transparent;color:var(--teal);font:inherit;font-weight:600;padding:0;cursor:pointer}
+  .crumb-link[aria-current="page"]{color:var(--ink);cursor:default}
   .entrypoints{font-size:11px;color:var(--muted)}
   .subpage-banner b{color:var(--ink);font-size:12.5px}
 
@@ -280,42 +284,46 @@
   <nav class="decknav" aria-label="Screens">
     <div class="brand">
       <h1>Locality Desktop</h1>
-      <div class="sub">WIREFRAME DECK · v5 COLLAPSE + BREADCRUMBS</div>
+      <div class="sub">WIREFRAME DECK · v6 FLOW TESTING</div>
     </div>
     <div class="ngroup">Onboarding</div>
     <button data-s="ob1" aria-current="true"><span class="k">1.1</span>Welcome</button>
     <button data-s="ob2"><span class="k">1.2</span>Connect a source</button>
     <button data-s="ob3"><span class="k">1.3</span>Local folder</button>
     <button data-s="ob4"><span class="k">1.4</span>Ready</button>
-    <div class="ngroup">Primary pages</div>
+    <div class="ngroup">Top pages</div>
     <button data-s="home"><span class="k">2.1</span>Home</button>
     <button data-s="sources"><span class="k">2.2</span>Sources</button>
     <button data-s="reviewcenter"><span class="k">2.3</span>Review center</button>
     <button data-s="settings"><span class="k">2.4</span>Settings</button>
-    <div class="ngroup">Subpages</div>
-    <button data-s="files"><span class="k">3.1</span>Files browser</button>
-    <button data-s="srcdetail"><span class="k">3.2</span>Source detail</button>
-    <button data-s="locate"><span class="k">3.3</span>Locate results</button>
-    <button data-s="problems"><span class="k">3.4</span>Sync problems</button>
-    <button data-s="conflict"><span class="k">3.5</span>Conflict editor</button>
-    <button data-s="activity"><span class="k">3.6</span>Activity log</button>
-    <button data-s="agents"><span class="k">3.7</span>Settings · Agents</button>
-    <div class="ngroup">Modals &amp; surfaces</div>
-    <button data-s="review"><span class="k">4.1</span>Push approval</button>
-    <button data-s="pushstates"><span class="k">4.2</span>Push states</button>
-    <button data-s="tray"><span class="k">4.3</span>Tray popover</button>
-    <button data-s="modals"><span class="k">4.4</span>Destructive modals</button>
+    <div class="ngroup">Home branches</div>
+    <button data-s="files"><span class="k">2.1.1</span>Files browser</button>
+    <button data-s="locate"><span class="k">2.1.2</span>Locate results</button>
+    <div class="ngroup">Sources branches</div>
+    <button data-s="srcdetail"><span class="k">2.2.1</span>Source detail</button>
+    <div class="ngroup">Review branches</div>
+    <button data-s="review"><span class="k">2.3.1</span>Push approval</button>
+    <button data-s="pushstates"><span class="k">2.3.2</span>Push states</button>
+    <button data-s="problems"><span class="k">2.3.3</span>Sync problems</button>
+    <button data-s="conflict"><span class="k">2.3.4</span>Conflict editor</button>
+    <div class="ngroup">Settings branches</div>
+    <button data-s="agents"><span class="k">2.4.1</span>Settings · Agents</button>
+    <button data-s="activity"><span class="k">2.4.2</span>Activity log</button>
+    <div class="ngroup">System surfaces</div>
+    <button data-s="tray"><span class="k">3.1</span>Tray popover</button>
+    <button data-s="modals"><span class="k">3.2</span>Destructive modals</button>
     <div class="ngroup">States &amp; reference</div>
-    <button data-s="empties"><span class="k">5.1</span>Empty &amp; loading</button>
-    <button data-s="legend"><span class="k">5.2</span>Status legend</button>
+    <button data-s="empties"><span class="k">4.1</span>Empty &amp; loading</button>
+    <button data-s="legend"><span class="k">4.2</span>Status legend</button>
   </nav>
 
   <main class="stage">
     <div class="decktools" aria-label="Wireframe collaboration controls">
       <button class="btn btn-sm" type="button" id="toggle-design-notes">Hide design notes</button>
+      <button class="btn btn-sm" type="button" id="copy-screen-link">Copy screen link</button>
       <button class="btn btn-sm" type="button" id="copy-current-notes">Copy page notes</button>
       <button class="btn btn-sm" type="button" id="copy-all-notes">Copy all notes</button>
-      <span class="hint">Team notes save in this browser. Copy them into the review thread or a PR to share.</span>
+      <span class="hint">Click app sidebar items, breadcrumbs, rows, and action buttons to test navigation paths. Screen links use URL hashes.</span>
       <span class="status" id="notes-status" aria-live="polite"></span>
     </div>
 
@@ -332,8 +340,8 @@
             Turn your Notion and other docs into local files your AI agents can edit — safely.</div>
           <p style="color:var(--muted);max-width:400px;margin:12px auto 26px">
             Your edits stay on your machine until you review them in Review Center and push them back.</p>
-          <span class="btn btn-primary">Get started →</span>
-          <div style="margin-top:16px"><span class="linkish">Restore from an existing mount</span></div>
+          <span class="btn btn-primary" data-go="ob2">Get started →</span>
+          <div style="margin-top:16px"><span class="linkish" data-go="home">Restore from an existing mount</span></div>
         </div>
       </div>
       <div class="notes"><b>notes</b> — traffic-light chrome + 4-dot step indicator persist across all setup steps ·
@@ -354,7 +362,7 @@
             <div class="card" style="padding:14px">
               <div style="display:flex;gap:8px;align-items:center;font-weight:600"><span class="src src-n">N</span>Notion</div>
               <p style="color:var(--muted);font-size:11.5px;margin:6px 0 12px">Workspaces, pages, databases</p>
-              <span class="btn btn-primary btn-sm">Connect</span>
+              <span class="btn btn-primary btn-sm" data-go="ob3">Connect</span>
             </div>
             <div class="card" style="padding:14px;opacity:.55">
               <div style="display:flex;gap:8px;align-items:center;font-weight:600"><span class="src src-g">G</span>Google Docs</div>
@@ -364,10 +372,10 @@
           </div>
           <div style="display:flex;gap:8px;align-items:center;margin-top:18px;color:var(--muted);font-size:12px">
             <span class="chip c-review">⟳ waiting</span> Waiting for authorization in your browser…
-            <span class="btn btn-sm">Reopen browser</span><span class="linkish">Copy sign-in link</span>
+            <span class="btn btn-sm" data-go="ob2">Reopen browser</span><span class="linkish">Copy sign-in link</span>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:26px">
-            <span class="btn">Back</span><span class="btn btn-primary" style="opacity:.5">Continue →</span>
+            <span class="btn" data-go="ob1">Back</span><span class="btn btn-primary" style="opacity:.5" data-go="ob3">Continue →</span>
           </div>
         </div>
       </div>
@@ -402,7 +410,7 @@
             <div class="rowline"><span class="chip c-review">⟳</span><span class="grow">Waiting for test file to appear…</span></div>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:22px">
-            <span class="btn">Back</span><span class="btn btn-primary">Continue →</span>
+            <span class="btn" data-go="ob2">Back</span><span class="btn btn-primary" data-go="ob4">Continue →</span>
           </div>
         </div>
       </div>
@@ -428,11 +436,11 @@
             <div style="font-size:11.5px;color:var(--muted);margin:4px 0 10px">
               Detected: Claude Code · Cursor · Warp · Gemini CLI<br>
               Writes skill and config files so agents know the filesystem contract.</div>
-            <span class="btn btn-sm">Install guidance</span>
+            <span class="btn btn-sm" data-go="agents">Install guidance</span>
           </div>
           <div style="margin:14px 0 20px;font-size:12px"><span class="linkish">▸ How agents use Locality</span></div>
           <div style="display:flex;justify-content:flex-end;gap:8px">
-            <span class="btn">Open my folder</span><span class="btn btn-primary">Open Locality →</span>
+            <span class="btn" data-go="files">Open my folder</span><span class="btn btn-primary" data-go="home">Open Locality →</span>
           </div>
         </div>
       </div>
@@ -460,19 +468,19 @@
               <span class="sp">Live mode: Off <span class="toggle"></span></span></div>
             <div class="content">
               <div class="statgrid">
-                <div class="stat"><div class="lbl">Sources</div><div class="num">2</div></div>
-                <div class="stat"><div class="lbl">Awaiting review</div><div class="num" style="color:var(--amber)">4</div></div>
-                <div class="stat"><div class="lbl">Problems</div><div class="num" style="color:var(--teal)">0 ✓</div></div>
+                <div class="stat" data-go="sources"><div class="lbl">Sources</div><div class="num">2</div></div>
+                <div class="stat" data-go="reviewcenter"><div class="lbl">Awaiting review</div><div class="num" style="color:var(--amber)">4</div></div>
+                <div class="stat" data-go="problems"><div class="lbl">Problems</div><div class="num" style="color:var(--teal)">0 ✓</div></div>
               </div>
               <div class="h-min">Locate a page</div>
-              <div class="wf-input">🔎 Paste a Notion URL or type a title…</div>
+              <div class="wf-input" data-go="locate">🔎 Paste a Notion URL or type a title…</div>
               <div class="h-min">Recent files</div>
               <div class="card">
-                <div class="rowline"><span class="src src-n">N</span><span class="grow">Roadmap.md</span>
+                <div class="rowline" data-go="reviewcenter"><span class="src src-n">N</span><span class="grow">Roadmap.md</span>
                   <span class="chip c-review-needed">● Needs review</span><span class="meta">2m ago</span></div>
-                <div class="rowline"><span class="src src-n">N</span><span class="grow">Specs/Auth.md</span>
+                <div class="rowline" data-go="files"><span class="src src-n">N</span><span class="grow">Specs/Auth.md</span>
                   <span class="chip c-synced">✓ Synced</span><span class="meta">1h ago</span></div>
-                <div class="rowline"><span class="src src-n">N</span><span class="grow">Notes/Standup.md</span>
+                <div class="rowline" data-go="files"><span class="src src-n">N</span><span class="grow">Notes/Standup.md</span>
                   <span class="chip c-draft">◐ Draft</span><span class="meta">3h ago</span></div>
               </div>
             </div>
@@ -484,7 +492,7 @@
       “Connect your first source [Connect Notion]” · <b>keyboard</b> — “/” focuses Locate, Cmd+1..4 jumps sidebar.</div>
     </section>
 
-    <!-- ============ 2.2 FILES ============ -->
+    <!-- ============ 2.1.1 FILES BROWSER ============ -->
     <section class="screen" id="files">
       <div class="shead"><h2>Files — unified browser</h2><span class="route">/files</span></div>
       <p class="sdesc">A searchable file browser reached from Home search, recent files, source detail, Review Center file actions, or tray search. It is a subpage, not a primary sidebar item.</p>
@@ -529,7 +537,7 @@
       <b>selection</b> — highlighted row drives the footer path; arrows move, Enter opens.</div>
     </section>
 
-    <!-- ============ 2.3 SOURCES ============ -->
+    <!-- ============ 2.2 SOURCES ============ -->
     <section class="screen" id="sources">
       <div class="shead"><h2>Sources</h2><span class="route">/sources · /sources/:id</span></div>
       <p class="sdesc">Connected workspaces and mount health in one place. Daily write decisions still route through Review Center.</p>
@@ -537,7 +545,7 @@
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Sources</span></div>
         <div class="content" style="padding:18px 22px">
           <div style="display:flex;align-items:center;margin-bottom:14px"><b style="font-size:14px">Sources</b>
-            <span class="btn btn-primary btn-sm" style="margin-left:auto">+ Add source</span></div>
+            <span class="btn btn-primary btn-sm" style="margin-left:auto" data-go="ob2">+ Add source</span></div>
           <div class="card" style="margin-bottom:12px;padding:14px">
             <div style="display:flex;align-items:center;gap:8px;font-weight:600">
               <span class="src src-n">N</span>Notion — Acme Team
@@ -546,8 +554,8 @@
             <div style="display:flex;gap:8px;align-items:center;font-size:11.5px;color:var(--muted);margin-bottom:12px">
               Mode: <span class="btn btn-sm">Review ▾</span> · 412 pages · 3 databases</div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <span class="btn btn-sm">Open folder</span><span class="btn btn-sm">Pause ▾</span>
-              <span class="btn btn-sm">Reconnect</span><span class="btn btn-ghost btn-sm">Details →</span></div>
+              <span class="btn btn-sm" data-go="files">Open folder</span><span class="btn btn-sm">Pause ▾</span>
+              <span class="btn btn-sm" data-go="srcdetail">Reconnect</span><span class="btn btn-ghost btn-sm" data-go="srcdetail">Details →</span></div>
           </div>
           <div class="card" style="padding:14px;opacity:.6">
             <div style="display:flex;align-items:center;gap:8px;font-weight:600">
@@ -561,7 +569,7 @@
       per-source sync mode · diagnostics shortcuts · danger zone (Reset local state / Prepare for uninstall → app-native modals).</div>
     </section>
 
-    <!-- ============ 2.4 REVIEW CENTER ============ -->
+    <!-- ============ 2.3 REVIEW CENTER ============ -->
     <section class="screen" id="reviewcenter">
       <div class="shead"><h2>Review Center</h2><span class="route">/review</span></div>
       <p class="sdesc">The approval workspace: changed files on the left, diff on the right, and a single primary path to approve selected changes.</p>
@@ -598,7 +606,7 @@
           <div>
             <div class="statusbar"><b style="font-size:13px">Auth.md</b>
               <span class="meta">Cursor · edited 12 min ago · +1 -1</span>
-              <span class="sp"><span class="btn btn-sm">Open file</span><span class="btn btn-sm">Rule…</span></span></div>
+              <span class="sp"><span class="btn btn-sm" data-go="files">Open file</span><span class="btn btn-sm" data-go="agents">Rule…</span></span></div>
           <div class="content">
             <div class="diff">
               <div class="dh">Auth.md
@@ -609,9 +617,9 @@
               <div class="dl dl-ctx">  Unchanged context line…</div>
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">
-              <span class="btn btn-sm">Reject selected</span><span class="btn btn-primary btn-sm">Approve selected</span>
+              <span class="btn btn-sm">Reject selected</span><span class="btn btn-primary btn-sm" data-go="review">Approve selected</span>
               <span class="btn btn-sm">Pull latest</span><span class="btn btn-sm">Reset to remote</span>
-              <span class="btn btn-sm">Resolve conflict</span></div>
+              <span class="btn btn-sm" data-go="conflict">Resolve conflict</span></div>
             <div style="margin-top:14px;font-size:12px;color:var(--muted)">
               Pushed work appears in Activity. Revert is shown only when a journal-backed reverse plan is still safe.</div>
           </div>
@@ -623,7 +631,7 @@
       discarded work is kept in .locality/trash for a retention window.</div>
     </section>
 
-    <!-- ============ 2.5 PUSH APPROVAL ============ -->
+    <!-- ============ 2.3.1 PUSH APPROVAL ============ -->
     <section class="screen" id="review">
       <div class="shead"><h2>Push approval — final gate</h2><span class="route">/review/push (modal route)</span></div>
       <p class="sdesc">A modal over Review Center: Back/Esc pushes nothing and preserves selection. Deletions gate the push button behind an explicit checkbox.</p>
@@ -654,7 +662,7 @@
       partial failure routes to Sync Problems · <b>focus</b> — lands on Back, Esc = Back, never pushes.</div>
     </section>
 
-    <!-- ============ 2.6 PROBLEMS ============ -->
+    <!-- ============ 2.3.3 SYNC PROBLEMS ============ -->
     <section class="screen" id="problems">
       <div class="shead"><h2>Sync problems — resolution center</h2><span class="route">/problems</span></div>
       <p class="sdesc">OneDrive-style error center: each row states the item, the plain-language cause, and a primary fix action.</p>
@@ -670,7 +678,7 @@
               <span class="chip c-conflict">⚠ Conflict</span> Auth.md <span class="src src-n">N</span></div>
             <p style="font-size:12px;color:var(--muted);margin:5px 0 10px">You and Notion both edited this page.</p>
             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-              <span class="btn btn-primary btn-sm">Resolve…</span>
+              <span class="btn btn-primary btn-sm" data-go="conflict">Resolve…</span>
               <span class="linkish">Keep mine</span><span class="linkish">Keep remote</span><span class="linkish">Keep both</span></div>
           </div>
           <div class="card" style="padding:12px 14px">
@@ -678,7 +686,7 @@
               <span class="chip c-error">✕ Push failed</span> Roadmap.md <span class="src src-n">N</span></div>
             <p style="font-size:12px;color:var(--muted);margin:5px 0 10px">Locality no longer has permission for this workspace.</p>
             <div style="display:flex;gap:8px;align-items:center">
-              <span class="btn btn-primary btn-sm">Reconnect source</span><span class="linkish">Retry</span></div>
+              <span class="btn btn-primary btn-sm" data-go="srcdetail">Reconnect source</span><span class="linkish">Retry</span></div>
           </div>
         </div>
       </div>
@@ -687,7 +695,7 @@
       destructive plan blocked → Review plan · “Keep both” writes name.conflict-YYYYMMDD-HHMM.md.</div>
     </section>
 
-    <!-- ============ 2.7 CONFLICT ============ -->
+    <!-- ============ 2.3.4 CONFLICT EDITOR ============ -->
     <section class="screen" id="conflict">
       <div class="shead"><h2>Conflict editor — three-pane</h2><span class="route">/review/:fileId</span></div>
       <p class="sdesc">Tower-style resolver: Local | editable Merged result | Remote, with click-to-take and markdown-aware auto-merge attempted first.</p>
@@ -712,15 +720,15 @@
                 <span class="btn btn-sm">◄ take all</span></div></div>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
-            <span class="btn">Cancel</span><span class="btn">Mark resolved &amp; keep draft</span>
-            <span class="btn btn-primary">Resolve &amp; push</span></div>
+            <span class="btn" data-go="reviewcenter">Cancel</span><span class="btn">Mark resolved &amp; keep draft</span>
+            <span class="btn btn-primary" data-go="pushstates">Resolve &amp; push</span></div>
         </div>
       </div>
       <div class="notes"><b>merge</b> — markdown three-way auto-merge runs first; only true divergences reach this screen ·
       word-level diff highlighting in all panes · preview toggle renders the merged markdown.</div>
     </section>
 
-    <!-- ============ 2.8 ACTIVITY ============ -->
+    <!-- ============ 2.4.2 ACTIVITY LOG ============ -->
     <section class="screen" id="activity">
       <div class="shead"><h2>Activity</h2><span class="route">/activity</span></div>
       <p class="sdesc">The History analog: an immutable, day-grouped log with expandable detail and Revert only when a safe reverse plan exists.</p>
@@ -749,7 +757,7 @@
       Queue Debug is no longer a tab here; it moved to Settings → Advanced.</div>
     </section>
 
-    <!-- ============ 2.9 SETTINGS ============ -->
+    <!-- ============ 2.4 SETTINGS ============ -->
     <section class="screen" id="settings">
       <div class="shead"><h2>Settings — sectioned</h2><span class="route">/settings/:section</span></div>
       <p class="sdesc">Left-hand sectioned nav (OneDrive pattern), deep-linkable. Shown: Sync &amp; Live Mode.</p>
@@ -757,8 +765,8 @@
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Settings</span></div>
         <div class="setshell">
           <div class="setnav">
-            <a href="#">General</a><a href="#">Sources</a><a class="on" href="#">Sync &amp; Live Mode</a>
-            <a href="#">Agents</a><a href="#">Notifications</a><a href="#">Network</a>
+            <a href="#">General</a><a href="#" data-go="srcdetail">Sources</a><a class="on" href="#">Sync &amp; Live Mode</a>
+            <a href="#" data-go="agents">Agents</a><a href="#">Notifications</a><a href="#">Network</a>
             <a href="#">Advanced</a><a href="#">About</a>
           </div>
           <div class="content" style="max-width:460px">
@@ -770,7 +778,7 @@
             <div class="check on"><i>✓</i><span>Pause on conflicts</span></div>
             <div class="check on"><i>✓</i><span>Pause on destructive plans</span></div>
             <div class="check on"><i>✓</i><span>Pause on review-required changes</span></div>
-            <div style="margin-top:14px"><span class="linkish">Per-source overrides →</span></div>
+            <div style="margin-top:14px"><span class="linkish" data-go="srcdetail">Per-source overrides →</span></div>
           </div>
         </div>
       </div>
@@ -779,7 +787,7 @@
       Advanced (logs, repair runtime, Queue Debug, danger zone) · About.</div>
     </section>
 
-    <!-- ============ 3.0 TRAY ============ -->
+    <!-- ============ 3.1 TRAY POPOVER ============ -->
     <section class="screen" id="tray">
       <div class="shead"><h2>Tray popover</h2><span class="route">menu bar</span></div>
       <p class="sdesc">Dropbox/Drive anatomy: search → status → review queue → recent → controls → avatar/settings. Pause offers preset durations.</p>
@@ -790,29 +798,29 @@
           <span style="margin-left:auto;font-size:11px;color:var(--muted)">Live mode</span><span class="toggle"></span></div>
         <div class="tsec">
           <div class="sect-label" style="padding:0 0 4px">Review Center (4)</div>
-          <div class="rowline" style="padding:4px 0"><span class="src src-n">N</span><span class="grow">Roadmap.md</span>
+          <div class="rowline" style="padding:4px 0" data-go="reviewcenter"><span class="src src-n">N</span><span class="grow">Roadmap.md</span>
             <span class="linkish">Review</span></div>
-          <div class="rowline" style="padding:4px 0"><span class="src src-n">N</span><span class="grow">Auth.md</span>
+          <div class="rowline" style="padding:4px 0" data-go="reviewcenter"><span class="src src-n">N</span><span class="grow">Auth.md</span>
             <span class="linkish">Review</span></div>
-          <div style="font-size:11px;padding-top:4px"><span class="linkish">See all →</span></div>
+          <div style="font-size:11px;padding-top:4px"><span class="linkish" data-go="reviewcenter">See all →</span></div>
         </div>
         <div class="tsec">
           <div class="sect-label" style="padding:0 0 4px">Recent</div>
-          <div class="rowline" style="padding:4px 0"><span class="src src-n">N</span><span class="grow">Standup.md</span><span class="meta">3h</span></div>
-          <div class="rowline" style="padding:4px 0"><span class="src src-n">N</span><span class="grow">Specs/Auth.md</span><span class="meta">1h</span></div>
+          <div class="rowline" style="padding:4px 0" data-go="files"><span class="src src-n">N</span><span class="grow">Standup.md</span><span class="meta">3h</span></div>
+          <div class="rowline" style="padding:4px 0" data-go="files"><span class="src src-n">N</span><span class="grow">Specs/Auth.md</span><span class="meta">1h</span></div>
         </div>
         <div class="tsec" style="display:flex;gap:12px;font-size:12px;align-items:center">
           <span class="linkish">Pause syncing ▾</span>
-          <span style="margin-left:auto" class="linkish">Open folder</span><span class="linkish">Activity</span></div>
+          <span style="margin-left:auto" class="linkish" data-go="files">Open folder</span><span class="linkish" data-go="activity">Activity</span></div>
         <div class="tsec" style="display:flex;align-items:center;gap:8px;background:var(--wash)">
           <span class="avatar"></span><span style="font-size:11.5px;color:var(--muted)">user@team</span>
-          <span style="margin-left:auto" class="linkish">⚙ Settings</span><span class="linkish">Quit</span></div>
+          <span style="margin-left:auto" class="linkish" data-go="settings">⚙ Settings</span><span class="linkish">Quit</span></div>
       </div>
       <div class="notes"><b>pause presets</b> — 30 min · 1 hour · Until tomorrow · Indefinitely (first three auto-resume) ·
       left-click opens popover; all rows keyboard-navigable; Esc closes.</div>
     </section>
 
-    <!-- ============ 4.0 MODALS ============ -->
+    <!-- ============ 3.2 DESTRUCTIVE MODALS ============ -->
     <section class="screen" id="modals">
       <div class="shead"><h2>Destructive modals — app-native</h2><span class="route">replaces browser confirm()</span></div>
       <p class="sdesc">One template for all destructive actions: plain-language consequences, typed confirmation for irreversible ones, red action, safe default focus.</p>
@@ -843,7 +851,7 @@
       same template covers Prepare for uninstall and page-deletion gates.</div>
     </section>
 
-    <!-- ============ 5.0 LEGEND ============ -->
+    <!-- ============ 4.2 STATUS LEGEND ============ -->
     <section class="screen" id="legend">
       <div class="shead"><h2>Status chip legend</h2><span class="route">used on every list row</span></div>
       <p class="sdesc">One vocabulary everywhere: sidebar badges, file rows, tray, and OS file badges all map to these seven states. Never color alone — always icon + text.</p>
@@ -866,7 +874,7 @@
       tray: aggregate line + per-item · OS badges: synced ✓ / in-flight progress / error ! mapped per platform.</div>
     </section>
 
-    <!-- ============ 6.1 SOURCE DETAIL ============ -->
+    <!-- ============ 2.2.1 SOURCE DETAIL ============ -->
     <section class="screen" id="srcdetail">
       <div class="shead"><h2>Source detail</h2><span class="route">/sources/:id</span></div>
       <p class="sdesc">Everything about one connected workspace: access, local files, mount health, and the danger zone — without crowding Home or Sources.</p>
@@ -875,13 +883,13 @@
         data-app-entry="Sources card > Details, Home source health card, connector warning > Manage source">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Notion · Acme Team</span></div>
         <div class="content" style="padding:16px 22px">
-          <div style="font-size:12px;margin-bottom:8px"><span class="linkish">← Sources</span></div>
+          <div style="font-size:12px;margin-bottom:8px"><span class="linkish" data-go="sources">← Sources</span></div>
           <div style="display:flex;align-items:center;gap:8px;font-weight:600;font-size:14px">
             <span class="src src-n">N</span>Notion — Acme Team
             <span class="chip c-synced" style="margin-left:auto">✓ Healthy</span></div>
           <div class="pathchip" style="margin:10px 0"><span>~/Library/CloudStorage/Locality/notion</span><em>Copy</em></div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
-            <span class="btn btn-sm">Open folder</span><span class="btn btn-sm">Open in VS Code</span>
+            <span class="btn btn-sm" data-go="files">Open folder</span><span class="btn btn-sm" data-go="files">Open in VS Code</span>
             <span class="btn btn-sm">Change access</span><span class="btn btn-sm">Pull changes ⤵</span></div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
             <div class="card"><div class="card-h">Access</div>
@@ -915,7 +923,7 @@
       Mode dropdown here is the per-source override referenced in Settings → Sync &amp; Live.</div>
     </section>
 
-    <!-- ============ 6.2 LOCATE ============ -->
+    <!-- ============ 2.1.2 LOCATE RESULTS ============ -->
     <section class="screen" id="locate">
       <div class="shead"><h2>Locate — results open</h2><span class="route">/locate?q=…</span></div>
       <p class="sdesc">Type a title → ranked suggestions with source badges and status. Paste a URL → resolves straight to the Located result.</p>
@@ -927,9 +935,9 @@
           <div class="h-min" style="margin-top:0">Locate a page</div>
           <div class="wf-input" style="color:var(--ink)">🔎 auth<span style="margin-left:2px;border-left:1px solid var(--ink)"></span></div>
           <div class="card" style="margin-top:-1px;border-top-left-radius:0;border-top-right-radius:0">
-            <div class="rowline" style="background:var(--teal-wash)"><span class="grow">📄 Auth.md</span>
+            <div class="rowline" style="background:var(--teal-wash)" data-go="files"><span class="grow">📄 Auth.md</span>
               <span class="src src-n">N</span><span class="chip c-synced">✓ Synced</span><span class="meta">Specs/</span></div>
-            <div class="rowline"><span class="grow">📄 Auth-review.md</span>
+            <div class="rowline" data-go="reviewcenter"><span class="grow">📄 Auth-review.md</span>
               <span class="src src-n">N</span><span class="chip c-review-needed">● Needs review</span><span class="meta">Drafts/</span></div>
             <div class="rowline"><span class="grow">📄 OAuth broker notes</span>
               <span class="src src-n">N</span><span class="chip c-synced">✓ Synced</span><span class="meta">Eng/Infra/</span></div>
@@ -939,14 +947,14 @@
           <div class="pathchip"><span>~/Library/CloudStorage/Locality/notion/Specs/Auth.md</span></div>
           <div style="display:flex;gap:8px;margin-top:10px">
             <span class="btn btn-sm btn-primary">Copy path</span>
-            <span class="btn btn-sm">Reveal in Finder</span><span class="btn btn-sm">Open in editor</span></div>
+            <span class="btn btn-sm" data-go="files">Reveal in Finder</span><span class="btn btn-sm" data-go="files">Open in editor</span></div>
         </div>
       </div>
       <div class="notes"><b>URL paste</b> — skips suggestions, resolves directly · <b>not granted</b> — inline error:
       “That page isn’t shared with Locality. [Change Notion access]” · suggestions require ≥2 characters, debounced.</div>
     </section>
 
-    <!-- ============ 6.3 PUSH STATES ============ -->
+    <!-- ============ 2.3.2 PUSH STATES ============ -->
     <section class="screen" id="pushstates">
       <div class="shead"><h2>Push approval — progress and success</h2><span class="route">/review/push</span></div>
       <p class="sdesc">Progress is per-file and honest; success names exactly what happened and points to Activity for audit and rare safe reversions.</p>
@@ -958,22 +966,22 @@
           <div class="rowline" style="padding:5px 0"><span class="chip c-synced">✓</span><span class="grow">Roadmap.md pushed</span></div>
           <div class="rowline" style="padding:5px 0"><span class="chip c-review">⟳</span><span class="grow">Auth.md pushing…</span></div>
           <div class="rowline" style="padding:5px 0;border-bottom:0"><span class="chip c-paused">○</span><span class="grow">Old.md queued</span></div>
-          <div class="mfoot"><span class="btn">Cancel remaining</span></div>
+          <div class="mfoot"><span class="btn" data-go="reviewcenter">Cancel remaining</span></div>
         </div>
         <div class="mcard" role="dialog" aria-label="Pushed" style="width:auto">
           <h3><span class="chip c-synced">✓</span> Pushed 3 changes to Notion</h3>
           <p style="font-size:12px;color:var(--muted);margin-top:4px">2 pages updated · 1 row updated · 1 page deleted</p>
           <div class="mfoot" style="justify-content:space-between;align-items:center">
-            <span class="linkish">View reverse plan</span>
-            <span style="display:flex;gap:8px"><span class="btn">View activity</span>
-            <span class="btn btn-primary">Done</span></span></div>
+            <span class="linkish" data-go="activity">View reverse plan</span>
+            <span style="display:flex;gap:8px"><span class="btn" data-go="activity">View activity</span>
+            <span class="btn btn-primary" data-go="reviewcenter">Done</span></span></div>
         </div>
       </div>
       <div class="notes"><b>partial failure</b> — success card lists failed items with “→ View in Sync Problems”; nothing
       silently retries · Cancel remaining never rolls back already-pushed files; Activity shows a Revert option only when safe.</div>
     </section>
 
-    <!-- ============ 6.4 AGENTS ============ -->
+    <!-- ============ 2.4.1 SETTINGS AGENTS ============ -->
     <section class="screen" id="agents">
       <div class="shead"><h2>Settings · Agents</h2><span class="route">/settings/agents</span></div>
       <p class="sdesc">Per-agent guidance status with one install/update action; the MCP fallback is surfaced as a configured capability, not jargon.</p>
@@ -999,7 +1007,7 @@
               <div class="rowline">⚡<span class="grow">Gemini CLI</span><span class="chip c-draft">○ Not installed</span></div>
             </div>
             <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
-              <span class="btn btn-primary btn-sm">Install / Update guidance</span>
+              <span class="btn btn-primary btn-sm" data-go="agents">Install / Update guidance</span>
               <span class="linkish">View written files →</span></div>
             <div class="rowline" style="margin-top:14px;border:1px solid var(--line-soft);border-radius:6px">
               <span class="grow" style="color:var(--muted)">MCP fallback: <b style="font-family:var(--mono);color:var(--ink)">loc</b> server</span>
@@ -1011,7 +1019,7 @@
       with “Open file location” · never edits opaque app databases — file-backed config only.</div>
     </section>
 
-    <!-- ============ 6.5 EMPTIES ============ -->
+    <!-- ============ 4.1 EMPTY AND LOADING STATES ============ -->
     <section class="screen" id="empties">
       <div class="shead"><h2>Empty &amp; loading states</h2><span class="route">sheet</span></div>
       <p class="sdesc">Every empty state is an invitation to act — a verb and a button, never mood copy. Lists load with skeletons; spinners are reserved for whole-screen waits.</p>
@@ -1095,17 +1103,17 @@
 
   function appNav(active){
     const items = [
-      ['home', '⌂', 'Home'],
-      ['sources', '◫', 'Sources'],
-      ['review', '●', 'Review Center', '4'],
-      ['settings', '⚙', 'Settings']
+      ['home', 'home', '⌂', 'Home'],
+      ['sources', 'sources', '◫', 'Sources'],
+      ['reviewcenter', 'review', '●', 'Review Center', '4'],
+      ['settings', 'settings', '⚙', 'Settings']
     ];
     return `
       <nav class="app-global-nav" aria-label="App navigation">
         <div class="logo"><span class="aperture"></span>Locality</div>
         <button class="collapse-btn" type="button" aria-expanded="true" aria-label="Collapse sidebar">Collapse</button>
-        ${items.map(([id, icon, label, count]) => `
-          <a href="#" class="${active === id ? 'on' : ''}">
+        ${items.map(([screenId, id, icon, label, count]) => `
+          <a href="#" data-go="${screenId}" class="${active === id ? 'on' : ''}">
             <span class="nav-ico">${icon}</span><span class="nav-label">${label}</span>${count ? `<span class="cnt">${count}</span>` : ''}
           </a>
         `).join('')}
@@ -1121,6 +1129,23 @@
       review: 'Review Center',
       settings: 'Settings'
     }[active] || 'Home';
+  }
+
+  function screenForCrumb(label){
+    return {
+      Home: 'home',
+      Sources: 'sources',
+      'Review Center': 'reviewcenter',
+      Settings: 'settings',
+      'Files browser': 'files',
+      'Locate results': 'locate',
+      'Notion - Acme Team': 'srcdetail',
+      'Push approval': 'review',
+      'Sync problems': 'problems',
+      'Conflict editor': 'conflict',
+      Agents: 'agents',
+      'Activity log': 'activity'
+    }[label] || '';
   }
 
   function directElementAfterToolbar(frame){
@@ -1170,7 +1195,11 @@
         const entry = frame.dataset.appEntry ? `<div class="entrypoints"><b>Reached from:</b> ${frame.dataset.appEntry}</div>` : '';
         banner.innerHTML = `
           <div class="crumbs" aria-label="Breadcrumbs">
-            ${crumbs.map((crumb, index) => `${index ? '<span>/</span>' : ''}<b>${crumb}</b>`).join('')}
+            ${crumbs.map((crumb, index) => {
+              const target = screenForCrumb(crumb);
+              const current = index === crumbs.length - 1 ? ' aria-current="page"' : '';
+              return `${index ? '<span>/</span>' : ''}<button class="crumb-link" type="button"${target ? ` data-go="${target}"` : ''}${current}>${crumb}</button>`;
+            }).join('')}
             <span class="chip ${frame.dataset.appKind === 'modal' ? 'c-review' : 'c-draft'}">${kind}</span>
           </div>
           ${entry}
@@ -1248,18 +1277,41 @@
     setNotesStatus('copied all notes');
   }
 
+  async function copyScreenLink(){
+    const url = new URL(window.location.href);
+    const screen = currentScreen();
+    url.hash = screen.id;
+    await copyText(url.toString());
+    setNotesStatus(`copied link to ${screenTitle(screen)}`);
+  }
+
   enhanceAppShells();
   buildTeamNotes();
 
-  function show(id){
+  function show(id, options = {}){
+    if (!document.getElementById(id)) return;
     screens.forEach(s => s.classList.toggle('active', s.id === id));
     nav.forEach(b => b.setAttribute('aria-current', b.dataset.s === id ? 'true' : 'false'));
     document.querySelector('.stage').scrollTop = 0;
     window.scrollTo({top:0});
+    if (options.updateHash !== false && window.location.hash !== `#${id}`) {
+      history.pushState(null, '', `#${id}`);
+    }
     setNotesStatus('');
   }
   nav.forEach(b => b.addEventListener('click', () => show(b.dataset.s)));
   document.addEventListener('click', e => {
+    const route = e.target.closest('[data-go]');
+    if (route) {
+      e.preventDefault();
+      const target = route.dataset.go;
+      if (target && document.getElementById(target)) {
+        show(target);
+        setNotesStatus(`opened ${screenTitle(document.getElementById(target))}`);
+      }
+      return;
+    }
+
     const button = e.target.closest('.collapse-btn');
     if (!button) return;
     const shell = button.closest('.final-appshell');
@@ -1274,8 +1326,13 @@
       ? 'Show design notes'
       : 'Hide design notes';
   });
+  document.getElementById('copy-screen-link').addEventListener('click', copyScreenLink);
   document.getElementById('copy-current-notes').addEventListener('click', () => copyScreenNotes(currentScreen()));
   document.getElementById('copy-all-notes').addEventListener('click', copyAllNotes);
+  window.addEventListener('popstate', () => {
+    const id = window.location.hash.slice(1) || 'ob1';
+    show(document.getElementById(id) ? id : 'ob1', {updateHash:false});
+  });
   document.addEventListener('keydown', e => {
     if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
     if (/input|textarea/i.test(document.activeElement.tagName)) return;
@@ -1284,6 +1341,10 @@
     const next = e.key === 'ArrowRight' ? Math.min(cur+1, ids.length-1) : Math.max(cur-1, 0);
     show(ids[next]);
   });
+  const initialId = window.location.hash.slice(1);
+  if (initialId && document.getElementById(initialId)) {
+    show(initialId, {updateHash:false});
+  }
 </script>
 </body>
 </html>
