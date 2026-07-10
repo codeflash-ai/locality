@@ -57,6 +57,14 @@ grep -q '<key>CFBundleIconFile</key>' "${FILE_PROVIDER_HOST_PLIST}" \
   || fail "File Provider host plist must declare CFBundleIconFile"
 grep -q '<key>CFBundleIconFile</key>' "${FILE_PROVIDER_EXTENSION_PLIST}" \
   || fail "File Provider extension plist must declare CFBundleIconFile"
+grep -q '<key>CFBundleIconName</key>' "${FILE_PROVIDER_HOST_PLIST}" \
+  || fail "File Provider host plist must declare CFBundleIconName"
+grep -q '<key>CFBundleIconName</key>' "${FILE_PROVIDER_EXTENSION_PLIST}" \
+  || fail "File Provider extension plist must declare CFBundleIconName"
+grep -q '<key>CFBundleIcons</key>' "${FILE_PROVIDER_HOST_PLIST}" \
+  || fail "File Provider host plist must declare CFBundleIcons"
+grep -q '<key>CFBundleIcons</key>' "${FILE_PROVIDER_EXTENSION_PLIST}" \
+  || fail "File Provider extension plist must declare CFBundleIcons"
 grep -q '<string>locality-mount-logo</string>' "${FILE_PROVIDER_HOST_PLIST}" \
   || fail "File Provider host plist must use the mount logo icon"
 grep -q '<string>locality-mount-logo</string>' "${FILE_PROVIDER_EXTENSION_PLIST}" \

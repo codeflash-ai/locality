@@ -8,6 +8,18 @@
 	<string>Locality</string>
 	<key>CFBundleIconFile</key>
 	<string>locality-mount-logo</string>
+	<key>CFBundleIconName</key>
+	<string>locality-mount-logo</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>locality-mount-logo</string>
+			</array>
+		</dict>
+	</dict>
 	<key>CFBundleIdentifier</key>
 	<string>ai.codeflash.locality.Locality</string>
   <key>CFBundleInfoDictionaryVersion</key>
