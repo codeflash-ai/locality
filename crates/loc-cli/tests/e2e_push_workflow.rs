@@ -71,10 +71,10 @@ use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
     ConnectionRecord, ConnectionRepository, ConnectorProfileId, ConnectorProfileRecord,
     ConnectorProfileRepository, CredentialStore, EntityRecord, EntityRepository,
-    FileCredentialStore, FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore,
-    JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationRepository,
-    open_credential_store,
+    FileCredentialStore, FreshnessStateRecord, FreshnessStateRepository, HydrationJobRepository,
+    InMemoryStateStore, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    VirtualMutationRepository, open_credential_store,
 };
 use localityd::execution::PushJob;
 use localityd::hydration::{
@@ -12467,6 +12467,114 @@ fn live_locate_notion_url_returns_markdown_path_and_can_prioritize_hydration() {
 }
 
 #[test]
+#[ignore = "requires Notion credentials in ~/.loc credentials and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
+fn live_cli_locate_notion_url_prints_local_markdown_path_and_queues_hydration() {
+    let env = LiveEnv::from_env();
+    let source_connection_id =
+        std::env::var(LIVE_CONNECTION_ENV).unwrap_or_else(|_| "notion-default".to_string());
+    let stored_secret =
+        live_notion_secret_from_default_store(&source_connection_id).expect("stored credential");
+    let access_token =
+        notion_access_token_from_secret(&stored_secret).expect("stored access token");
+    let api = HttpNotionApi::new(NotionConfig::default().with_token(access_token));
+    let mut cleanup = LiveCleanup::new(api);
+    let scratch = cleanup.create_page(
+        &env.parent_page_id,
+        &format!("Locality live CLI locate root {}", unique_suffix()),
+        vec![paragraph_child("CLI locate root body.")],
+    );
+    let child_title = format!("Locality live CLI located child {}", unique_suffix());
+    let child = cleanup.create_page(
+        &scratch.id,
+        &child_title,
+        vec![paragraph_child(
+            "CLI locate child body should be queued for hydration.",
+        )],
+    );
+
+    let fixture = E2eFixture::new();
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let connection_id = ConnectionId::new("stored-live-notion-locate");
+    seed_cli_live_connection(&fixture.state_root, &connection_id, &stored_secret);
+    let root = fixture.root.display().to_string();
+    let mount = loc_json_ok(loc_command(loc, &fixture.state_root).args([
+        "mount",
+        "notion",
+        root.as_str(),
+        "--root-page",
+        scratch.id.as_str(),
+        "--connection",
+        connection_id.as_str(),
+        "--mount-id",
+        fixture.mount_id.as_str(),
+        "--projection",
+        "plain-files",
+        "--json",
+    ]));
+    assert_eq!(mount.value["ok"], true, "{mount:#?}");
+
+    let child_url = notion_pretty_workspace_url("codeflash", &child_title, &child.id);
+    let locate_stdout = loc_text_with_exit(
+        loc_command(loc, &fixture.state_root).args(["locate", child_url.as_str()]),
+        0,
+    );
+    assert!(
+        locate_stdout.ends_with('\n'),
+        "locate should print one newline-terminated path, got {locate_stdout:?}"
+    );
+    let located_lines = locate_stdout.lines().collect::<Vec<_>>();
+    assert_eq!(
+        located_lines.len(),
+        1,
+        "locate should print only the local path, got {locate_stdout:?}"
+    );
+    let located_path = PathBuf::from(located_lines[0]);
+    assert!(
+        located_path.starts_with(&fixture.root),
+        "located path should be under the mounted root: {}",
+        located_path.display()
+    );
+    assert_eq!(
+        located_path.file_name().and_then(|name| name.to_str()),
+        Some("page.md"),
+        "locate should resolve page URLs to page.md: {}",
+        located_path.display()
+    );
+    assert_eq!(
+        located_path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str()),
+        Some(child_title.as_str()),
+        "locate should preserve the child page title in the projected path: {}",
+        located_path.display()
+    );
+
+    let store = SqliteStateStore::open(fixture.state_root.clone()).expect("open locate state");
+    let located = store
+        .get_entity(&fixture.mount_id, &RemoteId::new(child.id.clone()))
+        .expect("load located child entity")
+        .expect("located child entity");
+    assert_eq!(
+        located.path,
+        located_path
+            .strip_prefix(&fixture.root)
+            .expect("located path under fixture root")
+    );
+    assert_eq!(located.hydration, HydrationState::Stub);
+    let jobs = store.list_hydration_jobs().expect("list hydration jobs");
+    assert!(
+        jobs.iter().any(|job| {
+            job.mount_id == fixture.mount_id
+                && job.remote_id == RemoteId::new(child.id.clone())
+                && job.path == located_path
+                && job.reason == HydrationReason::FileOpen
+        }),
+        "locate should queue FileOpen hydration when localityd is disabled: {jobs:#?}"
+    );
+}
+
+#[test]
 #[ignore = "requires Notion credentials (NOTION_TOKEN or ~/.loc credentials) and LOCALITY_NOTION_LIVE_PARENT_PAGE; creates and archives scratch Notion content"]
 fn live_remote_delete_observation_removes_clean_hydrated_plain_file_page() {
     let env = LiveEnv::from_env();
@@ -15370,6 +15478,22 @@ fn loc_json_with_exit(command: &mut Command, expected_code: i32) -> LocJsonOutpu
         panic!("failed to parse loc JSON: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}")
     });
     LocJsonOutput { value, stdout }
+}
+
+fn loc_text_with_exit(command: &mut Command, expected_code: i32) -> String {
+    let output = command.output().expect("run loc command");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let code = output.status.code().unwrap_or(-1);
+    assert!(
+        code == expected_code,
+        "loc command exited with {code}, expected {expected_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "loc command should not print stderr on success\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    stdout
 }
 
 #[derive(Debug)]

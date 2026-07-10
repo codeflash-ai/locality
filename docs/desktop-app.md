@@ -244,13 +244,13 @@ This should be available from:
 Suggested command/API shape:
 
 ```text
-loc locate notion <url> --json
+loc locate <url>
 loc search <query> --connector notion --json
 ```
 
-The response should include the mount, local path, entity type, whether the file
-already existed, whether any projection update was needed, and whether the file
-was prioritized for local preparation.
+The CLI locate command should perform the same locate operations as the desktop
+GUI and print only the resolved local filesystem path. Richer locate metadata
+can be exposed later through a separate JSON/reporting surface if needed.
 
 Initial desktop implementation can search metadata already stored in SQLite:
 remote ID, title, and projected path. The next step is a dedicated local search

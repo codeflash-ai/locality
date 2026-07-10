@@ -17,6 +17,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc status [path] [--json]`
 - `loc live-mode on|off|status <file> [--json]`
 - `loc search <query> [--connector <connector>] [--limit <n>] [--json]`
+- `loc locate <query>`
 - `loc create page --title <title> [--parent <dir>] [--private] [--json]`
 - `loc templates list|validate|new|apply [args] [--json]`
 - `loc okf export <path> --out <dir> [--json]`
@@ -216,6 +217,26 @@ when you need the newest remote facts.
 dirty, conflicted, stale, or remotely deleted results are still returned for
 navigation, but future agent/MCP readers should treat their `safety.labels` as
 review or hydration requirements before reading file content.
+
+## Locate Notion Content
+
+`loc locate <query>` mirrors the desktop locate flow for Notion pages and
+databases, but prints only the resolved local filesystem path. The query can be
+a Notion URL, title, path fragment, or remote id. Non-Notion URLs are rejected so
+callers do not accidentally treat another system's URL as a Notion object.
+
+For exact Notion URLs, the command first resolves the object through the mounted
+Notion workspace and saves the returned parent path entries into local metadata.
+It then searches the local Notion index with the same visibility rules as the
+desktop GUI. If the resolved item is online-only, Locality asks the daemon to
+hydrate it with interactive priority and falls back to a queued hydration job
+when the daemon is unavailable.
+
+Successful human output is one line:
+
+```bash
+/Users/alice/Library/CloudStorage/Locality/notion/Product/Initial Idea/page.md
+```
 
 ## Local Draft Creation
 

@@ -10,8 +10,10 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use locality_connector::ConnectorUndoApplier;
 use locality_connector::oauth_broker::OAuthBrokerStart;
 use locality_core::LocalityError;
+use locality_core::freshness::RemoteVersion;
+use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::journal::{JournalStatus, PushId};
-use locality_core::model::{EntityKind, MountId, RemoteId};
+use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
 use locality_core::path_projection::{
     page_container_path, page_document_path, page_listing_parent_path,
 };
@@ -25,8 +27,9 @@ use locality_notion::oauth::{
 };
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-    ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, EntityRepository,
-    FreshnessStateRepository, JournalRepository, MountConfig, MountRepository, ProjectionMode,
+    ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, EntityRecord,
+    EntityRepository, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
+    JournalRepository, MountConfig, MountRepository, ProjectionMode, RemoteObservationRecord,
     RemoteObservationRepository, ShadowRepository, SqliteStateStore, VirtualMutationKind,
     VirtualMutationRepository, open_credential_store, reset_locality_state_storage,
 };
@@ -54,7 +57,7 @@ use crate::connect::{
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
-    resolve_source_for_mount_id, resolve_source_for_path, source_descriptor,
+    resolve_source_for_mount_id, resolve_source_for_path, source_descriptor, source_display_name,
 };
 use crate::create::{CreateError, CreatePageOptions, CreatePageReport, run_create_page};
 use crate::daemon::{DaemonControlError, DaemonControlReport, run_daemon_control};
@@ -79,7 +82,10 @@ use crate::push::{
     run_push_with_state_root, select_push_targets,
 };
 use crate::restore::{RestoreError, RestoreOptions, RestoreReport, run_restore};
-use crate::search::{SearchError, SearchOptions, SearchReport, notion_id_from_url, run_search};
+use crate::search::{
+    SearchError, SearchOptions, SearchReport, SearchResult, is_notion_url_host, notion_id_from_url,
+    run_search, run_search_with_access_roots, source_url_host,
+};
 use crate::status::{
     StatusError, StatusOptions, StatusReport, StatusSyncState, run_status,
     scoped_mount_ids_for_status_target,
@@ -157,6 +163,8 @@ enum LocalityCommand {
     Doctor,
     #[command(about = "Search local mount metadata without contacting remote sources")]
     Search(SearchArgs),
+    #[command(about = "Locate a mounted Notion page or database and print its local path")]
+    Locate(LocateArgs),
     #[command(about = "Create local draft content in a mounted Locality folder")]
     Create {
         #[command(subcommand)]
@@ -517,6 +525,16 @@ struct SearchArgs {
     all: bool,
 }
 
+#[derive(Debug, Args)]
+struct LocateArgs {
+    #[arg(
+        value_name = "query",
+        num_args = 1..,
+        help = "Notion URL, title, path fragment, or remote id to locate."
+    )]
+    query: Vec<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum CreateCommand {
     #[command(about = "Create a page directory with page.md")]
@@ -756,6 +774,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         LocalityCommand::LiveMode { .. } => live_mode(&legacy_args[1..], json),
         LocalityCommand::Doctor => doctor(json),
         LocalityCommand::Search(_) => search(&legacy_args[1..], json),
+        LocalityCommand::Locate(_) => locate(&legacy_args[1..], json),
         LocalityCommand::Create { .. } => create(&legacy_args[1..], json),
         LocalityCommand::Templates { .. } => templates(&legacy_args[1..], json),
         LocalityCommand::Okf { .. } => okf(&legacy_args[1..], json),
@@ -940,6 +959,12 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
             push_optional_flag_value(&mut args, "--connector", options.connector.as_deref());
             push_flag_value(&mut args, "--limit", &options.limit.to_string());
             push_flag(&mut args, "--all", options.all);
+        }
+        LocalityCommand::Locate(options) => {
+            args.push("locate".to_string());
+            for query_part in &options.query {
+                args.push(query_part.clone());
+            }
         }
         LocalityCommand::Create { command } => {
             args.push("create".to_string());
@@ -3087,6 +3112,451 @@ fn search(args: &[String], json: bool) -> i32 {
         print_search_report(&report);
         EXIT_SUCCESS
     }
+}
+
+fn locate(args: &[String], json: bool) -> i32 {
+    let query = positional_args(args).join(" ");
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("locate", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+
+    match locate_notion_query_path(&state_root, &mut store, &query) {
+        Ok(path) => {
+            println!("{path}");
+            EXIT_SUCCESS
+        }
+        Err(error) => locate_command_error(json, error),
+    }
+}
+
+fn locate_notion_query_path(
+    state_root: &Path,
+    store: &mut SqliteStateStore,
+    query: &str,
+) -> Result<String, CommandError> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err(CommandError::new(
+            "locate",
+            "empty_query",
+            "Paste a Notion page or database URL, or search your local Notion index.",
+        ));
+    }
+    if let Some(message) = unsupported_notion_locator_url_message(query) {
+        return Err(CommandError::new("locate", "unsupported_url", message));
+    }
+
+    if notion_id_from_url(query).is_some() {
+        prepare_exact_notion_url_path(state_root, store, query)?;
+    }
+
+    let options = SearchOptions {
+        query: query.to_string(),
+        connector: Some("notion".to_string()),
+        limit: 1,
+        include_stale_access: false,
+    };
+    let report = run_search_with_access_roots(store, options, locate_mount_access_root)
+        .map_err(|error| CommandError::new("locate", error.code(), error.message()))?;
+    let result = locate_result_from_report(query, report, store)?;
+    prioritize_located_notion_result(state_root, store, &result);
+    Ok(result.absolute_path)
+}
+
+fn locate_result_from_report(
+    query: &str,
+    report: SearchReport,
+    store: &SqliteStateStore,
+) -> Result<SearchResult, CommandError> {
+    report.results.into_iter().next().ok_or_else(|| {
+        if notion_id_from_url(query).is_some() {
+            notion_access_miss_error(store)
+        } else {
+            CommandError::new(
+                "locate",
+                "not_found",
+                "No local Notion page or database matched that search yet. Try a title, path fragment, or Notion URL.",
+            )
+        }
+    })
+}
+
+fn locate_mount_access_root(mount: &MountConfig) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if mount.projection == ProjectionMode::MacosFileProvider {
+            if macos_path_is_under_cloud_storage(&mount.root) {
+                return mount.root.clone();
+            }
+            if let Ok(url) = crate::file_provider::macos_file_provider_domain_url(
+                localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+            ) {
+                return url.join(localityd::virtual_fs::mount_point_directory_name(mount));
+            }
+        }
+    }
+
+    mount.root.clone()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_path_is_under_cloud_storage(path: &Path) -> bool {
+    locality_platform::user_home()
+        .map(|home| path.starts_with(home.join("Library").join("CloudStorage")))
+        .unwrap_or(false)
+}
+
+fn unsupported_notion_locator_url_message(query: &str) -> Option<String> {
+    let host = source_url_host(query)?;
+    if is_notion_url_host(host.as_str()) {
+        return None;
+    }
+
+    let source = match url_source_label(&host) {
+        Some(label) => label.to_string(),
+        None => format!("`{host}`"),
+    };
+    Some(format!(
+        "That looks like a {source} URL. This field opens Notion pages and databases only; paste a Notion page or database URL, title, or mounted Notion path."
+    ))
+}
+
+fn url_source_label(host: &str) -> Option<&'static str> {
+    if host == "github.com" || host.ends_with(".github.com") {
+        return Some("GitHub");
+    }
+    if host == "docs.google.com" || host == "drive.google.com" {
+        return Some("Google Docs");
+    }
+    None
+}
+
+fn prepare_exact_notion_url_path(
+    state_root: &Path,
+    store: &mut SqliteStateStore,
+    query: &str,
+) -> Result<(), CommandError> {
+    let Some(notion_id) = notion_id_from_url(query) else {
+        return Ok(());
+    };
+    let remote_id = RemoteId::new(notion_id.clone());
+    let mounts = store
+        .load_mounts()
+        .map_err(|error| CommandError::new("locate", "store_error", error.to_string()))?
+        .into_iter()
+        .filter(|mount| mount.connector == "notion")
+        .collect::<Vec<_>>();
+    if mounts.is_empty() {
+        return Err(CommandError::new(
+            "locate",
+            "no_notion_mount",
+            "Create a Notion folder before locating pages or databases.",
+        ));
+    }
+
+    let credentials = open_credential_store(state_root);
+    let mut last_error = None;
+    for mount in mounts {
+        let source = match resolve_source_for_mount_id(store, credentials.as_ref(), &mount.mount_id)
+        {
+            Ok(source) => source,
+            Err(error) => {
+                last_error = Some(CommandError::new("locate", error.code(), error.message()));
+                continue;
+            }
+        };
+        let localityd::source::ResolvedSource::Notion(connector) = source else {
+            continue;
+        };
+        match connector.resolve_object_path_entries(mount.mount_id.clone(), &remote_id) {
+            Ok(entries)
+                if entries
+                    .iter()
+                    .any(|entry| exact_notion_entry_matches(&entry.remote_id, &notion_id)) =>
+            {
+                save_exact_notion_entries(store, entries)?;
+                return Ok(());
+            }
+            Ok(_) => {
+                last_error = Some(CommandError::new(
+                    "locate",
+                    "notion_access_miss",
+                    format!(
+                        "Notion object `{}` was not returned while resolving its parent hierarchy.",
+                        remote_id.0
+                    ),
+                ));
+            }
+            Err(error) => {
+                last_error = Some(CommandError::new(
+                    "locate",
+                    "notion_resolution_failed",
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| notion_access_miss_error(store)))
+}
+
+fn exact_notion_entry_matches(remote_id: &RemoteId, compact_notion_id: &str) -> bool {
+    notion_id_from_url(remote_id.as_str()).as_deref() == Some(compact_notion_id)
+}
+
+fn save_exact_notion_entries(
+    store: &mut SqliteStateStore,
+    entries: Vec<TreeEntry>,
+) -> Result<(), CommandError> {
+    let observed_at = auto_save_timestamp();
+    for entry in entries {
+        let existing = store
+            .get_entity(&entry.mount_id, &entry.remote_id)
+            .map_err(|error| {
+                CommandError::new(
+                    "locate",
+                    "store_error",
+                    format!("Could not inspect local Notion metadata: {error}"),
+                )
+            })?;
+        let record = exact_located_entity_record(&entry, existing.as_ref())?;
+        store.save_entity(record).map_err(|error| {
+            CommandError::new(
+                "locate",
+                "store_error",
+                format!("Could not update local Notion metadata: {error}"),
+            )
+        })?;
+
+        let mut observation = RemoteObservationRecord::new(
+            entry.mount_id.clone(),
+            entry.remote_id.clone(),
+            entry.kind.clone(),
+            entry.title.clone(),
+            entry.path.clone(),
+            observed_at.clone(),
+        );
+        if let Some(remote_version) = entry.remote_edited_at.clone() {
+            observation = observation.with_remote_version(RemoteVersion::new(remote_version));
+        }
+        store
+            .save_remote_observation(observation)
+            .map_err(|error| {
+                CommandError::new(
+                    "locate",
+                    "store_error",
+                    format!("Could not update local Notion metadata: {error}"),
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
+fn exact_located_entity_record(
+    entry: &TreeEntry,
+    existing: Option<&EntityRecord>,
+) -> Result<EntityRecord, CommandError> {
+    let mut record = EntityRecord::from(entry.clone());
+    if let Some(existing) = existing {
+        if existing.path != entry.path
+            && matches!(
+                existing.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        {
+            return Err(CommandError::new(
+                "locate",
+                "pending_changes_at_old_path",
+                format!(
+                    "Notion page `{}` moved from `{}` to `{}`, but the old local file has pending changes. Review or push the old file before opening the new path.",
+                    existing.title,
+                    existing.path.display(),
+                    entry.path.display()
+                ),
+            ));
+        }
+        record.hydration = existing.hydration.clone();
+        record.content_hash = existing.content_hash.clone();
+        if matches!(
+            existing.hydration,
+            HydrationState::Hydrated | HydrationState::Dirty | HydrationState::Conflicted
+        ) {
+            record.remote_edited_at = existing.remote_edited_at.clone();
+        }
+    }
+    Ok(record)
+}
+
+fn notion_access_miss_error(store: &SqliteStateStore) -> CommandError {
+    let mounts = store.load_mounts().unwrap_or_default();
+    let connections = store.list_connections().unwrap_or_default();
+    let mount = choose_mount(&mounts);
+    let connection = choose_connection(&connections, mount.as_ref());
+    let workspace = connection
+        .as_ref()
+        .and_then(|connection| connection.workspace_name.clone())
+        .or_else(|| {
+            mount
+                .as_ref()
+                .map(|mount| connector_label(&mount.connector))
+        })
+        .unwrap_or_else(|| "the connected Notion workspace".to_string());
+    let scope = mount
+        .as_ref()
+        .map(|mount| notion_access_scope_label(Some(store), mount))
+        .unwrap_or_else(|| "No mounted Notion access yet".to_string());
+    let root_url = mount.as_ref().and_then(notion_access_scope_url);
+
+    CommandError::new(
+        "locate",
+        "notion_access_miss",
+        notion_access_miss_message_from_parts(&workspace, &scope, root_url.as_deref()),
+    )
+}
+
+fn notion_object_url(id: &str) -> String {
+    format!("https://www.notion.so/{}", notion_url_id(id))
+}
+
+fn notion_url_id(id: &str) -> String {
+    id.chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>()
+}
+
+fn notion_access_miss_message_from_parts(
+    workspace: &str,
+    access_scope: &str,
+    root_url: Option<&str>,
+) -> String {
+    let root_hint = root_url
+        .map(|url| format!(" Open the mounted root ({url}) to confirm the current access scope."))
+        .unwrap_or_default();
+    format!(
+        "That Notion page or database is outside the selected Notion access for workspace `{workspace}`. Current mount access: `{access_scope}`.{root_hint} Use Change Notion Access to select this page, database, or the correct teamspace, then sync the workspace."
+    )
+}
+
+fn notion_access_scope_label(store: Option<&SqliteStateStore>, mount: &MountConfig) -> String {
+    let Some(remote_root_id) = mount.remote_root_id.as_ref() else {
+        return "Selected pages and databases".to_string();
+    };
+
+    let title = store
+        .and_then(|store| {
+            store
+                .get_entity(&mount.mount_id, remote_root_id)
+                .ok()
+                .flatten()
+                .map(|entity| entity.title)
+                .or_else(|| {
+                    store
+                        .get_remote_observation(&mount.mount_id, remote_root_id)
+                        .ok()
+                        .flatten()
+                        .map(|observation| observation.title)
+                })
+        })
+        .filter(|title| !title.trim().is_empty());
+
+    match title {
+        Some(title) => title,
+        None => format!("Mounted root {}", notion_url_id(&remote_root_id.0)),
+    }
+}
+
+fn notion_access_scope_url(mount: &MountConfig) -> Option<String> {
+    mount
+        .remote_root_id
+        .as_ref()
+        .map(|remote_id| notion_object_url(&remote_id.0))
+}
+
+fn choose_mount(mounts: &[MountConfig]) -> Option<MountConfig> {
+    mounts
+        .iter()
+        .find(|mount| mount.connector == "notion")
+        .or_else(|| mounts.first())
+        .cloned()
+}
+
+fn choose_connection(
+    connections: &[ConnectionRecord],
+    mount: Option<&MountConfig>,
+) -> Option<ConnectionRecord> {
+    if let Some(connection_id) = mount.and_then(|mount| mount.connection_id.as_ref())
+        && let Some(connection) = connections
+            .iter()
+            .find(|connection| connection.connection_id == *connection_id)
+    {
+        return Some(connection.clone());
+    }
+
+    connections
+        .iter()
+        .find(|connection| connection.connector == "notion")
+        .or_else(|| connections.first())
+        .cloned()
+}
+
+fn connector_label(connector: &str) -> String {
+    source_display_name(connector)
+}
+
+fn prioritize_located_notion_result(
+    state_root: &Path,
+    store: &mut SqliteStateStore,
+    result: &SearchResult,
+) {
+    if !should_prioritize_located_result(result) {
+        return;
+    }
+
+    let path = PathBuf::from(&result.absolute_path);
+    let request = DaemonRequest::Hydrate {
+        mount_id: result.mount_id.clone(),
+        remote_id: result.remote_id.clone(),
+        path: path.clone(),
+    };
+    if matches!(
+        run_daemon_report::<Value>(state_root, &request),
+        DaemonReport::Report(_)
+    ) {
+        return;
+    }
+
+    let hydration = HydrationRequest::new(
+        MountId::new(result.mount_id.clone()),
+        RemoteId::new(result.remote_id.clone()),
+        path,
+        HydrationState::Hydrated,
+        HydrationReason::FileOpen,
+    );
+    let _ = store.upsert_hydration_job(HydrationJobRecord::from(hydration));
+}
+
+fn should_prioritize_located_result(result: &SearchResult) -> bool {
+    result.kind == "page" && result.state == "online_only"
+}
+
+fn locate_command_error(json: bool, error: CommandError) -> i32 {
+    let exit_code = match error.code.as_str() {
+        "empty_query" | "unsupported_url" => EXIT_USAGE,
+        "not_found" | "notion_access_miss" | "no_notion_mount" | "pending_changes_at_old_path" => {
+            EXIT_VALIDATION
+        }
+        _ => EXIT_INTERNAL,
+    };
+    command_error(json, error, exit_code)
 }
 
 fn create(args: &[String], json: bool) -> i32 {
@@ -7165,7 +7635,7 @@ mod tests {
     use clap::Parser;
     use clap::error::ErrorKind;
 
-    use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+    use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
     use locality_core::shadow::ShadowDocument;
     use locality_google_docs::GOOGLE_DOCS_CONNECTOR_ID;
     use locality_store::{
@@ -7178,7 +7648,9 @@ mod tests {
     use crate::history::{JournalEntryOutput, LogReport};
     use crate::local_oauth::{local_redirect, parse_oauth_callback};
     use crate::push::PushReport;
-    use crate::search::{SearchOptions, SearchReport};
+    use crate::search::{
+        SearchOptions, SearchRemoteState, SearchReport, SearchResult, SearchSafety,
+    };
 
     #[cfg(target_os = "windows")]
     use super::resolve_mount_target;
@@ -7186,12 +7658,12 @@ mod tests {
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, FileProviderCommandReport,
         PushConfirmationPromptError, VirtualProjectionRegistration, absolute_command_path,
         auto_registration_for_mounted_projection, default_mount_id_for_source,
-        diff_report_exit_code, file_provider_list_lines, google_docs_oauth_broker_config,
-        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
-        guard_unresolved_windows_cloud_files_unregister,
+        diff_report_exit_code, exact_located_entity_record, file_provider_list_lines,
+        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
+        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
-        mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
-        print_push_confirmation_preview, projection_mode_for_target,
+        locate_result_from_report, mounted_projection_preflight_error, notion_authorize_url,
+        notion_oauth_broker_config, print_push_confirmation_preview, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
         push_preview_plan_matches, should_prompt_for_push_confirmation,
@@ -7683,6 +8155,18 @@ mod tests {
         );
 
         let cli = parse_cli([
+            "locate",
+            "https://app.notion.com/p/codeflash/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "locate",
+                "https://app.notion.com/p/codeflash/Initial-Idea-37b3ac0ebb88802cbcf4d53c9cfc4972"
+            ]
+        );
+
+        let cli = parse_cli([
             "create",
             "page",
             "--title",
@@ -8073,6 +8557,109 @@ mod tests {
         let report = empty_search_report(&options);
 
         assert!(!should_refresh_notion_url_search(&options, &report));
+    }
+
+    #[test]
+    fn locate_result_print_path_selects_first_search_result() {
+        let state_root = unique_temp_path("loc-locate-result");
+        let store = SqliteStateStore::open(state_root.clone()).expect("open locate store");
+        let report = SearchReport {
+            ok: true,
+            command: "search",
+            query: "Roadmap".to_string(),
+            connector: Some("notion".to_string()),
+            count: 1,
+            results: vec![SearchResult {
+                mount_id: "notion-main".to_string(),
+                connector: "notion".to_string(),
+                title: "Roadmap".to_string(),
+                kind: "page".to_string(),
+                remote_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                path: "Planning/Roadmap/page.md".to_string(),
+                absolute_path: "/Users/alice/Locality/notion/Planning/Roadmap/page.md".to_string(),
+                state: "ready".to_string(),
+                safety: SearchSafety {
+                    agent_readable: true,
+                    labels: vec!["ready".to_string()],
+                },
+                remote: SearchRemoteState::default(),
+                score: 100,
+            }],
+        };
+
+        let result =
+            locate_result_from_report("Roadmap", report, &store).expect("locate search result");
+
+        assert_eq!(
+            result.absolute_path,
+            "/Users/alice/Locality/notion/Planning/Roadmap/page.md"
+        );
+        let _ = fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn exact_located_entity_preserves_hydrated_local_state() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let existing = EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "Old/Roadmap/page.md",
+        )
+        .with_hydration(HydrationState::Hydrated)
+        .with_content_hash("local-hash")
+        .with_remote_edited_at("remote-v1");
+        let entry = TreeEntry {
+            mount_id,
+            remote_id,
+            kind: EntityKind::Page,
+            title: "Roadmap".to_string(),
+            path: PathBuf::from("New/Roadmap/page.md"),
+            hydration: HydrationState::Stub,
+            content_hash: Some("fresh-hash".to_string()),
+            remote_edited_at: Some("remote-v2".to_string()),
+            stub_frontmatter: None,
+        };
+
+        let record = exact_located_entity_record(&entry, Some(&existing))
+            .expect("clean hydrated entity can move");
+
+        assert_eq!(record.path, PathBuf::from("New/Roadmap/page.md"));
+        assert_eq!(record.hydration, HydrationState::Hydrated);
+        assert_eq!(record.content_hash.as_deref(), Some("local-hash"));
+        assert_eq!(record.remote_edited_at.as_deref(), Some("remote-v1"));
+    }
+
+    #[test]
+    fn exact_located_entity_rejects_dirty_move() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let existing = EntityRecord::new(
+            mount_id.clone(),
+            remote_id.clone(),
+            EntityKind::Page,
+            "Roadmap",
+            "Old/Roadmap/page.md",
+        )
+        .with_hydration(HydrationState::Dirty);
+        let entry = TreeEntry {
+            mount_id,
+            remote_id,
+            kind: EntityKind::Page,
+            title: "Roadmap".to_string(),
+            path: PathBuf::from("New/Roadmap/page.md"),
+            hydration: HydrationState::Stub,
+            content_hash: None,
+            remote_edited_at: None,
+            stub_frontmatter: None,
+        };
+
+        let error = exact_located_entity_record(&entry, Some(&existing))
+            .expect_err("dirty entity move should be blocked");
+
+        assert_eq!(error.code, "pending_changes_at_old_path");
     }
 
     #[test]
