@@ -614,13 +614,65 @@ fn diff_plain_text_summary_includes_entity_creates() {
         .expect("run loc diff");
 
     assert!(
-        output.status.success(),
+        output.status.code() == Some(4),
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("1 entity created"), "{stdout}");
+}
+
+#[test]
+fn diff_plain_text_output_includes_readable_patch() {
+    let fixture = DiffFixture::new();
+    let state_root = fixture.root.join(".state");
+    let mut store = SqliteStateStore::open(state_root.clone()).expect("open sqlite");
+    store
+        .save_mount(MountConfig::new(
+            fixture.mount_id.clone(),
+            "notion",
+            fixture.root.clone(),
+        ))
+        .expect("save mount");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Roadmap",
+                "Roadmap.md",
+            )
+            .with_hydration(HydrationState::Hydrated),
+        )
+        .expect("save entity");
+    store
+        .save_shadow(&fixture.mount_id, shadow("# Roadmap\n\nOld paragraph.\n"))
+        .expect("save shadow");
+    let path = fixture.write_page("Roadmap.md", "# Roadmap\n\nChanged paragraph.\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_loc"))
+        .env("LOCALITY_STATE_DIR", &state_root)
+        .arg("diff")
+        .arg(&path)
+        .output()
+        .expect("run loc diff");
+
+    assert!(
+        output.status.code() == Some(4),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("1 block updated"), "{stdout}");
+    assert!(
+        stdout.contains("diff --locality a/Roadmap.md b/Roadmap.md"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("-Old paragraph."), "{stdout}");
+    assert!(stdout.contains("+Changed paragraph."), "{stdout}");
 }
 
 #[test]

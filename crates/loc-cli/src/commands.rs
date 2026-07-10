@@ -3810,7 +3810,13 @@ fn push(args: &[String], json: bool) -> i32 {
             json,
             io::stdin().is_terminal(),
         ) {
-            print_diff_report_fields(&report.validation, report.plan.as_ref());
+            if let Err(error) = print_push_confirmation_preview(&report, &mut io::stdout()) {
+                return command_error(
+                    json,
+                    CommandError::new("push", "stdout_write_failed", error.to_string()),
+                    EXIT_INTERNAL,
+                );
+            }
             match prompt_for_push_confirmation(&mut io::stdin().lock(), &mut io::stdout()) {
                 Ok(true) => {
                     let mut approved = options.clone();
@@ -3831,9 +3837,13 @@ fn push(args: &[String], json: bool) -> i32 {
                     return push_report_exit_code(&report);
                 }
                 Err(error) => {
+                    let code = match &error {
+                        PushConfirmationPromptError::Output(_) => "stdout_write_failed",
+                        PushConfirmationPromptError::Input(_) => "stdin_read_failed",
+                    };
                     return command_error(
                         json,
-                        CommandError::new("push", "stdin_read_failed", error.to_string()),
+                        CommandError::new("push", code, error.to_string()),
                         EXIT_INTERNAL,
                     );
                 }
@@ -4053,22 +4063,44 @@ fn should_prompt_for_push_confirmation(
     report.action == "confirm_plan" && !options.assume_yes && !json && stdin_is_terminal
 }
 
-fn prompt_for_push_confirmation<R, W>(input: &mut R, output: &mut W) -> io::Result<bool>
+#[derive(Debug)]
+enum PushConfirmationPromptError {
+    Output(io::Error),
+    Input(io::Error),
+}
+
+impl std::fmt::Display for PushConfirmationPromptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Output(error) | Self::Input(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+fn prompt_for_push_confirmation<R, W>(
+    input: &mut R,
+    output: &mut W,
+) -> Result<bool, PushConfirmationPromptError>
 where
     R: BufRead,
     W: Write,
 {
     loop {
-        write!(output, "Proceed with push? [y/N] ")?;
-        output.flush()?;
+        write!(output, "Proceed with push? [y/N] ").map_err(PushConfirmationPromptError::Output)?;
+        output
+            .flush()
+            .map_err(PushConfirmationPromptError::Output)?;
 
         let mut answer = String::new();
-        input.read_line(&mut answer)?;
+        input
+            .read_line(&mut answer)
+            .map_err(PushConfirmationPromptError::Input)?;
         match answer.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => return Ok(true),
             "" | "n" | "no" => return Ok(false),
             _ => {
-                writeln!(output, "Please answer y or n.")?;
+                writeln!(output, "Please answer y or n.")
+                    .map_err(PushConfirmationPromptError::Output)?;
             }
         }
     }
@@ -4135,7 +4167,7 @@ fn diff(args: &[String], json: bool) -> i32 {
             exit_code
         }
         Ok(report) => {
-            let exit_code = diff_report_exit_code(&report);
+            let exit_code = diff_plain_report_exit_code(&report);
             print_diff_report(&report);
             exit_code
         }
@@ -5525,31 +5557,56 @@ fn stub(command: &str, json: bool) -> i32 {
 
 fn print_diff_report(report: &crate::diff::DiffReport) {
     print_diff_report_fields(&report.validation, report.plan.as_ref());
+    print_readable_diff(report.readable_diff.as_ref());
+}
+
+fn print_push_confirmation_preview<W: Write>(
+    report: &PushReport,
+    output: &mut W,
+) -> io::Result<()> {
+    write_diff_report_fields(output, &report.validation, report.plan.as_ref())?;
+    write_readable_diff(output, report.readable_diff.as_ref())
 }
 
 fn print_diff_report_fields(
     validation: &[crate::diff::ValidationIssueOutput],
     plan: Option<&crate::diff::PushPlanOutput>,
 ) {
+    let mut output = io::stdout();
+    let _ = write_diff_report_fields(&mut output, validation, plan);
+}
+
+fn print_readable_diff(readable_diff: Option<&locality_core::readable_diff::ReadableDiffOutput>) {
+    let mut output = io::stdout();
+    let _ = write_readable_diff(&mut output, readable_diff);
+}
+
+fn write_diff_report_fields<W: Write>(
+    output: &mut W,
+    validation: &[crate::diff::ValidationIssueOutput],
+    plan: Option<&crate::diff::PushPlanOutput>,
+) -> io::Result<()> {
     if !validation.is_empty() {
         for issue in validation {
             match issue.line {
-                Some(line) => println!(
+                Some(line) => writeln!(
+                    output,
                     "{}:{}: {} ({})",
                     issue.file, line, issue.message, issue.code
-                ),
-                None => println!("{}: {} ({})", issue.file, issue.message, issue.code),
+                )?,
+                None => writeln!(output, "{}: {} ({})", issue.file, issue.message, issue.code)?,
             }
         }
-        return;
+        return Ok(());
     }
 
     let Some(plan) = plan else {
-        println!("no plan");
-        return;
+        writeln!(output, "no plan")?;
+        return Ok(());
     };
 
-    println!(
+    writeln!(
+        output,
         "{} block{} updated, {} replaced, {} media updated, {} block{} created, {} entit{} created, {} moved, {} block{} archived, {} entit{} archived",
         plan.summary.blocks_updated,
         plural(plan.summary.blocks_updated),
@@ -5572,7 +5629,25 @@ fn print_diff_report_fields(
         } else {
             "ies"
         }
-    );
+    )
+}
+
+fn write_readable_diff<W: Write>(
+    output: &mut W,
+    readable_diff: Option<&locality_core::readable_diff::ReadableDiffOutput>,
+) -> io::Result<()> {
+    let Some(readable_diff) = readable_diff else {
+        return Ok(());
+    };
+    if readable_diff.text.trim().is_empty() {
+        return Ok(());
+    }
+    writeln!(output)?;
+    write!(output, "{}", readable_diff.text)?;
+    if !readable_diff.text.ends_with('\n') {
+        writeln!(output)?;
+    }
+    Ok(())
 }
 
 fn read_connect_token(args: &[String], json: bool) -> Result<String, CommandError> {
@@ -6478,6 +6553,13 @@ fn diff_report_exit_code(report: &crate::diff::DiffReport) -> i32 {
     }
 }
 
+fn diff_plain_report_exit_code(report: &crate::diff::DiffReport) -> i32 {
+    match report.action.as_str() {
+        "confirm_plan" | "confirm_dangerous_plan" => 4,
+        _ => diff_report_exit_code(report),
+    }
+}
+
 fn pull_report_exit_code(report: &PullReport) -> i32 {
     if report.ok {
         EXIT_SUCCESS
@@ -6988,7 +7070,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{self, Cursor, Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7014,18 +7096,18 @@ mod tests {
     use super::resolve_mount_target;
     use super::{
         Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, FileProviderCommandReport,
-        VirtualProjectionRegistration, absolute_command_path,
+        PushConfirmationPromptError, VirtualProjectionRegistration, absolute_command_path,
         auto_registration_for_mounted_projection, default_mount_id_for_source,
         diff_report_exit_code, file_provider_list_lines, google_docs_oauth_broker_config,
         guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
         guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         mounted_projection_preflight_error, notion_authorize_url, notion_oauth_broker_config,
-        projection_mode_for_target, projection_usage_options_for_target,
-        prompt_for_push_confirmation, pull_direct_fallback_error,
-        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        spinner_config_for_command, spinner_enabled, status as run_status_command,
-        validate_virtual_projection_registration,
+        print_push_confirmation_preview, projection_mode_for_target,
+        projection_usage_options_for_target, prompt_for_push_confirmation,
+        pull_direct_fallback_error, should_prompt_for_push_confirmation,
+        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
+        status as run_status_command, validate_virtual_projection_registration,
     };
 
     #[test]
@@ -7609,6 +7691,22 @@ mod tests {
     }
 
     #[test]
+    fn push_confirmation_prompt_distinguishes_output_and_input_errors() {
+        let output_error =
+            prompt_for_push_confirmation(&mut Cursor::new(b"y\n"), &mut FailingWriter)
+                .expect_err("output error");
+        assert!(matches!(
+            output_error,
+            PushConfirmationPromptError::Output(_)
+        ));
+
+        let mut output = Vec::new();
+        let input_error =
+            prompt_for_push_confirmation(&mut FailingReader, &mut output).expect_err("input error");
+        assert!(matches!(input_error, PushConfirmationPromptError::Input(_)));
+    }
+
+    #[test]
     fn push_confirmation_prompt_is_only_for_interactive_safe_plans() {
         let options = crate::push::PushOptions {
             assume_yes: false,
@@ -7639,6 +7737,26 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn push_confirmation_preview_prints_readable_diff() {
+        let mut report = push_report("confirm_plan");
+        report.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n--- a/Roadmap.md\n+++ b/Roadmap.md\n"
+                .to_string(),
+        });
+
+        let mut output = Vec::new();
+        print_push_confirmation_preview(&report, &mut output).expect("preview");
+        let rendered = String::from_utf8(output).expect("utf8");
+
+        assert!(rendered.contains("0 blocks updated"), "{rendered}");
+        assert!(
+            rendered.contains("diff --locality a/Roadmap.md b/Roadmap.md"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -8344,6 +8462,7 @@ mod tests {
             entity_id: "page-1".to_string(),
             validation: Vec::new(),
             plan: None,
+            readable_diff: None,
             guardrail: GuardrailOutput {
                 decision: "proceed".to_string(),
                 reasons: Vec::new(),
@@ -8352,7 +8471,6 @@ mod tests {
             unsupported: Vec::new(),
             message: None,
             suggested_fix: None,
-            readable_diff: None,
             completed_stages: Vec::new(),
         }
     }
@@ -8366,7 +8484,8 @@ mod tests {
             mount_id: "notion-main".to_string(),
             entity_id: "page-1".to_string(),
             validation: Vec::new(),
-            plan: None,
+            plan: Some(empty_push_plan()),
+            readable_diff: None,
             guardrail: GuardrailOutput {
                 decision: "proceed".to_string(),
                 reasons: Vec::new(),
@@ -8383,6 +8502,54 @@ mod tests {
             unsupported: Vec::new(),
             suggested_fix: None,
         }
+    }
+
+    fn empty_push_plan() -> crate::diff::PushPlanOutput {
+        crate::diff::PushPlanOutput {
+            summary: crate::diff::PlanSummaryOutput {
+                blocks_created: 0,
+                blocks_updated: 0,
+                blocks_replaced: 0,
+                blocks_moved: 0,
+                media_updated: 0,
+                blocks_archived: 0,
+                entities_created: 0,
+                entities_archived: 0,
+                entities_moved: 0,
+                properties_updated: 0,
+            },
+            affected_entities: Vec::new(),
+            operations: Vec::new(),
+            degradations: Vec::new(),
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("flush failed"))
+        }
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("read failed"))
+        }
+    }
+
+    impl io::BufRead for FailingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::other("read failed"))
+        }
+
+        fn consume(&mut self, _amt: usize) {}
     }
 
     fn empty_search_report(options: &SearchOptions) -> SearchReport {

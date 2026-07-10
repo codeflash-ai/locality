@@ -10,6 +10,7 @@ use locality_core::LocalityResult;
 use locality_core::journal::{JournalStatus, JournalStore};
 use locality_core::model::{EntityKind, RemoteId};
 use locality_core::push::{PushApproval, PushExecutionAction, PushExecutionResult};
+use locality_core::readable_diff::ReadableDiffOutput;
 use locality_store::{
     AutoSaveRepository, EntityRepository, FreshnessStateRepository, JournalRepository,
     MountLiveModeRepository, MountRepository, RemoteObservationRepository, ShadowRepository,
@@ -199,6 +200,8 @@ pub struct PushReport {
     pub entity_id: String,
     pub validation: Vec<ValidationIssueOutput>,
     pub plan: Option<PushPlanOutput>,
+    #[serde(skip_serializing)]
+    pub readable_diff: Option<ReadableDiffOutput>,
     pub guardrail: GuardrailOutput,
     pub action: String,
     pub pipeline_action: String,
@@ -249,6 +252,7 @@ impl PushReport {
                 .map(ValidationIssueOutput::from)
                 .collect(),
             plan: pipeline.plan.map(PushPlanOutput::from),
+            readable_diff: None,
             guardrail: GuardrailOutput::from(pipeline.guardrail),
             action: daemon_action_name(&action, &pipeline_action, error.as_ref()).to_string(),
             pipeline_action,
@@ -301,6 +305,7 @@ impl PushReport {
             entity_id: preview.entity_id,
             validation: preview.validation,
             plan: preview.plan,
+            readable_diff: preview.readable_diff,
             guardrail: preview.guardrail,
             pipeline_action: preview.action,
             action,
