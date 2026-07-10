@@ -7,6 +7,7 @@ ICON="${ROOT}/apps/desktop/src-tauri/icons/dmg-icon.icns"
 APPLICATIONS_ICON="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/ApplicationsFolderIcon.icns"
 APPLICATIONS_ICON_X=550
 APPLICATIONS_ICON_Y=240
+DMG_BACKGROUND_NAME="dmg-background.png"
 
 if [[ -z "${DMG}" ]]; then
   DMG="$(find "${ROOT}/target/release/bundle/dmg" -maxdepth 1 -type f \( -name 'Locality_*.dmg' -o -name 'LOCALITY_*.dmg' \) | sort | tail -n 1)"
@@ -25,6 +26,7 @@ TMPDIR="$(mktemp -d)"
 MOUNTPOINT="${TMPDIR}/mount"
 RW_DMG="${TMPDIR}/loc-installer-rw.dmg"
 FINAL_DMG="${TMPDIR}/loc-installer-final.dmg"
+DS_STORE_BACKUP="${TMPDIR}/DS_Store"
 
 cleanup() {
   if [[ -d "${MOUNTPOINT}" ]]; then
@@ -37,6 +39,16 @@ trap cleanup EXIT
 hdiutil convert "${DMG}" -format UDRW -o "${RW_DMG}" -quiet
 mkdir -p "${MOUNTPOINT}"
 hdiutil attach "${RW_DMG}" -readwrite -noverify -noautoopen -mountpoint "${MOUNTPOINT}" -quiet
+
+if [[ ! -f "${MOUNTPOINT}/.DS_Store" ]]; then
+  echo "DMG is missing Finder layout metadata: ${MOUNTPOINT}/.DS_Store" >&2
+  exit 1
+fi
+if ! strings "${MOUNTPOINT}/.DS_Store" | grep -F -q "${DMG_BACKGROUND_NAME}"; then
+  echo "DMG Finder layout does not reference ${DMG_BACKGROUND_NAME}; refusing to ship a generic installer window." >&2
+  exit 1
+fi
+cp -p "${MOUNTPOINT}/.DS_Store" "${DS_STORE_BACKUP}"
 
 if [[ -L "${MOUNTPOINT}/Applications" ]]; then
   rm "${MOUNTPOINT}/Applications"
@@ -57,6 +69,7 @@ if [[ -f "${MOUNTPOINT}/Applications" && -f "${APPLICATIONS_ICON}" ]]; then
   Rez -append "${applications_icon_resource}" -o "${MOUNTPOINT}/Applications"
   SetFile -a C "${MOUNTPOINT}/Applications"
 fi
+cp -p "${DS_STORE_BACKUP}" "${MOUNTPOINT}/.DS_Store"
 
 cp "${ICON}" "${MOUNTPOINT}/.VolumeIcon.icns"
 if command -v SetFile >/dev/null 2>&1; then

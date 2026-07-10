@@ -49,6 +49,12 @@ grep -q 'dmg_status="notarized"' "${PUBLISH_SCRIPT}" \
   || fail "notarized artifacts must keep the notarized naming suffix"
 grep -q 'make new alias file to POSIX file "/Applications"' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
   || fail "DMG postprocess must replace the Applications symlink with a Finder alias"
+grep -F -q 'DS_STORE_BACKUP="${TMPDIR}/DS_Store"' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
+  || fail "DMG postprocess must back up Tauri Finder layout metadata before touching Finder aliases"
+grep -F -q 'strings "${MOUNTPOINT}/.DS_Store" | grep -F -q "${DMG_BACKGROUND_NAME}"' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
+  || fail "DMG postprocess must verify the instructional background metadata is present"
+grep -F -q 'cp -p "${DS_STORE_BACKUP}" "${MOUNTPOINT}/.DS_Store"' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
+  || fail "DMG postprocess must restore Tauri Finder layout metadata after touching Finder aliases"
 
 [[ -f "${DMG_BACKGROUND}" ]] \
   || fail "DMG installer background asset is missing"
