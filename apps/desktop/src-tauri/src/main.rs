@@ -144,6 +144,7 @@ const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250
 const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
 const LIVE_MODE_RUNNER_ACTIVE_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_MODE_RUNNER_IDLE_RECHECK: Duration = Duration::from_secs(5 * 60);
+const DESKTOP_BACKGROUND_LAUNCH_ARG: &str = "--background";
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4578,6 +4579,20 @@ fn set_launch_at_login_cache(enabled: bool) {
     }
 }
 
+fn desktop_launch_requested_background() -> bool {
+    desktop_launch_requested_background_from_args(env::args())
+}
+
+fn desktop_launch_requested_background_from_args<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .skip(1)
+        .any(|arg| arg.as_ref() == DESKTOP_BACKGROUND_LAUNCH_ARG)
+}
+
 fn refresh_launch_at_login_cache_async() {
     tauri::async_runtime::spawn_blocking(|| {
         set_launch_at_login_cache(launch_at_login_enabled());
@@ -5249,6 +5264,7 @@ fn launch_agent_plist(executable: &Path) -> String {
   <key>ProgramArguments</key>
   <array>
     <string>{executable}</string>
+    <string>{DESKTOP_BACKGROUND_LAUNCH_ARG}</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -5331,7 +5347,10 @@ fn windows_run_key_is_registered() -> Result<bool, String> {
 
 #[cfg(windows)]
 fn windows_run_value_for_executable(executable: &Path) -> String {
-    format!("\"{}\"", executable.display())
+    format!(
+        "\"{}\" {DESKTOP_BACKGROUND_LAUNCH_ARG}",
+        executable.display()
+    )
 }
 
 #[cfg(windows)]
@@ -5737,11 +5756,12 @@ fn schedule_relaunch_after_process_exit(pid: u32, executable: &Path) -> Result<(
         Command::new("/bin/sh")
             .arg("-c")
             .arg(
-                "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; sleep 0.3; exec /usr/bin/open -n \"$2\"",
+                "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; sleep 0.3; exec /usr/bin/open -n \"$2\" --args \"$3\"",
             )
             .arg("locality-update-relaunch")
             .arg(pid.to_string())
             .arg(target)
+            .arg(DESKTOP_BACKGROUND_LAUNCH_ARG)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -5755,7 +5775,7 @@ fn schedule_relaunch_after_process_exit(pid: u32, executable: &Path) -> Result<(
         let script = "$ErrorActionPreference = 'SilentlyContinue'; \
             Wait-Process -Id ([int]$args[0]); \
             Start-Sleep -Milliseconds 300; \
-            Start-Process -FilePath $args[1]";
+            Start-Process -FilePath $args[1] -ArgumentList $args[2]";
         Command::new("powershell.exe")
             .arg("-NoProfile")
             .arg("-WindowStyle")
@@ -5766,6 +5786,7 @@ fn schedule_relaunch_after_process_exit(pid: u32, executable: &Path) -> Result<(
             .arg(script)
             .arg(pid.to_string())
             .arg(executable)
+            .arg(DESKTOP_BACKGROUND_LAUNCH_ARG)
             .creation_flags(0x08000000)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -5782,10 +5803,11 @@ fn schedule_relaunch_after_process_exit(pid: u32, executable: &Path) -> Result<(
             .unwrap_or_else(|| executable.to_path_buf());
         Command::new("/bin/sh")
             .arg("-c")
-            .arg("while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; sleep 0.3; exec \"$2\"")
+            .arg("while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; sleep 0.3; exec \"$2\" \"$3\"")
             .arg("locality-update-relaunch")
             .arg(pid.to_string())
             .arg(target)
+            .arg(DESKTOP_BACKGROUND_LAUNCH_ARG)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -13592,8 +13614,33 @@ mod tests {
             super::windows_run_value_for_executable(Path::new(
                 r"C:\Program Files\Locality\Locality.exe"
             )),
-            r#""C:\Program Files\Locality\Locality.exe""#
+            r#""C:\Program Files\Locality\Locality.exe" --background"#
         );
+    }
+
+    #[test]
+    fn desktop_background_launch_requires_explicit_argument() {
+        assert!(!super::desktop_launch_requested_background_from_args([
+            "Locality"
+        ]));
+        assert!(super::desktop_launch_requested_background_from_args([
+            "Locality",
+            "--background"
+        ]));
+        assert!(!super::desktop_launch_requested_background_from_args([
+            "Locality",
+            "--backgrounded"
+        ]));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn launch_agent_starts_desktop_in_background() {
+        let plist = super::launch_agent_plist(Path::new(
+            "/Applications/Locality.app/Contents/MacOS/Locality",
+        ));
+
+        assert!(plist.contains("<string>--background</string>"));
     }
 
     #[cfg(unix)]
@@ -14541,6 +14588,8 @@ fn main() {
         return;
     }
 
+    let background_launch = desktop_launch_requested_background();
+
     desktop_log("info", "app.start", "Locality desktop starting");
     let Some(single_instance_guard) = acquire_desktop_single_instance() else {
         return;
@@ -14586,6 +14635,9 @@ fn main() {
             ensure_runtime_ready_in_background(app.app_handle().clone());
             start_live_mode_runner(app.app_handle().clone());
             start_windows_cloud_files_provider_supervisor();
+            if !background_launch {
+                show_main_window_with_view(app.app_handle(), None);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -14639,11 +14691,7 @@ fn main() {
         .expect("failed to build Locality desktop app")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen {
-                has_visible_windows: false,
-                ..
-            } = event
-            {
+            if let tauri::RunEvent::Reopen { .. } = event {
                 show_main_window_with_view(app, None);
             }
         });
