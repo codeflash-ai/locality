@@ -6,7 +6,7 @@ Locality installs a small agent guidance pack during desktop onboarding so local
 
 | Agent | Install target | Status |
 | --- | --- | --- |
-| Claude Code / Claude Desktop / Claude Cowork | `~/.claude/skills/locality/SKILL.md`, `~/.claude.json`, and Claude Desktop MCP config when present (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows) | Installed when the guidance installer runs and Claude is detected. |
+| Claude Code / Claude Desktop / Claude Cowork | `~/.claude/skills/locality/SKILL.md`, `~/.claude.json`, and Claude Desktop MCP config when present (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on classic Windows installs, or `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json` for packaged Windows Claude) | Installed when the guidance installer runs and Claude is detected. |
 | Codex | `~/.codex/skills/locality/SKILL.md` and `~/.codex/config.toml` | Installed when the guidance installer runs and Codex is detected. |
 | Warp | `~/.agents/skills/locality/SKILL.md` | Installed when the guidance installer runs and Warp is detected. Warp also reads project rules such as `AGENTS.md` and `WARP.md`; Locality keeps mount-point-local `AGENTS.md` under `/Locality/notion-main`. |
 | OpenCode | `~/.agents/skills/locality/SKILL.md` | Installed when the guidance installer runs and OpenCode is detected. |
@@ -56,8 +56,9 @@ starting `localityd` to disable the daemon-hosted MCP endpoint, or set
 `LOCALITY_MCP_ADDR=<host:port>` to move it.
 
 On Windows, the desktop installer detects both the current MSIX Claude Desktop
-package and the legacy per-user EXE install before writing
-`%APPDATA%\Claude\claude_desktop_config.json`.
+package and the legacy per-user EXE install before writing the config path that
+install uses: the package-local Roaming path for MSIX installs, or
+`%APPDATA%\Claude\claude_desktop_config.json` for legacy installs.
 
 ## Onboarding UX
 

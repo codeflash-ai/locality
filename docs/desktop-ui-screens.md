@@ -321,10 +321,10 @@ Goal: make the menu bar icon communicate enough state at a glance without
 becoming visually noisy.
 
 The base icon should remain monochrome so it feels native on macOS. The default
-state should be clean, with no green badge and no activity animation. The shape
-should read as a trusted aperture into agent-readable company data. Avoid paired
-vertical bars or other shapes that can read as pause. State badges should appear
-only when the user needs to review something or fix a broken connection:
+state should be clean, with no green badge and no activity animation. Use the
+short Locality mark so the tray, popover, app icon, and installer surfaces share
+the same recognizable silhouette. State badges should appear only when the user
+needs to review something or fix a broken connection:
 
 ```text
 Default           Working            Needs Review       Reconnect Needed
@@ -345,9 +345,9 @@ States:
 
 Chosen mark:
 
-- Use the original Aperture icon: two angled aperture edges, two horizontal
-  inner lanes, and a short center channel. It communicates a narrow trusted
-  opening into company knowledge without looking like a pause control.
+- Use the short Locality mark from the `_short.svg` logo pair. Use the dark
+  mark on light UI surfaces and the light mark on dark/accent surfaces or dark
+  icon backgrounds.
 - Do not show alternate tray mark concepts in the final product plan.
 - Do not use a default green badge or animated working badge.
 

@@ -57,7 +57,14 @@ Locality.exe
 loc.exe
 localityd.exe
 locality-cloud-files.exe
+locality-mount-logo.ico
 ```
+
+When the shared Cloud Files root is registered, `locality-cloud-files.exe`
+refreshes a hidden `desktop.ini` in `%USERPROFILE%\Locality` that points Explorer
+at the installed `locality-mount-logo.ico`. This branding applies only to the
+shared Locality root; child mount folders such as `notion-main` and
+`google-docs-main` remain ordinary projected workspace folders.
 
 The NSIS uninstall hook stops the desktop app, `localityd.exe`, `loc.exe`, and
 Cloud Files provider runtimes; runs the desktop binary's `--prepare-uninstall`

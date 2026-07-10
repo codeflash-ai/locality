@@ -16,13 +16,13 @@ use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, EntityRecord, EntityRepository,
     FreshnessStateRecord, FreshnessStateRepository, HydrationJobRecord, HydrationJobRepository,
     InMemoryStateStore, MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountRepository,
-    ProjectionMode, ShadowRepository, SqliteStateStore,
+    ProjectionMode, ShadowRepository, SqliteStateStore, live_mode_state_change_signal_path,
 };
 use localityd::DaemonConfig;
 use localityd::execution::{DaemonEventReport, PushJob};
 use localityd::freshness::freshness_timestamp;
 use localityd::hydration::HydrationOutcome;
-use localityd::ipc::{DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
+use localityd::ipc::{DaemonDebugQueueStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use localityd::runtime::{
     DaemonRuntime, DaemonRuntimeHandle, DefaultRuntimeJobRunner, FileEventRuntimeReport,
     FreshnessRuntimeReport, RuntimeJobRunner, ScheduledPullRuntimeReport,
@@ -148,7 +148,7 @@ fn runtime_answers_virtual_fs_children_while_pull_worker_is_blocked() {
 }
 
 #[test]
-fn runtime_waits_to_refresh_file_provider_children_while_pull_worker_is_blocked() {
+fn runtime_answers_cached_file_provider_children_while_pull_worker_is_blocked() {
     let (started_tx, started_rx) = mpsc::channel();
     let (children_tx, children_rx) = mpsc::channel();
     let (refresh_tx, refresh_rx) = mpsc::channel();
@@ -184,50 +184,34 @@ fn runtime_waits_to_refresh_file_provider_children_while_pull_worker_is_blocked(
         response_tx.send(response).expect("send metadata response");
     });
 
-    let children_before_release = children_rx.recv_timeout(Duration::from_millis(100));
-    let response_before_release = response_rx.recv_timeout(Duration::from_millis(100));
+    let children_call = children_rx.recv_timeout(Duration::from_secs(1));
+    let response = response_rx.recv_timeout(Duration::from_secs(1));
     let refresh_before_release = refresh_rx.recv_timeout(Duration::from_millis(100));
 
-    assert!(
-        children_before_release.is_err(),
-        "file provider children should wait for the active mutating job"
+    assert_eq!(
+        children_call.expect("file provider children should read cache while pull is active"),
+        (
+            "notion-main".to_string(),
+            ROOT_CONTAINER_IDENTIFIER.to_string()
+        )
     );
     assert!(
-        response_before_release.is_err(),
-        "file provider children response should wait for interactive refresh"
+        response
+            .expect("file provider children response should not wait for pull")
+            .ok
     );
     assert!(
         refresh_before_release.is_err(),
-        "interactive refresh should remain serialized behind active mutating work"
+        "cached file provider children should not force an interactive refresh"
     );
 
     release_blocked_runner(&release);
     assert!(pull_thread.join().expect("pull thread").ok);
     metadata_thread.join().expect("metadata thread");
 
-    assert_eq!(
-        refresh_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("interactive child refresh"),
-        (
-            "notion-main".to_string(),
-            ROOT_CONTAINER_IDENTIFIER.to_string()
-        )
-    );
-    assert_eq!(
-        children_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("file provider children should read refreshed projection"),
-        (
-            "notion-main".to_string(),
-            ROOT_CONTAINER_IDENTIFIER.to_string()
-        )
-    );
     assert!(
-        response_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("file provider children response")
-            .ok
+        refresh_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "cached file provider children should not refresh after the pull completes"
     );
     runtime.shutdown();
 }
@@ -1228,6 +1212,14 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
     ]);
 
     simulation.advance_to(
+        5,
+        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "mount:notion-main"),
+    );
+    simulation.release(mount_point_refresh);
+    simulation.expect_no_start();
+    simulation.wait_for_child_refresh_queued("children:page-a");
+
+    simulation.advance_to(
         10,
         SchedulerInputAction::InteractiveDirectoryOpen("children:page-a"),
     );
@@ -1245,7 +1237,10 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
         mount_id: "notion-main".to_string(),
         identifier: "page-open".to_string(),
     });
-    simulation.expect_no_start();
+    let page_open = simulation.expect_started(SchedulerExpectedStart::new(
+        SchedulerOpKind::FileProviderRead,
+        "page-open",
+    ));
 
     simulation.advance_to(
         30,
@@ -1253,10 +1248,7 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
     );
     simulation.release(page_a_children_refresh);
     simulation.assert_response_ok(directory_open);
-    let page_open = simulation.expect_started(SchedulerExpectedStart::new(
-        SchedulerOpKind::FileProviderRead,
-        "page-open",
-    ));
+    simulation.expect_no_start();
 
     simulation.advance_to(40, SchedulerInputAction::OtherOperation("ManualSync.md"));
     let pull = simulation.request(DaemonRequest::Pull {
@@ -1281,13 +1273,6 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
     );
     simulation.release(manual_pull);
     simulation.assert_response_ok(pull);
-    simulation.expect_no_start();
-
-    simulation.advance_to(
-        70,
-        SchedulerInputAction::Complete(SchedulerOpKind::RefreshChildren, "mount:notion-main"),
-    );
-    simulation.release(mount_point_refresh);
     simulation.expect_no_start();
 
     simulation.advance_to(
@@ -1332,7 +1317,7 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
             ROOT_CONTAINER_IDENTIFIER,
         ),
         SchedulerTimelineEntry::new(10, SchedulerOpKind::RefreshChildren, "children:page-a"),
-        SchedulerTimelineEntry::new(30, SchedulerOpKind::FileProviderRead, "page-open"),
+        SchedulerTimelineEntry::new(20, SchedulerOpKind::FileProviderRead, "page-open"),
         SchedulerTimelineEntry::new(50, SchedulerOpKind::Pull, "ManualSync.md"),
         SchedulerTimelineEntry::new(80, SchedulerOpKind::RefreshChildren, "children:page-b"),
         SchedulerTimelineEntry::new(100, SchedulerOpKind::RefreshChildren, "children:page-a1"),
@@ -1772,11 +1757,11 @@ fn runtime_drains_freshness_queued_by_file_event() {
 #[test]
 fn runtime_drains_freshness_queued_by_virtual_write() {
     let (freshness_tx, freshness_rx) = mpsc::channel();
-    let runtime = DaemonRuntime::spawn_with_runner(
-        relay_config("virtual-write-freshness"),
-        FreshnessFromEventRunner { freshness_tx },
-    )
-    .expect("spawn runtime");
+    let config = relay_config("virtual-write-freshness");
+    let signal_path = live_mode_state_change_signal_path(&config.state_root);
+    let runtime =
+        DaemonRuntime::spawn_with_runner(config, FreshnessFromEventRunner { freshness_tx })
+            .expect("spawn runtime");
 
     let response = runtime
         .handle()
@@ -1794,6 +1779,10 @@ fn runtime_drains_freshness_queued_by_virtual_write() {
     assert_eq!(job.remote_id, Some(RemoteId::new("page-1")));
     assert_eq!(job.kind, SyncJobKind::ObserveEntity);
     assert_eq!(job.reason, ChangeHintKind::LocalEdited);
+    assert!(
+        signal_path.exists(),
+        "virtual writes should publish the explicit Live Mode wake signal"
+    );
     runtime.shutdown();
 }
 
@@ -2337,6 +2326,31 @@ impl SchedulerPolicySimulation {
                 self.input_log
             ),
         }
+    }
+
+    fn wait_for_child_refresh_queued(&self, container_identifier: &str) {
+        let target = format!("notion-main:{container_identifier}");
+        for _ in 0..40 {
+            let response = self.handle.request(DaemonRequest::DebugQueueStatus);
+            assert!(response.ok, "debug queue request failed: {response:?}");
+            let payload = response.payload.expect("debug queue payload");
+            let snapshot: DaemonDebugQueueStatus =
+                serde_json::from_value(payload).expect("decode debug queue");
+            if snapshot.sections.iter().any(|section| {
+                section.name == "child_refreshes"
+                    && section
+                        .items
+                        .iter()
+                        .any(|item| item.target.as_deref() == Some(target.as_str()))
+            }) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!(
+            "child refresh {target} was not queued; input log: {:?}",
+            self.input_log
+        );
     }
 
     fn release(&self, operation: SchedulerStartedOperation) {

@@ -44,6 +44,10 @@ behavior as `macos_file_provider`.
 - Database directories expose cached `_schema.yaml` files from scheduled pull or
   lazy database refresh so row property validation does not need to read through
   the FUSE mount.
+- The shared FUSE root exposes a read-only hidden `.directory` metadata file with
+  `Icon=locality-mount-logo` for Linux file managers that honor freedesktop/KDE
+  directory metadata. Child mount folders and page/database directories do not
+  receive this file, so remote workspace content is not polluted by branding.
 
 ## Smoke Test
 

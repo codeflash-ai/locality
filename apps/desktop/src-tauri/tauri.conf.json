@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Locality",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "identifier": "ai.codeflash.locality",
   "build": {
     "beforeDevCommand": "node ./scripts/dev-command.mjs",
@@ -13,23 +13,7 @@
   "app": {
     "withGlobalTauri": false,
     "macOSPrivateApi": true,
-    "windows": [
-      {
-        "label": "main",
-        "title": "Locality",
-        "width": 960,
-        "height": 680,
-        "minWidth": 860,
-        "minHeight": 620,
-        "resizable": true,
-        "center": true,
-        "decorations": true,
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
-        "transparent": false,
-        "shadow": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }
@@ -54,7 +38,8 @@
         "PlugIns/LocalityFileProvider.appex": "macos/LocalityFileProvider/LocalityFileProvider.appex",
         "MacOS/locality-file-providerctl": "macos/LocalityFileProvider/locality-file-providerctl",
         "MacOS/loc": "macos/loc",
-        "MacOS/localityd": "macos/localityd"
+        "MacOS/localityd": "macos/localityd",
+        "Resources/locality-mount-logo.icns": "icons/locality-mount-logo.icns"
       },
       "dmg": {
         "background": "assets/dmg-background.png",
@@ -79,7 +64,8 @@
         "files": {
           "/usr/bin/loc": "linux/loc",
           "/usr/bin/localityd": "linux/localityd",
-          "/usr/bin/locality-fuse": "linux/locality-fuse"
+          "/usr/bin/locality-fuse": "linux/locality-fuse",
+          "/usr/share/icons/hicolor/256x256/apps/locality-mount-logo.png": "icons/locality-mount-logo.png"
         }
       },
       "rpm": {
@@ -88,7 +74,8 @@
         "files": {
           "/usr/bin/loc": "linux/loc",
           "/usr/bin/localityd": "linux/localityd",
-          "/usr/bin/locality-fuse": "linux/locality-fuse"
+          "/usr/bin/locality-fuse": "linux/locality-fuse",
+          "/usr/share/icons/hicolor/256x256/apps/locality-mount-logo.png": "icons/locality-mount-logo.png"
         }
       }
     }

@@ -64,7 +64,7 @@ use locality_notion::oauth::{
     DEFAULT_LOCALITY_NOTION_OAUTH_BROKER_URL, HttpNotionOAuthBrokerClient, NotionOAuthBrokerStart,
 };
 use locality_platform::{
-    append_service_log, bundled_binary_next_to_current_exe,
+    DAEMON_PID_FILENAME, append_service_log, bundled_binary_next_to_current_exe,
     default_state_root as platform_default_state_root, logs_dir as platform_logs_dir,
     user_home as platform_user_home,
 };
@@ -102,6 +102,8 @@ use localityd::virtual_fs::{
 };
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use tauri::TitleBarStyle;
 use tauri::{
     AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, Rect, WebviewUrl,
     WebviewWindowBuilder,
@@ -483,6 +485,7 @@ struct MountLiveModeChange {
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static DAEMON_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static DESKTOP_SNAPSHOT_CACHE: OnceLock<Mutex<DesktopSnapshotCache>> = OnceLock::new();
 static SURFACE_REFRESH_STATE: OnceLock<Mutex<SurfaceRefreshState>> = OnceLock::new();
 static LAUNCH_AT_LOGIN_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
 static LIVE_MODE_REMOTE_PULL_CURSOR: OnceLock<Mutex<usize>> = OnceLock::new();
@@ -498,6 +501,7 @@ static WINDOWS_CLOUD_FILES_PROVIDER_SUPERVISOR: OnceLock<
 > = OnceLock::new();
 const DESKTOP_INSTALL_MARKER_VERSION: u32 = 2;
 const DESKTOP_ACTIVITY_LIMIT: usize = 20;
+const DESKTOP_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(750);
 const SURFACE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const TRAY_POPOVER_WIDTH: f64 = 360.0;
 const TRAY_POPOVER_HEIGHT: f64 = 520.0;
@@ -509,6 +513,12 @@ const LIVE_MODE_ACTIVE_TARGET_WINDOW: Duration = Duration::from_secs(5 * 60);
 const LIVE_MODE_REMOTE_CHECK_ESTIMATED_REQUESTS_PER_PAGE: f64 = 1.0;
 const LIVE_MODE_REMOTE_CHECK_QUEUE_SHARE: f64 = 1.0 / 3.0;
 const LIVE_MODE_REMOTE_CHECK_MAX_BATCH_PAGES: usize = 5;
+
+#[derive(Default)]
+struct DesktopSnapshotCache {
+    loaded_at: Option<Instant>,
+    snapshot: Option<DesktopSnapshot>,
+}
 
 #[derive(Default)]
 struct SurfaceRefreshState {
@@ -615,7 +625,9 @@ struct MonitorScreenBounds {
 
 #[tauri::command]
 async fn desktop_snapshot(app: AppHandle) -> DesktopSnapshot {
-    let snapshot = match tauri::async_runtime::spawn_blocking(load_desktop_snapshot).await {
+    let snapshot = match tauri::async_runtime::spawn_blocking(load_desktop_snapshot_for_surface)
+        .await
+    {
         Ok(Ok(snapshot)) => snapshot,
         Ok(Err(message)) => degraded_snapshot(message),
         Err(error) => degraded_snapshot(format!("Could not load Locality desktop state: {error}")),
@@ -1085,6 +1097,22 @@ async fn ensure_runtime_ready(app: AppHandle) -> ActionReport {
         }
         Err(message) => ActionReport { ok: false, message },
     }
+}
+
+fn ensure_runtime_ready_in_background(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let report = ensure_runtime_ready(app).await;
+        if !report.ok {
+            desktop_log(
+                "warn",
+                "runtime.startup_failed",
+                format!(
+                    "could not prepare Locality runtime after desktop startup: {}",
+                    report.message
+                ),
+            );
+        }
+    });
 }
 
 #[tauri::command]
@@ -2892,6 +2920,32 @@ fn load_desktop_snapshot() -> Result<DesktopSnapshot, String> {
     load_desktop_snapshot_from_store(&store, &state_root)
 }
 
+fn load_desktop_snapshot_for_surface() -> Result<DesktopSnapshot, String> {
+    let mut cache = DESKTOP_SNAPSHOT_CACHE
+        .get_or_init(|| Mutex::new(DesktopSnapshotCache::default()))
+        .lock()
+        .expect("desktop snapshot cache lock poisoned");
+    if let (Some(loaded_at), Some(snapshot)) = (cache.loaded_at, cache.snapshot.as_ref())
+        && loaded_at.elapsed() < DESKTOP_SNAPSHOT_CACHE_TTL
+    {
+        return Ok(snapshot.clone());
+    }
+
+    let snapshot = load_desktop_snapshot()?;
+    cache.loaded_at = Some(Instant::now());
+    cache.snapshot = Some(snapshot.clone());
+    Ok(snapshot)
+}
+
+fn invalidate_desktop_snapshot_cache() {
+    if let Some(cache) = DESKTOP_SNAPSHOT_CACHE.get()
+        && let Ok(mut cache) = cache.lock()
+    {
+        cache.loaded_at = None;
+        cache.snapshot = None;
+    }
+}
+
 fn load_desktop_snapshot_from_store(
     store: &SqliteStateStore,
     state_root: &Path,
@@ -3149,6 +3203,8 @@ fn mount_summary(
         .as_ref()
         .and_then(mount_status_from_provider)
         .unwrap_or("ready");
+    let access_root = mount_access_root(mount);
+    let root_exists = mount_root_exists_for_desktop_summary(mount, &access_root);
 
     MountSummary {
         mount_id: mount.mount_id.0.clone(),
@@ -3161,7 +3217,7 @@ fn mount_summary(
         workspace_name: connection
             .and_then(|connection| connection.workspace_name.clone())
             .unwrap_or_else(|| connector_label(&mount.connector)),
-        local_path: absolute_display_path(&mount_access_root(mount)),
+        local_path: absolute_display_path(&access_root),
         notion_url: mount
             .remote_root_id
             .as_ref()
@@ -3175,7 +3231,7 @@ fn mount_summary(
         projection: projection_label(&mount.projection).to_string(),
         read_only: mount.read_only,
         status: mount_status.to_string(),
-        root_exists: mount_access_root(mount).exists(),
+        root_exists,
         entity_count: store
             .and_then(|store| store.list_entities(&mount.mount_id).ok())
             .map(|entities| entities.len())
@@ -3963,22 +4019,8 @@ fn tray_tooltip(snapshot: &DesktopSnapshot) -> String {
 fn tray_icon_image(state: TrayVisualState) -> Image<'static> {
     let size = 36;
     let mut rgba = vec![0; size * size * 4];
-    let paths = [
-        ((8.6, 26.8), (5.8, 18.0)),
-        ((5.8, 18.0), (8.6, 9.2)),
-        ((27.4, 9.2), (30.2, 18.0)),
-        ((30.2, 18.0), (27.4, 26.8)),
-        ((11.8, 13.0), (24.2, 13.0)),
-        ((11.8, 23.0), (24.2, 23.0)),
-        ((15.1, 18.0), (20.9, 18.0)),
-    ];
-
-    for (start, end) in paths {
-        draw_line(&mut rgba, size, start, end, 5.2, [255, 255, 255, 255]);
-    }
-    for (start, end) in paths {
-        draw_line(&mut rgba, size, start, end, 3.4, [17, 24, 39, 255]);
-    }
+    draw_short_logo_mark(&mut rgba, size, [255, 255, 255, 255], true);
+    draw_short_logo_mark(&mut rgba, size, [17, 24, 39, 255], false);
 
     match state {
         TrayVisualState::Ready => {}
@@ -3995,26 +4037,108 @@ fn tray_icon_image(state: TrayVisualState) -> Image<'static> {
     Image::new_owned(rgba, size as u32, size as u32)
 }
 
-fn draw_line(
-    rgba: &mut [u8],
-    size: usize,
-    start: (f64, f64),
-    end: (f64, f64),
-    width: f64,
-    color: [u8; 4],
-) {
-    let half_width = width / 2.0;
+fn draw_short_logo_mark(rgba: &mut [u8], size: usize, color: [u8; 4], halo: bool) {
+    let top = if halo {
+        [
+            (18.0, 1.8),
+            (32.6, 8.8),
+            (32.9, 13.4),
+            (21.0, 19.3),
+            (15.0, 19.3),
+            (3.1, 13.4),
+            (3.4, 8.8),
+        ]
+    } else {
+        [
+            (18.0, 3.1),
+            (30.9, 9.2),
+            (31.1, 12.3),
+            (20.4, 17.5),
+            (15.6, 17.5),
+            (4.9, 12.3),
+            (5.1, 9.2),
+        ]
+    };
+    let bottom = if halo {
+        [
+            (14.0, 18.8),
+            (22.0, 18.8),
+            (33.0, 25.5),
+            (32.4, 29.4),
+            (21.0, 34.4),
+            (15.0, 34.4),
+            (3.6, 29.4),
+            (3.0, 25.5),
+        ]
+    } else {
+        [
+            (14.8, 20.3),
+            (21.2, 20.3),
+            (31.0, 26.1),
+            (30.5, 28.6),
+            (20.4, 32.7),
+            (15.6, 32.7),
+            (5.5, 28.6),
+            (5.0, 26.1),
+        ]
+    };
+
+    draw_polygon(rgba, size, &top, color);
+    draw_polygon(rgba, size, &bottom, color);
+
+    let dot_radius = if halo { 2.8 } else { 1.65 };
+    for center in [
+        (4.6, 15.4),
+        (4.6, 18.5),
+        (4.6, 21.6),
+        (31.4, 15.4),
+        (31.4, 18.5),
+        (31.4, 21.6),
+    ] {
+        draw_disc(rgba, size, center, dot_radius, color);
+    }
+}
+
+fn draw_polygon(rgba: &mut [u8], size: usize, points: &[(f64, f64)], color: [u8; 4]) {
     for y in 0..size {
         for x in 0..size {
             let px = x as f64 + 0.5;
             let py = y as f64 + 0.5;
-            let distance = distance_to_segment((px, py), start, end);
-            let alpha = (half_width + 0.7 - distance).clamp(0.0, 1.0);
+            let inside = point_in_polygon((px, py), points);
+            let distance = points
+                .iter()
+                .zip(points.iter().cycle().skip(1))
+                .take(points.len())
+                .map(|(start, end)| distance_to_segment((px, py), *start, *end))
+                .fold(f64::INFINITY, f64::min);
+            let alpha = if inside {
+                (distance + 0.6).clamp(0.0, 1.0)
+            } else {
+                (0.6 - distance).clamp(0.0, 1.0)
+            };
             if alpha > 0.0 {
                 blend_pixel(rgba, size, x, y, color, alpha);
             }
         }
     }
+}
+
+fn point_in_polygon(point: (f64, f64), points: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    let mut previous = points[points.len() - 1];
+    for current in points {
+        let crosses = (current.1 > point.1) != (previous.1 > point.1);
+        if crosses {
+            let x_intersection = (previous.0 - current.0) * (point.1 - current.1)
+                / (previous.1 - current.1)
+                + current.0;
+            if point.0 < x_intersection {
+                inside = !inside;
+            }
+        }
+        previous = *current;
+    }
+    inside
 }
 
 fn draw_disc(rgba: &mut [u8], size: usize, center: (f64, f64), radius: f64, color: [u8; 4]) {
@@ -4901,10 +5025,9 @@ fn state_event_actions(
 fn state_event_path_wakes_live_mode(
     path: &Path,
     state_root: &Path,
-    content_roots: &[PathBuf],
+    _content_roots: &[PathBuf],
 ) -> bool {
     is_live_mode_state_change_signal_path(path, state_root)
-        || state_event_path_is_virtual_content_change(path, state_root, content_roots)
 }
 
 fn state_event_path_requires_refresh(
@@ -4934,8 +5057,13 @@ fn state_event_path_requires_refresh(
     match relative.components().next() {
         Some(std::path::Component::Normal(component)) => match component.to_str() {
             Some("content") => !is_virtual_content_temp_path(relative),
-            Some("desktop-activity.json") => true,
-            Some("credentials" | "desktop.json" | "desktop-install.json" | "logs") => false,
+            Some(
+                "credentials"
+                | "desktop-activity.json"
+                | "desktop.json"
+                | "desktop-install.json"
+                | "logs",
+            ) => false,
             _ => false,
         },
         _ => false,
@@ -4967,12 +5095,13 @@ fn is_virtual_content_temp_path(path: &Path) -> bool {
 }
 
 fn refresh_desktop_surfaces(app: &AppHandle) {
+    invalidate_desktop_snapshot_cache();
     schedule_desktop_surface_refresh(app.clone());
 }
 
 fn schedule_tray_icon_refresh(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let snapshot = tauri::async_runtime::spawn_blocking(load_desktop_snapshot)
+        let snapshot = tauri::async_runtime::spawn_blocking(load_desktop_snapshot_for_surface)
             .await
             .ok()
             .and_then(Result::ok);
@@ -5263,16 +5392,39 @@ fn desktop_log(level: &str, event: &str, message: impl AsRef<str>) {
 fn mount_access_root(mount: &MountConfig) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        if mount.projection == ProjectionMode::MacosFileProvider
-            && let Ok(url) = macos_file_provider_domain_url(
+        if mount.projection == ProjectionMode::MacosFileProvider {
+            if macos_path_is_under_cloud_storage(&mount.root) {
+                return mount.root.clone();
+            }
+            if let Ok(url) = macos_file_provider_domain_url(
                 localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
-            )
-        {
-            return url.join(mount_point_directory_name(mount));
+            ) {
+                return url.join(mount_point_directory_name(mount));
+            }
         }
     }
 
     mount.root.clone()
+}
+
+#[cfg(target_os = "macos")]
+fn mount_root_exists_for_desktop_summary(mount: &MountConfig, path: &Path) -> bool {
+    if mount.projection == ProjectionMode::MacosFileProvider
+        && macos_path_is_under_cloud_storage(path)
+    {
+        return true;
+    }
+    path.exists()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mount_root_exists_for_desktop_summary(_mount: &MountConfig, path: &Path) -> bool {
+    path.exists()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_path_is_under_cloud_storage(path: &Path) -> bool {
+    path.starts_with(macos_cloud_storage_dir())
 }
 
 fn default_state_root() -> PathBuf {
@@ -6211,6 +6363,19 @@ fn daemon_lifecycle_lock() -> &'static Mutex<()> {
 fn ensure_daemon_running_locked(state_root: &Path) -> Result<(), String> {
     let current_build = expected_daemon_build_info();
     match running_daemon_build(state_root) {
+        Some(build)
+            if build == current_build && running_daemon_predates_bundled_binary(state_root) =>
+        {
+            desktop_log(
+                "warn",
+                "daemon.stale_same_build",
+                format!(
+                    "detected running localityd build {} from before the bundled binary was installed; restarting localityd",
+                    build.build_id
+                ),
+            );
+            return restart_daemon_for_current_binary(state_root, &current_build);
+        }
         Some(build) if build == current_build => return Ok(()),
         Some(build) => {
             desktop_log(
@@ -6236,6 +6401,29 @@ fn ensure_daemon_running_locked(state_root: &Path) -> Result<(), String> {
 
     clear_stale_daemon_manager(state_root);
     start_daemon_for_current_binary(state_root)
+}
+
+fn running_daemon_predates_bundled_binary(state_root: &Path) -> bool {
+    let Some(binary) = bundled_localityd_binary() else {
+        return false;
+    };
+    let pid_file = state_root.join(DAEMON_PID_FILENAME);
+    let pid_modified = file_modified_time(&pid_file);
+    let binary_modified = file_modified_time(&binary);
+    daemon_process_started_before_bundled_binary(pid_modified, binary_modified)
+}
+
+fn daemon_process_started_before_bundled_binary(
+    pid_modified: Option<SystemTime>,
+    binary_modified: Option<SystemTime>,
+) -> bool {
+    matches!((pid_modified, binary_modified), (Some(pid), Some(binary)) if pid < binary)
+}
+
+fn file_modified_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
 }
 
 fn start_daemon_for_current_binary(state_root: &Path) -> Result<(), String> {
@@ -9247,22 +9435,28 @@ fn push_target_direct(target: &Path, confirm_dangerous: bool) -> Result<PushRepo
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
-    reconcile_desktop_projection_changes(&mut store, &state_root, Some(target))?;
+    let target = absolute_path(target)?;
+    reconcile_desktop_projection_changes(&mut store, &state_root, Some(&target))?;
+    let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
     let credentials = open_credential_store(&state_root);
-    let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
+    let connector = resolve_source_for_path(&store, credentials.as_ref(), &target)
         .map_err(|error| error.message())?;
 
-    run_push_with_daemon_at_state_root(
+    let report = run_push_with_daemon_at_state_root(
         &mut store,
         &connector,
-        target,
+        &target,
         PushOptions {
             assume_yes: true,
             confirm_dangerous,
         },
         Some(&state_root),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if push_report_exit_code(&report) == 0 {
+        refresh_visible_target_from_cache(&state_root, &mount, &relative_path, &target)?;
+    }
+    Ok(report)
 }
 
 fn set_live_mode_for_file_blocking(change: LiveModeFileChange) -> Result<ActionReport, String> {
@@ -9359,14 +9553,16 @@ fn auto_save_target_direct(target: &Path) -> Result<PushReport, String> {
     let state_root = default_state_root();
     let mut store = SqliteStateStore::open(state_root.clone())
         .map_err(|error| format!("Could not open Locality state: {error}"))?;
-    reconcile_desktop_projection_changes(&mut store, &state_root, Some(target))?;
+    let target = absolute_path(target)?;
+    reconcile_desktop_projection_changes(&mut store, &state_root, Some(&target))?;
+    let (mount, relative_path) = resolve_desktop_mount_path(&store, &target)?;
     let credentials = open_credential_store(&state_root);
-    let connector = resolve_source_for_path(&store, credentials.as_ref(), target)
+    let connector = resolve_source_for_path(&store, credentials.as_ref(), &target)
         .map_err(|error| error.message())?;
     let report = execute_auto_save_push_job_with_content_root(
         &mut store,
         localityd::execution::PushJob {
-            target_path: target.to_path_buf(),
+            target_path: target.clone(),
             assume_yes: true,
             confirm_dangerous: false,
         },
@@ -9374,7 +9570,11 @@ fn auto_save_target_direct(target: &Path) -> Result<PushReport, String> {
         Some(&state_root),
     )
     .map_err(|error| error.to_string())?;
-    Ok(PushReport::from_daemon(report))
+    let report = PushReport::from_daemon(report);
+    if push_report_exit_code(&report) == 0 {
+        refresh_visible_target_from_cache(&state_root, &mount, &relative_path, &target)?;
+    }
+    Ok(report)
 }
 
 fn pull_target_direct(target: &Path) -> Result<PullReport, String> {
@@ -9541,10 +9741,10 @@ fn refresh_visible_target_from_cache(
     }
     let content_path = virtual_fs_content_path(state_root, &mount.mount_id, relative_path)
         .map_err(|error| error.to_string())?;
-    let contents = fs::read(&content_path)
-        .map_err(|error| format!("Could not read restored local cache: {error}"))?;
+    let contents =
+        fs::read(&content_path).map_err(|error| format!("Could not read local cache: {error}"))?;
     write_file_atomic(target, &contents)
-        .map_err(|error| format!("Could not refresh visible file after reset: {error}"))
+        .map_err(|error| format!("Could not refresh visible file from local cache: {error}"))
 }
 
 fn diff_target_direct(target: &Path) -> Result<DiffReport, String> {
@@ -9730,8 +9930,20 @@ fn write_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp-locality-desktop");
-    fs::write(&tmp, contents)?;
-    fs::rename(tmp, path)
+    if let Err(error) = fs::write(&tmp, contents) {
+        if path.exists() {
+            return fs::write(path, contents).map_err(|_| error);
+        }
+        return Err(error);
+    }
+    fs::rename(&tmp, path).or_else(|error| {
+        let _ = fs::remove_file(&tmp);
+        if path.exists() {
+            fs::write(path, contents).map_err(|_| error)
+        } else {
+            Err(error)
+        }
+    })
 }
 
 fn push_report_message(report: &PushReport) -> String {
@@ -9965,6 +10177,27 @@ mod tests {
         assert!(super::absolute_state_root(PathBuf::from(".loc")).is_absolute());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomic_falls_back_to_existing_file_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TestTempDir::new("atomic-write-fallback");
+        let path = temp.path().join("page.md");
+        fs::write(&path, "old").expect("write existing file");
+        let mut readonly = fs::metadata(temp.path()).expect("metadata").permissions();
+        readonly.set_mode(0o555);
+        fs::set_permissions(temp.path(), readonly).expect("make parent readonly");
+
+        let result = super::write_file_atomic(&path, b"new");
+
+        let mut writable = fs::metadata(temp.path()).expect("metadata").permissions();
+        writable.set_mode(0o755);
+        fs::set_permissions(temp.path(), writable).expect("restore parent permissions");
+        result.expect("overwrite existing file");
+        assert_eq!(fs::read_to_string(&path).expect("read file"), "new");
+    }
+
     #[test]
     fn macos_app_bundle_for_exe_resolves_bundle_root() {
         let executable =
@@ -10056,6 +10289,25 @@ mod tests {
                 build_id: "build-123".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn daemon_process_started_before_bundled_binary_compares_modified_times() {
+        let pid_modified = UNIX_EPOCH + Duration::from_secs(10);
+        let binary_modified = UNIX_EPOCH + Duration::from_secs(20);
+
+        assert!(super::daemon_process_started_before_bundled_binary(
+            Some(pid_modified),
+            Some(binary_modified)
+        ));
+        assert!(!super::daemon_process_started_before_bundled_binary(
+            Some(binary_modified),
+            Some(pid_modified)
+        ));
+        assert!(!super::daemon_process_started_before_bundled_binary(
+            None,
+            Some(binary_modified)
+        ));
     }
 
     #[test]
@@ -11304,6 +11556,22 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_mount_access_root_uses_stored_cloudstorage_root() {
+        let root = super::macos_cloud_storage_dir()
+            .join("Locality")
+            .join("notion");
+        let mount = MountConfig::new(MountId::new("notion-main"), "notion", &root)
+            .projection(ProjectionMode::MacosFileProvider);
+
+        assert_eq!(super::mount_access_root(&mount), root);
+        assert!(super::mount_root_exists_for_desktop_summary(
+            &mount,
+            &mount.root
+        ));
+    }
+
     #[test]
     fn missing_macos_file_provider_reveal_keeps_requested_path_target() {
         let mount = MountConfig::new(
@@ -11765,6 +12033,20 @@ mod tests {
                 .chunks_exact(4)
                 .any(|pixel| { pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200 })
         );
+        for (x, y) in [(4, 15), (4, 18), (4, 21), (32, 15), (32, 18), (32, 21)] {
+            let pixel = tray_icon_pixel(&ready, x, y);
+            assert!(
+                pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200,
+                "expected short-logo side dot at ({x}, {y}), got {pixel:?}"
+            );
+        }
+        for (x, y) in [(18, 6), (18, 27)] {
+            let pixel = tray_icon_pixel(&ready, x, y);
+            assert!(
+                pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200,
+                "expected short-logo stacked body at ({x}, {y}), got {pixel:?}"
+            );
+        }
         assert!(review.rgba().chunks_exact(4).any(|pixel| {
             pixel[0] > 200 && pixel[1] > 100 && pixel[1] < 180 && pixel[2] < 80 && pixel[3] > 200
         }));
@@ -11773,6 +12055,17 @@ mod tests {
                 pixel[0] > 180 && pixel[1] < 90 && pixel[2] < 90 && pixel[3] > 200
             })
         );
+    }
+
+    fn tray_icon_pixel(image: &tauri::image::Image<'_>, x: usize, y: usize) -> [u8; 4] {
+        let offset = (y * image.width() as usize + x) * 4;
+        let rgba = image.rgba();
+        [
+            rgba[offset],
+            rgba[offset + 1],
+            rgba[offset + 2],
+            rgba[offset + 3],
+        ]
     }
 
     #[cfg(windows)]
@@ -13573,6 +13866,7 @@ mod tests {
             state_root.join("state.sqlite3"),
             state_root.join("state.sqlite3-wal"),
             state_root.join("state.sqlite3-shm"),
+            state_root.join("desktop-activity.json"),
             state_root.join("desktop.json"),
             state_root.join("desktop-install.json"),
             state_root.join("logs/localityd.log"),
@@ -13627,7 +13921,7 @@ mod tests {
         let content_root = temp.path().join("group-content");
         let content_roots = vec![content_root.clone()];
 
-        assert!(state_event_path_requires_refresh(
+        assert!(!state_event_path_requires_refresh(
             &state_root.join("desktop-activity.json"),
             &state_root,
             &content_roots
@@ -13637,7 +13931,7 @@ mod tests {
             &state_root,
             &content_roots
         ));
-        assert!(state_event_path_wakes_live_mode(
+        assert!(!state_event_path_wakes_live_mode(
             &content_root.join("notion-main/files/Roadmap/page.md"),
             &state_root,
             &content_roots
@@ -14289,6 +14583,7 @@ fn main() {
             start_desktop_activation_listener(app.app_handle().clone(), activation_event_handle);
             sync_tray_visibility(app.app_handle(), &desktop_settings());
             start_state_change_watcher(app.app_handle().clone());
+            ensure_runtime_ready_in_background(app.app_handle().clone());
             start_live_mode_runner(app.app_handle().clone());
             start_windows_cloud_files_provider_supervisor();
             Ok(())
@@ -14340,8 +14635,18 @@ fn main() {
             quit_completely,
             schedule_update_relaunch,
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Locality desktop app");
+        .build(tauri::generate_context!())
+        .expect("failed to build Locality desktop app")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = event
+            {
+                show_main_window_with_view(app, None);
+            }
+        });
 }
 
 fn should_hide_tray_popover(window_label: &str, event: &tauri::WindowEvent) -> bool {
@@ -14398,6 +14703,28 @@ fn configure_main_window_chrome(app: &mut tauri::App) {
     {
         let _ = app;
     }
+}
+
+fn build_main_window(app: &AppHandle) -> tauri::Result<()> {
+    if app.get_webview_window("main").is_some() {
+        return Ok(());
+    }
+    let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+        .title("Locality")
+        .inner_size(960.0, 680.0)
+        .min_inner_size(860.0, 620.0)
+        .resizable(true)
+        .center()
+        .decorations(true)
+        .transparent(false)
+        .shadow(true)
+        .visible(false);
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(TitleBarStyle::Overlay)
+        .hidden_title(true);
+    builder.build()?;
+    Ok(())
 }
 
 fn refresh_agent_guidance_for_current_mount_at(
@@ -14501,9 +14828,6 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         })
         .build(app)?;
 
-    if let Err(error) = build_tray_popover(app) {
-        eprintln!("loc desktop could not build tray popover: {error}");
-    }
     refresh_tray_icon(app.app_handle());
 
     Ok(())
@@ -14525,7 +14849,10 @@ fn tray_popover_anchor(
     )
 }
 
-fn build_tray_popover(app: &mut tauri::App) -> tauri::Result<()> {
+fn build_tray_popover(app: &AppHandle) -> tauri::Result<()> {
+    if app.get_webview_window("tray").is_some() {
+        return Ok(());
+    }
     WebviewWindowBuilder::new(app, "tray", WebviewUrl::App("index.html#tray".into()))
         .title("Locality")
         .inner_size(TRAY_POPOVER_WIDTH, TRAY_POPOVER_HEIGHT)
@@ -14544,9 +14871,31 @@ fn build_tray_popover(app: &mut tauri::App) -> tauri::Result<()> {
 }
 
 fn toggle_tray_popover(app: &AppHandle, position: PhysicalPosition<f64>) {
-    let Some(window) = app.get_webview_window("tray") else {
-        show_main_window_with_view(app, None);
-        return;
+    let window = match app.get_webview_window("tray") {
+        Some(window) => window,
+        None => {
+            if let Err(error) = build_tray_popover(app) {
+                desktop_log(
+                    "warn",
+                    "tray.popover_build_failed",
+                    format!("could not build tray popover webview: {error}"),
+                );
+                show_main_window_with_view(app, None);
+                return;
+            }
+            match app.get_webview_window("tray") {
+                Some(window) => window,
+                None => {
+                    desktop_log(
+                        "warn",
+                        "tray.popover_missing_after_build",
+                        "tray popover webview was not available after build",
+                    );
+                    show_main_window_with_view(app, None);
+                    return;
+                }
+            }
+        }
     };
 
     if window.is_visible().unwrap_or(false) {
@@ -14678,15 +15027,38 @@ fn show_main_window_with_view(app: &AppHandle, view: Option<&str>) {
         let _ = popover.hide();
     }
 
-    if let Some(window) = app.get_webview_window("main") {
-        if let Some(view) = view {
-            let escaped = view.replace('\\', "\\\\").replace('\'', "\\'");
-            let _ = window.eval(format!(
-                "window.dispatchEvent(new CustomEvent('loc-open-view', {{ detail: '{}' }}));",
-                escaped
-            ));
+    let window = match app.get_webview_window("main") {
+        Some(window) => window,
+        None => {
+            if let Err(error) = build_main_window(app) {
+                desktop_log(
+                    "warn",
+                    "main_window.build_failed",
+                    format!("could not build main window webview: {error}"),
+                );
+                return;
+            }
+            match app.get_webview_window("main") {
+                Some(window) => window,
+                None => {
+                    desktop_log(
+                        "warn",
+                        "main_window.missing_after_build",
+                        "main window webview was not available after build",
+                    );
+                    return;
+                }
+            }
         }
-        let _ = window.show();
-        let _ = window.set_focus();
+    };
+
+    if let Some(view) = view {
+        let escaped = view.replace('\\', "\\\\").replace('\'', "\\'");
+        let _ = window.eval(format!(
+            "window.dispatchEvent(new CustomEvent('loc-open-view', {{ detail: '{}' }}));",
+            escaped
+        ));
     }
+    let _ = window.show();
+    let _ = window.set_focus();
 }

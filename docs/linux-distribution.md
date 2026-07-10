@@ -28,7 +28,11 @@ Linux package formats at:
 /usr/bin/loc
 /usr/bin/localityd
 /usr/bin/locality-fuse
+/usr/share/icons/hicolor/256x256/apps/locality-mount-logo.png
 ```
+
+The icon theme asset backs the shared FUSE root `.directory` metadata file. It
+does not create files inside projected workspace directories.
 
 Expected local artifacts:
 

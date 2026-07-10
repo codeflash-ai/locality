@@ -910,6 +910,12 @@ where
         return Ok(ProjectionCandidateOutcome::Unchanged);
     }
 
+    let commit_has_conflict_markers =
+        std::str::from_utf8(&commit_contents).is_ok_and(has_unresolved_conflict_markers);
+    if commit_has_conflict_markers && projection_contents.as_bytes() != commit_contents {
+        write_binary_atomic(&candidate.path, &commit_contents).map_err(LocalityError::from)?;
+    }
+
     virtual_fs::commit_virtual_fs_write(
         store,
         content_root,
@@ -917,7 +923,7 @@ where
         &entity.remote_id.0,
         &commit_contents,
     )?;
-    if projection_contents.as_bytes() != commit_contents {
+    if !commit_has_conflict_markers && projection_contents.as_bytes() != commit_contents {
         write_binary_atomic(&candidate.path, &commit_contents).map_err(LocalityError::from)?;
     }
     Ok(ProjectionCandidateOutcome::Reconciled)
@@ -1314,11 +1320,20 @@ fn write_binary_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or("loc-file-provider-refresh");
     let temp_path = file_provider_atomic_temp_path(path, file_name);
-    std::fs::write(&temp_path, contents)?;
-    std::fs::rename(&temp_path, path).inspect_err(|_| {
+    if let Err(error) = std::fs::write(&temp_path, contents) {
+        if path.exists() {
+            return std::fs::write(path, contents).map_err(|_| error);
+        }
+        return Err(error);
+    }
+    std::fs::rename(&temp_path, path).or_else(|error| {
         let _ = std::fs::remove_file(&temp_path);
-    })?;
-    Ok(())
+        if path.exists() {
+            std::fs::write(path, contents).map_err(|_| error)
+        } else {
+            Err(error)
+        }
+    })
 }
 
 fn file_provider_atomic_temp_path(path: &Path, file_name: &str) -> PathBuf {
@@ -2788,5 +2803,28 @@ mod tests {
             .as_nanos();
         let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("{prefix}-{}-{unique}-{suffix}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_binary_atomic_falls_back_to_existing_file_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("loc-file-provider-atomic-write-fallback");
+        fs::create_dir_all(&root).expect("create root");
+        let path = root.join("page.md");
+        fs::write(&path, "old").expect("write existing file");
+        let mut readonly = fs::metadata(&root).expect("metadata").permissions();
+        readonly.set_mode(0o555);
+        fs::set_permissions(&root, readonly).expect("make parent readonly");
+
+        let result = super::write_binary_atomic(&path, b"new");
+
+        let mut writable = fs::metadata(&root).expect("metadata").permissions();
+        writable.set_mode(0o755);
+        fs::set_permissions(&root, writable).expect("restore parent permissions");
+        result.expect("overwrite existing file");
+        assert_eq!(fs::read_to_string(&path).expect("read file"), "new");
+        let _ = fs::remove_dir_all(root);
     }
 }
