@@ -385,15 +385,15 @@ Important language:
   destructive, blocked, or unrecoverable work. The normal local-write path comes
   from File Provider callbacks; a visible-file reconciliation fallback is
   throttled and scoped to the active already-hydrated page. When there is no
-  local pending change, Live
-  Mode asks `localityd` to queue one remote check for an already-hydrated page.
-  If the daemon sees a remote change, it hydrates the page through the normal
-  `RemoteFastForward` path and refreshes the visible CloudStorage projection
-  only if the visible file still matches the old shadow. Remote-only pending
-  changes also enqueue a daemon fast-forward instead of fetching from the
-  desktop process. These active-page Live Mode fast-forwards use interactive
-  hydration priority, matching the real-time expectation for the page currently
-  being worked on. When a fast-forwarded shadow adds or removes rendered
+  local pending change, Live Mode asks `localityd` to queue an interactive remote
+  fast-forward for one already-hydrated active page. The daemon fetches rendered
+  page content instead of relying only on connector metadata, compares it with
+  the current shadow, and refreshes the visible CloudStorage projection only if
+  the visible file still matches the old shadow. Remote-only pending changes
+  also enqueue a daemon fast-forward instead of fetching from the desktop
+  process. These active-page Live Mode fast-forwards use interactive hydration
+  priority, matching the real-time expectation for the page currently being
+  worked on. When a fast-forwarded shadow adds or removes rendered
   child-page links, the daemon queues a background child refresh for that parent
   so newly created remote pages become visible in the local tree. When Live Mode is
   disabled, the desktop runner must sleep on an explicit Live Mode state-change

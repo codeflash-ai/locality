@@ -1766,7 +1766,6 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
                         }
                     }
                 },
-                live_mode_queue_remote_observe,
                 live_mode_queue_remote_fast_forward,
                 live_mode_merge_remote_drift_target,
             )
@@ -1778,17 +1777,15 @@ fn live_mode_tick_for_enabled_mount(state_root: &Path, mount: &MountConfig) -> A
     }
 }
 
-fn live_mode_tick_from_snapshot<Sync, Check, FastForward, Merge>(
+fn live_mode_tick_from_snapshot<Sync, FastForward, Merge>(
     snapshot: &DesktopSnapshot,
     remote_pull_targets: &[LiveModeRemoteTarget],
     mut sync_target: Sync,
-    mut check_remote_target: Check,
     mut fast_forward_remote_target: FastForward,
     mut merge_remote_drift: Merge,
 ) -> ActionReport
 where
     Sync: FnMut(&PendingChange, &Path) -> Result<(), String>,
-    Check: FnMut(&LiveModeRemoteTarget) -> Result<(), String>,
     FastForward: FnMut(&LiveModeRemoteTarget) -> Result<(), String>,
     Merge: FnMut(&PendingChange, &Path) -> Result<LiveModeRemoteDriftMerge, String>,
 {
@@ -1802,7 +1799,7 @@ where
     let Some(change) = snapshot.pending_changes.first() else {
         if !remote_pull_targets.is_empty() {
             for target in remote_pull_targets {
-                if let Err(message) = check_remote_target(target) {
+                if let Err(message) = fast_forward_remote_target(target) {
                     return ActionReport { ok: false, message };
                 }
             }
@@ -1812,9 +1809,9 @@ where
                     "Live Mode queued {} remote {}.",
                     remote_pull_targets.len(),
                     if remote_pull_targets.len() == 1 {
-                        "check"
+                        "update"
                     } else {
-                        "checks"
+                        "updates"
                     }
                 ),
             };
@@ -2464,13 +2461,6 @@ fn live_mode_should_reconcile_local_target_for_key(
 
     times.insert(key, now);
     true
-}
-
-fn live_mode_queue_remote_observe(target: &LiveModeRemoteTarget) -> Result<(), String> {
-    live_mode_send_daemon_queue_request(DaemonRequest::ObserveEntity {
-        mount_id: target.mount_id.0.clone(),
-        remote_id: target.remote_id.0.clone(),
-    })
 }
 
 fn live_mode_queue_remote_fast_forward(target: &LiveModeRemoteTarget) -> Result<(), String> {
@@ -10598,7 +10588,6 @@ mod tests {
         let mut snapshot = sample_snapshot();
         snapshot.pending_changes.clear();
         let mut sync_calls = 0usize;
-        let mut check_calls = 0usize;
         let mut fast_forward_calls = 0usize;
 
         let report = live_mode_tick_from_snapshot(
@@ -10606,10 +10595,6 @@ mod tests {
             &[],
             |_, _| {
                 sync_calls += 1;
-                Ok(())
-            },
-            |_| {
-                check_calls += 1;
                 Ok(())
             },
             |_| {
@@ -10622,7 +10607,6 @@ mod tests {
         assert!(report.ok);
         assert_eq!(report.message, "Live Mode checked for changes.");
         assert_eq!(sync_calls, 0);
-        assert_eq!(check_calls, 0);
         assert_eq!(fast_forward_calls, 0);
     }
 
@@ -10632,7 +10616,7 @@ mod tests {
         snapshot.pending_changes.clear();
         let target = live_mode_target("/tmp/Locality/notion/teamspace-home/hello-world/page.md");
         let mut sync_calls = 0usize;
-        let mut checked = Vec::new();
+        let mut queued = Vec::new();
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
@@ -10642,17 +10626,16 @@ mod tests {
                 Ok(())
             },
             |target| {
-                checked.push(target.path.clone());
+                queued.push(target.path.clone());
                 Ok(())
             },
-            |_| panic!("remote check should not queue a fast-forward"),
             |_, _| panic!("remote-only tick should not merge local drift"),
         );
 
         assert!(report.ok);
-        assert_eq!(report.message, "Live Mode queued 1 remote check.");
+        assert_eq!(report.message, "Live Mode queued 1 remote update.");
         assert_eq!(sync_calls, 0);
-        assert_eq!(checked, vec![target.path]);
+        assert_eq!(queued, vec![target.path]);
     }
 
     #[test]
@@ -10662,23 +10645,22 @@ mod tests {
         let first = live_mode_target("/tmp/Locality/notion/teamspace-home/hello-world/page.md");
         let second = live_mode_target("/tmp/Locality/notion/teamspace-home/roadmap/page.md");
         let targets = vec![first.clone(), second.clone()];
-        let mut checked = Vec::new();
+        let mut queued = Vec::new();
 
         let report = live_mode_tick_from_snapshot(
             &snapshot,
             &targets,
             |_, _| panic!("remote-only tick should not sync local changes"),
             |target| {
-                checked.push(target.path.clone());
+                queued.push(target.path.clone());
                 Ok(())
             },
-            |_| panic!("remote check should not queue a fast-forward"),
             |_, _| panic!("remote-only tick should not merge local drift"),
         );
 
         assert!(report.ok);
-        assert_eq!(report.message, "Live Mode queued 2 remote checks.");
-        assert_eq!(checked, vec![first.path, second.path]);
+        assert_eq!(report.message, "Live Mode queued 2 remote updates.");
+        assert_eq!(queued, vec![first.path, second.path]);
     }
 
     #[test]
@@ -10793,7 +10775,6 @@ mod tests {
             std::slice::from_ref(&target),
             |_, _| panic!("remote pull should not sync local changes"),
             |_| Err("daemon unreachable".to_string()),
-            |_| panic!("remote check failure should not queue a fast-forward"),
             |_, _| panic!("remote-only tick should not merge local drift"),
         );
 
@@ -10822,7 +10803,6 @@ mod tests {
                 "/tmp/Locality/notion/another-page/page.md",
             )],
             |_, _| panic!("remote-only change should not run a local push"),
-            |_| panic!("remote-only pending change should not use the generic check cursor"),
             |target| {
                 pulled.push(target.clone());
                 Ok(())
@@ -10858,7 +10838,6 @@ mod tests {
                 "/tmp/Locality/notion/another-page/page.md",
             )],
             |_, _| panic!("remote delete should not push"),
-            |_| panic!("remote delete should not use the generic check cursor"),
             |_| panic!("remote delete should not fast-forward"),
             |_, _| panic!("remote delete should not merge remote drift"),
         );
@@ -11057,7 +11036,6 @@ mod tests {
                 synced.push((change.title.clone(), target.to_path_buf()));
                 Ok(())
             },
-            |_| panic!("pending changes should take the live mode tick"),
             |_| panic!("pending changes should not queue a remote fast-forward"),
             |_, _| panic!("safe pending changes should not merge remote drift"),
         );
@@ -11092,7 +11070,6 @@ mod tests {
                 synced.push((change.title.clone(), target.to_path_buf()));
                 Ok(())
             },
-            |_| panic!("mergeable local+remote drift should not block on remote pull cursor"),
             |_| panic!("mergeable local+remote drift should not queue remote fast-forward"),
             |change, target| {
                 merged.push((change.title.clone(), target.to_path_buf()));
@@ -11131,7 +11108,6 @@ mod tests {
             &snapshot,
             &[],
             |_, _| panic!("conflicted local+remote drift should not push"),
-            |_| panic!("conflicted local+remote drift should not use remote pull cursor"),
             |_| panic!("conflicted local+remote drift should not queue remote fast-forward"),
             |change, target| {
                 merged.push((change.title.clone(), target.to_path_buf()));
@@ -11170,7 +11146,6 @@ mod tests {
                 calls += 1;
                 Ok(())
             },
-            |_| panic!("review-required changes should pause before remote pulls"),
             |_| panic!("review-required changes should not queue remote fast-forward"),
             |_, _| panic!("large review-required changes should not merge remote drift"),
         );
