@@ -56,6 +56,23 @@
   .notes{margin-top:18px;border-top:1px dashed var(--line);padding-top:12px;
     font-family:var(--mono);font-size:10.5px;color:var(--muted);line-height:1.7}
   .notes b{color:var(--teal);font-weight:600}
+  body.hide-design-notes .notes{display:none}
+
+  .decktools{position:sticky;top:0;z-index:8;display:flex;align-items:center;gap:8px;
+    margin:-12px 0 22px;padding:8px 0;background:linear-gradient(var(--canvas) 76%,rgba(242,244,245,0))}
+  .decktools .hint{font-size:11px;color:var(--muted);margin-left:4px}
+  .decktools .status{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+  .team-notes{margin-top:14px;border:1px dashed var(--blue);border-radius:8px;background:var(--blue-wash);
+    padding:12px}
+  .team-notes-head{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
+  .team-notes-head b{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--blue)}
+  .team-notes-head span{font-size:11px;color:var(--muted)}
+  .team-note-input{width:100%;min-height:84px;resize:vertical;border:1px solid rgba(37,99,235,.22);
+    border-radius:6px;background:rgba(255,255,255,.72);padding:9px 10px;color:var(--ink);
+    font:12px/1.5 var(--sans)}
+  .team-note-input::placeholder{color:var(--faint)}
+  .team-note-actions{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:8px}
+  .team-note-actions small{font-size:10.5px;color:var(--muted)}
 
   /* ---------- window chrome ---------- */
   .frame{background:var(--paper);border:1px solid var(--line);border-radius:10px;
@@ -83,7 +100,7 @@
   .chip{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;font-weight:500;
     padding:1px 7px;border-radius:99px;white-space:nowrap}
   .c-synced{background:var(--teal-wash);color:var(--teal)}
-  .c-pending{background:var(--amber-wash);color:var(--amber)}
+  .c-review-needed{background:var(--amber-wash);color:var(--amber)}
   .c-draft{background:var(--slate-wash);color:var(--slate)}
   .c-review{background:var(--blue-wash);color:var(--blue)}
   .c-conflict{background:var(--orange-wash);color:var(--orange)}
@@ -205,6 +222,23 @@
   .setnav a{display:block;padding:5px 16px;font-size:12px;color:var(--ink);text-decoration:none;border-left:2px solid transparent}
   .setnav a.on{background:var(--teal-wash);border-left-color:var(--teal);color:var(--teal);font-weight:600}
 
+  .final-appshell{display:grid;grid-template-columns:172px minmax(0,1fr);min-height:480px}
+  .app-global-nav{background:var(--wash);border-right:1px solid var(--line-soft);padding:12px 0;
+    display:flex;flex-direction:column}
+  .app-global-nav .logo{display:flex;align-items:center;gap:7px;font-weight:600;font-size:13px;padding:2px 14px 12px}
+  .app-global-nav a{display:flex;align-items:center;gap:8px;padding:5px 14px;font-size:12px;color:var(--ink);
+    text-decoration:none;border-left:2px solid transparent}
+  .app-global-nav a.on{background:var(--teal-wash);border-left-color:var(--teal);color:var(--teal);font-weight:600}
+  .app-global-nav .cnt{margin-left:auto;background:var(--amber-wash);color:var(--amber);font-size:9.5px;
+    font-weight:600;border-radius:99px;padding:0 6px}
+  .app-global-nav .foot{margin-top:auto;padding:10px 14px;border-top:1px solid var(--line-soft);
+    display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--muted)}
+  .app-page{min-width:0;overflow:hidden}
+  .app-page > .content:first-child{min-height:446px}
+  .subpage-banner{display:flex;align-items:center;gap:8px;padding:8px 18px;border-bottom:1px solid var(--line-soft);
+    background:var(--wash);font-size:12px;color:var(--muted)}
+  .subpage-banner b{color:var(--ink);font-size:12.5px}
+
   .legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
 
   @media (max-width:820px){
@@ -213,8 +247,11 @@
     .brand{display:none}.ngroup{display:none}
     .decknav button{width:auto;white-space:nowrap;border-left:0;border-bottom:2px solid transparent;border-radius:6px}
     .decknav button[aria-current="true"]{border-bottom-color:var(--teal)}
-    .appshell,.setshell{grid-template-columns:1fr}
-    .snav,.setnav{display:none}
+    .decktools{position:static;flex-wrap:wrap;margin-top:0}
+    .decktools .hint{width:100%;margin-left:0}
+    .decktools .status{margin-left:0}
+    .appshell,.setshell,.final-appshell{grid-template-columns:1fr}
+    .snav,.setnav,.app-global-nav{display:none}
     .threepane{grid-template-columns:1fr}
     .pane{border-right:0;border-bottom:1px solid var(--line-soft)}
     .statgrid{grid-template-columns:1fr}
@@ -226,36 +263,44 @@
   <nav class="decknav" aria-label="Screens">
     <div class="brand">
       <h1>Locality Desktop</h1>
-      <div class="sub">WIREFRAME DECK · v2 REDESIGN</div>
+      <div class="sub">WIREFRAME DECK · v4 APP SHELL MAP</div>
     </div>
     <div class="ngroup">Onboarding</div>
     <button data-s="ob1" aria-current="true"><span class="k">1.1</span>Welcome</button>
     <button data-s="ob2"><span class="k">1.2</span>Connect a source</button>
     <button data-s="ob3"><span class="k">1.3</span>Local folder</button>
     <button data-s="ob4"><span class="k">1.4</span>Ready</button>
-    <div class="ngroup">Main window</div>
+    <div class="ngroup">Primary pages</div>
     <button data-s="home"><span class="k">2.1</span>Home</button>
-    <button data-s="files"><span class="k">2.2</span>Files</button>
-    <button data-s="sources"><span class="k">2.3</span>Sources</button>
-    <button data-s="pending"><span class="k">2.4</span>Pending changes</button>
-    <button data-s="review"><span class="k">2.5</span>Review &amp; Push</button>
-    <button data-s="problems"><span class="k">2.6</span>Sync problems</button>
-    <button data-s="conflict"><span class="k">2.7</span>Conflict editor</button>
-    <button data-s="activity"><span class="k">2.8</span>Activity</button>
-    <button data-s="settings"><span class="k">2.9</span>Settings</button>
-    <div class="ngroup">Tray &amp; modals</div>
-    <button data-s="tray"><span class="k">3.0</span>Tray popover</button>
-    <button data-s="modals"><span class="k">4.0</span>Destructive modals</button>
-    <button data-s="legend"><span class="k">5.0</span>Status legend</button>
-    <div class="ngroup">Extended states</div>
-    <button data-s="srcdetail"><span class="k">6.1</span>Source detail</button>
-    <button data-s="locate"><span class="k">6.2</span>Locate results</button>
-    <button data-s="pushstates"><span class="k">6.3</span>Push states</button>
-    <button data-s="agents"><span class="k">6.4</span>Settings · Agents</button>
-    <button data-s="empties"><span class="k">6.5</span>Empty &amp; loading</button>
+    <button data-s="sources"><span class="k">2.2</span>Sources</button>
+    <button data-s="reviewcenter"><span class="k">2.3</span>Review center</button>
+    <button data-s="settings"><span class="k">2.4</span>Settings</button>
+    <div class="ngroup">Subpages</div>
+    <button data-s="files"><span class="k">3.1</span>Files browser</button>
+    <button data-s="srcdetail"><span class="k">3.2</span>Source detail</button>
+    <button data-s="locate"><span class="k">3.3</span>Locate results</button>
+    <button data-s="problems"><span class="k">3.4</span>Sync problems</button>
+    <button data-s="conflict"><span class="k">3.5</span>Conflict editor</button>
+    <button data-s="activity"><span class="k">3.6</span>Activity log</button>
+    <button data-s="agents"><span class="k">3.7</span>Settings · Agents</button>
+    <div class="ngroup">Modals &amp; surfaces</div>
+    <button data-s="review"><span class="k">4.1</span>Push approval</button>
+    <button data-s="pushstates"><span class="k">4.2</span>Push states</button>
+    <button data-s="tray"><span class="k">4.3</span>Tray popover</button>
+    <button data-s="modals"><span class="k">4.4</span>Destructive modals</button>
+    <div class="ngroup">States &amp; reference</div>
+    <button data-s="empties"><span class="k">5.1</span>Empty &amp; loading</button>
+    <button data-s="legend"><span class="k">5.2</span>Status legend</button>
   </nav>
 
   <main class="stage">
+    <div class="decktools" aria-label="Wireframe collaboration controls">
+      <button class="btn btn-sm" type="button" id="toggle-design-notes">Hide design notes</button>
+      <button class="btn btn-sm" type="button" id="copy-current-notes">Copy page notes</button>
+      <button class="btn btn-sm" type="button" id="copy-all-notes">Copy all notes</button>
+      <span class="hint">Team notes save in this browser. Copy them into the review thread or a PR to share.</span>
+      <span class="status" id="notes-status" aria-live="polite"></span>
+    </div>
 
     <!-- ============ 1.1 WELCOME ============ -->
     <section class="screen active" id="ob1">
@@ -269,7 +314,7 @@
           <div style="font-size:20px;font-weight:600;letter-spacing:-.02em;max-width:420px;margin:0 auto">
             Turn your Notion and other docs into local files your AI agents can edit — safely.</div>
           <p style="color:var(--muted);max-width:400px;margin:12px auto 26px">
-            Your edits stay on your machine as “Pending” until you review and push them back.</p>
+            Your edits stay on your machine until you review them in Review Center and push them back.</p>
           <span class="btn btn-primary">Get started →</span>
           <div style="margin-top:16px"><span class="linkish">Restore from an existing mount</span></div>
         </div>
@@ -328,7 +373,7 @@
 
           <div class="h-min">How should changes sync?</div>
           <div class="radio on"><i></i><div><b style="font-size:12px">Review mode</b> <span class="chip c-synced">recommended</span>
-            <small>Agent edits stay Pending until you review and push. Nothing reaches Notion without your approval.</small></div></div>
+            <small>Agent edits wait in Review Center until you approve and push. Nothing reaches Notion without your approval.</small></div></div>
           <div class="radio"><i></i><div><b style="font-size:12px">Live mode</b>
             <small>Conservative background sync. Locality still pauses for conflicts, deletions, and review-required work.</small></div></div>
           <div style="font-size:11px;color:var(--faint);margin:4px 0 18px">You can change this per-source or per-file later.</div>
@@ -360,7 +405,7 @@
             <span class="chip c-synced" style="font-size:13px">✓</span> Locality is ready</div>
           <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Point your coding agent at:</div>
           <div class="pathchip"><span>~/Library/CloudStorage/Locality/notion</span><em>Copy</em></div>
-          <div style="font-size:11.5px;color:var(--muted);margin:6px 0 16px">Edits show up in Pending for your review.</div>
+          <div style="font-size:11.5px;color:var(--muted);margin:6px 0 16px">Edits show up in Review Center for your approval.</div>
           <div class="card" style="padding:12px 14px">
             <div style="font-weight:600;font-size:12.5px">⚡ Install agent guidance</div>
             <div style="font-size:11.5px;color:var(--muted);margin:4px 0 10px">
@@ -381,16 +426,17 @@
     <!-- ============ 2.1 HOME ============ -->
     <section class="screen" id="home">
       <div class="shead"><h2>Home</h2><span class="route">/</span></div>
-      <p class="sdesc">Glanceable status, three stat cards, Locate, and Recent — every row carries a source badge and a status chip.</p>
-      <div class="frame">
+      <p class="sdesc">Glanceable health, quick locate, recent work, and a clear path into Review Center when agent edits need approval.</p>
+      <div class="frame" data-app-shell="home" data-app-title="Home" data-strip-legacy-sidebar="true">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality</span></div>
         <div class="appshell">
           <div class="snav">
             <div class="logo"><span class="aperture"></span>Locality</div>
-            <a class="on" href="#">⌂ Home</a><a href="#">▤ Files</a><a href="#">◫ Sources</a>
-            <a href="#">● Pending <span class="cnt">4</span></a><a href="#">≡ Activity</a>
-            <a href="#">⚠ Problems</a><a href="#">⚙ Settings</a>
-            <div class="foot"><span class="avatar"></span>user@team</div>
+            <a class="on" href="#">⌂ Home</a>
+            <a href="#">◫ Sources</a>
+            <a href="#">● Review Center <span class="cnt">4</span></a>
+            <a href="#">⚙ Settings</a>
+            <div class="foot"><span class="chip c-synced">✓</span> Synced · 2m ago</div>
           </div>
           <div>
             <div class="statusbar"><span class="chip c-synced">✓ All changes reviewed</span>
@@ -398,7 +444,7 @@
             <div class="content">
               <div class="statgrid">
                 <div class="stat"><div class="lbl">Sources</div><div class="num">2</div></div>
-                <div class="stat"><div class="lbl">Pending</div><div class="num" style="color:var(--amber)">4</div></div>
+                <div class="stat"><div class="lbl">Awaiting review</div><div class="num" style="color:var(--amber)">4</div></div>
                 <div class="stat"><div class="lbl">Problems</div><div class="num" style="color:var(--teal)">0 ✓</div></div>
               </div>
               <div class="h-min">Locate a page</div>
@@ -406,7 +452,7 @@
               <div class="h-min">Recent files</div>
               <div class="card">
                 <div class="rowline"><span class="src src-n">N</span><span class="grow">Roadmap.md</span>
-                  <span class="chip c-pending">● Pending</span><span class="meta">2m ago</span></div>
+                  <span class="chip c-review-needed">● Needs review</span><span class="meta">2m ago</span></div>
                 <div class="rowline"><span class="src src-n">N</span><span class="grow">Specs/Auth.md</span>
                   <span class="chip c-synced">✓ Synced</span><span class="meta">1h ago</span></div>
                 <div class="rowline"><span class="src src-n">N</span><span class="grow">Notes/Standup.md</span>
@@ -416,15 +462,16 @@
           </div>
         </div>
       </div>
-      <div class="notes"><b>empty state</b> — no sources: stat cards replaced by one panel
-      “Connect your first source [Connect Notion]” · <b>keyboard</b> — “/” focuses Locate, Cmd+1..7 jumps sidebar.</div>
+      <div class="notes"><b>sidebar rule</b> — primary nav stays to Home, Sources, Review Center, Settings; Files, Activity,
+      and Problems surface contextually from those places · <b>empty state</b> — no sources: stat cards replaced by one panel
+      “Connect your first source [Connect Notion]” · <b>keyboard</b> — “/” focuses Locate, Cmd+1..4 jumps sidebar.</div>
     </section>
 
     <!-- ============ 2.2 FILES ============ -->
     <section class="screen" id="files">
       <div class="shead"><h2>Files — unified browser</h2><span class="route">/files</span></div>
-      <p class="sdesc">One browser across all sources; left rail filters by source and status. Selected row's full path lives in the footer PathChip.</p>
-      <div class="frame">
+      <p class="sdesc">A searchable file browser reached from Home search, source detail, or Review Center. Selected row's full path lives in the footer PathChip.</p>
+      <div class="frame" data-app-shell="home" data-app-title="Files browser" data-app-kind="subpage">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Files</span></div>
         <div class="appshell" style="grid-template-columns:150px 1fr">
           <div class="snav">
@@ -432,7 +479,7 @@
             <a href="#">○ All</a><a class="on" href="#">● Notion</a>
             <a href="#" style="opacity:.5">○ Google Docs <span class="meta" style="font-size:9px">soon</span></a>
             <div class="sect-label">Filters</div>
-            <a href="#">Pending</a><a href="#">Conflicts</a><a href="#">Synced</a>
+            <a href="#">Needs review</a><a href="#">Conflicts</a><a href="#">Synced</a>
           </div>
           <div>
             <div class="statusbar"><b style="font-size:13px">Files</b>
@@ -445,7 +492,7 @@
                 <div class="rowline"><span class="grow">📁 Specs/</span><span style="width:52px"><span class="src src-n">N</span></span>
                   <span style="width:86px;color:var(--faint)">—</span><span style="width:60px" class="meta">—</span></div>
                 <div class="rowline"><span class="grow">📄 Roadmap.md</span><span style="width:52px"><span class="src src-n">N</span></span>
-                  <span style="width:86px"><span class="chip c-pending">● Pending</span></span><span style="width:60px" class="meta">2m</span></div>
+                  <span style="width:86px"><span class="chip c-review-needed">● Review</span></span><span style="width:60px" class="meta">2m</span></div>
                 <div class="rowline" style="background:var(--teal-wash)"><span class="grow">📄 Auth.md</span><span style="width:52px"><span class="src src-n">N</span></span>
                   <span style="width:86px"><span class="chip c-synced">✓ Synced</span></span><span style="width:60px" class="meta">1h</span></div>
                 <div class="rowline"><span class="grow">📄 Standup.md</span><span style="width:52px"><span class="src src-n">N</span></span>
@@ -459,15 +506,15 @@
           </div>
         </div>
       </div>
-      <div class="notes"><b>row menu</b> — Open · Reveal in Finder · Locate original · Diff (if pending) · Set sync mode ·
+      <div class="notes"><b>row menu</b> — Open · Reveal in Finder · Locate original · Diff (if awaiting review) · Set sync mode ·
       <b>selection</b> — highlighted row drives the footer path; arrows move, Enter opens.</div>
     </section>
 
     <!-- ============ 2.3 SOURCES ============ -->
     <section class="screen" id="sources">
       <div class="shead"><h2>Sources</h2><span class="route">/sources · /sources/:id</span></div>
-      <p class="sdesc">Connectors + mounts unified. One card per connected workspace; upcoming connectors advertise themselves in place.</p>
-      <div class="frame">
+      <p class="sdesc">Connected workspaces and mount health in one place. Daily write decisions still route through Review Center.</p>
+      <div class="frame" data-app-shell="sources" data-app-title="Sources">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Sources</span></div>
         <div class="content" style="padding:18px 22px">
           <div style="display:flex;align-items:center;margin-bottom:14px"><b style="font-size:14px">Sources</b>
@@ -495,28 +542,44 @@
       per-source sync mode · diagnostics shortcuts · danger zone (Reset local state / Prepare for uninstall → app-native modals).</div>
     </section>
 
-    <!-- ============ 2.4 PENDING ============ -->
-    <section class="screen" id="pending">
-      <div class="shead"><h2>Pending changes</h2><span class="route">/pending</span></div>
-      <p class="sdesc">The GitHub-Desktop spine: checkbox file list left, diff right, Review &amp; Push below, Undo after every push.</p>
-      <div class="frame">
-        <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Pending</span></div>
-        <div class="appshell" style="grid-template-columns:200px 1fr">
+    <!-- ============ 2.4 REVIEW CENTER ============ -->
+    <section class="screen" id="reviewcenter">
+      <div class="shead"><h2>Review Center</h2><span class="route">/review</span></div>
+      <p class="sdesc">The approval workspace: changed files on the left, diff on the right, and a single primary path to approve selected changes.</p>
+      <div class="frame" data-app-shell="review" data-app-title="Review Center">
+        <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Review Center</span></div>
+        <div class="appshell" style="grid-template-columns:224px 1fr">
           <div class="snav" style="padding:0">
-            <div class="sect-label">Changed files</div>
+            <div style="padding:10px 12px;border-bottom:1px solid var(--line-soft)">
+              <div style="font-size:12.5px;font-weight:600">4 changes waiting</div>
+              <div style="font-size:11px;color:var(--muted);margin-top:2px">Oldest: 1 hour · 3 agents</div>
+            </div>
+            <div style="display:flex;gap:4px;padding:8px 10px;border-bottom:1px solid var(--line-soft)">
+              <span class="btn btn-sm btn-primary">All</span>
+              <span class="btn btn-sm">Notion</span>
+              <span class="btn btn-sm">By agent</span>
+            </div>
+            <div class="sect-label">Awaiting review</div>
             <div class="rowline"><span class="check on"><i>✓</i></span><span class="src src-n">N</span>
-              <span class="grow">Roadmap.md</span><span class="chip c-pending">mod</span></div>
+              <span class="grow">Roadmap.md</span><span class="meta">Claude</span></div>
             <div class="rowline" style="background:var(--teal-wash)"><span class="check on"><i>✓</i></span><span class="src src-n">N</span>
-              <span class="grow">Auth.md</span><span class="chip c-pending">mod</span></div>
+              <span class="grow">Auth.md</span><span class="meta">Cursor</span></div>
             <div class="rowline"><span class="check"><i></i></span><span class="src src-n">N</span>
-              <span class="grow">Notes.md</span><span class="chip c-synced">new</span></div>
+              <span class="grow">Notes.md</span><span class="meta">new</span></div>
             <div class="rowline"><span class="check on"><i>✓</i></span><span class="src src-n">N</span>
               <span class="grow">Old.md</span><span class="chip c-error">del</span></div>
             <div style="margin-top:auto;border-top:1px solid var(--line-soft);padding:10px 12px">
               <div style="font-size:11px;color:var(--muted);margin-bottom:8px">3 of 4 selected</div>
-              <span class="btn btn-primary btn-sm" style="width:100%;justify-content:center">Review &amp; Push…</span>
+              <div style="display:flex;gap:6px">
+                <span class="btn btn-sm" style="flex:1;justify-content:center">Reject</span>
+                <span class="btn btn-primary btn-sm" style="flex:1;justify-content:center">Approve</span>
+              </div>
             </div>
           </div>
+          <div>
+            <div class="statusbar"><b style="font-size:13px">Auth.md</b>
+              <span class="meta">Cursor · edited 12 min ago · +1 -1</span>
+              <span class="sp"><span class="btn btn-sm">Open file</span><span class="btn btn-sm">Rule…</span></span></div>
           <div class="content">
             <div class="diff">
               <div class="dh">Auth.md
@@ -527,29 +590,30 @@
               <div class="dl dl-ctx">  Unchanged context line…</div>
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">
-              <span class="btn btn-sm">Push</span><span class="btn btn-sm">Pull</span>
-              <span class="btn btn-sm">Keep draft</span><span class="btn btn-sm">Reset to remote</span>
-              <span class="btn btn-sm">Edit conflict</span></div>
+              <span class="btn btn-sm">Reject selected</span><span class="btn btn-primary btn-sm">Approve selected</span>
+              <span class="btn btn-sm">Pull latest</span><span class="btn btn-sm">Reset to remote</span>
+              <span class="btn btn-sm">Resolve conflict</span></div>
             <div style="margin-top:14px;font-size:12px;color:var(--muted)">
-              ↶ <span class="linkish">Undo last push</span> — pushed 4 changes · 30s ago</div>
+              Pushed work appears in Activity. Revert is shown only when a journal-backed reverse plan is still safe.</div>
+          </div>
           </div>
         </div>
       </div>
       <div class="notes"><b>keyboard</b> — ↑/↓ moves selection · Space toggles checkbox · Enter opens diff ·
-      <b>empty state</b> — “No pending changes. Agents’ edits will appear here.” ·
+      <b>empty state</b> — “No changes waiting for review. Agent edits will appear here.” ·
       discarded work is kept in .locality/trash for a retention window.</div>
     </section>
 
-    <!-- ============ 2.5 REVIEW ============ -->
+    <!-- ============ 2.5 PUSH APPROVAL ============ -->
     <section class="screen" id="review">
-      <div class="shead"><h2>Review &amp; Push — approval gate</h2><span class="route">/pending/review (modal route)</span></div>
-      <p class="sdesc">A modal over Pending: Back/Esc pushes nothing and preserves selection. Deletions gate the push button behind an explicit checkbox.</p>
-      <div class="frame overlayed">
-        <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Pending</span></div>
+      <div class="shead"><h2>Push approval — final gate</h2><span class="route">/review/push (modal route)</span></div>
+      <p class="sdesc">A modal over Review Center: Back/Esc pushes nothing and preserves selection. Deletions gate the push button behind an explicit checkbox.</p>
+      <div class="frame overlayed" data-app-shell="review" data-app-title="Push approval" data-app-kind="modal">
+        <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Review Center</span></div>
         <div class="under" style="height:360px;background:var(--wash)"></div>
         <div class="modal">
-          <div class="mcard" role="dialog" aria-label="Review and push">
-            <h3>Review &amp; Push</h3>
+          <div class="mcard" role="dialog" aria-label="Approve and push">
+            <h3>Approve and push</h3>
             <p style="font-size:12px;color:var(--muted)">You’re about to push <b>3 changes</b> to Notion
               <span class="src src-n" style="vertical-align:-3px">N</span></p>
             <div class="plan">
@@ -573,7 +637,7 @@
     <section class="screen" id="problems">
       <div class="shead"><h2>Sync problems — resolution center</h2><span class="route">/problems</span></div>
       <p class="sdesc">OneDrive-style error center: each row states the item, the plain-language cause, and a primary fix action.</p>
-      <div class="frame">
+      <div class="frame" data-app-shell="review" data-app-title="Sync problems" data-app-kind="subpage">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Problems</span></div>
         <div class="content" style="padding:18px 22px">
           <div style="display:flex;align-items:center;gap:8px;font-weight:600;font-size:14px;margin-bottom:14px">
@@ -602,9 +666,9 @@
 
     <!-- ============ 2.7 CONFLICT ============ -->
     <section class="screen" id="conflict">
-      <div class="shead"><h2>Conflict editor — three-pane</h2><span class="route">/pending/:fileId</span></div>
+      <div class="shead"><h2>Conflict editor — three-pane</h2><span class="route">/review/:fileId</span></div>
       <p class="sdesc">Tower-style resolver: Local | editable Merged result | Remote, with click-to-take and markdown-aware auto-merge attempted first.</p>
-      <div class="frame">
+      <div class="frame" data-app-shell="review" data-app-title="Conflict editor" data-app-kind="subpage">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Resolve conflict — Auth.md</span></div>
         <div style="padding:14px 16px">
           <div style="display:flex;align-items:center;margin-bottom:10px">
@@ -634,8 +698,8 @@
     <!-- ============ 2.8 ACTIVITY ============ -->
     <section class="screen" id="activity">
       <div class="shead"><h2>Activity</h2><span class="route">/activity</span></div>
-      <p class="sdesc">The History analog: an immutable, day-grouped log with expandable detail and Undo/Revert where possible.</p>
-      <div class="frame">
+      <p class="sdesc">The History analog: an immutable, day-grouped log with expandable detail and Revert only when a safe reverse plan exists.</p>
+      <div class="frame" data-app-shell="settings" data-app-title="Activity log" data-app-kind="subpage">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Activity</span></div>
         <div class="content" style="padding:18px 22px">
           <div class="sect-label" style="padding-left:0">Today</div>
@@ -654,7 +718,7 @@
           </div>
         </div>
       </div>
-      <div class="notes"><b>expanded entry</b> — affected files with per-file diff links + Undo/Revert ·
+      <div class="notes"><b>expanded entry</b> — affected files with per-file diff links + conditional Revert ·
       Queue Debug is no longer a tab here; it moved to Settings → Advanced.</div>
     </section>
 
@@ -662,7 +726,7 @@
     <section class="screen" id="settings">
       <div class="shead"><h2>Settings — sectioned</h2><span class="route">/settings/:section</span></div>
       <p class="sdesc">Left-hand sectioned nav (OneDrive pattern), deep-linkable. Shown: Sync &amp; Live Mode.</p>
-      <div class="frame">
+      <div class="frame" data-app-shell="settings" data-app-title="Settings">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Settings</span></div>
         <div class="setshell">
           <div class="setnav">
@@ -691,14 +755,14 @@
     <!-- ============ 3.0 TRAY ============ -->
     <section class="screen" id="tray">
       <div class="shead"><h2>Tray popover</h2><span class="route">menu bar</span></div>
-      <p class="sdesc">Dropbox/Drive anatomy: search → status → pending → recent → controls → avatar/settings. Pause offers preset durations.</p>
+      <p class="sdesc">Dropbox/Drive anatomy: search → status → review queue → recent → controls → avatar/settings. Pause offers preset durations.</p>
       <div class="tray">
         <div class="tsec"><div class="wf-input" style="border:0;padding:2px 0">🔎 Locate a page or file…</div></div>
         <div class="tsec" style="display:flex;align-items:center;gap:8px">
           <span class="chip c-synced">✓ All changes reviewed</span>
           <span style="margin-left:auto;font-size:11px;color:var(--muted)">Live mode</span><span class="toggle"></span></div>
         <div class="tsec">
-          <div class="sect-label" style="padding:0 0 4px">Pending (4)</div>
+          <div class="sect-label" style="padding:0 0 4px">Review Center (4)</div>
           <div class="rowline" style="padding:4px 0"><span class="src src-n">N</span><span class="grow">Roadmap.md</span>
             <span class="linkish">Review</span></div>
           <div class="rowline" style="padding:4px 0"><span class="src src-n">N</span><span class="grow">Auth.md</span>
@@ -759,7 +823,7 @@
       <div class="frame"><div style="padding:22px 26px">
         <div class="card">
           <div class="rowline"><span class="chip c-synced">✓ Synced</span><span class="grow" style="color:var(--muted)">local matches remote</span><span class="meta">teal #087b72</span></div>
-          <div class="rowline"><span class="chip c-pending">● Pending</span><span class="grow" style="color:var(--muted)">local edits awaiting review</span><span class="meta">amber #C08A00</span></div>
+          <div class="rowline"><span class="chip c-review-needed">● Needs review</span><span class="grow" style="color:var(--muted)">local edits awaiting approval</span><span class="meta">amber #C08A00</span></div>
           <div class="rowline"><span class="chip c-draft">◐ Draft</span><span class="grow" style="color:var(--muted)">intentionally not pushed</span><span class="meta">slate #64748b</span></div>
           <div class="rowline"><span class="chip c-review">⟳ Reviewing</span><span class="grow" style="color:var(--muted)">in the push plan / being pushed</span><span class="meta">blue #2563eb</span></div>
           <div class="rowline"><span class="chip c-conflict">⚠ Conflict</span><span class="grow" style="color:var(--muted)">local &amp; remote diverged</span><span class="meta">orange #d97706</span></div>
@@ -771,7 +835,7 @@
           <span class="src src-g" style="margin-left:14px">G</span><span style="font-size:11.5px;color:var(--muted)">Google Docs source badge</span>
         </div>
       </div></div>
-      <div class="notes"><b>surfacing</b> — sidebar: numeric badges on Pending &amp; Problems · file rows: chip per row ·
+      <div class="notes"><b>surfacing</b> — sidebar: numeric badge on Review Center, Problems appear only when attention is required · file rows: chip per row ·
       tray: aggregate line + per-item · OS badges: synced ✓ / in-flight progress / error ! mapped per platform.</div>
     </section>
 
@@ -779,7 +843,7 @@
     <section class="screen" id="srcdetail">
       <div class="shead"><h2>Source detail</h2><span class="route">/sources/:id</span></div>
       <p class="sdesc">Everything about one connected workspace: access, local files, mount health, and the danger zone — without crowding Home or Sources.</p>
-      <div class="frame">
+      <div class="frame" data-app-shell="sources" data-app-title="Source detail" data-app-kind="subpage">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Notion · Acme Team</span></div>
         <div class="content" style="padding:16px 22px">
           <div style="font-size:12px;margin-bottom:8px"><span class="linkish">← Sources</span></div>
@@ -826,7 +890,7 @@
     <section class="screen" id="locate">
       <div class="shead"><h2>Locate — results open</h2><span class="route">/locate?q=…</span></div>
       <p class="sdesc">Type a title → ranked suggestions with source badges and status. Paste a URL → resolves straight to the Located result.</p>
-      <div class="frame">
+      <div class="frame" data-app-shell="home" data-app-title="Locate results" data-app-kind="subpage">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Home</span></div>
         <div class="content" style="padding:20px 24px;max-width:560px">
           <div class="h-min" style="margin-top:0">Locate a page</div>
@@ -835,7 +899,7 @@
             <div class="rowline" style="background:var(--teal-wash)"><span class="grow">📄 Auth.md</span>
               <span class="src src-n">N</span><span class="chip c-synced">✓ Synced</span><span class="meta">Specs/</span></div>
             <div class="rowline"><span class="grow">📄 Auth-review.md</span>
-              <span class="src src-n">N</span><span class="chip c-pending">● Pending</span><span class="meta">Drafts/</span></div>
+              <span class="src src-n">N</span><span class="chip c-review-needed">● Needs review</span><span class="meta">Drafts/</span></div>
             <div class="rowline"><span class="grow">📄 OAuth broker notes</span>
               <span class="src src-n">N</span><span class="chip c-synced">✓ Synced</span><span class="meta">Eng/Infra/</span></div>
             <div class="rowline" style="justify-content:center;color:var(--faint);font-size:11px">No more matches in current access</div>
@@ -853,8 +917,8 @@
 
     <!-- ============ 6.3 PUSH STATES ============ -->
     <section class="screen" id="pushstates">
-      <div class="shead"><h2>Review &amp; Push — pushing and success</h2><span class="route">/pending/review</span></div>
-      <p class="sdesc">Progress is per-file and honest; success names exactly what happened and keeps Undo one click away.</p>
+      <div class="shead"><h2>Push approval — progress and success</h2><span class="route">/review/push</span></div>
+      <p class="sdesc">Progress is per-file and honest; success names exactly what happened and points to Activity for audit and rare safe reversions.</p>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start">
         <div class="mcard" role="dialog" aria-label="Pushing" style="width:auto">
           <h3><span class="chip c-review">⟳</span> Pushing 2 of 3…</h3>
@@ -869,20 +933,20 @@
           <h3><span class="chip c-synced">✓</span> Pushed 3 changes to Notion</h3>
           <p style="font-size:12px;color:var(--muted);margin-top:4px">2 pages updated · 1 row updated · 1 page deleted</p>
           <div class="mfoot" style="justify-content:space-between;align-items:center">
-            <span class="linkish">↶ Undo this push</span>
+            <span class="linkish">View reverse plan</span>
             <span style="display:flex;gap:8px"><span class="btn">View activity</span>
             <span class="btn btn-primary">Done</span></span></div>
         </div>
       </div>
       <div class="notes"><b>partial failure</b> — success card lists failed items with “→ View in Sync Problems”; nothing
-      silently retries · Cancel remaining never rolls back already-pushed files (they appear in Activity with Undo).</div>
+      silently retries · Cancel remaining never rolls back already-pushed files; Activity shows a Revert option only when safe.</div>
     </section>
 
     <!-- ============ 6.4 AGENTS ============ -->
     <section class="screen" id="agents">
       <div class="shead"><h2>Settings · Agents</h2><span class="route">/settings/agents</span></div>
       <p class="sdesc">Per-agent guidance status with one install/update action; the MCP fallback is surfaced as a configured capability, not jargon.</p>
-      <div class="frame">
+      <div class="frame" data-app-shell="settings" data-app-title="Settings · Agents" data-app-kind="subpage">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Settings</span></div>
         <div class="setshell">
           <div class="setnav">
@@ -898,7 +962,7 @@
             <div class="card">
               <div class="rowline">⚡<span class="grow">Claude Code</span><span class="chip c-synced">✓ Guidance installed</span></div>
               <div class="rowline">⚡<span class="grow">Cursor</span><span class="chip c-synced">✓ Guidance installed</span></div>
-              <div class="rowline">⚡<span class="grow">Warp</span><span class="chip c-pending">● Update available</span></div>
+              <div class="rowline">⚡<span class="grow">Warp</span><span class="chip c-review-needed">● Update available</span></div>
               <div class="rowline">⚡<span class="grow">Gemini CLI</span><span class="chip c-draft">○ Not installed</span></div>
             </div>
             <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
@@ -927,9 +991,9 @@
         </div>
         <div class="card" style="padding:26px;text-align:center">
           <div style="font-size:20px;color:var(--teal);margin-bottom:8px">✓</div>
-          <div style="font-weight:600;font-size:12.5px">No pending changes.</div>
-          <div style="font-size:11.5px;color:var(--muted)">Agents’ edits will appear here.</div>
-          <div class="meta" style="margin-top:10px;font-size:10.5px;color:var(--faint)">Pending — empty</div>
+          <div style="font-weight:600;font-size:12.5px">No changes waiting for review.</div>
+          <div style="font-size:11.5px;color:var(--muted)">Agent edits will appear in Review Center.</div>
+          <div class="meta" style="margin-top:10px;font-size:10.5px;color:var(--faint)">Review Center — empty</div>
         </div>
         <div class="card" style="padding:26px;text-align:center">
           <div style="font-size:20px;color:var(--teal);margin-bottom:8px">✓</div>
@@ -957,13 +1021,207 @@
 <script>
   const nav = document.querySelectorAll('.decknav button');
   const screens = document.querySelectorAll('.screen');
+  const notesStatus = document.getElementById('notes-status');
+  const noteKeyPrefix = 'locality-wireframe-notes:v3:';
+
+  function screenTitle(screen){
+    const title = screen.querySelector('.shead h2')?.textContent?.trim();
+    return title || screen.id;
+  }
+
+  function noteKey(screen){
+    return `${noteKeyPrefix}${screen.id}`;
+  }
+
+  function readNote(screen){
+    try {
+      return localStorage.getItem(noteKey(screen)) || '';
+    } catch {
+      return '';
+    }
+  }
+
+  function saveNote(screen, value){
+    try {
+      localStorage.setItem(noteKey(screen), value);
+      setNotesStatus('notes saved');
+    } catch {
+      setNotesStatus('notes not saved; copy before leaving');
+    }
+  }
+
+  function setNotesStatus(message){
+    notesStatus.textContent = message;
+    clearTimeout(setNotesStatus.timer);
+    setNotesStatus.timer = setTimeout(() => { notesStatus.textContent = ''; }, 2200);
+  }
+
+  function currentScreen(){
+    return document.querySelector('.screen.active') || screens[0];
+  }
+
+  function appNav(active){
+    const items = [
+      ['home', '⌂', 'Home'],
+      ['sources', '◫', 'Sources'],
+      ['review', '●', 'Review Center', '4'],
+      ['settings', '⚙', 'Settings']
+    ];
+    return `
+      <nav class="app-global-nav" aria-label="App navigation">
+        <div class="logo"><span class="aperture"></span>Locality</div>
+        ${items.map(([id, icon, label, count]) => `
+          <a href="#" class="${active === id ? 'on' : ''}">
+            <span>${icon}</span><span>${label}</span>${count ? `<span class="cnt">${count}</span>` : ''}
+          </a>
+        `).join('')}
+        <div class="foot"><span class="chip c-synced">✓</span> Synced · 2m ago</div>
+      </nav>
+    `;
+  }
+
+  function appParentLabel(active){
+    return {
+      home: 'Home',
+      sources: 'Sources',
+      review: 'Review Center',
+      settings: 'Settings'
+    }[active] || 'Home';
+  }
+
+  function directElementAfterToolbar(frame){
+    const toolbar = frame.querySelector(':scope > .tbar');
+    let node = toolbar ? toolbar.nextElementSibling : frame.firstElementChild;
+    return node || null;
+  }
+
+  function appendFrameBody(frame, page){
+    const toolbar = frame.querySelector(':scope > .tbar');
+    const first = toolbar ? toolbar.nextSibling : frame.firstChild;
+    const nodes = [];
+    for (let node = first; node; node = node.nextSibling) nodes.push(node);
+
+    if (frame.dataset.stripLegacySidebar === 'true') {
+      const legacyShell = directElementAfterToolbar(frame);
+      if (legacyShell?.classList.contains('appshell')) {
+        const legacyContent = Array.from(legacyShell.children).find(child => !child.classList.contains('snav'));
+        if (legacyContent) {
+          page.appendChild(legacyContent);
+          legacyShell.remove();
+          return;
+        }
+      }
+    }
+
+    nodes.forEach(node => page.appendChild(node));
+  }
+
+  function enhanceAppShells(){
+    document.querySelectorAll('.frame[data-app-shell]').forEach(frame => {
+      if (frame.dataset.shellEnhanced === 'true') return;
+      const active = frame.dataset.appShell;
+      const shell = document.createElement('div');
+      shell.className = 'final-appshell';
+      const page = document.createElement('div');
+      page.className = 'app-page';
+
+      if (frame.dataset.appKind) {
+        const banner = document.createElement('div');
+        banner.className = 'subpage-banner';
+        const kind = frame.dataset.appKind === 'modal' ? 'Modal' : 'Subpage';
+        banner.innerHTML = `<b>${frame.dataset.appTitle || kind}</b><span>${kind} under ${appParentLabel(active)}</span>`;
+        page.appendChild(banner);
+      }
+
+      appendFrameBody(frame, page);
+      shell.innerHTML = appNav(active);
+      shell.appendChild(page);
+      frame.appendChild(shell);
+      frame.dataset.shellEnhanced = 'true';
+    });
+  }
+
+  function buildTeamNotes(){
+    screens.forEach(screen => {
+      if (screen.querySelector('.team-notes')) return;
+      const panel = document.createElement('section');
+      panel.className = 'team-notes';
+      panel.setAttribute('aria-label', `Team notes for ${screenTitle(screen)}`);
+      panel.innerHTML = `
+        <div class="team-notes-head">
+          <b>Team notes</b>
+          <span>Per-screen notes for design review. Saved locally until copied out.</span>
+        </div>
+        <textarea class="team-note-input" rows="4" placeholder="Add questions, UX concerns, copy ideas, or implementation notes for this screen..."></textarea>
+        <div class="team-note-actions">
+          <small>Tip: copy page notes before sharing a screenshot or opening a PR.</small>
+          <button class="btn btn-sm copy-page-note" type="button">Copy this page</button>
+        </div>
+      `;
+      const textarea = panel.querySelector('.team-note-input');
+      textarea.value = readNote(screen);
+      textarea.addEventListener('input', () => {
+        saveNote(screen, textarea.value);
+      });
+      panel.querySelector('.copy-page-note').addEventListener('click', () => copyScreenNotes(screen));
+      screen.appendChild(panel);
+    });
+  }
+
+  async function copyText(text){
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const fallback = document.createElement('textarea');
+      fallback.value = text;
+      fallback.setAttribute('readonly', '');
+      fallback.style.position = 'fixed';
+      fallback.style.left = '-9999px';
+      document.body.appendChild(fallback);
+      fallback.select();
+      document.execCommand('copy');
+      fallback.remove();
+    }
+  }
+
+  function screenNotesMarkdown(screen){
+    const textarea = screen.querySelector('.team-note-input');
+    const body = textarea?.value.trim() || '_No team notes yet._';
+    return `## ${screenTitle(screen)}\n\n${body}`;
+  }
+
+  async function copyScreenNotes(screen){
+    await copyText(screenNotesMarkdown(screen));
+    setNotesStatus(`copied notes for ${screenTitle(screen)}`);
+  }
+
+  async function copyAllNotes(){
+    const notes = [...screens]
+      .map(screenNotesMarkdown)
+      .join('\n\n---\n\n');
+    await copyText(`# Locality desktop wireframe notes\n\n${notes}`);
+    setNotesStatus('copied all notes');
+  }
+
+  enhanceAppShells();
+  buildTeamNotes();
+
   function show(id){
     screens.forEach(s => s.classList.toggle('active', s.id === id));
     nav.forEach(b => b.setAttribute('aria-current', b.dataset.s === id ? 'true' : 'false'));
     document.querySelector('.stage').scrollTop = 0;
     window.scrollTo({top:0});
+    setNotesStatus('');
   }
   nav.forEach(b => b.addEventListener('click', () => show(b.dataset.s)));
+  document.getElementById('toggle-design-notes').addEventListener('click', e => {
+    document.body.classList.toggle('hide-design-notes');
+    e.currentTarget.textContent = document.body.classList.contains('hide-design-notes')
+      ? 'Show design notes'
+      : 'Hide design notes';
+  });
+  document.getElementById('copy-current-notes').addEventListener('click', () => copyScreenNotes(currentScreen()));
+  document.getElementById('copy-all-notes').addEventListener('click', copyAllNotes);
   document.addEventListener('keydown', e => {
     if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
     if (/input|textarea/i.test(document.activeElement.tagName)) return;
