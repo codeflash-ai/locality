@@ -3035,17 +3035,19 @@ where
         return Ok(AutoFastForwardQueueDecision::Skip);
     }
 
-    let now = freshness_timestamp();
-    if let Some(next_eligible_at) = active_lease_until(&freshness, &now) {
-        return Ok(AutoFastForwardQueueDecision::Delay(
-            SyncJob::new(
-                request.mount_id.clone(),
-                Some(request.remote_id.clone()),
-                SyncJobKind::ObserveEntity,
-                ChangeHintKind::RemoteMaybeChanged,
-            )
-            .next_eligible_at(next_eligible_at),
-        ));
+    if request.reason != HydrationReason::LiveModeRemoteFastForward {
+        let now = freshness_timestamp();
+        if let Some(next_eligible_at) = active_lease_until(&freshness, &now) {
+            return Ok(AutoFastForwardQueueDecision::Delay(
+                SyncJob::new(
+                    request.mount_id.clone(),
+                    Some(request.remote_id.clone()),
+                    SyncJobKind::ObserveEntity,
+                    ChangeHintKind::RemoteMaybeChanged,
+                )
+                .next_eligible_at(next_eligible_at),
+            ));
+        }
     }
 
     Ok(AutoFastForwardQueueDecision::Queue)

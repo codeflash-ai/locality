@@ -1971,6 +1971,40 @@ fn runtime_remote_fast_forward_request_uses_daemon_hydration_queue() {
 }
 
 #[test]
+fn runtime_live_mode_remote_fast_forward_request_bypasses_recent_open_delay() {
+    let config = relay_config("remote-fast-forward-request-active");
+    let mount_root = temp_root("remote-fast-forward-request-active-mount");
+    seed_clean_remote_changed_page(&config.state_root, &mount_root);
+    mark_page_recently_opened(&config.state_root);
+    let (hydrated_tx, hydrated_rx) = mpsc::channel();
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        AutoFastForwardRunner {
+            hydrated: hydrated_tx,
+        },
+    )
+    .expect("spawn runtime");
+
+    let response = runtime.handle().request(DaemonRequest::RemoteFastForward {
+        mount_id: "notion-main".to_string(),
+        remote_id: "page-1".to_string(),
+        path: PathBuf::from("Roadmap.md"),
+    });
+
+    assert!(
+        response.ok,
+        "remote fast-forward request failed: {response:?}"
+    );
+    let request = hydrated_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("live mode remote fast-forward hydration drained");
+    assert_eq!(request.mount_id, MountId::new("notion-main"));
+    assert_eq!(request.remote_id, RemoteId::new("page-1"));
+    assert_eq!(request.reason, HydrationReason::LiveModeRemoteFastForward);
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_queues_child_refresh_when_remote_fast_forward_discovers_child_link_diff() {
     let config = relay_config("remote-fast-forward-discovery");
     let mount_root = temp_root("remote-fast-forward-discovery-mount");

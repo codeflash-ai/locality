@@ -1796,6 +1796,22 @@ where
         };
     }
 
+    let remote_only_pending_targets = match live_mode_remote_only_pending_targets(snapshot) {
+        Ok(targets) => targets,
+        Err(message) => return ActionReport { ok: false, message },
+    };
+    if !remote_only_pending_targets.is_empty() {
+        for target in &remote_only_pending_targets {
+            if let Err(message) = fast_forward_remote_target(target) {
+                return ActionReport { ok: false, message };
+            }
+        }
+        return ActionReport {
+            ok: true,
+            message: live_mode_queued_remote_updates_message(remote_only_pending_targets.len()),
+        };
+    }
+
     let Some(change) = snapshot.pending_changes.first() else {
         if !remote_pull_targets.is_empty() {
             for target in remote_pull_targets {
@@ -1805,15 +1821,7 @@ where
             }
             return ActionReport {
                 ok: true,
-                message: format!(
-                    "Live Mode queued {} remote {}.",
-                    remote_pull_targets.len(),
-                    if remote_pull_targets.len() == 1 {
-                        "update"
-                    } else {
-                        "updates"
-                    }
-                ),
+                message: live_mode_queued_remote_updates_message(remote_pull_targets.len()),
             };
         }
 
@@ -1829,21 +1837,6 @@ where
     .unwrap_or_else(|_| PathBuf::from(&change.local_path));
 
     if change.state != "safe" {
-        if live_mode_change_is_remote_update_only(change) {
-            let target = match live_mode_remote_target_for_pending_change(change, &target) {
-                Ok(target) => target,
-                Err(message) => return ActionReport { ok: false, message },
-            };
-            match fast_forward_remote_target(&target) {
-                Ok(()) => {
-                    return ActionReport {
-                        ok: true,
-                        message: "Live Mode queued 1 remote update.".to_string(),
-                    };
-                }
-                Err(message) => return ActionReport { ok: false, message },
-            }
-        }
         if live_mode_change_may_merge_remote_drift(change) {
             match merge_remote_drift(change, &target) {
                 Ok(LiveModeRemoteDriftMerge::Clean) => {
@@ -1888,12 +1881,42 @@ where
     }
 }
 
+fn live_mode_remote_only_pending_targets(
+    snapshot: &DesktopSnapshot,
+) -> Result<Vec<LiveModeRemoteTarget>, String> {
+    let mut targets = Vec::new();
+    for change in &snapshot.pending_changes {
+        if !live_mode_change_is_remote_update_only(change) {
+            continue;
+        }
+        let target_path = expand_tilde(&join_mount_path(
+            &snapshot.mount.local_path,
+            &change.local_path,
+        ))
+        .unwrap_or_else(|_| PathBuf::from(&change.local_path));
+        targets.push(live_mode_remote_target_for_pending_change(
+            change,
+            &target_path,
+        )?);
+    }
+    Ok(targets)
+}
+
+fn live_mode_queued_remote_updates_message(count: usize) -> String {
+    format!(
+        "Live Mode queued {count} remote {}.",
+        if count == 1 { "update" } else { "updates" }
+    )
+}
+
 fn live_mode_change_is_remote_update_only(change: &PendingChange) -> bool {
-    change.state == "needs_review"
-        && change
-            .issue_codes
-            .iter()
-            .any(|code| code == "remote_changed")
+    matches!(
+        change.state.as_str(),
+        "needs_review" | "remote_update_available"
+    ) && change
+        .issue_codes
+        .iter()
+        .any(|code| code == "remote_changed")
 }
 
 fn live_mode_remote_target_for_pending_change(
@@ -2468,7 +2491,18 @@ fn live_mode_queue_remote_fast_forward(target: &LiveModeRemoteTarget) -> Result<
         mount_id: target.mount_id.0.clone(),
         remote_id: target.remote_id.0.clone(),
         path: target.path.clone(),
-    })
+    })?;
+    desktop_log(
+        "info",
+        "live_mode_remote_fast_forward_queued",
+        format!(
+            "queued remote fast-forward for `{}` ({}/{})",
+            target.path.display(),
+            target.mount_id.as_str(),
+            target.remote_id.as_str()
+        ),
+    );
+    Ok(())
 }
 
 fn live_mode_send_daemon_queue_request(request: DaemonRequest) -> Result<(), String> {
@@ -10791,7 +10825,7 @@ mod tests {
             title: "Remote Page".to_string(),
             local_path: "Teamspace/Remote Page/page.md".to_string(),
             summary: "remote update available".to_string(),
-            state: "needs_review".to_string(),
+            state: "remote_update_available".to_string(),
             issue_codes: vec!["remote_changed".to_string()],
             live_mode: sample_live_mode_status(true),
         }];
@@ -10802,6 +10836,52 @@ mod tests {
             &[live_mode_target(
                 "/tmp/Locality/notion/another-page/page.md",
             )],
+            |_, _| panic!("remote-only change should not run a local push"),
+            |target| {
+                pulled.push(target.clone());
+                Ok(())
+            },
+            |_, _| panic!("remote-only change should not merge local drift"),
+        );
+
+        assert!(report.ok);
+        assert_eq!(report.message, "Live Mode queued 1 remote update.");
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].mount_id, MountId::new("notion-main"));
+        assert_eq!(pulled[0].remote_id, RemoteId::new("remote-page"));
+        assert!(pulled[0].path.ends_with("Teamspace/Remote Page/page.md"));
+    }
+
+    #[test]
+    fn live_mode_tick_queues_remote_only_pending_change_before_review_work() {
+        let mut snapshot = sample_snapshot();
+        snapshot.pending_changes = vec![
+            PendingChange {
+                mount_id: "notion-main".to_string(),
+                entity_id: "local-review-page".to_string(),
+                title: "Local Review Page".to_string(),
+                local_path: "Teamspace/Local Review Page/page.md".to_string(),
+                summary: "needs review: large deletion".to_string(),
+                state: "needs_review".to_string(),
+                issue_codes: vec!["large_deletion".to_string()],
+                live_mode: sample_live_mode_status(true),
+            },
+            PendingChange {
+                mount_id: "notion-main".to_string(),
+                entity_id: "remote-page".to_string(),
+                title: "Remote Page".to_string(),
+                local_path: "Teamspace/Remote Page/page.md".to_string(),
+                summary: "remote update available".to_string(),
+                state: "needs_review".to_string(),
+                issue_codes: vec!["remote_changed".to_string()],
+                live_mode: sample_live_mode_status(true),
+            },
+        ];
+        let mut pulled = Vec::new();
+
+        let report = live_mode_tick_from_snapshot(
+            &snapshot,
+            &[],
             |_, _| panic!("remote-only change should not run a local push"),
             |target| {
                 pulled.push(target.clone());
