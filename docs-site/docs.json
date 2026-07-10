@@ -3,6 +3,14 @@
   "theme": "luma",
   "name": "Locality",
   "description": "Locality mounts apps like Notion and Google Docs as local files for humans, editors, and agents.",
+  "logo": {
+    "light": "/images/locality-logo-light.svg",
+    "dark": "/images/locality-logo-dark.svg"
+  },
+  "favicon": {
+    "light": "/images/locality-mark-light.svg",
+    "dark": "/images/locality-mark-dark.svg"
+  },
   "colors": {
     "primary": "#0F766E",
     "light": "#14B8A6",
@@ -13,6 +21,11 @@
   },
   "navbar": {
     "links": [
+      {
+        "label": "Website",
+        "href": "https://www.locality.dev/",
+        "icon": "globe"
+      },
       {
         "label": "GitHub",
         "href": "https://github.com/codeflash-ai/locality",
@@ -90,6 +103,10 @@
       {
         "label": "Product",
         "items": [
+          {
+            "label": "Website",
+            "href": "https://www.locality.dev/"
+          },
           {
             "label": "Install",
             "href": "/install"
