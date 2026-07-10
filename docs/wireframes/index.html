@@ -416,34 +416,61 @@
       <div class="notes"><b>states</b> — error: “We couldn’t connect. [Try again]” · success: card shows workspace
       avatar + name + Synced-teal “Connected ✓”, Continue enables · copy-link is the no-browser fallback.</div>
     </section>
-    <!-- ============ 1.4 READY ============ -->
+    <!-- ============ 1.4 FOLDER ============ -->
     <section class="screen" id="ob4">
-      <div class="shead"><h2>Onboarding · Ready</h2><span class="route">step 4 / 4</span></div>
-      <p class="sdesc">Hand-off to agents: the path, the promise, and agent-guidance install. The old education step lives here as a disclosure.</p>
+      <div class="shead"><h2>Onboarding · Local folder</h2><span class="route">step 4 / 5</span></div>
+      <p class="sdesc">Show where files appear and keep setup progress, approval waits, and recovery actions on this screen only.</p>
       <div class="frame">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup</span>
-          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></div></div>
+          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i></i></div></div>
+        <div style="padding:26px 36px 30px;max-width:620px">
+          <div style="font-size:17px;font-weight:600;margin-bottom:14px">Create your local folder</div>
+          <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Your connected source will appear here:</div>
+          <div class="pathchip"><span>~/Library/CloudStorage/Locality/notion</span><em>Copy</em></div>
+          <div style="margin:6px 0 18px"><span class="linkish">Choose a different location…</span></div>
+
+          <div class="h-min">Verifying setup</div>
+          <div class="card">
+            <div class="rowline"><span class="chip c-synced">✓</span><span class="grow">Folder created</span></div>
+            <div class="rowline"><span class="chip c-synced">✓</span><span class="grow">File Provider registered</span></div>
+            <div class="rowline"><span class="chip c-review">⟳</span><span class="grow">Waiting for test file to appear…</span></div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:22px">
+            <span class="btn" data-go="ob3">Back</span><span class="btn btn-primary" data-go="ob5">Continue →</span>
+          </div>
+          <div style="font-size:11px;color:var(--faint);margin-top:10px">Use this step for approval-required, waiting-for-folder, and retry-needed states.</div>
+        </div>
+      </div>
+      <div class="notes"><b>error state</b> — a failed check swaps to ✕ Error red with a fix action:
+      “File Provider not approved → [Open System Settings]” · keep all setup and recovery states on this screen.</div>
+    </section>
+
+    <!-- ============ 1.5 READY ============ -->
+    <section class="screen" id="ob5">
+      <div class="shead"><h2>Onboarding · Ready</h2><span class="route">step 5 / 5</span></div>
+      <p class="sdesc">Completion handoff: mounted path, agent-ready promise, and next action into the product.</p>
+      <div class="frame">
+        <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup</span>
+          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></div></div>
         <div style="padding:28px 36px 30px;max-width:620px">
           <div style="display:flex;align-items:center;gap:8px;font-size:17px;font-weight:600;margin-bottom:16px">
             <span class="chip c-synced" style="font-size:13px">✓</span> Locality is ready</div>
-          <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Point your coding agent at:</div>
+          <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Your local workspace is mounted here:</div>
           <div class="pathchip"><span>~/Library/CloudStorage/Locality/notion</span><em>Copy</em></div>
-          <div style="font-size:11.5px;color:var(--muted);margin:6px 0 16px">Edits show up in Review Center for your approval.</div>
+          <div style="font-size:11.5px;color:var(--muted);margin:6px 0 16px">Agents can open this folder now, and Locality will hold their edits for review.</div>
           <div class="card" style="padding:12px 14px">
-            <div style="font-weight:600;font-size:12.5px">⚡ Install agent guidance</div>
+            <div style="font-weight:600;font-size:12.5px">⚡ Agent guidance installed</div>
             <div style="font-size:11.5px;color:var(--muted);margin:4px 0 10px">
-              Detected: Claude Code · Cursor · Warp · Gemini CLI<br>
-              Writes skill and config files so agents know the filesystem contract.</div>
-            <span class="btn btn-sm" data-go="agents">Install guidance</span>
+              Claude Code · Cursor · Warp · Gemini CLI can learn the filesystem contract from guidance files inside the mount.</div>
+            <span class="btn btn-sm">Copy sample prompt</span>
           </div>
-          <div style="margin:14px 0 20px;font-size:12px"><span class="linkish">▸ How agents use Locality</span></div>
-          <div style="display:flex;justify-content:flex-end;gap:8px">
+          <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:20px">
             <span class="btn" data-go="files">Open my folder</span><span class="btn btn-primary" data-go="home">Open Locality →</span>
           </div>
         </div>
       </div>
-      <div class="notes"><b>notes</b> — guidance install shows a per-agent result list after running ·
-      disclosure holds the folder/markdown demo from the old step 2.</div>
+      <div class="notes"><b>handoff</b> — keep this screen about readiness, not setup progress ·
+      the old education disclosure should not reappear here now that step 2 owns that job.</div>
     </section>
 
     <!-- ============ 2.1 HOME ============ -->
