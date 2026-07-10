@@ -3,7 +3,7 @@ title: "Filesystem model"
 description: "Understand how app objects become folders, Markdown files, stubs, schemas, and pending changes."
 ---
 
-Locality is built around one rule: if a task can be expressed as a file operation, the product should make that the natural path.
+Locality is built around one rule: when a task can be expressed as a file operation, the file operation is the natural path.
 
 ## Notion shape
 
@@ -87,7 +87,7 @@ Preserve existing Locality frontmatter unless the task is explicitly about ident
 
 ## Stubs and hydration
 
-Large workspaces should not require a full first sync. Locality can list many objects before every body is downloaded.
+Large workspaces do not require a full first sync. Locality can list many objects before every body is downloaded.
 
 - **stub**: Locality knows the object exists, but the body is not ready locally;
 - **hydrated**: `page.md` content is available and tracked;

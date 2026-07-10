@@ -5,7 +5,7 @@
 ## Read first
 
 - [Overview](overview.mdx): Product model, core surfaces, and safety model.
-- [Install Locality](install.mdx): OS-specific install paths, GitHub release assets, verification, and updates.
+- [Install Locality](install.mdx): OS-specific GitHub release assets, verification, and updates.
 - [Quickstart](quickstart.mdx): Install, connect, mount, edit, diff, and push.
 - [Filesystem model](filesystem-model.mdx): How pages, databases, documents, stubs, media, and frontmatter map to files.
 

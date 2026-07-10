@@ -119,7 +119,7 @@ make test-release-notes
 
 ## Docs development
 
-The published docs use Mintlify from the repository's `docs-site/` directory. Internal engineering notes stay in `docs/`.
+The docs source uses Mintlify from the repository's `docs-site/` directory. Internal engineering notes stay in `docs/`.
 
 Preview from an isolated docs workspace:
 
@@ -133,7 +133,7 @@ Validate before committing:
 make docs-validate
 ```
 
-CI runs the same validation for docs-related pull requests:
+CI runs the same validation for docs-related pull requests. It does not publish the docs site:
 
 ```bash
 make docs-validate

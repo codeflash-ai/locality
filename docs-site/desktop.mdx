@@ -5,39 +5,35 @@ description: "Use the Locality desktop app for onboarding, mounts, files, pendin
 
 The desktop app is the fastest path for humans. It handles connection setup, workspace mounting, Finder access, pending changes, and Live Mode.
 
-<Note>
-  Placeholder for desktop walkthrough video: connect Notion, open the mounted folder, locate a page, review pending changes, and toggle Live Mode for one file.
-</Note>
-
 ## First run
 
-The intended first session is:
+The first-run flow guides the user through the same core setup path:
 
 <Steps>
-  <Step title="Connect a source">
+  <Step title="Connect Notion">
     Start with Notion. OAuth opens in the browser and lets you choose the pages or workspace content Locality can access.
   </Step>
-  <Step title="Create a mount">
-    Locality creates a local folder for the connected workspace and registers the native file provider when needed.
+  <Step title="Create or verify the local folder">
+    Locality prepares the local workspace folder and registers the native file provider when that projection mode is used.
   </Step>
   <Step title="Open the folder">
-    The primary action is opening the mounted folder. From there, files are available to Finder, editors, terminals, and agents.
+    The app shows the mounted folder path and opens it for Finder, editors, terminals, and agents.
   </Step>
   <Step title="Find one file">
-    Paste a Notion URL or search by title/path. Locality should make the target local path ready instead of waiting for a full workspace sync.
+    Paste a Notion URL or search by title/path to find the local `page.md` path.
   </Step>
 </Steps>
 
 ## Home
 
-Home should answer four questions:
+Home shows the daily workspace state:
 
-- which sources are connected;
-- which folders are mounted;
-- which files need attention;
-- where to paste a page URL or search for a file.
+- connected source state;
+- mounted folder state;
+- pending files that need attention;
+- a place to paste a page URL or search for a file.
 
-The most useful actions are:
+Common actions are:
 
 - open mounted folder;
 - copy path;
@@ -52,13 +48,13 @@ Mounts and Files are closely related, but they answer different jobs.
 - **Mounts** are connected workspaces and their local roots.
 - **Files** are the current local targets a user or agent may work on.
 
-The clean product path is to keep mount setup small and make file access prominent: recent files, searched files, copied paths, pending files, and conflicted files should be easy to reach from the same area.
+Use Mounts when you need the inventory of registered roots. Use Files when you need current paths, recent files, search results, pending files, or conflicted files.
 
 ## Pending changes
 
 Pending changes are local edits that can affect the remote app.
 
-The desktop pending screen should make the next action obvious:
+The desktop pending screen provides actions for:
 
 - review plan;
 - push safe changes;
@@ -67,7 +63,7 @@ The desktop pending screen should make the next action obvious:
 - open file;
 - copy path.
 
-Avoid presenting `undo` as a general safety button after a push. Use `undo push` only where journal-backed remote undo is actually available and still relevant.
+`undo` is not a general safety button after a push. Use CLI journal undo only when the target push has a journal-backed reverse plan that still applies.
 
 ## Live Mode
 
