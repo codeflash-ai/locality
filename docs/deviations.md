@@ -19,11 +19,11 @@ None.
 - Desktop mount creation currently creates the requested local folder only.
   Workspace-level Notion mounting still needs a core mount API that can mount an
   entire authorized workspace rather than requiring `--root-page`.
-- The native Tauri tray now opens an initial rich popover window using the
-  confirmed clean Aperture icon, refreshes its snapshot when opened, switches to
-  amber/red badged icons only for review or reconnect states, and keeps the
-  native menu for secondary actions. Exact native popover positioning polish
-  remains to be implemented.
+- The native Tauri tray now opens an initial rich popover window using the short
+  Locality mark, refreshes its snapshot when opened, switches to amber/red
+  badged icons only for review or reconnect states, and keeps the native menu
+  for secondary actions. Exact native popover positioning polish remains to be
+  implemented.
 - Desktop push review currently pushes the first pending file through the shared
   Rust push path after the user approves the review. A multi-file review/apply
   loop should batch or sequence all selected pending changes.
