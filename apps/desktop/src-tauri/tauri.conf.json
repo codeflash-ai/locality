@@ -30,7 +30,7 @@
     "category": "Productivity",
     "shortDescription": "Mount workspaces as local files for agents.",
     "longDescription": "Locality lets agents edit connected workspaces through local files while keeping remote writes reviewable.",
-    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "icon": ["icons/icon.icns", "icons/icon.png", "icons/icon.ico"],
     "macOS": {
       "minimumSystemVersion": "14.0",
       "signingIdentity": "-",
