@@ -109,6 +109,9 @@ jobs:
     name: Build and publish Linux x64
     needs: release-preflight
     runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: https://codeflash-ai.github.io/locality
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       PUBLISH_CHANNEL: release
@@ -299,5 +302,6 @@ jobs:
           path: target/release/linux-repo
 
       - name: Deploy Linux package repositories
+        id: deployment
         if: env.PRERELEASE != 'true'
         uses: actions/deploy-pages@v4
