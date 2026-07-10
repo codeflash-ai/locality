@@ -7,6 +7,7 @@ BUILD_ROOT="${ROOT}/.build/dev-bundle"
 APP="${BUILD_ROOT}/Locality.app"
 APPEX="${APP}/Contents/PlugIns/LocalityFileProvider.appex"
 MOUNT_LOGO_ICNS="${REPO_ROOT}/apps/desktop/src-tauri/icons/locality-mount-logo.icns"
+MOUNT_LOGO_SVG="${REPO_ROOT}/apps/desktop/src-tauri/icons/locality-mount-logo.svg"
 ARCH="$(uname -m)"
 TARGET="${ARCH}-apple-macos14.0"
 SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
@@ -23,6 +24,8 @@ cp "${ROOT}/App/Locality.Info.plist" "${APP}/Contents/Info.plist"
 cp "${ROOT}/App/LocalityFileProvider.Info.plist" "${APPEX}/Contents/Info.plist"
 cp "${MOUNT_LOGO_ICNS}" "${APP}/Contents/Resources/locality-mount-logo.icns"
 cp "${MOUNT_LOGO_ICNS}" "${APPEX}/Contents/Resources/locality-mount-logo.icns"
+cp "${MOUNT_LOGO_SVG}" "${APP}/Contents/Resources/locality-mount-logo.svg"
+cp "${MOUNT_LOGO_SVG}" "${APPEX}/Contents/Resources/locality-mount-logo.svg"
 
 swiftc \
   -target "${TARGET}" \

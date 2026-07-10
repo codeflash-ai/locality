@@ -20,6 +20,8 @@
 			<array>
 				<string>locality-mount-logo</string>
 			</array>
+			<key>CFBundleSymbolName</key>
+			<string>locality-mount-logo</string>
 		</dict>
 	</dict>
 	<key>CFBundleIdentifier</key>
