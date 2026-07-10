@@ -349,13 +349,46 @@
       "safely" is the thesis word: repeated in review-mode copy · secondary link handles reinstall/repair users.</div>
     </section>
 
-    <!-- ============ 1.2 CONNECT ============ -->
+    <!-- ============ 1.2 HOW AGENTS USE IT ============ -->
     <section class="screen" id="ob2">
-      <div class="shead"><h2>Onboarding · Connect a source</h2><span class="route">step 2 / 4</span></div>
+      <div class="shead"><h2>Onboarding · How agents use it</h2><span class="route">step 2 / 5</span></div>
+      <p class="sdesc">Teach the filesystem-first model before connection. Agents work in visible folders, Locality writes guidance, and changes stay local until review.</p>
+      <div class="frame">
+        <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup</span>
+          <div class="steps"><i class="on"></i><i class="on"></i><i></i><i></i><i></i></div></div>
+        <div style="padding:28px 36px 32px">
+          <div style="font-size:17px;font-weight:600">Agents work in files you can see</div>
+          <p style="color:var(--muted);margin:4px 0 18px">Each connected source appears as a local folder. Locality adds guidance files like AGENTS.md and CLAUDE.md so agents follow the filesystem contract, and edits stay local until you review them.</p>
+          <div style="display:grid;grid-template-columns:1.05fr .95fr;gap:14px;max-width:620px">
+            <div class="card" style="padding:14px">
+              <div class="card-h">Visible local workspace</div>
+              <div class="rowline"><span class="grow">notion-main/AGENTS.md</span><span class="chip c-synced">Guide</span></div>
+              <div class="rowline"><span class="grow">Roadmap/page.md</span><span class="chip c-review">Edited</span></div>
+              <div class="rowline"><span class="grow">Launch Plan/page.md</span><span class="chip c-synced">Synced</span></div>
+            </div>
+            <div class="card" style="padding:14px">
+              <div style="font-weight:600;font-size:12.5px;margin-bottom:8px">What Locality does</div>
+              <div class="check on"><i>✓</i><div><b style="font-size:12px">Keeps files visible</b><small>Agents and humans work in the same folder.</small></div></div>
+              <div class="check on"><i>✓</i><div><b style="font-size:12px">Writes guidance</b><small>Agents see the filesystem contract inside the mount.</small></div></div>
+              <div class="check on"><i>✓</i><div><b style="font-size:12px">Holds changes for review</b><small>Nothing syncs back until you approve it.</small></div></div>
+            </div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:26px">
+            <span class="btn" data-go="ob1">Back</span><span class="btn btn-primary" data-go="ob3">Continue →</span>
+          </div>
+        </div>
+      </div>
+      <div class="notes"><b>goal</b> — add the app-like educational pause without changing the deck's visual system ·
+      this screen teaches the folder contract before any source authorization happens.</div>
+    </section>
+
+    <!-- ============ 1.3 CONNECT ============ -->
+    <section class="screen" id="ob3">
+      <div class="shead"><h2>Onboarding · Connect a source</h2><span class="route">step 3 / 5</span></div>
       <p class="sdesc">Connector cards scale as new sources ship. OAuth runs in the system browser; the step shows waiting, error, and connected states inline.</p>
       <div class="frame">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup</span>
-          <div class="steps"><i class="on"></i><i class="on"></i><i></i><i></i></div></div>
+          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i></div></div>
         <div style="padding:28px 36px 32px">
           <div style="font-size:17px;font-weight:600">Connect a source</div>
           <p style="color:var(--muted);margin:4px 0 18px">Locality only reads and writes the pages you authorize.</p>
@@ -363,7 +396,7 @@
             <div class="card" style="padding:14px">
               <div style="display:flex;gap:8px;align-items:center;font-weight:600"><span class="src src-n">N</span>Notion</div>
               <p style="color:var(--muted);font-size:11.5px;margin:6px 0 12px">Workspaces, pages, databases</p>
-              <span class="btn btn-primary btn-sm" data-go="ob3">Connect</span>
+              <span class="btn btn-primary btn-sm" data-go="ob4">Connect</span>
             </div>
             <div class="card" style="padding:14px;opacity:.55">
               <div style="display:flex;gap:8px;align-items:center;font-weight:600"><span class="src src-g">G</span>Google Docs</div>
@@ -373,52 +406,16 @@
           </div>
           <div style="display:flex;gap:8px;align-items:center;margin-top:18px;color:var(--muted);font-size:12px">
             <span class="chip c-review">⟳ waiting</span> Waiting for authorization in your browser…
-            <span class="btn btn-sm" data-go="ob2">Reopen browser</span><span class="linkish">Copy sign-in link</span>
+            <span class="btn btn-sm" data-go="ob3">Reopen browser</span><span class="linkish">Copy sign-in link</span>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:26px">
-            <span class="btn" data-go="ob1">Back</span><span class="btn btn-primary" style="opacity:.5" data-go="ob3">Continue →</span>
+            <span class="btn" data-go="ob2">Back</span><span class="btn btn-primary" style="opacity:.5" data-go="ob4">Continue →</span>
           </div>
         </div>
       </div>
       <div class="notes"><b>states</b> — error: “We couldn’t connect. [Try again]” · success: card shows workspace
       avatar + name + Synced-teal “Connected ✓”, Continue enables · copy-link is the no-browser fallback.</div>
     </section>
-
-    <!-- ============ 1.3 FOLDER ============ -->
-    <section class="screen" id="ob3">
-      <div class="shead"><h2>Onboarding · Local folder + sync mode</h2><span class="route">step 3 / 4</span></div>
-      <p class="sdesc">Full path shown in a copy-on-click PathChip. Google-Drive-style two-option sync decision. Live verification checklist with per-check fix actions.</p>
-      <div class="frame">
-        <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup</span>
-          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></div></div>
-        <div style="padding:26px 36px 30px;max-width:620px">
-          <div style="font-size:17px;font-weight:600;margin-bottom:14px">Create your local folder</div>
-          <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Your Notion workspace will appear here:</div>
-          <div class="pathchip"><span>~/Library/CloudStorage/Locality/notion</span><em>Copy</em></div>
-          <div style="margin:6px 0 18px"><span class="linkish">Choose a different location…</span></div>
-
-          <div class="h-min">How should changes sync?</div>
-          <div class="radio on"><i></i><div><b style="font-size:12px">Review mode</b> <span class="chip c-synced">recommended</span>
-            <small>Agent edits wait in Review Center until you approve and push. Nothing reaches Notion without your approval.</small></div></div>
-          <div class="radio"><i></i><div><b style="font-size:12px">Live mode</b>
-            <small>Conservative background sync. Locality still pauses for conflicts, deletions, and review-required work.</small></div></div>
-          <div style="font-size:11px;color:var(--faint);margin:4px 0 18px">You can change this per-source or per-file later.</div>
-
-          <div class="h-min">Verifying setup</div>
-          <div class="card">
-            <div class="rowline"><span class="chip c-synced">✓</span><span class="grow">Folder created</span></div>
-            <div class="rowline"><span class="chip c-synced">✓</span><span class="grow">File Provider registered</span></div>
-            <div class="rowline"><span class="chip c-review">⟳</span><span class="grow">Waiting for test file to appear…</span></div>
-          </div>
-          <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:22px">
-            <span class="btn" data-go="ob2">Back</span><span class="btn btn-primary" data-go="ob4">Continue →</span>
-          </div>
-        </div>
-      </div>
-      <div class="notes"><b>error state</b> — a failed check swaps to ✕ Error red with a fix action:
-      “File Provider not approved → [Open System Settings]” · Continue disabled until all checks pass.</div>
-    </section>
-
     <!-- ============ 1.4 READY ============ -->
     <section class="screen" id="ob4">
       <div class="shead"><h2>Onboarding · Ready</h2><span class="route">step 4 / 4</span></div>
