@@ -79,6 +79,8 @@ import {
   updateStatusLabel,
   type UpdateStatus,
 } from "./updater";
+import localityShortDarkUrl from "./assets/brand/locality-short-dark.svg";
+import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
 
 const distributionChannel = (import.meta.env.VITE_LOCALITY_DISTRIBUTION_CHANNEL || "direct").toLowerCase();
 const appStoreDistribution = distributionChannel === "mas";
@@ -2028,7 +2030,7 @@ function MainShell({
       <div className="app-shell">
         <aside className="sidebar">
           <div className="sidebar-brand">
-            <ApertureIcon />
+            <LocalityLogo surface="light" />
             <strong>Locality</strong>
           </div>
           <nav>
@@ -4118,7 +4120,7 @@ function TrayPopover({
     <main className="tray-popover">
       <header className="tray-header">
         <div className="tray-title">
-          <ApertureIcon state={healthIconState(snapshot.health.state)} />
+          <LocalityLogo surface="light" state={healthIconState(snapshot.health.state)} />
           <strong>Locality</strong>
         </div>
         <StatusPill
@@ -5362,7 +5364,7 @@ function BrandTile({
       {variant === "folder" && <FolderOpen />}
       {variant === "progress" && <Loader2 />}
       {variant === "ready" && <Check />}
-      {!variant && (children ? <span className="brand-word">{children}</span> : <ApertureIcon />)}
+      {!variant && (children ? <span className="brand-word">{children}</span> : <LocalityLogo surface="light" />)}
       {variant === "notion" && children}
     </div>
   );
@@ -5501,16 +5503,18 @@ function StatusPill({
   );
 }
 
-function ApertureIcon({ state = "default" }: { state?: "default" | "review" | "reconnect" }) {
+function LocalityLogo({
+  surface,
+  state = "default",
+}: {
+  surface: "light" | "dark";
+  state?: "default" | "review" | "reconnect";
+}) {
+  const logoUrl = surface === "dark" ? localityShortLightUrl : localityShortDarkUrl;
+
   return (
-    <span className={`aperture-icon ${state}`}>
-      <svg aria-hidden="true" viewBox="0 0 28 18">
-        <path d="M7 14.4 4.5 9 7 3.6" />
-        <path d="M21 3.6 23.5 9 21 14.4" />
-        <path d="M9.5 5.7h9" />
-        <path d="M9.5 12.3h9" />
-        <path d="M12 9h4" />
-      </svg>
+    <span className={`locality-logo ${state}`} aria-hidden="true">
+      <img src={logoUrl} alt="" draggable="false" />
       {state !== "default" && <i />}
     </span>
   );

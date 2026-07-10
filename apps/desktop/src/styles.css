@@ -503,15 +503,9 @@ p {
   white-space: nowrap;
 }
 
-.brand-tile .aperture-icon {
-  width: 36px;
-  height: 24px;
-}
-
-.brand-tile .aperture-icon svg {
-  width: 29px;
-  height: 19px;
-  overflow: hidden;
+.brand-tile .locality-logo {
+  width: 38px;
+  height: 40px;
 }
 
 .brand-tile.notion {
@@ -3079,31 +3073,24 @@ p {
   color: var(--red);
 }
 
-.aperture-icon {
+.locality-logo {
   position: relative;
   display: inline-grid;
   place-items: center;
   width: 34px;
-  height: 23px;
-  border-radius: 7px;
+  height: 34px;
+  border-radius: 8px;
 }
 
-.aperture-icon svg {
-  width: 27px;
-  height: 18px;
-  color: #151c27;
-  overflow: visible;
+.locality-logo img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  user-select: none;
 }
 
-.aperture-icon path {
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 2.25;
-}
-
-.aperture-icon i {
+.locality-logo i {
   position: absolute;
   top: 2px;
   right: 0;
@@ -3113,12 +3100,17 @@ p {
   border-radius: 50%;
 }
 
-.aperture-icon.review i {
+.locality-logo.review i {
   background: var(--amber);
 }
 
-.aperture-icon.reconnect i {
+.locality-logo.reconnect i {
   background: var(--red);
+}
+
+.tray-title .locality-logo {
+  width: 28px;
+  height: 30px;
 }
 
 .muted-panel {

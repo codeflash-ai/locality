@@ -3963,22 +3963,8 @@ fn tray_tooltip(snapshot: &DesktopSnapshot) -> String {
 fn tray_icon_image(state: TrayVisualState) -> Image<'static> {
     let size = 36;
     let mut rgba = vec![0; size * size * 4];
-    let paths = [
-        ((8.6, 26.8), (5.8, 18.0)),
-        ((5.8, 18.0), (8.6, 9.2)),
-        ((27.4, 9.2), (30.2, 18.0)),
-        ((30.2, 18.0), (27.4, 26.8)),
-        ((11.8, 13.0), (24.2, 13.0)),
-        ((11.8, 23.0), (24.2, 23.0)),
-        ((15.1, 18.0), (20.9, 18.0)),
-    ];
-
-    for (start, end) in paths {
-        draw_line(&mut rgba, size, start, end, 5.2, [255, 255, 255, 255]);
-    }
-    for (start, end) in paths {
-        draw_line(&mut rgba, size, start, end, 3.4, [17, 24, 39, 255]);
-    }
+    draw_short_logo_mark(&mut rgba, size, [255, 255, 255, 255], true);
+    draw_short_logo_mark(&mut rgba, size, [17, 24, 39, 255], false);
 
     match state {
         TrayVisualState::Ready => {}
@@ -3995,26 +3981,108 @@ fn tray_icon_image(state: TrayVisualState) -> Image<'static> {
     Image::new_owned(rgba, size as u32, size as u32)
 }
 
-fn draw_line(
-    rgba: &mut [u8],
-    size: usize,
-    start: (f64, f64),
-    end: (f64, f64),
-    width: f64,
-    color: [u8; 4],
-) {
-    let half_width = width / 2.0;
+fn draw_short_logo_mark(rgba: &mut [u8], size: usize, color: [u8; 4], halo: bool) {
+    let top = if halo {
+        [
+            (18.0, 1.8),
+            (32.6, 8.8),
+            (32.9, 13.4),
+            (21.0, 19.3),
+            (15.0, 19.3),
+            (3.1, 13.4),
+            (3.4, 8.8),
+        ]
+    } else {
+        [
+            (18.0, 3.1),
+            (30.9, 9.2),
+            (31.1, 12.3),
+            (20.4, 17.5),
+            (15.6, 17.5),
+            (4.9, 12.3),
+            (5.1, 9.2),
+        ]
+    };
+    let bottom = if halo {
+        [
+            (14.0, 18.8),
+            (22.0, 18.8),
+            (33.0, 25.5),
+            (32.4, 29.4),
+            (21.0, 34.4),
+            (15.0, 34.4),
+            (3.6, 29.4),
+            (3.0, 25.5),
+        ]
+    } else {
+        [
+            (14.8, 20.3),
+            (21.2, 20.3),
+            (31.0, 26.1),
+            (30.5, 28.6),
+            (20.4, 32.7),
+            (15.6, 32.7),
+            (5.5, 28.6),
+            (5.0, 26.1),
+        ]
+    };
+
+    draw_polygon(rgba, size, &top, color);
+    draw_polygon(rgba, size, &bottom, color);
+
+    let dot_radius = if halo { 2.8 } else { 1.65 };
+    for center in [
+        (4.6, 15.4),
+        (4.6, 18.5),
+        (4.6, 21.6),
+        (31.4, 15.4),
+        (31.4, 18.5),
+        (31.4, 21.6),
+    ] {
+        draw_disc(rgba, size, center, dot_radius, color);
+    }
+}
+
+fn draw_polygon(rgba: &mut [u8], size: usize, points: &[(f64, f64)], color: [u8; 4]) {
     for y in 0..size {
         for x in 0..size {
             let px = x as f64 + 0.5;
             let py = y as f64 + 0.5;
-            let distance = distance_to_segment((px, py), start, end);
-            let alpha = (half_width + 0.7 - distance).clamp(0.0, 1.0);
+            let inside = point_in_polygon((px, py), points);
+            let distance = points
+                .iter()
+                .zip(points.iter().cycle().skip(1))
+                .take(points.len())
+                .map(|(start, end)| distance_to_segment((px, py), *start, *end))
+                .fold(f64::INFINITY, f64::min);
+            let alpha = if inside {
+                (distance + 0.6).clamp(0.0, 1.0)
+            } else {
+                (0.6 - distance).clamp(0.0, 1.0)
+            };
             if alpha > 0.0 {
                 blend_pixel(rgba, size, x, y, color, alpha);
             }
         }
     }
+}
+
+fn point_in_polygon(point: (f64, f64), points: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    let mut previous = points[points.len() - 1];
+    for current in points {
+        let crosses = (current.1 > point.1) != (previous.1 > point.1);
+        if crosses {
+            let x_intersection = (previous.0 - current.0) * (point.1 - current.1)
+                / (previous.1 - current.1)
+                + current.0;
+            if point.0 < x_intersection {
+                inside = !inside;
+            }
+        }
+        previous = *current;
+    }
+    inside
 }
 
 fn draw_disc(rgba: &mut [u8], size: usize, center: (f64, f64), radius: f64, color: [u8; 4]) {
@@ -11765,6 +11833,20 @@ mod tests {
                 .chunks_exact(4)
                 .any(|pixel| { pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200 })
         );
+        for (x, y) in [(4, 15), (4, 18), (4, 21), (32, 15), (32, 18), (32, 21)] {
+            let pixel = tray_icon_pixel(&ready, x, y);
+            assert!(
+                pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200,
+                "expected short-logo side dot at ({x}, {y}), got {pixel:?}"
+            );
+        }
+        for (x, y) in [(18, 6), (18, 27)] {
+            let pixel = tray_icon_pixel(&ready, x, y);
+            assert!(
+                pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200,
+                "expected short-logo stacked body at ({x}, {y}), got {pixel:?}"
+            );
+        }
         assert!(review.rgba().chunks_exact(4).any(|pixel| {
             pixel[0] > 200 && pixel[1] > 100 && pixel[1] < 180 && pixel[2] < 80 && pixel[3] > 200
         }));
@@ -11773,6 +11855,17 @@ mod tests {
                 pixel[0] > 180 && pixel[1] < 90 && pixel[2] < 90 && pixel[3] > 200
             })
         );
+    }
+
+    fn tray_icon_pixel(image: &tauri::image::Image<'_>, x: usize, y: usize) -> [u8; 4] {
+        let offset = (y * image.width() as usize + x) * 4;
+        let rgba = image.rgba();
+        [
+            rgba[offset],
+            rgba[offset + 1],
+            rgba[offset + 2],
+            rgba[offset + 3],
+        ]
     }
 
     #[cfg(windows)]
