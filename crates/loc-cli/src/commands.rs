@@ -183,7 +183,7 @@ enum LocalityCommand {
     #[command(about = "Undo a reconciled push using its journal entry")]
     Undo(UndoArgs),
     #[command(about = "List push journal entries")]
-    Log(PathArg),
+    Log(LogCliArgs),
     #[command(about = "Restore a local file from the last synced shadow")]
     Restore(RestoreCliArgs),
     #[command(about = "Reset Locality local state and credentials")]
@@ -462,6 +462,20 @@ struct LiveModeFileArgs {
 struct UndoArgs {
     #[arg(value_name = "push-id", help = "Push journal id to undo.")]
     push_id: String,
+}
+
+#[derive(Debug, Args)]
+struct LogCliArgs {
+    #[arg(value_name = "path", help = "Optional path to filter journal entries.")]
+    path: Option<String>,
+    #[arg(
+        long,
+        value_name = "push-id",
+        help = "Only show one push journal entry."
+    )]
+    push_id: Option<String>,
+    #[arg(long, help = "Print the readable diff saved with each journal entry.")]
+    diff: bool,
 }
 
 #[derive(Debug, Args)]
@@ -994,6 +1008,8 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
         LocalityCommand::Log(options) => {
             args.push("log".to_string());
             push_optional_positional(&mut args, options.path.as_deref());
+            push_optional_flag_value(&mut args, "--push-id", options.push_id.as_deref());
+            push_flag(&mut args, "--diff", options.diff);
         }
         LocalityCommand::Restore(options) => {
             args.push("restore".to_string());
@@ -3624,8 +3640,25 @@ fn log(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let push_id = match flag_value(args, "--push-id") {
+        Some(push_id) => Some(PushId(push_id.to_string())),
+        None if has_flag(args, "--push-id") => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "log",
+                    "usage",
+                    "usage: loc log [path] [--push-id <push-id>] [--diff] [--json]",
+                ),
+                EXIT_USAGE,
+            );
+        }
+        None => None,
+    };
     let options = LogOptions {
         path: first_positional(args).map(PathBuf::from),
+        push_id,
+        include_diff: has_flag(args, "--diff"),
     };
 
     match run_log(&store, options) {
@@ -4183,23 +4216,36 @@ fn diff(args: &[String], json: bool) -> i32 {
 }
 
 fn print_log_report(report: &LogReport) {
+    let mut output = io::stdout();
+    let _ = write_log_report(report, &mut output);
+}
+
+fn write_log_report<W: Write>(report: &LogReport, output: &mut W) -> io::Result<()> {
     if report.entries.is_empty() {
-        println!("no journal entries");
-        return;
+        writeln!(output, "no journal entries")?;
+        return Ok(());
     }
 
     for (index, entry) in report.entries.iter().enumerate() {
         if index > 0 {
-            println!();
+            writeln!(output)?;
         }
-        println!("push {}", entry.push_id);
-        println!("  status: {}", entry.status);
-        println!("  mount: {}", entry.mount_id);
-        println!("  entities: {}", entry.remote_ids.join(", "));
+        writeln!(output, "push {}", entry.push_id)?;
+        writeln!(output, "  status: {}", entry.status)?;
+        writeln!(output, "  mount: {}", entry.mount_id)?;
+        writeln!(output, "  entities: {}", entry.remote_ids.join(", "))?;
+        writeln!(output, "  author: {}", entry.author)?;
+        if let Some(created_at_unix_ms) = entry.created_at_unix_ms {
+            writeln!(output, "  created_at_unix_ms: {created_at_unix_ms}")?;
+        }
+        if let Some(previous_push_id) = &entry.previous_push_id {
+            writeln!(output, "  previous: {previous_push_id}")?;
+        }
         if let Some(failure) = &entry.failure {
-            println!("  failure: {failure}");
+            writeln!(output, "  failure: {failure}")?;
         }
-        println!(
+        writeln!(
+            output,
             "  summary: {} updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
             entry.plan_summary.blocks_updated,
             entry.plan_summary.blocks_replaced,
@@ -4207,9 +4253,12 @@ fn print_log_report(report: &LogReport) {
             entry.plan_summary.blocks_created,
             entry.plan_summary.blocks_moved,
             entry.plan_summary.blocks_archived
-        );
-        println!("  operations: {}", entry.operation_count);
+        )?;
+        writeln!(output, "  operations: {}", entry.operation_count)?;
+        write_readable_diff(output, entry.readable_diff.as_ref())?;
     }
+
+    Ok(())
 }
 
 fn print_undo_report(report: &UndoReport) {
@@ -6856,6 +6905,7 @@ fn takes_value(arg: &str) -> bool {
             | "--limit"
             | "--title"
             | "--parent"
+            | "--push-id"
     )
 }
 
@@ -7087,7 +7137,8 @@ mod tests {
         ShadowRepository, SqliteStateStore,
     };
 
-    use crate::diff::{DiffReport, GuardrailOutput};
+    use crate::diff::{DiffReport, GuardrailOutput, PlanSummaryOutput};
+    use crate::history::{JournalEntryOutput, LogReport};
     use crate::local_oauth::{local_redirect, parse_oauth_callback};
     use crate::push::PushReport;
     use crate::search::{SearchOptions, SearchReport};
@@ -7107,7 +7158,7 @@ mod tests {
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, should_prompt_for_push_confirmation,
         should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
-        status as run_status_command, validate_virtual_projection_registration,
+        status as run_status_command, validate_virtual_projection_registration, write_log_report,
     };
 
     #[test]
@@ -7331,7 +7382,14 @@ mod tests {
             ),
             (
                 vec!["log", "--help"],
-                vec!["Usage: loc log", "List push journal", "path", "--json"],
+                vec![
+                    "Usage: loc log",
+                    "List push journal",
+                    "path",
+                    "--push-id",
+                    "--diff",
+                    "--json",
+                ],
             ),
             (
                 vec!["restore", "--help"],
@@ -7640,6 +7698,57 @@ mod tests {
         assert_eq!(
             legacy_args_for_command(cli.command.as_ref().expect("command")),
             vec!["doctor"]
+        );
+
+        let cli = parse_cli(["log", "Roadmap.md", "--push-id", "push-1", "--diff"]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec!["log", "Roadmap.md", "--push-id", "push-1", "--diff"]
+        );
+    }
+
+    #[test]
+    fn log_report_writer_prints_metadata_and_readable_diff() {
+        let report = LogReport {
+            ok: true,
+            command: "log",
+            entries: vec![JournalEntryOutput {
+                push_id: "push-1".to_string(),
+                mount_id: "notion-main".to_string(),
+                remote_ids: vec!["page-1".to_string()],
+                status: "reconciled".to_string(),
+                failure: None,
+                author: "anonymous".to_string(),
+                previous_push_id: Some("push-0".to_string()),
+                created_at_unix_ms: Some(1_783_612_800_000),
+                readable_diff: Some(locality_core::readable_diff::ReadableDiffOutput {
+                    files: Vec::new(),
+                    text: "diff --locality a/Roadmap.md b/Roadmap.md\n".to_string(),
+                }),
+                preimage_count: 1,
+                apply_effect_count: 1,
+                plan_summary: PlanSummaryOutput {
+                    blocks_created: 0,
+                    blocks_updated: 1,
+                    blocks_replaced: 0,
+                    blocks_moved: 0,
+                    media_updated: 0,
+                    blocks_archived: 0,
+                    entities_created: 0,
+                    entities_archived: 0,
+                    entities_moved: 0,
+                    properties_updated: 0,
+                },
+                operation_count: 1,
+            }],
+        };
+        let mut output = Vec::new();
+
+        write_log_report(&report, &mut output).expect("write log report");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf8 output"),
+            "push push-1\n  status: reconciled\n  mount: notion-main\n  entities: page-1\n  author: anonymous\n  created_at_unix_ms: 1783612800000\n  previous: push-0\n  summary: 1 updated, 0 replaced, 0 media updated, 0 created, 0 moved, 0 archived\n  operations: 1\n\ndiff --locality a/Roadmap.md b/Roadmap.md\n"
         );
     }
 

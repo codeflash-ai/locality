@@ -10948,6 +10948,7 @@ fn live_push_log_and_undo_restores_remote_content() {
         &store,
         LogOptions {
             path: Some(page_path.clone()),
+            ..LogOptions::default()
         },
     )
     .expect("log undo push");
@@ -10975,6 +10976,7 @@ fn live_push_log_and_undo_restores_remote_content() {
         &store,
         LogOptions {
             path: Some(page_path),
+            ..LogOptions::default()
         },
     )
     .expect("log reverted undo push");
@@ -11183,6 +11185,7 @@ fn live_undo_child_page_create_archives_remote_page() {
         &store,
         LogOptions {
             path: Some(child_page_path.clone()),
+            ..LogOptions::default()
         },
     )
     .expect("log child page create push");
@@ -11210,6 +11213,7 @@ fn live_undo_child_page_create_archives_remote_page() {
         &store,
         LogOptions {
             path: Some(child_page_path),
+            ..LogOptions::default()
         },
     )
     .expect("log reverted child page create push");
@@ -11303,6 +11307,7 @@ fn live_undo_database_row_create_archives_remote_row() {
         &store,
         LogOptions {
             path: Some(new_row_path.clone()),
+            ..LogOptions::default()
         },
     )
     .expect("log database row create push");
@@ -11339,6 +11344,7 @@ fn live_undo_database_row_create_archives_remote_row() {
         &store,
         LogOptions {
             path: Some(new_row_path),
+            ..LogOptions::default()
         },
     )
     .expect("log reverted database row create push");

@@ -61,6 +61,7 @@ fn log_filters_journal_entries_by_projected_path() {
         &store,
         LogOptions {
             path: Some(fixture.root.join("Roadmap.md")),
+            ..LogOptions::default()
         },
     )
     .expect("filtered log");
@@ -87,6 +88,7 @@ fn log_page_directory_targets_page_document() {
         &store,
         LogOptions {
             path: Some(fixture.root.join("Roadmap")),
+            ..LogOptions::default()
         },
     )
     .expect("page-directory log");
@@ -139,6 +141,7 @@ fn log_filters_created_entity_journal_by_created_path() {
         &store,
         LogOptions {
             path: Some(fixture.root.join("New child/page.md")),
+            ..LogOptions::default()
         },
     )
     .expect("filtered created entity log");
@@ -158,6 +161,7 @@ fn log_reports_structured_error_for_unknown_path() {
         &store,
         LogOptions {
             path: Some(fixture.root.join("Missing.md")),
+            ..LogOptions::default()
         },
     )
     .expect_err("missing path");
