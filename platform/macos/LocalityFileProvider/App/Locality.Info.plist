@@ -4,10 +4,26 @@
 <dict>
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
-  <key>CFBundleExecutable</key>
-  <string>Locality</string>
-  <key>CFBundleIdentifier</key>
-  <string>ai.codeflash.locality.Locality</string>
+	<key>CFBundleExecutable</key>
+	<string>Locality</string>
+	<key>CFBundleIconFile</key>
+	<string>locality-mount-logo</string>
+	<key>CFBundleIconName</key>
+	<string>locality-mount-logo</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>locality-mount-logo</string>
+			</array>
+			<key>CFBundleSymbolName</key>
+			<string>locality-mount-logo</string>
+		</dict>
+	</dict>
+	<key>CFBundleIdentifier</key>
+	<string>ai.codeflash.locality.Locality</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>

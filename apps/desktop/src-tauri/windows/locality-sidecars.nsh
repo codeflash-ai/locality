@@ -105,6 +105,7 @@
   !insertmacro DELETE_LOCALITY_INSTALLED_FILE "loc.exe"
   !insertmacro DELETE_LOCALITY_INSTALLED_FILE "localityd.exe"
   !insertmacro DELETE_LOCALITY_INSTALLED_FILE "locality-cloud-files.exe"
+  !insertmacro DELETE_LOCALITY_INSTALLED_FILE "locality-mount-logo.ico"
 !macroend
 
 !macro DELETE_LOCALITY_TERMINAL_SHIM SHIM_PATH
@@ -131,6 +132,7 @@
   File /oname=loc.exe "${LOCALITY_SIDECAR_SOURCE_DIR}\loc.exe"
   File /oname=localityd.exe "${LOCALITY_SIDECAR_SOURCE_DIR}\localityd.exe"
   File /oname=locality-cloud-files.exe "${LOCALITY_SIDECAR_SOURCE_DIR}\locality-cloud-files.exe"
+  File /oname=locality-mount-logo.ico "${LOCALITY_SIDECAR_SOURCE_DIR}\locality-mount-logo.ico"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
@@ -143,6 +145,7 @@
   Delete "$INSTDIR\loc.exe"
   Delete "$INSTDIR\localityd.exe"
   Delete "$INSTDIR\locality-cloud-files.exe"
+  Delete "$INSTDIR\locality-mount-logo.ico"
   DeleteRegValue HKCU "${LOCALITY_RUN_KEY}" "${LOCALITY_RUN_VALUE}"
   !insertmacro DELETE_LOCALITY_TERMINAL_SHIM "$LOCALAPPDATA\Microsoft\WindowsApps\loc.cmd"
   !insertmacro DELETE_LOCALITY_TERMINAL_SHIM "$LOCALAPPDATA\Locality\bin\loc.cmd"
