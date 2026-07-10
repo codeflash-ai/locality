@@ -19,7 +19,8 @@ use locality_core::conflict::unresolved_conflict_marker_line;
 use locality_core::diff::property_value_from_frontmatter;
 use locality_core::freshness::RemoteVersion;
 use locality_core::journal::{
-    JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
+    JournalApplyEffect, JournalEntry, JournalMetadata, JournalPreimage, JournalStatus,
+    JournalStore, PushId,
 };
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::path_projection::{
@@ -310,12 +311,30 @@ where
         &prepared.entity,
         &prepared.pipeline,
     )?;
+    let remote_ids = prepared
+        .pipeline
+        .plan
+        .as_ref()
+        .map(|plan| plan.affected_entities.clone())
+        .unwrap_or_else(|| vec![prepared.entity.remote_id.clone()]);
+    let previous_push_id =
+        store.latest_journal_for_entities(&prepared.mount.mount_id, &remote_ids)?;
+    let created_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis());
+    let readable_diff = prepared.readable_diff.clone();
     let mut execution_request = PushExecutionRequest::new(
         push_id.clone(),
         prepared.mount.mount_id.clone(),
         prepared.pipeline.clone(),
     )
-    .with_remote_preconditions(remote_preconditions);
+    .with_remote_preconditions(remote_preconditions)
+    .with_metadata(JournalMetadata::anonymous(
+        previous_push_id,
+        created_at_unix_ms,
+    ))
+    .with_readable_diff(readable_diff);
 
     if !prepared.shadows.is_empty() {
         execution_request = execution_request.with_preimages(

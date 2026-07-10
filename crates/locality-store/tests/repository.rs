@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use locality_core::freshness::{FreshnessTier, RemoteVersion};
 use locality_core::journal::{
-    JournalApplyEffect, JournalEntry, JournalStatus, JournalStore, PushId, PushOperationId,
+    JournalApplyEffect, JournalEntry, JournalMetadata, JournalStatus, JournalStore, PushId,
+    PushOperationId,
 };
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::{PushOperation, PushPlan};
@@ -483,6 +484,90 @@ fn journal_repository_tracks_status_updates() {
     assert_eq!(entry.status, JournalStatus::Applied);
     assert_eq!(entry.apply_effects, apply_effects());
     assert_eq!(store.list_journal().expect("list journal").len(), 1);
+}
+
+#[test]
+fn journal_repository_finds_latest_previous_journal_for_entities() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    store
+        .append_journal(journal_entry("push-1", JournalStatus::Reconciled))
+        .expect("append first");
+    store
+        .append_journal(journal_entry("push-3", JournalStatus::Reconciled))
+        .expect("append third");
+
+    let previous = store
+        .latest_journal_for_entities(&mount_id, &[RemoteId::new("page-1")])
+        .expect("latest");
+
+    assert_eq!(previous, Some(PushId("push-3".to_string())));
+}
+
+#[test]
+fn journal_repository_finds_previous_journal_by_created_entity_apply_effect() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    store
+        .append_journal(
+            JournalEntry::new(
+                PushId("push-create".to_string()),
+                mount_id.clone(),
+                vec![RemoteId::new("parent-page")],
+                PushPlan::new(
+                    vec![RemoteId::new("parent-page")],
+                    vec![PushOperation::CreateEntity {
+                        parent_id: RemoteId::new("parent-page"),
+                        parent_kind: Some(EntityKind::Page),
+                        parent_workspace: false,
+                        title: "Created Page".to_string(),
+                        properties: Default::default(),
+                        body: "Created body.".to_string(),
+                        source_path: PathBuf::from("Created Page/page.md"),
+                    }],
+                ),
+                JournalStatus::Reconciled,
+            )
+            .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+                operation_id: PushOperationId(
+                    "push-create:0:create_entity:parent-page".to_string(),
+                ),
+                operation_index: 0,
+                parent_id: RemoteId::new("parent-page"),
+                entity_id: RemoteId::new("page-created"),
+            }]),
+        )
+        .expect("append create journal");
+
+    let previous = store
+        .latest_journal_for_entities(&mount_id, &[RemoteId::new("page-created")])
+        .expect("latest");
+
+    assert_eq!(previous, Some(PushId("push-create".to_string())));
+}
+
+#[test]
+fn journal_repository_orders_latest_previous_journal_by_created_timestamp() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    store
+        .append_journal(
+            journal_entry("push-10", JournalStatus::Reconciled)
+                .with_metadata(JournalMetadata::anonymous(None, Some(2_000))),
+        )
+        .expect("append newer timestamp");
+    store
+        .append_journal(
+            journal_entry("push-9", JournalStatus::Reconciled)
+                .with_metadata(JournalMetadata::anonymous(None, Some(1_000))),
+        )
+        .expect("append older timestamp");
+
+    let previous = store
+        .latest_journal_for_entities(&mount_id, &[RemoteId::new("page-1")])
+        .expect("latest");
+
+    assert_eq!(previous, Some(PushId("push-10".to_string())));
 }
 
 #[test]

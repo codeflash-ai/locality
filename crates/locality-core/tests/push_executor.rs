@@ -2,7 +2,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use locality_core::journal::{
-    JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
+    JournalApplyEffect, JournalEntry, JournalMetadata, JournalPreimage, JournalStatus,
+    JournalStore, PushId,
 };
 use locality_core::model::{MountId, RemoteId};
 use locality_core::planner::{GuardrailDecision, PushOperation, PushPlan};
@@ -12,6 +13,7 @@ use locality_core::push::{
     PushReconcileRequest, PushReconcileResult, PushReconciler, PushStage,
     execute_journaled_push_with_host,
 };
+use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
@@ -63,6 +65,29 @@ fn executor_journals_checks_applies_and_reconciles_in_order() {
     assert_eq!(host.concurrency.seen_push_id, Some(push_id()));
     assert_eq!(host.applier.seen_push_id, Some(push_id()));
     assert_eq!(host.reconciler.seen_push_id, Some(push_id()));
+}
+
+#[test]
+fn executor_copies_request_metadata_and_readable_diff_to_journal() {
+    let events = event_log();
+    let mut host = RecordingHost::new(events);
+    let metadata = JournalMetadata::anonymous(Some(PushId("push-0".to_string())), Some(12_345));
+    let readable_diff = ReadableDiffOutput {
+        files: Vec::new(),
+        text: "diff --locality a/Roadmap/page.md b/Roadmap/page.md\n".to_string(),
+    };
+
+    execute_journaled_push_with_host(
+        &mut host,
+        PushExecutionRequest::new(push_id(), mount_id(), approved_pipeline())
+            .with_metadata(metadata.clone())
+            .with_readable_diff(Some(readable_diff.clone())),
+    )
+    .expect("push execution");
+
+    let entry = host.journal.entry.expect("journal");
+    assert_eq!(entry.metadata, metadata);
+    assert_eq!(entry.readable_diff, Some(readable_diff));
 }
 
 #[test]

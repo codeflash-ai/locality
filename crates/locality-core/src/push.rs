@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::canonical::ParsedCanonicalDocument;
 use crate::diff::{BlockDiffEngine, DiffEngine};
 use crate::journal::{
-    JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
-    PushOperationId,
+    JournalApplyEffect, JournalEntry, JournalMetadata, JournalPreimage, JournalStatus,
+    JournalStore, PushId, PushOperationId,
 };
 use crate::model::{MountId, RemoteId};
 use crate::planner::{GuardrailDecision, GuardrailPolicy, PushPlan};
+use crate::readable_diff::ReadableDiffOutput;
 use crate::shadow::ShadowDocument;
 use crate::validation::{
     ValidationIssue, ValidationReport, validate_directive_syntax, validate_frontmatter_identity,
@@ -312,6 +313,10 @@ pub struct PushExecutionRequest {
     pub pipeline: PushPipelineResult,
     /// Pre-push canonical snapshots used by future resume and undo flows.
     pub preimages: Vec<JournalPreimage>,
+    /// Anonymous edit-list metadata to store with the journal entry.
+    pub metadata: JournalMetadata,
+    /// Reviewed readable diff snapshot to store with the journal entry.
+    pub readable_diff: Option<ReadableDiffOutput>,
     /// Synced Tree remote versions for entities that the connector should
     /// compare immediately before apply.
     pub remote_preconditions: Vec<RemotePrecondition>,
@@ -324,6 +329,8 @@ impl PushExecutionRequest {
             mount_id,
             pipeline,
             preimages: Vec::new(),
+            metadata: JournalMetadata::default(),
+            readable_diff: None,
             remote_preconditions: Vec::new(),
         }
     }
@@ -335,6 +342,16 @@ impl PushExecutionRequest {
 
     pub fn with_remote_preconditions(mut self, preconditions: Vec<RemotePrecondition>) -> Self {
         self.remote_preconditions = preconditions;
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: JournalMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub fn with_readable_diff(mut self, readable_diff: Option<ReadableDiffOutput>) -> Self {
+        self.readable_diff = readable_diff;
         self
     }
 }
@@ -511,7 +528,9 @@ where
             plan.clone(),
             JournalStatus::Prepared,
         )
-        .with_preimages(request.preimages.clone()),
+        .with_preimages(request.preimages.clone())
+        .with_metadata(request.metadata.clone())
+        .with_readable_diff(request.readable_diff.clone()),
     )?;
     host.update_status(&request.push_id, JournalStatus::Applying)?;
 
