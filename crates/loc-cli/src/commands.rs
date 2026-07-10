@@ -474,7 +474,10 @@ struct LogCliArgs {
         help = "Only show one push journal entry."
     )]
     push_id: Option<String>,
-    #[arg(long, help = "Print the readable diff saved with each journal entry.")]
+    #[arg(
+        long,
+        help = "Print the readable diff when the log resolves to one journal entry."
+    )]
     diff: bool,
 }
 
@@ -4262,6 +4265,7 @@ fn write_log_report<W: Write>(report: &LogReport, output: &mut W) -> io::Result<
         return Ok(());
     }
 
+    let inline_diff = report.entries.len() == 1;
     for (index, entry) in report.entries.iter().enumerate() {
         if index > 0 {
             writeln!(output)?;
@@ -4291,7 +4295,11 @@ fn write_log_report<W: Write>(report: &LogReport, output: &mut W) -> io::Result<
             entry.plan_summary.blocks_archived
         )?;
         writeln!(output, "  operations: {}", entry.operation_count)?;
-        write_readable_diff(output, entry.readable_diff.as_ref())?;
+        if inline_diff {
+            write_readable_diff(output, entry.readable_diff.as_ref())?;
+        } else if entry.readable_diff.is_some() {
+            writeln!(output, "  diff: loc log --push-id {} --diff", entry.push_id)?;
+        }
     }
 
     Ok(())
@@ -7779,6 +7787,66 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).expect("utf8 output"),
             "push push-1\n  status: reconciled\n  mount: notion-main\n  entities: page-1\n  author: anonymous\n  created_at_unix_ms: 1783612800000\n  previous: push-0\n  summary: 1 updated, 0 replaced, 0 media updated, 0 created, 0 moved, 0 archived\n  operations: 1\n\ndiff --locality a/Roadmap.md b/Roadmap.md\n"
+        );
+    }
+
+    #[test]
+    fn log_report_writer_omits_inline_diffs_for_multiple_entries() {
+        let entry = |push_id: &str, diff_text: &str| JournalEntryOutput {
+            push_id: push_id.to_string(),
+            mount_id: "notion-main".to_string(),
+            remote_ids: vec!["page-1".to_string()],
+            status: "reconciled".to_string(),
+            failure: None,
+            author: "anonymous".to_string(),
+            previous_push_id: None,
+            created_at_unix_ms: None,
+            readable_diff: Some(locality_core::readable_diff::ReadableDiffOutput {
+                files: Vec::new(),
+                text: diff_text.to_string(),
+            }),
+            preimage_count: 1,
+            apply_effect_count: 1,
+            plan_summary: PlanSummaryOutput {
+                blocks_created: 0,
+                blocks_updated: 1,
+                blocks_replaced: 0,
+                blocks_moved: 0,
+                media_updated: 0,
+                blocks_archived: 0,
+                entities_created: 0,
+                entities_archived: 0,
+                entities_moved: 0,
+                properties_updated: 0,
+            },
+            operation_count: 1,
+        };
+        let report = LogReport {
+            ok: true,
+            command: "log",
+            entries: vec![
+                entry("push-2", "diff --locality a/two.md b/two.md\n"),
+                entry("push-1", "diff --locality a/one.md b/one.md\n"),
+            ],
+        };
+        let mut output = Vec::new();
+
+        write_log_report(&report, &mut output).expect("write log report");
+        let rendered = String::from_utf8(output).expect("utf8 output");
+
+        assert!(rendered.contains("push push-2"), "{rendered}");
+        assert!(rendered.contains("push push-1"), "{rendered}");
+        assert!(
+            !rendered.contains("diff --locality"),
+            "multi-entry log should not inline diff bodies:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("diff: loc log --push-id push-2 --diff"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("diff: loc log --push-id push-1 --diff"),
+            "{rendered}"
         );
     }
 

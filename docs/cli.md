@@ -680,9 +680,10 @@ unified diff when file content changed.
 remote mutations. Once a push is journaled, Locality stores linked edit metadata
 and the readable diff in the durable push journal.
 
-`loc log --diff` reads those journaled diffs back for audit and review. Combine
-it with `--push-id <push-id>` to show the readable diff for one push entry, or
-with a path to narrow the journal before selecting a push.
+`loc log --diff` reads those journaled diffs back for audit and review. Use
+`--push-id <push-id> --diff` to show the readable diff for one push entry; when
+a human log view has multiple entries, Locality keeps the list compact and
+prints the command to inspect each entry's diff.
 
 ## Initial `loc push --json` Shape
 
@@ -780,7 +781,10 @@ from the SQLite state store. Without a path it lists all journal entries; with a
 path it resolves the path through the mount/entity mapping and lists entries
 that touched that entity. `--push-id` filters the path-scoped result to one push
 entry. By default, JSON and human output omit saved readable diffs so regular log
-calls stay compact; pass `--diff` to include them.
+calls stay compact. Pass `--diff` to include them in JSON. In human output,
+`--diff` prints the saved readable diff when the result has one entry; for
+multi-entry results it prints per-entry `loc log --push-id <push-id> --diff`
+hints instead of dumping every diff body.
 
 Each JSON entry includes:
 
@@ -801,7 +805,9 @@ Each JSON entry includes:
 
 Human output is a compact git-log-style list headed by `push <push-id>`. It
 prints linked edit fields such as `author`, `created_at_unix_ms`, and `previous`
-when available; with `--diff`, it then prints the saved readable diff text.
+when available. With `--diff`, one-entry output prints the saved readable diff
+text; multi-entry output prints a `diff: loc log --push-id <push-id> --diff`
+hint for each entry that has a saved diff.
 
 ## Initial `loc undo --json` Shape
 
