@@ -18,8 +18,6 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -109,9 +107,6 @@ jobs:
     name: Build and publish Linux x64
     needs: release-preflight
     runs-on: ubuntu-24.04
-    environment:
-      name: github-pages
-      url: https://codeflash-ai.github.io/locality
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       PUBLISH_CHANNEL: release
@@ -120,9 +115,6 @@ jobs:
       TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      LINUX_REPO_BASE_URL: ${{ vars.LINUX_REPO_BASE_URL || 'https://codeflash-ai.github.io/locality' }}
-      LINUX_REPO_GPG_PRIVATE_KEY: ${{ secrets.LINUX_REPO_GPG_PRIVATE_KEY }}
-      LINUX_REPO_GPG_PASSPHRASE: ${{ secrets.LINUX_REPO_GPG_PASSPHRASE }}
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v4
@@ -182,10 +174,6 @@ jobs:
             libgtk-3-dev \
             librsvg2-dev \
             libwebkit2gtk-4.1-dev \
-            apt-utils \
-            createrepo-c \
-            dpkg-dev \
-            gnupg \
             patchelf \
             pkg-config \
             rpm \
@@ -196,10 +184,10 @@ jobs:
         run: npm ci
         working-directory: apps/desktop
 
-      - name: Verify updater and repository secrets
+      - name: Verify updater secrets
         run: |
           missing=0
-          for name in TAURI_UPDATER_PUBKEY TAURI_SIGNING_PRIVATE_KEY LINUX_REPO_GPG_PRIVATE_KEY; do
+          for name in TAURI_UPDATER_PUBKEY TAURI_SIGNING_PRIVATE_KEY; do
             if [[ -z "${!name}" ]]; then
               echo "::error::Missing required secret or environment value: ${name}"
               missing=1
@@ -249,7 +237,7 @@ jobs:
             sha256sum "${artifact}" | sed "s#  ${artifact}#  $(basename "${artifact}")#" > "${artifact}.sha256"
           done
 
-      - name: Render updater manifest and package repositories
+      - name: Render updater manifest
         env:
           GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
           UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-linux.json
@@ -257,7 +245,6 @@ jobs:
           UPDATER_NOTES: Locality ${{ env.APP_VERSION }} Linux update.
         run: |
           make render-updater-manifest
-          make render-linux-repositories
 
       - name: Collect release assets
         run: |
@@ -290,18 +277,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${RELEASE_TAG}" target/release/github-assets/* --repo "${GITHUB_REPOSITORY}" --clobber
-
-      - name: Configure GitHub Pages
-        if: env.PRERELEASE != 'true'
-        uses: actions/configure-pages@v5
-
-      - name: Upload Linux repository Pages artifact
-        if: env.PRERELEASE != 'true'
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: target/release/linux-repo
-
-      - name: Deploy Linux package repositories
-        id: deployment
-        if: env.PRERELEASE != 'true'
-        uses: actions/deploy-pages@v4
