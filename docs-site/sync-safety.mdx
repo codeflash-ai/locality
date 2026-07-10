@@ -66,16 +66,16 @@ Use it when local edits should be discarded. Use `--force` only for a known conf
 
 ## Live Mode
 
-Live Mode can handle safe background sync, but it is not fully autonomous.
+Live Mode handles safe background sync, but it is not fully autonomous.
 
-It should:
+It can:
 
 - pull clean remote updates;
 - push safe local edits;
 - keep using the same push guardrails;
 - pause for conflicts, destructive plans, unsupported operations, remote drift that needs review, or anything ambiguous.
 
-It should not hide meaningful conflicts from the user.
+It does not hide meaningful conflicts from the user.
 
 ## Diagnostics
 

@@ -49,40 +49,41 @@
   "navigation": {
     "groups": [
       {
-        "group": "Start",
-        "icon": "rocket",
+        "group": "Get Started",
         "pages": [
           "overview",
           "install",
-          "quickstart",
-          "filesystem-model"
+          "quickstart"
         ]
       },
       {
-        "group": "Use Locality",
-        "icon": "folder-sync",
+        "group": "Core Concepts",
+        "pages": [
+          "filesystem-model",
+          "sync-safety"
+        ]
+      },
+      {
+        "group": "Workflows",
         "pages": [
           "desktop",
           "agents",
           "best-practices",
-          "sync-safety",
           "use-cases"
         ]
       },
       {
-        "group": "Reference",
-        "icon": "terminal",
+        "group": "Connectors",
         "pages": [
-          "cli-reference",
           "connectors/notion",
-          "connectors/google-docs",
-          "okf-export"
+          "connectors/google-docs"
         ]
       },
       {
-        "group": "Operations",
-        "icon": "settings",
+        "group": "Reference",
         "pages": [
+          "cli-reference",
+          "okf-export",
           "troubleshooting",
           "development"
         ]

@@ -1,11 +1,11 @@
-# Locality Public Docs
+# Locality Docs Source
 
-This directory is the Mintlify documentation site root.
+This directory is the Mintlify documentation source root.
 
-- `docs.json` configures the published navigation.
-- `*.mdx` files are public user-facing docs.
-- `connectors/*.mdx` contains public connector docs.
-- `llms.txt` is the public AI-readable docs index.
+- `docs.json` configures the docs navigation.
+- `*.mdx` files are user-facing docs source files.
+- `connectors/*.mdx` contains connector docs source files.
+- `llms.txt` is the AI-readable docs index source.
 
 Run from the repository root:
 

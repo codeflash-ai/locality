@@ -5,43 +5,31 @@ description: "Install Locality, connect a source, mount it locally, and push a r
 
 This guide shows the shortest useful path: connect Notion, mount it as files, edit one page, review the diff, and push.
 
-<Note>
-  Placeholder for setup screenshot: connected source, mounted folder path, and pending changes panel.
-</Note>
-
 ## 1. Install
 
-For all operating systems and direct release artifacts, see [Install Locality](/install).
+Download Locality from the latest finalized GitHub Release. For OS-specific asset names, see [Install Locality](/install).
 
-On macOS with Homebrew:
+macOS uses the DMG release asset:
 
-```bash
-brew tap codeflash-ai/tap
-brew install --cask loc
+```text
+Locality_Mac_v<version>.dmg
 ```
 
-Update an existing install:
+Linux uses the Debian, RPM, or AppImage release asset:
 
-```bash
-brew update
-brew upgrade --cask loc
+```text
+Locality_Linux_v<version>.deb
+Locality_Linux_v<version>.rpm
+Locality_Linux_v<version>.AppImage
 ```
 
-On Debian or Ubuntu:
+Windows uses the installer release asset:
 
-```bash
-curl -fsSL https://codeflash-ai.github.io/locality/apt/codeflash-loc.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-loc.gpg
-echo "deb [signed-by=/usr/share/keyrings/codeflash-loc.gpg] https://codeflash-ai.github.io/locality/apt stable main" | sudo tee /etc/apt/sources.list.d/loc.list >/dev/null
-sudo apt update
-sudo apt install loc
+```text
+Locality_Windows_v<version>.exe
 ```
 
-On Fedora, RHEL, or compatible distributions:
-
-```bash
-sudo curl -fsSL -o /etc/yum.repos.d/loc.repo https://codeflash-ai.github.io/locality/rpm/loc.repo
-sudo dnf install loc
-```
+For CLI workflows, make sure `loc` is available on your shell path. On macOS direct installs, open the desktop app once and complete onboarding so Locality can install or refresh the terminal command.
 
 ## 2. Connect Notion
 

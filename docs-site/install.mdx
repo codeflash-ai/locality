@@ -1,56 +1,30 @@
 ---
 title: "Install Locality"
-description: "Install Locality on macOS, Linux, or Windows from package managers or GitHub release artifacts."
+description: "Install Locality on macOS, Linux, or Windows from GitHub release artifacts."
 ---
 
-Install through a managed package path when possible. Use GitHub Releases when you need a direct installer, AppImage, or a specific release asset.
-
-<Note>
-  Placeholder for install demo video: install on macOS, connect Notion, open the Locality folder, and run `loc doctor`.
-</Note>
+The documented public install path is GitHub Releases. Download the asset for your operating system from the latest finalized release.
 
 ## Recommended paths
 
-| OS | Recommended install | Direct release asset |
+| OS | Release asset | Download |
 | --- | --- | --- |
-| macOS | Homebrew cask | `Locality_Mac_v<version>.dmg` |
-| Debian or Ubuntu | APT repository | `Locality_Linux_v<version>.deb` |
-| Fedora, RHEL, or compatible | DNF repository | `Locality_Linux_v<version>.rpm` |
-| Linux desktop self-update | AppImage | `Locality_Linux_v<version>.AppImage` |
-| Windows | GitHub installer | `Locality_Windows_v<version>.exe` |
+| macOS | `Locality_Mac.dmg` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Mac.dmg" target="_blank" rel="noopener noreferrer">Download DMG</a> |
+| Debian or Ubuntu | `Locality_Linux.deb` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb" target="_blank" rel="noopener noreferrer">Download DEB</a> |
+| Fedora, RHEL, or compatible | `Locality_Linux.rpm` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.rpm" target="_blank" rel="noopener noreferrer">Download RPM</a> |
+| Linux desktop self-update | `Locality_Linux.AppImage` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.AppImage" target="_blank" rel="noopener noreferrer">Download AppImage</a> |
+| Windows | `Locality_Windows.exe` | <a href="https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Windows.exe" target="_blank" rel="noopener noreferrer">Download EXE</a> |
 
 Release assets also include updater manifests such as `latest-macos.json`, `latest-linux.json`, and `latest-windows.json`, plus checksums and signatures where available.
 
-Stable latest-release URLs can use the unversioned aliases:
+The download links use stable latest-release aliases and open the GitHub Release asset in a new tab. For a specific version, use the full GitHub Releases page.
 
-```text
-https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Mac.dmg
-https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb
-https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.rpm
-https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.AppImage
-https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Windows.exe
-```
+Package-manager channels will be documented after they are publicly published and linked from a finalized release.
 
 ## macOS
 
-Use Homebrew for the normal macOS install:
-
-```bash
-brew tap codeflash-ai/tap
-brew install --cask loc
-```
-
-Update:
-
-```bash
-brew update
-brew upgrade --cask loc
-```
-
-Direct download:
-
 1. Open the GitHub Releases page.
-2. Download the latest notarized Apple Silicon DMG: `Locality_Mac_v<version>.dmg`.
+2. Download the latest finalized Apple Silicon DMG: `Locality_Mac_v<version>.dmg`.
 3. Move `Locality.app` to Applications.
 4. Open Locality and complete onboarding.
 
@@ -58,40 +32,25 @@ The public macOS build is currently Apple Silicon focused.
 
 ## Linux
 
-On Debian or Ubuntu:
+On Debian or Ubuntu, download the `.deb` release asset and install it locally:
 
 ```bash
-curl -fsSL https://codeflash-ai.github.io/locality/apt/codeflash-loc.asc | sudo gpg --dearmor -o /usr/share/keyrings/codeflash-loc.gpg
-echo "deb [signed-by=/usr/share/keyrings/codeflash-loc.gpg] https://codeflash-ai.github.io/locality/apt stable main" | sudo tee /etc/apt/sources.list.d/loc.list >/dev/null
-sudo apt update
-sudo apt install loc
+curl -L -o /tmp/locality.deb https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.deb
+sudo apt install /tmp/locality.deb
 ```
 
-Update:
+On Fedora, RHEL, or compatible distributions, download the `.rpm` release asset and install it locally:
 
 ```bash
-sudo apt update
-sudo apt upgrade loc
+curl -L -o /tmp/locality.rpm https://github.com/codeflash-ai/locality/releases/latest/download/Locality_Linux.rpm
+sudo dnf install /tmp/locality.rpm
 ```
 
-On Fedora, RHEL, or compatible distributions:
-
-```bash
-sudo curl -fsSL -o /etc/yum.repos.d/loc.repo https://codeflash-ai.github.io/locality/rpm/loc.repo
-sudo dnf install loc
-```
-
-Update:
-
-```bash
-sudo dnf upgrade loc
-```
-
-Linux packages require `fuse3` and `systemd`. The packages install the desktop app plus `loc`, `localityd`, and the FUSE projection helper.
+Linux packages require `fuse3` and `systemd`. The packages include the desktop app plus `loc`, `localityd`, and the FUSE projection helper.
 
 ### AppImage
 
-Use AppImage when you want the Tauri self-update channel instead of distro package updates:
+Use AppImage when you want a single-file Linux desktop artifact:
 
 ```bash
 mkdir -p ~/.local/bin
@@ -102,7 +61,7 @@ chmod +x ~/.local/bin/Locality.AppImage
 
 ## Windows
 
-Download the latest Windows installer from GitHub Releases:
+Download the Windows installer from the latest finalized GitHub Release:
 
 ```text
 Locality_Windows_v<version>.exe
