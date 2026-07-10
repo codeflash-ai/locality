@@ -1042,6 +1042,10 @@ impl ChildRefreshQueue {
         self.pending.len()
     }
 
+    fn contains(&self, key: &ChildRefreshKey) -> bool {
+        self.pending.contains_key(key)
+    }
+
     fn queue(&mut self, request: ChildRefreshRequest) -> bool {
         let key = request.key();
         let inserted = !self.pending.contains_key(&key);
@@ -1128,6 +1132,7 @@ struct RuntimeState {
     child_refreshes: ChildRefreshQueue,
     active_child_refreshes: BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
     completed_child_refreshes: BTreeMap<ChildRefreshKey, ChildRefreshPriority>,
+    pending_file_provider_children: BTreeMap<ChildRefreshKey, Vec<FileProviderChildrenWaiter>>,
     hydration: HydrationQueue,
     freshness: FreshnessQueue,
     deferred_hydration: Vec<HydrationRequest>,
@@ -1157,6 +1162,12 @@ impl ActiveChildRefresh {
         let status = ActiveRuntimeJob::from_child_refresh(&request);
         Self { request, status }
     }
+}
+
+struct FileProviderChildrenWaiter {
+    mount_id: String,
+    container_identifier: String,
+    respond_to: Sender<DaemonResponse>,
 }
 
 impl ActiveRuntimeJob {
@@ -1229,6 +1240,7 @@ impl RuntimeState {
             child_refreshes,
             active_child_refreshes: BTreeMap::new(),
             completed_child_refreshes: BTreeMap::new(),
+            pending_file_provider_children: BTreeMap::new(),
             hydration,
             freshness: FreshnessQueue::new(),
             deferred_hydration: Vec::new(),
@@ -1421,13 +1433,23 @@ impl RuntimeState {
                 mount_id,
                 container_identifier,
             } => {
-                self.pending_requests
-                    .push_front(MutatingRequest::FileProviderChildren {
+                if self.file_provider_children_should_wait_for_discovery(
+                    &mount_id,
+                    &container_identifier,
+                ) {
+                    self.wait_for_file_provider_children_refresh(
                         mount_id,
                         container_identifier,
                         respond_to,
-                    });
-                self.maybe_start_next_job();
+                    );
+                } else {
+                    let response = self.runner.run_virtual_fs_children(
+                        self.config.state_root.clone(),
+                        mount_id,
+                        container_identifier,
+                    );
+                    let _ = respond_to.send(response);
+                }
             }
             DaemonRequest::VirtualFsMaterialize {
                 mount_id,
@@ -1609,35 +1631,26 @@ impl RuntimeState {
                     self.queue_auto_push(target);
                 }
             }
-            JobCompletion::FileProviderChildren {
-                response,
-                respond_to,
-                mount_id,
-                container_identifier,
-                refresh_result,
-            } => {
-                let _ = respond_to.send(response);
-                self.handle_child_refresh_result(
-                    &mount_id,
-                    &container_identifier,
-                    ChildRefreshPriority::Interactive,
-                    0,
-                    refresh_result,
-                );
-            }
             JobCompletion::VirtualFsRefreshChildren {
                 mount_id,
                 container_identifier,
                 depth,
                 priority,
                 result,
-            } => self.handle_child_refresh_result(
-                &mount_id,
-                &container_identifier,
-                priority,
-                depth,
-                result,
-            ),
+            } => {
+                self.handle_child_refresh_result(
+                    &mount_id,
+                    &container_identifier,
+                    priority,
+                    depth,
+                    &result,
+                );
+                self.respond_file_provider_children_waiters(
+                    &mount_id,
+                    &container_identifier,
+                    &result,
+                );
+            }
             JobCompletion::ScheduledPull(result) => match result {
                 Ok(result) => {
                     for request in result.queued_hydrations {
@@ -1742,7 +1755,7 @@ impl RuntimeState {
         container_identifier: &str,
         priority: ChildRefreshPriority,
         depth: u32,
-        result: locality_core::LocalityResult<VirtualFsRefreshChildrenReport>,
+        result: &locality_core::LocalityResult<VirtualFsRefreshChildrenReport>,
     ) {
         match result {
             Ok(report) => {
@@ -2047,6 +2060,70 @@ impl RuntimeState {
         self.persist_child_refresh(&request);
         self.child_refreshes.queue(request);
         self.maybe_start_next_job();
+    }
+
+    fn file_provider_children_should_wait_for_discovery(
+        &self,
+        mount_id: &str,
+        container_identifier: &str,
+    ) -> bool {
+        let key = ChildRefreshKey {
+            mount_id: mount_id.to_string(),
+            container_identifier: container_identifier.to_string(),
+        };
+        self.child_refreshes.contains(&key) || self.active_child_refreshes.contains_key(&key)
+    }
+
+    fn wait_for_file_provider_children_refresh(
+        &mut self,
+        mount_id: String,
+        container_identifier: String,
+        respond_to: Sender<DaemonResponse>,
+    ) {
+        let key = ChildRefreshKey {
+            mount_id: mount_id.clone(),
+            container_identifier: container_identifier.clone(),
+        };
+        self.pending_file_provider_children
+            .entry(key)
+            .or_default()
+            .push(FileProviderChildrenWaiter {
+                mount_id: mount_id.clone(),
+                container_identifier: container_identifier.clone(),
+                respond_to,
+            });
+        self.queue_child_refresh(
+            mount_id,
+            container_identifier,
+            ChildRefreshPriority::Interactive,
+            0,
+        );
+    }
+
+    fn respond_file_provider_children_waiters(
+        &mut self,
+        mount_id: &str,
+        container_identifier: &str,
+        refresh_result: &locality_core::LocalityResult<VirtualFsRefreshChildrenReport>,
+    ) {
+        let key = ChildRefreshKey {
+            mount_id: mount_id.to_string(),
+            container_identifier: container_identifier.to_string(),
+        };
+        let Some(waiters) = self.pending_file_provider_children.remove(&key) else {
+            return;
+        };
+
+        for waiter in waiters {
+            let response = file_provider_children_response_after_refresh(
+                Arc::clone(&self.runner),
+                self.config.state_root.clone(),
+                waiter.mount_id,
+                waiter.container_identifier,
+                refresh_result,
+            );
+            let _ = waiter.respond_to.send(response);
+        }
     }
 
     fn persist_child_refresh(&self, request: &ChildRefreshRequest) {
@@ -3365,31 +3442,6 @@ fn run_job(
                 auto_push_targets: Vec::new(),
             }
         }
-        MutatingJob::Request(MutatingRequest::FileProviderChildren {
-            mount_id,
-            container_identifier,
-            respond_to,
-        }) => {
-            let refresh_result = runner.run_virtual_fs_refresh_children(
-                state_root.clone(),
-                mount_id.clone(),
-                container_identifier.clone(),
-            );
-            let response = file_provider_children_response_after_refresh(
-                runner,
-                state_root,
-                mount_id.clone(),
-                container_identifier.clone(),
-                &refresh_result,
-            );
-            JobCompletion::FileProviderChildren {
-                response,
-                respond_to,
-                mount_id,
-                container_identifier,
-                refresh_result,
-            }
-        }
         MutatingJob::Request(MutatingRequest::VirtualFsCommitWrite {
             mount_id,
             identifier,
@@ -3402,6 +3454,9 @@ fn run_job(
                 identifier,
                 contents_base64,
             );
+            if response_live_mode_signal_needed(&response) {
+                let _ = locality_store::publish_live_mode_state_change_signal(&state_root);
+            }
             let freshness_jobs = response_local_edit_observe_jobs(&response);
             let auto_push_targets = response_auto_push_targets(&state_root, &response);
             JobCompletion::Response {
@@ -3536,6 +3591,15 @@ fn response_local_edit_observe_jobs(response: &DaemonResponse) -> Vec<SyncJob> {
     }
 
     response_observe_jobs(response, ChangeHintKind::LocalEdited)
+}
+
+fn response_live_mode_signal_needed(response: &DaemonResponse) -> bool {
+    response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("hydration"))
+        .and_then(Value::as_str)
+        .is_some_and(|hydration| matches!(hydration, "dirty" | "conflicted"))
 }
 
 fn response_auto_push_targets(state_root: &Path, response: &DaemonResponse) -> Vec<PathBuf> {
@@ -3676,11 +3740,6 @@ enum MutatingRequest {
         identifier: String,
         respond_to: Sender<DaemonResponse>,
     },
-    FileProviderChildren {
-        mount_id: String,
-        container_identifier: String,
-        respond_to: Sender<DaemonResponse>,
-    },
     VirtualFsCommitWrite {
         mount_id: String,
         identifier: String,
@@ -3772,14 +3831,6 @@ impl MutatingRequest {
                 "file_provider_read".to_string(),
                 Some(format!("{mount_id}:{identifier}")),
             ),
-            Self::FileProviderChildren {
-                mount_id,
-                container_identifier,
-                ..
-            } => (
-                "file_provider_children".to_string(),
-                Some(format!("{mount_id}:{container_identifier}")),
-            ),
             Self::VirtualFsCommitWrite {
                 mount_id,
                 identifier,
@@ -3845,13 +3896,6 @@ enum JobCompletion {
         respond_to: Sender<DaemonResponse>,
         freshness_jobs: Vec<SyncJob>,
         auto_push_targets: Vec<PathBuf>,
-    },
-    FileProviderChildren {
-        response: DaemonResponse,
-        respond_to: Sender<DaemonResponse>,
-        mount_id: String,
-        container_identifier: String,
-        refresh_result: locality_core::LocalityResult<VirtualFsRefreshChildrenReport>,
     },
     VirtualFsRefreshChildren {
         mount_id: String,
@@ -4899,7 +4943,7 @@ mod tests {
     }
 
     #[test]
-    fn file_provider_children_queues_interactive_runtime_request() {
+    fn file_provider_children_returns_cached_listing_without_pending_discovery() {
         let state_root = temp_runtime_root("runtime-file-provider-children-interactive-discovery");
         seed_virtual_mount(&state_root);
         let mut runtime = runtime_state_for_root(state_root.clone());
@@ -4914,19 +4958,9 @@ mod tests {
             respond_to,
         );
 
-        assert!(response.try_recv().is_err());
-        assert_eq!(runtime.pending_requests.len(), 1);
-        assert_eq!(
-            runtime
-                .pending_requests
-                .front()
-                .expect("pending file provider request")
-                .active_status_parts(),
-            (
-                "file_provider_children".to_string(),
-                Some("notion-main:mount:notion-main".to_string())
-            )
-        );
+        assert!(response.try_recv().expect("cached response").ok);
+        assert!(runtime.pending_requests.is_empty());
+        assert!(runtime.pending_file_provider_children.is_empty());
         assert!(runtime.child_refreshes.debug_requests(10).is_empty());
 
         let jobs = SqliteStateStore::open(state_root.clone())
@@ -4939,7 +4973,7 @@ mod tests {
     }
 
     #[test]
-    fn file_provider_children_runtime_request_does_not_precompute_structural_depth() {
+    fn file_provider_children_cached_page_directory_does_not_queue_structural_depth() {
         let state_root =
             temp_runtime_root("runtime-file-provider-children-interactive-structural-depth");
         seed_virtual_mount(&state_root);
@@ -4967,25 +5001,85 @@ mod tests {
             respond_to,
         );
 
-        assert!(response.try_recv().is_err());
-        assert_eq!(runtime.pending_requests.len(), 1);
-        assert_eq!(
-            runtime
-                .pending_requests
-                .front()
-                .expect("pending file provider request")
-                .active_status_parts(),
-            (
-                "file_provider_children".to_string(),
-                Some("notion-main:children:page-1".to_string())
-            )
-        );
+        assert!(response.try_recv().expect("cached response").ok);
+        assert!(runtime.pending_requests.is_empty());
+        assert!(runtime.pending_file_provider_children.is_empty());
         assert!(runtime.child_refreshes.debug_requests(10).is_empty());
 
         let jobs = SqliteStateStore::open(state_root.clone())
             .expect("open store")
             .list_metadata_discovery_jobs()
             .expect("list discovery");
+        assert!(jobs.is_empty());
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn file_provider_children_promotes_pending_discovery_and_waits_for_refresh() {
+        let state_root =
+            temp_runtime_root("runtime-file-provider-children-pending-discovery-waits");
+        seed_virtual_mount(&state_root);
+        {
+            let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+            store
+                .save_entity(EntityRecord::new(
+                    MountId::new("notion-main"),
+                    RemoteId::new("page-1"),
+                    EntityKind::Page,
+                    "Roadmap",
+                    "Teams/Roadmap/page.md",
+                ))
+                .expect("save page");
+            store
+                .upsert_metadata_discovery_job(metadata_discovery_job(
+                    "children:page-1",
+                    MetadataDiscoveryPriority::Background,
+                    2,
+                ))
+                .expect("queue discovery");
+        }
+        let mut runtime = runtime_state_for_root(state_root.clone());
+        runtime.active_job = Some(test_active_job());
+
+        let (respond_to, response) = std::sync::mpsc::channel();
+        runtime.handle_request(
+            DaemonRequest::FileProviderChildren {
+                mount_id: "notion-main".to_string(),
+                container_identifier: "children:page-1".to_string(),
+            },
+            respond_to,
+        );
+
+        assert!(response.try_recv().is_err());
+        assert!(runtime.pending_requests.is_empty());
+        assert_eq!(runtime.pending_file_provider_children.len(), 1);
+        let requests = runtime.child_refreshes.debug_requests(10);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].container_identifier, "children:page-1");
+        assert_eq!(requests[0].priority, ChildRefreshPriority::Interactive);
+
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("open store")
+            .list_metadata_discovery_jobs()
+            .expect("list discovery");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].priority, MetadataDiscoveryPriority::Interactive);
+
+        runtime.handle_completion(JobCompletion::VirtualFsRefreshChildren {
+            mount_id: "notion-main".to_string(),
+            container_identifier: "children:page-1".to_string(),
+            depth: 2,
+            priority: ChildRefreshPriority::Interactive,
+            result: Ok(VirtualFsRefreshChildrenReport::default()),
+        });
+
+        assert!(response.try_recv().expect("refreshed response").ok);
+        assert!(runtime.pending_file_provider_children.is_empty());
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("open store")
+            .list_metadata_discovery_jobs()
+            .expect("list discovery after refresh");
         assert!(jobs.is_empty());
 
         let _ = std::fs::remove_dir_all(state_root);

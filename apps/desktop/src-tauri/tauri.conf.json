@@ -13,23 +13,7 @@
   "app": {
     "withGlobalTauri": false,
     "macOSPrivateApi": true,
-    "windows": [
-      {
-        "label": "main",
-        "title": "Locality",
-        "width": 960,
-        "height": 680,
-        "minWidth": 860,
-        "minHeight": 620,
-        "resizable": true,
-        "center": true,
-        "decorations": true,
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
-        "transparent": false,
-        "shadow": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }
