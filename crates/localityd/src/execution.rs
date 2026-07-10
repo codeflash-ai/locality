@@ -13,6 +13,7 @@ use locality_core::hydration::HydrationRequest;
 use locality_core::journal::{JournalStatus, PushId};
 use locality_core::model::{MountId, RemoteId};
 use locality_core::push::{PushExecutionResult, PushPipelineResult};
+use locality_core::readable_diff::ReadableDiffOutput;
 use serde::{Deserialize, Serialize};
 
 use crate::hydration::{HydrationDrainReport, HydrationOutcome, HydrationSource};
@@ -70,6 +71,7 @@ pub struct PushJobReport {
     pub mount_id: MountId,
     pub entity_id: RemoteId,
     pub pipeline: PushPipelineResult,
+    pub readable_diff: Option<ReadableDiffOutput>,
     pub action: PushJobAction,
     pub execution: Option<PushExecutionResult>,
     pub push_id: Option<PushId>,

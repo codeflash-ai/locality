@@ -640,7 +640,7 @@ fn diff_plain_text_summary_includes_entity_creates() {
         .expect("run loc diff");
 
     assert!(
-        output.status.code() == Some(4),
+        output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -686,7 +686,7 @@ fn diff_plain_text_output_includes_readable_patch() {
         .expect("run loc diff");
 
     assert!(
-        output.status.code() == Some(4),
+        output.status.success(),
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)

@@ -171,6 +171,7 @@ where
             mount_id: prepared.mount.mount_id,
             entity_id: prepared.entity.remote_id,
             pipeline: prepared.pipeline,
+            readable_diff: prepared.readable_diff,
             action: PushJobAction::NotReady,
             execution: None,
             push_id: None,
@@ -334,7 +335,7 @@ where
         previous_push_id,
         created_at_unix_ms,
     ))
-    .with_readable_diff(readable_diff);
+    .with_readable_diff(readable_diff.clone());
 
     if !prepared.shadows.is_empty() {
         execution_request = execution_request.with_preimages(
@@ -372,6 +373,7 @@ where
             mount_id: prepared.mount.mount_id,
             entity_id: prepared.entity.remote_id,
             pipeline: prepared.pipeline,
+            readable_diff: readable_diff.clone(),
             action: PushJobAction::from_execution(&result),
             push_id: Some(result.push_id.clone()),
             journal_status: result.journal_status.clone(),
@@ -383,6 +385,7 @@ where
             mount_id: prepared.mount.mount_id,
             entity_id: prepared.entity.remote_id,
             pipeline: prepared.pipeline,
+            readable_diff,
             action: PushJobAction::Failed,
             execution: None,
             push_id: Some(push_id.clone()),

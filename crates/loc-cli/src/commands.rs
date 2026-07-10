@@ -4106,6 +4106,7 @@ fn verify_daemon_push_plan_matches_cli_preview(
 fn push_preview_plan_matches(cli_preview: &PushReport, daemon_preview: &PushReport) -> bool {
     cli_preview.validation == daemon_preview.validation
         && cli_preview.plan == daemon_preview.plan
+        && cli_preview.readable_diff == daemon_preview.readable_diff
         && cli_preview.guardrail == daemon_preview.guardrail
 }
 
@@ -4235,7 +4236,7 @@ fn diff(args: &[String], json: bool) -> i32 {
             exit_code
         }
         Ok(report) => {
-            let exit_code = diff_plain_report_exit_code(&report);
+            let exit_code = diff_report_exit_code(&report);
             print_diff_report(&report);
             exit_code
         }
@@ -6637,13 +6638,6 @@ fn diff_report_exit_code(report: &crate::diff::DiffReport) -> i32 {
     }
 }
 
-fn diff_plain_report_exit_code(report: &crate::diff::DiffReport) -> i32 {
-    match report.action.as_str() {
-        "confirm_plan" | "confirm_dangerous_plan" => 4,
-        _ => diff_report_exit_code(report),
-    }
-}
-
 fn pull_report_exit_code(report: &PullReport) -> i32 {
     if report.ok {
         EXIT_SUCCESS
@@ -7192,9 +7186,9 @@ mod tests {
         print_push_confirmation_preview, projection_mode_for_target,
         projection_usage_options_for_target, prompt_for_push_confirmation,
         pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
-        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
-        spinner_config_for_command, spinner_enabled, status as run_status_command,
-        validate_virtual_projection_registration, write_log_report,
+        push_preview_plan_matches, should_prompt_for_push_confirmation,
+        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
+        status as run_status_command, validate_virtual_projection_registration, write_log_report,
     };
 
     #[test]
@@ -7799,6 +7793,18 @@ mod tests {
     }
 
     #[test]
+    fn confirm_plan_diff_report_exits_successfully_when_clean() {
+        let mut report = report(true);
+        report.action = "confirm_plan".to_string();
+        report.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n".to_string(),
+        });
+
+        assert_eq!(diff_report_exit_code(&report), EXIT_SUCCESS);
+    }
+
+    #[test]
     fn push_report_exit_codes_track_gate_states() {
         assert_eq!(
             crate::push::push_report_exit_code(&push_report("noop")),
@@ -7927,6 +7933,25 @@ mod tests {
         assert!(!push_confirmation_preview_matches_displayed(
             &displayed, &refreshed
         ));
+    }
+
+    #[test]
+    fn daemon_push_preview_match_includes_readable_diff() {
+        let mut cli_preview = push_report("confirm_plan");
+        cli_preview.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n-Old\n+New\n".to_string(),
+        });
+        let mut daemon_preview = cli_preview.clone();
+
+        assert!(push_preview_plan_matches(&cli_preview, &daemon_preview));
+
+        daemon_preview.readable_diff = Some(locality_core::readable_diff::ReadableDiffOutput {
+            files: Vec::new(),
+            text: "diff --locality a/Roadmap.md b/Roadmap.md\n-Old\n+Different\n".to_string(),
+        });
+
+        assert!(!push_preview_plan_matches(&cli_preview, &daemon_preview));
     }
 
     #[test]

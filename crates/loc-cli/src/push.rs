@@ -223,6 +223,7 @@ impl PushReport {
             mount_id,
             entity_id,
             pipeline,
+            readable_diff,
             action,
             execution,
             push_id,
@@ -252,7 +253,7 @@ impl PushReport {
                 .map(ValidationIssueOutput::from)
                 .collect(),
             plan: pipeline.plan.map(PushPlanOutput::from),
-            readable_diff: None,
+            readable_diff,
             guardrail: GuardrailOutput::from(pipeline.guardrail),
             action: daemon_action_name(&action, &pipeline_action, error.as_ref()).to_string(),
             pipeline_action,
