@@ -419,11 +419,11 @@ Locality projects connected company sources, including Notion, into the local fi
 
 ## Safe workflow
 
-1. If the user gives a Notion URL, locate the matching local Markdown file before editing.
+1. If the user gives a Notion URL, run `loc locate <url>` and edit the printed local Markdown path.
 2. Edit the local Markdown file directly.
 3. Do not edit Locality identity frontmatter, block IDs, `::loc{{...}}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
 4. Leave edits pending for Locality review and tell the user what changed.
-5. If an Locality CLI is available, use `loc status` only when you need to inspect pending changes; regular clean files hydrate automatically on open.
+5. Use `loc status` only when you need to inspect pending changes; regular clean files hydrate automatically on open.
 6. If desktop Live Mode is on, safe local edits may sync automatically. Do not run routine `loc pull` or `loc push` after every edit.
 7. Only push when the user explicitly asks or when Live Mode pauses for review. Run `loc diff <file>` first, then `loc push <file> -y` for safe plans.
 8. If push says the remote changed since last sync, run `loc pull <file>`, resolve any inline conflict markers in the Markdown, rerun `loc diff <file>`, then push again.
