@@ -102,8 +102,10 @@ use localityd::virtual_fs::{
 };
 use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use tauri::TitleBarStyle;
 use tauri::{
-    AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, Rect, TitleBarStyle, WebviewUrl,
+    AppHandle, Manager, PhysicalPosition, PhysicalSize, Position, Rect, WebviewUrl,
     WebviewWindowBuilder,
     image::Image,
     menu::{Menu, MenuItem, Submenu},
@@ -14706,19 +14708,21 @@ fn build_main_window(app: &AppHandle) -> tauri::Result<()> {
     if app.get_webview_window("main").is_some() {
         return Ok(());
     }
-    WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+    let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
         .title("Locality")
         .inner_size(960.0, 680.0)
         .min_inner_size(860.0, 620.0)
         .resizable(true)
         .center()
         .decorations(true)
-        .title_bar_style(TitleBarStyle::Overlay)
-        .hidden_title(true)
         .transparent(false)
         .shadow(true)
-        .visible(false)
-        .build()?;
+        .visible(false);
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(TitleBarStyle::Overlay)
+        .hidden_title(true);
+    builder.build()?;
     Ok(())
 }
 

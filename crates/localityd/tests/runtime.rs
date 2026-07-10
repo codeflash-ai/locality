@@ -22,7 +22,7 @@ use localityd::DaemonConfig;
 use localityd::execution::{DaemonEventReport, PushJob};
 use localityd::freshness::freshness_timestamp;
 use localityd::hydration::HydrationOutcome;
-use localityd::ipc::{DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
+use localityd::ipc::{DaemonDebugQueueStatus, DaemonRequest, DaemonResponse, DaemonRuntimeStatus};
 use localityd::runtime::{
     DaemonRuntime, DaemonRuntimeHandle, DefaultRuntimeJobRunner, FileEventRuntimeReport,
     FreshnessRuntimeReport, RuntimeJobRunner, ScheduledPullRuntimeReport,
@@ -1217,6 +1217,7 @@ fn runtime_scheduler_simulates_mixed_interactive_and_background_workload() {
     );
     simulation.release(mount_point_refresh);
     simulation.expect_no_start();
+    simulation.wait_for_child_refresh_queued("children:page-a");
 
     simulation.advance_to(
         10,
@@ -2325,6 +2326,31 @@ impl SchedulerPolicySimulation {
                 self.input_log
             ),
         }
+    }
+
+    fn wait_for_child_refresh_queued(&self, container_identifier: &str) {
+        let target = format!("notion-main:{container_identifier}");
+        for _ in 0..40 {
+            let response = self.handle.request(DaemonRequest::DebugQueueStatus);
+            assert!(response.ok, "debug queue request failed: {response:?}");
+            let payload = response.payload.expect("debug queue payload");
+            let snapshot: DaemonDebugQueueStatus =
+                serde_json::from_value(payload).expect("decode debug queue");
+            if snapshot.sections.iter().any(|section| {
+                section.name == "child_refreshes"
+                    && section
+                        .items
+                        .iter()
+                        .any(|item| item.target.as_deref() == Some(target.as_str()))
+            }) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!(
+            "child refresh {target} was not queued; input log: {:?}",
+            self.input_log
+        );
     }
 
     fn release(&self, operation: SchedulerStartedOperation) {
