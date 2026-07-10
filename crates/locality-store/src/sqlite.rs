@@ -11,10 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use locality_core::LocalityResult;
 use locality_core::hydration::HydrationReason;
 use locality_core::journal::{
-    JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, JournalStore, PushId,
+    JournalApplyEffect, JournalEntry, JournalMetadata, JournalPreimage, JournalStatus,
+    JournalStore, PushId,
 };
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::{PlanSummary, PushOperation, PushPlan};
+use locality_core::readable_diff::ReadableDiffOutput;
 use locality_core::shadow::ShadowDocument;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
@@ -42,7 +44,7 @@ use crate::repository::{
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
@@ -51,6 +53,8 @@ const RETIRED_NOTION_PRIVATE_ROOT_ID: &str = "notion-root:private";
 const RETIRED_NOTION_WORKSPACE_ROOT_ID: &str = "notion-root:workspace";
 const ENTITY_SEARCH_CANDIDATE_LIMIT: i64 = 256;
 const DEFAULT_NOTION_CAPABILITIES_JSON: &str = "{\"supports_block_updates\":true,\"supports_databases\":true,\"supports_oauth\":true,\"supports_remote_observation\":true,\"supports_lazy_child_enumeration\":true,\"supports_media_download\":true,\"supports_undo\":true,\"supports_batch_observation\":false}";
+const DEFAULT_JOURNAL_METADATA_JSON: &str =
+    "{\"author\":{\"kind\":\"anonymous\",\"display_name\":\"anonymous\"}}";
 const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "core:schema",
@@ -109,7 +113,7 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:journals",
         component_kind: "durable_json",
-        current_version: 1,
+        current_version: 2,
         min_reader_version: 1,
         required: true,
         rebuildable: false,
@@ -1357,9 +1361,11 @@ impl JournalRepository for SqliteStateStore {
                 plan_json,
                 preimages_json,
                 apply_effects_json,
-                status_json
+                status_json,
+                metadata_json,
+                readable_diff_json
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 entry.push_id.0,
                 entry.mount_id.0,
@@ -1368,6 +1374,8 @@ impl JournalRepository for SqliteStateStore {
                 to_json(&entry.preimages)?,
                 to_json(&entry.apply_effects)?,
                 to_json(&entry.status)?,
+                to_json(&entry.metadata)?,
+                optional_to_json(&entry.readable_diff)?,
             ],
         )?;
         Ok(())
@@ -1417,7 +1425,7 @@ impl JournalRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_effects_json, status_json
+                "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_effects_json, status_json, metadata_json, readable_diff_json
                  FROM journals
                  WHERE push_id = ?1",
                 params![push_id.0],
@@ -1431,7 +1439,7 @@ impl JournalRepository for SqliteStateStore {
     fn list_journal(&self) -> StoreResult<Vec<JournalEntry>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_effects_json, status_json
+            "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_effects_json, status_json, metadata_json, readable_diff_json
              FROM journals
              ORDER BY push_id",
         )?;
@@ -1585,7 +1593,17 @@ type EntityRow = (
 );
 type HydrationJobRow = (String, String, String, String, String, i64, Option<String>);
 type ShadowRow = (String, String, String, String, String, String);
-type JournalRow = (String, String, String, String, String, String, String);
+type JournalRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+);
 type VirtualMutationRow = (
     String,
     String,
@@ -1667,6 +1685,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         ensure_state_components_allow_schema_migration(connection, user_version)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
+        migrate_journals_component_to_v2(connection)?;
         migrate_virtual_mutations_component_to_v2(connection)?;
         return Ok(());
     }
@@ -1862,6 +1881,8 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             preimages_json TEXT NOT NULL DEFAULT '[]',
             apply_effects_json TEXT NOT NULL DEFAULT '[]',
             status_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{\"author\":{\"kind\":\"anonymous\",\"display_name\":\"anonymous\"}}',
+            readable_diff_json TEXT,
             FOREIGN KEY (mount_id) REFERENCES mounts(mount_id) ON DELETE CASCADE
         );
         ",
@@ -2084,6 +2105,30 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         }
     }
 
+    if user_version < 17 {
+        if !column_exists(connection, "journals", "metadata_json")? {
+            connection.execute_batch(
+                "ALTER TABLE journals
+                 ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{\"author\":{\"kind\":\"anonymous\",\"display_name\":\"anonymous\"}}';",
+            )?;
+        }
+        connection.execute(
+            "UPDATE journals
+             SET metadata_json = ?1
+             WHERE metadata_json = '{}'",
+            params![DEFAULT_JOURNAL_METADATA_JSON],
+        )?;
+        if !column_exists(connection, "journals", "readable_diff_json")? {
+            connection.execute_batch(
+                "ALTER TABLE journals
+                 ADD COLUMN readable_diff_json TEXT;",
+            )?;
+        }
+        if user_version >= 13 {
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
@@ -2138,6 +2183,13 @@ fn state_component_issue_allows_schema_migration(
             found: 1,
             current: WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION,
         } if component_id == "projection:windows_cloud_files"
+    ) || matches!(
+        issue,
+        StateCompatibilityIssue::OlderComponent {
+            component_id,
+            found: 1,
+            current: 2,
+        } if component_id == "durable:journals"
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -2504,6 +2556,8 @@ fn journal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalRow> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
     ))
 }
 
@@ -2517,7 +2571,21 @@ fn journal_from_row(row: JournalRow) -> StoreResult<JournalEntry> {
         preimages: from_json::<Vec<JournalPreimage>>(&row.4)?,
         apply_effects: journal_apply_effects_from_json(&row.5, &operation_index_map)?,
         status: from_json(&row.6)?,
+        metadata: journal_metadata_from_json(&row.7)?,
+        readable_diff: row
+            .8
+            .as_deref()
+            .map(from_json::<ReadableDiffOutput>)
+            .transpose()?,
     })
+}
+
+fn journal_metadata_from_json(value: &str) -> StoreResult<JournalMetadata> {
+    if value == "{}" {
+        Ok(JournalMetadata::default())
+    } else {
+        from_json::<JournalMetadata>(value)
+    }
 }
 
 fn journal_plan_from_json(value: &str) -> StoreResult<(PushPlan, Vec<Option<usize>>)> {
@@ -2872,6 +2940,10 @@ fn migrate_windows_cloud_files_projection_layout_to_v2(
 
 fn migrate_virtual_mutations_component_to_v2(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
+}
+
+fn migrate_journals_component_to_v2(connection: &Connection) -> StoreResult<()> {
+    migrate_state_component_to_current(connection, "durable:journals")
 }
 
 fn migrate_state_component_to_current(
@@ -3665,6 +3737,10 @@ fn bool_to_int(value: bool) -> i64 {
 
 fn to_json<T: Serialize>(value: &T) -> StoreResult<String> {
     serde_json::to_string(value).map_err(Into::into)
+}
+
+fn optional_to_json<T: Serialize>(value: &Option<T>) -> StoreResult<Option<String>> {
+    value.as_ref().map(to_json).transpose()
 }
 
 fn from_json<T: DeserializeOwned>(value: &str) -> StoreResult<T> {
