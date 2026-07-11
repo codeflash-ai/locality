@@ -152,6 +152,7 @@ const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250
 const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
 const LIVE_MODE_RUNNER_ACTIVE_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_MODE_RUNNER_IDLE_RECHECK: Duration = Duration::from_secs(5 * 60);
+const LIVE_MODE_RUNNER_PERIODIC_RECHECK: Duration = LIVE_MODE_ACTIVE_REMOTE_CHECK_INTERVAL;
 const DESKTOP_BACKGROUND_LAUNCH_ARG: &str = "--background";
 
 #[derive(Clone, Serialize)]
@@ -10244,7 +10245,8 @@ mod tests {
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
 
     use super::{
-        ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION, MonitorScreenBounds,
+        ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION,
+        LIVE_MODE_RUNNER_ACTIVE_INTERVAL, LIVE_MODE_RUNNER_PERIODIC_RECHECK, MonitorScreenBounds,
         PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
         acknowledge_install_state_at, activity_timestamp, clear_mount_cached_projection,
         clear_state_root_contents, clear_visible_projection_paths, conflict_preview,
@@ -10256,9 +10258,9 @@ mod tests {
         is_unsupported_schema_version_message, live_mode_local_reconcile_targets_for_mount_at,
         live_mode_merge_remote_drift_markdown, live_mode_remote_check_page_budget_for_rate,
         live_mode_remote_pull_candidates, live_mode_remote_pull_scan_is_due_for_key,
-        live_mode_should_reconcile_local_target_for_key, live_mode_target,
-        live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
-        macos_app_bundle_for_exe, macos_file_provider_child_item_count,
+        live_mode_runner_should_tick, live_mode_should_reconcile_local_target_for_key,
+        live_mode_target, live_mode_tick_from_snapshot, live_mode_wake_generation,
+        load_desktop_activity, macos_app_bundle_for_exe, macos_file_provider_child_item_count,
         macos_file_provider_mount_root_health_error,
         macos_file_provider_mount_root_recovery_reason, mark_mount_live_mode_syncing,
         mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
@@ -14253,6 +14255,37 @@ mod tests {
     }
 
     #[test]
+    fn live_mode_runner_ticks_immediately_then_waits_for_periodic_recheck() {
+        let now = Instant::now();
+        let mut next_tick = now;
+
+        assert!(live_mode_runner_should_tick(false, now, &mut next_tick));
+        assert!(!live_mode_runner_should_tick(
+            false,
+            now + LIVE_MODE_RUNNER_ACTIVE_INTERVAL,
+            &mut next_tick
+        ));
+        assert!(live_mode_runner_should_tick(
+            false,
+            now + LIVE_MODE_RUNNER_PERIODIC_RECHECK,
+            &mut next_tick
+        ));
+    }
+
+    #[test]
+    fn live_mode_runner_signal_ticks_before_periodic_recheck() {
+        let now = Instant::now();
+        let mut next_tick = now;
+
+        assert!(live_mode_runner_should_tick(false, now, &mut next_tick));
+        assert!(live_mode_runner_should_tick(
+            true,
+            now + LIVE_MODE_RUNNER_ACTIVE_INTERVAL,
+            &mut next_tick
+        ));
+    }
+
+    #[test]
     fn desktop_activity_records_newest_first_and_caps_entries() {
         let temp = TestTempDir::new("desktop-activity");
         for index in 0..(DESKTOP_ACTIVITY_LIMIT + 2) {
@@ -15198,22 +15231,55 @@ fn should_hide_tray_popover(window_label: &str, event: &tauri::WindowEvent) -> b
 fn start_live_mode_runner(app: AppHandle) {
     std::thread::spawn(move || {
         let mut wake_generation = live_mode_wake_generation();
+        let mut next_periodic_tick = Instant::now();
         loop {
             if !mount_live_mode_enabled() {
                 wait_for_live_mode_state_change(
                     &mut wake_generation,
                     LIVE_MODE_RUNNER_IDLE_RECHECK,
                 );
+                next_periodic_tick = Instant::now();
                 continue;
             }
-            let report = live_mode_tick_blocking();
-            if live_mode_tick_should_refresh_surfaces(&report) {
-                refresh_desktop_surfaces(&app);
+
+            if live_mode_runner_should_tick(false, Instant::now(), &mut next_periodic_tick) {
+                run_live_mode_tick_for_runner(&app);
+                wake_generation = live_mode_wake_generation();
+                continue;
+            }
+
+            let woke = wait_for_live_mode_state_change(
+                &mut wake_generation,
+                LIVE_MODE_RUNNER_ACTIVE_INTERVAL,
+            );
+            if !mount_live_mode_enabled() {
+                continue;
+            }
+            if live_mode_runner_should_tick(woke, Instant::now(), &mut next_periodic_tick) {
+                run_live_mode_tick_for_runner(&app);
             }
             wake_generation = live_mode_wake_generation();
-            wait_for_live_mode_state_change(&mut wake_generation, LIVE_MODE_RUNNER_ACTIVE_INTERVAL);
         }
     });
+}
+
+fn live_mode_runner_should_tick(
+    woke: bool,
+    now: Instant,
+    next_periodic_tick: &mut Instant,
+) -> bool {
+    if woke || now >= *next_periodic_tick {
+        *next_periodic_tick = now + LIVE_MODE_RUNNER_PERIODIC_RECHECK;
+        return true;
+    }
+    false
+}
+
+fn run_live_mode_tick_for_runner(app: &AppHandle) {
+    let report = live_mode_tick_blocking();
+    if live_mode_tick_should_refresh_surfaces(&report) {
+        refresh_desktop_surfaces(app);
+    }
 }
 
 fn mount_live_mode_enabled() -> bool {
