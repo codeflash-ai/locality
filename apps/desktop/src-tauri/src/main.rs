@@ -1968,7 +1968,7 @@ fn live_mode_has_mounted_folder(snapshot: &DesktopSnapshot) -> bool {
 }
 
 fn live_mode_enabled_mount(state_root: &Path) -> Result<Option<MountConfig>, String> {
-    let store = SqliteStateStore::open(state_root.to_path_buf())
+    let mut store = SqliteStateStore::open(state_root.to_path_buf())
         .map_err(|error| format!("Live Mode could not open Locality state: {error}"))?;
     let mounts = store
         .load_mounts()
@@ -1976,11 +1976,54 @@ fn live_mode_enabled_mount(state_root: &Path) -> Result<Option<MountConfig>, Str
     let Some(mount) = choose_mount(&mounts) else {
         return Ok(None);
     };
-    let enabled = store
+    let Some(record) = store
         .get_mount_live_mode(&mount.mount_id)
         .map_err(|error| format!("Live Mode could not inspect its state: {error}"))?
-        .is_some_and(|record| record.enabled);
-    Ok(enabled.then_some(mount))
+    else {
+        return Ok(None);
+    };
+    if record.enabled {
+        return Ok(Some(mount));
+    }
+    if live_mode_resume_stale_disabled_pause_if_safe(&mut store, state_root, &mount, &record)? {
+        return Ok(Some(mount));
+    }
+    Ok(None)
+}
+
+fn live_mode_resume_stale_disabled_pause_if_safe(
+    store: &mut SqliteStateStore,
+    state_root: &Path,
+    mount: &MountConfig,
+    record: &MountLiveModeRecord,
+) -> Result<bool, String> {
+    if !live_mode_disabled_pause_can_resume(record) {
+        return Ok(false);
+    }
+    let pending_changes = pending_changes_for_mount(store, state_root, &mount.mount_id)?;
+    if pending_changes.is_empty() || pending_changes.iter().any(|change| change.state != "safe") {
+        return Ok(false);
+    }
+
+    let now = live_mode_timestamp();
+    let resumed = record.clone().active(
+        Some("Live Mode resumed after remote drift cleared.".to_string()),
+        now.clone(),
+        now,
+    );
+    store.save_mount_live_mode(resumed).map_err(|error| {
+        format!("Live Mode could not resume after remote drift cleared: {error}")
+    })?;
+    Ok(true)
+}
+
+fn live_mode_disabled_pause_can_resume(record: &MountLiveModeRecord) -> bool {
+    !record.enabled
+        && record.state == MountLiveModeState::Error
+        && record.last_reason.as_deref().is_some_and(|reason| {
+            live_mode_failure_should_pause(reason)
+                && reason.contains("remote changed while local edits are pending")
+        })
 }
 
 #[derive(Debug, Default)]
@@ -10295,12 +10338,13 @@ mod tests {
         hydration_after_editor_write, inspect_install_state, install_terminal_cli_link_at,
         install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
         is_unsupported_schema_version_message, live_mode_claim_remote_fast_forward_key,
-        live_mode_local_reconcile_targets_for_mount_at, live_mode_merge_remote_drift_markdown,
-        live_mode_release_remote_fast_forward_key, live_mode_remote_check_page_budget_for_rate,
-        live_mode_remote_pull_candidates, live_mode_remote_pull_scan_is_due_for_key,
-        live_mode_runner_should_tick, live_mode_should_reconcile_local_target_for_key,
-        live_mode_target, live_mode_tick_from_snapshot, live_mode_wake_generation,
-        load_desktop_activity, macos_app_bundle_for_exe, macos_file_provider_child_item_count,
+        live_mode_enabled_mount, live_mode_local_reconcile_targets_for_mount_at,
+        live_mode_merge_remote_drift_markdown, live_mode_release_remote_fast_forward_key,
+        live_mode_remote_check_page_budget_for_rate, live_mode_remote_pull_candidates,
+        live_mode_remote_pull_scan_is_due_for_key, live_mode_runner_should_tick,
+        live_mode_should_reconcile_local_target_for_key, live_mode_target,
+        live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
+        macos_app_bundle_for_exe, macos_file_provider_child_item_count,
         macos_file_provider_mount_root_health_error,
         macos_file_provider_mount_root_recovery_reason, mark_mount_live_mode_syncing,
         mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
@@ -11369,6 +11413,112 @@ mod tests {
         assert_eq!(summary.state, "off");
         assert_eq!(summary.label, "Live Mode off");
         assert_eq!(summary.reason, None);
+    }
+
+    #[test]
+    fn live_mode_disabled_remote_drift_pause_can_resume() {
+        let record = MountLiveModeRecord::new(MountId::new("notion-main"), true, "1").error(
+            "Live Mode paused for `Roadmap`: remote changed while local edits are pending.",
+            "2",
+            "2",
+        );
+
+        assert!(super::live_mode_disabled_pause_can_resume(&record));
+    }
+
+    #[test]
+    fn live_mode_disabled_non_remote_drift_pause_stays_paused() {
+        let record = MountLiveModeRecord::new(MountId::new("notion-main"), true, "1").error(
+            "Live Mode paused for `Roadmap`: conflict.",
+            "2",
+            "2",
+        );
+
+        assert!(!super::live_mode_disabled_pause_can_resume(&record));
+    }
+
+    #[test]
+    fn live_mode_enabled_mount_resumes_stale_remote_drift_pause_for_safe_pending_change() {
+        let temp = TestTempDir::new("live-mode-resume-stale-remote-drift");
+        let state_root = temp.path();
+        let mount_root = state_root.join("notion");
+        let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open store");
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let relative_path = Path::new("Roadmap/page.md");
+        let body = "# Roadmap\n\nOriginal body.\n";
+        let mount = MountConfig::new(mount_id.clone(), "notion", &mount_root)
+            .projection(ProjectionMode::MacosFileProvider);
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_mount_live_mode(MountLiveModeRecord::new(mount_id.clone(), true, "1").error(
+                "Live Mode paused for `Roadmap`: remote changed while local edits are pending.",
+                "2",
+                "2",
+            ))
+            .expect("save paused live mode");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    relative_path,
+                )
+                .with_hydration(HydrationState::Dirty)
+                .with_remote_edited_at("remote-v1"),
+            )
+            .expect("save entity");
+        store
+            .save_shadow(
+                &mount_id,
+                ShadowDocument::from_synced_body(
+                    remote_id.clone(),
+                    body,
+                    7,
+                    [RemoteId::new("heading-1"), RemoteId::new("paragraph-1")],
+                )
+                .expect("shadow"),
+            )
+            .expect("save shadow");
+        store
+            .save_remote_observation(
+                RemoteObservationRecord::new(
+                    mount_id.clone(),
+                    remote_id.clone(),
+                    EntityKind::Page,
+                    "Roadmap",
+                    relative_path,
+                    "unix_ms:10",
+                )
+                .with_remote_version(RemoteVersion::new("remote-v1")),
+            )
+            .expect("save observation");
+        store
+            .save_freshness_state(
+                FreshnessStateRecord::new(mount_id.clone(), remote_id.clone(), FreshnessTier::Hot)
+                    .checked_at("unix_ms:10"),
+            )
+            .expect("save freshness");
+
+        let content_path =
+            localityd::virtual_fs::virtual_fs_content_path(state_root, &mount_id, relative_path)
+                .expect("content path");
+        fs::create_dir_all(content_path.parent().expect("content parent"))
+            .expect("create content parent");
+        fs::write(&content_path, "# Roadmap\n\nLocal edit.\n").expect("write dirty content");
+
+        let selected = live_mode_enabled_mount(state_root)
+            .expect("enabled mount")
+            .expect("resumed mount");
+        assert_eq!(selected.mount_id, mount_id);
+        let record = store
+            .get_mount_live_mode(&mount_id)
+            .expect("load live mode")
+            .expect("live mode record");
+        assert!(record.enabled);
+        assert_eq!(record.state, MountLiveModeState::Active);
     }
 
     #[test]
