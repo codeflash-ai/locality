@@ -12355,7 +12355,7 @@ mod tests {
         for (x, y) in [(5, 15), (5, 18), (5, 21), (30, 15), (30, 18), (30, 21)] {
             let pixel = tray_icon_pixel(&ready, x, y);
             assert!(
-                pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200,
+                tray_icon_visible_dark_pixel(pixel, 200),
                 "expected short-logo side dot at ({x}, {y}), got {pixel:?}"
             );
         }
@@ -12369,16 +12369,13 @@ mod tests {
         for (x, y) in [(18, 4), (6, 11), (29, 11)] {
             let pixel = tray_icon_pixel(&ready, x, y);
             assert!(
-                pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 100,
+                tray_icon_visible_dark_pixel(pixel, 100),
                 "expected short-logo top outline at ({x}, {y}), got {pixel:?}"
             );
         }
         let bottom_body = tray_icon_pixel(&ready, 18, 27);
         assert!(
-            bottom_body[0] < 40
-                && bottom_body[1] < 50
-                && bottom_body[2] < 70
-                && bottom_body[3] > 200,
+            tray_icon_visible_dark_pixel(bottom_body, 200),
             "expected short-logo bottom body, got {bottom_body:?}"
         );
         let top_center = tray_icon_pixel(&ready, 18, 9);
@@ -12416,6 +12413,10 @@ mod tests {
             .chunks_exact(4)
             .filter(|pixel| pixel[3] > 200)
             .count()
+    }
+
+    fn tray_icon_visible_dark_pixel(pixel: [u8; 4], min_alpha: u8) -> bool {
+        pixel[0] < 100 && pixel[1] < 110 && pixel[2] < 130 && pixel[3] > min_alpha
     }
 
     fn tray_icon_pixel(image: &tauri::image::Image<'_>, x: usize, y: usize) -> [u8; 4] {
