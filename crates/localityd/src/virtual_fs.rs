@@ -1076,7 +1076,11 @@ pub fn rename_virtual_fs_item<S>(
     new_filename: &str,
 ) -> LocalityResult<VirtualFsMutationReport>
 where
-    S: MountRepository + EntityRepository + VirtualMutationRepository + FreshnessStateRepository,
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + VirtualMutationRepository
+        + FreshnessStateRepository,
 {
     let mount = require_virtual_mount(store, mount_id)?;
     if mount.read_only {
@@ -1089,9 +1093,9 @@ where
         .list_virtual_mutations(mount_id)
         .map_err(LocalityError::from)?;
     let new_parent_path = container_path(&mount, &entities, &mutations, new_parent_identifier)?;
-    let new_parent = move_parent_remote(&mount, &entities, new_parent_identifier)?;
 
     if let Some(child_identifier) = identifier.strip_prefix(CHILDREN_PREFIX) {
+        let new_parent = move_parent_remote(&mount, &entities, new_parent_identifier)?;
         let new_page_dir = new_parent_path.join(new_filename);
         let new_path = page_document_path(&new_page_dir);
         let title = title_from_filename(new_filename);
@@ -1204,7 +1208,21 @@ where
         ));
     }
     let new_path = new_parent_path.join(new_filename);
+    if let Some(report) = reconcile_atomic_temp_rename(
+        store,
+        content_root,
+        &mount,
+        &entities,
+        mount_id,
+        identifier,
+        new_parent_identifier,
+        new_filename,
+        &new_path,
+    )? {
+        return Ok(report);
+    }
     ensure_virtual_path_available_for_rename(store, mount_id, identifier, &new_path)?;
+    let new_parent = move_parent_remote(&mount, &entities, new_parent_identifier)?;
 
     if let Some(mut mutation) = local_mutation(store, mount_id, identifier)? {
         let old_path = content_path_for_relative(content_root, &mutation.projected_path)?;
@@ -1276,6 +1294,95 @@ where
         path: item.path.clone(),
         item,
     })
+}
+
+fn reconcile_atomic_temp_rename<S>(
+    store: &mut S,
+    content_root: &Path,
+    mount: &MountConfig,
+    entities: &[EntityRecord],
+    mount_id: &MountId,
+    identifier: &str,
+    new_parent_identifier: &str,
+    new_filename: &str,
+    new_path: &Path,
+) -> LocalityResult<Option<VirtualFsMutationReport>>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + VirtualMutationRepository
+        + FreshnessStateRepository,
+{
+    if new_filename != locality_core::path_projection::PAGE_DOCUMENT_FILENAME {
+        return Ok(None);
+    }
+    let Some(mutation) = local_mutation(store, mount_id, identifier)? else {
+        return Ok(None);
+    };
+
+    if is_page_document_path(&mutation.projected_path)
+        && new_parent_identifier == pending_page_child_dir_identifier(identifier)
+        && mutation.projected_path == new_path
+    {
+        let index = ProviderIndex::new(entities);
+        let item = pending_item(mount, &mutation, &index);
+        return Ok(Some(VirtualFsMutationReport {
+            mount_id: mount_id.0.clone(),
+            identifier: mutation.local_id,
+            path: item.path.clone(),
+            item,
+        }));
+    }
+
+    if !is_atomic_temp_filename(&filename(&mutation.projected_path)) {
+        return Ok(None);
+    }
+    let Some(target) = store
+        .find_entity_by_path(mount_id, new_path)
+        .map_err(LocalityError::from)?
+    else {
+        return Ok(None);
+    };
+    if target.kind != EntityKind::Page {
+        return Ok(None);
+    }
+
+    let temp_path = content_path_for_relative(content_root, &mutation.projected_path)?;
+    let contents = match std::fs::read(&temp_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(LocalityError::Io(format!(
+                "failed to read atomic temp file `{}`: {error}",
+                temp_path.display()
+            )));
+        }
+    };
+    commit_virtual_fs_write(
+        store,
+        content_root,
+        mount_id,
+        &target.remote_id.0,
+        &contents,
+    )?;
+    store
+        .delete_virtual_mutation(mount_id, &mutation.local_id)
+        .map_err(LocalityError::from)?;
+    let _ = std::fs::remove_file(&temp_path);
+    let refreshed = store.list_entities(mount_id).map_err(LocalityError::from)?;
+    let index = ProviderIndex::new(&refreshed);
+    let entity = refreshed
+        .iter()
+        .find(|entity| entity.remote_id == target.remote_id)
+        .ok_or_else(|| missing_identifier(&target.remote_id.0))?;
+    let item = entity_item(mount, entity, &index);
+    Ok(Some(VirtualFsMutationReport {
+        mount_id: mount_id.0.clone(),
+        identifier: target.remote_id.0,
+        path: item.path.clone(),
+        item,
+    }))
 }
 
 pub fn trash_virtual_fs_item<S>(
@@ -4043,6 +4150,110 @@ mod tests {
                 .expect("list mutations")
                 .len(),
             1
+        );
+        commit_virtual_fs_write(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &temp.identifier,
+            b"# Draft\n\nBody from an atomic save.",
+        )
+        .expect("write atomic temp contents");
+        let renamed = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &temp.identifier,
+            &created.identifier,
+            "page.md",
+        )
+        .expect("rename atomic temp to page.md");
+        assert_eq!(renamed.identifier, page.identifier);
+        assert_eq!(renamed.item.filename, "page.md");
+        assert_eq!(renamed.item.path, "Home/Draft/page.md");
+        assert_eq!(
+            std::fs::read(content_root.join("Home/Draft/page.md"))
+                .expect("read pending page cache"),
+            b"# Draft\n\nBody from an atomic save."
+        );
+        assert_eq!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn atomic_temp_rename_over_existing_page_commits_page_write() {
+        let mount_id = MountId::new("notion-main");
+        let remote_id = RemoteId::new("page-1");
+        let state_root = temp_root("loc-virtual-fs-atomic-temp-rename");
+        let content_root = state_root.join("content/notion-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                remote_id.clone(),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            ))
+            .expect("save page");
+
+        let temp = create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:page-1",
+            "page.md.tmp.1234.abcd",
+        )
+        .expect("create atomic temp");
+        commit_virtual_fs_write(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &temp.identifier,
+            b"# Home\n\nEdited through atomic save.",
+        )
+        .expect("write atomic temp");
+
+        let renamed = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            &temp.identifier,
+            "children:page-1",
+            "page.md",
+        )
+        .expect("rename atomic temp over page.md");
+
+        assert_eq!(renamed.identifier, "page-1");
+        assert_eq!(renamed.item.filename, "page.md");
+        assert_eq!(
+            std::fs::read(content_root.join("Home/page.md")).expect("read page cache"),
+            b"# Home\n\nEdited through atomic save."
+        );
+        assert!(!content_root.join("Home/page.md.tmp.1234.abcd").exists());
+        assert!(
+            store
+                .get_virtual_mutation(&mount_id, &temp.identifier)
+                .expect("get temp mutation")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_entity(&mount_id, &remote_id)
+                .expect("get page")
+                .expect("page")
+                .hydration,
+            HydrationState::Dirty
         );
 
         let _ = std::fs::remove_dir_all(state_root);

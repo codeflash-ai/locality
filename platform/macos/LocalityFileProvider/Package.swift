@@ -26,5 +26,10 @@ let package = Package(
             name: "LocalityFileProviderCtl",
             path: "Sources/LocalityFileProviderCtl"
         ),
+        .testTarget(
+            name: "LocalityFileProviderTests",
+            dependencies: ["LocalityFileProvider"],
+            path: "Tests/LocalityFileProviderTests"
+        ),
     ]
 )

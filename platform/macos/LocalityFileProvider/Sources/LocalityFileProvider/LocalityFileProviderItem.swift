@@ -58,7 +58,15 @@ final class LocalityFileProviderItem: NSObject, NSFileProviderItem {
   }
 
   private static func allowsAddingSubItems(_ metadata: LocalityItemMetadata) -> Bool {
-    metadata.entityKind == "database" || metadata.identifier.hasPrefix("children:")
+    if metadata.entityKind == "database" || metadata.entityKind == "page" {
+      return true
+    }
+    return daemonIdentifierString(metadata.identifier).hasPrefix("children:")
+  }
+
+  private static func daemonIdentifierString(_ identifier: String) -> String {
+    LocalitySharedDomain.resolve(NSFileProviderItemIdentifier(identifier))?.daemonIdentifier
+      ?? identifier
   }
 
   static func daemonIdentifier(_ identifier: NSFileProviderItemIdentifier) -> String {
