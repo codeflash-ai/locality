@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 pub type CredentialResult<T> = Result<T, CredentialError>;
 
@@ -168,6 +168,7 @@ impl CredentialStore for KeychainCredentialStore {
             .output()
             .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
         if output.status.success() {
+            cache_keychain_secret(secret_ref, secret)?;
             Ok(())
         } else {
             Err(CredentialError::Unavailable(
@@ -177,16 +178,9 @@ impl CredentialStore for KeychainCredentialStore {
     }
 
     fn get(&self, secret_ref: &str) -> CredentialResult<String> {
-        for service in COMPAT_KEYCHAIN_SERVICES {
-            if let Some(password) = read_keychain_password(secret_ref, service)? {
-                if service != PRIMARY_KEYCHAIN_SERVICE {
-                    let _ = self.put(secret_ref, &password);
-                }
-                return Ok(password);
-            }
-        }
-
-        Err(CredentialError::NotFound(secret_ref.to_string()))
+        get_cached_keychain_secret(secret_ref, read_keychain_password, |secret_ref, secret| {
+            self.put(secret_ref, secret)
+        })
     }
 
     fn delete(&self, secret_ref: &str) -> CredentialResult<()> {
@@ -196,8 +190,63 @@ impl CredentialStore for KeychainCredentialStore {
                 .output()
                 .map_err(|error| CredentialError::Unavailable(error.to_string()))?;
         }
+        forget_keychain_secret(secret_ref)?;
         Ok(())
     }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+static KEYCHAIN_CREDENTIAL_CACHE: LazyLock<Mutex<BTreeMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[cfg(any(test, target_os = "macos"))]
+fn get_cached_keychain_secret(
+    secret_ref: &str,
+    mut read_keychain_password: impl FnMut(&str, &str) -> CredentialResult<Option<String>>,
+    mut promote_secret: impl FnMut(&str, &str) -> CredentialResult<()>,
+) -> CredentialResult<String> {
+    if let Some(secret) = cached_keychain_secret(secret_ref)? {
+        return Ok(secret);
+    }
+
+    for service in COMPAT_KEYCHAIN_SERVICES {
+        if let Some(password) = read_keychain_password(secret_ref, service)? {
+            if service != PRIMARY_KEYCHAIN_SERVICE {
+                let _ = promote_secret(secret_ref, &password);
+            }
+            cache_keychain_secret(secret_ref, &password)?;
+            return Ok(password);
+        }
+    }
+
+    Err(CredentialError::NotFound(secret_ref.to_string()))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn cached_keychain_secret(secret_ref: &str) -> CredentialResult<Option<String>> {
+    Ok(KEYCHAIN_CREDENTIAL_CACHE
+        .lock()
+        .map_err(|_| CredentialError::Unavailable("credential cache lock poisoned".to_string()))?
+        .get(secret_ref)
+        .cloned())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn cache_keychain_secret(secret_ref: &str, secret: &str) -> CredentialResult<()> {
+    KEYCHAIN_CREDENTIAL_CACHE
+        .lock()
+        .map_err(|_| CredentialError::Unavailable("credential cache lock poisoned".to_string()))?
+        .insert(secret_ref.to_string(), secret.to_string());
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn forget_keychain_secret(secret_ref: &str) -> CredentialResult<()> {
+    KEYCHAIN_CREDENTIAL_CACHE
+        .lock()
+        .map_err(|_| CredentialError::Unavailable("credential cache lock poisoned".to_string()))?
+        .remove(secret_ref);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -503,9 +552,12 @@ fn set_private_file_permissions(_path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+
     use super::{
-        COMPAT_KEYCHAIN_SERVICES, CredentialStoreBackend, PRIMARY_KEYCHAIN_SERVICE,
-        credential_store_backend_for_override, decode_hex_encoded_password,
+        COMPAT_KEYCHAIN_SERVICES, CredentialResult, CredentialStoreBackend,
+        PRIMARY_KEYCHAIN_SERVICE, credential_store_backend_for_override,
+        decode_hex_encoded_password, get_cached_keychain_secret,
         keychain_hex_password_from_diagnostics, keychain_output_password,
         primary_windows_target_name, windows_target_names,
     };
@@ -567,6 +619,85 @@ mod tests {
     #[test]
     fn keychain_services_include_afs_compatibility_alias() {
         assert_eq!(COMPAT_KEYCHAIN_SERVICES, [PRIMARY_KEYCHAIN_SERVICE, "afs"]);
+    }
+
+    #[test]
+    fn keychain_get_uses_process_cache_after_first_read() {
+        let calls = Cell::new(0);
+        let secret_ref = "connection:test-cache-primary";
+
+        let first = get_cached_keychain_secret(
+            secret_ref,
+            |read_ref, service| {
+                assert_eq!(read_ref, secret_ref);
+                assert_eq!(service, PRIMARY_KEYCHAIN_SERVICE);
+                calls.set(calls.get() + 1);
+                Ok(Some("cached-secret".to_string()))
+            },
+            |_, _| -> CredentialResult<()> { panic!("primary keychain hit should not promote") },
+        )
+        .expect("first credential lookup");
+
+        let second = get_cached_keychain_secret(
+            secret_ref,
+            |_, _| -> CredentialResult<Option<String>> {
+                panic!("cached credential lookup should not query keychain")
+            },
+            |_, _| -> CredentialResult<()> {
+                panic!("cached credential lookup should not promote")
+            },
+        )
+        .expect("cached credential lookup");
+
+        assert_eq!(first, "cached-secret");
+        assert_eq!(second, "cached-secret");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn keychain_get_caches_compatibility_service_result_after_promotion() {
+        let calls = Cell::new(0);
+        let promotions = RefCell::new(Vec::new());
+        let secret_ref = "connection:test-cache-compat";
+
+        let first = get_cached_keychain_secret(
+            secret_ref,
+            |read_ref, service| {
+                assert_eq!(read_ref, secret_ref);
+                calls.set(calls.get() + 1);
+                if service == "afs" {
+                    Ok(Some("legacy-secret".to_string()))
+                } else {
+                    Ok(None)
+                }
+            },
+            |promoted_ref, secret| {
+                promotions
+                    .borrow_mut()
+                    .push((promoted_ref.to_string(), secret.to_string()));
+                Ok(())
+            },
+        )
+        .expect("compatibility credential lookup");
+
+        let second = get_cached_keychain_secret(
+            secret_ref,
+            |_, _| -> CredentialResult<Option<String>> {
+                panic!("cached compatibility credential should not query keychain")
+            },
+            |_, _| -> CredentialResult<()> {
+                panic!("cached compatibility credential should not promote")
+            },
+        )
+        .expect("cached compatibility credential lookup");
+
+        assert_eq!(first, "legacy-secret");
+        assert_eq!(second, "legacy-secret");
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            promotions.into_inner(),
+            vec![(secret_ref.to_string(), "legacy-secret".to_string())]
+        );
     }
 
     #[test]
