@@ -3006,27 +3006,34 @@ fn load_desktop_snapshot_from_store(
     let mount = choose_mount(&mounts);
     let connection = choose_connection(&connections, mount.as_ref());
     let needs_onboarding = desktop_needs_onboarding(connection.as_ref(), mount.as_ref());
+    let pending_changes = match mount.as_ref() {
+        Some(mount) => pending_changes_for_mount(store, state_root, &mount.mount_id)?,
+        None => Vec::new(),
+    };
+    let active_mount_id = mount.as_ref().map(|mount| mount.mount_id.clone());
     let mount_summaries = mounts
         .iter()
-        .map(|mount| {
-            let connection = choose_connection_for_mount(&connections, mount);
-            let provider = provider_runtime_summary(state_root, mount);
-            mount_summary(
+        .map(|candidate| {
+            let connection = choose_connection_for_mount(&connections, candidate);
+            let provider = provider_runtime_summary(state_root, candidate);
+            let pending_change_count = if active_mount_id.as_ref() == Some(&candidate.mount_id) {
+                Some(pending_changes.len())
+            } else {
+                None
+            };
+            mount_summary_with_pending_change_count(
                 Some(store),
                 state_root,
-                Some(mount),
+                Some(candidate),
                 connection.as_ref(),
                 provider,
+                pending_change_count,
             )
         })
         .collect::<Vec<_>>();
     let provider = mount
         .as_ref()
         .and_then(|mount| provider_runtime_summary(state_root, mount));
-    let pending_changes = match mount.as_ref() {
-        Some(mount) => pending_changes_for_mount(store, state_root, &mount.mount_id)?,
-        None => Vec::new(),
-    };
     let live_mode = mount_live_mode_summary(store, mount.as_ref(), &pending_changes);
     let recent_files = match mount.as_ref() {
         Some(mount) if desktop_mount_has_current_access(mount, connection.as_ref()) => {
@@ -3051,12 +3058,13 @@ fn load_desktop_snapshot_from_store(
             attention_count: pending_changes.len(),
         },
         connection: connection_summary(connection.as_ref()),
-        mount: mount_summary(
+        mount: mount_summary_with_pending_change_count(
             Some(store),
             state_root,
             mount.as_ref(),
             connection.as_ref(),
             provider,
+            Some(pending_changes.len()),
         ),
         mounts: mount_summaries,
         active_mount_id: mount.as_ref().map(|mount| mount.mount_id.0.clone()),
@@ -3224,6 +3232,17 @@ fn mount_summary(
     connection: Option<&ConnectionRecord>,
     provider: Option<ProviderRuntimeSummary>,
 ) -> MountSummary {
+    mount_summary_with_pending_change_count(store, state_root, mount, connection, provider, None)
+}
+
+fn mount_summary_with_pending_change_count(
+    store: Option<&SqliteStateStore>,
+    state_root: &Path,
+    mount: Option<&MountConfig>,
+    connection: Option<&ConnectionRecord>,
+    provider: Option<ProviderRuntimeSummary>,
+    pending_change_count: Option<usize>,
+) -> MountSummary {
     let Some(mount) = mount else {
         return MountSummary {
             mount_id: String::new(),
@@ -3284,11 +3303,13 @@ fn mount_summary(
             .and_then(|store| store.list_entities(&mount.mount_id).ok())
             .map(|entities| entities.len())
             .unwrap_or(0),
-        pending_change_count: store
-            .map(|store| pending_changes_for_mount(store, state_root, &mount.mount_id))
-            .and_then(Result::ok)
-            .map(|changes| changes.len())
-            .unwrap_or(0),
+        pending_change_count: pending_change_count.unwrap_or_else(|| {
+            store
+                .map(|store| pending_changes_for_mount(store, state_root, &mount.mount_id))
+                .and_then(Result::ok)
+                .map(|changes| changes.len())
+                .unwrap_or(0)
+        }),
         provider,
     }
 }
@@ -3513,15 +3534,16 @@ where
         .mounts
         .iter()
         .flat_map(|mount| {
-            mount.entries.iter().map(move |entry| {
-                (
-                    MountId::new(mount.mount_id.clone()),
-                    entry,
-                    live_mode_status_for_entry(store, &MountId::new(mount.mount_id.clone()), entry),
-                )
-            })
+            mount
+                .entries
+                .iter()
+                .filter(|entry| status_entry_needs_desktop_attention(entry))
+                .map(move |entry| {
+                    let mount_id = MountId::new(mount.mount_id.clone());
+                    let live_mode = live_mode_status_for_entry(store, &mount_id, entry);
+                    (mount_id, entry, live_mode)
+                })
         })
-        .filter(|(_, entry, _)| status_entry_needs_desktop_attention(entry))
         .map(|(mount_id, entry, live_mode)| PendingChange {
             mount_id: mount_id.0,
             entity_id: entry.entity_id.clone(),
@@ -10216,6 +10238,7 @@ mod tests {
         LIVE_MODE_STATE_CHANGE_SIGNAL_FILE, MountConfig, MountLiveModeRecord,
         MountLiveModeRepository, MountLiveModeState, MountRepository, ProjectionMode,
         RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+        StoreResult,
     };
     use localityd::ipc::DaemonBuildInfo;
     use tauri::{PhysicalPosition, PhysicalSize, Rect};
@@ -13068,6 +13091,18 @@ mod tests {
     }
 
     #[test]
+    fn pending_changes_do_not_lookup_live_mode_state_for_clean_entries() {
+        let status = status_report_with_entry(status_entry(
+            loc_cli::status::StatusState::Clean,
+            loc_cli::status::StatusSyncState::AllSynced,
+            0,
+            vec![],
+        ));
+
+        assert!(pending_changes_from_status(&NoAutoSaveLookupStore, &status).is_empty());
+    }
+
+    #[test]
     fn pending_changes_keep_failed_journal_with_dirty_file() {
         let status = status_report_with_entry(status_entry(
             loc_cli::status::StatusState::Dirty,
@@ -13355,6 +13390,48 @@ mod tests {
 
         assert!(message.contains("Discarded local edits"));
         assert!(message.contains("latest Notion version"));
+    }
+
+    struct NoAutoSaveLookupStore;
+
+    impl AutoSaveRepository for NoAutoSaveLookupStore {
+        fn save_auto_save_enrollment(
+            &mut self,
+            _enrollment: AutoSaveEnrollmentRecord,
+        ) -> StoreResult<()> {
+            panic!("clean pending change scan should not save auto-save enrollments")
+        }
+
+        fn get_auto_save_enrollment(
+            &self,
+            _mount_id: &MountId,
+            _path: &Path,
+        ) -> StoreResult<Option<AutoSaveEnrollmentRecord>> {
+            panic!("clean pending change scan should not query auto-save enrollments")
+        }
+
+        fn find_auto_save_enrollment_by_remote_id(
+            &self,
+            _mount_id: &MountId,
+            _remote_id: &RemoteId,
+        ) -> StoreResult<Option<AutoSaveEnrollmentRecord>> {
+            panic!("clean pending change scan should not query auto-save enrollments by remote id")
+        }
+
+        fn list_auto_save_enrollments(
+            &self,
+            _mount_id: &MountId,
+        ) -> StoreResult<Vec<AutoSaveEnrollmentRecord>> {
+            panic!("clean pending change scan should not list auto-save enrollments")
+        }
+
+        fn delete_auto_save_enrollment(
+            &mut self,
+            _mount_id: &MountId,
+            _path: &Path,
+        ) -> StoreResult<()> {
+            panic!("clean pending change scan should not delete auto-save enrollments")
+        }
     }
 
     fn status_report_with_entry(
