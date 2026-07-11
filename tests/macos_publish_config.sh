@@ -49,12 +49,14 @@ grep -q 'dmg_status="notarized"' "${PUBLISH_SCRIPT}" \
   || fail "notarized artifacts must keep the notarized naming suffix"
 grep -q 'make new alias file to POSIX file "/Applications"' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
   || fail "DMG postprocess must replace the Applications symlink with a Finder alias"
-grep -F -q 'DS_STORE_BACKUP="${TMPDIR}/DS_Store"' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
-  || fail "DMG postprocess must back up Tauri Finder layout metadata before touching Finder aliases"
+grep -F -q 'set background picture of iconOptions to backgroundFile' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
+  || fail "DMG postprocess must actively set the instructional Finder background"
+grep -F -q 'set bounds of container window' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
+  || fail "DMG postprocess must actively set the installer Finder window bounds"
+grep -F -q 'DMG Finder layout did not create metadata' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
+  || fail "DMG postprocess must fail when Finder does not create layout metadata"
 grep -F -q 'strings "${MOUNTPOINT}/.DS_Store" | grep -F -q "${DMG_BACKGROUND_NAME}"' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
   || fail "DMG postprocess must verify the instructional background metadata is present"
-grep -F -q 'cp -p "${DS_STORE_BACKUP}" "${MOUNTPOINT}/.DS_Store"' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
-  || fail "DMG postprocess must restore Tauri Finder layout metadata after touching Finder aliases"
 
 [[ -f "${DMG_BACKGROUND}" ]] \
   || fail "DMG installer background asset is missing"
@@ -78,6 +80,10 @@ grep -q '<key>CFBundleSymbolName</key>' "${FILE_PROVIDER_HOST_PLIST}" \
   || fail "File Provider host plist must declare CFBundleSymbolName for Finder sidebar glyphs"
 grep -q '<key>CFBundleSymbolName</key>' "${FILE_PROVIDER_EXTENSION_PLIST}" \
   || fail "File Provider extension plist must declare CFBundleSymbolName for Finder sidebar glyphs"
+grep -q '<string>square.stack.3d.up</string>' "${FILE_PROVIDER_HOST_PLIST}" \
+  || fail "File Provider host plist must use a tintable Finder sidebar symbol"
+grep -q '<string>square.stack.3d.up</string>' "${FILE_PROVIDER_EXTENSION_PLIST}" \
+  || fail "File Provider extension plist must use a tintable Finder sidebar symbol"
 grep -q '<string>locality-mount-logo</string>' "${FILE_PROVIDER_HOST_PLIST}" \
   || fail "File Provider host plist must use the mount logo icon"
 grep -q '<string>locality-mount-logo</string>' "${FILE_PROVIDER_EXTENSION_PLIST}" \

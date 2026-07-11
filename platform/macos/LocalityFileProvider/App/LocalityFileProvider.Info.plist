@@ -12,6 +12,8 @@
 	<string>locality-mount-logo</string>
 	<key>CFBundleIconName</key>
 	<string>locality-mount-logo</string>
+	<key>CFBundleSymbolName</key>
+	<string>square.stack.3d.up</string>
 	<key>CFBundleIcons</key>
 	<dict>
 		<key>CFBundlePrimaryIcon</key>
@@ -21,7 +23,7 @@
 				<string>locality-mount-logo</string>
 			</array>
 			<key>CFBundleSymbolName</key>
-			<string>locality-mount-logo</string>
+			<string>square.stack.3d.up</string>
 		</dict>
 	</dict>
 	<key>CFBundleIdentifier</key>

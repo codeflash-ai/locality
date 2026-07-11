@@ -47,7 +47,7 @@ line2_y="$((line1_y + line1_height + 4))"
 
 magick -size 760x440 xc:'#fafafa' \
   -stroke "${ORANGE}" -strokewidth 4 -fill none -draw 'path "M 290 270 C 313 294 347 292 364 269 C 381 292 416 291 437 266"' \
-  -stroke "${ORANGE}" -strokewidth 4 -fill none -draw 'path "M 419 262 L 439 265 L 428 283"' \
+  -stroke "${ORANGE}" -strokewidth 4 -fill none -draw 'path "M 419 259 L 441 264 L 431 283"' \
   -stroke none \
   -fill "${NOTE_COLOR}" -font .SF-Compact-Regular -pointsize 15 -gravity south \
   -annotate +0+71 'Then open Locality from Applications.' \

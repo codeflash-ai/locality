@@ -42,12 +42,14 @@ That script builds `loc`, `localityd`, and the Swift File Provider extension, st
 `apps/desktop/src-tauri/macos/LocalityFileProvider/`, stages `loc` and `localityd`
 under `apps/desktop/src-tauri/macos/`, and Tauri copies those files into the
 final app bundle. The File Provider host and extension Info.plists both declare
-the shared-root mount logo through `CFBundleIconFile`, and the build script copies
-`locality-mount-logo.icns` into both bundle resource directories. Tauri also
-packages the same ICNS under the shipped app's `Contents/Resources` so the
-containing host has the resource available. Existing `~/Library/CloudStorage/Locality`
-domains may need unregister/register or a local File Provider reset before Finder
-drops a cached provider icon. After the Tauri DMG is created, `build-tauri` runs
+the shared-root mount logo through `CFBundleIconFile` for full-size bundle icon
+surfaces and `CFBundleSymbolName` for Finder's tintable sidebar glyph. The build
+script copies `locality-mount-logo.icns` into both bundle resource directories.
+Tauri also packages the same ICNS under the shipped app's `Contents/Resources`
+so the containing host has the resource available. Existing
+`~/Library/CloudStorage/Locality` domains may need unregister/register or a
+local File Provider reset before Finder drops a cached provider icon. After the
+Tauri DMG is created, `build-tauri` runs
 `apps/desktop/scripts/postprocess-dmg-volume-icon.sh` so the mounted installer
 volume uses a disk-style Locality icon instead of the application icon. The DMG
 also carries a Finder background and icon layout that presents `Locality.app` on

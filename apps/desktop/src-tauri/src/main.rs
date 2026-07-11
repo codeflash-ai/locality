@@ -4025,7 +4025,10 @@ fn set_tray_icon_and_tooltip(app: &AppHandle, state: TrayVisualState, tooltip: &
             return;
         }
 
-        let _ = tray.set_icon_with_as_template(Some(tray_icon_image(state)), false);
+        let _ = tray.set_icon_with_as_template(
+            Some(tray_icon_image(state)),
+            tray_icon_should_use_template(),
+        );
         let _ = tray.set_tooltip(Some(tooltip.to_string()));
     }
 }
@@ -4067,22 +4070,37 @@ fn tray_tooltip(snapshot: &DesktopSnapshot) -> String {
 fn tray_icon_image(state: TrayVisualState) -> Image<'static> {
     let size = 36;
     let mut rgba = vec![0; size * size * 4];
-    draw_short_logo_mark(&mut rgba, size, [255, 255, 255, 255], true);
-    draw_short_logo_mark(&mut rgba, size, [17, 24, 39, 255], false);
+    if tray_icon_should_use_template() {
+        draw_short_logo_mark(&mut rgba, size, [17, 24, 39, 255], false);
 
-    match state {
-        TrayVisualState::Ready => {}
-        TrayVisualState::Review => {
-            draw_disc(&mut rgba, size, (27.0, 9.0), 5.2, [255, 255, 255, 255]);
-            draw_disc(&mut rgba, size, (27.0, 9.0), 3.6, [217, 140, 31, 255]);
+        match state {
+            TrayVisualState::Ready => {}
+            TrayVisualState::Review | TrayVisualState::Reconnect => {
+                draw_disc(&mut rgba, size, (27.0, 9.0), 3.8, [17, 24, 39, 255]);
+            }
         }
-        TrayVisualState::Reconnect => {
-            draw_disc(&mut rgba, size, (27.0, 9.0), 5.2, [255, 255, 255, 255]);
-            draw_disc(&mut rgba, size, (27.0, 9.0), 3.6, [207, 63, 63, 255]);
+    } else {
+        draw_short_logo_mark(&mut rgba, size, [255, 255, 255, 255], true);
+        draw_short_logo_mark(&mut rgba, size, [17, 24, 39, 255], false);
+
+        match state {
+            TrayVisualState::Ready => {}
+            TrayVisualState::Review => {
+                draw_disc(&mut rgba, size, (27.0, 9.0), 5.2, [255, 255, 255, 255]);
+                draw_disc(&mut rgba, size, (27.0, 9.0), 3.6, [217, 140, 31, 255]);
+            }
+            TrayVisualState::Reconnect => {
+                draw_disc(&mut rgba, size, (27.0, 9.0), 5.2, [255, 255, 255, 255]);
+                draw_disc(&mut rgba, size, (27.0, 9.0), 3.6, [207, 63, 63, 255]);
+            }
         }
     }
 
     Image::new_owned(rgba, size as u32, size as u32)
+}
+
+fn tray_icon_should_use_template() -> bool {
+    cfg!(target_os = "macos")
 }
 
 fn draw_short_logo_mark(rgba: &mut [u8], size: usize, color: [u8; 4], halo: bool) {
@@ -10230,9 +10248,9 @@ mod tests {
         screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
         should_prioritize_located_result, state_event_path_requires_refresh,
         state_event_path_wakes_live_mode, summarize_virtual_projection_children,
-        terminal_cli_link_state, tray_icon_image, tray_popover_anchor, tray_popover_position,
-        unsupported_notion_locator_url_message, validate_mount_root,
-        virtual_projection_prefetch_container_identifiers,
+        terminal_cli_link_state, tray_icon_image, tray_icon_should_use_template,
+        tray_popover_anchor, tray_popover_position, unsupported_notion_locator_url_message,
+        validate_mount_root, virtual_projection_prefetch_container_identifiers,
         virtual_projection_refresh_signal_identifiers,
         virtual_projection_waits_for_mount_point_children_before_registration,
         wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
@@ -12161,11 +12179,18 @@ mod tests {
         assert_eq!(ready.height(), 36);
         assert_eq!(review.width(), 36);
         assert_eq!(reconnect.height(), 36);
-        assert!(
-            ready.rgba().chunks_exact(4).any(|pixel| {
+        if tray_icon_should_use_template() {
+            assert!(
+                !ready.rgba().chunks_exact(4).any(|pixel| {
+                    pixel[0] > 240 && pixel[1] > 240 && pixel[2] > 240 && pixel[3] > 200
+                }),
+                "template tray icons should not carry a white halo that macOS will tint as part of the glyph"
+            );
+        } else {
+            assert!(ready.rgba().chunks_exact(4).any(|pixel| {
                 pixel[0] > 240 && pixel[1] > 240 && pixel[2] > 240 && pixel[3] > 200
-            })
-        );
+            }));
+        }
         assert!(
             ready
                 .rgba()
@@ -12186,14 +12211,36 @@ mod tests {
                 "expected short-logo stacked body at ({x}, {y}), got {pixel:?}"
             );
         }
-        assert!(review.rgba().chunks_exact(4).any(|pixel| {
-            pixel[0] > 200 && pixel[1] > 100 && pixel[1] < 180 && pixel[2] < 80 && pixel[3] > 200
-        }));
-        assert!(
-            reconnect.rgba().chunks_exact(4).any(|pixel| {
+        if tray_icon_should_use_template() {
+            let ready_opaque = tray_icon_opaque_pixel_count(&ready);
+            assert!(
+                tray_icon_opaque_pixel_count(&review) > ready_opaque,
+                "review template icon should still add a visible status dot"
+            );
+            assert!(
+                tray_icon_opaque_pixel_count(&reconnect) > ready_opaque,
+                "reconnect template icon should still add a visible status dot"
+            );
+        } else {
+            assert!(review.rgba().chunks_exact(4).any(|pixel| {
+                pixel[0] > 200
+                    && pixel[1] > 100
+                    && pixel[1] < 180
+                    && pixel[2] < 80
+                    && pixel[3] > 200
+            }));
+            assert!(reconnect.rgba().chunks_exact(4).any(|pixel| {
                 pixel[0] > 180 && pixel[1] < 90 && pixel[2] < 90 && pixel[3] > 200
-            })
-        );
+            }));
+        }
+    }
+
+    fn tray_icon_opaque_pixel_count(image: &tauri::image::Image<'_>) -> usize {
+        image
+            .rgba()
+            .chunks_exact(4)
+            .filter(|pixel| pixel[3] > 200)
+            .count()
     }
 
     fn tray_icon_pixel(image: &tauri::image::Image<'_>, x: usize, y: usize) -> [u8; 4] {
@@ -15208,7 +15255,7 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
-        .icon_as_template(false)
+        .icon_as_template(tray_icon_should_use_template())
         .tooltip("Locality")
         .menu(&menu)
         .show_menu_on_left_click(false)
