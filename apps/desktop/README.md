@@ -68,6 +68,13 @@ Build a local NSIS installer from the repo root on Windows:
 make build-tauri-windows
 ```
 
+For a Windows on Arm installer:
+
+```sh
+rustup target add aarch64-pc-windows-msvc
+make build-tauri-windows-arm64
+```
+
 The build stages `loc.exe`, `localityd.exe`, and `locality-cloud-files.exe` under
 `src-tauri/windows` before Tauri bundles the app. The installer copies those
 sidecars next to the desktop executable so the app can start the packaged

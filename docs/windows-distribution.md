@@ -12,10 +12,25 @@ Build a local NSIS installer from the repo root on Windows:
 make build-tauri-windows
 ```
 
+Build the Windows on Arm installer from a Windows host with the Rust target
+installed:
+
+```powershell
+rustup target add aarch64-pc-windows-msvc
+make build-tauri-windows-arm64
+```
+
 For release-like local packaging, use:
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/publish-windows.ps1
+```
+
+For Windows on Arm release-like packaging, run:
+
+```powershell
+rustup target add aarch64-pc-windows-msvc
+make publish-windows-arm64
 ```
 
 The Tauri pre-bundle hook runs:
@@ -26,7 +41,10 @@ apps/desktop/scripts/prepare-windows-bundle.ps1
 
 That script builds `loc-cli`, `localityd`, and `locality-cloud-files` in release mode,
 stages the three sidecars under `apps/desktop/src-tauri/windows/`, and lets the
-NSIS hook copy them next to the installed desktop executable.
+NSIS hook copy them next to the installed desktop executable. Set
+`LOCALITY_WINDOWS_TARGET=aarch64-pc-windows-msvc` or use the ARM64 make targets
+to build and stage Windows on Arm sidecars from
+`target\aarch64-pc-windows-msvc\release`.
 
 Expected local artifacts:
 
@@ -34,6 +52,8 @@ Expected local artifacts:
 target/release/bundle/nsis/*.exe
 target/release/bundle/windows/Locality-beta-windows-x86_64-setup.exe
 target/release/bundle/windows/Locality-beta-windows-x86_64-setup.exe.sha256
+target/release/bundle/windows/Locality-beta-windows-aarch64-setup.exe
+target/release/bundle/windows/Locality-beta-windows-aarch64-setup.exe.sha256
 ```
 
 The publish script requires a clean git working tree by default because the
@@ -174,6 +194,7 @@ Render the Windows updater manifest with:
 ```powershell
 $env:UPDATER_MANIFEST_OUTPUT = "target/release/bundle/updater/latest-windows.json"
 $env:UPDATER_WINDOWS_X86_64_ARTIFACT = "target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe"
+$env:UPDATER_WINDOWS_AARCH64_ARTIFACT = "target/release/bundle/windows/Locality-release-windows-aarch64-setup.exe"
 bash scripts/render-tauri-updater-manifest.sh
 ```
 
@@ -193,6 +214,12 @@ Locality_Windows_v0.1.0.exe.sig
 Locality_Windows.exe
 Locality_Windows.exe.sha256
 Locality_Windows.exe.sig
+Locality_Windows_ARM64_v0.1.0.exe
+Locality_Windows_ARM64_v0.1.0.exe.sha256
+Locality_Windows_ARM64_v0.1.0.exe.sig
+Locality_Windows_ARM64.exe
+Locality_Windows_ARM64.exe.sha256
+Locality_Windows_ARM64.exe.sig
 latest-windows.json
 SHA256SUMS-windows
 ```

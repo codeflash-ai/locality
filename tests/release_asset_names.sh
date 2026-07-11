@@ -38,8 +38,14 @@ grep -F -q 'Locality_Windows_v$env:APP_VERSION.exe' "${WINDOWS_WORKFLOW}" \
   || fail "Windows release workflow must publish Locality_Windows_v<version>.exe"
 grep -F -q 'Locality_Windows.exe' "${WINDOWS_WORKFLOW}" \
   || fail "Windows release workflow must publish a stable Locality_Windows.exe alias"
+grep -F -q 'Locality_Windows_ARM64_v$env:APP_VERSION.exe' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows release workflow must publish Locality_Windows_ARM64_v<version>.exe"
+grep -F -q 'Locality_Windows_ARM64.exe' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows release workflow must publish a stable Locality_Windows_ARM64.exe alias"
 grep -F -q 'UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/windows/Locality_Windows_v${{ env.APP_VERSION }}.exe' "${WINDOWS_WORKFLOW}" \
   || fail "Windows updater manifest must point at the standard installer asset"
+grep -F -q 'UPDATER_WINDOWS_AARCH64_ARTIFACT: target/release/bundle/windows/Locality_Windows_ARM64_v${{ env.APP_VERSION }}.exe' "${WINDOWS_WORKFLOW}" \
+  || fail "Windows updater manifest must point at the standard ARM64 installer asset"
 grep -F -q -- '"--notes", "Release assets are still being published."' "${WINDOWS_WORKFLOW}" \
   || fail "Windows release workflow must create only placeholder release notes"
 grep -F -q '$createArgs += @("--prerelease", "--latest=false")' "${WINDOWS_WORKFLOW}" \
@@ -101,6 +107,8 @@ grep -F -q 'Locality_Linux.AppImage' "${RELEASE_FINALIZE_SCRIPT}" \
   || fail "release finalizer must require stable Linux download assets"
 grep -F -q 'Locality_Windows.exe' "${RELEASE_FINALIZE_SCRIPT}" \
   || fail "release finalizer must require the stable Windows download asset"
+grep -F -q 'Locality_Windows_ARM64.exe' "${RELEASE_FINALIZE_SCRIPT}" \
+  || fail "release finalizer must require the stable Windows ARM64 download asset"
 if grep -F -q 'scripts/render-release-notes.sh' "${MACOS_WORKFLOW}" "${WINDOWS_WORKFLOW}" "${LINUX_WORKFLOW}"; then
   fail "platform release workflows must not run Codex release-note generation"
 fi
@@ -121,6 +129,8 @@ touch "${tmp_root}/Locality_Mac_Updater_v0.1.5.app.tar.gz"
 printf 'mac-signature\n' >"${tmp_root}/Locality_Mac_Updater_v0.1.5.app.tar.gz.sig"
 touch "${tmp_root}/Locality_Windows_v0.1.5.exe"
 printf 'windows-signature\n' >"${tmp_root}/Locality_Windows_v0.1.5.exe.sig"
+touch "${tmp_root}/Locality_Windows_ARM64_v0.1.5.exe"
+printf 'windows-arm64-signature\n' >"${tmp_root}/Locality_Windows_ARM64_v0.1.5.exe.sig"
 touch "${tmp_root}/Locality_Linux_v0.1.5.AppImage"
 printf 'linux-signature\n' >"${tmp_root}/Locality_Linux_v0.1.5.AppImage.sig"
 
@@ -130,17 +140,22 @@ UPDATER_VERSION="0.1.5" \
   UPDATER_MACOS_AARCH64_ARTIFACT="${tmp_root}/Locality_Mac_Updater_v0.1.5.app.tar.gz" \
   UPDATER_LINUX_X86_64_ARTIFACT="${tmp_root}/Locality_Linux_v0.1.5.AppImage" \
   UPDATER_WINDOWS_X86_64_ARTIFACT="${tmp_root}/Locality_Windows_v0.1.5.exe" \
+  UPDATER_WINDOWS_AARCH64_ARTIFACT="${tmp_root}/Locality_Windows_ARM64_v0.1.5.exe" \
   "${UPDATER_SCRIPT}" >/dev/null
 
 grep -F -q '"darwin-aarch64"' "${tmp_root}/latest.json" \
   || fail "updater manifest must accept explicit macOS platform artifacts without arch in the filename"
 grep -F -q '"windows-x86_64"' "${tmp_root}/latest.json" \
   || fail "updater manifest must accept explicit Windows platform artifacts without arch in the filename"
+grep -F -q '"windows-aarch64"' "${tmp_root}/latest.json" \
+  || fail "updater manifest must accept explicit Windows ARM64 platform artifacts"
 grep -F -q '"linux-x86_64"' "${tmp_root}/latest.json" \
   || fail "updater manifest must accept explicit Linux platform artifacts without arch in the filename"
 grep -F -q 'Locality_Mac_Updater_v0.1.5.app.tar.gz' "${tmp_root}/latest.json" \
   || fail "updater manifest must use the standard macOS updater filename"
 grep -F -q 'Locality_Windows_v0.1.5.exe' "${tmp_root}/latest.json" \
   || fail "updater manifest must use the standard Windows installer filename"
+grep -F -q 'Locality_Windows_ARM64_v0.1.5.exe' "${tmp_root}/latest.json" \
+  || fail "updater manifest must use the standard Windows ARM64 installer filename"
 grep -F -q 'Locality_Linux_v0.1.5.AppImage' "${tmp_root}/latest.json" \
   || fail "updater manifest must use the standard Linux AppImage filename"

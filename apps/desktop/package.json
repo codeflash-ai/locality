@@ -13,6 +13,7 @@
     "build:mas": "VITE_LOCALITY_DISTRIBUTION_CHANNEL=mas LOCALITY_DISTRIBUTION_CHANNEL=mas tauri build --bundles app",
     "build:linux": "tauri build --bundles deb,rpm",
     "build:windows": "tauri build --bundles nsis",
+    "build:windows-arm64": "tauri build --bundles nsis --target aarch64-pc-windows-msvc",
     "preview": "vite preview --host 127.0.0.1 --port 1421",
     "tauri": "tauri"
   },

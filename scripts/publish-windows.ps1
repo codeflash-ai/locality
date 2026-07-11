@@ -3,7 +3,6 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Resolve-Path (Join-Path $ScriptDir "..")
 $DesktopDir = Join-Path $Root "apps\desktop"
-$NsisDir = Join-Path $Root "target\release\bundle\nsis"
 $WindowsOutDir = Join-Path $Root "target\release\bundle\windows"
 $UpdaterDir = Join-Path $Root "target\release\bundle\updater"
 $ProductName = if ($env:PUBLISH_PRODUCT_NAME) { $env:PUBLISH_PRODUCT_NAME } else { "Locality" }
@@ -48,6 +47,15 @@ function Assert-CleanTree {
 }
 
 function Get-WindowsArch {
+    param([string] $TargetTriple)
+    if (-not [string]::IsNullOrWhiteSpace($TargetTriple)) {
+        switch -Regex ($TargetTriple.ToLowerInvariant()) {
+            "^x86_64-pc-windows-msvc$" { return "x86_64" }
+            "^aarch64-pc-windows-msvc$" { return "aarch64" }
+            default { Fail "unsupported Windows target triple: $TargetTriple" }
+        }
+    }
+
     $arch = $env:PROCESSOR_ARCHITECTURE
     if ($env:PROCESSOR_ARCHITEW6432) {
         $arch = $env:PROCESSOR_ARCHITEW6432
@@ -57,6 +65,16 @@ function Get-WindowsArch {
         "^(ARM64|AARCH64)$" { return "aarch64" }
         default { return $arch.ToLowerInvariant() }
     }
+}
+
+function Get-WindowsBuildTarget {
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALITY_WINDOWS_TARGET)) {
+        return $env:LOCALITY_WINDOWS_TARGET
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:PUBLISH_WINDOWS_TARGET)) {
+        return $env:PUBLISH_WINDOWS_TARGET
+    }
+    return ""
 }
 
 function Get-TauriBuildConfig {
@@ -148,11 +166,24 @@ $commitShort = (& git -C $Root rev-parse --short=7 HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($commitShort)) {
     Fail "could not read git commit"
 }
-$arch = Get-WindowsArch
+$targetTriple = Get-WindowsBuildTarget
+$arch = Get-WindowsArch -TargetTriple $targetTriple
 $configJson = Get-TauriBuildConfig
+if (-not [string]::IsNullOrWhiteSpace($targetTriple)) {
+    $env:LOCALITY_WINDOWS_TARGET = $targetTriple
+}
+$bundleDir = if ([string]::IsNullOrWhiteSpace($targetTriple)) {
+    Join-Path $Root "target\release\bundle"
+} else {
+    Join-Path $Root "target\$targetTriple\release\bundle"
+}
+$NsisDir = Join-Path $bundleDir "nsis"
 
 Write-Log "commit $commitShort"
 Write-Log "architecture $arch"
+if (-not [string]::IsNullOrWhiteSpace($targetTriple)) {
+    Write-Log "target $targetTriple"
+}
 if (Test-LocalityWindowsCodeSigningRequested) {
     Write-Log "Windows Authenticode signing enabled"
 } elseif (Test-LocalityWindowsExternalCodeSigningRequested) {
@@ -175,7 +206,11 @@ New-Item -ItemType Directory -Force -Path $WindowsOutDir | Out-Null
 Write-Log "building Tauri NSIS package"
 Push-Location $Root
 try {
-    & npm --prefix $DesktopDir run tauri -- build --bundles nsis --config $configJson
+    $tauriArgs = @("--prefix", $DesktopDir, "run", "tauri", "--", "build", "--bundles", "nsis", "--config", $configJson)
+    if (-not [string]::IsNullOrWhiteSpace($targetTriple)) {
+        $tauriArgs += @("--target", $targetTriple)
+    }
+    & npm @tauriArgs
     if ($LASTEXITCODE -ne 0) {
         Fail "Tauri Windows build failed"
     }

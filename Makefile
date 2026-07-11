@@ -107,9 +107,17 @@ publish-linux: setup ## Build and validate Linux .deb and .rpm packages.
 publish-windows: setup ## Build, sign, and validate a Windows NSIS package.
 	pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/publish-windows.ps1
 
+.PHONY: publish-windows-arm64
+publish-windows-arm64: setup ## Build, sign, and validate a Windows ARM64 NSIS package.
+	LOCALITY_WINDOWS_TARGET=aarch64-pc-windows-msvc pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/publish-windows.ps1
+
 .PHONY: build-tauri-windows
 build-tauri-windows: setup ## Build the Windows Tauri installer.
 	$(DESKTOP_NPM) run build:windows
+
+.PHONY: build-tauri-windows-arm64
+build-tauri-windows-arm64: setup ## Build the Windows ARM64 Tauri installer.
+	LOCALITY_WINDOWS_TARGET=aarch64-pc-windows-msvc $(DESKTOP_NPM) run build:windows-arm64
 
 .PHONY: render-homebrew-cask
 render-homebrew-cask: ## Render a Homebrew cask from published macOS DMG artifacts.

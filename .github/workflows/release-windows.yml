@@ -97,8 +97,8 @@ jobs:
         run: npm run build
         working-directory: apps/desktop
 
-  windows-x64:
-    name: Build and publish Windows x64
+  windows:
+    name: Build and publish Windows x64 and ARM64
     needs: release-preflight
     runs-on: windows-latest
     env:
@@ -157,6 +157,9 @@ jobs:
 
       - name: Select stable Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Windows ARM64 Rust target
+        run: rustup target add aarch64-pc-windows-msvc
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -228,13 +231,13 @@ jobs:
           tenant-id: ${{ env.AZURE_TENANT_ID }}
           subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Prepare unsigned Windows sidecars
+      - name: Prepare unsigned Windows x64 sidecars
         shell: pwsh
         env:
           LOCALITY_WINDOWS_EXTERNAL_CODESIGN: ""
         run: ./apps/desktop/scripts/prepare-windows-bundle.ps1
 
-      - name: Sign Windows sidecars
+      - name: Sign Windows x64 sidecars
         if: steps.windows-signing.outputs.enabled == 'true'
         uses: azure/artifact-signing-action@v2
         with:
@@ -246,7 +249,7 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-      - name: Validate signed Windows sidecars
+      - name: Validate signed Windows x64 sidecars
         if: steps.windows-signing.outputs.enabled == 'true'
         shell: pwsh
         run: |
@@ -255,10 +258,46 @@ jobs:
             Assert-LocalityWindowsSigned -Path (Join-Path "apps/desktop/src-tauri/windows" $name)
           }
 
-      - name: Build, sign, and validate Windows installer
+      - name: Build, sign, and validate Windows x64 installer
         shell: pwsh
         env:
           LOCALITY_WINDOWS_BUNDLE_PREPARED: "1"
+          PUBLISH_ALLOW_DIRTY: "1"
+        run: ./scripts/publish-windows.ps1
+
+      - name: Prepare unsigned Windows ARM64 sidecars
+        shell: pwsh
+        env:
+          LOCALITY_WINDOWS_EXTERNAL_CODESIGN: ""
+          LOCALITY_WINDOWS_TARGET: aarch64-pc-windows-msvc
+        run: ./apps/desktop/scripts/prepare-windows-bundle.ps1
+
+      - name: Sign Windows ARM64 sidecars
+        if: steps.windows-signing.outputs.enabled == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ env.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ env.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ env.AZURE_ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          files-folder: ${{ github.workspace }}\apps\desktop\src-tauri\windows
+          files-folder-filter: exe
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Validate signed Windows ARM64 sidecars
+        if: steps.windows-signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          . ./scripts/windows-codesign.ps1
+          foreach ($name in @("loc.exe", "localityd.exe", "locality-cloud-files.exe")) {
+            Assert-LocalityWindowsSigned -Path (Join-Path "apps/desktop/src-tauri/windows" $name)
+          }
+
+      - name: Build, sign, and validate Windows ARM64 installer
+        shell: pwsh
+        env:
+          LOCALITY_WINDOWS_BUNDLE_PREPARED: "1"
+          LOCALITY_WINDOWS_TARGET: aarch64-pc-windows-msvc
           PUBLISH_ALLOW_DIRTY: "1"
         run: ./scripts/publish-windows.ps1
 
@@ -299,25 +338,38 @@ jobs:
       - name: Create standard GitHub asset names
         shell: pwsh
         run: |
-          $source = "target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe"
-          $destination = "target/release/bundle/windows/Locality_Windows_v$env:APP_VERSION.exe"
-          $latestDestination = "target/release/bundle/windows/Locality_Windows.exe"
-          if (-not (Test-Path -LiteralPath $source)) {
-            Write-Error "Could not find Windows installer $source."
-            exit 1
+          function Copy-InstallerAsset {
+            param(
+              [string] $Source,
+              [string] $VersionedDestination,
+              [string] $LatestDestination
+            )
+            if (-not (Test-Path -LiteralPath $Source)) {
+              Write-Error "Could not find Windows installer $Source."
+              exit 1
+            }
+            if (-not (Test-Path -LiteralPath "$Source.sig")) {
+              Write-Error "Could not find Windows updater signature $Source.sig."
+              exit 1
+            }
+            Copy-Item -LiteralPath $Source -Destination $VersionedDestination -Force
+            Copy-Item -LiteralPath "$Source.sig" -Destination "$VersionedDestination.sig" -Force
+            Copy-Item -LiteralPath $Source -Destination $LatestDestination -Force
+            Copy-Item -LiteralPath "$Source.sig" -Destination "$LatestDestination.sig" -Force
+            foreach ($path in @($VersionedDestination, $LatestDestination)) {
+              $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+              "$hash  $(Split-Path -Leaf $path)" | Set-Content -Encoding ascii -LiteralPath "$path.sha256"
+            }
           }
-          if (-not (Test-Path -LiteralPath "$source.sig")) {
-            Write-Error "Could not find Windows updater signature $source.sig."
-            exit 1
-          }
-          Copy-Item -LiteralPath $source -Destination $destination -Force
-          Copy-Item -LiteralPath "$source.sig" -Destination "$destination.sig" -Force
-          Copy-Item -LiteralPath $source -Destination $latestDestination -Force
-          Copy-Item -LiteralPath "$source.sig" -Destination "$latestDestination.sig" -Force
-          foreach ($path in @($destination, $latestDestination)) {
-            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
-            "$hash  $(Split-Path -Leaf $path)" | Set-Content -Encoding ascii -LiteralPath "$path.sha256"
-          }
+
+          Copy-InstallerAsset `
+            -Source "target/release/bundle/windows/Locality-release-windows-x86_64-setup.exe" `
+            -VersionedDestination "target/release/bundle/windows/Locality_Windows_v$env:APP_VERSION.exe" `
+            -LatestDestination "target/release/bundle/windows/Locality_Windows.exe"
+          Copy-InstallerAsset `
+            -Source "target/release/bundle/windows/Locality-release-windows-aarch64-setup.exe" `
+            -VersionedDestination "target/release/bundle/windows/Locality_Windows_ARM64_v$env:APP_VERSION.exe" `
+            -LatestDestination "target/release/bundle/windows/Locality_Windows_ARM64.exe"
 
       - name: Render Windows updater manifest
         shell: bash
@@ -325,6 +377,7 @@ jobs:
           GITHUB_RELEASE_TAG: ${{ env.RELEASE_TAG }}
           UPDATER_MANIFEST_OUTPUT: target/release/bundle/updater/latest-windows.json
           UPDATER_WINDOWS_X86_64_ARTIFACT: target/release/bundle/windows/Locality_Windows_v${{ env.APP_VERSION }}.exe
+          UPDATER_WINDOWS_AARCH64_ARTIFACT: target/release/bundle/windows/Locality_Windows_ARM64_v${{ env.APP_VERSION }}.exe
           UPDATER_NOTES: Locality ${{ env.APP_VERSION }} Windows update.
         run: scripts/render-tauri-updater-manifest.sh
 
@@ -333,7 +386,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path target/release/github-assets | Out-Null
           Copy-Item "target/release/bundle/windows/Locality_Windows_v$env:APP_VERSION.exe*" target/release/github-assets/
+          Copy-Item "target/release/bundle/windows/Locality_Windows_ARM64_v$env:APP_VERSION.exe*" target/release/github-assets/
           Copy-Item target/release/bundle/windows/Locality_Windows.exe* target/release/github-assets/
+          Copy-Item target/release/bundle/windows/Locality_Windows_ARM64.exe* target/release/github-assets/
           Copy-Item target/release/bundle/updater/latest-windows.json target/release/github-assets/
           Get-ChildItem target/release/github-assets -File |
             Sort-Object Name |

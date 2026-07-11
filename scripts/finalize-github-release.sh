@@ -92,6 +92,12 @@ required_assets=(
   "Locality_Windows.exe"
   "Locality_Windows.exe.sha256"
   "Locality_Windows.exe.sig"
+  "Locality_Windows_ARM64_v${APP_VERSION}.exe"
+  "Locality_Windows_ARM64_v${APP_VERSION}.exe.sha256"
+  "Locality_Windows_ARM64_v${APP_VERSION}.exe.sig"
+  "Locality_Windows_ARM64.exe"
+  "Locality_Windows_ARM64.exe.sha256"
+  "Locality_Windows_ARM64.exe.sig"
   "latest-windows.json"
   "SHA256SUMS-windows"
 )
