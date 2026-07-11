@@ -1971,6 +1971,66 @@ fn runtime_remote_fast_forward_request_uses_daemon_hydration_queue() {
 }
 
 #[test]
+fn runtime_remote_fast_forward_request_skips_duplicate_active_target() {
+    let config = relay_config("remote-fast-forward-dedupe-active");
+    let mount_root = temp_root("remote-fast-forward-dedupe-active-mount");
+    seed_clean_remote_changed_page(&config.state_root, &mount_root);
+    let (started_tx, started_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let runtime = DaemonRuntime::spawn_with_runner(
+        config,
+        BlockingHydrationRunner {
+            started: started_tx,
+            release: Arc::clone(&release),
+        },
+    )
+    .expect("spawn runtime");
+
+    let first = runtime.handle().request(DaemonRequest::RemoteFastForward {
+        mount_id: "notion-main".to_string(),
+        remote_id: "page-1".to_string(),
+        path: PathBuf::from("Roadmap.md"),
+    });
+    assert!(first.ok, "first remote fast-forward failed: {first:?}");
+    assert_eq!(
+        first
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("queued"))
+            .and_then(|queued| queued.as_bool()),
+        Some(true)
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first hydration started");
+
+    let duplicate = runtime.handle().request(DaemonRequest::RemoteFastForward {
+        mount_id: "notion-main".to_string(),
+        remote_id: "page-1".to_string(),
+        path: PathBuf::from("Roadmap.md"),
+    });
+    assert!(
+        duplicate.ok,
+        "duplicate remote fast-forward failed: {duplicate:?}"
+    );
+    assert_eq!(
+        duplicate
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("queued"))
+            .and_then(|queued| queued.as_bool()),
+        Some(false)
+    );
+
+    release_blocked_runner(&release);
+    assert!(
+        started_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+        "duplicate remote fast-forward should not start a second hydration"
+    );
+    runtime.shutdown();
+}
+
+#[test]
 fn runtime_live_mode_remote_fast_forward_request_bypasses_recent_open_delay() {
     let config = relay_config("remote-fast-forward-request-active");
     let mount_root = temp_root("remote-fast-forward-request-active-mount");
@@ -2718,6 +2778,12 @@ struct BlockingPullRunner {
     release: Arc<(Mutex<bool>, Condvar)>,
 }
 
+#[derive(Clone)]
+struct BlockingHydrationRunner {
+    started: mpsc::Sender<HydrationRequest>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
 impl RuntimeJobRunner for BlockingPullRunner {
     fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
         self.started.send(()).expect("notify started");
@@ -2752,6 +2818,41 @@ impl RuntimeJobRunner for BlockingPullRunner {
         Err(LocalityError::InvalidState(
             "hydration should not run".to_string(),
         ))
+    }
+}
+
+impl RuntimeJobRunner for BlockingHydrationRunner {
+    fn run_pull(&self, _state_root: PathBuf, _path: PathBuf) -> DaemonResponse {
+        DaemonResponse::error("unexpected_pull", "pull should not run")
+    }
+
+    fn run_push(&self, _state_root: PathBuf, _job: PushJob) -> DaemonResponse {
+        DaemonResponse::error("unexpected_push", "push should not run")
+    }
+
+    fn run_scheduled_pull(
+        &self,
+        _state_root: PathBuf,
+        _tick: PullSchedulerTick,
+        _policy: HydrationPolicy,
+    ) -> locality_core::LocalityResult<ScheduledPullRuntimeReport> {
+        Err(LocalityError::InvalidState(
+            "scheduled pull should not run".to_string(),
+        ))
+    }
+
+    fn run_hydration(
+        &self,
+        _state_root: PathBuf,
+        request: HydrationRequest,
+    ) -> locality_core::LocalityResult<HydrationOutcome> {
+        self.started.send(request).expect("notify started");
+        let (lock, condvar) = &*self.release;
+        let mut released = lock.lock().expect("lock release");
+        while !*released {
+            released = condvar.wait(released).expect("wait release");
+        }
+        Ok(HydrationOutcome::Hydrated)
     }
 }
 

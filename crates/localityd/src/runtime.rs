@@ -1148,8 +1148,28 @@ struct RuntimeState {
 struct ActiveRuntimeJob {
     kind: String,
     target: Option<String>,
+    live_mode_fast_forward_target: Option<RemoteTargetKey>,
     started_at: Instant,
     started_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RemoteTargetKey {
+    mount_id: MountId,
+    remote_id: RemoteId,
+}
+
+impl RemoteTargetKey {
+    fn new(mount_id: MountId, remote_id: RemoteId) -> Self {
+        Self {
+            mount_id,
+            remote_id,
+        }
+    }
+
+    fn from_hydration_request(request: &HydrationRequest) -> Self {
+        Self::new(request.mount_id.clone(), request.remote_id.clone())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1177,6 +1197,7 @@ impl ActiveRuntimeJob {
         Self {
             kind,
             target,
+            live_mode_fast_forward_target: job.live_mode_fast_forward_target(),
             started_at: Instant::now(),
             started_at_unix_ms: unix_time_ms(),
         }
@@ -1189,6 +1210,7 @@ impl ActiveRuntimeJob {
                 "{}:{}",
                 request.mount_id, request.container_identifier
             )),
+            live_mode_fast_forward_target: None,
             started_at: Instant::now(),
             started_at_unix_ms: unix_time_ms(),
         }
@@ -1329,7 +1351,7 @@ impl RuntimeState {
                 remote_id,
                 path,
             } => {
-                self.queue_hydration(HydrationRequest::new(
+                let queued = self.queue_hydration(HydrationRequest::new(
                     MountId::new(mount_id.clone()),
                     RemoteId::new(remote_id.clone()),
                     path.clone(),
@@ -1337,7 +1359,7 @@ impl RuntimeState {
                     HydrationReason::FileOpen,
                 ));
                 let _ = respond_to.send(DaemonResponse::ok(json!({
-                    "queued": true,
+                    "queued": queued,
                     "mount_id": mount_id,
                     "remote_id": remote_id,
                     "path": path,
@@ -1369,7 +1391,7 @@ impl RuntimeState {
                 remote_id,
                 path,
             } => {
-                self.queue_hydration(HydrationRequest::new(
+                let queued = self.queue_hydration(HydrationRequest::new(
                     MountId::new(mount_id.clone()),
                     RemoteId::new(remote_id.clone()),
                     path.clone(),
@@ -1377,7 +1399,7 @@ impl RuntimeState {
                     HydrationReason::LiveModeRemoteFastForward,
                 ));
                 let _ = respond_to.send(DaemonResponse::ok(json!({
-                    "queued": true,
+                    "queued": queued,
                     "mount_id": mount_id,
                     "remote_id": remote_id,
                     "path": path,
@@ -1925,26 +1947,28 @@ impl RuntimeState {
         );
     }
 
-    fn queue_hydration(&mut self, request: HydrationRequest) {
+    fn queue_hydration(&mut self, request: HydrationRequest) -> bool {
         if request.reason.is_remote_fast_forward() {
+            if self.remote_fast_forward_target_is_already_queued(&request) {
+                return false;
+            }
             match self.auto_fast_forward_queue_decision(&request) {
                 Ok(AutoFastForwardQueueDecision::Queue) => {}
-                Ok(AutoFastForwardQueueDecision::Skip) => return,
+                Ok(AutoFastForwardQueueDecision::Skip) => return false,
                 Ok(AutoFastForwardQueueDecision::Delay(job)) => {
-                    self.queue_freshness(job);
-                    return;
+                    return self.queue_freshness(job);
                 }
                 Err(error) => {
                     eprintln!(
                         "localityd skipped remote fast-forward for `{}`: {error}",
                         request.path.display()
                     );
-                    return;
+                    return false;
                 }
             }
         }
 
-        self.hydration.queue_request(request.clone());
+        let queued = self.hydration.queue_request(request.clone());
 
         match SqliteStateStore::open(self.config.state_root.clone())
             .and_then(|mut store| store.upsert_hydration_job(HydrationJobRecord::from(request)))
@@ -1952,6 +1976,18 @@ impl RuntimeState {
             Ok(()) => {}
             Err(error) => eprintln!("localityd failed to persist hydration request: {error}"),
         }
+        queued
+    }
+
+    fn remote_fast_forward_target_is_already_queued(&self, request: &HydrationRequest) -> bool {
+        let target = RemoteTargetKey::from_hydration_request(request);
+        self.active_job
+            .as_ref()
+            .and_then(|job| job.live_mode_fast_forward_target.as_ref())
+            .is_some_and(|active| active == &target)
+            || self
+                .hydration
+                .contains_target(&request.mount_id, &request.remote_id)
     }
 
     fn queue_freshness(&mut self, job: SyncJob) -> bool {
@@ -3819,6 +3855,17 @@ impl MutatingJob {
                     None => job.mount_id.as_str().to_string(),
                 }),
             ),
+        }
+    }
+
+    fn live_mode_fast_forward_target(&self) -> Option<RemoteTargetKey> {
+        match self {
+            Self::Hydration { request }
+                if request.reason == HydrationReason::LiveModeRemoteFastForward =>
+            {
+                Some(RemoteTargetKey::from_hydration_request(request))
+            }
+            _ => None,
         }
     }
 }
@@ -6367,6 +6414,7 @@ mod tests {
         ActiveRuntimeJob {
             kind: "test".to_string(),
             target: None,
+            live_mode_fast_forward_target: None,
             started_at: std::time::Instant::now(),
             started_at_unix_ms: 0,
         }

@@ -501,6 +501,9 @@ static LAUNCH_AT_LOGIN_STATE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
 static LIVE_MODE_REMOTE_PULL_CURSOR: OnceLock<Mutex<usize>> = OnceLock::new();
 static LIVE_MODE_REMOTE_PULL_SCAN_TIMES: OnceLock<Mutex<BTreeMap<MountId, Instant>>> =
     OnceLock::new();
+static LIVE_MODE_REMOTE_FAST_FORWARD_TIMES: OnceLock<
+    Mutex<BTreeMap<(MountId, RemoteId), Instant>>,
+> = OnceLock::new();
 static LIVE_MODE_LOCAL_RECONCILE_TIMES: OnceLock<Mutex<BTreeMap<PathBuf, Instant>>> =
     OnceLock::new();
 static LIVE_MODE_TICK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -519,6 +522,7 @@ const TRAY_POPOVER_EDGE_MARGIN: f64 = 8.0;
 const TRAY_POPOVER_ANCHOR_OFFSET: f64 = 12.0;
 const LIVE_MODE_LOCAL_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const LIVE_MODE_ACTIVE_REMOTE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+const LIVE_MODE_REMOTE_FAST_FORWARD_LEASE: Duration = Duration::from_secs(30);
 const LIVE_MODE_ACTIVE_TARGET_WINDOW: Duration = Duration::from_secs(5 * 60);
 const LIVE_MODE_REMOTE_CHECK_ESTIMATED_REQUESTS_PER_PAGE: f64 = 1.0;
 const LIVE_MODE_REMOTE_CHECK_QUEUE_SHARE: f64 = 1.0 / 3.0;
@@ -2500,47 +2504,82 @@ fn live_mode_queue_remote_fast_forward_at_state_root(
     state_root: &Path,
     target: &LiveModeRemoteTarget,
 ) -> Result<(), String> {
-    live_mode_send_daemon_queue_request_at_state_root(
+    let key = (target.mount_id.clone(), target.remote_id.clone());
+    if !live_mode_claim_remote_fast_forward_key(&key, Instant::now()) {
+        return Ok(());
+    }
+
+    let response = send_request(
         state_root,
-        DaemonRequest::RemoteFastForward {
+        &DaemonRequest::RemoteFastForward {
             mount_id: target.mount_id.0.clone(),
             remote_id: target.remote_id.0.clone(),
             path: target.path.clone(),
         },
-    )?;
-    desktop_log(
-        "info",
-        "live_mode_remote_fast_forward_queued",
+    )
+    .map_err(|error| {
+        live_mode_release_remote_fast_forward_key(&key);
         format!(
-            "queued remote fast-forward for `{}` ({}/{})",
-            target.path.display(),
-            target.mount_id.as_str(),
-            target.remote_id.as_str()
-        ),
-    );
+            "Live Mode could not reach the Locality daemon to queue remote sync work: {}",
+            error.message()
+        )
+    })?;
+    if !response.ok {
+        live_mode_release_remote_fast_forward_key(&key);
+        let message = response
+            .error
+            .map(|error| error.message)
+            .unwrap_or_else(|| "daemon rejected the Live Mode request".to_string());
+        return Err(format!(
+            "Live Mode could not queue remote sync work: {message}"
+        ));
+    }
+
+    if response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("queued"))
+        .and_then(|queued| queued.as_bool())
+        .unwrap_or(true)
+    {
+        desktop_log(
+            "info",
+            "live_mode_remote_fast_forward_queued",
+            format!(
+                "queued remote fast-forward for `{}` ({}/{})",
+                target.path.display(),
+                target.mount_id.as_str(),
+                target.remote_id.as_str()
+            ),
+        );
+    }
     Ok(())
 }
 
-fn live_mode_send_daemon_queue_request_at_state_root(
-    state_root: &Path,
-    request: DaemonRequest,
-) -> Result<(), String> {
-    match send_request(state_root, &request) {
-        Ok(response) if response.ok => Ok(()),
-        Ok(response) => {
-            let message = response
-                .error
-                .map(|error| error.message)
-                .unwrap_or_else(|| "daemon rejected the Live Mode request".to_string());
-            Err(format!(
-                "Live Mode could not queue remote sync work: {message}"
-            ))
-        }
-        Err(error) => Err(format!(
-            "Live Mode could not reach the Locality daemon to queue remote sync work: {}",
-            error.message()
-        )),
+fn live_mode_claim_remote_fast_forward_key(key: &(MountId, RemoteId), now: Instant) -> bool {
+    let Ok(mut times) = live_mode_remote_fast_forward_times().lock() else {
+        return true;
+    };
+    times.retain(|_, last| {
+        now.checked_duration_since(*last)
+            .is_some_and(|elapsed| elapsed < LIVE_MODE_REMOTE_FAST_FORWARD_LEASE)
+    });
+    if times.contains_key(key) {
+        return false;
     }
+    times.insert(key.clone(), now);
+    true
+}
+
+fn live_mode_release_remote_fast_forward_key(key: &(MountId, RemoteId)) {
+    let Ok(mut times) = live_mode_remote_fast_forward_times().lock() else {
+        return;
+    };
+    times.remove(key);
+}
+
+fn live_mode_remote_fast_forward_times() -> &'static Mutex<BTreeMap<(MountId, RemoteId), Instant>> {
+    LIVE_MODE_REMOTE_FAST_FORWARD_TIMES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10246,17 +10285,18 @@ mod tests {
 
     use super::{
         ActionReport, DESKTOP_ACTIVITY_LIMIT, DESKTOP_INSTALL_MARKER_VERSION,
-        LIVE_MODE_RUNNER_ACTIVE_INTERVAL, LIVE_MODE_RUNNER_PERIODIC_RECHECK, MonitorScreenBounds,
-        PendingChange, ScreenBounds, TerminalCliLinkState, TrayVisualState,
-        acknowledge_install_state_at, activity_timestamp, clear_mount_cached_projection,
-        clear_state_root_contents, clear_visible_projection_paths, conflict_preview,
-        connection_metadata_changed, current_daemon_build_id, current_desktop_build_id,
-        diff_report_message, exact_located_entity_record, exact_notion_entry_matches,
-        failed_push_summary, has_unresolved_conflict_markers, hydration_after_editor_write,
-        inspect_install_state, install_terminal_cli_link_at,
+        LIVE_MODE_REMOTE_FAST_FORWARD_LEASE, LIVE_MODE_RUNNER_ACTIVE_INTERVAL,
+        LIVE_MODE_RUNNER_PERIODIC_RECHECK, MonitorScreenBounds, PendingChange, ScreenBounds,
+        TerminalCliLinkState, TrayVisualState, acknowledge_install_state_at, activity_timestamp,
+        clear_mount_cached_projection, clear_state_root_contents, clear_visible_projection_paths,
+        conflict_preview, connection_metadata_changed, current_daemon_build_id,
+        current_desktop_build_id, diff_report_message, exact_located_entity_record,
+        exact_notion_entry_matches, failed_push_summary, has_unresolved_conflict_markers,
+        hydration_after_editor_write, inspect_install_state, install_terminal_cli_link_at,
         install_terminal_cli_link_in_path_dirs, is_notion_access_lost_message,
-        is_unsupported_schema_version_message, live_mode_local_reconcile_targets_for_mount_at,
-        live_mode_merge_remote_drift_markdown, live_mode_remote_check_page_budget_for_rate,
+        is_unsupported_schema_version_message, live_mode_claim_remote_fast_forward_key,
+        live_mode_local_reconcile_targets_for_mount_at, live_mode_merge_remote_drift_markdown,
+        live_mode_release_remote_fast_forward_key, live_mode_remote_check_page_budget_for_rate,
         live_mode_remote_pull_candidates, live_mode_remote_pull_scan_is_due_for_key,
         live_mode_runner_should_tick, live_mode_should_reconcile_local_target_for_key,
         live_mode_target, live_mode_tick_from_snapshot, live_mode_wake_generation,
@@ -14283,6 +14323,47 @@ mod tests {
             now + LIVE_MODE_RUNNER_ACTIVE_INTERVAL,
             &mut next_tick
         ));
+    }
+
+    #[test]
+    fn live_mode_remote_fast_forward_lease_suppresses_recent_duplicate() {
+        let key = (
+            MountId::new("lease-mount-duplicate"),
+            RemoteId::new("lease-remote-duplicate"),
+        );
+        live_mode_release_remote_fast_forward_key(&key);
+        let now = Instant::now();
+
+        assert!(live_mode_claim_remote_fast_forward_key(&key, now));
+        assert!(!live_mode_claim_remote_fast_forward_key(
+            &key,
+            now + Duration::from_millis(1)
+        ));
+        assert!(live_mode_claim_remote_fast_forward_key(
+            &key,
+            now + LIVE_MODE_REMOTE_FAST_FORWARD_LEASE + Duration::from_millis(1)
+        ));
+
+        live_mode_release_remote_fast_forward_key(&key);
+    }
+
+    #[test]
+    fn live_mode_remote_fast_forward_lease_can_release_for_retry() {
+        let key = (
+            MountId::new("lease-mount-release"),
+            RemoteId::new("lease-remote-release"),
+        );
+        live_mode_release_remote_fast_forward_key(&key);
+        let now = Instant::now();
+
+        assert!(live_mode_claim_remote_fast_forward_key(&key, now));
+        live_mode_release_remote_fast_forward_key(&key);
+        assert!(live_mode_claim_remote_fast_forward_key(
+            &key,
+            now + Duration::from_millis(1)
+        ));
+
+        live_mode_release_remote_fast_forward_key(&key);
     }
 
     #[test]

@@ -611,6 +611,11 @@ impl HydrationQueue {
         self.pending.len()
     }
 
+    pub fn contains_target(&self, mount_id: &MountId, remote_id: &RemoteId) -> bool {
+        self.pending
+            .contains_key(&HydrationKey::new(mount_id.clone(), remote_id.clone()))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -750,11 +755,15 @@ struct HydrationKey {
 }
 
 impl HydrationKey {
-    fn from_request(request: &HydrationRequest) -> Self {
+    fn new(mount_id: MountId, remote_id: RemoteId) -> Self {
         Self {
-            mount_id: request.mount_id.clone(),
-            remote_id: request.remote_id.clone(),
+            mount_id,
+            remote_id,
         }
+    }
+
+    fn from_request(request: &HydrationRequest) -> Self {
+        Self::new(request.mount_id.clone(), request.remote_id.clone())
     }
 }
 
