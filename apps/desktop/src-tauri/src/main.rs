@@ -4208,108 +4208,63 @@ fn tray_icon_should_use_template() -> bool {
     cfg!(target_os = "macos")
 }
 
+const TRAY_LOGO_MARK_PNG: &[u8] = include_bytes!("../assets/tray-locality-mark.png");
+
 fn draw_short_logo_mark(rgba: &mut [u8], size: usize, color: [u8; 4], halo: bool) {
-    let top = if halo {
-        [
-            (18.0, 1.8),
-            (32.6, 8.8),
-            (32.9, 13.4),
-            (21.0, 19.3),
-            (15.0, 19.3),
-            (3.1, 13.4),
-            (3.4, 8.8),
-        ]
-    } else {
-        [
-            (18.0, 3.1),
-            (30.9, 9.2),
-            (31.1, 12.3),
-            (20.4, 17.5),
-            (15.6, 17.5),
-            (4.9, 12.3),
-            (5.1, 9.2),
-        ]
-    };
-    let bottom = if halo {
-        [
-            (14.0, 18.8),
-            (22.0, 18.8),
-            (33.0, 25.5),
-            (32.4, 29.4),
-            (21.0, 34.4),
-            (15.0, 34.4),
-            (3.6, 29.4),
-            (3.0, 25.5),
-        ]
-    } else {
-        [
-            (14.8, 20.3),
-            (21.2, 20.3),
-            (31.0, 26.1),
-            (30.5, 28.6),
-            (20.4, 32.7),
-            (15.6, 32.7),
-            (5.5, 28.6),
-            (5.0, 26.1),
-        ]
-    };
-
-    draw_polygon(rgba, size, &top, color);
-    draw_polygon(rgba, size, &bottom, color);
-
-    let dot_radius = if halo { 2.8 } else { 1.65 };
-    for center in [
-        (4.6, 15.4),
-        (4.6, 18.5),
-        (4.6, 21.6),
-        (31.4, 15.4),
-        (31.4, 18.5),
-        (31.4, 21.6),
-    ] {
-        draw_disc(rgba, size, center, dot_radius, color);
+    let mark = tray_logo_mark_image();
+    if halo {
+        for y_offset in -1..=1 {
+            for x_offset in -1..=1 {
+                if x_offset != 0 || y_offset != 0 {
+                    draw_image_alpha_mask(rgba, size, mark, x_offset, y_offset, color);
+                }
+            }
+        }
     }
+    draw_image_alpha_mask(rgba, size, mark, 0, 0, color);
 }
 
-fn draw_polygon(rgba: &mut [u8], size: usize, points: &[(f64, f64)], color: [u8; 4]) {
-    for y in 0..size {
-        for x in 0..size {
-            let px = x as f64 + 0.5;
-            let py = y as f64 + 0.5;
-            let inside = point_in_polygon((px, py), points);
-            let distance = points
-                .iter()
-                .zip(points.iter().cycle().skip(1))
-                .take(points.len())
-                .map(|(start, end)| distance_to_segment((px, py), *start, *end))
-                .fold(f64::INFINITY, f64::min);
-            let alpha = if inside {
-                (distance + 0.6).clamp(0.0, 1.0)
-            } else {
-                (0.6 - distance).clamp(0.0, 1.0)
-            };
+fn tray_logo_mark_image() -> &'static Image<'static> {
+    static TRAY_LOGO_MARK: OnceLock<Image<'static>> = OnceLock::new();
+    TRAY_LOGO_MARK.get_or_init(|| {
+        Image::from_bytes(TRAY_LOGO_MARK_PNG).expect("embedded tray logo PNG should decode")
+    })
+}
+
+fn draw_image_alpha_mask(
+    rgba: &mut [u8],
+    size: usize,
+    image: &Image<'_>,
+    x_offset: i32,
+    y_offset: i32,
+    color: [u8; 4],
+) {
+    let image_width = image.width() as usize;
+    let image_height = image.height() as usize;
+    let image_rgba = image.rgba();
+    for y in 0..image_height {
+        let target_y = y as i32 + y_offset;
+        if !(0..size as i32).contains(&target_y) {
+            continue;
+        }
+        for x in 0..image_width {
+            let target_x = x as i32 + x_offset;
+            if !(0..size as i32).contains(&target_x) {
+                continue;
+            }
+            let alpha = image_rgba[(y * image_width + x) * 4 + 3] as f64 / 255.0;
             if alpha > 0.0 {
-                blend_pixel(rgba, size, x, y, color, alpha);
+                blend_pixel(
+                    rgba,
+                    size,
+                    target_x as usize,
+                    target_y as usize,
+                    color,
+                    alpha,
+                );
             }
         }
     }
-}
-
-fn point_in_polygon(point: (f64, f64), points: &[(f64, f64)]) -> bool {
-    let mut inside = false;
-    let mut previous = points[points.len() - 1];
-    for current in points {
-        let crosses = (current.1 > point.1) != (previous.1 > point.1);
-        if crosses {
-            let x_intersection = (previous.0 - current.0) * (point.1 - current.1)
-                / (previous.1 - current.1)
-                + current.0;
-            if point.0 < x_intersection {
-                inside = !inside;
-            }
-        }
-        previous = *current;
-    }
-    inside
 }
 
 fn draw_disc(rgba: &mut [u8], size: usize, center: (f64, f64), radius: f64, color: [u8; 4]) {
@@ -4324,21 +4279,6 @@ fn draw_disc(rgba: &mut [u8], size: usize, center: (f64, f64), radius: f64, colo
             }
         }
     }
-}
-
-fn distance_to_segment(point: (f64, f64), start: (f64, f64), end: (f64, f64)) -> f64 {
-    let vx = end.0 - start.0;
-    let vy = end.1 - start.1;
-    let wx = point.0 - start.0;
-    let wy = point.1 - start.1;
-    let length_squared = vx * vx + vy * vy;
-    if length_squared == 0.0 {
-        return ((point.0 - start.0).powi(2) + (point.1 - start.1).powi(2)).sqrt();
-    }
-
-    let t = ((wx * vx + wy * vy) / length_squared).clamp(0.0, 1.0);
-    let closest = (start.0 + t * vx, start.1 + t * vy);
-    ((point.0 - closest.0).powi(2) + (point.1 - closest.1).powi(2)).sqrt()
 }
 
 fn blend_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4], coverage: f64) {
@@ -12412,20 +12352,40 @@ mod tests {
                 .chunks_exact(4)
                 .any(|pixel| { pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200 })
         );
-        for (x, y) in [(4, 15), (4, 18), (4, 21), (32, 15), (32, 18), (32, 21)] {
+        for (x, y) in [(5, 15), (5, 18), (5, 21), (30, 15), (30, 18), (30, 21)] {
             let pixel = tray_icon_pixel(&ready, x, y);
             assert!(
                 pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200,
                 "expected short-logo side dot at ({x}, {y}), got {pixel:?}"
             );
         }
-        for (x, y) in [(18, 6), (18, 27)] {
+        for (x, y) in [(3, 15), (33, 15)] {
             let pixel = tray_icon_pixel(&ready, x, y);
             assert!(
-                pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 200,
-                "expected short-logo stacked body at ({x}, {y}), got {pixel:?}"
+                pixel[3] < 80,
+                "expected side dot to stay inside the logo cap span at ({x}, {y}), got {pixel:?}"
             );
         }
+        for (x, y) in [(18, 4), (6, 11), (29, 11)] {
+            let pixel = tray_icon_pixel(&ready, x, y);
+            assert!(
+                pixel[0] < 40 && pixel[1] < 50 && pixel[2] < 70 && pixel[3] > 100,
+                "expected short-logo top outline at ({x}, {y}), got {pixel:?}"
+            );
+        }
+        let bottom_body = tray_icon_pixel(&ready, 18, 27);
+        assert!(
+            bottom_body[0] < 40
+                && bottom_body[1] < 50
+                && bottom_body[2] < 70
+                && bottom_body[3] > 200,
+            "expected short-logo bottom body, got {bottom_body:?}"
+        );
+        let top_center = tray_icon_pixel(&ready, 18, 9);
+        assert!(
+            top_center[3] < 80,
+            "expected short-logo top interior to stay transparent, got {top_center:?}"
+        );
         if tray_icon_should_use_template() {
             let ready_opaque = tray_icon_opaque_pixel_count(&ready);
             assert!(
