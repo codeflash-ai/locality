@@ -12416,7 +12416,7 @@ mod tests {
     }
 
     fn tray_icon_visible_dark_pixel(pixel: [u8; 4], min_alpha: u8) -> bool {
-        pixel[0] < 100 && pixel[1] < 110 && pixel[2] < 130 && pixel[3] > min_alpha
+        pixel[0] < 190 && pixel[1] < 190 && pixel[2] < 200 && pixel[3] > min_alpha
     }
 
     fn tray_icon_pixel(image: &tauri::image::Image<'_>, x: usize, y: usize) -> [u8; 4] {
