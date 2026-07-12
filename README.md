@@ -8,6 +8,8 @@ on file saves or on `push` command.
 
 This file approach simplifies external apps for your agents, and collaborating with agents for work.
 
+https://github.com/user-attachments/assets/b2486a4a-e957-4c4f-8e4d-12163c920b16
+
 The first supported platform is Notion: pages become directories, page bodies live
 in `page.md`, child pages become child directories, and database rows become
 page-like folders with frontmatter. Humans, editors, scripts, and coding agents
