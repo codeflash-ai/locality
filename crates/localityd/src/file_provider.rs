@@ -1767,7 +1767,10 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         fs::write(
             &path,
-            render_canonical_markdown(&CanonicalDocument::new(frontmatter(&remote_id), "Body.\n")),
+            render_canonical_markdown(&CanonicalDocument::new(
+                versioned_frontmatter(&remote_id, "remote-v1"),
+                "Body.\n",
+            )),
         )
         .expect("write visible page");
 
