@@ -709,6 +709,18 @@ where
 }
 
 fn target_visible_remote_id(target: &Path) -> Option<RemoteId> {
+    target_visible_remote_id_with(target, projection_path_is_dataless_placeholder)
+}
+
+fn target_visible_remote_id_with(
+    target: &Path,
+    is_dataless_placeholder: impl Fn(&Path) -> bool,
+) -> Option<RemoteId> {
+    // Reading a dataless File Provider placeholder from the daemon can recurse
+    // through fetchContents back into the daemon runtime.
+    if is_dataless_placeholder(target) {
+        return None;
+    }
     if !target.is_file() {
         return None;
     }
@@ -1745,6 +1757,27 @@ mod tests {
         assert!(projection_metadata_flags_are_dataless(SF_DATALESS));
         assert!(projection_metadata_flags_are_dataless(SF_DATALESS | 0x1));
         assert!(!projection_metadata_flags_are_dataless(0));
+    }
+
+    #[test]
+    fn target_visible_remote_id_skips_dataless_placeholder_before_reading_identity() {
+        let root = temp_root("loc-file-provider-target-dataless-id");
+        let path = root.join("page.md");
+        let remote_id = RemoteId::new("page-1");
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(
+            &path,
+            render_canonical_markdown(&CanonicalDocument::new(frontmatter(&remote_id), "Body.\n")),
+        )
+        .expect("write visible page");
+
+        assert_eq!(
+            target_visible_remote_id_with(&path, |_| false),
+            Some(remote_id)
+        );
+        assert_eq!(target_visible_remote_id_with(&path, |_| true), None);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
