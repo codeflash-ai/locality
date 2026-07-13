@@ -149,6 +149,14 @@ fn validate_macos_file_provider_mount_root(
             absolute_display_path(&default_notion_mount_root())
         ));
     }
+    if let Ok(metadata) = fs::metadata(&root)
+        && !metadata.is_dir()
+    {
+        return Err(format!(
+            "Choose a folder path, not a file: {}",
+            root.display()
+        ));
+    }
     Ok(())
 }
 ```
