@@ -122,6 +122,17 @@
   .pathchip span{overflow-wrap:anywhere}
   .pathchip em{font-style:normal;color:var(--teal);font-family:var(--sans);font-size:11px;font-weight:500;flex:none}
 
+  .source-sync{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11.5px;color:var(--muted)}
+  .source-sync b{color:var(--ink);font-weight:600}
+  .danger-accordion{margin-top:14px;border:1px solid rgba(220,38,38,.22);border-radius:8px;background:var(--red-wash)}
+  .danger-accordion summary{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:pointer;
+    color:var(--red);font-size:12px;font-weight:700;list-style:none}
+  .danger-accordion summary::-webkit-details-marker{display:none}
+  .danger-accordion summary::after{content:"Show";margin-left:auto;font-size:11px;font-weight:500;color:var(--red)}
+  .danger-accordion[open] summary::after{content:"Hide"}
+  .danger-accordion .danger-body{border-top:1px solid rgba(220,38,38,.15);padding:10px 12px;
+    display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+
   .radio,.check{display:flex;gap:8px;align-items:flex-start;font-size:12px;margin:6px 0}
   .radio i{width:13px;height:13px;border:1.5px solid var(--line);border-radius:50%;flex:none;margin-top:1px}
   .radio.on i{border-color:var(--teal);box-shadow:inset 0 0 0 3px #fff,inset 0 0 0 8px var(--teal)}
@@ -284,14 +295,14 @@
   <nav class="decknav" aria-label="Screens">
     <div class="brand">
       <h1>Locality Desktop</h1>
-      <div class="sub">WIREFRAME DECK · v6 FLOW TESTING</div>
+      <div class="sub">WIREFRAME DECK · v7 LIVE SYNC FLOWS</div>
     </div>
     <div class="ngroup">Onboarding</div>
     <button data-s="ob1" aria-current="true"><span class="k">1.1</span>Welcome</button>
-    <button data-s="ob2"><span class="k">1.2</span>How agents use it</button>
-    <button data-s="ob3"><span class="k">1.3</span>Connect a source</button>
-    <button data-s="ob4"><span class="k">1.4</span>Local folder</button>
-    <button data-s="ob5"><span class="k">1.5</span>Ready</button>
+    <button data-s="ob2"><span class="k">1.2</span>Connect a source</button>
+    <button data-s="ob3"><span class="k">1.3</span>Local folder</button>
+    <button data-s="ob4"><span class="k">1.4</span>Ready</button>
+    <button data-s="ob5"><span class="k">1.5</span>Optional agent guide</button>
     <div class="ngroup">Top pages</div>
     <button data-s="home"><span class="k">2.1</span>Home</button>
     <button data-s="sources"><span class="k">2.2</span>Sources</button>
@@ -330,11 +341,11 @@
 
     <!-- ============ 1.1 WELCOME ============ -->
     <section class="screen active" id="ob1">
-      <div class="shead"><h2>Onboarding · Welcome</h2><span class="route">step 1 / 5</span></div>
+      <div class="shead"><h2>Onboarding · Welcome</h2><span class="route">step 1 / 4</span></div>
       <p class="sdesc">Sets expectations and states the trust promise in one line. One primary action, one recovery path.</p>
       <div class="frame">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup</span>
-          <div class="steps"><i class="on"></i><i></i><i></i><i></i><i></i></div></div>
+          <div class="steps"><i class="on"></i><i></i><i></i><i></i></div></div>
         <div style="padding:60px 40px;text-align:center">
           <img class="welcome-logo" src="assets/locality-logo-dark.svg" alt="Locality">
           <div style="font-size:20px;font-weight:600;letter-spacing:-.02em;max-width:420px;margin:0 auto">
@@ -345,50 +356,17 @@
           <div style="margin-top:16px"><span class="linkish" data-go="home">Restore from an existing mount</span></div>
         </div>
       </div>
-      <div class="notes"><b>notes</b> — traffic-light chrome + 5-dot step indicator persist across all setup steps ·
+      <div class="notes"><b>notes</b> — traffic-light chrome + 4-dot setup indicator persists across required setup steps ·
       "safely" is the thesis word: repeated in review-mode copy · secondary link handles reinstall/repair users.</div>
     </section>
 
-    <!-- ============ 1.2 HOW AGENTS USE IT ============ -->
+    <!-- ============ 1.2 CONNECT ============ -->
     <section class="screen" id="ob2">
-      <div class="shead"><h2>Onboarding · How agents use it</h2><span class="route">step 2 / 5</span></div>
-      <p class="sdesc">Teach the filesystem-first model before connection. Agents work in visible folders, Locality writes guidance, and changes stay local until review.</p>
+      <div class="shead"><h2>Onboarding · Connect a source</h2><span class="route">step 2 / 4</span></div>
+      <p class="sdesc">First meaningful setup action. Connector cards scale as new sources ship, while OAuth waits and errors stay inline.</p>
       <div class="frame">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup</span>
-          <div class="steps"><i class="on"></i><i class="on"></i><i></i><i></i><i></i></div></div>
-        <div style="padding:28px 36px 32px">
-          <div style="font-size:17px;font-weight:600">Agents work in files you can see</div>
-          <p style="color:var(--muted);margin:4px 0 18px">Each connected source appears as a local folder. Locality adds guidance files like AGENTS.md and CLAUDE.md so agents follow the filesystem contract, and edits stay local until you review them.</p>
-          <div style="display:grid;grid-template-columns:1.05fr .95fr;gap:14px;max-width:620px">
-            <div class="card" style="padding:14px">
-              <div class="card-h">Visible local workspace</div>
-              <div class="rowline"><span class="grow">notion-main/AGENTS.md</span><span class="chip c-synced">Guide</span></div>
-              <div class="rowline"><span class="grow">Roadmap/page.md</span><span class="chip c-review">Edited</span></div>
-              <div class="rowline"><span class="grow">Launch Plan/page.md</span><span class="chip c-synced">Synced</span></div>
-            </div>
-            <div class="card" style="padding:14px">
-              <div style="font-weight:600;font-size:12.5px;margin-bottom:8px">What Locality does</div>
-              <div class="check on"><i>✓</i><div><b style="font-size:12px">Keeps files visible</b><small>Agents and humans work in the same folder.</small></div></div>
-              <div class="check on"><i>✓</i><div><b style="font-size:12px">Writes guidance</b><small>Agents see the filesystem contract inside the mount.</small></div></div>
-              <div class="check on"><i>✓</i><div><b style="font-size:12px">Holds changes for review</b><small>Nothing syncs back until you approve it.</small></div></div>
-            </div>
-          </div>
-          <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:26px">
-            <span class="btn" data-go="ob1">Back</span><span class="btn btn-primary" data-go="ob3">Continue →</span>
-          </div>
-        </div>
-      </div>
-      <div class="notes"><b>goal</b> — add the app-like educational pause without changing the deck's visual system ·
-      this screen teaches the folder contract before any source authorization happens.</div>
-    </section>
-
-    <!-- ============ 1.3 CONNECT ============ -->
-    <section class="screen" id="ob3">
-      <div class="shead"><h2>Onboarding · Connect a source</h2><span class="route">step 3 / 5</span></div>
-      <p class="sdesc">Connector cards scale as new sources ship. OAuth runs in the system browser; the step shows waiting, error, and connected states inline.</p>
-      <div class="frame">
-        <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup</span>
-          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i></div></div>
+          <div class="steps"><i class="on"></i><i class="on"></i><i></i><i></i></div></div>
         <div style="padding:28px 36px 32px">
           <div style="font-size:17px;font-weight:600">Connect a source</div>
           <p style="color:var(--muted);margin:4px 0 18px">Locality only reads and writes the pages you authorize.</p>
@@ -396,7 +374,7 @@
             <div class="card" style="padding:14px">
               <div style="display:flex;gap:8px;align-items:center;font-weight:600"><span class="src src-n">N</span>Notion</div>
               <p style="color:var(--muted);font-size:11.5px;margin:6px 0 12px">Workspaces, pages, databases</p>
-              <span class="btn btn-primary btn-sm" data-go="ob4">Connect</span>
+              <span class="btn btn-primary btn-sm" data-go="ob3">Connect</span>
             </div>
             <div class="card" style="padding:14px;opacity:.55">
               <div style="display:flex;gap:8px;align-items:center;font-weight:600"><span class="src src-g">G</span>Google Docs</div>
@@ -406,24 +384,25 @@
           </div>
           <div style="display:flex;gap:8px;align-items:center;margin-top:18px;color:var(--muted);font-size:12px">
             <span class="chip c-review">⟳ waiting</span> Waiting for authorization in your browser…
-            <span class="btn btn-sm" data-go="ob3">Reopen browser</span><span class="linkish">Copy sign-in link</span>
+            <span class="btn btn-sm" data-go="ob2">Reopen browser</span><span class="linkish">Copy sign-in link</span>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:26px">
-            <span class="btn" data-go="ob2">Back</span><span class="btn btn-primary" style="opacity:.5" data-go="ob4">Continue →</span>
+            <span class="btn" data-go="ob1">Back</span><span class="btn btn-primary" style="opacity:.5" data-go="ob3">Continue →</span>
           </div>
         </div>
       </div>
       <div class="notes"><b>states</b> — error: “We couldn’t connect. [Try again]” · success: card shows workspace
       avatar + name + Synced-teal “Connected ✓”, Continue enables · copy-link is the no-browser fallback ·
-      multi-source framing stays visible here even though onboarding advances through one primary source path.</div>
+      product education moved to optional step 1.5 so setup starts with action.</div>
     </section>
-    <!-- ============ 1.4 FOLDER ============ -->
-    <section class="screen" id="ob4">
-      <div class="shead"><h2>Onboarding · Local folder</h2><span class="route">step 4 / 5</span></div>
+
+    <!-- ============ 1.3 FOLDER ============ -->
+    <section class="screen" id="ob3">
+      <div class="shead"><h2>Onboarding · Local folder</h2><span class="route">step 3 / 4</span></div>
       <p class="sdesc">Show where files appear and keep setup progress, approval waits, and recovery actions on this screen only.</p>
       <div class="frame">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup</span>
-          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i></i></div></div>
+          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i></i></div></div>
         <div style="padding:26px 36px 30px;max-width:620px">
           <div style="font-size:17px;font-weight:600;margin-bottom:14px">Create your local folder</div>
           <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Your connected source will appear here:</div>
@@ -437,7 +416,7 @@
             <div class="rowline"><span class="chip c-review">⟳</span><span class="grow">Waiting for test file to appear…</span></div>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:22px">
-            <span class="btn" data-go="ob3">Back</span><span class="btn btn-primary" data-go="ob5">Continue →</span>
+            <span class="btn" data-go="ob2">Back</span><span class="btn btn-primary" data-go="ob4">Continue →</span>
           </div>
           <div style="font-size:11px;color:var(--faint);margin-top:10px">Use this step for approval-required, waiting-for-folder, and retry-needed states.</div>
         </div>
@@ -446,32 +425,65 @@
       “File Provider not approved → [Open System Settings]” · keep all setup and recovery states on this screen.</div>
     </section>
 
-    <!-- ============ 1.5 READY ============ -->
-    <section class="screen" id="ob5">
-      <div class="shead"><h2>Onboarding · Ready</h2><span class="route">step 5 / 5</span></div>
-      <p class="sdesc">Completion handoff: mounted path, agent-ready promise, and next action into the product.</p>
+    <!-- ============ 1.4 READY ============ -->
+    <section class="screen" id="ob4">
+      <div class="shead"><h2>Onboarding · Ready</h2><span class="route">step 4 / 4</span></div>
+      <p class="sdesc">Completion handoff: mounted path, optional agent guidance, and next action into the product.</p>
       <div class="frame">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup</span>
-          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></div></div>
+          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></div></div>
         <div style="padding:28px 36px 30px;max-width:620px">
           <div style="display:flex;align-items:center;gap:8px;font-size:17px;font-weight:600;margin-bottom:16px">
             <span class="chip c-synced" style="font-size:13px">✓</span> Locality is ready</div>
           <div style="font-size:12px;color:var(--muted);margin-bottom:6px">Your local workspace is mounted here:</div>
           <div class="pathchip"><span>~/Library/CloudStorage/Locality/notion</span><em>Copy</em></div>
-          <div style="font-size:11.5px;color:var(--muted);margin:6px 0 16px">Agents can open this folder now, and Locality will hold their edits for review.</div>
+          <div style="font-size:11.5px;color:var(--muted);margin:6px 0 16px">Agents can open this folder now, and Locality will hold their edits for review unless Live Mode is enabled for this source.</div>
           <div class="card" style="padding:12px 14px">
-            <div style="font-weight:600;font-size:12.5px">⚡ Agent guidance installed</div>
+            <div style="font-weight:600;font-size:12.5px">Agent guidance is optional</div>
             <div style="font-size:11.5px;color:var(--muted);margin:4px 0 10px">
-              Claude Code · Cursor · Warp · Gemini CLI can learn the filesystem contract from guidance files inside the mount.</div>
-            <span class="btn btn-sm">Copy sample prompt</span>
+              Open Locality now, or learn how AGENTS.md and editor guidance help agents use the mount correctly.</div>
+            <span class="btn btn-sm" data-go="ob5">View optional guide</span>
           </div>
           <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:20px">
             <span class="btn" data-go="files">Open my folder</span><span class="btn btn-primary" data-go="home">Open Locality →</span>
           </div>
         </div>
       </div>
-      <div class="notes"><b>handoff</b> — keep this screen about readiness, not setup progress ·
-      step 2 owns the education story now, so step 5 stays a pure completion handoff.</div>
+      <div class="notes"><b>handoff</b> — required onboarding ends here ·
+      optional education sits behind a secondary action so the setup path stays short.</div>
+    </section>
+
+    <!-- ============ 1.5 OPTIONAL AGENT GUIDE ============ -->
+    <section class="screen" id="ob5">
+      <div class="shead"><h2>Onboarding · Optional agent guide</h2><span class="route">optional after setup</span></div>
+      <p class="sdesc">Product knowledge appears after the user has completed setup. This screen explains the filesystem-first model without blocking connection.</p>
+      <div class="frame">
+        <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality Setup · Optional</span>
+          <div class="steps"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></div></div>
+        <div style="padding:28px 36px 32px">
+          <div style="font-size:17px;font-weight:600">Agents work in files you can see</div>
+          <p style="color:var(--muted);margin:4px 0 18px">Each connected source appears as a local folder. Locality adds guidance files like AGENTS.md and CLAUDE.md so agents follow the filesystem contract, and edits stay local until review or Live Mode safely syncs them.</p>
+          <div style="display:grid;grid-template-columns:1.05fr .95fr;gap:14px;max-width:620px">
+            <div class="card" style="padding:14px">
+              <div class="card-h">Visible local workspace</div>
+              <div class="rowline"><span class="grow">notion-main/AGENTS.md</span><span class="chip c-synced">Guide</span></div>
+              <div class="rowline"><span class="grow">Roadmap/page.md</span><span class="chip c-review">Edited</span></div>
+              <div class="rowline"><span class="grow">Launch Plan/page.md</span><span class="chip c-synced">Synced</span></div>
+            </div>
+            <div class="card" style="padding:14px">
+              <div style="font-weight:600;font-size:12.5px;margin-bottom:8px">What Locality does</div>
+              <div class="check on"><i>✓</i><div><b style="font-size:12px">Keeps files visible</b><small>Agents and humans work in the same folder.</small></div></div>
+              <div class="check on"><i>✓</i><div><b style="font-size:12px">Writes guidance</b><small>Agents see the filesystem contract inside the mount.</small></div></div>
+              <div class="check on"><i>✓</i><div><b style="font-size:12px">Keeps review explicit</b><small>Review Center handles approvals and exceptions.</small></div></div>
+            </div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:26px">
+            <span class="btn" data-go="ob4">Back</span><span class="btn" data-go="agents">Configure agent guidance</span><span class="btn btn-primary" data-go="home">Open Locality →</span>
+          </div>
+        </div>
+      </div>
+      <div class="notes"><b>goal</b> — optional education after setup avoids slowing the first-run path ·
+      users can skip it, while teams can still use it during demos and onboarding reviews.</div>
     </section>
 
     <!-- ============ 2.1 HOME ============ -->
@@ -566,7 +578,7 @@
     <!-- ============ 2.2 SOURCES ============ -->
     <section class="screen" id="sources">
       <div class="shead"><h2>Sources</h2><span class="route">/sources · /sources/:id</span></div>
-      <p class="sdesc">Connected workspaces and mount health in one place. Daily write decisions still route through Review Center.</p>
+      <p class="sdesc">Connected workspaces, mount health, and per-source sync controls in one place. Daily write decisions still route through Review Center when review is required.</p>
       <div class="frame" data-app-shell="sources" data-app-title="Sources">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Sources</span></div>
         <div class="content" style="padding:18px 22px">
@@ -577,10 +589,11 @@
               <span class="src src-n">N</span>Notion — Acme Team
               <span class="chip c-synced" style="margin-left:auto">✓ Healthy</span></div>
             <div class="pathchip" style="margin:10px 0"><span>~/Library/CloudStorage/Locality/notion</span><em>Copy</em></div>
-            <div style="display:flex;gap:8px;align-items:center;font-size:11.5px;color:var(--muted);margin-bottom:12px">
-              Mode: <span class="btn btn-sm">Review ▾</span> · 412 pages · 3 databases</div>
+            <div class="source-sync" style="margin-bottom:12px">
+              <b>Sync for this source</b><span class="btn btn-sm">Review mode ▾</span><span class="chip c-paused">Live off</span>
+              <span>412 pages · 3 databases</span></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <span class="btn btn-sm" data-go="files">Open folder</span><span class="btn btn-sm">Pause ▾</span>
+              <span class="btn btn-sm" data-go="files">Open folder</span><span class="btn btn-sm">Sync now</span><span class="btn btn-sm">Pause source ▾</span>
               <span class="btn btn-sm" data-go="srcdetail">Reconnect</span><span class="btn btn-ghost btn-sm" data-go="srcdetail">Details →</span></div>
           </div>
           <div class="card" style="padding:14px;opacity:.6">
@@ -591,38 +604,39 @@
           </div>
         </div>
       </div>
-      <div class="notes"><b>source detail</b> adds — mount health checklist · File Provider status · synced-scope list ·
-      per-source sync mode · diagnostics shortcuts · danger zone (Reset local state / Prepare for uninstall → app-native modals).</div>
+      <div class="notes"><b>sync model</b> — Settings defines the default for new sources; each source card has its own mode,
+      Sync now, and Pause source controls · source detail adds diagnostics, scoped access, and the hidden danger-zone accordion.</div>
     </section>
 
     <!-- ============ 2.3 REVIEW CENTER ============ -->
     <section class="screen" id="reviewcenter">
-      <div class="shead"><h2>Review Center</h2><span class="route">/review</span></div>
-      <p class="sdesc">The approval workspace: changed files on the left, diff on the right, and a single primary path to approve selected changes.</p>
+      <div class="shead"><h2>Review Center — Live Mode on</h2><span class="route">/review</span></div>
+      <p class="sdesc">When Live Mode is on, safe edits auto-sync and appear in Activity. Review Center becomes the exception queue for approvals, conflicts, policy pauses, and failed syncs.</p>
       <div class="frame" data-app-shell="review" data-app-title="Review Center">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Review Center</span></div>
         <div class="appshell" style="grid-template-columns:224px 1fr">
           <div class="snav" style="padding:0">
             <div style="padding:10px 12px;border-bottom:1px solid var(--line-soft)">
-              <div style="font-size:12.5px;font-weight:600">4 changes waiting</div>
-              <div style="font-size:11px;color:var(--muted);margin-top:2px">Oldest: 1 hour · 3 agents</div>
+              <div style="font-size:12.5px;font-weight:600">4 items need attention</div>
+              <div style="font-size:11px;color:var(--muted);margin-top:2px">Live Mode on · safe edits sync automatically</div>
             </div>
             <div style="display:flex;gap:4px;padding:8px 10px;border-bottom:1px solid var(--line-soft)">
               <span class="btn btn-sm btn-primary">All</span>
-              <span class="btn btn-sm">Notion</span>
-              <span class="btn btn-sm">By agent</span>
+              <span class="btn btn-sm">Approvals</span>
+              <span class="btn btn-sm">Problems</span>
             </div>
-            <div class="sect-label">Awaiting review</div>
+            <div class="sect-label">Needs manual approval</div>
             <div class="rowline"><span class="check on"><i>✓</i></span><span class="src src-n">N</span>
-              <span class="grow">Roadmap.md</span><span class="meta">Claude</span></div>
+              <span class="grow">Roadmap.md</span><span class="chip c-review-needed">Rule</span></div>
             <div class="rowline" style="background:var(--teal-wash)"><span class="check on"><i>✓</i></span><span class="src src-n">N</span>
-              <span class="grow">Auth.md</span><span class="meta">Cursor</span></div>
-            <div class="rowline"><span class="check"><i></i></span><span class="src src-n">N</span>
-              <span class="grow">Notes.md</span><span class="meta">new</span></div>
+              <span class="grow">Auth.md</span><span class="chip c-review-needed">Policy</span></div>
+            <div class="sect-label">Paused by safety</div>
             <div class="rowline"><span class="check on"><i>✓</i></span><span class="src src-n">N</span>
-              <span class="grow">Old.md</span><span class="chip c-error">del</span></div>
+              <span class="grow">Old.md</span><span class="chip c-conflict">Delete</span></div>
+            <div class="rowline"><span class="check"><i></i></span><span class="src src-n">N</span>
+              <span class="grow">Notes.md</span><span class="chip c-conflict">Conflict</span></div>
             <div style="margin-top:auto;border-top:1px solid var(--line-soft);padding:10px 12px">
-              <div style="font-size:11px;color:var(--muted);margin-bottom:8px">3 of 4 selected</div>
+              <div style="font-size:11px;color:var(--muted);margin-bottom:8px">3 selected · Live Mode stays paused for selected files</div>
               <div style="display:flex;gap:6px">
                 <span class="btn btn-sm" style="flex:1;justify-content:center">Reject</span>
                 <span class="btn btn-primary btn-sm" style="flex:1;justify-content:center">Approve</span>
@@ -631,9 +645,13 @@
           </div>
           <div>
             <div class="statusbar"><b style="font-size:13px">Auth.md</b>
-              <span class="meta">Cursor · edited 12 min ago · +1 -1</span>
+              <span class="meta">Cursor · Live Mode paused for this file · +1 -1</span>
               <span class="sp"><span class="btn btn-sm" data-go="files">Open file</span><span class="btn btn-sm" data-go="agents">Rule…</span></span></div>
           <div class="content">
+            <div class="card" style="padding:10px 12px;margin-bottom:12px;background:var(--amber-wash);border-color:rgba(192,138,0,.2)">
+              <div style="font-weight:600;font-size:12px;color:var(--amber)">Review required by source policy</div>
+              <div style="font-size:11.5px;color:var(--muted);margin-top:3px">Safe edits from this source can live-sync, but this file matches a rule that requires human approval before push.</div>
+            </div>
             <div class="diff">
               <div class="dh">Auth.md
                 <div class="seg"><span class="on">Unified</span><span>Split</span></div></div>
@@ -643,18 +661,18 @@
               <div class="dl dl-ctx">  Unchanged context line…</div>
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">
-              <span class="btn btn-sm">Reject selected</span><span class="btn btn-primary btn-sm" data-go="review">Approve selected</span>
+              <span class="btn btn-sm">Reject selected</span><span class="btn btn-primary btn-sm" data-go="review">Approve &amp; push</span>
               <span class="btn btn-sm">Pull latest</span><span class="btn btn-sm">Reset to remote</span>
               <span class="btn btn-sm" data-go="conflict">Resolve conflict</span></div>
             <div style="margin-top:14px;font-size:12px;color:var(--muted)">
-              Pushed work appears in Activity. Revert is shown only when a journal-backed reverse plan is still safe.</div>
+              Auto-synced work skips this queue and appears in Activity. Revert is shown only when a journal-backed reverse plan is still safe.</div>
           </div>
           </div>
         </div>
       </div>
-      <div class="notes"><b>keyboard</b> — ↑/↓ moves selection · Space toggles checkbox · Enter opens diff ·
-      <b>empty state</b> — “No changes waiting for review. Agent edits will appear here.” ·
-      discarded work is kept in .locality/trash for a retention window.</div>
+      <div class="notes"><b>Live Mode flow</b> — clean remote pulls and safe local pushes do not stop here; they go straight to Activity.
+      Review Center shows destructive changes, same-block conflicts, remote drift, large plans, permission failures, and source rules requiring approval ·
+      <b>empty state</b> — “No review needed. Live Mode synced safe changes automatically.”</div>
     </section>
 
     <!-- ============ 2.3.1 PUSH APPROVAL ============ -->
@@ -762,20 +780,27 @@
         data-app-crumbs="Settings|Activity log"
         data-app-entry="Settings > Activity log, Home recent activity > View all, push success > View activity">
         <div class="tbar"><div class="dots"><i></i><i></i><i></i></div><span class="ttl">Locality — Activity</span></div>
-        <div class="content" style="padding:18px 22px">
-          <div class="sect-label" style="padding-left:0">Today</div>
-          <div class="card" style="margin-bottom:14px">
-            <div class="rowline"><span class="chip c-synced">⤴</span><span class="grow">Pushed 4 changes to Notion</span>
-              <span class="meta">10:24</span><span class="linkish">details ▾</span></div>
-            <div class="rowline"><span class="chip c-review">⤵</span><span class="grow">Pulled 2 pages from Notion</span>
-              <span class="meta">09:03</span></div>
-            <div class="rowline"><span class="chip c-paused">⏸</span><span class="grow">Live sync paused: conflict</span>
-              <span class="meta">08:50</span><span class="linkish">resolve</span></div>
+        <div class="setshell">
+          <div class="setnav">
+            <a href="#">General</a><a href="#" data-go="srcdetail">Sources</a><a href="#" data-go="settings">Sync &amp; Live Mode</a>
+            <a class="on" href="#">Activity</a><a href="#" data-go="agents">Agents</a><a href="#">Notifications</a><a href="#">Network</a>
+            <a href="#">Advanced</a><a href="#">About</a>
           </div>
-          <div class="sect-label" style="padding-left:0">Yesterday</div>
-          <div class="card">
-            <div class="rowline"><span class="chip c-synced">⤴</span><span class="grow">Pushed 1 change</span>
-              <span class="meta">17:12</span></div>
+          <div class="content" style="padding:18px 22px">
+            <div class="sect-label" style="padding-left:0">Today</div>
+            <div class="card" style="margin-bottom:14px">
+              <div class="rowline"><span class="chip c-synced">⤴</span><span class="grow">Pushed 4 changes to Notion</span>
+                <span class="meta">10:24</span><span class="linkish">details ▾</span></div>
+              <div class="rowline"><span class="chip c-review">⤵</span><span class="grow">Pulled 2 pages from Notion</span>
+                <span class="meta">09:03</span></div>
+              <div class="rowline"><span class="chip c-paused">⏸</span><span class="grow">Live sync paused: conflict</span>
+                <span class="meta">08:50</span><span class="linkish">resolve</span></div>
+            </div>
+            <div class="sect-label" style="padding-left:0">Yesterday</div>
+            <div class="card">
+              <div class="rowline"><span class="chip c-synced">⤴</span><span class="grow">Pushed 1 change</span>
+                <span class="meta">17:12</span></div>
+            </div>
           </div>
         </div>
       </div>
@@ -792,7 +817,7 @@
         <div class="setshell">
           <div class="setnav">
             <a href="#">General</a><a href="#" data-go="srcdetail">Sources</a><a class="on" href="#">Sync &amp; Live Mode</a>
-            <a href="#" data-go="agents">Agents</a><a href="#">Notifications</a><a href="#">Network</a>
+            <a href="#" data-go="activity">Activity</a><a href="#" data-go="agents">Agents</a><a href="#">Notifications</a><a href="#">Network</a>
             <a href="#">Advanced</a><a href="#">About</a>
           </div>
           <div class="content" style="max-width:460px">
@@ -804,12 +829,17 @@
             <div class="check on"><i>✓</i><span>Pause on conflicts</span></div>
             <div class="check on"><i>✓</i><span>Pause on destructive plans</span></div>
             <div class="check on"><i>✓</i><span>Pause on review-required changes</span></div>
-            <div style="margin-top:14px"><span class="linkish" data-go="srcdetail">Per-source overrides →</span></div>
+            <div class="h-min">Source overrides</div>
+            <div class="card">
+              <div class="rowline" data-go="srcdetail"><span class="src src-n">N</span><span class="grow">Notion — Acme Team</span><span class="btn btn-sm">Review mode ▾</span></div>
+              <div class="rowline"><span class="src src-g">G</span><span class="grow" style="color:var(--muted)">Google Docs</span><span class="chip c-draft">Not connected</span></div>
+            </div>
+            <div style="margin-top:14px"><span class="linkish" data-go="srcdetail">Manage per-source sync →</span></div>
           </div>
         </div>
       </div>
       <div class="notes"><b>sections</b> — General (login item, theme, editor, updates) · Sources · Sync &amp; Live ·
-      Agents (detected agents + Install/Update guidance) · Notifications · Network ·
+      Activity · Agents (detected agents + Install/Update guidance) · Notifications · Network ·
       Advanced (logs, repair runtime, Queue Debug, danger zone) · About.</div>
     </section>
 
@@ -929,7 +959,15 @@
               <div class="rowline"><span class="grow" style="color:var(--muted)">Pages</span>412</div>
               <div class="rowline"><span class="grow" style="color:var(--muted)">Databases</span>3</div>
               <div class="rowline"><span class="grow" style="color:var(--muted)">Root</span>exists <span class="chip c-synced">✓</span></div>
-              <div class="rowline"><span class="grow" style="color:var(--muted)">Mode</span><span class="btn btn-sm">Review ▾</span></div></div>
+              <div class="rowline"><span class="grow" style="color:var(--muted)">Root sync</span><span class="chip c-synced">Enabled</span></div></div>
+          </div>
+          <div class="card" style="margin-top:10px">
+            <div class="card-h">Sync for this source</div>
+            <div class="rowline"><span class="grow" style="color:var(--muted)">Mode</span><span class="btn btn-sm">Review mode ▾</span></div>
+            <div class="rowline"><span class="grow" style="color:var(--muted)">Clean remote pulls</span><span class="chip c-synced">On</span></div>
+            <div class="rowline"><span class="grow" style="color:var(--muted)">Live safe pushes</span><span class="chip c-paused">Off</span><span class="btn btn-sm">Turn on</span></div>
+            <div class="rowline"><span class="grow" style="color:var(--muted)">Review rules</span>Destructive, conflict, large plan</div>
+            <div class="rowline"><span class="btn btn-sm">Sync now</span><span class="btn btn-sm">Pause source ▾</span><span class="linkish">Use global default</span></div>
           </div>
           <div class="h-min">Mount health</div>
           <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:12px">
@@ -937,16 +975,17 @@
             <span><span class="chip c-synced">✓</span> Provider registered</span>
             <span><span class="chip c-synced">✓</span> Credentials valid</span>
             <span><span class="chip c-synced">✓</span> Last sync 2m ago</span></div>
-          <div class="card" style="margin-top:14px;border-color:var(--red);background:var(--red-wash)">
-            <div class="card-h" style="border-color:rgba(220,38,38,.15);color:var(--red)">⚠ Danger zone</div>
-            <div style="padding:10px 12px;display:flex;gap:8px;align-items:center">
+          <details class="danger-accordion">
+            <summary>⚠ Danger zone <span style="color:var(--muted);font-weight:500">Closed by default</span></summary>
+            <div class="danger-body">
               <span class="btn btn-sm" style="border-color:var(--red);color:var(--red)">Reset local state</span>
               <span class="btn btn-sm" style="border-color:var(--red);color:var(--red)">Disconnect source</span>
-              <span style="font-size:11px;color:var(--muted)">Both open typed-confirmation modals.</span></div></div>
+              <span style="font-size:11px;color:var(--muted)">Both open typed-confirmation modals.</span></div>
+          </details>
         </div>
       </div>
       <div class="notes"><b>notes</b> — a failed health check swaps to ✕ Error with a fix action (Start runtime / Reconnect / Open logs) ·
-      Mode dropdown here is the per-source override referenced in Settings → Sync &amp; Live.</div>
+      per-source sync controls override the global default; Danger Zone stays collapsed until explicitly opened.</div>
     </section>
 
     <!-- ============ 2.1.2 LOCATE RESULTS ============ -->
@@ -1018,7 +1057,7 @@
         <div class="setshell">
           <div class="setnav">
             <a href="#">General</a><a href="#">Sources</a><a href="#">Sync &amp; Live Mode</a>
-            <a class="on" href="#">Agents</a><a href="#">Notifications</a><a href="#">Network</a>
+            <a href="#" data-go="activity">Activity</a><a class="on" href="#">Agents</a><a href="#">Notifications</a><a href="#">Network</a>
             <a href="#">Advanced</a><a href="#">About</a>
           </div>
           <div class="content" style="max-width:460px">
