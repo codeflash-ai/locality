@@ -4966,6 +4966,7 @@ fn reset_platform_projection_state(state_root: &Path) -> Result<(), String> {
     stop_windows_cloud_files_provider_supervisor(state_root)
 }
 
+#[cfg(test)]
 fn clear_state_root_contents(state_root: &Path) -> Result<(), String> {
     reset_locality_state_storage(state_root)
         .map(|_| ())

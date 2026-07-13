@@ -6,6 +6,7 @@ use locality_platform::{
     cloud_files_mount_id_component, decode_cloud_files_mount_id_component,
     windows_cloud_files_registration_marker_dir,
 };
+#[cfg(any(target_os = "windows", test))]
 use locality_store::MountConfig;
 use locality_store::{MountRepository, ProjectionMode, SqliteStateStore};
 use serde::{Deserialize, Serialize};
@@ -2020,6 +2021,7 @@ fn local_path_disappeared(error: &HelperError) -> bool {
         || error.message.contains("cannot find the file")
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn stale_pending_file_delete(identifier: &str, error: &HelperError) -> bool {
     daemon_identifier_for_identity_check(identifier).starts_with("local:")
         && error.message.contains("was not found in mount")
@@ -2065,11 +2067,13 @@ fn cached_identity_refresh_unavailable(error: &HelperError) -> bool {
     )
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn is_local_identity(identifier: &str) -> bool {
     let identifier = daemon_identifier_for_identity_check(identifier);
     identifier.starts_with("local:") || identifier.starts_with("children:local:")
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn daemon_identifier_for_identity_check(identifier: &str) -> std::borrow::Cow<'_, str> {
     localityd::virtual_projection::unwrap_identifier(identifier)
         .map(|unwrapped| std::borrow::Cow::Owned(unwrapped.daemon_identifier))
@@ -2857,6 +2861,7 @@ unsafe fn handle_delete(
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn stale_pending_page_directory_delete(identifier: &str, error: &HelperError) -> bool {
     daemon_identifier_for_identity_check(identifier).starts_with("children:local:")
         && error.message.contains("not present in daemon state")
@@ -3594,10 +3599,12 @@ fn path_is_under_sync_root(context: &ProviderContext, path: &Path) -> bool {
     path == root || path.starts_with(&(root + r"\"))
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn same_cloud_path(left: &Path, right: &Path) -> bool {
     normalized_cloud_path_string(left) == normalized_cloud_path_string(right)
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn shared_provider_mount_matches_projection_root(
     mount: &MountConfig,
     projection_root: &Path,
@@ -3608,6 +3615,7 @@ fn shared_provider_mount_matches_projection_root(
     )
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn normalized_cloud_path_string(path: &Path) -> String {
     let path = platform_display_path(path.to_path_buf());
     path.to_string_lossy()
