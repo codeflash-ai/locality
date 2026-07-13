@@ -5744,12 +5744,31 @@ fn validate_desktop_mount_root(
     projection: &ProjectionMode,
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    if *projection == ProjectionMode::MacosFileProvider {
-        return validate_macos_file_provider_mount_root(
+    {
+        return validate_desktop_mount_root_with_macos_provider_roots(
             root,
             state_root,
+            projection,
             &macos_file_provider_cloud_storage_roots(),
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = projection;
+        validate_mount_root(root, state_root)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_desktop_mount_root_with_macos_provider_roots(
+    root: &Path,
+    state_root: &Path,
+    projection: &ProjectionMode,
+    provider_roots: &[PathBuf],
+) -> Result<(), String> {
+    if *projection == ProjectionMode::MacosFileProvider {
+        return validate_macos_file_provider_mount_root(root, state_root, provider_roots);
     }
 
     let _ = projection;
@@ -5771,76 +5790,170 @@ fn validate_mount_root_location(root: &Path, state_root: &Path) -> Result<PathBu
 }
 
 #[cfg(target_os = "macos")]
+fn normalize_absolute_mount_path(path: &Path) -> Result<PathBuf, String> {
+    let path = absolute_path(path)?;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(Path::new("/")),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(format!(
+                        "Could not normalize mount path `{}`.",
+                        path.display()
+                    ));
+                }
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(target_os = "macos")]
+fn resolved_mount_validation_path(path: &Path) -> Result<PathBuf, String> {
+    let normalized = normalize_absolute_mount_path(path)?;
+    let mut existing_ancestor = None;
+    for candidate in normalized.ancestors() {
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => {
+                existing_ancestor = Some(candidate);
+                break;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect mount path `{}`: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    let existing_ancestor = existing_ancestor
+        .ok_or_else(|| format!("No existing parent folder for {}", normalized.display()))?;
+    let missing_tail = normalized
+        .strip_prefix(existing_ancestor)
+        .map_err(|error| {
+            format!(
+                "Could not resolve mount path `{}`: {error}",
+                normalized.display()
+            )
+        })?;
+    let resolved_ancestor = fs::canonicalize(existing_ancestor).map_err(|error| {
+        format!(
+            "Could not resolve mount path `{}`: {error}",
+            existing_ancestor.display()
+        )
+    })?;
+    Ok(resolved_ancestor.join(missing_tail))
+}
+
+#[cfg(target_os = "macos")]
 fn validate_macos_file_provider_mount_root(
     root: &Path,
     state_root: &Path,
     provider_roots: &[PathBuf],
 ) -> Result<(), String> {
-    let root = validate_mount_root_location(root, state_root)?;
+    let root = validate_mount_root_structure(root, state_root, false)?;
+    let resolved_root = resolved_mount_validation_path(&root)?;
+    let resolved_state_root = resolved_mount_validation_path(state_root)?;
+    if resolved_root.starts_with(&resolved_state_root) {
+        return Err("Choose a folder outside the Locality state directory.".to_string());
+    }
     let provider_roots = provider_roots
         .iter()
-        .filter_map(|provider_root| absolute_path(provider_root).ok())
+        .filter_map(|provider_root| resolved_mount_validation_path(provider_root).ok())
         .collect::<Vec<_>>();
-    let inside_provider_root = provider_roots
-        .iter()
-        .any(|provider_root| root.starts_with(provider_root) && root != *provider_root);
+    let inside_provider_root = provider_roots.iter().any(|provider_root| {
+        resolved_root.starts_with(provider_root) && resolved_root != *provider_root
+    });
     if !inside_provider_root {
         return Err(format!(
             "Choose a mount point inside the Locality File Provider root, for example {}.",
             absolute_display_path(&default_notion_mount_root())
         ));
     }
-    if let Ok(metadata) = fs::metadata(&root)
-        && !metadata.is_dir()
-    {
-        return Err(format!(
-            "Choose a folder path, not a file: {}",
-            root.display()
-        ));
-    }
     Ok(())
 }
 
-fn validate_mount_root(root: &Path, state_root: &Path) -> Result<(), String> {
+fn validate_mount_root_structure(
+    root: &Path,
+    state_root: &Path,
+    require_writable: bool,
+) -> Result<PathBuf, String> {
     let root = validate_mount_root_location(root, state_root)?;
 
-    if let Ok(metadata) = fs::metadata(&root) {
-        if !metadata.is_dir() {
+    match fs::metadata(&root) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "Choose a folder path, not a file: {}",
+                    root.display()
+                ));
+            }
+            if require_writable && metadata.permissions().readonly() {
+                return Err(format!("Selected folder is read-only: {}", root.display()));
+            }
+            return Ok(root);
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) => {}
+        Err(error) => {
             return Err(format!(
-                "Choose a folder path, not a file: {}",
+                "Could not inspect mount folder `{}`: {error}",
                 root.display()
             ));
         }
-        if metadata.permissions().readonly() {
-            return Err(format!("Selected folder is read-only: {}", root.display()));
-        }
-        return Ok(());
     }
 
-    let parent = root
-        .ancestors()
-        .skip(1)
-        .find(|candidate| candidate.exists())
+    let mut existing_parent = None;
+    for candidate in root.ancestors().skip(1) {
+        match fs::metadata(candidate) {
+            Ok(metadata) => {
+                existing_parent = Some((candidate, metadata));
+                break;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect parent folder `{}`: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    let (parent, metadata) = existing_parent
         .ok_or_else(|| format!("No existing parent folder for {}", root.display()))?;
-    let metadata = fs::metadata(parent).map_err(|error| {
-        format!(
-            "Could not inspect parent folder `{}`: {error}",
-            parent.display()
-        )
-    })?;
     if !metadata.is_dir() {
         return Err(format!(
             "Mount parent is not a folder: {}",
             parent.display()
         ));
     }
-    if metadata.permissions().readonly() {
+    if require_writable && metadata.permissions().readonly() {
         return Err(format!(
             "Mount parent folder is read-only: {}",
             parent.display()
         ));
     }
-    Ok(())
+    Ok(root)
+}
+
+fn validate_mount_root(root: &Path, state_root: &Path) -> Result<(), String> {
+    validate_mount_root_structure(root, state_root, true).map(|_| ())
 }
 
 fn projection_label(projection: &ProjectionMode) -> &'static str {
@@ -11897,14 +12010,103 @@ mod tests {
                 .readonly()
         );
 
-        let result = super::validate_macos_file_provider_mount_root(
+        let result = super::validate_desktop_mount_root_with_macos_provider_roots(
             &root,
             &temp.path().join(".loc"),
+            &ProjectionMode::MacosFileProvider,
             std::slice::from_ref(&provider_root),
         );
 
         fs::set_permissions(&root, original_permissions).expect("restore mount point permissions");
         result.expect("provider-owned mount point should not require a POSIX write bit");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_mount_rejects_parent_traversal_outside_provider_root() {
+        let temp = TestTempDir::new("desktop-file-provider-parent-traversal");
+        let provider_root = temp.path().join("Locality");
+        let outside_root = temp.path().join("outside");
+        fs::create_dir_all(&provider_root).expect("create provider root");
+        fs::create_dir_all(&outside_root).expect("create outside root");
+        let traversing_root = provider_root.join("..").join("outside");
+
+        let error = super::validate_macos_file_provider_mount_root(
+            &traversing_root,
+            &temp.path().join(".loc"),
+            std::slice::from_ref(&provider_root),
+        )
+        .expect_err("parent traversal outside provider root rejected");
+
+        assert!(error.contains("inside the Locality File Provider root"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_mount_rejects_symlink_outside_provider_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestTempDir::new("desktop-file-provider-symlink-escape");
+        let provider_root = temp.path().join("Locality");
+        let outside_root = temp.path().join("outside");
+        fs::create_dir_all(&provider_root).expect("create provider root");
+        fs::create_dir_all(&outside_root).expect("create outside root");
+        let symlink_root = provider_root.join("escape");
+        symlink(&outside_root, &symlink_root).expect("create escaping symlink");
+
+        let error = super::validate_macos_file_provider_mount_root(
+            &symlink_root,
+            &temp.path().join(".loc"),
+            std::slice::from_ref(&provider_root),
+        )
+        .expect_err("symlink outside provider root rejected");
+
+        assert!(error.contains("inside the Locality File Provider root"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_mount_rejects_file_root() {
+        let temp = TestTempDir::new("desktop-file-provider-file-root");
+        let provider_root = temp.path().join("Locality");
+        let file_root = provider_root.join("notion");
+        fs::create_dir_all(&provider_root).expect("create provider root");
+        fs::write(&file_root, "not a folder").expect("create file root");
+
+        let error = super::validate_macos_file_provider_mount_root(
+            &file_root,
+            &temp.path().join(".loc"),
+            std::slice::from_ref(&provider_root),
+        )
+        .expect_err("file mount root rejected");
+
+        assert_eq!(
+            error,
+            format!("Choose a folder path, not a file: {}", file_root.display())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_mount_rejects_file_as_nearest_ancestor() {
+        let temp = TestTempDir::new("desktop-file-provider-file-ancestor");
+        let provider_root = temp.path().join("Locality");
+        let file_parent = provider_root.join("notion");
+        let child_root = file_parent.join("child");
+        fs::create_dir_all(&provider_root).expect("create provider root");
+        fs::write(&file_parent, "not a folder").expect("create file parent");
+
+        let error = super::validate_macos_file_provider_mount_root(
+            &child_root,
+            &temp.path().join(".loc"),
+            std::slice::from_ref(&provider_root),
+        )
+        .expect_err("file nearest ancestor rejected");
+
+        assert_eq!(
+            error,
+            format!("Mount parent is not a folder: {}", file_parent.display())
+        );
     }
 
     #[test]

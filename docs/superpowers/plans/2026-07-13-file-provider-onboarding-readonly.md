@@ -223,7 +223,76 @@ git add apps/desktop/src-tauri/src/main.rs
 git commit -m "fix: accept existing File Provider mount points in onboarding"
 ```
 
-### Task 3: Verify The Desktop Change And Prepare The PR
+### Task 3: Harden Provider Boundaries From Code Review
+
+**Files:**
+- Modify: `apps/desktop/src-tauri/src/main.rs:5741-5900`
+- Test: `apps/desktop/src-tauri/src/main.rs:11900-12100`
+
+- [ ] **Step 1: Reproduce provider-root escapes and invalid ancestors**
+
+Add macOS tests that reject:
+
+```rust
+let traversing_root = provider_root.join("..").join("outside");
+let symlink_root = provider_root.join("escape"); // symlink to outside
+let child_below_file = provider_root.join("notion").join("child");
+```
+
+Run each focused filter and verify the initial helper accepts these invalid
+paths before hardening:
+
+```bash
+cargo test -p locality-desktop macos_file_provider_mount_rejects_ -- --nocapture
+```
+
+- [ ] **Step 2: Share structural inspection and resolve containment canonically**
+
+Replace the File Provider helper's metadata shortcut with the same structural
+inspection used by ordinary mounts, parameterized only by writability:
+
+```rust
+let root = validate_mount_root_structure(root, state_root, false)?;
+let resolved_root = resolved_mount_validation_path(&root)?;
+let resolved_state_root = resolved_mount_validation_path(state_root)?;
+```
+
+`validate_mount_root_structure` must reject existing files, reject a file as
+the nearest existing ancestor, propagate unexpected metadata errors, and skip
+`permissions().readonly()` only when `require_writable` is false.
+`resolved_mount_validation_path` must normalize `..`, canonicalize the nearest
+existing ancestor, append only its missing tail, and compare the result against
+canonical state and provider roots so symlinks cannot escape the boundary.
+
+- [ ] **Step 3: Exercise production projection dispatch**
+
+Route production and tests through an injectable macOS dispatch helper:
+
+```rust
+validate_desktop_mount_root_with_macos_provider_roots(
+    root,
+    state_root,
+    &ProjectionMode::MacosFileProvider,
+    provider_roots,
+)
+```
+
+The read-only regression must call this dispatch helper rather than the lower
+level File Provider validator.
+
+- [ ] **Step 4: Verify all hardened cases**
+
+```bash
+cargo test -p locality-desktop mount_validation -- --nocapture
+cargo test -p locality-desktop macos_file_provider_mount_rejects -- --nocapture
+cargo test -p locality-desktop macos_desktop_mount_accepts_read_only_file_provider_mount_point -- --nocapture
+cargo test -p locality-desktop macos_desktop_mount_rejects_paths_outside_cloudstorage -- --nocapture
+```
+
+Expected: ordinary writability checks and all provider containment/type checks
+pass.
+
+### Task 4: Verify The Desktop Change And Prepare The PR
 
 **Files:**
 - Verify: `apps/desktop/src-tauri/src/main.rs`

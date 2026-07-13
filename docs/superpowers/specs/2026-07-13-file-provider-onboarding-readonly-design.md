@@ -32,6 +32,12 @@ For the macOS File Provider projection:
    checks, registration, activation, and runtime startup remain the authority
    for whether it is usable.
 
+Before applying that exception, Locality retains the ordinary target and
+nearest-existing-ancestor directory checks and propagates unexpected metadata
+errors. It resolves the requested path, state root, and recognized provider
+roots through their canonical existing ancestors so `..` traversal and symlink
+escapes cannot receive the File Provider exemption.
+
 The exception is limited to a path strictly below a recognized Locality File
 Provider root. It does not weaken validation for plain-file mounts or arbitrary
 read-only directories.
@@ -48,9 +54,12 @@ read-only directories.
 ## Testing
 
 - Add a focused macOS regression test proving an existing read-only directory
-  beneath the Locality File Provider root passes desktop mount validation.
+  beneath the Locality File Provider root passes production desktop projection
+  dispatch.
 - Keep or add coverage proving an ordinary read-only directory is still
   rejected by generic mount validation.
+- Reject parent traversal, symlinks escaping the provider root, existing file
+  targets, and missing targets whose nearest existing ancestor is a file.
 - Run the desktop Rust tests covering mount validation and onboarding reports,
   followed by the relevant desktop frontend tests and formatting checks.
 
