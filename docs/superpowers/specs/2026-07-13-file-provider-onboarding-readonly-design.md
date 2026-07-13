@@ -34,9 +34,10 @@ For the macOS File Provider projection:
 
 Before applying that exception, Locality retains the ordinary target and
 nearest-existing-ancestor directory checks and propagates unexpected metadata
-errors. It resolves the requested path, state root, and recognized provider
-roots through their canonical existing ancestors so `..` traversal and symlink
-escapes cannot receive the File Provider exemption.
+errors. It rejects parent-directory components, then resolves the requested
+path, state root, and recognized provider roots through their canonical
+existing ancestors so traversal and symlink escapes cannot receive the File
+Provider exemption, including a symlink followed by `..`.
 
 The exception is limited to a path strictly below a recognized Locality File
 Provider root. It does not weaken validation for plain-file mounts or arbitrary

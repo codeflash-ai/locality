@@ -5799,12 +5799,10 @@ fn normalize_absolute_mount_path(path: &Path) -> Result<PathBuf, String> {
             std::path::Component::RootDir => normalized.push(Path::new("/")),
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(format!(
-                        "Could not normalize mount path `{}`.",
-                        path.display()
-                    ));
-                }
+                return Err(format!(
+                    "Could not normalize mount path with parent traversal `{}`.",
+                    path.display()
+                ));
             }
             std::path::Component::Normal(value) => normalized.push(value),
         }
@@ -5860,6 +5858,15 @@ fn validate_macos_file_provider_mount_root(
     state_root: &Path,
     provider_roots: &[PathBuf],
 ) -> Result<(), String> {
+    if root
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "Choose a mount point inside the Locality File Provider root, for example {}.",
+            absolute_display_path(&default_notion_mount_root())
+        ));
+    }
     let root = validate_mount_root_structure(root, state_root, false)?;
     let resolved_root = resolved_mount_validation_path(&root)?;
     let resolved_state_root = resolved_mount_validation_path(state_root)?;
@@ -12060,6 +12067,32 @@ mod tests {
             std::slice::from_ref(&provider_root),
         )
         .expect_err("symlink outside provider root rejected");
+
+        assert!(error.contains("inside the Locality File Provider root"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_mount_rejects_symlink_followed_by_parent_traversal() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestTempDir::new("desktop-file-provider-symlink-parent-traversal");
+        let provider_root = temp.path().join("Locality");
+        let outside_nested = temp.path().join("outside").join("nested");
+        let outside_mount = temp.path().join("outside").join("mount");
+        fs::create_dir_all(&provider_root).expect("create provider root");
+        fs::create_dir_all(&outside_nested).expect("create outside symlink target");
+        fs::create_dir_all(&outside_mount).expect("create escaped mount root");
+        let symlink_root = provider_root.join("escape");
+        symlink(&outside_nested, &symlink_root).expect("create escaping symlink");
+        let traversing_root = symlink_root.join("..").join("mount");
+
+        let error = super::validate_macos_file_provider_mount_root(
+            &traversing_root,
+            &temp.path().join(".loc"),
+            std::slice::from_ref(&provider_root),
+        )
+        .expect_err("symlink plus parent traversal rejected");
 
         assert!(error.contains("inside the Locality File Provider root"));
     }

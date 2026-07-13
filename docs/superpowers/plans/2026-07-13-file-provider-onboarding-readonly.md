@@ -260,9 +260,11 @@ let resolved_state_root = resolved_mount_validation_path(state_root)?;
 `validate_mount_root_structure` must reject existing files, reject a file as
 the nearest existing ancestor, propagate unexpected metadata errors, and skip
 `permissions().readonly()` only when `require_writable` is false.
-`resolved_mount_validation_path` must normalize `..`, canonicalize the nearest
-existing ancestor, append only its missing tail, and compare the result against
-canonical state and provider roots so symlinks cannot escape the boundary.
+The File Provider validator must reject `ParentDir` components before path
+resolution. `resolved_mount_validation_path` then canonicalizes the nearest
+existing ancestor, appends only its missing tail, and compares the result
+against canonical state and provider roots so symlinks cannot escape the
+boundary, including a symlink followed by `..`.
 
 - [ ] **Step 3: Exercise production projection dispatch**
 
