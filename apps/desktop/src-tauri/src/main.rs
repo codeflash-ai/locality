@@ -5868,6 +5868,7 @@ fn validate_macos_file_provider_mount_root(
         ));
     }
     let root = validate_mount_root_structure(root, state_root, false)?;
+    let root = normalize_absolute_mount_path(&root)?;
     let resolved_root = resolved_mount_validation_path(&root)?;
     let resolved_state_root = resolved_mount_validation_path(state_root)?;
     if resolved_root.starts_with(&resolved_state_root) {
@@ -5875,11 +5876,27 @@ fn validate_macos_file_provider_mount_root(
     }
     let provider_roots = provider_roots
         .iter()
-        .filter_map(|provider_root| resolved_mount_validation_path(provider_root).ok())
+        .filter_map(|provider_root| {
+            let provider_root = normalize_absolute_mount_path(provider_root).ok()?;
+            if fs::symlink_metadata(&provider_root)
+                .ok()
+                .is_some_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return None;
+            }
+            let resolved_provider_root = resolved_mount_validation_path(&provider_root).ok()?;
+            Some((provider_root, resolved_provider_root))
+        })
         .collect::<Vec<_>>();
-    let inside_provider_root = provider_roots.iter().any(|provider_root| {
-        resolved_root.starts_with(provider_root) && resolved_root != *provider_root
-    });
+    let inside_provider_root =
+        provider_roots
+            .iter()
+            .any(|(provider_root, resolved_provider_root)| {
+                root.starts_with(provider_root)
+                    && root != *provider_root
+                    && resolved_root.starts_with(resolved_provider_root)
+                    && resolved_root != *resolved_provider_root
+            });
     if !inside_provider_root {
         return Err(format!(
             "Choose a mount point inside the Locality File Provider root, for example {}.",
@@ -12067,6 +12084,51 @@ mod tests {
             std::slice::from_ref(&provider_root),
         )
         .expect_err("symlink outside provider root rejected");
+
+        assert!(error.contains("inside the Locality File Provider root"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_mount_rejects_direct_path_under_symlinked_provider_root_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestTempDir::new("desktop-file-provider-symlinked-provider-direct-target");
+        let provider_root = temp.path().join("Locality-Locality");
+        let outside_root = temp.path().join("outside");
+        let outside_mount = outside_root.join("notion");
+        fs::create_dir_all(&outside_mount).expect("create outside mount root");
+        symlink(&outside_root, &provider_root).expect("create symlinked provider root");
+
+        let error = super::validate_macos_file_provider_mount_root(
+            &outside_mount,
+            &temp.path().join(".loc"),
+            std::slice::from_ref(&provider_root),
+        )
+        .expect_err("direct path under symlinked provider target rejected");
+
+        assert!(error.contains("inside the Locality File Provider root"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_provider_mount_rejects_path_spelled_through_symlinked_provider_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestTempDir::new("desktop-file-provider-symlinked-provider-path");
+        let provider_root = temp.path().join("Locality-Locality");
+        let outside_root = temp.path().join("outside");
+        let outside_mount = outside_root.join("notion");
+        fs::create_dir_all(&outside_mount).expect("create outside mount root");
+        symlink(&outside_root, &provider_root).expect("create symlinked provider root");
+        let mount_through_provider = provider_root.join("notion");
+
+        let error = super::validate_macos_file_provider_mount_root(
+            &mount_through_provider,
+            &temp.path().join(".loc"),
+            std::slice::from_ref(&provider_root),
+        )
+        .expect_err("path spelled through symlinked provider root rejected");
 
         assert!(error.contains("inside the Locality File Provider root"));
     }
