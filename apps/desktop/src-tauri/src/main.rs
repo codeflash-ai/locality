@@ -5743,33 +5743,20 @@ fn validate_desktop_mount_root(
     state_root: &Path,
     projection: &ProjectionMode,
 ) -> Result<(), String> {
-    validate_mount_root(root, state_root)?;
-
     #[cfg(target_os = "macos")]
-    {
-        if *projection == ProjectionMode::MacosFileProvider {
-            let root = absolute_path(root)?;
-            let provider_roots = macos_file_provider_cloud_storage_roots()
-                .into_iter()
-                .filter_map(|provider_root| absolute_path(&provider_root).ok())
-                .collect::<Vec<_>>();
-            let inside_provider_root = provider_roots
-                .iter()
-                .any(|provider_root| root.starts_with(provider_root) && root != *provider_root);
-            if !inside_provider_root {
-                return Err(format!(
-                    "Choose a mount point inside the Locality File Provider root, for example {}.",
-                    absolute_display_path(&default_notion_mount_root())
-                ));
-            }
-        }
+    if *projection == ProjectionMode::MacosFileProvider {
+        return validate_macos_file_provider_mount_root(
+            root,
+            state_root,
+            &macos_file_provider_cloud_storage_roots(),
+        );
     }
 
     let _ = projection;
-    Ok(())
+    validate_mount_root(root, state_root)
 }
 
-fn validate_mount_root(root: &Path, state_root: &Path) -> Result<(), String> {
+fn validate_mount_root_location(root: &Path, state_root: &Path) -> Result<PathBuf, String> {
     if root.as_os_str().is_empty() {
         return Err("Choose a folder for the Notion mount.".to_string());
     }
@@ -5779,6 +5766,43 @@ fn validate_mount_root(root: &Path, state_root: &Path) -> Result<(), String> {
     if root.starts_with(&state_root) {
         return Err("Choose a folder outside the Locality state directory.".to_string());
     }
+
+    Ok(root)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_file_provider_mount_root(
+    root: &Path,
+    state_root: &Path,
+    provider_roots: &[PathBuf],
+) -> Result<(), String> {
+    let root = validate_mount_root_location(root, state_root)?;
+    let provider_roots = provider_roots
+        .iter()
+        .filter_map(|provider_root| absolute_path(provider_root).ok())
+        .collect::<Vec<_>>();
+    let inside_provider_root = provider_roots
+        .iter()
+        .any(|provider_root| root.starts_with(provider_root) && root != *provider_root);
+    if !inside_provider_root {
+        return Err(format!(
+            "Choose a mount point inside the Locality File Provider root, for example {}.",
+            absolute_display_path(&default_notion_mount_root())
+        ));
+    }
+    if let Ok(metadata) = fs::metadata(&root)
+        && !metadata.is_dir()
+    {
+        return Err(format!(
+            "Choose a folder path, not a file: {}",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mount_root(root: &Path, state_root: &Path) -> Result<(), String> {
+    let root = validate_mount_root_location(root, state_root)?;
 
     if let Ok(metadata) = fs::metadata(&root) {
         if !metadata.is_dir() {
@@ -11829,6 +11853,58 @@ mod tests {
         let root = temp.path().join("Notion");
 
         validate_mount_root(&root, &temp.path().join(".loc")).expect("valid child path");
+    }
+
+    #[test]
+    fn mount_validation_rejects_existing_read_only_directory() {
+        let temp = TestTempDir::new("read-only-mount-root");
+        let root = temp.path().join("Notion");
+        fs::create_dir_all(&root).expect("create mount root");
+
+        let original_permissions = fs::metadata(&root)
+            .expect("read mount metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_readonly(true);
+        fs::set_permissions(&root, read_only_permissions).expect("make mount read-only");
+        let result = validate_mount_root(&root, &temp.path().join(".loc"));
+        fs::set_permissions(&root, original_permissions).expect("restore mount permissions");
+
+        assert_eq!(
+            result.expect_err("ordinary read-only mount root rejected"),
+            format!("Selected folder is read-only: {}", root.display())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_desktop_mount_accepts_read_only_file_provider_mount_point() {
+        let temp = TestTempDir::new("desktop-read-only-file-provider-root");
+        let provider_root = temp.path().join("Locality");
+        let root = provider_root.join("notion");
+        fs::create_dir_all(&root).expect("create provider mount point");
+
+        let original_permissions = fs::metadata(&root)
+            .expect("read provider mount point metadata")
+            .permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_readonly(true);
+        fs::set_permissions(&root, read_only_permissions).expect("make mount point read-only");
+        assert!(
+            fs::metadata(&root)
+                .expect("read updated mount point metadata")
+                .permissions()
+                .readonly()
+        );
+
+        let result = super::validate_macos_file_provider_mount_root(
+            &root,
+            &temp.path().join(".loc"),
+            std::slice::from_ref(&provider_root),
+        );
+
+        fs::set_permissions(&root, original_permissions).expect("restore mount point permissions");
+        result.expect("provider-owned mount point should not require a POSIX write bit");
     }
 
     #[test]
