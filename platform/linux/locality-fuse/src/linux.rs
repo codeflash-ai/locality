@@ -1652,6 +1652,7 @@ fn attr_time_for_item(item: &VirtualFsItem) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use locality_store::InMemoryStateStore;
     #[test]
     fn folder_attrs_do_not_stat_materialized_path() {
         let path = std::env::temp_dir().join(format!(
@@ -1848,6 +1849,84 @@ mod tests {
             .expect_err("read-only item rejects write access");
 
         assert_eq!(error, libc::EROFS.into());
+    }
+
+    #[tokio::test]
+    async fn read_only_shared_mount_point_metadata_rejects_create_mkdir_and_write_access() {
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse)
+        .read_only(true);
+        store.save_mount(mount).expect("save mount");
+        let projection_children = localityd::virtual_projection::virtual_projection_root_children(
+            &store,
+            Path::new("/tmp/Locality"),
+            ProjectionMode::LinuxFuse,
+        )
+        .expect("projection root children");
+        let mount_item = projection_children
+            .children
+            .into_iter()
+            .next()
+            .expect("shared mount point item");
+        assert!(mount_item.read_only);
+
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: shared_test_root_item(),
+                children: BTreeMap::new(),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), shared_test_root_item()),
+                (PathBuf::from("/notion-main"), mount_item),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let create_error = fs
+            .create_file_at_parent_path(Path::new("/notion-main"), "Draft.md")
+            .expect_err("read-only shared mount rejects creates");
+        assert!(matches!(create_error, FuseError::ReadOnly));
+        assert!(
+            fs.client
+                .created_files
+                .lock()
+                .expect("created files")
+                .is_empty()
+        );
+
+        let mkdir_error = fs
+            .mkdir(
+                Request::default(),
+                OsStr::new("/notion-main"),
+                OsStr::new("Draft"),
+                0,
+                0,
+            )
+            .await
+            .expect_err("read-only shared mount rejects mkdir");
+        assert_eq!(mkdir_error, libc::EROFS.into());
+
+        let access_error = fs
+            .access(
+                Request::default(),
+                OsStr::new("/notion-main"),
+                libc::W_OK as u32,
+            )
+            .await
+            .expect_err("read-only shared mount rejects write access");
+        assert_eq!(access_error, libc::EROFS.into());
     }
 
     #[test]

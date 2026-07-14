@@ -118,7 +118,7 @@ fn shared_mount_point_item(mount: &MountConfig) -> VirtualFsItem {
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: filename.clone(),
         kind: VirtualFsItemKind::Folder,
-        read_only: false,
+        read_only: mount.read_only,
         entity_kind: None,
         remote_id: None,
         path: filename,
@@ -145,6 +145,7 @@ fn invalid_identifier(message: impl Into<String>) -> LocalityError {
 #[cfg(test)]
 mod tests {
     use locality_core::model::MountId;
+    use locality_store::InMemoryStateStore;
 
     use super::*;
     use crate::virtual_fs::VirtualFsItemKind;
@@ -248,5 +249,25 @@ mod tests {
                 .is_some_and(|parent| parent.starts_with(SHARED_IDENTIFIER_PREFIX))
         );
         assert_eq!(wrapped.path, "Work Notion/Roadmap/page.md");
+    }
+
+    #[test]
+    fn shared_mount_point_item_reflects_read_only_mount() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(mount_id, "notion", "/tmp/Locality/notion-main")
+            .projection(ProjectionMode::LinuxFuse)
+            .read_only(true);
+        store.save_mount(mount).expect("save mount");
+
+        let report = virtual_projection_root_children(
+            &store,
+            Path::new("/tmp/Locality"),
+            ProjectionMode::LinuxFuse,
+        )
+        .expect("shared root children");
+
+        assert_eq!(report.children.len(), 1);
+        assert!(report.children[0].read_only);
     }
 }

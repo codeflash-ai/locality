@@ -1726,10 +1726,7 @@ fn create_parent_remote_id_for_entity(
     remote_id: RemoteId,
     entity: &EntityRecord,
 ) -> LocalityResult<RemoteId> {
-    if source_descriptor(&mount.connector)
-        .create_entity_parent_kinds()
-        .contains(&entity.kind)
-    {
+    if source_accepts_create_parent_kind(mount, &entity.kind) {
         Ok(remote_id)
     } else {
         Err(LocalityError::Unsupported(
@@ -2211,7 +2208,7 @@ fn root_item(mount: &MountConfig) -> VirtualFsItem {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| mount.mount_id.0.clone()),
         kind: VirtualFsItemKind::Folder,
-        read_only: false,
+        read_only: mount.read_only,
         entity_kind: None,
         remote_id: None,
         path: String::new(),
@@ -2276,7 +2273,7 @@ fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: filename.clone(),
         kind: VirtualFsItemKind::Folder,
-        read_only: false,
+        read_only: mount.read_only,
         entity_kind: None,
         remote_id: None,
         path: filename,
@@ -2286,6 +2283,26 @@ fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
         materialized_path: Some(virtual_projection_mount_point(mount).display().to_string()),
         byte_size: None,
     }
+}
+
+fn item_file_read_only(mount: &MountConfig, path: &Path) -> bool {
+    !source_write_decision_for_path(mount, path).is_writable()
+}
+
+fn item_folder_read_only(
+    mount: &MountConfig,
+    path: &Path,
+    entity_kind: Option<&EntityKind>,
+) -> bool {
+    item_file_read_only(mount, path)
+        || !source_create_decision_for_parent_path(mount, path).is_writable()
+        || entity_kind.is_some_and(|kind| !source_accepts_create_parent_kind(mount, kind))
+}
+
+fn source_accepts_create_parent_kind(mount: &MountConfig, kind: &EntityKind) -> bool {
+    source_descriptor(&mount.connector)
+        .create_entity_parent_kinds()
+        .contains(kind)
 }
 
 fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex) -> VirtualFsItem {
@@ -2303,6 +2320,10 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
     } else {
         None
     };
+    let read_only = match &kind {
+        VirtualFsItemKind::File => item_file_read_only(mount, &entity.path),
+        VirtualFsItemKind::Folder => item_folder_read_only(mount, &entity.path, Some(&entity.kind)),
+    };
 
     VirtualFsItem {
         identifier: entity.remote_id.0.clone(),
@@ -2313,7 +2334,7 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
         )),
         filename: filename(&entity.path),
         kind,
-        read_only: !source_write_decision_for_path(mount, &entity.path).is_writable(),
+        read_only,
         entity_kind: Some(entity.kind.clone()),
         remote_id: Some(entity.remote_id.0.clone()),
         path: path_string(&entity.path),
@@ -2340,7 +2361,7 @@ fn pending_item(
         parent_identifier: Some(parent_identifier),
         filename: filename(&mutation.projected_path),
         kind: VirtualFsItemKind::File,
-        read_only: !source_write_decision_for_path(mount, &mutation.projected_path).is_writable(),
+        read_only: item_file_read_only(mount, &mutation.projected_path),
         entity_kind: Some(EntityKind::Page),
         remote_id: None,
         path: path_string(&mutation.projected_path),
@@ -2386,7 +2407,7 @@ fn pending_page_child_dir_item(
         )),
         filename: filename(&path),
         kind: VirtualFsItemKind::Folder,
-        read_only: !source_write_decision_for_path(mount, &path).is_writable(),
+        read_only: item_folder_read_only(mount, &path, Some(&EntityKind::Page)),
         entity_kind: Some(EntityKind::Page),
         remote_id: None,
         path: path_string(&path),
@@ -2410,7 +2431,7 @@ fn pending_temp_item(
         parent_identifier: Some(pending_page_child_dir_identifier(&mutation.local_id)),
         filename: filename.to_string(),
         kind: VirtualFsItemKind::File,
-        read_only: !source_write_decision_for_path(mount, &path).is_writable(),
+        read_only: item_file_read_only(mount, &path),
         entity_kind: Some(EntityKind::Page),
         remote_id: None,
         path: path_string(&path),
@@ -2613,7 +2634,7 @@ fn page_child_dir_item(
         )),
         filename: filename(path),
         kind: VirtualFsItemKind::Folder,
-        read_only: !source_write_decision_for_path(mount, path).is_writable(),
+        read_only: item_folder_read_only(mount, path, Some(&EntityKind::Page)),
         entity_kind: None,
         remote_id: Some(remote_id.0.clone()),
         path: path_string(path),
@@ -2635,7 +2656,7 @@ fn path_dir_item(mount: &MountConfig, path: &Path, index: &ProviderIndex) -> Vir
         )),
         filename: filename(path),
         kind: VirtualFsItemKind::Folder,
-        read_only: !source_write_decision_for_path(mount, path).is_writable(),
+        read_only: item_folder_read_only(mount, path, None),
         entity_kind: None,
         remote_id: None,
         path: path_string(path),
@@ -3085,6 +3106,29 @@ mod tests {
     }
 
     #[test]
+    fn read_only_mount_reports_virtual_roots_as_read_only() {
+        let mut store = InMemoryStateStore::new();
+        let mount_id = MountId::new("notion-main");
+        let mount = virtual_mount(&mount_id).read_only(true);
+        store.save_mount(mount.clone()).expect("save mount");
+
+        let root = virtual_fs_item(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER)
+            .expect("root item")
+            .item;
+        assert!(root.read_only);
+
+        let mount_point = virtual_fs_item(&store, &mount_id, &mount_point_identifier(&mount))
+            .expect("mount point item")
+            .item;
+        assert!(mount_point.read_only);
+
+        let root_children = virtual_fs_children(&store, &mount_id, ROOT_CONTAINER_IDENTIFIER)
+            .expect("root children");
+        assert_eq!(root_children.children.len(), 1);
+        assert!(root_children.children[0].read_only);
+    }
+
+    #[test]
     fn mount_point_identifier_is_not_a_materializable_entity_identifier() {
         assert!(matches!(
             super::entity_identifier("mount:notion-main"),
@@ -3203,6 +3247,166 @@ mod tests {
 
         assert_eq!(report.item.path, "draft/reply.md");
         assert_eq!(report.item.entity_kind, Some(EntityKind::Page));
+    }
+
+    #[test]
+    fn gmail_folder_read_only_metadata_reflects_direct_draft_create_policy() {
+        let mount_id = MountId::new("gmail-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "gmail"))
+            .expect("save mount");
+        for (remote_id, title, path) in [
+            ("gmail-folder:draft", "draft", "draft"),
+            ("gmail-folder:inbox", "inbox", "inbox"),
+            ("gmail-folder:sent", "sent", "sent"),
+            ("gmail-folder:draft/nested", "nested", "draft/nested"),
+        ] {
+            store
+                .save_entity(EntityRecord {
+                    mount_id: mount_id.clone(),
+                    remote_id: RemoteId::new(remote_id),
+                    kind: EntityKind::Directory,
+                    title: title.to_string(),
+                    path: path.into(),
+                    hydration: HydrationState::Stub,
+                    content_hash: None,
+                    remote_edited_at: Some(format!("folder:{path}")),
+                })
+                .expect("save folder");
+        }
+        store
+            .save_entity(EntityRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("msg-draft-1"),
+                kind: EntityKind::Page,
+                title: "Reply".to_string(),
+                path: "draft/reply.md".into(),
+                hydration: HydrationState::Hydrated,
+                content_hash: None,
+                remote_edited_at: Some("gmail:msg-draft-1:1".to_string()),
+            })
+            .expect("save draft message");
+
+        assert!(
+            !virtual_fs_item(&store, &mount_id, "gmail-folder:draft")
+                .expect("draft item")
+                .item
+                .read_only
+        );
+        assert!(
+            virtual_fs_item(&store, &mount_id, "gmail-folder:inbox")
+                .expect("inbox item")
+                .item
+                .read_only
+        );
+        assert!(
+            virtual_fs_item(&store, &mount_id, "gmail-folder:sent")
+                .expect("sent item")
+                .item
+                .read_only
+        );
+        assert!(
+            virtual_fs_item(&store, &mount_id, "gmail-folder:draft/nested")
+                .expect("nested draft folder item")
+                .item
+                .read_only
+        );
+
+        let draft_children =
+            virtual_fs_children(&store, &mount_id, "gmail-folder:draft").expect("draft children");
+        let page_child = draft_children
+            .children
+            .iter()
+            .find(|child| child.identifier == "children:msg-draft-1")
+            .expect("draft page child folder");
+        assert!(page_child.read_only);
+    }
+
+    #[test]
+    fn source_folder_read_only_metadata_reflects_create_parent_kinds() {
+        let notion_mount_id = MountId::new("notion-main");
+        let mut notion_store = InMemoryStateStore::new();
+        notion_store
+            .save_mount(virtual_mount(&notion_mount_id))
+            .expect("save notion mount");
+        notion_store
+            .save_entity(EntityRecord::new(
+                notion_mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "Page",
+                "Page/page.md",
+            ))
+            .expect("save notion page");
+        notion_store
+            .save_entity(EntityRecord::new(
+                notion_mount_id.clone(),
+                RemoteId::new("database-1"),
+                EntityKind::Database,
+                "Database",
+                "Database",
+            ))
+            .expect("save notion database");
+
+        let notion_page_children =
+            virtual_fs_children(&notion_store, &notion_mount_id, "mount:notion-main")
+                .expect("notion mount point children");
+        let notion_page_folder = notion_page_children
+            .children
+            .iter()
+            .find(|child| child.identifier == "children:page-1")
+            .expect("notion page folder");
+        assert!(!notion_page_folder.read_only);
+        assert!(
+            !virtual_fs_item(&notion_store, &notion_mount_id, "database-1")
+                .expect("notion database item")
+                .item
+                .read_only
+        );
+
+        let google_mount_id = MountId::new("google-docs-main");
+        let mut google_store = InMemoryStateStore::new();
+        google_store
+            .save_mount(virtual_mount_with_connector(
+                &google_mount_id,
+                "google-docs",
+            ))
+            .expect("save google docs mount");
+        google_store
+            .save_entity(EntityRecord::new(
+                google_mount_id.clone(),
+                RemoteId::new("folder-1"),
+                EntityKind::Directory,
+                "Folder",
+                "Folder",
+            ))
+            .expect("save google docs folder");
+        google_store
+            .save_entity(EntityRecord::new(
+                google_mount_id.clone(),
+                RemoteId::new("doc-1"),
+                EntityKind::Page,
+                "Doc",
+                "Doc/page.md",
+            ))
+            .expect("save google docs page");
+
+        assert!(
+            !virtual_fs_item(&google_store, &google_mount_id, "folder-1")
+                .expect("google docs folder item")
+                .item
+                .read_only
+        );
+        let google_root_children =
+            virtual_fs_children(&google_store, &google_mount_id, "mount:google-docs-main")
+                .expect("google docs mount point children");
+        let google_page_folder = google_root_children
+            .children
+            .iter()
+            .find(|child| child.identifier == "children:doc-1")
+            .expect("google docs page folder");
+        assert!(google_page_folder.read_only);
     }
 
     #[test]
