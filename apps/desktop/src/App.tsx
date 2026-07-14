@@ -90,6 +90,7 @@ type LocateState = "idle" | "preparing" | "ready" | "error";
 type OnboardingStep = 1 | 2 | 3 | 4 | 5;
 type ReviewFilter = "all" | "approvals" | "problems";
 type FileStatusFilter = "all" | "review" | "conflict" | "synced";
+type DestructiveSettingsAction = "reset" | "uninstall";
 
 const PRODUCT_TERMS = {
   home: "Home",
@@ -4070,6 +4071,8 @@ function SettingsView({
   const [installingAgents, setInstallingAgents] = useState(false);
   const [resettingState, setResettingState] = useState(false);
   const [preparingUninstall, setPreparingUninstall] = useState(false);
+  const [destructiveAction, setDestructiveAction] = useState<DestructiveSettingsAction | null>(null);
+  const [destructiveConfirmation, setDestructiveConfirmation] = useState("");
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const daemonStopped = snapshot.health.state === "stopped";
@@ -4152,13 +4155,6 @@ function SettingsView({
   }
 
   async function resetLocalState() {
-    const confirmed = window.confirm(
-      "Reset local Locality state? This clears Locality metadata, cache, mount registration, and connector credentials. It does not delete your local files.",
-    );
-    if (!confirmed) {
-      return;
-    }
-
     setResetMessage("");
     setResettingState(true);
     try {
@@ -4169,7 +4165,8 @@ function SettingsView({
       );
       setResetMessage(report.message);
       if (report.ok) {
-        window.alert(report.message);
+        setDestructiveAction(null);
+        setDestructiveConfirmation("");
         await callCommand<ActionReport>(
           "quit_completely",
           undefined,
@@ -4184,13 +4181,6 @@ function SettingsView({
   }
 
   async function prepareUninstall() {
-    const confirmed = window.confirm(
-      "Prepare Locality for uninstall? This stops Locality, removes Locality agent integrations and MCP config, clears Locality local state, and leaves your local files in place.",
-    );
-    if (!confirmed) {
-      return;
-    }
-
     setResetMessage("");
     setPreparingUninstall(true);
     try {
@@ -4201,6 +4191,8 @@ function SettingsView({
       );
       setResetMessage(report.message);
       if (report.ok) {
+        setDestructiveAction(null);
+        setDestructiveConfirmation("");
         await onRefresh().catch(() => undefined);
         onResetComplete();
       }
@@ -4208,6 +4200,30 @@ function SettingsView({
       setResetMessage(errorMessage(error));
     } finally {
       setPreparingUninstall(false);
+    }
+  }
+
+  function requestDestructiveAction(action: DestructiveSettingsAction) {
+    setResetMessage("");
+    setDestructiveConfirmation("");
+    setDestructiveAction(action);
+  }
+
+  function cancelDestructiveAction() {
+    if (resettingState || preparingUninstall) {
+      return;
+    }
+    setDestructiveAction(null);
+    setDestructiveConfirmation("");
+  }
+
+  function confirmDestructiveAction() {
+    if (destructiveAction === "reset") {
+      void resetLocalState();
+      return;
+    }
+    if (destructiveAction === "uninstall") {
+      void prepareUninstall();
     }
   }
 
@@ -4361,7 +4377,7 @@ function SettingsView({
                 compact
                 icon={resettingState ? <Loader2 className="spin-icon" /> : <RotateCcw />}
                 disabled={resettingState || preparingUninstall}
-                onClick={() => void resetLocalState()}
+                onClick={() => requestDestructiveAction("reset")}
               >
                 {resettingState ? "Resetting" : "Reset Local State"}
               </SecondaryButton>
@@ -4369,7 +4385,7 @@ function SettingsView({
                 compact
                 icon={preparingUninstall ? <Loader2 className="spin-icon" /> : <Trash2 />}
                 disabled={resettingState || preparingUninstall}
-                onClick={() => void prepareUninstall()}
+                onClick={() => requestDestructiveAction("uninstall")}
               >
                 {preparingUninstall ? "Preparing" : "Prepare for Uninstall"}
               </SecondaryButton>
@@ -4389,6 +4405,100 @@ function SettingsView({
             <Power />
             <span>Quit Completely</span>
             <ChevronRight />
+          </button>
+        </div>
+      </section>
+      {destructiveAction && (
+        <DestructiveSettingsDialog
+          action={destructiveAction}
+          value={destructiveConfirmation}
+          busy={resettingState || preparingUninstall}
+          onChange={setDestructiveConfirmation}
+          onCancel={cancelDestructiveAction}
+          onConfirm={confirmDestructiveAction}
+        />
+      )}
+    </div>
+  );
+}
+
+function DestructiveSettingsDialog({
+  action,
+  value,
+  busy,
+  onChange,
+  onCancel,
+  onConfirm,
+}: {
+  action: DestructiveSettingsAction;
+  value: string;
+  busy: boolean;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const isReset = action === "reset";
+  const requiredValue = isReset ? "RESET" : "UNINSTALL";
+  const confirmed = value.trim().toUpperCase() === requiredValue;
+  const title = isReset ? "Reset local state" : "Prepare for uninstall";
+  const actionLabel = isReset ? "Reset local state" : "Prepare for uninstall";
+  const description = isReset
+    ? "This removes Locality's local database, credentials, sync metadata, and mount registration on this machine."
+    : "This stops Locality, removes local agent integrations and MCP config, and clears Locality local state on this machine.";
+  const consequences = isReset
+    ? [
+        "Your files in the Locality folder are kept.",
+        "Your Notion workspace is not changed.",
+        "You will need to reconnect and re-verify the local folder.",
+      ]
+    : [
+        "Your files in the Locality folder are kept.",
+        "Your Notion workspace is not changed.",
+        "Locality opens onboarding again after cleanup.",
+      ];
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="destructive-modal" role="dialog" aria-modal="true" aria-labelledby="destructive-settings-title">
+        <div className="destructive-modal-header">
+          <div>
+            <h2 id="destructive-settings-title">{title}</h2>
+            <p>{description}</p>
+          </div>
+          <button className="icon-button has-tooltip" data-tooltip="Cancel" disabled={busy} onClick={onCancel}>
+            <X />
+          </button>
+        </div>
+        <ul className="destructive-list">
+          {consequences.map((item) => (
+            <li key={item}>{item}</li>
+          ))}
+        </ul>
+        <label className="destructive-input-label">
+          <span>
+            Type <strong>{requiredValue}</strong> to confirm
+          </span>
+          <input
+            autoFocus
+            value={value}
+            disabled={busy}
+            onChange={(event) => onChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                onCancel();
+              }
+              if (event.key === "Enter" && confirmed && !busy) {
+                onConfirm();
+              }
+            }}
+          />
+        </label>
+        <div className="modal-actions">
+          <SecondaryButton disabled={busy} onClick={onCancel}>
+            Cancel
+          </SecondaryButton>
+          <button className="destructive-action-button" disabled={!confirmed || busy} onClick={onConfirm}>
+            {busy ? "Working..." : actionLabel}
           </button>
         </div>
       </section>
