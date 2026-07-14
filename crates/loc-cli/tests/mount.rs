@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use loc_cli::mount::{GuidanceFileAction, MountOptions, run_mount};
 use locality_connector::ConnectorCapabilities;
 use locality_core::model::{MountId, RemoteId};
+use locality_gmail::{GMAIL_OAUTH_SCOPES, gmail_capabilities_json};
 use locality_platform::{capabilities::projection_cli_value, mount_cli_capabilities};
 use locality_store::{
     ConnectionId, ConnectionRecord, ConnectionRepository, ConnectorProfileId,
@@ -454,6 +455,99 @@ fn cli_keeps_multiple_default_notion_workspace_mounts_with_distinct_connections(
 }
 
 #[test]
+fn cli_mount_gmail_persists_requested_registration() {
+    let fixture = MountFixture::new("loc-cli-gmail-mount-registration");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_gmail_connection(&state_root, "gmail-work");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("gmail");
+    let mount_root_arg = mount_root.display().to_string();
+
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "gmail",
+        mount_root_arg.as_str(),
+        "--connection",
+        "gmail-work",
+        "--mount-id",
+        "gmail-main",
+        "--projection",
+        "plain-files",
+        "--read-only",
+        "--json",
+    ]));
+
+    assert_eq!(report["connector"], "gmail", "{report:#?}");
+    assert_eq!(report["remote_root_id"], Value::Null, "{report:#?}");
+    assert_eq!(report["connection_id"], "gmail-work", "{report:#?}");
+    assert_eq!(report["mount_id"], "gmail-main", "{report:#?}");
+    assert_eq!(report["projection"], "plain_files", "{report:#?}");
+    assert_eq!(report["read_only"], true, "{report:#?}");
+
+    let store = SqliteStateStore::open(state_root).expect("open state");
+    let mount = store
+        .get_mount(&MountId::new("gmail-main"))
+        .expect("load mount")
+        .expect("mount exists");
+    assert_eq!(mount.connector, "gmail");
+    assert_eq!(mount.remote_root_id, None);
+    assert_eq!(mount.connection_id, Some(ConnectionId::new("gmail-work")));
+    assert_eq!(mount.mount_id, MountId::new("gmail-main"));
+    assert_eq!(mount.projection, ProjectionMode::PlainFiles);
+    assert!(mount.read_only);
+}
+
+#[test]
+fn cli_mount_gmail_rejects_remote_root_selectors() {
+    let cases: &[&[&str]] = &[
+        &["--workspace"],
+        &["--root-page", "root-page"],
+        &["--workspace-folder", "workspace-folder"],
+    ];
+
+    for forbidden_args in cases {
+        let fixture = MountFixture::new("loc-cli-gmail-mount-root-rejection");
+        fs::create_dir_all(&fixture.root).expect("create fixture root");
+        let state_root = fixture.root.join("state");
+        seed_cli_gmail_connection(&state_root, "gmail-work");
+
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("gmail");
+        let mount_root_arg = mount_root.display().to_string();
+        let mut command = loc_command(loc, &state_root);
+        command.args([
+            "mount",
+            "gmail",
+            mount_root_arg.as_str(),
+            "--connection",
+            "gmail-work",
+            "--mount-id",
+            "gmail-main",
+            "--projection",
+            "plain-files",
+            "--json",
+        ]);
+        command.args(*forbidden_args);
+
+        let output = command.output().expect("run loc mount gmail");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "Gmail mount accepted forbidden args {forbidden_args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let store = SqliteStateStore::open(state_root).expect("open state");
+        assert!(
+            store.load_mounts().expect("load mounts").is_empty(),
+            "Gmail mount with forbidden args {forbidden_args:?} must not be persisted"
+        );
+    }
+}
+
+#[test]
 fn virtual_mount_rejects_duplicate_mount_point_under_same_root() {
     let fixture = MountFixture::new("loc-cli-duplicate-mount-point");
     let mut store = InMemoryStateStore::new();
@@ -616,6 +710,63 @@ fn notion_capabilities_json() -> String {
         supports_batch_observation: false,
     })
     .expect("serialize Notion capabilities")
+}
+
+fn seed_cli_gmail_connection(state_root: &Path, connection_id: &str) {
+    fs::create_dir_all(state_root).expect("create state root");
+    let profile_id = ConnectorProfileId::new("gmail-oauth-default");
+    let secret_ref = format!("connection:{connection_id}");
+    let credentials = FileCredentialStore::new(state_root);
+    credentials
+        .put(
+            &secret_ref,
+            "{\"connector\":\"gmail\",\"refresh_handle\":\"refresh-handle\"}",
+        )
+        .expect("seed credential");
+
+    let now = "2026-07-03T00:00:00Z".to_string();
+    let capabilities_json = gmail_capabilities_json().expect("gmail capabilities");
+    let mut store = SqliteStateStore::open(state_root.to_path_buf()).expect("open state");
+    store
+        .save_connector_profile(ConnectorProfileRecord {
+            profile_id: profile_id.clone(),
+            connector: "gmail".to_string(),
+            display_name: "Gmail OAuth".to_string(),
+            auth_kind: "oauth".to_string(),
+            scopes: GMAIL_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+            capabilities_json: capabilities_json.clone(),
+            enabled_actions_json: "[\"read\",\"send\"]".to_string(),
+            connector_version: "gmail.v1".to_string(),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })
+        .expect("seed Gmail profile");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: ConnectionId::new(connection_id),
+            profile_id: Some(profile_id),
+            connector: "gmail".to_string(),
+            display_name: "Gmail".to_string(),
+            account_label: Some(format!("{connection_id}@example.com")),
+            workspace_id: Some("gmail".to_string()),
+            workspace_name: Some("Gmail".to_string()),
+            auth_kind: "oauth".to_string(),
+            secret_ref,
+            scopes: GMAIL_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+            capabilities_json,
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .expect("seed Gmail connection");
 }
 
 fn loc_command(loc: &str, state_root: &Path) -> Command {
