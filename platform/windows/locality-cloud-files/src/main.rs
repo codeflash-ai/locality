@@ -3228,14 +3228,15 @@ fn fs_metadata_for_item(
 ) -> windows::Win32::Storage::CloudFilters::CF_FS_METADATA {
     use windows::Win32::Storage::CloudFilters::CF_FS_METADATA;
     use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO,
     };
 
-    let attributes = if item.kind == localityd::file_provider::FileProviderItemKind::Folder {
-        FILE_ATTRIBUTE_DIRECTORY.0
-    } else {
-        FILE_ATTRIBUTE_NORMAL.0
-    };
+    let attributes = file_attributes_for_item(
+        item,
+        FILE_ATTRIBUTE_DIRECTORY.0,
+        FILE_ATTRIBUTE_NORMAL.0,
+        FILE_ATTRIBUTE_READONLY.0,
+    );
 
     CF_FS_METADATA {
         BasicInfo: FILE_BASIC_INFO {
@@ -3244,6 +3245,24 @@ fn fs_metadata_for_item(
         },
         FileSize: size as i64,
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn file_attributes_for_item(
+    item: &localityd::file_provider::FileProviderItem,
+    directory_attribute: u32,
+    normal_attribute: u32,
+    readonly_attribute: u32,
+) -> u32 {
+    let mut attributes = if item.kind == localityd::file_provider::FileProviderItemKind::Folder {
+        directory_attribute
+    } else {
+        normal_attribute
+    };
+    if item.read_only {
+        attributes |= readonly_attribute;
+    }
+    attributes
 }
 
 #[cfg(target_os = "windows")]
@@ -4142,6 +4161,67 @@ mod tests {
             &child_local,
             &missing_directory
         ));
+    }
+
+    #[test]
+    fn read_only_items_include_readonly_attribute_without_losing_kind_attributes() {
+        const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+
+        let file = localityd::file_provider::FileProviderItem {
+            identifier: "gmail-main:message-1".to_string(),
+            parent_identifier: Some(
+                localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string(),
+            ),
+            filename: "Message.eml".to_string(),
+            kind: localityd::file_provider::FileProviderItemKind::File,
+            read_only: true,
+            entity_kind: None,
+            remote_id: Some("message-1".to_string()),
+            path: "Gmail/Message.eml".to_string(),
+            hydration: None,
+            content_type: "message/rfc822".to_string(),
+            remote_edited_at: None,
+            materialized_path: None,
+            byte_size: Some(123),
+        };
+        let folder = localityd::file_provider::FileProviderItem {
+            identifier: "gmail-main:inbox".to_string(),
+            parent_identifier: Some(
+                localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string(),
+            ),
+            filename: "inbox".to_string(),
+            kind: localityd::file_provider::FileProviderItemKind::Folder,
+            read_only: true,
+            entity_kind: None,
+            remote_id: None,
+            path: "Gmail/inbox".to_string(),
+            hydration: None,
+            content_type: "public.folder".to_string(),
+            remote_edited_at: None,
+            materialized_path: None,
+            byte_size: None,
+        };
+
+        assert_eq!(
+            file_attributes_for_item(
+                &file,
+                FILE_ATTRIBUTE_DIRECTORY,
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_READONLY,
+            ),
+            FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_READONLY
+        );
+        assert_eq!(
+            file_attributes_for_item(
+                &folder,
+                FILE_ATTRIBUTE_DIRECTORY,
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_READONLY,
+            ),
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY
+        );
     }
 
     #[cfg(target_os = "windows")]
