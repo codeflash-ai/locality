@@ -37,7 +37,7 @@ Core rules:
 | Surface | Suggested size | Purpose |
 |---|---:|---|
 | First-run window | 720 x 560 | Focused onboarding wizard |
-| Main window | 960 x 680 | Files, locate, pending changes, activity, settings |
+| Main window | 960 x 680 | Home, sources, review center, files, activity, settings |
 | Tray popover | 360 x 520 | Quick status and actions |
 | Modal dialog | 520 x variable | Focused confirmations or short forms |
 
@@ -48,12 +48,14 @@ The main window should use a compact left sidebar:
 ```text
 Locality
   Home
-  Files
-  Mounts
-  Pending Changes
-  Activity
+  Sources
+  Review Center
   Settings
 ```
+
+`Files` and `Activity` are contextual pages. Files is reached from Home search,
+recent file rows, source detail, tray search, and review actions. Activity is
+reached from Settings and post-push success flows.
 
 The first-run flow should not show the full sidebar. It should use a simple
 step indicator and a single content panel.
@@ -64,7 +66,7 @@ Use these labels in normal UI:
 
 - `Ready`
 - `Preparing`
-- `Pending Changes`
+- `Review Center`
 - `Needs Review`
 - `Conflict`
 - `Reconnect Needed`
@@ -89,47 +91,48 @@ Daily Use
   Tray Popover
   Home
   Files
-  Pending Changes
+  Review Center
   Push Review
-  Mounts
-  Mount Detail
-  Activity
+  Sources
+  Source Detail
   Settings
+  Activity
   Diagnostics
 ```
 
-## Daily Use Mounts
+## Daily Use Sources
 
-The sidebar label is `Mounts`. The first screen lists every registered mount point
-from the desktop snapshot instead of immediately showing the preferred Notion
-mount.
+The sidebar label is `Sources`. The first screen lists every registered connected
+source from the desktop snapshot instead of immediately showing only the
+preferred Notion folder.
 
-The list uses compact mount cards so long filesystem paths do not dominate the
-screen. The header includes a `+ Add Mount` action for adding future connector
-mounts from the same place. Each card shows:
+The list uses compact source cards so long filesystem paths do not dominate the
+screen. The header includes a `+ Add Source` action for adding future connectors
+from the same place. Each card shows:
 
-- Mount: connector name, workspace label, mount id, and a `Primary` marker for
-  the preferred mount used by Home, tray, and Pending Changes.
+- Source: connector name, workspace label, mount id, and a `Primary` marker for
+  the preferred source used by Home, tray, and Review Center.
 - Local path: a compact middle-truncated path with the full path available on
   hover.
 - Projection: plain files, macOS File Provider, Linux FUSE, or Windows Cloud
   Files.
 - Access: read-only or edit-enabled.
-- Content: indexed item count and pending-change count.
-- Status: mount/provider status label.
+- Content: indexed item count and review item count.
+- Status: source/provider status label.
 - Actions: copy path, open folder, and open details.
 
-Clicking the mount name or Details opens Mount Detail for that mount. The detail
-screen keeps the existing mount controls, but all path-based actions use the
-selected mount rather than the preferred snapshot mount. The breadcrumb is:
+Clicking the source name or Details opens Source Detail for that source. The
+detail screen keeps path controls, per-source sync controls, and diagnostics.
+All path-based actions use the selected source rather than the preferred snapshot
+source. The breadcrumb is:
 
 ```text
-Home / Mounts / <mount-id>
+Home / Sources / <mount-id>
 ```
 
-The `Mounts` breadcrumb returns to the table without changing the selected
-mount in backend state. No backend mount selection command is introduced by this
-screen.
+The `Sources` breadcrumb returns to the table without changing the selected
+source in backend state. No backend source selection command is introduced by
+this screen.
 
 ## First-Run Onboarding
 
@@ -374,7 +377,7 @@ Layout:
 │ │ Paste Notion URL                 │ │
 │ └──────────────────────────────────┘ │
 │                                      │
-│ Pending Changes                  0   │
+│ Review Center                    0   │
 │                                      │
 │ Suggestions                          │
 │ Connect Linear                       │
@@ -390,12 +393,12 @@ Attention state:
 ┌──────────────────────────────────────┐
 │ Locality                    Needs Review  │
 │                                      │
-│ Pending Changes                  3   │
+│ Review Center                    3   │
 │ roadmap.md                           │
 │ launch-plan.md                       │
 │ customer-notes.md                    │
 │                                      │
-│ [ Review Pending Changes ]           │
+│ [ Open Review Center ]               │
 │ Open Notion Folder                   │
 │                                      │
 │ Open a Notion page                   │
@@ -437,10 +440,8 @@ Layout:
 │ Locality           │ Home                                         │
 │               │                                              │
 │ Home          │ ...                                          │
-│ Files         │                                              │
-│ Mounts        │                                              │
-│ Pending       │                                              │
-│ Activity      │                                              │
+│ Sources       │                                              │
+│ Review Center │                                              │
 │ Settings      │                                              │
 │               │                                              │
 │ Notion Ready  │                                              │
@@ -450,7 +451,7 @@ Layout:
 Sidebar bottom status:
 
 - `Notion Ready`
-- `Pending Changes`
+- `Needs Review`
 - `Reconnect Needed`
 - `Locality Stopped`
 
@@ -481,8 +482,8 @@ Recent Files
 Standups with Locality
 ~/Library/CloudStorage/Locality/notion-main/Engineering Wiki/Standups with Locality/page.md
 
-Pending Changes
-No pending changes
+Review Center
+No review needed
 
 Suggestions
 Connect Linear
@@ -494,9 +495,9 @@ Attention state:
 Home
 
 Needs Review
-3 files have pending changes.
+3 files need review.
 
-[ Review Pending Changes ]
+[ Open Review Center ]
 Open Notion Folder
 ```
 
@@ -592,15 +593,15 @@ should be routed to reconnect or change access.
 
 The current workspace section owns the everyday file controls. Keep path actions
 next to the path itself as compact icon buttons: copy path, reveal in Finder, and
-open in editor. Do not repeat the full mount list in Files; the Mounts screen is
-the management place for all registered local folders. Advanced diagnostics can
+open in editor. Do not repeat the full source list in Files; the Sources screen
+is the management place for all registered local folders. Advanced diagnostics can
 live behind disclosure inside Files or Settings.
 
 Search results should label safety states clearly:
 
 - `Ready`
 - `Online Only`
-- `Pending`
+- `Needs Review`
 - `Remote Update`
 - `Conflict`
 
@@ -623,20 +624,22 @@ Reconnect state:
 - primary action changes to `Reconnect Notion`;
 - keep folder actions available if local files still exist.
 
-## Pending Changes
+## Review Center
 
-Goal: show local edits that can affect Notion and route the user to review.
+Goal: show local edits and sync exceptions that can affect Notion and route the
+user to review or resolution.
 
-Primary action when safe changes exist: `Review Push`
+Primary action when review items exist: `Review Push`
 
-Secondary actions: `Open Folder`, `Restore Local File` per item when applicable.
+Secondary actions: `Push Safe Changes`, `Open File`, `Pull Latest`, `Reset to
+Remote`, and per-file Live Mode controls when applicable.
 
 Layout:
 
 ```text
-Pending Changes
+Review Center
 
-3 files have pending changes.
+3 items need attention.
 
 ┌──────────────────────────────────────────────────────────────┐
 │ Roadmap 2026                                                 │
@@ -655,7 +658,7 @@ Pending Changes
 
 Item states:
 
-- safe pending change;
+- approval required;
 - needs review;
 - conflict;
 - read-only blocked;
@@ -664,11 +667,12 @@ Item states:
 Empty state:
 
 ```text
-Pending Changes
+Review Center
 
-No pending changes.
+No review needed.
 
-Local edits will appear here before they update Notion.
+Safe Live Mode work can sync automatically. Items that need approval will appear
+here.
 ```
 
 ## Push Review
@@ -963,7 +967,7 @@ Avoid in normal UI:
 2. Inline Open Notion Page fields and path-copy result.
 3. Tray popover and quit options.
 4. Home screen.
-5. Pending changes and push review.
+5. Review Center and push review.
 6. Files screen with current workspace controls.
 7. Activity.
 8. Settings and diagnostics.

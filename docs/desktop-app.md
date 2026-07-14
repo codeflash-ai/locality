@@ -328,7 +328,7 @@ Primary items:
 
 - Open Notion Folder
 - Notion URL input for locating a page
-- Pending Changes
+- Review Center
 - Add Connection...
 - Settings
 - Quit Options
@@ -350,12 +350,13 @@ accident than closing a normal app window.
 Recommended sections:
 
 - Connections: connected Notion workspace and future connectors.
-- Mounts: local folders with quick open and reveal actions.
-- Pending Changes: files that need push, conflicts, or blocked edits.
+- Sources: connected workspaces with quick open, reveal, and sync actions.
+- Review Center: files that need push approval, conflict resolution, or blocked
+  edit decisions.
 - Suggestions: useful next connectors or setup improvements.
 
-Avoid internal file-state terms in user-facing UI. Use "pending changes",
-"needs review", "conflict", or "not ready to push" depending on context.
+Avoid internal file-state terms in user-facing UI. Use "needs review",
+"conflict", "blocked", or "not ready to push" depending on context.
 
 ## Safety UX
 
@@ -415,7 +416,7 @@ Shows the current state in product terms:
 - an explicit Live Mode toggle for users who want clean hydrated pages checked
   for remote changes and safe pending changes pushed continuously without
   opening the review flow;
-- pending changes;
+- review items;
 - attention items;
 - connector suggestions.
 
@@ -431,10 +432,10 @@ Shows one mounted workspace:
 - read-only state;
 - advanced diagnostics behind disclosure.
 
-### Pending Changes
+### Review Center
 
-Shows files that will affect Notion on push. The user can review the plan, push
-safe changes, handle conflicts, or open files locally.
+Shows files that will affect Notion on push or need sync attention. The user can
+review the plan, push safe changes, handle conflicts, or open files locally.
 
 ### Activity
 
