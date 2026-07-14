@@ -1,5 +1,5 @@
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use locality_core::model::{CanonicalDocument, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationIssue;
@@ -93,10 +93,14 @@ pub fn message_frontmatter(bundle: &GmailNativeBundle) -> String {
 }
 
 pub fn remote_version(message: &GmailMessage) -> String {
+    let mut labels = message.label_ids.clone();
+    labels.sort();
+
     format!(
-        "gmail:{}:{}",
+        "gmail:{}:{}:{}",
         message.id,
-        message.internal_date.as_deref().unwrap_or("unknown")
+        message.internal_date.as_deref().unwrap_or("unknown"),
+        labels.join(",")
     )
 }
 
@@ -153,15 +157,19 @@ fn text_part(part: &GmailMessagePart, mime_type: &str) -> Option<String> {
     if part.mime_type.as_deref() == Some(mime_type)
         && let Some(data) = part.body.as_ref().and_then(|body| body.data.as_ref())
     {
-        return URL_SAFE_NO_PAD
-            .decode(data.as_bytes())
-            .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok());
+        return decode_gmail_base64url(data).and_then(|bytes| String::from_utf8(bytes).ok());
     }
 
     part.parts
         .iter()
         .find_map(|part| text_part(part, mime_type))
+}
+
+fn decode_gmail_base64url(data: &str) -> Option<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(data.as_bytes())
+        .or_else(|_| URL_SAFE.decode(data.as_bytes()))
+        .ok()
 }
 
 fn has_attachments(message: &GmailMessage) -> bool {
@@ -200,13 +208,55 @@ fn ensure_trailing_newline(mut value: String) -> String {
 }
 
 fn yaml_list_items(header: &str) -> String {
-    header
-        .split(',')
+    split_address_header(header)
+        .into_iter()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(yaml_scalar)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn split_address_header(header: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (index, ch) in header.char_indices() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_quotes = true,
+            ',' => {
+                let part = header[start..index].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    let part = header[start..].trim();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+
+    parts
 }
 
 fn sanitize_recipients(values: &[String]) -> String {
@@ -223,14 +273,30 @@ fn sanitize_header(value: &str) -> String {
 }
 
 fn yaml_scalar(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{:04X}", u32::from(ch))),
+            ch => escaped.push(ch),
+        }
+    }
+
+    format!("\"{}\"", escaped)
 }
 
 #[cfg(test)]
 mod tests {
     use locality_core::LocalityError;
 
-    use super::{GmailDraftDocument, GmailNativeBundle, build_draft_mime, render_gmail_message};
+    use super::{
+        GmailDraftDocument, GmailNativeBundle, build_draft_mime, remote_version,
+        render_gmail_message,
+    };
     use crate::dto::GmailMessage;
 
     #[test]
@@ -263,6 +329,126 @@ mod tests {
         assert!(rendered.document.frontmatter.contains("subject: \"Hello\""));
         assert_eq!(rendered.document.body, "Hello from Gmail.\n");
         assert_eq!(rendered.shadow.entity_id.as_str(), "msg-1");
+    }
+
+    #[test]
+    fn renders_padded_gmail_body_data() {
+        let message: GmailMessage = serde_json::from_value(serde_json::json!({
+            "id": "msg-padded",
+            "threadId": "thread-padded",
+            "labelIds": ["INBOX"],
+            "internalDate": "1720900000000",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    { "name": "Subject", "value": "Padded" }
+                ],
+                "body": { "data": "SGVsbG8gZnJvbSBwYWRkZWQuCg==" }
+            }
+        }))
+        .expect("message");
+
+        let rendered = render_gmail_message(&GmailNativeBundle {
+            mailbox: "inbox".to_string(),
+            message,
+        })
+        .expect("render");
+
+        assert_eq!(rendered.document.body, "Hello from padded.\n");
+    }
+
+    #[test]
+    fn escapes_control_chars_in_frontmatter_scalars() {
+        let message: GmailMessage = serde_json::from_value(serde_json::json!({
+            "id": "msg-control",
+            "threadId": "thread-control",
+            "labelIds": ["INBOX"],
+            "internalDate": "1720900000000",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    { "name": "Subject", "value": "Hello\n---\r\t\u{0001}" }
+                ],
+                "body": { "data": "Qm9keQo" }
+            }
+        }))
+        .expect("message");
+
+        let rendered = render_gmail_message(&GmailNativeBundle {
+            mailbox: "inbox".to_string(),
+            message,
+        })
+        .expect("render");
+
+        assert!(
+            rendered
+                .document
+                .frontmatter
+                .contains("subject: \"Hello\\n---\\r\\t\\u0001\"")
+        );
+        assert!(
+            !rendered
+                .document
+                .frontmatter
+                .contains("subject: \"Hello\n---")
+        );
+    }
+
+    #[test]
+    fn keeps_quoted_display_name_commas_in_address_lists() {
+        let message: GmailMessage = serde_json::from_value(serde_json::json!({
+            "id": "msg-addresses",
+            "threadId": "thread-addresses",
+            "labelIds": ["INBOX"],
+            "internalDate": "1720900000000",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    { "name": "To", "value": "\"Doe, Jane\" <jane@example.com>, bob@example.com" },
+                    { "name": "Subject", "value": "Addresses" }
+                ],
+                "body": { "data": "Qm9keQo" }
+            }
+        }))
+        .expect("message");
+
+        let rendered = render_gmail_message(&GmailNativeBundle {
+            mailbox: "inbox".to_string(),
+            message,
+        })
+        .expect("render");
+
+        assert!(
+            rendered
+                .document
+                .frontmatter
+                .contains("to: [\"\\\"Doe, Jane\\\" <jane@example.com>\", \"bob@example.com\"]")
+        );
+    }
+
+    #[test]
+    fn remote_version_changes_when_labels_change() {
+        let mut inbox_message = GmailMessage {
+            id: "msg-labels".to_string(),
+            internal_date: Some("1720900000000".to_string()),
+            label_ids: vec!["INBOX".to_string()],
+            ..GmailMessage::default()
+        };
+        let archived_message = GmailMessage {
+            label_ids: vec!["ARCHIVE".to_string()],
+            ..inbox_message.clone()
+        };
+
+        assert_ne!(
+            remote_version(&inbox_message),
+            remote_version(&archived_message)
+        );
+
+        inbox_message.label_ids = vec!["ARCHIVE".to_string()];
+        assert_eq!(
+            remote_version(&inbox_message),
+            remote_version(&archived_message)
+        );
     }
 
     #[test]
