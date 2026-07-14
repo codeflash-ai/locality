@@ -53,7 +53,7 @@ function isOAuthSessionPayload(value: unknown): value is OAuthSessionPayload {
   const payload = value as Partial<OAuthSessionPayload>;
   return (
     payload.v === 1 &&
-    (payload.connector === "notion" || payload.connector === "google-docs") &&
+    (payload.connector === "notion" || payload.connector === "google-docs" || payload.connector === "gmail") &&
     typeof payload.state === "string" &&
     typeof payload.redirect_uri === "string" &&
     typeof payload.iat === "number" &&

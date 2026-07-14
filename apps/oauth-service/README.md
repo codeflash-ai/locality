@@ -134,6 +134,57 @@ Request:
 }
 ```
 
+### `POST /v1/oauth/gmail/start`
+
+Request:
+
+```json
+{
+  "redirect_uri": "http://localhost:8757/oauth/gmail/callback"
+}
+```
+
+Response:
+
+```json
+{
+  "connector": "gmail",
+  "client_id": "public-client-id",
+  "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?...",
+  "redirect_uri": "http://localhost:8757/oauth/gmail/callback",
+  "session": "signed-session",
+  "state": "opaque-state",
+  "expires_in": 600
+}
+```
+
+### `POST /v1/oauth/gmail/exchange`
+
+Request:
+
+```json
+{
+  "session": "signed-session",
+  "state": "opaque-state",
+  "code": "provider-authorization-code",
+  "redirect_uri": "http://localhost:8757/oauth/gmail/callback"
+}
+```
+
+Response includes the Google OAuth access token for Gmail read/compose scopes,
+granted scopes, optional ID token, and either `refresh_token_handle` or
+`refresh_token`, depending on `LOCALITY_TOKEN_MODE`.
+
+### `POST /v1/oauth/gmail/refresh`
+
+Request:
+
+```json
+{
+  "refresh_token_handle": "locrh_v1..."
+}
+```
+
 ## Local Development
 
 ```sh
@@ -156,6 +207,14 @@ npm run check
 - `LOCALITY_NOTION_CLIENT_SECRET`: Notion OAuth client secret.
 - `LOCALITY_GOOGLE_DOCS_CLIENT_ID`: Google OAuth client ID.
 - `LOCALITY_GOOGLE_DOCS_CLIENT_SECRET`: Google OAuth client secret.
+- `LOCALITY_GMAIL_CLIENT_ID`: Google OAuth client ID for Gmail.
+- `LOCALITY_GMAIL_CLIENT_SECRET`: Google OAuth client secret for Gmail.
+
+Optional connector overrides:
+
+- `LOCALITY_NOTION_REDIRECT_URIS`, `LOCALITY_GOOGLE_DOCS_REDIRECT_URIS`, `LOCALITY_GMAIL_REDIRECT_URIS`: comma-separated allowed loopback redirect URIs.
+- `LOCALITY_NOTION_AUTH_BASE_URL`, `LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL`, `LOCALITY_GMAIL_AUTH_BASE_URL`: provider authorization base URL.
+- `LOCALITY_NOTION_API_BASE_URL`, `LOCALITY_GOOGLE_DOCS_API_BASE_URL`, `LOCALITY_GMAIL_API_BASE_URL`: provider token API base URL.
 
 ## Deployment
 
