@@ -16,7 +16,9 @@ import {
   EyeOff,
   FolderOpen,
   Home,
+  LayoutGrid,
   ListChecks,
+  List,
   Loader2,
   Minus,
   Plus,
@@ -96,6 +98,7 @@ type DestructiveSettingsAction = "reset" | "uninstall";
 type SettingsSection = "general" | "sources" | "sync" | "activity" | "agents" | "advanced" | "about";
 type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
 type SourceConnectorId = "notion" | "google-docs" | "gmail";
+type SourceListViewMode = "list" | "tiles";
 type ConnectorOption = {
   id: SourceConnectorId;
   name: string;
@@ -2921,6 +2924,7 @@ function AddSourceDialog({
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
+  const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
   const needsConnection = connectionMissing(snapshot);
   const needsFolder = !needsConnection && mountMissing(snapshot);
@@ -2981,97 +2985,121 @@ function AddSourceDialog({
           </button>
         </div>
 
-        <label className="source-search-row">
-          <Search />
-          <input
-            autoFocus
-            value={query}
-            placeholder="Search sources"
-            onChange={(event) => setQuery(event.target.value)}
-          />
-        </label>
+        <div className="source-toolbar">
+          <label className="source-search-row">
+            <Search />
+            <input
+              autoFocus
+              value={query}
+              placeholder="Search sources"
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </label>
+          <div className="source-view-toggle" aria-label="Source view">
+            <button
+              type="button"
+              className={viewMode === "list" ? "active" : ""}
+              aria-pressed={viewMode === "list"}
+              onClick={() => setViewMode("list")}
+            >
+              <List />
+              <span>List</span>
+            </button>
+            <button
+              type="button"
+              className={viewMode === "tiles" ? "active" : ""}
+              aria-pressed={viewMode === "tiles"}
+              onClick={() => setViewMode("tiles")}
+            >
+              <LayoutGrid />
+              <span>Tiles</span>
+            </button>
+          </div>
+        </div>
 
-        <div className="connector-choice-grid">
-          {visibleConnectors.map((connector) => {
-            const disabled = busy || (connector.id !== "notion" && connector.mounted);
-            const actionLabel = sourceActionLabel(connector.id, {
-              needsConnection,
-              needsFolder,
-              mounted: connector.mounted,
-            });
-            return (
-              <article
-                className={`connector-choice-card ${connector.mounted ? "mounted" : "active"}`}
-                aria-disabled={disabled}
-                key={connector.id}
-              >
-                <div className="connector-choice-heading">
-                  <ConnectorIcon connector={connector.id} />
-                  <div>
-                    <h3>{connector.name}</h3>
-                    <p>{connector.description}</p>
+        <div className="source-list-scroll">
+          <div className={`connector-choice-grid ${viewMode}`}>
+            {visibleConnectors.map((connector) => {
+              const disabled = busy || (connector.id !== "notion" && connector.mounted);
+              const actionLabel = sourceActionLabel(connector.id, {
+                needsConnection,
+                needsFolder,
+                mounted: connector.mounted,
+              });
+              return (
+                <article
+                  className={`connector-choice-card ${connector.mounted ? "mounted" : "active"}`}
+                  aria-disabled={disabled}
+                  key={connector.id}
+                >
+                  <div className="connector-choice-heading">
+                    <ConnectorIcon connector={connector.id} />
+                    <div>
+                      <h3>{connector.name}</h3>
+                      <p>{connector.description}</p>
+                    </div>
+                    <StatusPill
+                      tone={
+                        connector.mounted || (connector.id === "notion" && !needsConnection && !needsFolder)
+                          ? "ready"
+                          : "warn"
+                      }
+                      title={connector.status}
+                    >
+                      {connector.status}
+                    </StatusPill>
                   </div>
-                  <StatusPill
-                    tone={
-                      connector.mounted || (connector.id === "notion" && !needsConnection && !needsFolder)
-                        ? "ready"
-                        : "warn"
-                    }
-                    title={connector.status}
-                  >
-                    {connector.status}
-                  </StatusPill>
-                </div>
-                <div className="connector-choice-facts">
-                  {connector.id === "notion" ? (
-                    <>
-                      <SettingRow title="Workspace" value={snapshot.connection.workspaceName || "Not connected"} />
-                      <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
-                      <SettingRow title="Access" value={snapshot.mount.accessScope || "Not requested"} />
-                    </>
-                  ) : connector.id === "google-docs" ? (
-                    <>
-                      <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
-                      <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
-                    </>
-                  ) : (
-                    <>
-                      <SettingRow title="Mailboxes" value="Inbox, Sent, Draft" />
-                      <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
-                    </>
+                  <div className="connector-choice-facts">
+                    {connector.id === "notion" ? (
+                      <>
+                        <SettingRow title="Workspace" value={snapshot.connection.workspaceName || "Not connected"} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                        <SettingRow title="Access" value={snapshot.mount.accessScope || "Not requested"} />
+                      </>
+                    ) : connector.id === "google-docs" ? (
+                      <>
+                        <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                      </>
+                    ) : (
+                      <>
+                        <SettingRow title="Mailboxes" value="Inbox, Sent, Draft" />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                      </>
+                    )}
+                  </div>
+                  {connector.id === "google-docs" && !connector.mounted && (
+                    <label className="source-inline-field">
+                      <span>Drive folder</span>
+                      <input
+                        value={googleDocsWorkspaceFolder}
+                        placeholder="Folder name, URL, or ID"
+                        onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
+                      />
+                    </label>
                   )}
-                </div>
-                {connector.id === "google-docs" && !connector.mounted && (
-                  <label className="source-inline-field">
-                    <span>Drive folder</span>
-                    <input
-                      value={googleDocsWorkspaceFolder}
-                      placeholder="Folder name, URL, or ID"
-                      onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
-                    />
-                  </label>
-                )}
-                {connector.mounted && connector.id !== "notion" ? (
-                  <SecondaryButton compact disabled icon={<Check />}>
-                    Mounted
-                  </SecondaryButton>
-                ) : (
-                  <PrimaryButton
-                    compact
-                    busy={busy}
-                    disabled={connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim()}
-                    icon={busy ? <Loader2 className="spin-icon" /> : sourceActionIcon(connector.id, needsConnection)}
-                    onClick={() => onAction(connector.id, { googleDocsWorkspaceFolder })}
-                  >
-                    {busy ? "Working" : actionLabel}
-                  </PrimaryButton>
-                )}
-              </article>
-            );
-          })}
-          {visibleConnectors.length === 0 && (
-            <div className="settings-empty-state">No source matched that search.</div>
-          )}
+                  {connector.mounted && connector.id !== "notion" ? (
+                    <SecondaryButton compact disabled icon={<Check />}>
+                      Mounted
+                    </SecondaryButton>
+                  ) : (
+                    <PrimaryButton
+                      compact
+                      busy={busy}
+                      disabled={connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim()}
+                      icon={busy ? <Loader2 className="spin-icon" /> : sourceActionIcon(connector.id, needsConnection)}
+                      onClick={() => onAction(connector.id, { googleDocsWorkspaceFolder })}
+                    >
+                      {busy ? "Working" : actionLabel}
+                    </PrimaryButton>
+                  )}
+                </article>
+              );
+            })}
+            {visibleConnectors.length === 0 && (
+              <div className="settings-empty-state">No source matched that search.</div>
+            )}
+          </div>
         </div>
 
         {message && <p className={state === "error" ? "field-error" : "quiet-note inline-note"}>{message}</p>}

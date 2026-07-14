@@ -2538,13 +2538,16 @@ button.home-stat:hover {
 
 .source-modal {
   display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 16px;
   width: min(680px, calc(100vw - 48px));
+  max-height: min(760px, calc(100vh - 48px));
   padding: 18px;
   border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--paper);
   box-shadow: 0 28px 90px rgba(20, 30, 43, 0.24);
+  overflow: hidden;
 }
 
 .source-modal h2 {
@@ -2556,6 +2559,13 @@ button.home-stat:hover {
   margin-top: 5px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.source-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
 }
 
 .source-search-row {
@@ -2584,9 +2594,63 @@ button.home-stat:hover {
   font-size: 13px;
 }
 
+.source-view-toggle {
+  display: inline-flex;
+  min-height: 38px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.source-view-toggle button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 74px;
+  justify-content: center;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.source-view-toggle button.active {
+  background: rgba(8, 123, 114, 0.1);
+  color: var(--teal);
+  box-shadow: inset 0 0 0 1px rgba(8, 123, 114, 0.14);
+}
+
+.source-view-toggle button:focus-visible {
+  outline: 2px solid rgba(8, 123, 114, 0.28);
+  outline-offset: 2px;
+}
+
+.source-view-toggle svg {
+  width: 14px;
+  height: 14px;
+}
+
+.source-list-scroll {
+  min-height: 0;
+  margin-right: -4px;
+  padding-right: 4px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .connector-choice-grid {
   display: grid;
   gap: 10px;
+}
+
+.connector-choice-grid.tiles {
+  grid-template-columns: repeat(auto-fill, minmax(178px, 1fr));
 }
 
 .connector-choice-card {
@@ -2596,6 +2660,13 @@ button.home-stat:hover {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.84);
+}
+
+.connector-choice-grid.tiles .connector-choice-card {
+  align-content: start;
+  gap: 10px;
+  min-height: 190px;
+  padding: 11px;
 }
 
 .connector-choice-card.active {
@@ -2619,6 +2690,17 @@ button.home-stat:hover {
   gap: 12px;
 }
 
+.connector-choice-grid.tiles .connector-choice-heading {
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+
+.connector-choice-grid.tiles .connector-choice-heading .status-pill {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
 .connector-choice-heading h3 {
   color: var(--ink);
   font-size: 14px;
@@ -2626,6 +2708,14 @@ button.home-stat:hover {
 
 .connector-choice-heading p {
   max-width: 420px;
+}
+
+.connector-choice-grid.tiles .connector-choice-heading p {
+  display: -webkit-box;
+  max-width: none;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .connector-icon {
@@ -2696,6 +2786,10 @@ button.home-stat:hover {
   overflow: hidden;
 }
 
+.connector-choice-grid.tiles .connector-choice-facts {
+  display: none;
+}
+
 .connector-choice-facts .setting-row {
   min-height: 34px;
   padding: 7px 10px;
@@ -2729,6 +2823,14 @@ button.home-stat:hover {
 .source-inline-field input:focus {
   border-color: rgba(8, 123, 114, 0.34);
   box-shadow: 0 0 0 3px rgba(8, 123, 114, 0.1);
+}
+
+.connector-choice-grid.tiles .source-inline-field {
+  gap: 5px;
+}
+
+.connector-choice-grid.tiles .source-inline-field input {
+  min-height: 32px;
 }
 
 .compact-settings {
