@@ -2162,6 +2162,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "locality-gmail"
+version = "0.3.0"
+dependencies = [
+ "base64 0.22.1",
+ "locality-connector",
+ "locality-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "yaml_serde",
+]
+
+[[package]]
 name = "locality-google-docs"
 version = "0.3.0"
 dependencies = [
