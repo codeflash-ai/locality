@@ -1621,6 +1621,55 @@ p {
   padding: 18px;
 }
 
+.home-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.home-stat {
+  display: grid;
+  gap: 5px;
+  min-height: 84px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.74);
+  box-shadow: 0 8px 24px rgba(20, 30, 43, 0.05);
+  color: var(--ink);
+  text-align: left;
+}
+
+button.home-stat:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-strong);
+}
+
+.home-stat span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.home-stat strong {
+  font-size: 26px;
+  line-height: 1;
+}
+
+.home-stat strong.warn {
+  color: var(--amber);
+}
+
+.home-stat strong.danger {
+  color: var(--red);
+}
+
+.home-stat.passive {
+  cursor: default;
+}
+
 .workspace-card h2,
 .attention-panel h2 {
   margin-top: 5px;
@@ -2323,6 +2372,31 @@ p {
 
 .discovery-panel p.field-error {
   color: var(--red);
+}
+
+.file-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
+.file-filter-bar button {
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.68);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.file-filter-bar button.active,
+.file-filter-bar button:hover {
+  border-color: rgba(8, 123, 114, 0.24);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .file-discovery-list {

@@ -89,6 +89,7 @@ type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | 
 type LocateState = "idle" | "preparing" | "ready" | "error";
 type OnboardingStep = 1 | 2 | 3 | 4 | 5;
 type ReviewFilter = "all" | "approvals" | "problems";
+type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 
 const PRODUCT_TERMS = {
   home: "Home",
@@ -771,6 +772,32 @@ function changeMatchesReviewFilter(change: PendingChange, filter: ReviewFilter) 
   }
   const isProblem = change.state === "conflict" || change.state === "blocked";
   return filter === "problems" ? isProblem : !isProblem;
+}
+
+function fileStatusFilterLabel(filter: FileStatusFilter) {
+  if (filter === "review") {
+    return "Needs review";
+  }
+  if (filter === "conflict") {
+    return "Conflicts";
+  }
+  if (filter === "synced") {
+    return "Synced";
+  }
+  return "All";
+}
+
+function itemMatchesFileStatusFilter(item: LocatedItem, filter: FileStatusFilter) {
+  if (filter === "all") {
+    return true;
+  }
+  if (filter === "review") {
+    return item.state === "pending_changes" || item.state === "remote_update_available";
+  }
+  if (filter === "conflict") {
+    return item.state === "conflict";
+  }
+  return item.state === "ready";
 }
 
 function onboardingStepMeta(step: OnboardingStep) {
@@ -2314,6 +2341,7 @@ function HomeView({
     toggleLiveMode,
   } = useMountLiveModeController(snapshot, onRefresh);
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
+  const homeReviewCounts = reviewQueueCounts(snapshot.pendingChanges);
 
   async function connectNotion() {
     setActionError("");
@@ -2421,6 +2449,22 @@ function HomeView({
         </section>
       ) : (
         <>
+          <section className="home-stat-grid" aria-label="Workspace summary">
+            <button type="button" className="home-stat" onClick={onMount}>
+              <span>Sources</span>
+              <strong>{snapshot.mounts.length || 1}</strong>
+            </button>
+            <button type="button" className="home-stat" onClick={onReview}>
+              <span>Awaiting review</span>
+              <strong className={homeReviewCounts.total > 0 ? "warn" : ""}>{homeReviewCounts.total}</strong>
+            </button>
+            <div className="home-stat passive">
+              <span>Problems</span>
+              <strong className={homeReviewCounts.problems > 0 ? "danger" : ""}>
+                {homeReviewCounts.problems > 0 ? homeReviewCounts.problems : "0"}
+              </strong>
+            </div>
+          </section>
           <section className="workspace-card">
             <div className="workspace-summary">
               <p className="label">{PRODUCT_TERMS.connectedSource}</p>
@@ -2709,7 +2753,11 @@ function FilesView({
   onReview: () => void;
 }) {
   const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<FileStatusFilter>("all");
   const { results, searching } = useNotionSearchResults(query, !mountMissing(snapshot));
+  const searchActive = query.trim().length >= 2;
+  const browseItems = searchActive ? results : snapshot.recentFiles;
+  const visibleItems = browseItems.filter((item) => itemMatchesFileStatusFilter(item, statusFilter));
 
   return (
     <div className="view-stack">
@@ -2727,10 +2775,25 @@ function FilesView({
       )}
 
       <section className="panel discovery-panel">
-        <div>
-          <p className="label">Current access</p>
-          <h2>Search current files</h2>
-          <p>Results come from connected sources available in this Locality session.</p>
+        <div className="discovery-heading">
+          <div>
+            <p className="label">Current access</p>
+            <h2>Browse current files</h2>
+            <p>Results come from connected sources available in this Locality session.</p>
+          </div>
+          <div className="file-filter-bar" role="tablist" aria-label="File status filters">
+            {(["all", "review", "conflict", "synced"] as const).map((filter) => (
+              <button
+                key={filter}
+                className={statusFilter === filter ? "active" : ""}
+                role="tab"
+                aria-selected={statusFilter === filter}
+                onClick={() => setStatusFilter(filter)}
+              >
+                {fileStatusFilterLabel(filter)}
+              </button>
+            ))}
+          </div>
         </div>
         <div className="locate-row">
           <Search />
@@ -2740,18 +2803,33 @@ function FilesView({
             onChange={(event) => setQuery(event.target.value)}
           />
         </div>
-        {query.trim().length >= 2 && (
-          <div className="file-discovery-list" aria-busy={searching ? "true" : "false"}>
-            {results.length ? (
-              results.map((item) => <FileDiscoveryRow key={`${item.kind}-${item.localPath}`} item={item} />)
-            ) : (
-              <EmptyDiscoveryState text={searching ? "Searching current files..." : "No current files matched."} />
-            )}
-          </div>
+        <div className="file-discovery-list" aria-busy={searching ? "true" : "false"}>
+          {visibleItems.length ? (
+            visibleItems.map((item) => <FileDiscoveryRow key={`${item.kind}-${item.localPath}`} item={item} />)
+          ) : (
+            <EmptyDiscoveryState
+              text={
+                searching
+                  ? "Searching current files..."
+                  : searchActive
+                    ? "No current files matched."
+                    : statusFilter === "all"
+                      ? "No current files are available yet."
+                      : `No ${fileStatusFilterLabel(statusFilter).toLowerCase()} files are available.`
+              }
+            />
+          )}
+        </div>
+        {!searchActive && snapshot.recentFiles.length > 0 && (
+          <p className="quiet-note inline-note">
+            Showing recent files. Use search to look across current access.
+          </p>
         )}
       </section>
 
-      <RecentFilesPanel items={snapshot.recentFiles} />
+      {snapshot.recentFiles.length > 0 && searchActive && (
+        <RecentFilesPanel items={snapshot.recentFiles} />
+      )}
     </div>
   );
 }
