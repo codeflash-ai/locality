@@ -4,9 +4,9 @@ use loc_cli::connect::{
     DEFAULT_NOTION_PROFILE_ID, GmailBrokerOAuthConnectOptions, GmailOAuthBrokerExchange,
     GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange, NotionConnectionProbe,
     NotionConnectionProbeResult, NotionOAuthBrokerExchange, NotionOAuthExchange,
-    OAuthConnectOptions, run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth,
-    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth, run_disconnect,
-    run_profiles,
+    OAuthConnectOptions, OAuthExchangeFailure, run_connect_gmail_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_notion, run_connect_notion_broker_oauth,
+    run_connect_notion_oauth, run_disconnect, run_profiles,
 };
 use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
 use locality_gmail::{GMAIL_OAUTH_SCOPES, StoredGmailCredential};
@@ -340,6 +340,73 @@ fn connect_gmail_broker_oauth_rejects_missing_required_scope() {
             .expect("lookup connection")
             .is_none()
     );
+}
+
+#[test]
+fn connect_gmail_broker_oauth_scope_validation_reports_gmail_guidance() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = ScopedFakeGmailBrokerOAuthExchange {
+        scopes: GMAIL_OAUTH_SCOPES
+            .iter()
+            .filter(|scope| **scope != "https://www.googleapis.com/auth/gmail.compose")
+            .map(|scope| scope.to_string())
+            .collect(),
+    };
+
+    let error = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        gmail_connect_options(),
+        &exchange,
+    )
+    .expect_err("missing Gmail compose scope must be rejected");
+    let message = error.message();
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        message.starts_with("Gmail OAuth exchange failed: "),
+        "{message}"
+    );
+    assert!(!message.contains("Notion OAuth"), "{message}");
+    assert_eq!(error.suggested_command(), Some("loc connect gmail"));
+}
+
+#[test]
+fn connect_oauth_exchange_errors_report_connector_guidance() {
+    let notion = loc_cli::connect::ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::notion(
+        "authorization code was rejected",
+    ));
+    assert_eq!(
+        notion.message(),
+        "Notion OAuth exchange failed: authorization code was rejected"
+    );
+    assert_eq!(notion.suggested_command(), Some("loc connect notion"));
+
+    let google_docs = loc_cli::connect::ConnectError::OAuthExchangeFailed(
+        OAuthExchangeFailure::google_docs("authorization code was rejected"),
+    );
+    let google_docs_message = google_docs.message();
+    assert_eq!(
+        google_docs_message,
+        "Google Docs OAuth exchange failed: authorization code was rejected"
+    );
+    assert!(!google_docs_message.contains("Notion OAuth"));
+    assert_eq!(
+        google_docs.suggested_command(),
+        Some("loc connect google-docs")
+    );
+
+    let gmail = loc_cli::connect::ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::gmail(
+        "authorization code was rejected",
+    ));
+    let gmail_message = gmail.message();
+    assert_eq!(
+        gmail_message,
+        "Gmail OAuth exchange failed: authorization code was rejected"
+    );
+    assert!(!gmail_message.contains("Notion OAuth"));
+    assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
 }
 
 #[test]

@@ -216,8 +216,9 @@ impl NotionOAuthExchange for HttpNotionOAuthClient {
         &self,
         request: &NotionOAuthCodeExchange,
     ) -> Result<NotionOAuthToken, ConnectError> {
-        HttpNotionOAuthClient::exchange_code(self, request)
-            .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))
+        HttpNotionOAuthClient::exchange_code(self, request).map_err(|error| {
+            ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::notion(error.to_string()))
+        })
     }
 }
 
@@ -226,8 +227,9 @@ impl NotionOAuthBrokerExchange for HttpNotionOAuthBrokerClient {
         &self,
         request: &NotionOAuthBrokerCodeExchange,
     ) -> Result<NotionOAuthToken, ConnectError> {
-        HttpNotionOAuthBrokerClient::exchange_code(self, request)
-            .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))
+        HttpNotionOAuthBrokerClient::exchange_code(self, request).map_err(|error| {
+            ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::notion(error.to_string()))
+        })
     }
 }
 
@@ -236,8 +238,9 @@ impl GoogleDocsOAuthBrokerExchange for HttpGoogleDocsOAuthBrokerClient {
         &self,
         request: &OAuthBrokerCodeExchange,
     ) -> Result<OAuthBrokerToken, ConnectError> {
-        HttpGoogleDocsOAuthBrokerClient::exchange_code(self, request)
-            .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))
+        HttpGoogleDocsOAuthBrokerClient::exchange_code(self, request).map_err(|error| {
+            ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::google_docs(error.to_string()))
+        })
     }
 }
 
@@ -246,8 +249,9 @@ impl GmailOAuthBrokerExchange for HttpGmailOAuthBrokerClient {
         &self,
         request: &OAuthBrokerCodeExchange,
     ) -> Result<OAuthBrokerToken, ConnectError> {
-        HttpGmailOAuthBrokerClient::exchange_code(self, request)
-            .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))
+        HttpGmailOAuthBrokerClient::exchange_code(self, request).map_err(|error| {
+            ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::gmail(error.to_string()))
+        })
     }
 }
 
@@ -593,8 +597,9 @@ where
         redirect_uri: options.redirect_uri,
     };
     let token = exchange.exchange_code(&exchange_request)?;
-    validate_gmail_oauth_scopes(&token.scopes)
-        .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))?;
+    validate_gmail_oauth_scopes(&token.scopes).map_err(|error| {
+        ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::gmail(error.to_string()))
+    })?;
     let acquired_at = timestamp_secs();
     let secret_ref = format!("connection:{}", connection_id.0);
     let stored = StoredGmailCredential::from_broker_token(
@@ -740,11 +745,63 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthExchangeFailure {
+    connector: OAuthExchangeConnector,
+    message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OAuthExchangeConnector {
+    Notion,
+    GoogleDocs,
+    Gmail,
+}
+
+impl OAuthExchangeFailure {
+    pub fn notion(message: impl Into<String>) -> Self {
+        Self {
+            connector: OAuthExchangeConnector::Notion,
+            message: message.into(),
+        }
+    }
+
+    pub fn google_docs(message: impl Into<String>) -> Self {
+        Self {
+            connector: OAuthExchangeConnector::GoogleDocs,
+            message: message.into(),
+        }
+    }
+
+    pub fn gmail(message: impl Into<String>) -> Self {
+        Self {
+            connector: OAuthExchangeConnector::Gmail,
+            message: message.into(),
+        }
+    }
+
+    fn connector_display_name(&self) -> &'static str {
+        match self.connector {
+            OAuthExchangeConnector::Notion => "Notion",
+            OAuthExchangeConnector::GoogleDocs => "Google Docs",
+            OAuthExchangeConnector::Gmail => "Gmail",
+        }
+    }
+
+    fn suggested_command(&self) -> &'static str {
+        match self.connector {
+            OAuthExchangeConnector::Notion => "loc connect notion",
+            OAuthExchangeConnector::GoogleDocs => "loc connect google-docs",
+            OAuthExchangeConnector::Gmail => "loc connect gmail",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectError {
     ConnectionMissing(String),
     ConnectionNameRequired(String),
     ConnectionProbeFailed(String),
-    OAuthExchangeFailed(String),
+    OAuthExchangeFailed(OAuthExchangeFailure),
     CredentialEncode(String),
     Credential(CredentialError),
     Store(StoreError),
@@ -774,8 +831,12 @@ impl ConnectError {
             Self::ConnectionProbeFailed(message) => {
                 format!("Notion connection probe failed: {message}")
             }
-            Self::OAuthExchangeFailed(message) => {
-                format!("Notion OAuth exchange failed: {message}")
+            Self::OAuthExchangeFailed(failure) => {
+                format!(
+                    "{} OAuth exchange failed: {}",
+                    failure.connector_display_name(),
+                    failure.message
+                )
             }
             Self::CredentialEncode(message) => {
                 format!("failed to encode Notion credential: {message}")
@@ -787,9 +848,10 @@ impl ConnectError {
 
     pub fn suggested_command(&self) -> Option<&'static str> {
         match self {
-            Self::ConnectionMissing(_)
-            | Self::ConnectionProbeFailed(_)
-            | Self::OAuthExchangeFailed(_) => Some("loc connect notion"),
+            Self::ConnectionMissing(_) | Self::ConnectionProbeFailed(_) => {
+                Some("loc connect notion")
+            }
+            Self::OAuthExchangeFailed(failure) => Some(failure.suggested_command()),
             Self::Credential(_) | Self::CredentialEncode(_) => Some("loc connect notion"),
             Self::ConnectionNameRequired(_) | Self::Store(_) => None,
         }
