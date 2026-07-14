@@ -981,10 +981,11 @@ where
     let mutations = store
         .list_virtual_mutations(mount_id)
         .map_err(LocalityError::from)?;
-    let parent_path = container_path(&mount, &entities, &mutations, parent_identifier)?;
-    ensure_source_parent_accepts_create(&mount, &parent_path)?;
-    let page_dir = parent_path.join(dirname);
+    let parent_container_path = container_path(&mount, &entities, &mutations, parent_identifier)?;
+    ensure_source_parent_accepts_create(&mount, &parent_container_path)?;
+    let page_dir = parent_container_path.join(dirname);
     let projected_path = page_document_path(&page_dir);
+    ensure_source_parent_accepts_create(&mount, parent_path(&projected_path))?;
     if let Some(item) = existing_directory_create_item(&mount, &entities, &mutations, &page_dir) {
         return Ok(mutation_report_for_existing_item(mount_id, item));
     }
@@ -3295,6 +3296,78 @@ mod tests {
 
         assert_eq!(report.item.path, "draft/reply.md");
         assert_eq!(report.item.entity_kind, Some(EntityKind::Page));
+    }
+
+    #[test]
+    fn gmail_draft_folder_rejects_nested_directory_create_without_mutation_or_file() {
+        let mount_id = MountId::new("gmail-main");
+        let state_root = temp_root("loc-gmail-draft-nested-dir-create");
+        let content_root = state_root.join("content/gmail-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "gmail"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("gmail-folder:draft"),
+                kind: EntityKind::Directory,
+                title: "draft".to_string(),
+                path: "draft".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: Some("folder:draft".to_string()),
+            })
+            .expect("save draft folder");
+
+        let error = create_virtual_fs_directory(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "gmail-folder:draft",
+            "reply",
+        )
+        .expect_err("nested Gmail draft directories are rejected");
+
+        assert!(
+            matches!(error, LocalityError::Unsupported(message) if message.contains("Gmail creates are only supported directly inside draft/"))
+        );
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
+        assert!(!content_root.join("draft/reply/page.md").exists());
+        let draft_folder = store
+            .get_entity(&mount_id, &RemoteId::new("gmail-folder:draft"))
+            .expect("load draft folder")
+            .expect("draft folder");
+        assert_eq!(draft_folder.hydration, HydrationState::Stub);
+
+        let report = create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "gmail-folder:draft",
+            "reply.md",
+        )
+        .expect("direct Gmail draft files are still accepted");
+
+        assert_eq!(report.item.path, "draft/reply.md");
+        assert_eq!(
+            std::fs::read(content_root.join("draft/reply.md")).expect("read pending draft"),
+            b""
+        );
+        assert_eq!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
