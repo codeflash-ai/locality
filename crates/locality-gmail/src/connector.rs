@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use locality_connector::{
     ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
 };
 use locality_core::freshness::{RemoteObservation, RemoteVersion};
-use locality_core::journal::JournalApplyEffect;
+use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
@@ -25,7 +26,7 @@ use crate::dto::{
 };
 use crate::oauth::GMAIL_CONNECTOR_ID;
 use crate::render::{
-    GmailDraftDocument, GmailNativeBundle, build_draft_mime, message_frontmatter,
+    GmailDraftDocument, GmailNativeBundle, build_draft_mime_with_message_id, message_frontmatter,
     raw_message_base64url, remote_version, render_gmail_message,
 };
 
@@ -262,16 +263,41 @@ impl Connector for GmailConnector {
                 return Err(LocalityError::Unsupported("gmail draft source path"));
             }
 
+            let message_id = locality_message_id(request.push_id, &operation_id);
+            if let Some(sent) = find_sent_message_by_message_id(self.api.as_ref(), &message_id)? {
+                let sent_id = RemoteId::new(sent.id);
+                changed_remote_ids.push(sent_id.clone());
+                effects.push(JournalApplyEffect::CreatedEntity {
+                    operation_id,
+                    operation_index: index,
+                    parent_id: RemoteId::new(SENT_FOLDER_ID),
+                    entity_id: sent_id,
+                });
+                continue;
+            }
+
             let draft = draft_from_push_create(title, properties, body)?;
-            let mime = build_draft_mime(&draft)?;
+            let mime = build_draft_mime_with_message_id(&draft, Some(&message_id))?;
             let created = self.api.create_draft(GmailDraftCreateRequest {
                 message: GmailRawMessage {
                     raw: raw_message_base64url(&mime),
                 },
             })?;
-            let sent = self
+            let sent = match self
                 .api
-                .send_draft(GmailDraftSendRequest { id: created.id })?;
+                .send_draft(GmailDraftSendRequest { id: created.id })
+            {
+                Ok(sent) => sent,
+                Err(error) => {
+                    if let Some(sent) =
+                        find_sent_message_by_message_id(self.api.as_ref(), &message_id)?
+                    {
+                        sent
+                    } else {
+                        return Err(error);
+                    }
+                }
+            };
             let sent_id = RemoteId::new(sent.id);
             changed_remote_ids.push(sent_id.clone());
             effects.push(JournalApplyEffect::CreatedEntity {
@@ -291,6 +317,28 @@ impl Connector for GmailConnector {
     fn apply_undo(&self, _request: ApplyUndoRequest<'_>) -> LocalityResult<ApplyUndoResult> {
         Err(LocalityError::Unsupported("gmail undo"))
     }
+}
+
+fn find_sent_message_by_message_id(
+    api: &dyn GmailApi,
+    message_id: &str,
+) -> LocalityResult<Option<GmailMessage>> {
+    let query = format!("rfc822msgid:<{message_id}>");
+    let list = api.list_messages("SENT", 10, None, Some(&query))?;
+    let Some(message_ref) = list.messages.first() else {
+        return Ok(None);
+    };
+
+    api.get_message_metadata(&message_ref.id).map(Some)
+}
+
+fn locality_message_id(push_id: &PushId, operation_id: &PushOperationId) -> String {
+    let seed = format!("{}:{}", push_id.0, operation_id.0);
+    let mut encoded = String::with_capacity(seed.len() * 2);
+    for byte in seed.as_bytes() {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    format!("loc-{encoded}@locality.local")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,7 +413,7 @@ fn list_label_entries(
     mailbox: &str,
     parent_path: &Path,
 ) -> LocalityResult<Vec<TreeEntry>> {
-    let list = api.list_messages(label_id, RECENT_LIMIT, None)?;
+    let list = api.list_messages(label_id, RECENT_LIMIT, None, None)?;
     list.messages
         .into_iter()
         .map(|message_ref| {
@@ -756,7 +804,132 @@ mod tests {
         .expect("utf8 mime");
         assert!(mime.contains("To: ann@example.com\r\n"));
         assert!(mime.contains("Subject: Explicit subject\r\n"));
+        assert!(mime.contains("Message-ID: <"));
+        assert!(mime.contains("@locality.local>\r\n"));
         assert!(mime.contains("\r\n\r\nBody\r\nSecond line\r\n"));
+    }
+
+    #[test]
+    fn apply_create_entity_recovers_existing_sent_message_by_message_id_without_resend() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let push_id = PushId("push-1".to_string());
+        let operation_id = PushOperationId("op-1".to_string());
+        let message_id = super::locality_message_id(&push_id, &operation_id);
+        api.calls.lock().expect("calls").sent_search_results.insert(
+            format!("rfc822msgid:<{message_id}>"),
+            "sent-msg-previous".to_string(),
+        );
+        let plan = PushPlan::new(
+            vec![RemoteId::new("gmail-folder:draft")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("gmail-folder:draft"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Hello".to_string(),
+                properties: std::collections::BTreeMap::from([
+                    (
+                        "to".to_string(),
+                        PropertyValue::List(vec!["ann@example.com".to_string()]),
+                    ),
+                    (
+                        "subject".to_string(),
+                        PropertyValue::String("Explicit subject".to_string()),
+                    ),
+                ]),
+                body: "Body\n".to_string(),
+                source_path: "draft/hello.md".into(),
+            }],
+        );
+
+        let result = connector
+            .apply(locality_connector::ApplyPlanRequest {
+                push_id: &push_id,
+                mount_id: &MountId::new("gmail-main"),
+                plan: &plan,
+                operation_ids: std::slice::from_ref(&operation_id),
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect("apply");
+
+        assert_eq!(
+            result.changed_remote_ids,
+            vec![RemoteId::new("sent-msg-previous")]
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.created_drafts, 0);
+        assert!(calls.sent_drafts.is_empty());
+        assert_eq!(
+            calls.list_queries,
+            vec![format!("rfc822msgid:<{message_id}>")]
+        );
+    }
+
+    #[test]
+    fn apply_create_entity_recovers_sent_message_after_send_response_failure() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let push_id = PushId("push-1".to_string());
+        let operation_id = PushOperationId("op-1".to_string());
+        let message_id = super::locality_message_id(&push_id, &operation_id);
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.send_error = Some(LocalityError::Io(
+                "gmail draft send response decode failed".to_string(),
+            ));
+            calls.sent_search_results_after_send.insert(
+                format!("rfc822msgid:<{message_id}>"),
+                "sent-msg-recovered".to_string(),
+            );
+        }
+        let plan = PushPlan::new(
+            vec![RemoteId::new("gmail-folder:draft")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("gmail-folder:draft"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Hello".to_string(),
+                properties: std::collections::BTreeMap::from([
+                    (
+                        "to".to_string(),
+                        PropertyValue::List(vec!["ann@example.com".to_string()]),
+                    ),
+                    (
+                        "subject".to_string(),
+                        PropertyValue::String("Explicit subject".to_string()),
+                    ),
+                ]),
+                body: "Body\n".to_string(),
+                source_path: "draft/hello.md".into(),
+            }],
+        );
+
+        let result = connector
+            .apply(locality_connector::ApplyPlanRequest {
+                push_id: &push_id,
+                mount_id: &MountId::new("gmail-main"),
+                plan: &plan,
+                operation_ids: std::slice::from_ref(&operation_id),
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect("apply");
+
+        assert_eq!(
+            result.changed_remote_ids,
+            vec![RemoteId::new("sent-msg-recovered")]
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.created_drafts, 1);
+        assert_eq!(calls.sent_drafts, vec!["draft-1"]);
+        assert_eq!(
+            calls.list_queries,
+            vec![
+                format!("rfc822msgid:<{message_id}>"),
+                format!("rfc822msgid:<{message_id}>"),
+            ]
+        );
     }
 
     #[test]
@@ -836,6 +1009,10 @@ mod tests {
     #[derive(Default, Debug)]
     struct FakeCalls {
         list_max_results: Vec<u32>,
+        list_queries: Vec<String>,
+        sent_search_results: std::collections::BTreeMap<String, String>,
+        sent_search_results_after_send: std::collections::BTreeMap<String, String>,
+        send_error: Option<LocalityError>,
         message_labels: std::collections::BTreeMap<String, Vec<String>>,
         created_drafts: usize,
         created_draft_raw: Vec<String>,
@@ -848,12 +1025,45 @@ mod tests {
             label_id: &str,
             max_results: u32,
             _page_token: Option<&str>,
+            query: Option<&str>,
         ) -> locality_core::LocalityResult<GmailMessageList> {
-            self.calls
-                .lock()
-                .expect("calls")
-                .list_max_results
-                .push(max_results);
+            let mut calls = self.calls.lock().expect("calls");
+            calls.list_max_results.push(max_results);
+            if let Some(query) = query {
+                calls.list_queries.push(query.to_string());
+            }
+            if let Some(sent_message_id) = calls.sent_search_results.get(query.unwrap_or_default())
+            {
+                return Ok(GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: sent_message_id.clone(),
+                        thread_id: Some(format!("{sent_message_id}-thread")),
+                    }],
+                    next_page_token: None,
+                    result_size_estimate: Some(1),
+                });
+            }
+            if !calls.sent_drafts.is_empty()
+                && let Some(sent_message_id) = calls
+                    .sent_search_results_after_send
+                    .get(query.unwrap_or_default())
+            {
+                return Ok(GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: sent_message_id.clone(),
+                        thread_id: Some(format!("{sent_message_id}-thread")),
+                    }],
+                    next_page_token: None,
+                    result_size_estimate: Some(1),
+                });
+            }
+            if query.is_some() {
+                return Ok(GmailMessageList {
+                    messages: Vec::new(),
+                    next_page_token: None,
+                    result_size_estimate: Some(0),
+                });
+            }
             let id = match label_id {
                 "INBOX" => "inbox-msg-1",
                 "SENT" => "sent-msg-1",
@@ -907,11 +1117,11 @@ mod tests {
             &self,
             request: GmailDraftSendRequest,
         ) -> locality_core::LocalityResult<GmailMessage> {
-            self.calls
-                .lock()
-                .expect("calls")
-                .sent_drafts
-                .push(request.id);
+            let mut calls = self.calls.lock().expect("calls");
+            calls.sent_drafts.push(request.id);
+            if let Some(error) = calls.send_error.clone() {
+                return Err(error);
+            }
             Ok(message_fixture("sent-msg-1"))
         }
     }

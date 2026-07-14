@@ -23,6 +23,7 @@ pub trait GmailApi: std::fmt::Debug + Send + Sync {
         label_id: &str,
         max_results: u32,
         page_token: Option<&str>,
+        query: Option<&str>,
     ) -> LocalityResult<GmailMessageList>;
     fn get_message_metadata(&self, message_id: &str) -> LocalityResult<GmailMessage>;
     fn get_message_full(&self, message_id: &str) -> LocalityResult<GmailMessage>;
@@ -79,7 +80,7 @@ impl HttpGmailApiClient {
         decode_response(request.send(), "gmail api GET")
     }
 
-    fn post_json<T, B>(&self, path: &str, body: &B) -> LocalityResult<T>
+    fn post_json_with_context<T, B>(&self, path: &str, body: &B, context: &str) -> LocalityResult<T>
     where
         T: DeserializeOwned,
         B: Serialize + ?Sized,
@@ -90,7 +91,7 @@ impl HttpGmailApiClient {
                 .bearer_auth(&self.access_token)
                 .json(body)
                 .send(),
-            "gmail api POST",
+            context,
         )
     }
 }
@@ -101,15 +102,19 @@ impl GmailApi for HttpGmailApiClient {
         label_id: &str,
         max_results: u32,
         page_token: Option<&str>,
+        search_query: Option<&str>,
     ) -> LocalityResult<GmailMessageList> {
-        let mut query = vec![
+        let mut params = vec![
             ("labelIds".to_string(), label_id.to_string()),
             ("maxResults".to_string(), max_results.to_string()),
         ];
         if let Some(page_token) = page_token {
-            query.push(("pageToken".to_string(), page_token.to_string()));
+            params.push(("pageToken".to_string(), page_token.to_string()));
         }
-        self.get_json("/users/me/messages", query)
+        if let Some(search_query) = search_query {
+            params.push(("q".to_string(), search_query.to_string()));
+        }
+        self.get_json("/users/me/messages", params)
     }
 
     fn get_message_metadata(&self, message_id: &str) -> LocalityResult<GmailMessage> {
@@ -128,11 +133,11 @@ impl GmailApi for HttpGmailApiClient {
     }
 
     fn create_draft(&self, request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft> {
-        self.post_json("/users/me/drafts", &request)
+        self.post_json_with_context("/users/me/drafts", &request, "gmail draft create")
     }
 
     fn send_draft(&self, request: GmailDraftSendRequest) -> LocalityResult<GmailMessage> {
-        self.post_json("/users/me/drafts/send", &request)
+        self.post_json_with_context("/users/me/drafts/send", &request, "gmail draft send")
     }
 }
 

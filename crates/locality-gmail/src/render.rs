@@ -110,6 +110,13 @@ pub fn remote_version(message: &GmailMessage) -> String {
 }
 
 pub fn build_draft_mime(draft: &GmailDraftDocument) -> LocalityResult<String> {
+    build_draft_mime_with_message_id(draft, None)
+}
+
+pub fn build_draft_mime_with_message_id(
+    draft: &GmailDraftDocument,
+    message_id: Option<&str>,
+) -> LocalityResult<String> {
     if draft.to.iter().all(|value| value.trim().is_empty()) {
         return Err(LocalityError::Validation(vec![ValidationIssue::new(
             "gmail_draft_missing_to",
@@ -138,6 +145,12 @@ pub fn build_draft_mime(draft: &GmailDraftDocument) -> LocalityResult<String> {
         mime.push_str(&format!("Bcc: {}\r\n", sanitize_recipients(&draft.bcc)));
     }
     mime.push_str(&format!("Subject: {}\r\n", sanitize_header(&draft.subject)));
+    if let Some(message_id) = message_id
+        .map(sanitize_message_id)
+        .filter(|value| !value.is_empty())
+    {
+        mime.push_str(&format!("Message-ID: <{message_id}>\r\n"));
+    }
     mime.push_str("MIME-Version: 1.0\r\n");
     mime.push_str("Content-Type: text/plain; charset=\"UTF-8\"\r\n");
     mime.push_str("Content-Transfer-Encoding: 8bit\r\n");
@@ -336,6 +349,13 @@ fn sanitize_recipients(values: &[String]) -> String {
 
 fn sanitize_header(value: &str) -> String {
     value.replace(['\r', '\n'], " ").trim().to_string()
+}
+
+fn sanitize_message_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '@'))
+        .collect()
 }
 
 fn normalize_mime_body_line_endings(value: &str) -> String {
