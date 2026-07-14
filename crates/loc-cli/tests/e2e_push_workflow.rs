@@ -7032,7 +7032,7 @@ fn shared_virtual_projection_modes_root_lists_mount_points_and_statuses_all_moun
             &mut store,
             &docs_content_root,
             &docs_mount_id,
-            "children:docs-root",
+            "mount:google-docs-main",
             "Draft.md",
         )
         .unwrap_or_else(|error| {
@@ -7126,7 +7126,7 @@ fn shared_virtual_projection_modes_root_lists_mount_points_and_statuses_all_moun
         );
         assert_status_issue(
             &shared_status,
-            "Docs Home/Draft.md",
+            "Draft.md",
             "pending_virtual_create",
             &format!("{projection:?}: shared virtual root status"),
         );
