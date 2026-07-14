@@ -1362,7 +1362,12 @@ p {
   box-shadow: none;
 }
 
+.app-shell.sidebar-collapsed {
+  grid-template-columns: 68px 1fr;
+}
+
 .sidebar {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 20px;
@@ -1375,9 +1380,44 @@ p {
 .sidebar-brand {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 9px;
   padding: 0 9px;
   font-size: 18px;
+}
+
+.sidebar-brand-mark {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 9px;
+}
+
+.sidebar-brand-mark strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-collapse-button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.sidebar-collapse-button:hover {
+  border-color: var(--line);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--accent);
+}
+
+.sidebar-collapse-button svg {
+  width: 15px;
+  height: 15px;
 }
 
 .sidebar nav {
@@ -1483,6 +1523,68 @@ p {
 .sidebar-link:hover {
   background: rgba(227, 244, 241, 0.8);
   color: var(--accent);
+}
+
+.sidebar-collapsed .sidebar {
+  gap: 18px;
+  padding: 18px 10px;
+}
+
+.sidebar-collapsed .sidebar-brand {
+  justify-content: center;
+  padding: 0;
+}
+
+.sidebar-collapsed .sidebar-brand-mark strong {
+  display: none;
+}
+
+.sidebar-collapsed .sidebar-brand .locality-logo {
+  width: 30px;
+  height: 30px;
+}
+
+.sidebar-collapsed .sidebar-collapse-button {
+  position: absolute;
+  top: 18px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.sidebar-collapsed .sidebar nav {
+  justify-items: center;
+  margin-top: 6px;
+}
+
+.sidebar-collapsed .sidebar-link {
+  justify-content: center;
+  width: 38px;
+  min-height: 38px;
+  padding: 0;
+}
+
+.sidebar-collapsed .sidebar-link span {
+  display: none;
+}
+
+.sidebar-collapsed .sidebar-update {
+  display: none;
+}
+
+.sidebar-collapsed .sidebar-status {
+  display: grid;
+  justify-items: center;
+  padding: 0;
+}
+
+.sidebar-collapsed .status-pill {
+  width: 14px;
+  min-height: 14px;
+  padding: 0;
+  overflow: hidden;
+  color: transparent;
 }
 
 .sidebar-status {

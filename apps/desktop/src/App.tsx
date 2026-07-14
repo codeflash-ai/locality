@@ -28,6 +28,8 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
+  PanelLeftClose,
+  PanelLeftOpen,
   Trash2,
   Zap,
   X,
@@ -2111,6 +2113,7 @@ function MainShell({
   const statusTitle = healthDescription(snapshot.health.state, snapshot.health.attentionCount);
   const statusTarget = chromeStatusTarget(snapshot);
   const [selectedMountId, setSelectedMountId] = useState<string | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const mountTableRows = useMemo(
     () => mountRows(snapshot.mounts, snapshot.mount, snapshot.activeMountId),
     [snapshot.activeMountId, snapshot.mount, snapshot.mounts],
@@ -2164,11 +2167,23 @@ function MainShell({
         metaTitle={statusTitle}
         onMetaClick={statusTarget ? () => onViewChange(statusTarget) : undefined}
       />
-      <div className="app-shell">
+      <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
         <aside className="sidebar">
           <div className="sidebar-brand">
-            <LocalityLogo surface="light" />
-            <strong>Locality</strong>
+            <span className="sidebar-brand-mark">
+              <LocalityLogo surface="light" />
+              <strong>Locality</strong>
+            </span>
+            <button
+              className="sidebar-collapse-button has-tooltip"
+              type="button"
+              data-tooltip={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-pressed={sidebarCollapsed}
+              onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+            >
+              {sidebarCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
+            </button>
           </div>
           <nav>
             <SidebarButton active={view === "home"} icon={<Home />} onClick={() => onViewChange("home")}>
@@ -5893,8 +5908,9 @@ function SidebarButton({
   children: React.ReactNode;
   onClick: () => void;
 }) {
+  const label = typeof children === "string" ? children : undefined;
   return (
-    <button className={`sidebar-link ${active ? "active" : ""}`} onClick={onClick}>
+    <button className={`sidebar-link ${active ? "active" : ""}`} title={label} aria-label={label} onClick={onClick}>
       {icon}
       <span>{children}</span>
     </button>
