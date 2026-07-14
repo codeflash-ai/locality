@@ -88,7 +88,7 @@ impl FileProviderHelperError {
             Self::Failed(message) if macos_file_provider_application_unavailable(message) => {
                 let message = message.trim_end_matches('.');
                 format!(
-                    "{message}. The Locality macOS File Provider app or extension is not available to macOS. For local development, run `make install-macos-file-provider`, then reopen Locality and enable the File Provider if macOS asks."
+                    "{message}. The Locality macOS File Provider app or extension is not available to macOS. For local development, run `make install-macos-file-provider`, then reopen Locality and click OK in the macOS \"Start Syncing\" prompt if macOS asks."
                 )
             }
             Self::Failed(message) => message.clone(),
@@ -3029,7 +3029,8 @@ mod tests {
         .message();
 
         assert!(message.contains("make install-macos-file-provider"));
-        assert!(message.contains("enable the File Provider"));
+        assert!(message.contains("Start Syncing"));
+        assert!(!message.contains("enable the File Provider"));
         assert!(!message.contains("right now.."));
     }
 

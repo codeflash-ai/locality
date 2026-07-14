@@ -12471,7 +12471,7 @@ mod tests {
 
     #[test]
     fn workspace_mount_onboarding_preserves_application_unavailable_guidance() {
-        let message = "Could not register macOS File Provider: The application cannot be used right now. The Locality macOS File Provider app or extension is not available to macOS. For local development, run `make install-macos-file-provider`, then reopen Locality and enable the File Provider if macOS asks.";
+        let message = "Could not register macOS File Provider: The application cannot be used right now. The Locality macOS File Provider app or extension is not available to macOS. For local development, run `make install-macos-file-provider`, then reopen Locality and click OK in the macOS \"Start Syncing\" prompt if macOS asks.";
 
         assert!(super::recoverable_macos_file_provider_activation_error(
             message
