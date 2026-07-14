@@ -279,6 +279,30 @@ fn connect_gmail_broker_oauth_stores_refresh_handle_without_secrets() {
 }
 
 #[test]
+fn connect_gmail_broker_oauth_accepts_worker_scope_string() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = JsonGmailBrokerOAuthExchange {
+        payload: gmail_worker_token_payload(GMAIL_OAUTH_SCOPES.join(" ")),
+    };
+
+    run_connect_gmail_broker_oauth(&mut store, &credentials, gmail_connect_options(), &exchange)
+        .expect("connect gmail oauth");
+
+    let secret = credentials
+        .get("connection:gmail-default")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredGmailCredential>(&secret).expect("stored oauth");
+    assert_eq!(
+        stored.scopes,
+        GMAIL_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn connect_gmail_broker_oauth_rejects_missing_required_scope() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
@@ -329,6 +353,40 @@ fn connect_gmail_broker_oauth_rejects_full_mailbox_scope() {
         .collect::<Vec<_>>();
     scopes.push("https://mail.google.com/".to_string());
     let exchange = ScopedFakeGmailBrokerOAuthExchange { scopes };
+
+    let error = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        gmail_connect_options(),
+        &exchange,
+    )
+    .expect_err("full Gmail mailbox scope must be rejected");
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        error
+            .message()
+            .contains("Gmail OAuth broker returned unsupported full mailbox scope")
+    );
+    assert!(error.message().contains("https://mail.google.com/"));
+    assert!(credentials.get("connection:gmail-default").is_err());
+    assert!(
+        store
+            .get_connection(&ConnectionId::new("gmail-default"))
+            .expect("lookup connection")
+            .is_none()
+    );
+}
+
+#[test]
+fn connect_gmail_broker_oauth_rejects_full_mailbox_scope_from_worker_scope_string() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let mut scope = GMAIL_OAUTH_SCOPES.join(" ");
+    scope.push_str(" https://mail.google.com/");
+    let exchange = JsonGmailBrokerOAuthExchange {
+        payload: gmail_worker_token_payload(scope),
+    };
 
     let error = run_connect_gmail_broker_oauth(
         &mut store,
@@ -632,6 +690,28 @@ impl GmailOAuthBrokerExchange for ScopedFakeGmailBrokerOAuthExchange {
     }
 }
 
+#[derive(Clone, Debug)]
+struct JsonGmailBrokerOAuthExchange {
+    payload: serde_json::Value,
+}
+
+impl GmailOAuthBrokerExchange for JsonGmailBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "gmail");
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/gmail/callback"
+        );
+        Ok(serde_json::from_value(self.payload.clone()).expect("decode worker-shaped token"))
+    }
+}
+
 fn gmail_connect_options() -> GmailBrokerOAuthConnectOptions {
     GmailBrokerOAuthConnectOptions {
         connection_id: Some(ConnectionId::new("gmail-default")),
@@ -656,4 +736,18 @@ fn gmail_broker_token(scopes: Vec<String>) -> OAuthBrokerToken {
         workspace_name: Some("Gmail".to_string()),
         scopes,
     }
+}
+
+fn gmail_worker_token_payload(scope: String) -> serde_json::Value {
+    serde_json::json!({
+        "access_token": "oauth-access-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token_handle": "opaque-refresh-handle",
+        "account_id": "acct-1",
+        "account_label": "user@example.com",
+        "workspace_id": "gmail",
+        "workspace_name": "Gmail",
+        "scope": scope,
+    })
 }
