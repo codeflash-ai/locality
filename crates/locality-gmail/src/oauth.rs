@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::OnceLock;
 
 use locality_connector::ConnectorCapabilities;
@@ -23,7 +24,7 @@ pub const GMAIL_OAUTH_SCOPES: &[&str] = &[
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredGmailCredential {
     pub kind: String,
     pub connector: String,
@@ -39,6 +40,30 @@ pub struct StoredGmailCredential {
     pub refresh_token_handle: Option<String>,
     pub acquired_at: u64,
     pub expires_at: Option<u64>,
+}
+
+impl fmt::Debug for StoredGmailCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredGmailCredential")
+            .field("kind", &self.kind)
+            .field("connector", &self.connector)
+            .field("access_token", &"<redacted>")
+            .field("token_type", &self.token_type)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("oauth_broker_url", &self.oauth_broker_url)
+            .field("account_id", &self.account_id)
+            .field("account_label", &self.account_label)
+            .field("workspace_id", &self.workspace_id)
+            .field("workspace_name", &self.workspace_name)
+            .field("scopes", &self.scopes)
+            .field(
+                "refresh_token_handle",
+                &self.refresh_token_handle.as_ref().map(|_| "<redacted>"),
+            )
+            .field("acquired_at", &self.acquired_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl StoredGmailCredential {
@@ -167,8 +192,8 @@ pub fn gmail_capabilities_json() -> Result<String, serde_json::Error> {
         supports_block_updates: false,
         supports_databases: false,
         supports_oauth: true,
-        supports_remote_observation: true,
-        supports_lazy_child_enumeration: true,
+        supports_remote_observation: false,
+        supports_lazy_child_enumeration: false,
         supports_media_download: false,
         supports_undo: false,
         supports_batch_observation: false,
@@ -213,10 +238,13 @@ mod tests {
                 .expect("decode capabilities");
 
         assert!(capabilities.supports_oauth);
-        assert!(capabilities.supports_remote_observation);
-        assert!(capabilities.supports_lazy_child_enumeration);
+        assert!(!capabilities.supports_remote_observation);
+        assert!(!capabilities.supports_lazy_child_enumeration);
         assert!(!capabilities.supports_databases);
+        assert!(!capabilities.supports_media_download);
+        assert!(!capabilities.supports_block_updates);
         assert!(!capabilities.supports_undo);
+        assert!(!capabilities.supports_batch_observation);
     }
 
     #[test]
@@ -242,6 +270,10 @@ mod tests {
         assert_eq!(stored.connector, GMAIL_CONNECTOR_ID);
         assert_eq!(stored.refresh_token_handle.as_deref(), Some("handle-1"));
         assert_eq!(stored.expires_at, Some(3700));
+        let debug = format!("{stored:?}");
+        assert!(!debug.contains("access-token"));
+        assert!(!debug.contains("handle-1"));
+        assert!(debug.contains("<redacted>"));
         let json = serde_json::to_string(&stored).expect("serialize");
         assert!(!json.contains("\"refresh_token\":"));
         assert!(!json.contains("client_secret"));

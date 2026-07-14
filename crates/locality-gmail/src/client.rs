@@ -1,7 +1,9 @@
+use std::fmt;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use locality_core::{LocalityError, LocalityResult};
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -28,11 +30,21 @@ pub trait GmailApi: std::fmt::Debug + Send + Sync {
     fn send_draft(&self, request: GmailDraftSendRequest) -> LocalityResult<GmailMessage>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpGmailApiClient {
     access_token: String,
     base_url: String,
     client: Client,
+}
+
+impl fmt::Debug for HttpGmailApiClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpGmailApiClient")
+            .field("access_token", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("client", &self.client)
+            .finish()
+    }
 }
 
 impl HttpGmailApiClient {
@@ -101,16 +113,11 @@ impl GmailApi for HttpGmailApiClient {
     }
 
     fn get_message_metadata(&self, message_id: &str) -> LocalityResult<GmailMessage> {
-        self.get_json(
-            &format!("/users/me/messages/{message_id}"),
-            vec![
-                ("format".to_string(), "metadata".to_string()),
-                (
-                    "metadataHeaders".to_string(),
-                    "From,To,Cc,Bcc,Subject,Date,Message-ID".to_string(),
-                ),
-            ],
-        )
+        let mut query = vec![("format".to_string(), "metadata".to_string())];
+        for header in ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID"] {
+            query.push(("metadataHeaders".to_string(), header.to_string()));
+        }
+        self.get_json(&format!("/users/me/messages/{message_id}"), query)
     }
 
     fn get_message_full(&self, message_id: &str) -> LocalityResult<GmailMessage> {
@@ -143,6 +150,17 @@ where
         let body = response
             .text()
             .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+        if status == StatusCode::NOT_FOUND {
+            return Err(LocalityError::RemoteNotFound(body));
+        }
+        if status == StatusCode::FORBIDDEN {
+            return Err(LocalityError::Guardrail(format!(
+                "gmail permission denied: {body}"
+            )));
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(LocalityError::Io(format!("gmail rate limited: {body}")));
+        }
         return Err(LocalityError::Io(format!(
             "{context} returned HTTP {status}: {body}"
         )));
@@ -156,4 +174,138 @@ fn ensure_reqwest_crypto_provider() {
     REQWEST_CRYPTO_PROVIDER.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use locality_core::LocalityError;
+
+    use super::{GmailApi, HttpGmailApiClient};
+
+    #[test]
+    fn debug_redacts_http_client_access_token() {
+        let client =
+            HttpGmailApiClient::with_base_url("http-client-access-token", "http://127.0.0.1:1");
+
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("http-client-access-token"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn get_message_metadata_sends_repeated_metadata_header_query_params() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"id":"message-1","threadId":"thread-1"}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        client
+            .get_message_metadata("message-1")
+            .expect("metadata response");
+
+        let request = request_rx.recv().expect("request line");
+        server.join().expect("server exits");
+        let query = request
+            .split_whitespace()
+            .nth(1)
+            .and_then(|target| target.split_once('?').map(|(_, query)| query))
+            .expect("request query");
+        let metadata_headers: Vec<&str> = query
+            .split('&')
+            .filter(|pair| pair.starts_with("metadataHeaders="))
+            .collect();
+
+        assert_eq!(
+            metadata_headers,
+            vec![
+                "metadataHeaders=From",
+                "metadataHeaders=To",
+                "metadataHeaders=Cc",
+                "metadataHeaders=Bcc",
+                "metadataHeaders=Subject",
+                "metadataHeaders=Date",
+                "metadataHeaders=Message-ID",
+            ]
+        );
+        assert!(!query.contains("From%2CTo"));
+        assert!(!query.contains("From,To"));
+    }
+
+    #[test]
+    fn http_errors_map_google_status_semantics() {
+        assert!(matches!(
+            request_error_for_status("HTTP/1.1 404 Not Found", "missing"),
+            LocalityError::RemoteNotFound(body) if body == "missing"
+        ));
+        assert!(matches!(
+            request_error_for_status("HTTP/1.1 403 Forbidden", "forbidden"),
+            LocalityError::Guardrail(message)
+                if message == "gmail permission denied: forbidden"
+        ));
+        assert!(matches!(
+            request_error_for_status("HTTP/1.1 429 Too Many Requests", "slow down"),
+            LocalityError::Io(message) if message == "gmail rate limited: slow down"
+        ));
+        assert!(matches!(
+            request_error_for_status("HTTP/1.1 500 Internal Server Error", "broken"),
+            LocalityError::Io(message)
+                if message.contains("gmail api GET returned HTTP 500 Internal Server Error: broken")
+        ));
+    }
+
+    fn request_error_for_status(status_line: &'static str, body: &'static str) -> LocalityError {
+        let (base_url, request_rx, server) = spawn_response_server(status_line, body);
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+        let error = client
+            .get_message_full("message-1")
+            .expect_err("status should fail");
+        request_rx.recv().expect("request line");
+        server.join().expect("server exits");
+        error
+    }
+
+    fn spawn_response_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let request = read_http_request(&mut stream);
+            let request_line = request.lines().next().unwrap_or_default().to_string();
+            request_tx.send(request_line).expect("send request line");
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        (base_url, request_rx, server)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut buffer).expect("read request");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("utf8 request")
+    }
 }
