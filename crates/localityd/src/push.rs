@@ -27,7 +27,7 @@ use locality_core::path_projection::{
     is_page_document_path, page_container_path, page_document_path,
 };
 use locality_core::planner::GuardrailDecision;
-use locality_core::planner::{GuardrailPolicy, PushOperation, PushPlan};
+use locality_core::planner::{GuardrailPolicy, PropertyValue, PushOperation, PushPlan};
 use locality_core::push::{
     PushApplier, PushApplyRequest, PushApplyResult, PushApproval, PushConcurrencyCheck,
     PushConcurrencyRequest, PushExecutionRequest, PushExecutionResult, PushPipelineAction,
@@ -159,7 +159,7 @@ where
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
     let relative_path = auto_save_relative_path(&prepared);
 
-    if let Some(reason) = auto_save_block_reason(&prepared.pipeline) {
+    if let Some(reason) = auto_save_block_reason_for_prepared(&prepared) {
         mark_auto_save_blocked(
             store,
             &prepared.mount.mount_id,
@@ -507,7 +507,10 @@ where
     let mut latest = None;
     for journal in store.list_journal().map_err(LocalityError::from)? {
         if journal.mount_id != *mount_id
-            || !matches!(journal.status, JournalStatus::Failed(_))
+            || !matches!(
+                journal.status,
+                JournalStatus::Failed(_) | JournalStatus::Applied
+            )
             || journal.plan != *plan
             || !resumable_created_entity_effects(&journal)
             || !plan
@@ -576,6 +579,25 @@ fn auto_save_relative_path(prepared: &PreparedPush) -> PathBuf {
                 })
         })
         .unwrap_or_else(|| prepared.entity.path.clone())
+}
+
+fn auto_save_block_reason_for_prepared(prepared: &PreparedPush) -> Option<String> {
+    gmail_auto_save_block_reason(prepared).or_else(|| auto_save_block_reason(&prepared.pipeline))
+}
+
+fn gmail_auto_save_block_reason(prepared: &PreparedPush) -> Option<String> {
+    if prepared.mount.connector != "gmail" {
+        return None;
+    }
+    let plan = prepared.pipeline.plan.as_ref()?;
+    if plan
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+    {
+        return Some("Gmail draft sends require review".to_string());
+    }
+    None
 }
 
 fn created_entity_id(report: &PushJobReport) -> Option<RemoteId> {
@@ -2446,12 +2468,7 @@ fn create_entity_pipeline(
             Some("remove the `loc` block or set `loc.type` to `page`".to_string()),
         ));
     }
-    if parsed
-        .frontmatter
-        .title
-        .as_ref()
-        .is_none_or(|title| title.trim().is_empty())
-    {
+    if create_entity_title_required(parsed, mount) {
         validation.push(ValidationIssue::new(
             "create_entity_missing_title",
             relative_path,
@@ -2514,13 +2531,14 @@ fn create_entity_pipeline(
     } else {
         Some(parent.kind.clone())
     };
+    let title = create_entity_title(relative_path, parsed, mount);
     let plan = PushPlan::new(
         affected_entities,
         vec![PushOperation::CreateEntity {
             parent_id,
             parent_kind,
             parent_workspace: private_create,
-            title: parsed.frontmatter.title.clone().unwrap_or_default(),
+            title,
             properties,
             body: parsed.document.body.clone(),
             source_path: relative_path.to_path_buf(),
@@ -2546,6 +2564,54 @@ fn create_entity_pipeline(
         action,
         completed_stages,
     }
+}
+
+fn create_entity_title_required(
+    parsed: &locality_core::canonical::ParsedCanonicalDocument,
+    mount: &MountConfig,
+) -> bool {
+    mount.connector != "gmail"
+        && parsed
+            .frontmatter
+            .title
+            .as_ref()
+            .is_none_or(|title| title.trim().is_empty())
+}
+
+fn create_entity_title(
+    relative_path: &Path,
+    parsed: &locality_core::canonical::ParsedCanonicalDocument,
+    mount: &MountConfig,
+) -> String {
+    if let Some(title) = parsed.frontmatter.title.as_ref()
+        && !title.trim().is_empty()
+    {
+        return title.clone();
+    }
+    if mount.connector == "gmail"
+        && let Some(subject) = frontmatter_string(&parsed.frontmatter.properties, "subject")
+        && !subject.trim().is_empty()
+    {
+        return subject.trim().to_string();
+    }
+    relative_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn frontmatter_string(
+    properties: &locality_core::canonical::FrontmatterProperties,
+    key: &str,
+) -> Option<String> {
+    properties
+        .get(key)
+        .map(property_value_from_frontmatter)
+        .and_then(|value| match value {
+            PropertyValue::String(value) => Some(value),
+            _ => None,
+        })
 }
 
 fn private_create_requested(parsed: &locality_core::canonical::ParsedCanonicalDocument) -> bool {

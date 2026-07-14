@@ -1184,6 +1184,67 @@ fn prepare_gmail_draft_create_keeps_subject_and_recipients_as_properties() {
 }
 
 #[test]
+fn prepare_gmail_draft_create_accepts_subject_without_title() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("gmail");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("gmail-folder:draft"),
+                EntityKind::Directory,
+                "draft",
+                "draft",
+            )
+            .with_hydration(HydrationState::Stub)
+            .with_remote_edited_at("folder:draft"),
+        )
+        .expect("save draft folder");
+    let draft_path = fixture.write_raw(
+        "draft/quarterly-update.md",
+        "---\nloc:\n  type: page\n  connector: gmail\nsubject: Quarterly update\nto: [\"ann@example.com\"]\n---\nBody\n",
+    );
+
+    let prepared = prepare_push(
+        &store,
+        &job(draft_path),
+        Some(&fixture.state_root),
+        &LocalSourceValidator,
+    )
+    .expect("prepare push");
+
+    assert_eq!(prepared.pipeline.action, PushPipelineAction::ConfirmPlan);
+    assert!(prepared.pipeline.validation.is_clean());
+    let plan = prepared.pipeline.plan.expect("plan");
+    match &plan.operations[0] {
+        PushOperation::CreateEntity {
+            parent_id,
+            parent_kind,
+            title,
+            properties,
+            body,
+            source_path,
+            ..
+        } => {
+            assert_eq!(parent_id, &RemoteId::new("gmail-folder:draft"));
+            assert_eq!(parent_kind, &Some(EntityKind::Directory));
+            assert_eq!(title, "Quarterly update");
+            assert_eq!(body, "Body\n");
+            assert_eq!(source_path, &PathBuf::from("draft/quarterly-update.md"));
+            assert_eq!(
+                properties.get("subject"),
+                Some(&PropertyValue::String("Quarterly update".to_string()))
+            );
+            assert_eq!(
+                properties.get("to"),
+                Some(&PropertyValue::List(vec!["ann@example.com".to_string()]))
+            );
+        }
+        operation => panic!("unexpected operation: {operation:?}"),
+    }
+}
+
+#[test]
 fn prepare_push_plans_notion_private_create_with_workspace_parent() {
     let fixture = PrepareFixture::new();
     let store = fixture.store("notion");
