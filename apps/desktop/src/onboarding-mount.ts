@@ -11,6 +11,7 @@ export type WorkspaceMountOnboardingPrimaryAction =
 
 export type WorkspaceMountOnboardingLaunchStrategy =
   | "open_finder"
+  | "open_system_settings"
   | "instructions_only"
   | "none";
 
@@ -46,6 +47,9 @@ export function mountOnboardingPrimaryLabel(
 export function mountOnboardingHeadline(
   report: WorkspaceMountOnboardingReport | null,
 ) {
+  if (report?.state === "approval_required" && report.launchStrategy === "open_system_settings") {
+    return "Turn on Locality in macOS Settings.";
+  }
   switch (report?.state) {
     case "approval_required":
       return "Approve the macOS Start Syncing prompt.";
@@ -67,7 +71,13 @@ export function mountOnboardingNeedsInstructions(
 export function mountOnboardingInstructions(
   report: WorkspaceMountOnboardingReport | null,
 ) {
-  if (report?.state !== "approval_required" || report.launchStrategy !== "instructions_only") {
+  if (report?.state !== "approval_required") {
+    return null;
+  }
+  if (report.launchStrategy === "open_system_settings") {
+    return null;
+  }
+  if (report.launchStrategy !== "instructions_only") {
     return null;
   }
   return (

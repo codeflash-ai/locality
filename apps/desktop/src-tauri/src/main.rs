@@ -367,6 +367,7 @@ impl WorkspaceMountOnboardingPrimaryAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceMountOnboardingLaunchStrategy {
     OpenFinder,
+    OpenSystemSettings,
     InstructionsOnly,
     None,
 }
@@ -375,6 +376,7 @@ impl WorkspaceMountOnboardingLaunchStrategy {
     fn as_str(self) -> &'static str {
         match self {
             Self::OpenFinder => "open_finder",
+            Self::OpenSystemSettings => "open_system_settings",
             Self::InstructionsOnly => "instructions_only",
             Self::None => "none",
         }
@@ -1213,19 +1215,34 @@ fn run_workspace_mount_onboarding_blocking(
 ) -> WorkspaceMountOnboardingReport {
     run_workspace_mount_onboarding_with(
         request,
+        prepare_macos_file_provider_approval_retry,
         create_desktop_mount_blocking,
         launch_macos_file_provider_approval_surface,
+        launch_macos_file_provider_settings,
+        macos_workspace_mount_domain_user_enabled,
     )
 }
 
-fn run_workspace_mount_onboarding_with<CreateMount, LaunchApproval>(
+fn run_workspace_mount_onboarding_with<
+    CreateMount,
+    PrepareApprovalRetry,
+    LaunchApproval,
+    LaunchSettings,
+    DomainUserEnabled,
+>(
     request: WorkspaceMountOnboardingRequest,
+    mut prepare_approval_retry: PrepareApprovalRetry,
     mut create_mount: CreateMount,
     mut launch_approval: LaunchApproval,
+    mut launch_settings: LaunchSettings,
+    mut domain_user_enabled: DomainUserEnabled,
 ) -> WorkspaceMountOnboardingReport
 where
     CreateMount: FnMut(CreateDesktopMountRequest) -> Result<String, String>,
+    PrepareApprovalRetry: FnMut() -> Result<(), String>,
     LaunchApproval: FnMut() -> WorkspaceMountOnboardingLaunchStrategy,
+    LaunchSettings: FnMut() -> WorkspaceMountOnboardingLaunchStrategy,
+    DomainUserEnabled: FnMut() -> Result<bool, String>,
 {
     let action = match WorkspaceMountOnboardingAction::parse(request.action.trim()) {
         Ok(action) => action,
@@ -1242,6 +1259,14 @@ where
     if matches!(action, WorkspaceMountOnboardingAction::AllowInMacos) {
         #[cfg(target_os = "macos")]
         {
+            if let Err(message) = prepare_approval_retry() {
+                return workspace_mount_onboarding_report(
+                    MacosWorkspaceMountOnboardingState::Failed,
+                    message,
+                    WorkspaceMountOnboardingPrimaryAction::RetrySetup,
+                    WorkspaceMountOnboardingLaunchStrategy::None,
+                );
+            }
             let _ = launch_approval();
         }
         #[cfg(not(target_os = "macos"))]
@@ -1270,8 +1295,59 @@ where
             WorkspaceMountOnboardingPrimaryAction::RetrySetup,
             WorkspaceMountOnboardingLaunchStrategy::None,
         ),
-        Err(message) => classify_workspace_mount_onboarding_failure(&message),
+        Err(message) => classify_workspace_mount_onboarding_failure_with_context(
+            &message,
+            !matches!(action, WorkspaceMountOnboardingAction::Start),
+            &mut domain_user_enabled,
+            &mut launch_settings,
+        ),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_macos_file_provider_approval_retry() -> Result<(), String> {
+    let report =
+        run_macos_file_provider_helper("list", Vec::new()).map_err(|error| error.message())?;
+    let domain = report
+        .helper_report
+        .get("domains")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|domains| {
+            domains.iter().find(|domain| {
+                domain.get("identifier").and_then(serde_json::Value::as_str)
+                    == Some(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
+            })
+        });
+    let Some(domain) = domain else {
+        return Ok(());
+    };
+    if domain
+        .get("userEnabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    run_macos_file_provider_helper(
+        "unregister",
+        vec![
+            "--mount-id".to_string(),
+            localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        format!(
+            "Could not reset the denied macOS File Provider approval before retrying: {}",
+            error.message()
+        )
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prepare_macos_file_provider_approval_retry() -> Result<(), String> {
+    Ok(())
 }
 
 #[tauri::command]
@@ -9110,14 +9186,18 @@ fn workspace_mount_onboarding_curated_message(
     state: MacosWorkspaceMountOnboardingState,
 ) -> Option<&'static str> {
     match state {
-        MacosWorkspaceMountOnboardingState::ApprovalRequired => {
-            Some("Click OK in the macOS \"Start Syncing\" prompt. Locality will continue once macOS enables the CloudStorage folder.")
-        }
+        MacosWorkspaceMountOnboardingState::ApprovalRequired => Some(
+            "Click OK in the macOS \"Start Syncing\" prompt. Locality will continue once macOS enables the CloudStorage folder.",
+        ),
         MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot => {
             Some("Locality is still waiting for the CloudStorage folder to appear.")
         }
         _ => None,
     }
+}
+
+fn workspace_mount_onboarding_settings_message() -> &'static str {
+    "macOS still has Locality turned off. In System Settings, open Login Items & Extensions > File Providers, turn on Locality, then click Check again."
 }
 
 fn workspace_mount_onboarding_should_refresh_surfaces(
@@ -9151,12 +9231,32 @@ fn macos_workspace_mount_onboarding_state(
     None
 }
 
-fn classify_workspace_mount_onboarding_failure(message: &str) -> WorkspaceMountOnboardingReport {
+fn classify_workspace_mount_onboarding_failure_with_context<DomainUserEnabled, LaunchSettings>(
+    message: &str,
+    explicit_approval_followup: bool,
+    mut domain_user_enabled: DomainUserEnabled,
+    mut launch_settings: LaunchSettings,
+) -> WorkspaceMountOnboardingReport
+where
+    DomainUserEnabled: FnMut() -> Result<bool, String>,
+    LaunchSettings: FnMut() -> WorkspaceMountOnboardingLaunchStrategy,
+{
     #[cfg(target_os = "macos")]
     {
         if recoverable_macos_file_provider_activation_error(message) {
-            let user_enabled = macos_workspace_mount_domain_user_enabled().unwrap_or(false);
+            let user_enabled = domain_user_enabled().unwrap_or(false);
             if let Some(state) = macos_workspace_mount_onboarding_state(message, user_enabled) {
+                if state == MacosWorkspaceMountOnboardingState::ApprovalRequired
+                    && explicit_approval_followup
+                {
+                    let launch_strategy = launch_settings();
+                    return workspace_mount_onboarding_report(
+                        state,
+                        workspace_mount_onboarding_settings_message(),
+                        WorkspaceMountOnboardingPrimaryAction::CheckAgain,
+                        launch_strategy,
+                    );
+                }
                 let primary_action = match state {
                     MacosWorkspaceMountOnboardingState::ApprovalRequired => {
                         WorkspaceMountOnboardingPrimaryAction::AllowInMacos
@@ -9232,6 +9332,33 @@ fn launch_macos_file_provider_approval_surface() -> WorkspaceMountOnboardingLaun
 
 #[cfg(not(target_os = "macos"))]
 fn launch_macos_file_provider_approval_surface() -> WorkspaceMountOnboardingLaunchStrategy {
+    WorkspaceMountOnboardingLaunchStrategy::None
+}
+
+#[cfg(target_os = "macos")]
+fn launch_macos_file_provider_settings() -> WorkspaceMountOnboardingLaunchStrategy {
+    for target in [
+        "x-apple.systempreferences:com.apple.LoginItems-Settings.extension",
+        "x-apple.systempreferences:com.apple.ExtensionsPreferences",
+        "/System/Library/PreferencePanes/Extensions.prefPane",
+    ] {
+        if Command::new("open").arg(target).spawn().is_ok() {
+            return WorkspaceMountOnboardingLaunchStrategy::OpenSystemSettings;
+        }
+    }
+    if Command::new("open")
+        .arg("-b")
+        .arg("com.apple.systempreferences")
+        .spawn()
+        .is_ok()
+    {
+        return WorkspaceMountOnboardingLaunchStrategy::OpenSystemSettings;
+    }
+    WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch_macos_file_provider_settings() -> WorkspaceMountOnboardingLaunchStrategy {
     WorkspaceMountOnboardingLaunchStrategy::None
 }
 
@@ -12477,7 +12604,12 @@ mod tests {
             message
         ));
 
-        let report = super::classify_workspace_mount_onboarding_failure(message);
+        let report = super::classify_workspace_mount_onboarding_failure_with_context(
+            message,
+            false,
+            || Ok(false),
+            || super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+        );
         assert_eq!(report.state, "failed");
         assert_eq!(report.primary_action, "retry_setup");
         assert_eq!(report.launch_strategy, "none");
@@ -12486,16 +12618,24 @@ mod tests {
 
     #[test]
     fn workspace_mount_onboarding_allow_action_retries_mount_setup_after_native_prompt() {
-        let mut launch_count = 0usize;
-        let mut requests = Vec::new();
+        let launch_count = std::cell::Cell::new(0usize);
+        let retry_cleanup_count = std::cell::Cell::new(0usize);
+        let requests = std::cell::RefCell::new(Vec::new());
+        let events = std::cell::RefCell::new(Vec::new());
 
         let report = super::run_workspace_mount_onboarding_with(
             super::WorkspaceMountOnboardingRequest {
                 path: "~/Library/CloudStorage/Locality/notion-main".to_string(),
                 action: "allow_in_macos".to_string(),
             },
+            || {
+                retry_cleanup_count.set(retry_cleanup_count.get() + 1);
+                events.borrow_mut().push("cleanup");
+                Ok(())
+            },
             |request| {
-                requests.push((
+                events.borrow_mut().push("create");
+                requests.borrow_mut().push((
                     request.connector.clone(),
                     request.path.clone(),
                     request.mount_id.clone(),
@@ -12503,14 +12643,19 @@ mod tests {
                 Ok("Mounted Notion at /Users/test/Library/CloudStorage/Locality/notion-main with macOS File Provider.".to_string())
             },
             || {
-                launch_count += 1;
+                launch_count.set(launch_count.get() + 1);
+                events.borrow_mut().push("launch");
                 super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly
             },
+            || super::WorkspaceMountOnboardingLaunchStrategy::OpenSystemSettings,
+            || Ok(true),
         );
 
-        assert_eq!(launch_count, 1);
+        assert_eq!(retry_cleanup_count.get(), 1);
+        assert_eq!(launch_count.get(), 1);
+        assert_eq!(events.into_inner(), vec!["cleanup", "launch", "create"]);
         assert_eq!(
-            requests,
+            requests.into_inner(),
             vec![(
                 "notion".to_string(),
                 "~/Library/CloudStorage/Locality/notion-main".to_string(),
@@ -12525,14 +12670,19 @@ mod tests {
     }
 
     #[test]
-    fn workspace_mount_onboarding_allow_action_stays_approval_required_when_domain_remains_disabled(
-    ) {
+    fn workspace_mount_onboarding_allow_action_prompts_settings_after_denial() {
         let mut launch_count = 0usize;
+        let mut settings_launch_count = 0usize;
+        let mut retry_cleanup_count = 0usize;
 
         let report = super::run_workspace_mount_onboarding_with(
             super::WorkspaceMountOnboardingRequest {
                 path: "~/Library/CloudStorage/Locality/notion-main".to_string(),
                 action: "allow_in_macos".to_string(),
+            },
+            || {
+                retry_cleanup_count += 1;
+                Ok(())
             },
             |_request| {
                 Err("Could not open macOS File Provider domain `loc`: The Locality File Provider is registered but not enabled. Click OK in the macOS Start Syncing prompt, then try again.".to_string())
@@ -12541,19 +12691,93 @@ mod tests {
                 launch_count += 1;
                 super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly
             },
+            || {
+                settings_launch_count += 1;
+                super::WorkspaceMountOnboardingLaunchStrategy::OpenSystemSettings
+            },
+            || Ok(false),
         );
 
         let expected_state = if cfg!(target_os = "macos") {
+            assert_eq!(retry_cleanup_count, 1);
             assert_eq!(launch_count, 1);
+            assert_eq!(settings_launch_count, 1);
             "approval_required"
         } else {
+            assert_eq!(retry_cleanup_count, 0);
             assert_eq!(launch_count, 0);
+            assert_eq!(settings_launch_count, 0);
             "failed"
         };
         assert_eq!(report.state, expected_state);
         if cfg!(target_os = "macos") {
+            assert_eq!(report.primary_action, "check_again");
+            assert_eq!(report.launch_strategy, "open_system_settings");
+            assert!(report.message.contains("System Settings"));
+        }
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_start_keeps_native_prompt_guidance_before_user_retry() {
+        let mut settings_launch_count = 0usize;
+
+        let report = super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "~/Library/CloudStorage/Locality/notion-main".to_string(),
+                action: "start".to_string(),
+            },
+            || Ok(()),
+            |_request| {
+                Err("Could not open macOS File Provider domain `loc`: The Locality File Provider is registered but not enabled. Click OK in the macOS Start Syncing prompt, then try again.".to_string())
+            },
+            || super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+            || {
+                settings_launch_count += 1;
+                super::WorkspaceMountOnboardingLaunchStrategy::OpenSystemSettings
+            },
+            || Ok(false),
+        );
+
+        if cfg!(target_os = "macos") {
+            assert_eq!(report.state, "approval_required");
             assert_eq!(report.primary_action, "allow_in_macos");
+            assert_eq!(report.launch_strategy, "instructions_only");
             assert!(report.message.contains("Start Syncing"));
+            assert_eq!(settings_launch_count, 0);
+        } else {
+            assert_eq!(report.state, "failed");
+        }
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_retry_opens_settings_when_domain_remains_disabled() {
+        let mut settings_launch_count = 0usize;
+
+        let report = super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "~/Library/CloudStorage/Locality/notion-main".to_string(),
+                action: "allow_in_macos".to_string(),
+            },
+            || Ok(()),
+            |_request| {
+                Err("Could not open macOS File Provider domain `loc`: The Locality File Provider is registered but not enabled. Click OK in the macOS Start Syncing prompt, then try again.".to_string())
+            },
+            || super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+            || {
+                settings_launch_count += 1;
+                super::WorkspaceMountOnboardingLaunchStrategy::OpenSystemSettings
+            },
+            || Ok(false),
+        );
+
+        if cfg!(target_os = "macos") {
+            assert_eq!(report.state, "approval_required");
+            assert_eq!(report.primary_action, "check_again");
+            assert_eq!(report.launch_strategy, "open_system_settings");
+            assert!(report.message.contains("System Settings"));
+            assert_eq!(settings_launch_count, 1);
+        } else {
+            assert_eq!(report.state, "failed");
         }
     }
 
@@ -12563,7 +12787,9 @@ mod tests {
             super::workspace_mount_onboarding_curated_message(
                 super::MacosWorkspaceMountOnboardingState::ApprovalRequired
             ),
-            Some("Click OK in the macOS \"Start Syncing\" prompt. Locality will continue once macOS enables the CloudStorage folder.")
+            Some(
+                "Click OK in the macOS \"Start Syncing\" prompt. Locality will continue once macOS enables the CloudStorage folder."
+            )
         );
         assert_eq!(
             super::workspace_mount_onboarding_curated_message(

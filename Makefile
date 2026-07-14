@@ -11,6 +11,7 @@ endif
 LOC_DEBUG := target/debug/loc$(EXE_SUFFIX)
 LOC_RELEASE := target/release/loc$(EXE_SUFFIX)
 LOCALITY_FILE_PROVIDER_TARGET ?= notion-main
+PROMPT_TEST_APP_ARGS ?=
 
 ifeq ($(OS),Windows_NT)
 CLEAN_START_PLAN_CMD := & '.\scripts\clean-start.ps1'
@@ -148,6 +149,10 @@ prepare-macos-file-provider: ## Stage the macOS File Provider extension for Taur
 install-macos-file-provider: ## Install/register the local macOS File Provider development bundle.
 	platform/macos/LocalityFileProvider/scripts/install-dev-bundle.sh
 
+.PHONY: install-macos-prompt-test-app
+install-macos-prompt-test-app: build-tauri ## Build, reset, install, register, and launch a fresh macOS File Provider prompt test app.
+	scripts/install-macos-prompt-test-app.sh $(PROMPT_TEST_APP_ARGS)
+
 .PHONY: prepare-desktop-dev-sidecars
 prepare-desktop-dev-sidecars: ## Build debug desktop sidecars used by Tauri dev.
 	$(DESKTOP_NPM) run dev:prepare
@@ -203,6 +208,10 @@ test-linux-publish-config: ## Validate Linux package publish configuration.
 .PHONY: test-macos-publish-config
 test-macos-publish-config: ## Validate macOS package publish configuration.
 	tests/macos_publish_config.sh
+
+.PHONY: test-macos-prompt-test-app-installer
+test-macos-prompt-test-app-installer: ## Validate the macOS prompt test app installer dry-run plan.
+	bash scripts/install-macos-prompt-test-app.test.sh
 
 .PHONY: test-windows-publish-config
 test-windows-publish-config: ## Validate Windows package publish configuration.

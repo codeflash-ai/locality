@@ -61,6 +61,19 @@ describe("mount onboarding helpers", () => {
     );
   });
 
+  it("explains the remembered macOS denial settings path", () => {
+    const deniedReport = report({
+      primaryAction: "check_again",
+      launchStrategy: "open_system_settings",
+    });
+
+    expect(mountOnboardingHeadline(deniedReport)).toBe(
+      "Turn on Locality in macOS Settings.",
+    );
+    expect(mountOnboardingNeedsInstructions(deniedReport)).toBe(false);
+    expect(mountOnboardingInstructions?.(deniedReport)).toBeNull();
+  });
+
   it("does not show approval instructions while waiting for the CloudStorage root", () => {
     expect(
       mountOnboardingNeedsInstructions(
