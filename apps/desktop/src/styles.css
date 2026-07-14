@@ -1,21 +1,33 @@
 :root {
-  --bg: #edf3f4;
-  --surface: rgba(255, 255, 255, 0.88);
-  --surface-strong: #ffffff;
-  --ink: #111827;
-  --muted: #536273;
+  --canvas: #f2f4f5;
+  --paper: #ffffff;
+  --wash: #f8fafa;
+  --ink: #16202a;
+  --muted: #66707c;
   --subtle: #7b8797;
+  --faint: #9aa4ad;
   --line: rgba(148, 163, 184, 0.28);
+  --line-soft: #e7ebed;
   --line-strong: rgba(86, 107, 125, 0.28);
-  --accent: #087b72;
-  --accent-soft: #e4f7f4;
+  --teal: #087b72;
+  --teal-wash: #e2f0ee;
+  --amber: #c08a00;
+  --amber-soft: #faf3e0;
+  --orange: #d97706;
+  --orange-soft: #fbeede;
+  --red: #dc2626;
+  --red-soft: #fbe7e7;
+  --blue: #2563eb;
+  --blue-soft: #e6edfb;
+  --slate: #64748b;
+  --slate-soft: #eceff3;
+  --bg: var(--canvas);
+  --surface: rgba(255, 255, 255, 0.88);
+  --surface-strong: var(--paper);
+  --accent: var(--teal);
+  --accent-soft: var(--teal-wash);
   --green: #1f9d68;
   --green-soft: #e5f8ef;
-  --amber: #d98c1f;
-  --amber-soft: #fff4df;
-  --red: #cf3f3f;
-  --red-soft: #ffe8e7;
-  --blue: #2f74d0;
   --shadow: 0 24px 70px rgba(20, 30, 43, 0.14);
   --tight-shadow: 0 14px 36px rgba(20, 30, 43, 0.12);
   --type-caption: 11px;
@@ -1574,6 +1586,12 @@ p {
 .view-copy {
   color: var(--muted);
   font-size: var(--type-body-large);
+}
+
+.section-title {
+  color: var(--ink);
+  font-size: var(--type-title-md);
+  line-height: 1.2;
 }
 
 .workspace-card,

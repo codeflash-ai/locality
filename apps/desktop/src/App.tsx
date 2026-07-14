@@ -90,6 +90,21 @@ type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | 
 type LocateState = "idle" | "preparing" | "ready" | "error";
 type OnboardingStep = 1 | 2 | 3 | 4 | 5;
 
+const PRODUCT_TERMS = {
+  home: "Home",
+  files: "Files",
+  sources: "Sources",
+  sourceDetail: "Source detail",
+  reviewCenter: "Review Center",
+  pushApproval: "Push approval",
+  activity: "Activity",
+  settings: "Settings",
+  liveMode: "Live Mode",
+  connectedSource: "Connected source",
+  localWorkspace: "Local workspace",
+  reviewNeeded: "Needs review",
+} as const;
+
 type DesktopSnapshot = {
   health: {
     state: string;
@@ -2035,34 +2050,34 @@ function MainShell({
           </div>
           <nav>
             <SidebarButton active={view === "home"} icon={<Home />} onClick={() => onViewChange("home")}>
-              Home
+              {PRODUCT_TERMS.home}
             </SidebarButton>
             <SidebarButton active={view === "files"} icon={<Search />} onClick={() => onViewChange("files")}>
-              Files
+              {PRODUCT_TERMS.files}
             </SidebarButton>
             <SidebarButton active={view === "mount"} icon={<FolderOpen />} onClick={openMountsView}>
-              Mounts
+              {PRODUCT_TERMS.sources}
             </SidebarButton>
             <SidebarButton
               active={view === "pending" || view === "review"}
               icon={<ListChecks />}
               onClick={() => onViewChange("pending")}
             >
-              Pending
+              {PRODUCT_TERMS.reviewCenter}
             </SidebarButton>
             <SidebarButton
               active={view === "activity"}
               icon={<History />}
               onClick={() => onViewChange("activity")}
             >
-              Activity
+              {PRODUCT_TERMS.activity}
             </SidebarButton>
             <SidebarButton
               active={view === "settings"}
               icon={<Settings />}
               onClick={() => onViewChange("settings")}
             >
-              Settings
+              {PRODUCT_TERMS.settings}
             </SidebarButton>
           </nav>
           <SidebarUpdateNotice
@@ -2283,7 +2298,7 @@ function HomeView({
 
   return (
     <div className="view-stack">
-      <ViewHeader eyebrow="Home" title="Notion workspace">
+      <ViewHeader eyebrow={PRODUCT_TERMS.home} title="Notion workspace">
         <StatusPill
           tone={healthTone(snapshot.health.state)}
           title={healthDescription(snapshot.health.state, snapshot.health.attentionCount)}
@@ -2323,7 +2338,7 @@ function HomeView({
         <>
           <section className="workspace-card">
             <div className="workspace-summary">
-              <p className="label">Connected workspace</p>
+              <p className="label">{PRODUCT_TERMS.connectedSource}</p>
               <h2>{snapshot.mount.workspaceName}</h2>
               <p className="path-line">{snapshot.mount.localPath}</p>
             </div>
@@ -2351,7 +2366,7 @@ function HomeView({
                 Files
               </SecondaryButton>
               <SecondaryButton icon={<FolderOpen />} onClick={onMount}>
-                View Mounts
+                View Sources
               </SecondaryButton>
             </div>
           </section>
@@ -2390,19 +2405,19 @@ function HomeView({
       {hasPendingChanges ? (
         <section className="attention-panel">
           <div>
-            <p className="label">Pending Changes</p>
-            <h2>{snapshot.pendingChanges.length} files have pending changes.</h2>
+            <p className="label">{PRODUCT_TERMS.reviewCenter}</p>
+            <h2>{snapshot.pendingChanges.length} files need review.</h2>
           </div>
           <PrimaryButton icon={<ListChecks />} onClick={onReview}>
-            Review Pending Changes
+            Open Review Center
           </PrimaryButton>
         </section>
       ) : (
         <section className="panel muted-panel">
           <Check />
           <div>
-            <h2>No pending changes</h2>
-            <p>Local edits will appear here before they update Notion.</p>
+            <h2>No review needed</h2>
+            <p>Safe local edits can sync automatically. Anything risky will appear in Review Center.</p>
           </div>
         </section>
       )}
@@ -2492,8 +2507,8 @@ function MountsView({
 
   return (
     <div className="view-stack mounts-view">
-      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Mounts" }]} />
-      <ViewHeader title="Mounted folders">
+      <Breadcrumbs items={[{ label: PRODUCT_TERMS.home, onClick: onHome }, { label: PRODUCT_TERMS.sources }]} />
+      <ViewHeader title={PRODUCT_TERMS.sources}>
         <SecondaryButton
           compact
           busy={creating}
@@ -2501,7 +2516,7 @@ function MountsView({
           icon={<Plus />}
           onClick={() => void createMount()}
         >
-          Add Mount
+          Add Source
         </SecondaryButton>
         <SecondaryButton
           compact
@@ -2517,8 +2532,8 @@ function MountsView({
         <section className="empty-action-panel">
           <BrandTile variant="folder" />
           <div>
-            <h2>Add a Notion mounted folder</h2>
-            <p>Use the default Notion folder under the shared Locality location.</p>
+            <h2>Add a Notion source</h2>
+            <p>Connect a source once, then use its local folder from Files or your editor.</p>
           </div>
           <PrimaryButton
             busy={creating}
@@ -2526,15 +2541,15 @@ function MountsView({
             icon={<FolderOpen />}
             onClick={() => void createMount()}
           >
-            Add Notion Mount
+            Add Notion Source
           </PrimaryButton>
         </section>
       ) : (
         <>
           <p className="view-copy">
-            {rows.length} mounted {rows.length === 1 ? "folder" : "folders"} registered for this Locality state.
+            {rows.length} connected {rows.length === 1 ? "source" : "sources"} registered for this Locality state.
           </p>
-          <section className="mounts-grid" aria-label="Registered mounted folders">
+          <section className="mounts-grid" aria-label="Connected sources">
             {rows.map((row) => (
               <article className={`mount-card ${row.active ? "active" : ""}`} key={row.id}>
                 <div className="mount-card-top">
@@ -2615,8 +2630,8 @@ function FilesView({
       <ViewHeader title="Files">
         <Breadcrumbs
           items={[
-            { label: "Home", onClick: onHome },
-            { label: "Files" },
+            { label: PRODUCT_TERMS.home, onClick: onHome },
+            { label: PRODUCT_TERMS.files },
           ]}
         />
       </ViewHeader>
@@ -2629,7 +2644,7 @@ function FilesView({
         <div>
           <p className="label">Current access</p>
           <h2>Search current files</h2>
-          <p>Results come from active workspaces and active connections only.</p>
+          <p>Results come from connected sources available in this Locality session.</p>
         </div>
         <div className="locate-row">
           <Search />
@@ -2747,7 +2762,7 @@ function CurrentWorkspacePanel({
     <section className="panel workspace-detail-panel">
       <div className="discovery-heading">
         <div>
-          <p className="label">Current workspace</p>
+          <p className="label">{PRODUCT_TERMS.localWorkspace}</p>
           <h2>{snapshot.mount.workspaceName}</h2>
           <p>{snapshot.mount.connectorName} · {snapshot.mount.accessScope}</p>
         </div>
@@ -2792,7 +2807,7 @@ function CurrentWorkspacePanel({
         </SecondaryButton>
         {hasPendingChanges && (
           <PrimaryButton compact icon={<ListChecks />} onClick={onReview}>
-            Review Pending
+            Review
           </PrimaryButton>
         )}
       </div>
@@ -2820,7 +2835,7 @@ function CurrentWorkspacePanel({
           <span>Connection: {snapshot.connection.status}</span>
           <span>Status: {snapshot.mount.status}</span>
           <span>Connector: {snapshot.mount.connector}</span>
-          <span>Pending: {snapshot.pendingChanges.length}</span>
+          <span>Review items: {snapshot.pendingChanges.length}</span>
         </div>
       </details>
     </section>
@@ -2930,8 +2945,8 @@ function MountDetailView({
     <div className="view-stack">
       <Breadcrumbs
         items={[
-          { label: "Home", onClick: onHome },
-          { label: "Mounts", onClick: onMounts },
+          { label: PRODUCT_TERMS.home, onClick: onHome },
+          { label: PRODUCT_TERMS.sources, onClick: onMounts },
           { label: mount.mountId },
         ]}
       />
@@ -2946,10 +2961,10 @@ function MountDetailView({
           <FolderOpen />
         </div>
         <div>
-          <p className="label">{mount.connectorName} mounted folder</p>
+          <p className="label">{mount.connectorName} source</p>
           <h2 title={mount.localPath}>{compactPath(mount.localPath, 78)}</h2>
           <p>
-            Locality exposes this connected workspace as local files at the registered mount point.
+            Locality exposes this connected source as local files at the registered folder.
           </p>
         </div>
         <div className="mount-actions">
@@ -2979,7 +2994,7 @@ function MountDetailView({
               icon={pullState === "pulling" ? <Loader2 className="spin-icon" /> : <RefreshCw />}
               onClick={() => void pullChanges()}
             >
-              {pullState === "pulling" ? "Pulling changes" : "Pull changes"}
+              {pullState === "pulling" ? "Syncing source" : "Sync source"}
             </SecondaryButton>
           )}
         </div>
@@ -3019,10 +3034,10 @@ function MountDetailView({
       <section className="safety-strip">
         <ShieldCheck />
         <div>
-          <h2>Edits stay pending until reviewed</h2>
+          <h2>Review catches work that needs approval</h2>
           <p>
-            Local changes are staged first. This mount currently has {mount.pendingChangeCount} pending
-            {mount.pendingChangeCount === 1 ? " change" : " changes"}.
+            Safe Live Mode work can sync automatically. This source currently has {mount.pendingChangeCount}
+            {mount.pendingChangeCount === 1 ? " item" : " items"} waiting for review.
           </p>
         </div>
         {isActiveMount && hasPendingChanges && (
@@ -3186,15 +3201,15 @@ function PendingView({
 
   return (
     <div className="view-stack">
-      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Pending" }]} />
-      <ViewHeader title="Pending Changes">
+      <Breadcrumbs items={[{ label: PRODUCT_TERMS.home, onClick: onHome }, { label: PRODUCT_TERMS.reviewCenter }]} />
+      <ViewHeader title={PRODUCT_TERMS.reviewCenter}>
         <div className="button-row">
           <SecondaryButton
             disabled={!hasPendingChanges || isPushing}
             icon={isPushing ? <Loader2 className="spin-icon" /> : <ShieldCheck />}
             onClick={() => void pushAll()}
           >
-            {isPushing ? "Pushing..." : "Push All"}
+            {isPushing ? "Pushing..." : "Push Safe Changes"}
           </SecondaryButton>
           <PrimaryButton disabled={!hasPendingChanges || isPushing} icon={<ListChecks />} onClick={onReview}>
             Review Push
@@ -3208,7 +3223,9 @@ function PendingView({
       )}
       {hasPendingChanges ? (
         <>
-          <p className="view-copy">{snapshot.pendingChanges.length} files have pending changes.</p>
+          <p className="view-copy">
+            {snapshot.pendingChanges.length} files need approval, conflict resolution, or a sync decision.
+          </p>
           <FileChangeList
             changes={snapshot.pendingChanges}
             mountPath={snapshot.mount.localPath}
@@ -3220,8 +3237,8 @@ function PendingView({
         <section className="panel muted-panel">
           <Check />
           <div>
-            <h2>No pending changes</h2>
-            <p>Local edits will appear here before they update Notion.</p>
+            <h2>No review needed</h2>
+            <p>Safe Live Mode work can sync automatically. Items that need approval will appear here.</p>
           </div>
         </section>
       )}
@@ -3310,15 +3327,22 @@ function ReviewView({
 
   return (
     <div className="view-stack">
-      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Pending", onClick: onPending }, { label: "Review" }]} />
-      <ViewHeader title={plan.title}>
+      <Breadcrumbs
+        items={[
+          { label: PRODUCT_TERMS.home, onClick: onHome },
+          { label: PRODUCT_TERMS.reviewCenter, onClick: onPending },
+          { label: PRODUCT_TERMS.pushApproval },
+        ]}
+      />
+      <ViewHeader title={PRODUCT_TERMS.pushApproval}>
         <StatusPill
           tone={pushState === "error" ? "danger" : isPushing ? "warn" : "ready"}
           title={isPushing ? "Locality is writing the approved local changes to Notion." : "This push is ready for review."}
         >
-          {pushState === "error" ? "Needs Attention" : isPushing ? "Pushing" : pushSucceeded ? "Pushed" : "Safe"}
+          {pushState === "error" ? "Needs attention" : isPushing ? "Pushing" : pushSucceeded ? "Pushed" : "Ready"}
         </StatusPill>
       </ViewHeader>
+      <h2 className="section-title">{plan.title}</h2>
       <p className="view-copy">{plan.summary}</p>
       {isPushing && (
         <p className="quiet-note inline-note">
@@ -3351,7 +3375,7 @@ function ReviewView({
           icon={isPushing ? <Loader2 className="spin-icon" /> : pushSucceeded ? <Check /> : <ShieldCheck />}
           onClick={push}
         >
-          {isPushing ? "Pushing..." : pushSucceeded ? "Pushed" : "Push to Notion"}
+          {isPushing ? "Pushing..." : pushSucceeded ? "Pushed" : "Approve and Push"}
         </PrimaryButton>
         <SecondaryButton disabled={isPushing || pushSucceeded}>Cancel</SecondaryButton>
       </div>
@@ -3371,8 +3395,8 @@ function ActivityView({ snapshot, onHome }: { snapshot: DesktopSnapshot; onHome:
 
   return (
     <div className="view-stack">
-      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Activity" }]} />
-      <ViewHeader title="Activity">
+      <Breadcrumbs items={[{ label: PRODUCT_TERMS.home, onClick: onHome }, { label: PRODUCT_TERMS.activity }]} />
+      <ViewHeader title={PRODUCT_TERMS.activity}>
         <div className="activity-tabs" role="tablist" aria-label="Activity sections">
           <button className={tab === "recent" ? "active" : ""} onClick={() => setTab("recent")} role="tab">
             Recent
@@ -3889,7 +3913,7 @@ function SettingsView({
 
   return (
     <div className="view-stack">
-      <Breadcrumbs items={[{ label: "Home", onClick: onHome }, { label: "Settings" }]} />
+      <Breadcrumbs items={[{ label: PRODUCT_TERMS.home, onClick: onHome }, { label: PRODUCT_TERMS.settings }]} />
       <ViewHeader title="Locality controls" />
 
       <section className="settings-grid">
@@ -3913,9 +3937,9 @@ function SettingsView({
 
         <div className="panel">
           <PanelTitle title="Safety" />
-          <SettingRow title="Local edits" value="Pending until reviewed" />
+          <SettingRow title="Local edits" value="Review when needed" />
           <SettingRow title="Push confirmation" value="Require for large changes" />
-          <SettingRow title="Default new mount mode" value="Edit enabled" />
+          <SettingRow title="Default new source mode" value="Edit enabled" />
         </div>
 
         <div className="panel">
@@ -4239,7 +4263,7 @@ function TrayPopover({
       )}
 
       <button className="tray-row-button" onClick={() => openMain("pending")}>
-        <span>Pending Changes</span>
+        <span>{PRODUCT_TERMS.reviewCenter}</span>
         <strong>{snapshot.pendingChanges.length}</strong>
       </button>
 
@@ -5130,7 +5154,7 @@ function ProductLoopDemo() {
         </div>
         <div className="demo-tile">
           <div>
-            <strong>Pending review</strong>
+            <strong>Needs review</strong>
             <span>Safe</span>
           </div>
           <p>Edited intro paragraph</p>
@@ -5606,7 +5630,7 @@ function chromeStatusLabel(snapshot: DesktopSnapshot) {
     return "Ready";
   }
   if (snapshot.health.state === "needs_review") {
-    return "Pending Changes";
+    return PRODUCT_TERMS.reviewCenter;
   }
   return healthLabel(snapshot.health.state);
 }
@@ -5616,7 +5640,7 @@ function sidebarStatusLabel(snapshot: DesktopSnapshot) {
     return "Notion Ready";
   }
   if (snapshot.health.state === "needs_review") {
-    return "Pending Changes";
+    return PRODUCT_TERMS.reviewNeeded;
   }
   return healthLabel(snapshot.health.state);
 }
@@ -5698,7 +5722,7 @@ function locatedStateLabel(state: LocatedItem["state"]) {
     return "Online Only";
   }
   if (state === "pending_changes") {
-    return "Pending";
+    return PRODUCT_TERMS.reviewNeeded;
   }
   if (state === "conflict") {
     return "Conflict";
