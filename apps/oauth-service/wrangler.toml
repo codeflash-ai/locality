@@ -10,3 +10,4 @@ enabled = true
 LOCALITY_TOKEN_MODE = "handle"
 LOCALITY_NOTION_REDIRECT_URIS = "http://localhost:8757/oauth/notion/callback,http://127.0.0.1:8757/oauth/notion/callback"
 LOCALITY_GOOGLE_DOCS_REDIRECT_URIS = "http://localhost:8757/oauth/google-docs/callback,http://127.0.0.1:8757/oauth/google-docs/callback"
+LOCALITY_GMAIL_REDIRECT_URIS = "http://localhost:8757/oauth/gmail/callback,http://127.0.0.1:8757/oauth/gmail/callback"
