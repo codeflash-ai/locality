@@ -95,6 +95,13 @@ type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
 type SettingsSection = "general" | "sources" | "sync" | "activity" | "agents" | "advanced" | "about";
 type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
+type ConnectorOption = {
+  id: "notion" | "google-docs" | "gmail";
+  name: string;
+  description: string;
+  status: string;
+  keywords: string[];
+};
 
 const PRODUCT_TERMS = {
   home: "Home",
@@ -2849,6 +2856,7 @@ function AddSourceDialog({
   onAction: () => void;
   onClose: () => void;
 }) {
+  const [query, setQuery] = useState("");
   const needsConnection = connectionMissing(snapshot);
   const needsFolder = !needsConnection && mountMissing(snapshot);
   const busy = state === "connecting" || state === "creating" || state === "changing";
@@ -2863,6 +2871,38 @@ function AddSourceDialog({
     : needsFolder
       ? "Connected, folder needed"
       : "Ready";
+  const connectors: ConnectorOption[] = [
+    {
+      id: "notion",
+      name: "Notion",
+      description: "Pages and databases as folders with page.md files.",
+      status: sourceStatus,
+      keywords: ["notion", "wiki", "pages", "database", "docs"],
+    },
+    {
+      id: "google-docs",
+      name: "Google Docs",
+      description: "Docs and Drive folders through the same local file workflow.",
+      status: "Desktop setup pending",
+      keywords: ["google", "docs", "gdocs", "drive", "documents"],
+    },
+    {
+      id: "gmail",
+      name: "Gmail",
+      description: "Inbox and sent as readable files, drafts as reviewed outbound mail.",
+      status: "Desktop setup pending",
+      keywords: ["gmail", "mail", "email", "inbox", "drafts"],
+    },
+  ];
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleConnectors = normalizedQuery
+    ? connectors.filter((connector) =>
+        [connector.name, connector.description, connector.status, ...connector.keywords]
+          .join(" ")
+          .toLowerCase()
+          .includes(normalizedQuery),
+      )
+    : connectors;
 
   return (
     <div className="modal-backdrop" role="presentation">
@@ -2878,48 +2918,74 @@ function AddSourceDialog({
           </button>
         </div>
 
-        <div className="connector-choice-grid">
-          <article className="connector-choice-card active">
-            <div className="connector-choice-heading">
-              <BrandTile variant="notion">N</BrandTile>
-              <div>
-                <h3>Notion</h3>
-                <p>Pages and databases become folders with page.md files.</p>
-              </div>
-              <StatusPill tone={needsConnection || needsFolder ? "warn" : "ready"} title={sourceStatus}>
-                {sourceStatus}
-              </StatusPill>
-            </div>
-            <div className="connector-choice-facts">
-              <SettingRow title="Workspace" value={snapshot.connection.workspaceName || "Not connected"} />
-              <SettingRow title="Local folder" value={snapshot.mount.localPath || "Not created yet"} />
-              <SettingRow title="Access" value={snapshot.mount.accessScope || "Not requested"} />
-            </div>
-            <PrimaryButton compact busy={busy} icon={actionIcon} onClick={onAction}>
-              {busy ? "Working" : actionLabel}
-            </PrimaryButton>
-          </article>
+        <label className="source-search-row">
+          <Search />
+          <input
+            autoFocus
+            value={query}
+            placeholder="Search sources"
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </label>
 
-          <article className="connector-choice-card disabled" aria-disabled="true">
-            <div className="connector-choice-heading">
-              <BrandTile variant="folder" />
-              <div>
-                <h3>Google Docs</h3>
-                <p>Document connectors will use the same local file workflow.</p>
-              </div>
-              <StatusPill tone="warn" title="Coming soon">
-                Coming Soon
-              </StatusPill>
-            </div>
-            <SecondaryButton compact disabled>
-              Coming Soon
-            </SecondaryButton>
-          </article>
+        <div className="connector-choice-grid">
+          {visibleConnectors.map((connector) => {
+            const isNotion = connector.id === "notion";
+            return (
+              <article
+                className={`connector-choice-card ${isNotion ? "active" : "disabled"}`}
+                aria-disabled={!isNotion}
+                key={connector.id}
+              >
+                <div className="connector-choice-heading">
+                  <ConnectorIcon connector={connector.id} />
+                  <div>
+                    <h3>{connector.name}</h3>
+                    <p>{connector.description}</p>
+                  </div>
+                  <StatusPill
+                    tone={isNotion ? (needsConnection || needsFolder ? "warn" : "ready") : "warn"}
+                    title={connector.status}
+                  >
+                    {connector.status}
+                  </StatusPill>
+                </div>
+                {isNotion ? (
+                  <>
+                    <div className="connector-choice-facts">
+                      <SettingRow title="Workspace" value={snapshot.connection.workspaceName || "Not connected"} />
+                      <SettingRow title="Local folder" value={snapshot.mount.localPath || "Not created yet"} />
+                      <SettingRow title="Access" value={snapshot.mount.accessScope || "Not requested"} />
+                    </div>
+                    <PrimaryButton compact busy={busy} icon={actionIcon} onClick={onAction}>
+                      {busy ? "Working" : actionLabel}
+                    </PrimaryButton>
+                  </>
+                ) : (
+                  <SecondaryButton compact disabled>
+                    Coming Later
+                  </SecondaryButton>
+                )}
+              </article>
+            );
+          })}
+          {visibleConnectors.length === 0 && (
+            <div className="settings-empty-state">No source matched that search.</div>
+          )}
         </div>
 
         {message && <p className={state === "error" ? "field-error" : "quiet-note inline-note"}>{message}</p>}
       </section>
     </div>
+  );
+}
+
+function ConnectorIcon({ connector }: { connector: ConnectorOption["id"] }) {
+  const label = connector === "notion" ? "N" : connector === "google-docs" ? "D" : "M";
+  return (
+    <span className={`connector-icon ${connector}`} aria-hidden="true">
+      <span>{label}</span>
+    </span>
   );
 }
 
@@ -4810,6 +4876,7 @@ function TrayPopover({
   const visibleChanges = snapshot.pendingChanges.slice(0, 3);
   const visibleSearchResults = locateState === "ready" ? [] : searchResults.slice(0, 3);
   const trayReviewCounts = reviewQueueCounts(snapshot.pendingChanges);
+  const trayAccountLabel = snapshot.connection.accountLabel || snapshot.connection.workspaceName || "Locality";
 
   useEffect(() => {
     if (!quitOptionsOpen) {
@@ -4888,75 +4955,12 @@ function TrayPopover({
         </StatusPill>
       </header>
 
-      <section className="tray-section tray-workspace">
-        <div className="tray-section-heading">
-          <span>{PRODUCT_TERMS.connectedSource}</span>
-          <button onClick={() => openMain("mount")}>Sources</button>
-        </div>
-        <h2>{snapshot.mount.workspaceName}</h2>
-        <div className="tray-path-row">
-          <button className="path-button" title="Copy path" onClick={() => copyText(snapshot.mount.localPath)}>
-            {compactPath(snapshot.mount.localPath, 46)}
-          </button>
-          <button
-            className="icon-button has-tooltip"
-            data-tooltip="Open folder"
-            onClick={() => void callCommand("open_path", { path: snapshot.mount.localPath }, { ok: true })}
-          >
-            <FolderOpen />
-          </button>
-        </div>
-      </section>
-
-      <section className="tray-section tray-live-mode">
-        <button
-          className={`tray-live-mode-control ${liveModeEnabled ? "active" : ""}`}
-          aria-pressed={liveModeEnabled}
-          aria-label={`${liveModeEnabled ? "Turn off" : "Turn on"} Live Mode`}
-          disabled={mountMissing(snapshot) || connectionMissing(snapshot)}
-          onClick={() => void toggleLiveMode()}
-        >
-          <span className="tray-live-mode-copy">
-            {liveModeBusy ? <span className="live-mode-spinner" aria-hidden="true" /> : <Zap />}
-            <span>
-              <strong>Live Mode</strong>
-              <small>{trayLiveModeLabel(snapshot.liveMode, liveModeBusy)}</small>
-            </span>
-          </span>
-          <span className={`toggle ${liveModeEnabled ? "enabled" : ""}`} aria-hidden="true">
-            <i />
-          </span>
-        </button>
-        {liveModeMessage && (
-          <p className={liveModeState === "error" ? "field-error" : "quiet-note inline-note"}>
-            {liveModeMessage}
-          </p>
-        )}
-      </section>
-
-      <section className="tray-section tray-review-summary">
-        <button className="tray-review-button" type="button" onClick={() => openMain("pending")}>
-          <span>
-            <strong>{PRODUCT_TERMS.reviewCenter}</strong>
-            <small>
-              {trayReviewCounts.total > 0
-                ? `${trayReviewCounts.approvals} approvals · ${trayReviewCounts.problems} problems`
-                : liveModeEnabled
-                  ? "Safe edits sync automatically"
-                  : "No review needed"}
-            </small>
-          </span>
-          <b>{trayReviewCounts.total}</b>
-        </button>
-      </section>
-
-      <section className="tray-section">
-        <div className="tray-locate-label">Open a Notion page</div>
+      <section className="tray-section tray-search-section">
         <div className="tray-locate-row">
           <Search />
           <input
             value={url}
-            placeholder="Paste URL or search title"
+            placeholder="Locate a page or file"
             onChange={(event) => {
               setUrl(event.target.value);
               setLocateState("idle");
@@ -4997,59 +5001,98 @@ function TrayPopover({
         )}
       </section>
 
+      <section className="tray-status-row">
+        <button className="tray-status-copy" type="button" onClick={() => openMain("pending")}>
+          <StatusPill
+            tone={trayReviewCounts.total > 0 ? "warn" : healthTone(snapshot.health.state)}
+            title={trayReviewCounts.total > 0 ? "Local edits need review." : healthDescription(snapshot.health.state, snapshot.health.attentionCount)}
+          >
+            {trayReviewCounts.total > 0 ? `${trayReviewCounts.total} need review` : "All changes reviewed"}
+          </StatusPill>
+        </button>
+        <button
+          className="tray-live-inline"
+          aria-pressed={liveModeEnabled}
+          aria-label={`${liveModeEnabled ? "Turn off" : "Turn on"} Live Mode`}
+          disabled={mountMissing(snapshot) || connectionMissing(snapshot)}
+          onClick={() => void toggleLiveMode()}
+        >
+          <span>{liveModeBusy ? "Syncing" : "Live Mode"}</span>
+          <span className={`toggle ${liveModeEnabled ? "enabled" : ""}`} aria-hidden="true">
+            <i />
+          </span>
+        </button>
+      </section>
+      {liveModeMessage && (
+        <p className={liveModeState === "error" ? "field-error" : "quiet-note inline-note"}>
+          {liveModeMessage}
+        </p>
+      )}
+
+      <section className="tray-section tray-list-section">
+        <div className="tray-section-heading">
+          <span>{PRODUCT_TERMS.reviewCenter} ({trayReviewCounts.total})</span>
+          <button onClick={() => openMain("pending")}>{trayReviewCounts.total > 0 ? "See all" : "Open"}</button>
+        </div>
+        {visibleChanges.length > 0 ? (
+          visibleChanges.slice(0, 2).map((change) => (
+            <button
+              className="tray-list-row"
+              key={change.localPath}
+              onClick={() =>
+                void callCommand("open_path", { path: joinMountPath(snapshot.mount.localPath, change.localPath) }, { ok: true })
+              }
+            >
+              <ConnectorIcon connector="notion" />
+              <span>
+                <strong>{change.title}</strong>
+                <small>{change.summary}</small>
+              </span>
+              <em>Review</em>
+            </button>
+          ))
+        ) : (
+          <div className="tray-empty-row">No changes waiting for review.</div>
+        )}
+      </section>
+
       {snapshot.recentFiles.length > 0 && (
-        <section className="tray-section tray-recent-files">
+        <section className="tray-section tray-list-section tray-recent-files">
           <div className="tray-section-heading">
-            <span>Recent Files</span>
+            <span>Recent</span>
             <button onClick={() => openMain("files")}>View</button>
           </div>
-          {snapshot.recentFiles.slice(0, 3).map((item) => (
+          {snapshot.recentFiles.slice(0, 2).map((item) => (
             <button
+              className="tray-list-row"
               type="button"
               key={`${item.kind}-${item.localPath}`}
               onClick={() => void callCommand("reveal_path", { path: item.localPath }, { ok: true })}
             >
-              <strong>{item.title}</strong>
-              <small>{item.localPath}</small>
+              <ConnectorIcon connector="notion" />
+              <span>
+                <strong>{item.title}</strong>
+                <small>{item.localPath}</small>
+              </span>
               <span className={`search-state ${item.state}`}>{locatedStateLabel(item.state)}</span>
             </button>
           ))}
         </section>
       )}
 
-      {visibleChanges.length > 0 && (
-        <section className="tray-change-list">
-          <div className="tray-section-heading">
-            <span>Needs attention</span>
-            <button onClick={() => openMain("pending")}>Review</button>
-          </div>
-          {visibleChanges.map((change) => (
-            <button
-              key={change.localPath}
-              onClick={() =>
-                void callCommand("open_path", { path: joinMountPath(snapshot.mount.localPath, change.localPath) }, { ok: true })
-              }
-            >
-              <span>{change.title}</span>
-              <small>{change.summary}</small>
-            </button>
-          ))}
-        </section>
-      )}
-
-      <section className="tray-section tray-suggestion">
-        <p className="label">Suggestion</p>
-        <div className="tray-suggestion-row">
-          <strong>Connect {snapshot.suggestions[0]?.connector ?? "Linear"}</strong>
-          <button disabled>Coming Soon</button>
-        </div>
+      <section className="tray-controls-row">
+        <button disabled title="Pause presets need backend support">Pause syncing</button>
+        <button onClick={() => void callCommand("open_path", { path: snapshot.mount.localPath }, { ok: true })}>
+          Open folder
+        </button>
+        <button onClick={() => openMain("activity")}>Activity</button>
       </section>
 
       <footer className="tray-footer">
-        <button onClick={() => openMain("activity")}>Activity</button>
+        <span className="tray-account">{trayAccountLabel}</span>
         <button onClick={() => openMain("settings")}>Settings</button>
         <div className="tray-quit-options" ref={quitOptionsRef}>
-          <button onClick={() => setQuitOptionsOpen((open) => !open)}>Quit Options</button>
+          <button onClick={() => setQuitOptionsOpen((open) => !open)}>Quit</button>
           {quitOptionsOpen && (
             <div className="tray-quit-menu">
               <button onClick={() => void callCommand("hide_menubar", undefined, { ok: true })}>
