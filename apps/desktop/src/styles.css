@@ -1353,7 +1353,7 @@ p {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 172px 1fr;
+  grid-template-columns: 184px 1fr;
   width: 100vw;
   min-height: calc(100vh - 38px);
   max-height: calc(100vh - 38px);
@@ -1381,21 +1381,23 @@ p {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 9px;
-  padding: 0 9px;
+  gap: 8px;
+  padding: 0 2px;
   font-size: 18px;
 }
 
 .sidebar-brand-mark {
   display: inline-flex;
   align-items: center;
-  min-width: 0;
+  flex: 1 1 auto;
+  min-width: max-content;
   gap: 9px;
 }
 
 .sidebar-brand-mark strong {
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: nowrap;
 }
 
 .sidebar-collapse-button {
@@ -1580,12 +1582,38 @@ p {
   padding: 0;
 }
 
+.sidebar-collapsed .status-button {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 9px;
+}
+
+.sidebar-collapsed .status-button:hover {
+  background: rgba(227, 244, 241, 0.72);
+}
+
 .sidebar-collapsed .status-pill {
-  width: 14px;
-  min-height: 14px;
+  width: 12px;
+  min-height: 12px;
   padding: 0;
   overflow: hidden;
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.86);
   color: transparent;
+  font-size: 0;
+}
+
+.sidebar-collapsed .status-pill.ready {
+  background: var(--green);
+}
+
+.sidebar-collapsed .status-pill.warn {
+  background: var(--amber);
+}
+
+.sidebar-collapsed .status-pill.danger {
+  background: var(--red);
 }
 
 .sidebar-status {
@@ -4645,7 +4673,7 @@ button.home-stat:hover {
   }
 
   .app-shell {
-    grid-template-columns: 150px 1fr;
+    grid-template-columns: 184px 1fr;
   }
 
   .content {
