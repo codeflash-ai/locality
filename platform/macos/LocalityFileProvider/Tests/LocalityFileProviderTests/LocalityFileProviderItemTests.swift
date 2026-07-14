@@ -52,11 +52,66 @@ final class LocalityFileProviderItemTests: XCTestCase {
     XCTAssertTrue(item.capabilities.contains(.allowsRenaming))
   }
 
+  func testWritableMountRootFolderAllowsAddingSubitems() {
+    let item = LocalityFileProviderItem(
+      metadata: metadata(
+        identifier: LocalitySharedDomain.itemIdentifier(
+          mountId: "google-docs-main",
+          daemonIdentifier: "mount:google-docs-main"
+        ),
+        filename: "google-docs-main",
+        kind: "folder"
+      )
+    )
+
+    XCTAssertTrue(item.capabilities.contains(.allowsReading))
+    XCTAssertTrue(item.capabilities.contains(.allowsContentEnumerating))
+    XCTAssertTrue(item.capabilities.contains(.allowsAddingSubItems))
+  }
+
+  func testReadOnlyFolderDoesNotAllowAddingSubitems() {
+    let item = LocalityFileProviderItem(
+      metadata: metadata(
+        identifier: LocalitySharedDomain.itemIdentifier(
+          mountId: "gmail-main",
+          daemonIdentifier: "gmail-folder:inbox"
+        ),
+        filename: "inbox",
+        kind: "folder",
+        readOnly: true
+      )
+    )
+
+    XCTAssertTrue(item.capabilities.contains(.allowsReading))
+    XCTAssertTrue(item.capabilities.contains(.allowsContentEnumerating))
+    XCTAssertFalse(item.capabilities.contains(.allowsAddingSubItems))
+  }
+
+  func testReadOnlyPageDocumentDoesNotAllowWritingOrRenaming() {
+    let item = LocalityFileProviderItem(
+      metadata: metadata(
+        identifier: LocalitySharedDomain.itemIdentifier(
+          mountId: "gmail-main",
+          daemonIdentifier: "msg-inbox-1"
+        ),
+        filename: "Inbox.md",
+        kind: "file",
+        entityKind: "page",
+        readOnly: true
+      )
+    )
+
+    XCTAssertTrue(item.capabilities.contains(.allowsReading))
+    XCTAssertFalse(item.capabilities.contains(.allowsWriting))
+    XCTAssertFalse(item.capabilities.contains(.allowsRenaming))
+  }
+
   private func metadata(
     identifier: String,
     filename: String,
     kind: String,
-    entityKind: String? = nil
+    entityKind: String? = nil,
+    readOnly: Bool = false
   ) -> LocalityItemMetadata {
     LocalityItemMetadata(
       identifier: identifier,
@@ -64,6 +119,7 @@ final class LocalityFileProviderItemTests: XCTestCase {
       filename: filename,
       kind: kind,
       entityKind: entityKind,
+      readOnly: readOnly,
       remoteId: nil,
       path: filename,
       hydration: nil,

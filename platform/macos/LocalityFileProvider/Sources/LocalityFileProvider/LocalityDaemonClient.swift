@@ -164,6 +164,7 @@ struct LocalityItemMetadata: Decodable {
   let filename: String
   let kind: String
   let entityKind: String?
+  let readOnly: Bool
   let remoteId: String?
   let path: String
   let hydration: String?
@@ -178,6 +179,7 @@ struct LocalityItemMetadata: Decodable {
     case filename
     case kind
     case entityKind = "entity_kind"
+    case readOnly = "read_only"
     case remoteId = "remote_id"
     case path
     case hydration

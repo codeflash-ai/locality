@@ -8,7 +8,8 @@ use locality_store::{MountConfig, MountRepository, ProjectionMode};
 
 use crate::virtual_fs::{
     ROOT_CONTAINER_IDENTIFIER, VirtualFsChildrenReport, VirtualFsItem, VirtualFsItemKind,
-    mount_point_directory_name, mount_point_identifier, virtual_projection_root,
+    mount_point_directory_name, mount_point_identifier, source_root_read_only,
+    virtual_projection_root,
 };
 
 pub const SHARED_IDENTIFIER_PREFIX: &str = "m:";
@@ -118,7 +119,7 @@ fn shared_mount_point_item(mount: &MountConfig) -> VirtualFsItem {
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: filename.clone(),
         kind: VirtualFsItemKind::Folder,
-        read_only: mount.read_only,
+        read_only: source_root_read_only(mount),
         entity_kind: None,
         remote_id: None,
         path: filename,
@@ -269,5 +270,51 @@ mod tests {
 
         assert_eq!(report.children.len(), 1);
         assert!(report.children[0].read_only);
+    }
+
+    #[test]
+    fn shared_mount_point_item_reflects_source_root_create_policy() {
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("notion-main"),
+                    "notion",
+                    "/tmp/Locality/notion-main",
+                )
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save notion mount");
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("google-docs-main"),
+                    "google-docs",
+                    "/tmp/Locality/google-docs-main",
+                )
+                .with_remote_root_id(locality_core::model::RemoteId::new("workspace-folder"))
+                .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save google docs mount");
+
+        let report = virtual_projection_root_children(
+            &store,
+            Path::new("/tmp/Locality"),
+            ProjectionMode::LinuxFuse,
+        )
+        .expect("shared root children");
+
+        let notion = report
+            .children
+            .iter()
+            .find(|item| item.filename == "notion-main")
+            .expect("notion mount point");
+        let google_docs = report
+            .children
+            .iter()
+            .find(|item| item.filename == "google-docs-main")
+            .expect("google docs mount point");
+        assert!(notion.read_only);
+        assert!(!google_docs.read_only);
     }
 }

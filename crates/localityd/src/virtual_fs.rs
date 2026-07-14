@@ -2208,7 +2208,7 @@ fn root_item(mount: &MountConfig) -> VirtualFsItem {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| mount.mount_id.0.clone()),
         kind: VirtualFsItemKind::Folder,
-        read_only: mount.read_only,
+        read_only: source_root_read_only(mount),
         entity_kind: None,
         remote_id: None,
         path: String::new(),
@@ -2273,7 +2273,7 @@ fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: filename.clone(),
         kind: VirtualFsItemKind::Folder,
-        read_only: mount.read_only,
+        read_only: source_root_read_only(mount),
         entity_kind: None,
         remote_id: None,
         path: filename,
@@ -2283,6 +2283,14 @@ fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
         materialized_path: Some(virtual_projection_mount_point(mount).display().to_string()),
         byte_size: None,
     }
+}
+
+pub(crate) fn source_root_read_only(mount: &MountConfig) -> bool {
+    mount.read_only
+        || source_descriptor(&mount.connector)
+            .source_root_create_parent_kind()
+            .is_none()
+        || mount.remote_root_id.is_none()
 }
 
 fn item_file_read_only(mount: &MountConfig, path: &Path) -> bool {
@@ -3126,6 +3134,46 @@ mod tests {
             .expect("root children");
         assert_eq!(root_children.children.len(), 1);
         assert!(root_children.children[0].read_only);
+    }
+
+    #[test]
+    fn virtual_roots_report_read_only_when_source_root_creates_are_unsupported() {
+        let mut store = InMemoryStateStore::new();
+        let notion_mount_id = MountId::new("notion-main");
+        let google_mount_id = MountId::new("google-docs-main");
+        let notion_mount = virtual_mount(&notion_mount_id);
+        let google_mount = virtual_mount_with_connector(&google_mount_id, "google-docs")
+            .with_remote_root_id(RemoteId::new("workspace-folder"));
+        store.save_mount(notion_mount.clone()).expect("save notion");
+        store
+            .save_mount(google_mount.clone())
+            .expect("save google docs");
+
+        let notion_root = virtual_fs_item(&store, &notion_mount_id, ROOT_CONTAINER_IDENTIFIER)
+            .expect("notion root")
+            .item;
+        let notion_mount_point = virtual_fs_item(
+            &store,
+            &notion_mount_id,
+            &mount_point_identifier(&notion_mount),
+        )
+        .expect("notion mount point")
+        .item;
+        assert!(notion_root.read_only);
+        assert!(notion_mount_point.read_only);
+
+        let google_root = virtual_fs_item(&store, &google_mount_id, ROOT_CONTAINER_IDENTIFIER)
+            .expect("google docs root")
+            .item;
+        let google_mount_point = virtual_fs_item(
+            &store,
+            &google_mount_id,
+            &mount_point_identifier(&google_mount),
+        )
+        .expect("google docs mount point")
+        .item;
+        assert!(!google_root.read_only);
+        assert!(!google_mount_point.read_only);
     }
 
     #[test]

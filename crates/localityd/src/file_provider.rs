@@ -28,7 +28,8 @@ use crate::shadow_match::{
 };
 use crate::virtual_fs;
 use crate::virtual_fs::{
-    mount_point_directory_name, mount_point_identifier, virtual_projection_mount_point,
+    mount_point_directory_name, mount_point_identifier, source_root_read_only,
+    virtual_projection_mount_point,
 };
 use crate::virtual_projection::wrap_identifier;
 
@@ -125,7 +126,7 @@ fn shared_domain_mount_point_item(mount: &MountConfig) -> FileProviderItem {
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: filename.clone(),
         kind: FileProviderItemKind::Folder,
-        read_only: false,
+        read_only: source_root_read_only(mount),
         entity_kind: None,
         remote_id: None,
         path: filename,
@@ -1738,6 +1739,48 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(filenames, vec!["notion-main", "notion-work"]);
+    }
+
+    #[test]
+    fn shared_macos_file_provider_domain_children_reflect_source_root_create_policy() {
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("notion-main"),
+                    "notion",
+                    "/tmp/Locality/notion-main",
+                )
+                .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save notion mount");
+        store
+            .save_mount(
+                MountConfig::new(
+                    MountId::new("google-docs-main"),
+                    "google-docs",
+                    "/tmp/Locality/google-docs-main",
+                )
+                .with_remote_root_id(RemoteId::new("workspace-folder"))
+                .projection(ProjectionMode::MacosFileProvider),
+            )
+            .expect("save google docs mount");
+
+        let report =
+            file_provider_domain_children(&store, MACOS_FILE_PROVIDER_DOMAIN_ID).expect("children");
+
+        let notion = report
+            .children
+            .iter()
+            .find(|child| child.mount_id == "notion-main")
+            .expect("notion mount");
+        let google_docs = report
+            .children
+            .iter()
+            .find(|child| child.mount_id == "google-docs-main")
+            .expect("google docs mount");
+        assert!(notion.item.read_only);
+        assert!(!google_docs.item.read_only);
     }
 
     #[test]

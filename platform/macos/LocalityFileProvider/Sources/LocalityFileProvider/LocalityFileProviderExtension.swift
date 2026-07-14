@@ -370,6 +370,7 @@ final class LocalityFileProviderExtension: NSObject, NSFileProviderReplicatedExt
       filename: domain.displayName.isEmpty ? "Locality" : domain.displayName,
       kind: "folder",
       entityKind: nil,
+      readOnly: true,
       remoteId: nil,
       path: "",
       hydration: nil,
