@@ -1097,6 +1097,13 @@ fn daemon_push_resumes_failed_gmail_send_reconciliation_without_reapplying() {
     assert_eq!(journal.len(), 1);
     assert!(matches!(journal[0].status, JournalStatus::Failed(_)));
     assert_eq!(journal[0].apply_effects.len(), 1);
+    let edited_cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::write(
+        &edited_cache_path,
+        "---\ntitle: Edited reply\nto: [\"user@example.com\"]\nsubject: Edited reply\n---\nChanged body.\n",
+    )
+    .expect("edit stale draft");
 
     let second = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
         .expect("retry push");
@@ -1249,6 +1256,158 @@ fn daemon_push_resumes_applied_gmail_send_reconciliation_without_reapplying() {
     assert_eq!(message.path, PathBuf::from("sent/reply.md"));
     assert!(content_root.join("sent/reply.md").exists());
     assert!(!content_root.join(source_path).exists());
+}
+
+#[test]
+fn daemon_push_reconciles_repeated_gmail_draft_filename_to_unique_sent_paths() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/reply.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\ntitle: Reply\nto: [\"user@example.com\"]\nsubject: Reply\n---\nBody one.\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("gmail-folder:draft");
+    let sent_folder_id = RemoteId::new("gmail-folder:sent");
+    let first_remote_id = RemoteId::new("gmail-message:sent-1");
+    let second_remote_id = RemoteId::new("gmail-message:sent-2");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "gmail", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            sent_folder_id.clone(),
+            EntityKind::Directory,
+            "sent",
+            "sent",
+        ))
+        .expect("save sent folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:gmail-draft-1",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id.clone()),
+            "draft/reply.md",
+            Some(cache_path.clone()),
+        ))
+        .expect("save first mutation");
+    let first_source = FakePushSource::default()
+        .with_created_entity(
+            first_remote_id.clone(),
+            rendered_gmail_entity(
+                "gmail-message:sent-1",
+                "Reply",
+                "1720900000000",
+                "Body one.",
+            ),
+        )
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-gmail-draft-1".to_string()),
+            operation_index: 0,
+            parent_id: sent_folder_id.clone(),
+            entity_id: first_remote_id.clone(),
+        }]);
+
+    let first = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &first_source,
+        Some(&state_root),
+    )
+    .expect("first push");
+
+    assert_eq!(first.action, PushJobAction::Reconciled);
+    let first_message = store
+        .get_entity(&fixture.mount_id, &first_remote_id)
+        .expect("get first sent message")
+        .expect("first sent message");
+    assert_eq!(
+        first_message.path,
+        PathBuf::from("sent/1720900000000-reply-gmail-message-sent-1.md")
+    );
+
+    fs::write(
+        &cache_path,
+        "---\ntitle: Reply\nto: [\"user@example.com\"]\nsubject: Reply\n---\nBody two.\n",
+    )
+    .expect("second cache file");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:gmail-draft-2",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/reply.md",
+            Some(cache_path),
+        ))
+        .expect("save second mutation");
+    let second_source = FakePushSource::default()
+        .with_created_entity(
+            second_remote_id.clone(),
+            rendered_gmail_entity(
+                "gmail-message:sent-2",
+                "Reply",
+                "1720900001000",
+                "Body two.",
+            ),
+        )
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-gmail-draft-2".to_string()),
+            operation_index: 0,
+            parent_id: sent_folder_id,
+            entity_id: second_remote_id.clone(),
+        }]);
+
+    let second = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &second_source,
+        Some(&state_root),
+    )
+    .expect("second push");
+
+    assert_eq!(second.action, PushJobAction::Reconciled);
+    let second_message = store
+        .get_entity(&fixture.mount_id, &second_remote_id)
+        .expect("get second sent message")
+        .expect("second sent message");
+    assert_eq!(
+        second_message.path,
+        PathBuf::from("sent/1720900001000-reply-gmail-message-sent-2.md")
+    );
+    assert!(content_root.join(first_message.path).exists());
+    assert!(content_root.join(second_message.path).exists());
 }
 
 #[test]
@@ -1796,6 +1955,28 @@ fn rendered_entity(remote_id: &str, plain_body: &str) -> HydratedEntity {
         document,
         shadow: shadow(remote_id, plain_body),
         remote_edited_at: Some("2026-06-11T00:00:00Z".to_string()),
+        assets: Vec::new(),
+    }
+}
+
+fn rendered_gmail_entity(
+    remote_id: &str,
+    subject: &str,
+    internal_date: &str,
+    plain_body: &str,
+) -> HydratedEntity {
+    let body = markdown_body(plain_body);
+    let remote_version = format!("gmail:{remote_id}:{internal_date}:SENT");
+    let document = CanonicalDocument::new(
+        format!(
+            "loc:\n  id: {remote_id}\n  type: page\n  connector: gmail\n  synced_at: {remote_version}\n  remote_edited_at: {remote_version}\ntitle: {subject}\ngmail:\n  mailbox: sent\n  message_id: {remote_id}\n  thread_id: thread-{remote_id}\n  labels: [SENT]\nfrom: sender@example.com\nto: [user@example.com]\ncc: []\nbcc: []\nsubject: {subject}\ndate: Tue, 14 Jul 2026 10:00:00 +0000\n"
+        ),
+        body.clone(),
+    );
+    HydratedEntity {
+        document,
+        shadow: shadow(remote_id, plain_body),
+        remote_edited_at: Some(remote_version),
         assets: Vec::new(),
     }
 }

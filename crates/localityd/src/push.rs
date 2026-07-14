@@ -511,12 +511,12 @@ where
                 journal.status,
                 JournalStatus::Failed(_) | JournalStatus::Applied
             )
-            || journal.plan != *plan
             || !resumable_created_entity_effects(&journal)
             || !plan
                 .operations
                 .iter()
                 .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+            || !journal_created_entity_sources_match(&journal, plan)
         {
             continue;
         }
@@ -537,6 +537,51 @@ fn resumable_created_entity_effects(journal: &JournalEntry) -> bool {
             .apply_effects
             .iter()
             .all(|effect| matches!(effect, JournalApplyEffect::CreatedEntity { .. }))
+}
+
+fn journal_created_entity_sources_match(journal: &JournalEntry, plan: &PushPlan) -> bool {
+    let mut current_sources = plan
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::CreateEntity {
+                parent_id,
+                source_path,
+                ..
+            } => Some((parent_id, source_path)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    for effect in &journal.apply_effects {
+        let JournalApplyEffect::CreatedEntity {
+            operation_index, ..
+        } = effect
+        else {
+            return false;
+        };
+        let Some(PushOperation::CreateEntity {
+            parent_id,
+            source_path,
+            ..
+        }) = journal.plan.operations.get(*operation_index)
+        else {
+            return false;
+        };
+
+        let Some(matched_index) =
+            current_sources
+                .iter()
+                .position(|(current_parent_id, current_source_path)| {
+                    *current_parent_id == parent_id && *current_source_path == source_path
+                })
+        else {
+            return false;
+        };
+        current_sources.remove(matched_index);
+    }
+
+    current_sources.is_empty()
 }
 
 fn created_entity_effect_ids(effects: &[JournalApplyEffect]) -> Vec<RemoteId> {
@@ -2844,11 +2889,6 @@ where
                         entity_path,
                     )
                     .with_hydration(HydrationState::Stub);
-                    self.store
-                        .save_entity(entity.clone())
-                        .map_err(LocalityError::from)?;
-                    let path =
-                        projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
                     let rendered = self.source.fetch_render(
                         &locality_core::hydration::HydrationRequest::new(
                             request.mount_id.clone(),
@@ -2858,6 +2898,17 @@ where
                             locality_core::hydration::HydrationReason::ExplicitPull,
                         ),
                     )?;
+                    entity.path = created_entity_reconcile_path_from_rendered(
+                        self.store,
+                        request.mount_id,
+                        &entity.path,
+                        parent_kind,
+                        parent_id,
+                        entity_id,
+                        &rendered,
+                    )?;
+                    let path =
+                        projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
                     let output_root = projection_output_root(self.state_root.as_deref(), &mount)?;
                     accept_post_apply_remote(
                         self.store,
@@ -3003,6 +3054,105 @@ where
     }
 
     Ok(source_path.to_path_buf())
+}
+
+fn created_entity_reconcile_path_from_rendered<S>(
+    store: &S,
+    mount_id: &MountId,
+    current_path: &Path,
+    parent_kind: &Option<EntityKind>,
+    parent_id: &RemoteId,
+    entity_id: &RemoteId,
+    rendered: &HydratedEntity,
+) -> LocalityResult<PathBuf>
+where
+    S: EntityRepository,
+{
+    if !matches!(parent_kind, Some(EntityKind::Directory)) {
+        return Ok(current_path.to_path_buf());
+    }
+
+    let Some(parent) = store
+        .get_entity(mount_id, parent_id)
+        .map_err(LocalityError::from)?
+    else {
+        return Ok(current_path.to_path_buf());
+    };
+    if parent.kind != EntityKind::Directory {
+        return Ok(current_path.to_path_buf());
+    }
+
+    if let Some(filename) = gmail_rendered_message_filename(entity_id, rendered) {
+        return Ok(parent.path.join(filename));
+    }
+
+    Ok(current_path.to_path_buf())
+}
+
+fn gmail_rendered_message_filename(
+    entity_id: &RemoteId,
+    rendered: &HydratedEntity,
+) -> Option<String> {
+    let rendered_markdown = render_canonical_markdown(&rendered.document);
+    let parsed = parse_canonical_markdown(&rendered_markdown).ok()?;
+    let frontmatter_remote_edited_at = parsed
+        .frontmatter
+        .loc
+        .as_ref()
+        .and_then(|loc| loc.remote_edited_at.as_deref());
+    let remote_edited_at = rendered
+        .remote_edited_at
+        .as_deref()
+        .or(frontmatter_remote_edited_at)?;
+    let internal_date = gmail_internal_date(entity_id, remote_edited_at)?;
+    let subject = frontmatter_string(&parsed.frontmatter.properties, "subject");
+    let title = parsed
+        .frontmatter
+        .title
+        .as_deref()
+        .or(subject.as_deref())
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("(no subject)");
+
+    Some(format!(
+        "{}-{}-{}.md",
+        gmail_safe_slug(internal_date),
+        gmail_safe_slug(title),
+        gmail_safe_slug(entity_id.as_str())
+    ))
+}
+
+fn gmail_internal_date<'a>(entity_id: &RemoteId, remote_version: &'a str) -> Option<&'a str> {
+    let rest = remote_version.strip_prefix("gmail:")?;
+    let rest = rest.strip_prefix(entity_id.as_str())?;
+    let rest = rest.strip_prefix(':')?;
+    let internal_date = rest.split(':').next().unwrap_or("unknown");
+    Some(if internal_date.is_empty() {
+        "unknown"
+    } else {
+        internal_date
+    })
+}
+
+fn gmail_safe_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "untitled".to_string()
+    } else {
+        slug.to_string()
+    }
 }
 
 fn remove_stale_created_entity_source_path(
