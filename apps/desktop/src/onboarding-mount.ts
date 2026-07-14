@@ -26,7 +26,7 @@ export function mountOnboardingPrimaryLabel(
   busy: boolean,
 ) {
   if (busy && report?.primaryAction === "allow_in_macos") {
-    return "Opening Finder";
+    return "Opening macOS prompt";
   }
   if (busy) {
     return "Checking setup";
@@ -48,7 +48,7 @@ export function mountOnboardingHeadline(
 ) {
   switch (report?.state) {
     case "approval_required":
-      return "Allow Locality in Finder.";
+      return "Approve the macOS Start Syncing prompt.";
     case "waiting_for_cloudstorage_root":
       return "Waiting for the Locality folder to appear.";
     case "failed":
@@ -71,9 +71,8 @@ export function mountOnboardingInstructions(
     return null;
   }
   return (
-    "Open Finder, choose Locality under Locations, enable the File Provider, then return here " +
-    "and click Check again. If Finder does not show Locality, open System Settings, go to " +
-    "Privacy & Security, then enable Locality under Extensions or File Providers."
+    'Click OK in the macOS "Start Syncing" prompt, then Locality will check the folder again. ' +
+    "If you clicked Don't allow, choose Allow in macOS to try again."
   );
 }
 

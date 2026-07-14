@@ -43,9 +43,12 @@ describe("mount onboarding helpers", () => {
     );
   });
 
-  it("switches to progress copy while the action is running", () => {
+  it("labels and describes the native macOS approval prompt", () => {
     expect(mountOnboardingPrimaryLabel(report({ primaryAction: "allow_in_macos" }), true)).toBe(
-      "Opening Finder",
+      "Opening macOS prompt",
+    );
+    expect(mountOnboardingHeadline(report({ state: "approval_required" }))).toBe(
+      "Approve the macOS Start Syncing prompt.",
     );
   });
 
@@ -70,19 +73,20 @@ describe("mount onboarding helpers", () => {
     ).toBe(false);
   });
 
-  it("keeps the System Settings fallback in the approval instructions", () => {
-    expect(
-      mountOnboardingInstructions?.(report({ launchStrategy: "instructions_only" })) ?? null,
-    ).toBe(
-      "Open Finder, choose Locality under Locations, enable the File Provider, then return here " +
-        "and click Check again. If Finder does not show Locality, open System Settings, go to " +
-        "Privacy & Security, then enable Locality under Extensions or File Providers.",
+  it("explains that OK in the native prompt enables the File Provider location", () => {
+    const instructions =
+      mountOnboardingInstructions?.(report({ launchStrategy: "instructions_only" })) ?? null;
+
+    expect(instructions).toBe(
+      `Click OK in the macOS "Start Syncing" prompt, then Locality will check the folder again. If you clicked Don't allow, choose Allow in macOS to try again.`,
     );
+    expect(instructions).not.toContain("enable the File Provider");
+    expect(instructions).not.toContain("System Settings");
   });
 
   it("maps backend states to the step 4 headline", () => {
     expect(mountOnboardingHeadline(report({ state: "approval_required" }))).toBe(
-      "Allow Locality in Finder.",
+      "Approve the macOS Start Syncing prompt.",
     );
     expect(mountOnboardingHeadline(report({ state: "waiting_for_cloudstorage_root" }))).toBe(
       "Waiting for the Locality folder to appear.",
