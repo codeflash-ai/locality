@@ -2895,7 +2895,7 @@ fn connect_gmail_broker_oauth_stores_refresh_handle_without_secrets() {
         GmailBrokerOAuthConnectOptions {
             connection_id: Some(ConnectionId::new("gmail-default")),
             broker_url: "https://auth.example.test".to_string(),
-            client_id: "gmail-client-id".to_string(),
+            client_id: "google-client-id".to_string(),
             session: "session".to_string(),
             state: "state".to_string(),
             code: "gmail-code".to_string(),
@@ -3300,8 +3300,8 @@ git commit -m "feat: add Gmail CLI connect and mount"
 In `apps/oauth-service/test/app.test.ts`, add Gmail env values:
 
 ```ts
-LOCALITY_GMAIL_CLIENT_ID: "gmail-client-id",
-LOCALITY_GMAIL_CLIENT_SECRET: "gmail-client-secret",
+LOCALITY_GOOGLE_CLIENT_ID: "google-client-id",
+LOCALITY_GOOGLE_CLIENT_SECRET: "google-client-secret",
 LOCALITY_GMAIL_API_BASE_URL: "https://oauth2.example.test",
 LOCALITY_GMAIL_AUTH_BASE_URL: "https://accounts.example.test",
 LOCALITY_GMAIL_REDIRECT_URIS: "http://localhost:8757/oauth/gmail/callback"
@@ -3315,8 +3315,8 @@ it("starts Gmail OAuth sessions", async () => {
   expect(response.status).toBe(200);
   const body = await response.json() as any;
   expect(body.connector).toBe("gmail");
-  expect(body.client_id).toBe("gmail-client-id");
-  expect(body.authorization_url).toContain("client_id=gmail-client-id");
+  expect(body.client_id).toBe("google-client-id");
+  expect(body.authorization_url).toContain("client_id=google-client-id");
   expect(body.authorization_url).toContain("gmail.readonly");
   expect(body.authorization_url).toContain("gmail.compose");
   expect(body.redirect_uri).toBe("http://localhost:8757/oauth/gmail/callback");
@@ -3390,7 +3390,7 @@ export interface GmailTokenResponse {
 
 export function gmailAuthorizeUrl(env: BrokerEnv, redirectUri: string, state: string): string {
   const url = new URL(`${gmailAuthBaseUrl(env)}/o/oauth2/v2/auth`);
-  url.searchParams.set("client_id", requireEnv(env.LOCALITY_GMAIL_CLIENT_ID, "LOCALITY_GMAIL_CLIENT_ID"));
+  url.searchParams.set("client_id", requireEnv(env.LOCALITY_GOOGLE_CLIENT_ID, "LOCALITY_GOOGLE_CLIENT_ID"));
   url.searchParams.set("response_type", "code");
   url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("scope", GMAIL_OAUTH_SCOPES.join(" "));
@@ -3423,8 +3423,8 @@ async function gmailTokenRequest(
   body: Record<string, string>,
   fetcher: typeof fetch
 ): Promise<GmailTokenResponse> {
-  const clientId = requireEnv(env.LOCALITY_GMAIL_CLIENT_ID, "LOCALITY_GMAIL_CLIENT_ID");
-  const clientSecret = requireEnv(env.LOCALITY_GMAIL_CLIENT_SECRET, "LOCALITY_GMAIL_CLIENT_SECRET");
+  const clientId = requireEnv(env.LOCALITY_GOOGLE_CLIENT_ID, "LOCALITY_GOOGLE_CLIENT_ID");
+  const clientSecret = requireEnv(env.LOCALITY_GOOGLE_CLIENT_SECRET, "LOCALITY_GOOGLE_CLIENT_SECRET");
   const params = new URLSearchParams({ client_id: clientId, client_secret: clientSecret });
   for (const [key, value] of Object.entries(body)) {
     params.set(key, value);
@@ -3461,8 +3461,8 @@ function requireEnv(value: string | undefined, name: string): string {
 In `apps/oauth-service/src/types.ts`, add:
 
 ```ts
-LOCALITY_GMAIL_CLIENT_ID?: string;
-LOCALITY_GMAIL_CLIENT_SECRET?: string;
+LOCALITY_GOOGLE_CLIENT_ID?: string;
+LOCALITY_GOOGLE_CLIENT_SECRET?: string;
 LOCALITY_GMAIL_API_BASE_URL?: string;
 LOCALITY_GMAIL_AUTH_BASE_URL?: string;
 LOCALITY_GMAIL_REDIRECT_URIS?: string;
@@ -3496,7 +3496,7 @@ app.post("/v1/oauth/gmail/start", async (c) => {
   );
   return c.json({
     connector: "gmail",
-    client_id: c.env.LOCALITY_GMAIL_CLIENT_ID,
+    client_id: c.env.LOCALITY_GOOGLE_CLIENT_ID,
     authorization_url: gmailAuthorizeUrl(c.env, redirectUri, state),
     redirect_uri: redirectUri,
     session,
@@ -3560,8 +3560,8 @@ In `apps/oauth-service/README.md`, add Gmail sections for:
 POST /v1/oauth/gmail/start
 POST /v1/oauth/gmail/exchange
 POST /v1/oauth/gmail/refresh
-LOCALITY_GMAIL_CLIENT_ID
-LOCALITY_GMAIL_CLIENT_SECRET
+LOCALITY_GOOGLE_CLIENT_ID
+LOCALITY_GOOGLE_CLIENT_SECRET
 LOCALITY_GMAIL_REDIRECT_URIS
 ```
 

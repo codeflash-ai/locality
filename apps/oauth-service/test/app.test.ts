@@ -29,13 +29,11 @@ const env: BrokerEnv = {
   LOCALITY_NOTION_API_BASE_URL: "https://notion.example.test",
   LOCALITY_NOTION_AUTH_BASE_URL: "https://notion.example.test",
   LOCALITY_NOTION_REDIRECT_URIS: "http://localhost:8757/oauth/notion/callback",
-  LOCALITY_GOOGLE_DOCS_CLIENT_ID: "google-docs-client-id",
-  LOCALITY_GOOGLE_DOCS_CLIENT_SECRET: "google-docs-client-secret",
+  LOCALITY_GOOGLE_CLIENT_ID: "google-client-id",
+  LOCALITY_GOOGLE_CLIENT_SECRET: "google-client-secret",
   LOCALITY_GOOGLE_DOCS_API_BASE_URL: "https://oauth2.example.test",
   LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL: "https://accounts.example.test",
   LOCALITY_GOOGLE_DOCS_REDIRECT_URIS: "http://localhost:8757/oauth/google-docs/callback",
-  LOCALITY_GMAIL_CLIENT_ID: "gmail-client-id",
-  LOCALITY_GMAIL_CLIENT_SECRET: "gmail-client-secret",
   LOCALITY_GMAIL_API_BASE_URL: "https://oauth2.example.test",
   LOCALITY_GMAIL_AUTH_BASE_URL: "https://accounts.example.test",
   LOCALITY_GMAIL_REDIRECT_URIS: "http://localhost:8757/oauth/gmail/callback"
@@ -249,8 +247,8 @@ describe("auth broker", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as StartResponse;
     expect(body.connector).toBe("google-docs");
-    expect(body.client_id).toBe("google-docs-client-id");
-    expect(body.authorization_url).toContain("client_id=google-docs-client-id");
+    expect(body.client_id).toBe("google-client-id");
+    expect(body.authorization_url).toContain("client_id=google-client-id");
     expect(body.authorization_url).toContain("response_type=code");
     expect(body.authorization_url).toContain("access_type=offline");
     expect(body.authorization_url).toContain("prompt=consent");
@@ -307,8 +305,8 @@ describe("auth broker", () => {
       })
     );
     const requestBody = new URLSearchParams((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
-    expect(requestBody.get("client_id")).toBe("google-docs-client-id");
-    expect(requestBody.get("client_secret")).toBe("google-docs-client-secret");
+    expect(requestBody.get("client_id")).toBe("google-client-id");
+    expect(requestBody.get("client_secret")).toBe("google-client-secret");
     expect(requestBody.get("grant_type")).toBe("authorization_code");
   });
 
@@ -372,10 +370,10 @@ describe("auth broker", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as StartResponse;
     expect(body.connector).toBe("gmail");
-    expect(body.client_id).toBe("gmail-client-id");
+    expect(body.client_id).toBe("google-client-id");
     const authorizationUrl = new URL(body.authorization_url);
     expect(`${authorizationUrl.origin}${authorizationUrl.pathname}`).toBe("https://accounts.example.test/o/oauth2/v2/auth");
-    expect(authorizationUrl.searchParams.get("client_id")).toBe("gmail-client-id");
+    expect(authorizationUrl.searchParams.get("client_id")).toBe("google-client-id");
     expect(authorizationUrl.searchParams.get("response_type")).toBe("code");
     expect(authorizationUrl.searchParams.get("redirect_uri")).toBe("http://localhost:8757/oauth/gmail/callback");
     expect(authorizationUrl.searchParams.get("scope")?.split(" ").sort()).toEqual(
@@ -444,8 +442,8 @@ describe("auth broker", () => {
       })
     );
     const requestBody = new URLSearchParams((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
-    expect(requestBody.get("client_id")).toBe("gmail-client-id");
-    expect(requestBody.get("client_secret")).toBe("gmail-client-secret");
+    expect(requestBody.get("client_id")).toBe("google-client-id");
+    expect(requestBody.get("client_secret")).toBe("google-client-secret");
     expect(requestBody.get("grant_type")).toBe("authorization_code");
     expect(requestBody.get("code")).toBe("authorization-code");
     expect(requestBody.get("redirect_uri")).toBe("http://localhost:8757/oauth/gmail/callback");

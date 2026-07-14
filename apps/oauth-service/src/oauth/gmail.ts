@@ -1,5 +1,6 @@
-import { configError, upstreamError } from "../http/errors";
+import { upstreamError } from "../http/errors";
 import type { BrokerEnv } from "../types";
+import { googleClientId, googleClientSecret } from "./google";
 
 export const GMAIL_OAUTH_SCOPES = [
   "openid",
@@ -20,7 +21,7 @@ export interface GmailTokenResponse {
 
 export function gmailAuthorizeUrl(env: BrokerEnv, redirectUri: string, state: string): string {
   const url = new URL(`${gmailAuthBaseUrl(env)}/o/oauth2/v2/auth`);
-  url.searchParams.set("client_id", requireEnv(env.LOCALITY_GMAIL_CLIENT_ID, "LOCALITY_GMAIL_CLIENT_ID"));
+  url.searchParams.set("client_id", googleClientId(env));
   url.searchParams.set("response_type", "code");
   url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("scope", GMAIL_OAUTH_SCOPES.join(" "));
@@ -68,8 +69,8 @@ async function gmailTokenRequest(
   body: Record<string, string>,
   fetcher: typeof fetch
 ): Promise<GmailTokenResponse> {
-  const clientId = requireEnv(env.LOCALITY_GMAIL_CLIENT_ID, "LOCALITY_GMAIL_CLIENT_ID");
-  const clientSecret = requireEnv(env.LOCALITY_GMAIL_CLIENT_SECRET, "LOCALITY_GMAIL_CLIENT_SECRET");
+  const clientId = googleClientId(env);
+  const clientSecret = googleClientSecret(env);
   const params = new URLSearchParams({
     client_id: clientId,
     client_secret: clientSecret,
@@ -94,11 +95,4 @@ function gmailAuthBaseUrl(env: BrokerEnv): string {
 
 function gmailApiBaseUrl(env: BrokerEnv): string {
   return (env.LOCALITY_GMAIL_API_BASE_URL ?? "https://oauth2.googleapis.com").replace(/\/+$/, "");
-}
-
-function requireEnv(value: string | undefined, name: string): string {
-  if (!value) {
-    throw configError(`${name} is required`);
-  }
-  return value;
 }

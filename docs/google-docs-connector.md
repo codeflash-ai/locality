@@ -25,6 +25,10 @@ The Google Docs OAuth flow uses the Locality OAuth broker and requests:
 - `https://www.googleapis.com/auth/drive.file`
 - `https://www.googleapis.com/auth/drive.metadata`
 
+The broker uses the shared `LOCALITY_GOOGLE_CLIENT_ID` and
+`LOCALITY_GOOGLE_CLIENT_SECRET` pair for both Google Docs and Gmail. The Google
+OAuth client must allow the Google Docs and Gmail localhost callbacks.
+
 `documents` is used for Google Docs body read/write. `drive.file` keeps write
 access limited to app-created or explicitly granted files. `drive.metadata`
 allows Locality to discover Drive metadata for Google Docs and folders inside
