@@ -1,12 +1,15 @@
 use loc_cli::connect::{
-    BrokerOAuthConnectOptions, ConnectOptions, DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID,
-    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID,
+    BrokerOAuthConnectOptions, ConnectOptions, DEFAULT_GMAIL_OAUTH_PROFILE_ID,
+    DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID, DEFAULT_NOTION_OAUTH_PROFILE_ID,
+    DEFAULT_NOTION_PROFILE_ID, GmailBrokerOAuthConnectOptions, GmailOAuthBrokerExchange,
     GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange, NotionConnectionProbe,
     NotionConnectionProbeResult, NotionOAuthBrokerExchange, NotionOAuthExchange,
-    OAuthConnectOptions, run_connect_google_docs_broker_oauth, run_connect_notion,
-    run_connect_notion_broker_oauth, run_connect_notion_oauth, run_disconnect, run_profiles,
+    OAuthConnectOptions, run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth,
+    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth, run_disconnect,
+    run_profiles,
 };
 use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
+use locality_gmail::{GMAIL_OAUTH_SCOPES, StoredGmailCredential};
 use locality_google_docs::{GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential};
 use locality_notion::oauth::{
     NotionOAuthBrokerCodeExchange, NotionOAuthCodeExchange, NotionOAuthToken,
@@ -211,6 +214,54 @@ fn connect_google_docs_broker_oauth_stores_refresh_handle_without_secrets() {
         .get("connection:docs-work")
         .expect("credential saved");
     let stored = serde_json::from_str::<StoredGoogleDocsCredential>(&secret).expect("stored oauth");
+    assert_eq!(
+        stored.refresh_token_handle.as_deref(),
+        Some("opaque-refresh-handle")
+    );
+    assert_eq!(
+        stored.oauth_broker_url.as_deref(),
+        Some("https://auth.example.test")
+    );
+
+    let json = serde_json::to_string(&report).expect("json");
+    assert!(!json.contains("oauth-access-token"));
+    assert!(!json.contains("opaque-refresh-handle"));
+    assert!(!json.contains("client-secret"));
+    assert!(!json.contains("secret_ref"));
+}
+
+#[test]
+fn connect_gmail_broker_oauth_stores_refresh_handle_without_secrets() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = FakeGmailBrokerOAuthExchange;
+
+    let report = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        GmailBrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("gmail-default")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "gmail-client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/gmail/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect("connect gmail oauth");
+
+    assert_eq!(report.connection_id, "gmail-default");
+    assert_eq!(report.profile_id, DEFAULT_GMAIL_OAUTH_PROFILE_ID);
+    assert_eq!(report.connector, "gmail");
+    assert_eq!(report.auth_kind, "oauth");
+    assert_eq!(report.account_label.as_deref(), Some("user@example.com"));
+
+    let secret = credentials
+        .get("connection:gmail-default")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredGmailCredential>(&secret).expect("stored oauth");
     assert_eq!(
         stored.refresh_token_handle.as_deref(),
         Some("opaque-refresh-handle")
@@ -442,6 +493,39 @@ impl GoogleDocsOAuthBrokerExchange for FakeGoogleDocsBrokerOAuthExchange {
             workspace_id: Some("google-drive".to_string()),
             workspace_name: Some("Google Drive".to_string()),
             scopes: GOOGLE_DOCS_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FakeGmailBrokerOAuthExchange;
+
+impl GmailOAuthBrokerExchange for FakeGmailBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "gmail");
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/gmail/callback"
+        );
+        Ok(OAuthBrokerToken {
+            access_token: "oauth-access-token".to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: Some(3600),
+            refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+            account_id: Some("acct-1".to_string()),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("gmail".to_string()),
+            workspace_name: Some("Gmail".to_string()),
+            scopes: GMAIL_OAUTH_SCOPES
                 .iter()
                 .map(|scope| scope.to_string())
                 .collect(),

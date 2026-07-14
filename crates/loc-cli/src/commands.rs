@@ -17,6 +17,10 @@ use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEn
 use locality_core::path_projection::{
     page_container_path, page_document_path, page_listing_parent_path,
 };
+use locality_gmail::{
+    DEFAULT_GMAIL_OAUTH_BROKER_URL, DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID,
+    HttpGmailOAuthBrokerClient,
+};
 use locality_google_docs::{
     DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
     GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
@@ -50,10 +54,11 @@ use serde_json::Value;
 
 use crate::connect::{
     BrokerOAuthConnectOptions, ConnectError, ConnectOptions, ConnectReport, ConnectionShowReport,
-    ConnectionsReport, DisconnectReport, GoogleDocsBrokerOAuthConnectOptions,
-    HttpNotionConnectionProbe, OAuthConnectOptions, ProfilesReport,
-    run_connect_google_docs_broker_oauth, run_connect_notion, run_connect_notion_broker_oauth,
-    run_connect_notion_oauth, run_connection_show, run_connections, run_disconnect, run_profiles,
+    ConnectionsReport, DisconnectReport, GmailBrokerOAuthConnectOptions,
+    GoogleDocsBrokerOAuthConnectOptions, HttpNotionConnectionProbe, OAuthConnectOptions,
+    ProfilesReport, run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth,
+    run_connect_notion, run_connect_notion_broker_oauth, run_connect_notion_oauth,
+    run_connection_show, run_connections, run_disconnect, run_profiles,
 };
 use crate::connector::{
     ConnectorResolveError, SourceDescriptor, resolve_notion_connector_for_mount,
@@ -216,6 +221,8 @@ enum ConnectCommand {
     Notion(ConnectNotionArgs),
     #[command(name = "google-docs", about = "Connect Google Docs")]
     GoogleDocs(ConnectGoogleDocsArgs),
+    #[command(about = "Connect Gmail")]
+    Gmail(ConnectGmailArgs),
 }
 
 #[derive(Debug, Args)]
@@ -251,6 +258,26 @@ struct ConnectGoogleDocsArgs {
         long,
         value_name = "ID",
         help = "Connection id to save. Defaults to google-docs-default."
+    )]
+    name: Option<String>,
+    #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
+    no_browser: bool,
+    #[arg(long, value_name = "URL", help = "OAuth broker base URL.")]
+    broker_url: Option<String>,
+    #[arg(
+        long,
+        value_name = "URI",
+        help = "OAuth redirect URI for the local callback listener."
+    )]
+    redirect_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ConnectGmailArgs {
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Connection id to save. Defaults to gmail-default."
     )]
     name: Option<String>,
     #[arg(long, help = "Print the OAuth URL instead of opening a browser.")]
@@ -344,6 +371,8 @@ enum MountCommand {
     Notion(MountNotionArgs),
     #[command(name = "google-docs", about = "Mount Google Docs content")]
     GoogleDocs(MountGoogleDocsArgs),
+    #[command(about = "Mount Gmail")]
+    Gmail(MountGmailArgs),
 }
 
 #[derive(Debug, Args)]
@@ -406,6 +435,34 @@ struct MountGoogleDocsArgs {
         long,
         value_name = "id",
         help = "Mount id to save. Defaults to google-docs-main, or a connection/root-derived id when needed."
+    )]
+    mount_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "mode",
+        help = "Projection mode. Supported values depend on the host platform."
+    )]
+    projection: Option<String>,
+    #[arg(
+        long,
+        help = "Register the mount as read-only and block push operations."
+    )]
+    read_only: bool,
+}
+
+#[derive(Debug, Args)]
+struct MountGmailArgs {
+    #[arg(
+        value_name = "path",
+        help = "Local directory where the Gmail mount should be registered."
+    )]
+    path: String,
+    #[arg(long, value_name = "id", help = "Connection id to use for this mount.")]
+    connection: Option<String>,
+    #[arg(
+        long,
+        value_name = "id",
+        help = "Mount id to save. Defaults to gmail-main."
     )]
     mount_id: Option<String>,
     #[arg(
@@ -838,6 +895,21 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         options.redirect_uri.as_deref(),
                     );
                 }
+                ConnectCommand::Gmail(options) => {
+                    args.push("gmail".to_string());
+                    push_optional_flag_value(&mut args, "--name", options.name.as_deref());
+                    push_flag(&mut args, "--no-browser", options.no_browser);
+                    push_optional_flag_value(
+                        &mut args,
+                        "--broker-url",
+                        options.broker_url.as_deref(),
+                    );
+                    push_optional_flag_value(
+                        &mut args,
+                        "--redirect-uri",
+                        options.redirect_uri.as_deref(),
+                    );
+                }
             }
         }
         LocalityCommand::Connections => args.push("connections".to_string()),
@@ -910,6 +982,22 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                     args.push(options.path.clone());
                     args.push("--workspace-folder".to_string());
                     args.push(options.workspace_folder.clone());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--connection",
+                        options.connection.as_deref(),
+                    );
+                    push_optional_flag_value(&mut args, "--mount-id", options.mount_id.as_deref());
+                    push_optional_flag_value(
+                        &mut args,
+                        "--projection",
+                        options.projection.as_deref(),
+                    );
+                    push_flag(&mut args, "--read-only", options.read_only);
+                }
+                MountCommand::Gmail(options) => {
+                    args.push("gmail".to_string());
+                    args.push(options.path.clone());
                     push_optional_flag_value(
                         &mut args,
                         "--connection",
@@ -1242,6 +1330,9 @@ fn reset(args: &[String], json: bool) -> i32 {
 
 fn connect(args: &[String], json: bool) -> i32 {
     let connector = first_positional(args);
+    if connector == Some(GMAIL_CONNECTOR_ID) {
+        return connect_gmail(args, json);
+    }
     if connector == Some(GOOGLE_DOCS_CONNECTOR_ID) {
         return connect_google_docs(args, json);
     }
@@ -1251,7 +1342,7 @@ fn connect(args: &[String], json: bool) -> i32 {
             CommandError::new(
                 "connect",
                 "usage",
-                "usage: loc connect <notion|google-docs> [options] [--json]",
+                "usage: loc connect <notion|google-docs|gmail> [options] [--json]",
             ),
             EXIT_USAGE,
         );
@@ -1549,6 +1640,77 @@ fn connect_google_docs(args: &[String], json: bool) -> i32 {
         redirect_uri: start.redirect_uri,
     };
     match run_connect_google_docs_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
+        Ok(report) if json => {
+            print_json(&report);
+            EXIT_SUCCESS
+        }
+        Ok(report) => {
+            print_connect_report(&report);
+            EXIT_SUCCESS
+        }
+        Err(error) => connect_command_error("connect", json, error),
+    }
+}
+
+fn connect_gmail(args: &[String], json: bool) -> i32 {
+    let state_root = default_state_root();
+    let mut store = match SqliteStateStore::open(state_root.clone()) {
+        Ok(store) => store,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new("connect", "store_open_failed", error.to_string()),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let credentials = open_credential_store(&state_root);
+    let broker_config = match gmail_oauth_broker_config(args) {
+        Ok(config) => config,
+        Err(error) => return command_error(json, error, EXIT_INTERNAL),
+    };
+    let broker = HttpGmailOAuthBrokerClient::new(broker_config.broker_url.clone());
+    let start = match broker.start(&OAuthBrokerStart {
+        connector: GMAIL_CONNECTOR_ID.to_string(),
+        redirect_uri: broker_config.redirect_uri,
+    }) {
+        Ok(start) => start,
+        Err(error) => {
+            return command_error(
+                json,
+                CommandError::new(
+                    "connect",
+                    "oauth_broker_start_failed",
+                    format!("Gmail OAuth broker start failed: {error}"),
+                )
+                .with_suggested_command("loc connect gmail"),
+                EXIT_INTERNAL,
+            );
+        }
+    };
+    let authorization = match run_local_oauth_authorization(
+        "Gmail",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        has_flag(args, "--no-browser"),
+        json,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return command_error(json, gmail_local_oauth_command_error(error), EXIT_INTERNAL);
+        }
+    };
+    let options = GmailBrokerOAuthConnectOptions {
+        connection_id: flag_value(args, "--name").map(ConnectionId::new),
+        broker_url: broker_config.broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+    match run_connect_gmail_broker_oauth(&mut store, credentials.as_ref(), options, &broker) {
         Ok(report) if json => {
             print_json(&report);
             EXIT_SUCCESS
@@ -2405,9 +2567,8 @@ fn mount_remote_root_id(
             let connector =
                 resolve_google_docs_connector_for_mount(store, credentials.as_ref(), &temp_mount)
                     .map_err(|error| connector_resolve_command_error("mount", error))?;
-            let folder_id = connector
-                .resolve_workspace_folder(workspace_folder)
-                .map_err(|error| {
+            let folder_id = connector.resolve_workspace_folder(workspace_folder).map_err(
+                |error| {
                     CommandError::new(
                         "mount",
                         "workspace_folder_error",
@@ -2416,8 +2577,22 @@ fn mount_remote_root_id(
                         ),
                     )
                     .with_suggested_command("loc connect google-docs")
-                })?;
+                },
+            )?;
             Ok(Some(folder_id))
+        }
+        GMAIL_CONNECTOR_ID => {
+            if has_flag(args, "--workspace")
+                || flag_value(args, "--root-page").is_some()
+                || flag_value(args, "--workspace-folder").is_some()
+            {
+                return Err(CommandError::new(
+                    "mount",
+                    "usage",
+                    "loc mount gmail does not accept Notion or Google Docs root flags",
+                ));
+            }
+            Ok(None)
         }
         connector => Err(CommandError::new(
             "mount",
@@ -6250,6 +6425,12 @@ struct GoogleDocsOAuthBrokerCliConfig {
     redirect_uri: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GmailOAuthBrokerCliConfig {
+    broker_url: String,
+    redirect_uri: String,
+}
+
 fn notion_oauth_config(args: &[String]) -> Result<NotionOAuthCliConfig, CommandError> {
     let client_id = env_first(&["LOCALITY_NOTION_OAUTH_CLIENT_ID", "NOTION_OAUTH_CLIENT_ID"])
         .ok_or_else(|| missing_oauth_config("LOCALITY_NOTION_OAUTH_CLIENT_ID"))?;
@@ -6339,6 +6520,32 @@ fn google_docs_oauth_broker_config(
     })
 }
 
+fn gmail_oauth_broker_config(args: &[String]) -> Result<GmailOAuthBrokerCliConfig, CommandError> {
+    let broker_url = flag_value(args, "--broker-url")
+        .map(str::to_string)
+        .or_else(|| {
+            env_first(&[
+                "LOCALITY_GMAIL_OAUTH_BROKER_URL",
+                "LOCALITY_AUTH_BROKER_URL",
+            ])
+        })
+        .unwrap_or_else(|| DEFAULT_GMAIL_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = flag_value(args, "--redirect-uri")
+        .map(str::to_string)
+        .or_else(|| env_first(&["LOCALITY_GMAIL_OAUTH_REDIRECT_URI"]))
+        .unwrap_or_else(|| DEFAULT_GMAIL_OAUTH_REDIRECT_URI.to_string());
+
+    local_redirect(&redirect_uri).map_err(|error| {
+        CommandError::new("connect", error.code, error.message)
+            .with_suggested_command("loc connect gmail")
+    })?;
+
+    Ok(GmailOAuthBrokerCliConfig {
+        broker_url,
+        redirect_uri,
+    })
+}
+
 fn missing_oauth_config(name: &str) -> CommandError {
     CommandError::new(
         "connect",
@@ -6409,6 +6616,15 @@ fn google_docs_local_oauth_command_error(error: LocalOAuthError) -> CommandError
     let command_error = CommandError::new("connect", error.code, error.message);
     if command_error.code == "invalid_redirect_uri" {
         command_error.with_suggested_command("loc connect google-docs")
+    } else {
+        command_error
+    }
+}
+
+fn gmail_local_oauth_command_error(error: LocalOAuthError) -> CommandError {
+    let command_error = CommandError::new("connect", error.code, error.message);
+    if command_error.code == "invalid_redirect_uri" {
+        command_error.with_suggested_command("loc connect gmail")
     } else {
         command_error
     }
@@ -7199,7 +7415,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -7691,6 +7907,7 @@ mod tests {
                     "Commands:",
                     "notion",
                     "google-docs",
+                    "gmail",
                     "--json",
                 ],
             ),
@@ -7708,6 +7925,15 @@ mod tests {
                 vec![
                     "Usage: loc connect google-docs",
                     "Connect Google Docs",
+                    "--broker-url",
+                    "--redirect-uri",
+                ],
+            ),
+            (
+                vec!["connect", "gmail", "--help"],
+                vec![
+                    "Usage: loc connect gmail",
+                    "Connect Gmail",
                     "--broker-url",
                     "--redirect-uri",
                 ],
@@ -7781,6 +8007,7 @@ mod tests {
                     "Commands:",
                     "notion",
                     "google-docs",
+                    "gmail",
                     "--json",
                 ],
             ),
@@ -7799,6 +8026,15 @@ mod tests {
                     "Usage: loc mount google-docs",
                     "Mount Google Docs content",
                     "--workspace-folder",
+                ],
+            ),
+            (
+                vec!["mount", "gmail", "--help"],
+                vec![
+                    "Usage: loc mount gmail",
+                    "Mount Gmail",
+                    "--connection",
+                    "--projection",
                 ],
             ),
             (
@@ -8129,6 +8365,56 @@ mod tests {
                 "https://auth.example.test",
                 "--redirect-uri",
                 "http://localhost:8757/oauth/google-docs/callback"
+            ]
+        );
+
+        let cli = parse_cli([
+            "connect",
+            "gmail",
+            "--name",
+            "gmail-work",
+            "--no-browser",
+            "--broker-url",
+            "https://auth.example.test",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "connect",
+                "gmail",
+                "--name",
+                "gmail-work",
+                "--no-browser",
+                "--broker-url",
+                "https://auth.example.test"
+            ]
+        );
+
+        let cli = parse_cli([
+            "mount",
+            "gmail",
+            "/tmp/Locality/gmail-main",
+            "--connection",
+            "gmail-work",
+            "--mount-id",
+            "gmail-main",
+            "--projection",
+            "plain-files",
+            "--read-only",
+        ]);
+        assert_eq!(
+            legacy_args_for_command(cli.command.as_ref().expect("command")),
+            vec![
+                "mount",
+                "gmail",
+                "/tmp/Locality/gmail-main",
+                "--connection",
+                "gmail-work",
+                "--mount-id",
+                "gmail-main",
+                "--projection",
+                "plain-files",
+                "--read-only"
             ]
         );
 

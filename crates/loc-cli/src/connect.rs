@@ -2,6 +2,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
+use locality_gmail::{
+    GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, HttpGmailOAuthBrokerClient, StoredGmailCredential,
+    gmail_capabilities_json,
+};
 use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, HttpGoogleDocsOAuthBrokerClient,
     StoredGoogleDocsCredential, google_docs_capabilities_json,
@@ -22,6 +26,7 @@ use serde::Serialize;
 pub const DEFAULT_NOTION_PROFILE_ID: &str = "notion-token-default";
 pub const DEFAULT_NOTION_OAUTH_PROFILE_ID: &str = "notion-oauth-default";
 pub const DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID: &str = "google-docs-oauth-default";
+pub const DEFAULT_GMAIL_OAUTH_PROFILE_ID: &str = "gmail-oauth-default";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
@@ -51,6 +56,17 @@ pub struct BrokerOAuthConnectOptions {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GoogleDocsBrokerOAuthConnectOptions {
+    pub connection_id: Option<ConnectionId>,
+    pub broker_url: String,
+    pub client_id: String,
+    pub session: String,
+    pub state: String,
+    pub code: String,
+    pub redirect_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GmailBrokerOAuthConnectOptions {
     pub connection_id: Option<ConnectionId>,
     pub broker_url: String,
     pub client_id: String,
@@ -166,6 +182,13 @@ pub trait GoogleDocsOAuthBrokerExchange {
     ) -> Result<OAuthBrokerToken, ConnectError>;
 }
 
+pub trait GmailOAuthBrokerExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, ConnectError>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HttpNotionConnectionProbe;
 
@@ -214,6 +237,16 @@ impl GoogleDocsOAuthBrokerExchange for HttpGoogleDocsOAuthBrokerClient {
         request: &OAuthBrokerCodeExchange,
     ) -> Result<OAuthBrokerToken, ConnectError> {
         HttpGoogleDocsOAuthBrokerClient::exchange_code(self, request)
+            .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))
+    }
+}
+
+impl GmailOAuthBrokerExchange for HttpGmailOAuthBrokerClient {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, ConnectError> {
+        HttpGmailOAuthBrokerClient::exchange_code(self, request)
             .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))
     }
 }
@@ -533,6 +566,95 @@ where
     })
 }
 
+pub fn run_connect_gmail_broker_oauth<S, E>(
+    store: &mut S,
+    credentials: &dyn CredentialStore,
+    options: GmailBrokerOAuthConnectOptions,
+    exchange: &E,
+) -> Result<ConnectReport, ConnectError>
+where
+    S: ConnectionRepository + ConnectorProfileRepository,
+    E: GmailOAuthBrokerExchange,
+{
+    let connection_id = match options.connection_id {
+        Some(connection_id) => connection_id,
+        None => default_connection_id_for_connector(
+            store,
+            GMAIL_CONNECTOR_ID,
+            "gmail-default",
+            "Gmail",
+        )?,
+    };
+    let exchange_request = OAuthBrokerCodeExchange {
+        connector: GMAIL_CONNECTOR_ID.to_string(),
+        session: options.session,
+        state: options.state,
+        code: options.code,
+        redirect_uri: options.redirect_uri,
+    };
+    let token = exchange.exchange_code(&exchange_request)?;
+    let acquired_at = timestamp_secs();
+    let secret_ref = format!("connection:{}", connection_id.0);
+    let stored = StoredGmailCredential::from_broker_token(
+        token.clone(),
+        options.client_id,
+        options.broker_url,
+        acquired_at,
+    );
+    let secret = serde_json::to_string(&stored)
+        .map_err(|error| ConnectError::CredentialEncode(error.to_string()))?;
+    credentials
+        .put(&secret_ref, &secret)
+        .map_err(ConnectError::Credential)?;
+
+    let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_GMAIL_OAUTH_PROFILE_ID);
+    store
+        .save_connector_profile(default_gmail_oauth_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+
+    let display_name = connection_id.0.clone();
+    let account_label = token
+        .account_label
+        .clone()
+        .or_else(|| token.account_id.clone())
+        .or_else(|| token.workspace_name.clone());
+    let connection = ConnectionRecord {
+        connection_id: connection_id.clone(),
+        profile_id: Some(profile_id.clone()),
+        connector: GMAIL_CONNECTOR_ID.to_string(),
+        display_name: display_name.clone(),
+        account_label: account_label.clone(),
+        workspace_id: token.workspace_id.clone(),
+        workspace_name: token.workspace_name.clone(),
+        auth_kind: "oauth".to_string(),
+        secret_ref,
+        scopes: token.scopes.clone(),
+        capabilities_json: gmail_capabilities_json()
+            .map_err(|error| ConnectError::CredentialEncode(error.to_string()))?,
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        expires_at: stored.expires_at.map(|expires_at| expires_at.to_string()),
+    };
+    store
+        .save_connection(connection)
+        .map_err(ConnectError::Store)?;
+
+    Ok(ConnectReport {
+        ok: true,
+        command: "connect",
+        connection_id: connection_id.0,
+        profile_id: profile_id.0,
+        connector: GMAIL_CONNECTOR_ID.to_string(),
+        display_name,
+        account_label,
+        workspace_id: token.workspace_id,
+        workspace_name: token.workspace_name,
+        auth_kind: "oauth".to_string(),
+    })
+}
+
 pub fn run_profiles<S>(store: &S) -> Result<ProfilesReport, ConnectError>
 where
     S: ConnectorProfileRepository,
@@ -754,6 +876,25 @@ fn default_google_docs_oauth_profile(now: String) -> ConnectorProfileRecord {
         capabilities_json: google_docs_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
         enabled_actions_json: "[\"read\",\"write\"]".to_string(),
         connector_version: "google-docs.v1".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn default_gmail_oauth_profile(now: String) -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new(DEFAULT_GMAIL_OAUTH_PROFILE_ID),
+        connector: GMAIL_CONNECTOR_ID.to_string(),
+        display_name: "Gmail OAuth".to_string(),
+        auth_kind: "oauth".to_string(),
+        scopes: GMAIL_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect(),
+        capabilities_json: gmail_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
+        enabled_actions_json: "[\"read\",\"send\"]".to_string(),
+        connector_version: "gmail.v1".to_string(),
         status: "active".to_string(),
         created_at: now.clone(),
         updated_at: now,
