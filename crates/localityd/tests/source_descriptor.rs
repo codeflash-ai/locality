@@ -1,7 +1,7 @@
 use locality_connector::Connector;
 use locality_connector::oauth_broker::OAuthBrokerToken;
 use locality_core::canonical::parse_canonical_markdown;
-use locality_core::model::{MountId, RemoteId};
+use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
@@ -54,6 +54,23 @@ fn google_docs_descriptor_comes_from_registry() {
         descriptor
             .mount_guidance()
             .contains("Docs manually added inside the workspace folder")
+    );
+}
+
+#[test]
+fn gmail_descriptor_comes_from_registry() {
+    let descriptor = source_descriptor("gmail");
+
+    assert_eq!(descriptor.id(), "gmail");
+    assert_eq!(descriptor.display_name(), "Gmail");
+    assert_eq!(descriptor.default_mount_id(), "gmail-main");
+    assert_eq!(descriptor.connect_command(), Some("loc connect gmail"));
+    assert_eq!(descriptor.auth_env_var(), None);
+    assert!(descriptor.supports_oauth());
+    assert!(descriptor.mount_guidance().contains("Gmail facts"));
+    assert_eq!(
+        descriptor.create_entity_parent_kinds(),
+        &[EntityKind::Directory]
     );
 }
 
@@ -145,8 +162,11 @@ fn save_google_docs_oauth_connection(store: &mut InMemoryStateStore) -> (Connect
 }
 
 #[test]
-fn supported_source_connectors_lists_runtime_registered_connectors() {
-    assert_eq!(supported_source_connectors(), vec!["notion", "google-docs"]);
+fn supported_source_connectors_include_gmail() {
+    assert_eq!(
+        supported_source_connectors(),
+        vec!["notion", "google-docs", "gmail"]
+    );
 }
 
 #[test]

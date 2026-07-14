@@ -21,6 +21,7 @@ use locality_core::planner::PushOperationKind;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
+use locality_gmail::{GMAIL_CONNECTOR_ID, GmailConnector};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, GoogleDocsConnector};
 use locality_notion::NotionConnector;
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
@@ -30,6 +31,7 @@ use locality_store::{
 };
 
 use crate::file_provider;
+use crate::gmail::resolve_gmail_connector_for_mount;
 use crate::google_docs::resolve_google_docs_connector_for_mount;
 use crate::hydration::{HydratedEntity, HydrationSource};
 use crate::notion::{ConnectorResolveError, resolve_notion_connector_for_mount};
@@ -41,6 +43,7 @@ const NOTION_AGENT_GUIDANCE: &str = include_str!("../../../templates/mount/AGENT
 pub enum ResolvedSource {
     Notion(NotionConnector),
     GoogleDocs(GoogleDocsConnector),
+    Gmail(GmailConnector),
 }
 
 pub trait SourceResolverStore: ConnectionRepository + ConnectorProfileRepository {}
@@ -78,6 +81,13 @@ const SOURCE_REGISTRY: &[SourceRegistration] = &[
         resolve: resolve_google_docs_source,
         validate_changed_frontmatter: crate::google_docs::validate_google_docs_frontmatter,
         validate_create_frontmatter: crate::google_docs::validate_google_docs_frontmatter,
+    },
+    SourceRegistration {
+        id: GMAIL_CONNECTOR_ID,
+        descriptor: gmail_source_descriptor,
+        resolve: resolve_gmail_source,
+        validate_changed_frontmatter: crate::gmail::validate_gmail_changed_frontmatter,
+        validate_create_frontmatter: crate::gmail::validate_gmail_create_frontmatter,
     },
 ];
 
@@ -138,9 +148,6 @@ impl SourceDescriptor {
 }
 
 pub fn source_descriptor(connector: &str) -> SourceDescriptor {
-    if connector == "gmail" {
-        return gmail_source_descriptor();
-    }
     source_registration(connector)
         .map(|registration| (registration.descriptor)())
         .unwrap_or_else(|| generic_source_descriptor(connector))
@@ -248,13 +255,13 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
 
 fn gmail_source_descriptor() -> SourceDescriptor {
     SourceDescriptor {
-        id: Cow::Borrowed("gmail"),
+        id: Cow::Borrowed(GMAIL_CONNECTOR_ID),
         display_name: Cow::Borrowed("Gmail"),
         default_mount_id: Cow::Borrowed("gmail-main"),
-        connect_command: None,
+        connect_command: Some(Cow::Borrowed("loc connect gmail")),
         auth_env_var: None,
         supports_oauth: true,
-        mount_guidance: Cow::Owned(generic_mount_guidance("Gmail")),
+        mount_guidance: Cow::Owned(gmail_mount_guidance()),
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
     }
@@ -275,6 +282,14 @@ fn resolve_google_docs_source(
 ) -> Result<ResolvedSource, ConnectorResolveError> {
     resolve_google_docs_connector_for_mount(store, credentials, mount)
         .map(ResolvedSource::GoogleDocs)
+}
+
+fn resolve_gmail_source(
+    store: &dyn SourceResolverStore,
+    credentials: &dyn CredentialStore,
+    mount: &MountConfig,
+) -> Result<ResolvedSource, ConnectorResolveError> {
+    resolve_gmail_connector_for_mount(store, credentials, mount).map(ResolvedSource::Gmail)
 }
 
 fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
@@ -341,6 +356,17 @@ Google Docs facts:\n\
 - Pull enumerates Google Docs and Drive folders under the configured workspace folder, including Docs manually added inside the workspace folder.\n\
 - Non-Google-Docs Drive files are ignored by this connector in V1.\n",
         generic_mount_guidance("Google Docs")
+    )
+}
+
+fn gmail_mount_guidance() -> String {
+    format!(
+        "{}\n\
+Gmail facts:\n\
+- This mount projects Gmail inbox/, sent/, and draft/ folders.\n\
+- inbox/ and sent/ are read-only. Create a Markdown file directly under draft/ to send mail.\n\
+- Draft creates require `to` frontmatter and either `subject` or `title` frontmatter.\n",
+        generic_mount_guidance("Gmail")
     )
 }
 
@@ -420,6 +446,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.kind(),
             Self::GoogleDocs(source) => source.kind(),
+            Self::Gmail(source) => source.kind(),
         }
     }
 
@@ -427,6 +454,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.capabilities(),
             Self::GoogleDocs(source) => source.capabilities(),
+            Self::Gmail(source) => source.capabilities(),
         }
     }
 
@@ -434,6 +462,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.supported_push_operations(),
             Self::GoogleDocs(source) => source.supported_push_operations(),
+            Self::Gmail(source) => source.supported_push_operations(),
         }
     }
 
@@ -441,6 +470,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.enumerate(request),
             Self::GoogleDocs(source) => source.enumerate(request),
+            Self::Gmail(source) => source.enumerate(request),
         }
     }
 
@@ -448,6 +478,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.observe(request),
             Self::GoogleDocs(source) => source.observe(request),
+            Self::Gmail(source) => source.observe(request),
         }
     }
 
@@ -455,6 +486,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.list_children(request),
             Self::GoogleDocs(source) => source.list_children(request),
+            Self::Gmail(source) => source.list_children(request),
         }
     }
 
@@ -462,6 +494,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.fetch(request),
             Self::GoogleDocs(source) => source.fetch(request),
+            Self::Gmail(source) => source.fetch(request),
         }
     }
 
@@ -469,6 +502,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.render(entity),
             Self::GoogleDocs(source) => source.render(entity),
+            Self::Gmail(source) => source.render(entity),
         }
     }
 
@@ -476,6 +510,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.parse(document),
             Self::GoogleDocs(source) => source.parse(document),
+            Self::Gmail(source) => source.parse(document),
         }
     }
 
@@ -483,6 +518,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.check_concurrency(request),
             Self::GoogleDocs(source) => source.check_concurrency(request),
+            Self::Gmail(source) => source.check_concurrency(request),
         }
     }
 
@@ -490,6 +526,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.apply(request),
             Self::GoogleDocs(source) => source.apply(request),
+            Self::Gmail(source) => source.apply(request),
         }
     }
 
@@ -497,6 +534,7 @@ impl Connector for ResolvedSource {
         match self {
             Self::Notion(source) => source.apply_undo(request),
             Self::GoogleDocs(source) => source.apply_undo(request),
+            Self::Gmail(source) => source.apply_undo(request),
         }
     }
 }
@@ -506,6 +544,7 @@ impl HydrationSource for ResolvedSource {
         match self {
             Self::Notion(source) => source.fetch_render(request),
             Self::GoogleDocs(source) => source.fetch_render(request),
+            Self::Gmail(source) => source.fetch_render(request),
         }
     }
 
@@ -513,6 +552,7 @@ impl HydrationSource for ResolvedSource {
         match self {
             Self::Notion(source) => source.fetch_database_schema_yaml(database_id),
             Self::GoogleDocs(source) => source.fetch_database_schema_yaml(database_id),
+            Self::Gmail(source) => source.fetch_database_schema_yaml(database_id),
         }
     }
 }
@@ -564,6 +604,7 @@ impl SourcePushValidator for ResolvedSource {
         match self {
             Self::Notion(source) => source.validate_changed_frontmatter(context),
             Self::GoogleDocs(source) => source.validate_changed_frontmatter(context),
+            Self::Gmail(source) => source.validate_changed_frontmatter(context),
         }
     }
 
@@ -574,6 +615,7 @@ impl SourcePushValidator for ResolvedSource {
         match self {
             Self::Notion(source) => source.validate_create_frontmatter(context),
             Self::GoogleDocs(source) => source.validate_create_frontmatter(context),
+            Self::Gmail(source) => source.validate_create_frontmatter(context),
         }
     }
 }
@@ -586,6 +628,7 @@ impl SourceAdapter for ResolvedSource {
         match self {
             Self::Notion(source) => Self::Notion(source.scoped_to_mount(mount)),
             Self::GoogleDocs(source) => Self::GoogleDocs(source.scoped_to_mount(mount)),
+            Self::Gmail(source) => Self::Gmail(source.scoped_to_mount(mount)),
         }
     }
 
@@ -593,6 +636,7 @@ impl SourceAdapter for ResolvedSource {
         match self {
             Self::Notion(source) => SourceAdapter::database_schema_yaml(source, database_id),
             Self::GoogleDocs(source) => SourceAdapter::database_schema_yaml(source, database_id),
+            Self::Gmail(source) => SourceAdapter::database_schema_yaml(source, database_id),
         }
     }
 }

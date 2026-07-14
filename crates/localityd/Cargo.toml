@@ -21,6 +21,7 @@ locality-store.workspace = true
 locality-connector.workspace = true
 locality-notion.workspace = true
 locality-google-docs.workspace = true
+locality-gmail.workspace = true
 base64 = "0.22"
 getrandom = "0.3"
 notify = "8"

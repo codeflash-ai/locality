@@ -2232,6 +2232,7 @@ dependencies = [
  "getrandom 0.3.4",
  "locality-connector",
  "locality-core",
+ "locality-gmail",
  "locality-google-docs",
  "locality-notion",
  "locality-platform",
