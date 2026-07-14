@@ -11,6 +11,7 @@ name = "locality_gmail"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = "0.22"
 locality-core.workspace = true
 locality-connector.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls-no-provider"] }
