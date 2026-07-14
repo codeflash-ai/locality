@@ -773,6 +773,22 @@ function changeMatchesReviewFilter(change: PendingChange, filter: ReviewFilter) 
   return filter === "problems" ? isProblem : !isProblem;
 }
 
+function onboardingStepMeta(step: OnboardingStep) {
+  if (step === 2) {
+    return "Optional guide";
+  }
+  if (step === 3) {
+    return "2 of 4";
+  }
+  if (step === 4) {
+    return "3 of 4";
+  }
+  if (step === 5) {
+    return "4 of 4";
+  }
+  return "1 of 4";
+}
+
 function useMountLiveModeController(
   snapshot: DesktopSnapshot,
   onRefresh: () => Promise<void>,
@@ -1329,7 +1345,7 @@ function SetupLoading() {
               Checking setup
             </div>
             <h1>Checking your Locality setup</h1>
-            <p>Locality is checking your Notion connection and mount point.</p>
+            <p>Locality is checking your Notion connection and local folder.</p>
           </div>
         </SetupContent>
       </section>
@@ -1361,6 +1377,7 @@ function Onboarding({
   const [locatedItem, setLocatedItem] = useState<LocatedItem | null>(null);
   const [locateState, setLocateState] = useState<LocateState>("idle");
   const [locateError, setLocateError] = useState("");
+  const [optionalGuideReturnStep, setOptionalGuideReturnStep] = useState<OnboardingStep | null>(null);
   const [mountOnboarding, setMountOnboarding] = useState<WorkspaceMountOnboardingReport | null>(null);
   const [mounting, setMounting] = useState(false);
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
@@ -1693,6 +1710,27 @@ function Onboarding({
     onComplete();
   }
 
+  function openOptionalGuide(returnStep: OnboardingStep) {
+    setOptionalGuideReturnStep(returnStep);
+    setStep(2);
+  }
+
+  function closeOptionalGuide() {
+    const nextStep = optionalGuideReturnStep ?? 3;
+    setOptionalGuideReturnStep(null);
+    setStep(nextStep);
+  }
+
+  function continueFromOptionalGuide() {
+    if (optionalGuideReturnStep === 5) {
+      setOptionalGuideReturnStep(null);
+      finishOnboarding();
+      return;
+    }
+    setOptionalGuideReturnStep(null);
+    setStep(connectionReadyNow ? 4 : 3);
+  }
+
   async function locatePage() {
     if (!locateUrl.trim()) {
       return;
@@ -1731,18 +1769,21 @@ function Onboarding({
   return (
     <main className="setup-shell">
       <section className="setup-window">
-        <WindowChrome title="Locality Setup" meta={`${step} of 5`} />
+        <WindowChrome title="Locality Setup" meta={onboardingStepMeta(step)} />
         {step === 1 && (
           <SetupContent variant="hero" side={<ProductLoopDemo />}>
             <div>
               <div className="eyebrow">Meet Locality</div>
               <h1>Turn work apps into agent-ready files.</h1>
               <p>
-                Locality mounts tools like Notion as a local folder. Agents edit Markdown you can
+                Locality turns tools like Notion into a local folder. Agents edit Markdown you can
                 inspect, while Locality keeps the connected app in sync after review.
               </p>
             </div>
-            <PrimaryButton onClick={() => setStep(2)}>Set Up Locality</PrimaryButton>
+            <div className="button-row">
+              <PrimaryButton onClick={() => setStep(3)}>Get Started</PrimaryButton>
+              <SecondaryButton onClick={() => openOptionalGuide(1)}>How agents use it</SecondaryButton>
+            </div>
             <div className="onboarding-pill-row">
               <span>Finder-native files</span>
               <span>Markdown edits</span>
@@ -1754,15 +1795,22 @@ function Onboarding({
         {step === 2 && (
           <SetupContent side={<AgentWorkspaceDemo />}>
             <div>
-              <div className="eyebrow">How agents use it</div>
+              <div className="eyebrow">Optional agent guide</div>
               <h1>Agents work in files you can see.</h1>
               <p>
-                Each app appears as a folder. Pages and docs become page.md files that stay in sync
-                with the connected app. Locality adds AGENTS.md and CLAUDE.md so agents know how to
-                work in the folder safely.
+                Each connected source appears as a local folder. Pages and docs become page.md files.
+                Locality writes guidance files so agents understand what to edit, when to stop, and
+                how Review Center protects the remote app.
               </p>
             </div>
-            <PrimaryButton onClick={() => setStep(3)}>Continue</PrimaryButton>
+            <div className="button-row">
+              <PrimaryButton onClick={continueFromOptionalGuide}>
+                {optionalGuideReturnStep === 5 ? "Open Locality" : "Continue Setup"}
+              </PrimaryButton>
+              {optionalGuideReturnStep && (
+                <SecondaryButton onClick={closeOptionalGuide}>Back</SecondaryButton>
+              )}
+            </div>
           </SetupContent>
         )}
 
@@ -1771,7 +1819,7 @@ function Onboarding({
             side={<ConnectorOptions connected={connectionReadyNow} />}
           >
             <div>
-              <div className="eyebrow">Connect app</div>
+              <div className="eyebrow">Connect source</div>
               {(oauthInFlight || connectionReadyNow) && (
                 <div className={`sync-note ${connectionReadyNow ? "connected" : ""}`}>
                   {connectionReadyNow ? <Check /> : <Loader2 className="spin-icon" />}
@@ -1787,10 +1835,10 @@ function Onboarding({
               </h1>
               <p>
                 {connectionReadyNow
-                  ? `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare agent guidance.`
+                  ? `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare the local workspace.`
                   : oauthInFlight
                     ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
-                    : "Connect the workspace you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
+                    : "Connect the source you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
               </p>
             </div>
             {oauthInFlight && !connectionReadyNow && (
@@ -1839,7 +1887,7 @@ function Onboarding({
               <h1>{mountOnboardingHeadline(mountOnboarding)}</h1>
               <p>
                 {mountOnboarding?.message ??
-                  "Locality is creating your Notion folder under the default CloudStorage root and preparing agent guidance."}
+                  "Locality is creating your Notion folder under the default CloudStorage root and verifying that files appear locally."}
               </p>
             </div>
             <div className="sync-note">
@@ -1897,8 +1945,8 @@ function Onboarding({
             <div>
               <h1>Locality is ready!</h1>
               <p>
-                Your Notion mount point is ready. Agents can open this folder, edit
-                Markdown, and leave changes for Locality review. Open the app to review changes,
+                Your local workspace is ready. Agents can open this folder, edit
+                Markdown, and leave changes for Review Center. Open the app to review changes,
                 manage sync, and turn on Live Mode when you want file saves to update Notion and
                 new Notion changes to appear locally.
               </p>
@@ -1908,6 +1956,9 @@ function Onboarding({
               <PrimaryButton onClick={finishOnboarding}>
                 Open Locality
               </PrimaryButton>
+              <SecondaryButton onClick={() => openOptionalGuide(5)}>
+                View Optional Guide
+              </SecondaryButton>
             </div>
             <div className="folder-inline final-folder-card">
               <div className="ready-head">
@@ -1928,7 +1979,7 @@ function Onboarding({
               <div className="agent-demo-header">
                 <div>
                   <strong>Try this agent prompt</strong>
-                  <p>Claude, Codex are now setup to use Locality.</p>
+                  <p>Claude and Codex are now set up to use Locality.</p>
                 </div>
                 <SecondaryButton
                   onClick={() => copyText(finalPrompt)}
@@ -1981,7 +2032,7 @@ function AgentGuidanceSummary({
         <p>{fallbackTargets[0].detail}</p>
       )}
       {state !== "installing" && installedAgents.length === 0 && fallbackTargets.length === 0 && !failed && (
-        <p>Locality is preparing local agent instructions for this Notion mount point.</p>
+        <p>Locality is preparing local agent instructions for this source.</p>
       )}
       {failed && report?.targets.find((target) => target.status === "failed")?.detail && (
         <p>{report.targets.find((target) => target.status === "failed")?.detail}</p>
@@ -4125,7 +4176,7 @@ function SettingsView({
             busy={busySetting === "show_menu_bar"}
             onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
           />
-          <SettingRow title="Default Notion mount point" value="~/Library/CloudStorage/Locality/notion" />
+          <SettingRow title="Default Notion folder" value="~/Library/CloudStorage/Locality/notion" />
           {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
         </div>
 
@@ -5897,7 +5948,7 @@ function healthDescription(state: string, attentionCount: number) {
   if (state === "checking_freshness") {
     return "Locality is checking the local mount and Notion freshness state.";
   }
-  return "Notion is connected, the mount is ready, and remote writes remain explicit.";
+  return "Notion is connected, the local workspace is ready, and remote writes remain explicit.";
 }
 
 function healthTone(state: string): "ready" | "warn" | "danger" {
