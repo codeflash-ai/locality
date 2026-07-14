@@ -289,12 +289,14 @@ impl Connector for GmailConnector {
             {
                 Ok(sent) => sent,
                 Err(error) => {
-                    if let Some(sent) =
-                        find_sent_message_by_message_id(self.api.as_ref(), &message_id)?
-                    {
-                        sent
-                    } else {
-                        return Err(error);
+                    match find_sent_message_by_message_id(self.api.as_ref(), &message_id) {
+                        Ok(Some(sent)) => sent,
+                        Ok(None) => return Err(error),
+                        Err(lookup_error) => {
+                            return Err(LocalityError::Io(format!(
+                                "gmail draft send ambiguous after send failure; sent lookup failed: {lookup_error}"
+                            )));
+                        }
                     }
                 }
             };
@@ -933,6 +935,59 @@ mod tests {
     }
 
     #[test]
+    fn apply_create_entity_preserves_send_ambiguity_when_recovery_lookup_fails() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.send_error = Some(LocalityError::Io(
+                "gmail draft send response decode failed".to_string(),
+            ));
+            calls.sent_search_error_after_send =
+                Some(LocalityError::Io("sent search timed out".to_string()));
+        }
+        let plan = PushPlan::new(
+            vec![RemoteId::new("gmail-folder:draft")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("gmail-folder:draft"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Hello".to_string(),
+                properties: std::collections::BTreeMap::from([
+                    (
+                        "to".to_string(),
+                        PropertyValue::List(vec!["ann@example.com".to_string()]),
+                    ),
+                    (
+                        "subject".to_string(),
+                        PropertyValue::String("Explicit subject".to_string()),
+                    ),
+                ]),
+                body: "Body\n".to_string(),
+                source_path: "draft/hello.md".into(),
+            }],
+        );
+
+        let error = connector
+            .apply(locality_connector::ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("gmail-main"),
+                plan: &plan,
+                operation_ids: &[PushOperationId("op-1".to_string())],
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect_err("recovery lookup failure should preserve ambiguous send");
+
+        let message = error.to_string();
+        assert!(message.contains("gmail draft send"));
+        assert!(message.contains("sent search timed out"));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.created_drafts, 1);
+        assert_eq!(calls.sent_drafts, vec!["draft-1"]);
+    }
+
+    #[test]
     fn apply_create_entity_rejects_nested_draft_source_path() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
@@ -1013,6 +1068,7 @@ mod tests {
         sent_search_results: std::collections::BTreeMap<String, String>,
         sent_search_results_after_send: std::collections::BTreeMap<String, String>,
         send_error: Option<LocalityError>,
+        sent_search_error_after_send: Option<LocalityError>,
         message_labels: std::collections::BTreeMap<String, Vec<String>>,
         created_drafts: usize,
         created_draft_raw: Vec<String>,
@@ -1042,6 +1098,11 @@ mod tests {
                     next_page_token: None,
                     result_size_estimate: Some(1),
                 });
+            }
+            if !calls.sent_drafts.is_empty()
+                && let Some(error) = calls.sent_search_error_after_send.clone()
+            {
+                return Err(error);
             }
             if !calls.sent_drafts.is_empty()
                 && let Some(sent_message_id) = calls

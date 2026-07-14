@@ -1370,6 +1370,115 @@ fn daemon_push_blocks_ambiguous_gmail_send_journal_without_reapplying() {
 }
 
 #[test]
+fn daemon_push_blocks_failed_gmail_send_recovery_lookup_without_reapplying() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/reply.md");
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\ntitle: Reply\nto: [\"user@example.com\"]\nsubject: Reply\n---\nBody.\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("gmail-folder:draft");
+    let sent_folder_id = RemoteId::new("gmail-folder:sent");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "gmail", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            sent_folder_id,
+            EntityKind::Directory,
+            "sent",
+            "sent",
+        ))
+        .expect("save sent folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:gmail-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id.clone()),
+            "draft/reply.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "subject".to_string(),
+        PropertyValue::String("Reply".to_string()),
+    );
+    properties.insert(
+        "to".to_string(),
+        PropertyValue::List(vec!["user@example.com".to_string()]),
+    );
+    let plan = PushPlan::new(
+        vec![draft_folder_id],
+        vec![PushOperation::CreateEntity {
+            parent_id: RemoteId::new("gmail-folder:draft"),
+            parent_kind: Some(EntityKind::Directory),
+            parent_workspace: false,
+            title: "Reply".to_string(),
+            properties,
+            body: "Body.\n".to_string(),
+            source_path: source_path.to_path_buf(),
+        }],
+    );
+    let push_id = PushId("push-failed-gmail-send-lookup".to_string());
+    store
+        .append_journal(JournalEntry::new(
+            push_id.clone(),
+            fixture.mount_id.clone(),
+            plan.affected_entities.clone(),
+            plan,
+            JournalStatus::Failed(
+                "io error: gmail draft send ambiguous after send failure; sent lookup failed: sent search timed out"
+                    .to_string(),
+            ),
+        ))
+        .expect("append failed journal");
+    let source = FakePushSource::default();
+
+    let report = execute_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: true,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("retry failed gmail push");
+
+    assert_eq!(report.action, PushJobAction::Failed);
+    assert_eq!(source.applied_count(), 0, "retry must not resend Gmail");
+    assert_eq!(report.push_id.as_ref(), Some(&push_id));
+    let error = report.error.expect("guardrail error");
+    assert_eq!(error.code, "guardrail");
+    assert!(error.message.contains("ambiguous result"));
+}
+
+#[test]
 fn daemon_push_reconciles_repeated_gmail_draft_filename_to_unique_sent_paths() {
     let fixture = PushFixture::new();
     let state_root = fixture.root.join(".state");
