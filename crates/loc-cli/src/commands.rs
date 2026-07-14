@@ -5033,15 +5033,21 @@ fn print_mount_report(report: &MountReport) {
 }
 
 fn print_connect_report(report: &ConnectReport) {
+    let mut output = io::stdout();
+    let _ = write_connect_report(report, &mut output);
+}
+
+fn write_connect_report<W: Write>(report: &ConnectReport, output: &mut W) -> io::Result<()> {
     let account = report
         .account_label
         .as_deref()
         .or(report.workspace_name.as_deref())
-        .unwrap_or("Notion");
-    println!(
-        "connected notion as \"{}\" (connection: {})",
-        account, report.connection_id
-    );
+        .unwrap_or(&report.display_name);
+    writeln!(
+        output,
+        "connected {} as \"{}\" (connection: {})",
+        report.connector, account, report.connection_id
+    )
 }
 
 fn print_connections_report(report: &ConnectionsReport) {
@@ -7871,12 +7877,13 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::resolve_mount_target;
     use super::{
-        Cli, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION, FileProviderCommandReport,
-        PushConfirmationPromptError, VirtualProjectionRegistration, absolute_command_path,
-        auto_registration_for_mounted_projection, default_mount_id_for_source,
-        diff_report_exit_code, exact_located_entity_record, file_provider_list_lines,
-        google_docs_oauth_broker_config, guard_linux_fuse_shared_root_unregister,
-        guard_unresolved_linux_fuse_unregister, guard_unresolved_windows_cloud_files_unregister,
+        Cli, ConnectReport, DaemonUnavailableReason, EXIT_SUCCESS, EXIT_VALIDATION,
+        FileProviderCommandReport, PushConfirmationPromptError, VirtualProjectionRegistration,
+        absolute_command_path, auto_registration_for_mounted_projection,
+        default_mount_id_for_source, diff_report_exit_code, exact_located_entity_record,
+        file_provider_list_lines, google_docs_oauth_broker_config,
+        guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
+        guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
         locate_result_from_report, mounted_projection_preflight_error, notion_authorize_url,
         notion_oauth_broker_config, print_push_confirmation_preview, projection_mode_for_target,
@@ -7884,7 +7891,8 @@ mod tests {
         pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
         push_preview_plan_matches, should_prompt_for_push_confirmation,
         should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
-        status as run_status_command, validate_virtual_projection_registration, write_log_report,
+        status as run_status_command, validate_virtual_projection_registration,
+        write_connect_report, write_log_report,
     };
 
     #[test]
@@ -8557,6 +8565,30 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).expect("utf8 output"),
             "push push-1\n  status: reconciled\n  mount: notion-main\n  entities: page-1\n  author: anonymous\n  created_at_unix_ms: 1783612800000\n  previous: push-0\n  summary: 1 updated, 0 replaced, 0 media updated, 0 created, 0 moved, 0 archived\n  operations: 1\n\ndiff --locality a/Roadmap.md b/Roadmap.md\n"
+        );
+    }
+
+    #[test]
+    fn connect_report_writer_uses_connector_and_display_name_fallback() {
+        let report = ConnectReport {
+            ok: true,
+            command: "connect",
+            connection_id: "gmail-default".to_string(),
+            profile_id: "gmail-oauth".to_string(),
+            connector: "gmail".to_string(),
+            display_name: "gmail-default".to_string(),
+            account_label: None,
+            workspace_id: None,
+            workspace_name: None,
+            auth_kind: "oauth".to_string(),
+        };
+        let mut output = Vec::new();
+
+        write_connect_report(&report, &mut output).expect("write connect report");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf8 output"),
+            "connected gmail as \"gmail-default\" (connection: gmail-default)\n"
         );
     }
 
