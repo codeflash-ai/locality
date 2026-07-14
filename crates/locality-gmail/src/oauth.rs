@@ -192,8 +192,8 @@ pub fn gmail_capabilities_json() -> Result<String, serde_json::Error> {
         supports_block_updates: false,
         supports_databases: false,
         supports_oauth: true,
-        supports_remote_observation: false,
-        supports_lazy_child_enumeration: false,
+        supports_remote_observation: true,
+        supports_lazy_child_enumeration: true,
         supports_media_download: false,
         supports_undo: false,
         supports_batch_observation: false,
@@ -238,8 +238,8 @@ mod tests {
                 .expect("decode capabilities");
 
         assert!(capabilities.supports_oauth);
-        assert!(!capabilities.supports_remote_observation);
-        assert!(!capabilities.supports_lazy_child_enumeration);
+        assert!(capabilities.supports_remote_observation);
+        assert!(capabilities.supports_lazy_child_enumeration);
         assert!(!capabilities.supports_databases);
         assert!(!capabilities.supports_media_download);
         assert!(!capabilities.supports_block_updates);

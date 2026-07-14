@@ -3,8 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_connector::oauth_broker::OAuthBrokerRefresh;
 use locality_connector::{Connector, EnumerateRequest, FetchRequest};
+use locality_core::diff::property_value_from_frontmatter;
 use locality_core::hydration::HydrationRequest;
 use locality_core::model::{RemoteId, TreeEntry};
+use locality_core::planner::PropertyValue;
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_gmail::render::{GmailNativeBundle, remote_version, render_gmail_message};
@@ -70,9 +72,26 @@ fn connector_from_connection(
     credentials: &dyn CredentialStore,
     connection: &ConnectionRecord,
 ) -> Result<GmailConnector, ConnectorResolveError> {
+    if connection.connector != GMAIL_CONNECTOR_ID {
+        return Err(ConnectorResolveError::UnsupportedConnector(
+            connection.connector.clone(),
+        ));
+    }
+
     if connection.status != "active" {
         return Err(ConnectorResolveError::ConnectionRevoked {
             connection_id: connection.connection_id.0.clone(),
+            suggested_command: GMAIL_CONNECT_COMMAND.to_string(),
+        });
+    }
+
+    if connection.auth_kind != "oauth" {
+        return Err(ConnectorResolveError::AuthRequired {
+            connection_id: connection.connection_id.0.clone(),
+            message: Some(format!(
+                "Gmail connection `{}` must use OAuth credentials",
+                connection.connection_id.0
+            )),
             suggested_command: GMAIL_CONNECT_COMMAND.to_string(),
         });
     }
@@ -88,10 +107,6 @@ fn connection_access_token(
     let secret = credentials
         .get(&connection.secret_ref)
         .map_err(|error| credential_error(connection, error))?;
-    if connection.auth_kind != "oauth" {
-        return Ok(secret);
-    }
-
     let mut stored = serde_json::from_str::<StoredGmailCredential>(&secret)
         .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))?;
     if stored.expires_soon(timestamp_secs()) {
@@ -192,7 +207,9 @@ where
     Ok(connections
         .into_iter()
         .filter(|connection| {
-            connection.connector == GMAIL_CONNECTOR_ID && connection.status == "active"
+            connection.connector == GMAIL_CONNECTOR_ID
+                && connection.status == "active"
+                && connection.auth_kind == "oauth"
         })
         .collect())
 }
@@ -300,11 +317,9 @@ pub(crate) fn validate_gmail_create_frontmatter(
         ));
     }
 
-    let has_subject = context
-        .parsed
-        .frontmatter
-        .properties
-        .contains_key("subject")
+    let has_subject = frontmatter_string(&context.parsed.frontmatter.properties, "subject")
+        .as_deref()
+        .is_some_and(|subject| !subject.trim().is_empty())
         || context
             .parsed
             .frontmatter
@@ -321,7 +336,7 @@ pub(crate) fn validate_gmail_create_frontmatter(
         ));
     }
 
-    if !context.parsed.frontmatter.properties.contains_key("to") {
+    if frontmatter_string_list(&context.parsed.frontmatter.properties, "to").is_empty() {
         report.push(ValidationIssue::new(
             "gmail_draft_missing_to",
             context.relative_path,
@@ -332,6 +347,37 @@ pub(crate) fn validate_gmail_create_frontmatter(
     }
 
     Ok(report)
+}
+
+fn frontmatter_string_list(
+    properties: &locality_core::canonical::FrontmatterProperties,
+    key: &str,
+) -> Vec<String> {
+    properties
+        .get(key)
+        .map(property_value_from_frontmatter)
+        .map(|value| match value {
+            PropertyValue::String(value) => vec![value],
+            PropertyValue::List(values) => values,
+            _ => Vec::new(),
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect()
+}
+
+fn frontmatter_string(
+    properties: &locality_core::canonical::FrontmatterProperties,
+    key: &str,
+) -> Option<String> {
+    properties
+        .get(key)
+        .map(property_value_from_frontmatter)
+        .and_then(|value| match value {
+            PropertyValue::String(value) => Some(value),
+            _ => None,
+        })
 }
 
 fn gmail_mailbox_from_path(path: &Path) -> Option<&str> {

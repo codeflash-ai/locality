@@ -3,6 +3,7 @@ use locality_connector::oauth_broker::OAuthBrokerToken;
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
+use locality_gmail::{GMAIL_CONNECTOR_ID, StoredGmailCredential};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use locality_store::{
@@ -161,6 +162,117 @@ fn save_google_docs_oauth_connection(store: &mut InMemoryStateStore) -> (Connect
     (connection_id, secret_ref)
 }
 
+fn save_gmail_connection(
+    store: &mut InMemoryStateStore,
+    connection_id: &str,
+    connector: &str,
+    auth_kind: &str,
+) -> (ConnectionId, String) {
+    let profile_id = ConnectorProfileId::new(format!("{connection_id}-profile"));
+    let connection_id = ConnectionId::new(connection_id);
+    let secret_ref = format!("connection:{}", connection_id.0);
+
+    store
+        .save_connector_profile(ConnectorProfileRecord {
+            profile_id: profile_id.clone(),
+            connector: connector.to_string(),
+            display_name: "Gmail OAuth".to_string(),
+            auth_kind: auth_kind.to_string(),
+            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_string()],
+            capabilities_json: "{}".to_string(),
+            enabled_actions_json: "[]".to_string(),
+            connector_version: "1".to_string(),
+            status: "active".to_string(),
+            created_at: "2026-06-25T10:00:00Z".to_string(),
+            updated_at: "2026-06-25T10:00:00Z".to_string(),
+        })
+        .expect("save profile");
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: connection_id.clone(),
+            profile_id: Some(profile_id),
+            connector: connector.to_string(),
+            display_name: "Gmail".to_string(),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("gmail".to_string()),
+            workspace_name: Some("Gmail".to_string()),
+            auth_kind: auth_kind.to_string(),
+            secret_ref: secret_ref.clone(),
+            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_string()],
+            capabilities_json: "{}".to_string(),
+            status: "active".to_string(),
+            created_at: "2026-06-25T10:00:00Z".to_string(),
+            updated_at: "2026-06-25T10:00:00Z".to_string(),
+            expires_at: None,
+        })
+        .expect("save connection");
+
+    (connection_id, secret_ref)
+}
+
+fn stored_gmail_credential(access_token: &str) -> StoredGmailCredential {
+    StoredGmailCredential::from_broker_token(
+        OAuthBrokerToken {
+            access_token: access_token.to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: Some(3600),
+            refresh_token_handle: Some("handle-1".to_string()),
+            account_id: Some("acct-1".to_string()),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("gmail".to_string()),
+            workspace_name: Some("Gmail".to_string()),
+            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_string()],
+        },
+        "client-id".to_string(),
+        "https://auth.example.test".to_string(),
+        4_102_444_800,
+    )
+}
+
+fn gmail_mount() -> MountConfig {
+    MountConfig::new(MountId::new("gmail-main"), GMAIL_CONNECTOR_ID, "/tmp/gmail")
+}
+
+fn validate_gmail_create(path: &str, markdown: &str) -> Vec<String> {
+    let mount = gmail_mount();
+    let parsed = parse_canonical_markdown(markdown).expect("parse gmail markdown");
+
+    LocalSourceValidator
+        .validate_create_frontmatter(SourceValidationContext {
+            state_root: None,
+            mount: &mount,
+            parent: None,
+            relative_path: std::path::Path::new(path),
+            parsed: &parsed,
+            shadow: None,
+        })
+        .expect("validate gmail create")
+        .issues
+        .into_iter()
+        .map(|issue| issue.code)
+        .collect()
+}
+
+fn validate_gmail_changed(path: &str, markdown: &str) -> Vec<String> {
+    let mount = gmail_mount();
+    let parsed = parse_canonical_markdown(markdown).expect("parse gmail markdown");
+
+    LocalSourceValidator
+        .validate_changed_frontmatter(SourceValidationContext {
+            state_root: None,
+            mount: &mount,
+            parent: None,
+            relative_path: std::path::Path::new(path),
+            parsed: &parsed,
+            shadow: None,
+        })
+        .expect("validate gmail changed")
+        .issues
+        .into_iter()
+        .map(|issue| issue.code)
+        .collect()
+}
+
 #[test]
 fn supported_source_connectors_include_gmail() {
     assert_eq!(
@@ -186,6 +298,102 @@ fn resolving_unregistered_connector_reports_unsupported_connector() {
         error.message(),
         "connector `custom` is not supported by this build"
     );
+}
+
+#[test]
+fn resolving_gmail_mount_uses_active_oauth_connection_credentials() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (_connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "gmail-default", GMAIL_CONNECTOR_ID, "oauth");
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored_gmail_credential("gmail-access-token"))
+                .expect("credential json"),
+        )
+        .expect("save credential");
+
+    let source =
+        resolve_source_for_mount(&store, &credentials, &gmail_mount()).expect("resolve gmail");
+
+    let ResolvedSource::Gmail(connector) = source else {
+        panic!("expected gmail source");
+    };
+    assert_eq!(connector.config().access_token, "gmail-access-token");
+}
+
+#[test]
+fn resolving_explicit_gmail_connection_rejects_non_oauth_credentials() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "gmail-api-key", GMAIL_CONNECTOR_ID, "api_key");
+    credentials
+        .put(&secret_ref, "raw-secret-token")
+        .expect("save credential");
+    let mount = gmail_mount().with_connection_id(connection_id);
+
+    let error =
+        resolve_source_for_mount(&store, &credentials, &mount).expect_err("reject non-oauth");
+
+    assert_eq!(error.code(), "auth_required");
+    assert!(error.message().contains("OAuth"));
+    assert_eq!(error.suggested_command(), Some("loc connect gmail"));
+}
+
+#[test]
+fn resolving_explicit_gmail_connection_rejects_wrong_connector_record() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) = save_gmail_connection(
+        &mut store,
+        "google-docs-default",
+        GOOGLE_DOCS_CONNECTOR_ID,
+        "oauth",
+    );
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored_gmail_credential("wrong-connector-token"))
+                .expect("credential json"),
+        )
+        .expect("save credential");
+    let mount = gmail_mount().with_connection_id(connection_id);
+
+    let error =
+        resolve_source_for_mount(&store, &credentials, &mount).expect_err("reject connector");
+
+    assert_eq!(error.code(), "unsupported_connector");
+    assert!(error.message().contains(GOOGLE_DOCS_CONNECTOR_ID));
+}
+
+#[test]
+fn resolving_implicit_gmail_mount_ignores_active_non_oauth_connections() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (_raw_connection_id, raw_secret_ref) =
+        save_gmail_connection(&mut store, "gmail-api-key", GMAIL_CONNECTOR_ID, "api_key");
+    credentials
+        .put(&raw_secret_ref, "raw-secret-token")
+        .expect("save raw credential");
+    let (_oauth_connection_id, oauth_secret_ref) =
+        save_gmail_connection(&mut store, "gmail-oauth", GMAIL_CONNECTOR_ID, "oauth");
+    credentials
+        .put(
+            &oauth_secret_ref,
+            &serde_json::to_string(&stored_gmail_credential("oauth-token"))
+                .expect("credential json"),
+        )
+        .expect("save oauth credential");
+
+    let source =
+        resolve_source_for_mount(&store, &credentials, &gmail_mount()).expect("resolve gmail");
+
+    let ResolvedSource::Gmail(connector) = source else {
+        panic!("expected gmail source");
+    };
+    assert_eq!(connector.config().access_token, "oauth-token");
 }
 
 #[test]
@@ -349,6 +557,71 @@ fn resolving_expired_google_docs_credential_with_stopped_local_broker_requires_r
     assert!(error.message().contains(&broker_url));
     assert!(error.message().contains("default hosted broker"));
     assert_eq!(error.suggested_command(), Some("loc connect google-docs"));
+}
+
+#[test]
+fn local_gmail_validator_allows_valid_direct_draft_create() {
+    let issues = validate_gmail_create(
+        "draft/foo.md",
+        "---\nto: [\"user@example.com\"]\nsubject: Hello\n---\nBody\n",
+    );
+
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn local_gmail_validator_blocks_missing_and_empty_draft_recipients() {
+    for markdown in [
+        "---\nsubject: Hello\n---\nBody\n",
+        "---\nto: []\nsubject: Hello\n---\nBody\n",
+        "---\nto: \"\"\nsubject: Hello\n---\nBody\n",
+    ] {
+        let issues = validate_gmail_create("draft/foo.md", markdown);
+
+        assert_eq!(issues, vec!["gmail_draft_missing_to"]);
+    }
+}
+
+#[test]
+fn local_gmail_validator_blocks_empty_subject_without_title() {
+    let issues = validate_gmail_create(
+        "draft/foo.md",
+        "---\nto: [\"user@example.com\"]\nsubject: \"\"\n---\nBody\n",
+    );
+
+    assert_eq!(issues, vec!["gmail_draft_missing_subject"]);
+}
+
+#[test]
+fn local_gmail_validator_allows_empty_subject_with_non_empty_title() {
+    let issues = validate_gmail_create(
+        "draft/foo.md",
+        "---\ntitle: Fallback title\nto: [\"user@example.com\"]\nsubject: \"\"\n---\nBody\n",
+    );
+
+    assert!(issues.is_empty());
+}
+
+#[test]
+fn local_gmail_validator_blocks_nested_draft_create() {
+    let issues = validate_gmail_create(
+        "draft/nested/foo.md",
+        "---\nto: [\"user@example.com\"]\nsubject: Hello\n---\nBody\n",
+    );
+
+    assert_eq!(issues, vec!["gmail_create_outside_draft"]);
+}
+
+#[test]
+fn local_gmail_validator_blocks_changed_inbox_and_sent_items() {
+    for path in ["inbox/message.md", "sent/message.md"] {
+        let issues = validate_gmail_changed(
+            path,
+            "---\nloc:\n  id: message-1\n  type: page\n  connector: gmail\nsubject: Hello\n---\nBody\n",
+        );
+
+        assert_eq!(issues, vec!["gmail_read_only_mailbox"]);
+    }
 }
 
 #[test]
