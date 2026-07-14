@@ -422,10 +422,10 @@ Locality projects connected company sources, including Notion, into the local fi
 1. If the user gives a Notion URL, run `loc locate <url>` and edit the printed local Markdown path.
 2. Edit the local Markdown file directly.
 3. Do not edit Locality identity frontmatter, block IDs, `::loc{{...}}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
-4. Leave edits pending for Locality review and tell the user what changed.
+4. Unless the user asked you to sync back to Notion, leave edits pending for Locality review and tell the user what changed.
 5. Use `loc status` only when you need to inspect pending changes; regular clean files hydrate automatically on open.
 6. If desktop Live Mode is on, safe local edits may sync automatically. Do not run routine `loc pull` or `loc push` after every edit.
-7. Only push when the user explicitly asks or when Live Mode pauses for review. Run `loc diff <file>` first, then `loc push <file> -y` for safe plans.
+7. If the user asks you to sync back to Notion, update Notion, publish, or apply the edit remotely, do not stop after local edits. Run `loc diff <file>` first, then `loc push <file> -y` for safe plans.
 8. If push says the remote changed since last sync, run `loc pull <file>`, resolve any inline conflict markers in the Markdown, rerun `loc diff <file>`, then push again.
 
 ## Creating Notion Content
@@ -470,7 +470,7 @@ fn managed_instruction_block(mount_path: &str) -> String {
 
 fn suggested_agent_prompt(mount_path: &str) -> String {
     format!(
-        "Use Locality to edit my Notion workspace. Open the Notion files under {mount_path}, make the requested edits directly in Markdown, and leave the changes pending for Locality review."
+        "Use Locality to edit my Notion workspace. Open the Notion files under {mount_path}, make the requested edits directly in Markdown, and leave the changes pending for Locality review unless I ask you to sync back to Notion. When I do, run `loc diff <file>` and then `loc push <file> -y` for safe plans."
     )
 }
 
@@ -1037,6 +1037,7 @@ mod tests {
         assert!(skill.contains("name: locality"));
         assert!(skill.contains("~/Library/CloudStorage/Locality/notion"));
         assert!(skill.contains("pending for Locality review"));
+        assert!(skill.contains("sync back to Notion"));
         assert!(skill.contains("If desktop Live Mode is on"));
         assert!(skill.contains("Do not run routine `loc pull` or `loc push`"));
         assert!(skill.contains("loc diff <file>"));

@@ -29,7 +29,8 @@ Update the launch plan at:
 - preserve Locality frontmatter and `::loc{...}` directives;
 - use `loc status <path>` when they need state;
 - use `loc diff <path>` before remote writes;
-- push only when the user asks, or when Live Mode reports a review path.
+- push only when the user asks, or when Live Mode reports a review path;
+- if the user asks them to sync back to Notion, update Notion, publish, or apply edits remotely, run `loc diff <path>` and then `loc push <path> -y` for safe plans.
 
 ## What agents should avoid
 
@@ -41,7 +42,7 @@ Update the launch plan at:
 
 ## Live Mode behavior
 
-When Live Mode is enabled, agents should not run routine `loc pull` or `loc push` after every edit. They should edit the file and stop.
+When Live Mode is enabled, agents should not run routine `loc pull` or `loc push` after every edit. They should edit the file and stop unless the user explicitly asks them to sync the change back to the source app.
 
 Use `loc status` only when:
 

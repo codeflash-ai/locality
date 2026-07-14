@@ -2130,6 +2130,8 @@ dependencies = [
  "loc-cli",
  "locality-connector",
  "locality-core",
+ "locality-gmail",
+ "locality-google-docs",
  "locality-notion",
  "locality-platform",
  "locality-store",

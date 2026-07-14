@@ -342,6 +342,7 @@ Locality projects {source} as local Markdown. Browse directories normally; onlin
 - Push intentional changes with `loc push <path>`; use `loc push <path> -y` only after review or explicit approval.\n\
 - Use `loc pull <path>` only to force a clean local file or plain-files projection to match latest remote now. Use `loc push <path>` to make {source} match local edits.\n\
 - If desktop Live Mode is on, safe edits may sync automatically. Do not run routine `loc pull` or `loc push` after every edit.\n\
+- If the user asks you to sync back to {source}, update {source}, publish, or apply the edit remotely, do not stop after local edits. Run `loc diff <path>` first, then `loc push <path> -y` for safe plans.\n\
 - When Live Mode pauses for review, conflict, remote drift, or a large/destructive plan, use `loc status` and `loc diff` before recovery.\n\
 - Do not edit `AGENTS.md`, `CLAUDE.md`, `_schema.yaml`, Locality identity frontmatter, or `::loc{{...}}` directives unless explicitly asked.\n\
 - If a file has conflict markers, resolve the Markdown to the intended final content, remove every marker line, then rerun `loc diff` and `loc push`.\n"

@@ -95,12 +95,14 @@ type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
 type SettingsSection = "general" | "sources" | "sync" | "activity" | "agents" | "advanced" | "about";
 type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
+type SourceConnectorId = "notion" | "google-docs" | "gmail";
 type ConnectorOption = {
-  id: "notion" | "google-docs" | "gmail";
+  id: SourceConnectorId;
   name: string;
   description: string;
   status: string;
   keywords: string[];
+  mounted: boolean;
 };
 
 const PRODUCT_TERMS = {
@@ -2619,7 +2621,10 @@ function MountsView({
     setSourceDialogOpen(true);
   }
 
-  async function createMount(): Promise<ActionReport> {
+  async function createConnectorMount(
+    connector: SourceConnectorId,
+    googleDocsWorkspaceFolder?: string,
+  ): Promise<ActionReport> {
     if (creating) {
       return { ok: false, message: "Source setup is already running." };
     }
@@ -2627,8 +2632,22 @@ function MountsView({
     setCreating(true);
     try {
       const report = await callCommand<ActionReport>(
-        "create_workspace_mount",
-        { path: snapshot.mount.localPath },
+        connector === "notion" ? "create_workspace_mount" : "create_desktop_mount",
+        connector === "notion"
+          ? { path: sourceDefaultPath(snapshot, "notion") }
+          : {
+              request: {
+                connector,
+                path: sourceDefaultPath(snapshot, connector),
+                mountId: sourceMountId(connector),
+                connectionId: null,
+                readOnly: false,
+                notionRootPage: null,
+                googleDocsWorkspaceFolder: connector === "google-docs"
+                  ? googleDocsWorkspaceFolder?.trim() || "Locality"
+                  : null,
+              },
+            },
         { ok: true, message: "Created demo mount." },
       );
       if (!report.ok) {
@@ -2644,6 +2663,10 @@ function MountsView({
     } finally {
       setCreating(false);
     }
+  }
+
+  async function createMount(): Promise<ActionReport> {
+    return createConnectorMount("notion");
   }
 
   async function connectNotionSource(): Promise<ActionReport> {
@@ -2676,26 +2699,67 @@ function MountsView({
     return report;
   }
 
-  async function runSourceDialogAction() {
+  async function connectConnectorSource(connector: SourceConnectorId): Promise<ActionReport> {
+    if (connector === "notion") {
+      return connectNotionSource();
+    }
+
+    const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
+    setActionError("");
+    const report = await callCommand<ActionReport>(
+      command,
+      undefined,
+      { ok: true, message: `Connected demo ${sourceDisplayName(connector)} account.` },
+    );
+    if (!report.ok) {
+      setActionError(report.message);
+      return report;
+    }
+    await onRefresh();
+    return report;
+  }
+
+  async function runSourceDialogAction(
+    connector: SourceConnectorId,
+    options?: { googleDocsWorkspaceFolder?: string },
+  ) {
     if (sourceDialogState === "connecting" || sourceDialogState === "creating" || sourceDialogState === "changing") {
       return;
     }
 
     setSourceDialogMessage("");
-    const nextState = connectionMissing(snapshot)
-      ? "connecting"
-      : mountMissing(snapshot)
-        ? "creating"
-        : "changing";
+    const nextState = connector === "notion"
+      ? connectionMissing(snapshot)
+        ? "connecting"
+        : mountMissing(snapshot)
+          ? "creating"
+          : "changing"
+      : "connecting";
     setSourceDialogState(nextState);
     try {
-      const report = connectionMissing(snapshot)
-        ? await connectNotionSource()
-        : mountMissing(snapshot)
-          ? await createMount()
-          : await changeNotionSourceAccess();
-      setSourceDialogMessage(report.message);
-      setSourceDialogState(report.ok ? "success" : "error");
+      const report = connector === "notion"
+        ? connectionMissing(snapshot)
+          ? await connectNotionSource()
+          : mountMissing(snapshot)
+            ? await createMount()
+            : await changeNotionSourceAccess()
+        : await connectConnectorSource(connector);
+      if (!report.ok || connector === "notion") {
+        setSourceDialogMessage(report.message);
+        setSourceDialogState(report.ok ? "success" : "error");
+        return;
+      }
+
+      setSourceDialogState("creating");
+      const mountReport = await createConnectorMount(connector, options?.googleDocsWorkspaceFolder);
+      const message = mountReport.ok
+        ? `${report.message} ${mountReport.message}`
+        : `${report.message} ${mountReport.message}`;
+      setSourceDialogMessage(message);
+      setSourceDialogState(mountReport.ok ? "success" : "error");
+      if (mountReport.ok) {
+        await onRefresh();
+      }
     } catch (error) {
       setSourceDialogMessage(errorMessage(error));
       setSourceDialogState("error");
@@ -2835,7 +2899,7 @@ function MountsView({
           snapshot={snapshot}
           state={sourceDialogState}
           message={sourceDialogMessage}
-          onAction={() => void runSourceDialogAction()}
+          onAction={(connector, options) => void runSourceDialogAction(connector, options)}
           onClose={() => setSourceDialogOpen(false)}
         />
       )}
@@ -2853,24 +2917,20 @@ function AddSourceDialog({
   snapshot: DesktopSnapshot;
   state: SourceSetupState;
   message: string;
-  onAction: () => void;
+  onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
+  const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
   const needsConnection = connectionMissing(snapshot);
   const needsFolder = !needsConnection && mountMissing(snapshot);
   const busy = state === "connecting" || state === "creating" || state === "changing";
-  const actionLabel = needsConnection
-    ? "Connect Notion"
-    : needsFolder
-      ? "Create Local Folder"
-      : "Change Notion Access";
-  const actionIcon = busy ? <Loader2 className="spin-icon" /> : needsConnection ? <ShieldCheck /> : <FolderOpen />;
   const sourceStatus = needsConnection
     ? "Not connected"
     : needsFolder
       ? "Connected, folder needed"
       : "Ready";
+  const mountedConnectors = new Set(snapshot.mounts.map((mount) => mount.connector));
   const connectors: ConnectorOption[] = [
     {
       id: "notion",
@@ -2878,20 +2938,23 @@ function AddSourceDialog({
       description: "Pages and databases as folders with page.md files.",
       status: sourceStatus,
       keywords: ["notion", "wiki", "pages", "database", "docs"],
+      mounted: mountedConnectors.has("notion") || !mountMissing(snapshot),
     },
     {
       id: "google-docs",
       name: "Google Docs",
       description: "Docs and Drive folders through the same local file workflow.",
-      status: "Desktop setup pending",
+      status: mountedConnectors.has("google-docs") ? "Mounted" : "Ready to connect",
       keywords: ["google", "docs", "gdocs", "drive", "documents"],
+      mounted: mountedConnectors.has("google-docs"),
     },
     {
       id: "gmail",
       name: "Gmail",
       description: "Inbox and sent as readable files, drafts as reviewed outbound mail.",
-      status: "Desktop setup pending",
+      status: mountedConnectors.has("gmail") ? "Mounted" : "Ready to connect",
       keywords: ["gmail", "mail", "email", "inbox", "drafts"],
+      mounted: mountedConnectors.has("gmail"),
     },
   ];
   const normalizedQuery = query.trim().toLowerCase();
@@ -2930,11 +2993,16 @@ function AddSourceDialog({
 
         <div className="connector-choice-grid">
           {visibleConnectors.map((connector) => {
-            const isNotion = connector.id === "notion";
+            const disabled = busy || (connector.id !== "notion" && connector.mounted);
+            const actionLabel = sourceActionLabel(connector.id, {
+              needsConnection,
+              needsFolder,
+              mounted: connector.mounted,
+            });
             return (
               <article
-                className={`connector-choice-card ${isNotion ? "active" : "disabled"}`}
-                aria-disabled={!isNotion}
+                className={`connector-choice-card ${connector.mounted ? "mounted" : "active"}`}
+                aria-disabled={disabled}
                 key={connector.id}
               >
                 <div className="connector-choice-heading">
@@ -2944,27 +3012,59 @@ function AddSourceDialog({
                     <p>{connector.description}</p>
                   </div>
                   <StatusPill
-                    tone={isNotion ? (needsConnection || needsFolder ? "warn" : "ready") : "warn"}
+                    tone={
+                      connector.mounted || (connector.id === "notion" && !needsConnection && !needsFolder)
+                        ? "ready"
+                        : "warn"
+                    }
                     title={connector.status}
                   >
                     {connector.status}
                   </StatusPill>
                 </div>
-                {isNotion ? (
-                  <>
-                    <div className="connector-choice-facts">
+                <div className="connector-choice-facts">
+                  {connector.id === "notion" ? (
+                    <>
                       <SettingRow title="Workspace" value={snapshot.connection.workspaceName || "Not connected"} />
-                      <SettingRow title="Local folder" value={snapshot.mount.localPath || "Not created yet"} />
+                      <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                       <SettingRow title="Access" value={snapshot.mount.accessScope || "Not requested"} />
-                    </div>
-                    <PrimaryButton compact busy={busy} icon={actionIcon} onClick={onAction}>
-                      {busy ? "Working" : actionLabel}
-                    </PrimaryButton>
-                  </>
-                ) : (
-                  <SecondaryButton compact disabled>
-                    Coming Later
+                    </>
+                  ) : connector.id === "google-docs" ? (
+                    <>
+                      <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
+                      <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                    </>
+                  ) : (
+                    <>
+                      <SettingRow title="Mailboxes" value="Inbox, Sent, Draft" />
+                      <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                    </>
+                  )}
+                </div>
+                {connector.id === "google-docs" && !connector.mounted && (
+                  <label className="source-inline-field">
+                    <span>Drive folder</span>
+                    <input
+                      value={googleDocsWorkspaceFolder}
+                      placeholder="Folder name, URL, or ID"
+                      onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
+                    />
+                  </label>
+                )}
+                {connector.mounted && connector.id !== "notion" ? (
+                  <SecondaryButton compact disabled icon={<Check />}>
+                    Mounted
                   </SecondaryButton>
+                ) : (
+                  <PrimaryButton
+                    compact
+                    busy={busy}
+                    disabled={connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim()}
+                    icon={busy ? <Loader2 className="spin-icon" /> : sourceActionIcon(connector.id, needsConnection)}
+                    onClick={() => onAction(connector.id, { googleDocsWorkspaceFolder })}
+                  >
+                    {busy ? "Working" : actionLabel}
+                  </PrimaryButton>
                 )}
               </article>
             );
@@ -2980,11 +3080,91 @@ function AddSourceDialog({
   );
 }
 
-function ConnectorIcon({ connector }: { connector: ConnectorOption["id"] }) {
-  const label = connector === "notion" ? "N" : connector === "google-docs" ? "D" : "M";
+function sourceDisplayName(connector: SourceConnectorId) {
+  switch (connector) {
+    case "notion":
+      return "Notion";
+    case "google-docs":
+      return "Google Docs";
+    case "gmail":
+      return "Gmail";
+  }
+}
+
+function sourceMountId(connector: SourceConnectorId) {
+  switch (connector) {
+    case "notion":
+      return "notion-main";
+    case "google-docs":
+      return "google-docs-main";
+    case "gmail":
+      return "gmail-main";
+  }
+}
+
+function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnectorId) {
+  const existing = snapshot.mounts.find((mount) => mount.connector === connector)?.localPath;
+  if (existing?.trim()) {
+    return existing;
+  }
+  if (connector === "notion" && snapshot.mount.localPath.trim()) {
+    return snapshot.mount.localPath;
+  }
+  switch (connector) {
+    case "notion":
+      return "~/Library/CloudStorage/Locality/notion";
+    case "google-docs":
+      return "~/Library/CloudStorage/Locality/google-docs-main";
+    case "gmail":
+      return "~/Library/CloudStorage/Locality/gmail-main";
+  }
+}
+
+function sourceActionLabel(
+  connector: SourceConnectorId,
+  state: { needsConnection: boolean; needsFolder: boolean; mounted: boolean },
+) {
+  if (connector !== "notion") {
+    return state.mounted ? "Mounted" : "Connect & Mount";
+  }
+  if (state.needsConnection) {
+    return "Connect Notion";
+  }
+  if (state.needsFolder) {
+    return "Create Local Folder";
+  }
+  return "Change Notion Access";
+}
+
+function sourceActionIcon(connector: SourceConnectorId, needsConnection: boolean) {
+  if (connector === "notion" && needsConnection) {
+    return <ShieldCheck />;
+  }
+  return <FolderOpen />;
+}
+
+function ConnectorIcon({ connector }: { connector: SourceConnectorId }) {
   return (
     <span className={`connector-icon ${connector}`} aria-hidden="true">
-      <span>{label}</span>
+      {connector === "notion" && (
+        <svg viewBox="0 0 24 24" role="img">
+          <path d="M4.459 4.208c.746.606 1.026.56 2.428.466l13.215-.793c.28 0 .047-.28-.046-.326L17.86 1.968c-.42-.326-.981-.7-2.055-.607L3.01 2.295c-.466.046-.56.28-.374.466zm.793 3.08v13.904c0 .747.373 1.027 1.214.98l14.523-.84c.841-.046.935-.56.935-1.167V6.354c0-.606-.233-.933-.748-.887l-15.177.887c-.56.047-.747.327-.747.933zm14.337.745c.093.42 0 .84-.42.888l-.7.14v10.264c-.608.327-1.168.514-1.635.514-.748 0-.935-.234-1.495-.933l-4.577-7.186v6.952L12.21 19s0 .84-1.168.84l-3.222.186c-.093-.186 0-.653.327-.746l.84-.233V9.854L7.822 9.76c-.094-.42.14-1.026.793-1.073l3.456-.233 4.764 7.279v-6.44l-1.215-.139c-.093-.514.28-.887.747-.933zM1.936 1.035l13.31-.98c1.634-.14 2.055-.047 3.082.7l4.249 2.986c.7.513.934.653.934 1.213v16.378c0 1.026-.373 1.634-1.68 1.726l-15.458.934c-.98.047-1.448-.093-1.962-.747l-3.129-4.06c-.56-.747-.793-1.306-.793-1.96V2.667c0-.839.374-1.54 1.447-1.632z" />
+        </svg>
+      )}
+      {connector === "google-docs" && (
+        <svg viewBox="0 0 24 24" role="img">
+          <path d="M14.727 6.727H14V0H4.91c-.905 0-1.637.732-1.637 1.636v20.728c0 .904.732 1.636 1.636 1.636h14.182c.904 0 1.636-.732 1.636-1.636V6.727h-6zm-.545 10.455H7.09v-1.364h7.09v1.364zm2.727-3.273H7.091v-1.364h9.818v1.364zm0-3.273H7.091V9.273h9.818v1.363zM14.727 6h6l-6-6v6z" />
+        </svg>
+      )}
+      {connector === "gmail" && (
+        <svg viewBox="0 0 32 32" role="img">
+          <path className="gmail-envelope" d="M6.5 9.2h19v13.6c0 1-.8 1.8-1.8 1.8H8.3c-1 0-1.8-.8-1.8-1.8V9.2Z" />
+          <path className="gmail-blue" d="M6.5 10.1v12.7c0 1 .8 1.8 1.8 1.8h2.6V13.4L6.5 10.1Z" />
+          <path className="gmail-green" d="M21.1 13.4v11.2h2.6c1 0 1.8-.8 1.8-1.8V10.1l-4.4 3.3Z" />
+          <path className="gmail-yellow" d="M21.1 13.4 16 17.2v3.2l5.1-3.8v-3.2Z" />
+          <path className="gmail-red" d="M6.5 9.2c0-1.5 1.8-2.4 3-1.5L16 12.6l6.5-4.9c1.2-.9 3 .0 3 1.5v.9L16 17.2 6.5 10.1v-.9Z" />
+        </svg>
+      )}
     </span>
   );
 }

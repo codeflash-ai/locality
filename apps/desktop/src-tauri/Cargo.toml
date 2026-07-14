@@ -11,7 +11,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 loc-cli = { path = "../../../crates/loc-cli" }
+locality-connector.workspace = true
 locality-core.workspace = true
+locality-gmail.workspace = true
+locality-google-docs.workspace = true
 locality-notion.workspace = true
 locality-platform.workspace = true
 locality-store.workspace = true
@@ -23,9 +26,6 @@ tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-pn
 tauri-plugin-dialog = "2"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
-
-[dev-dependencies]
-locality-connector.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

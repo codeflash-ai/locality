@@ -12,6 +12,7 @@ Working rules:
 - Push intentional changes with `loc push <path>`; use `loc push <path> -y` only after review or explicit approval.
 - Use `loc pull <path>` only to refresh clean local files now. Use `loc push <path>` to make Notion match local edits.
 - If desktop Live Mode is on, safe edits may sync automatically. Do not run routine `loc pull` or `loc push` after every edit.
+- If the user asks you to sync back to Notion, update Notion, publish, or apply the edit remotely, do not stop after local edits. Run `loc diff <path>` first, then `loc push <path> -y` for safe plans.
 - When Live Mode pauses for review, conflict, remote drift, or a large/destructive plan, use `loc status` and `loc diff` before taking recovery action.
 - Keep edits narrow and preserve the document shape unless the user requests a broader rewrite.
 

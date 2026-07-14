@@ -1531,7 +1531,10 @@ p {
 }
 
 .sidebar-collapsed .sidebar-brand {
+  display: grid;
   justify-content: center;
+  justify-items: center;
+  gap: 8px;
   padding: 0;
 }
 
@@ -1545,17 +1548,15 @@ p {
 }
 
 .sidebar-collapsed .sidebar-collapse-button {
-  position: absolute;
-  top: 18px;
-  right: 6px;
-  width: 22px;
-  height: 22px;
+  position: static;
+  width: 28px;
+  height: 28px;
   background: rgba(255, 255, 255, 0.9);
 }
 
 .sidebar-collapsed .sidebar nav {
   justify-items: center;
-  margin-top: 6px;
+  margin-top: 0;
 }
 
 .sidebar-collapsed .sidebar-link {
@@ -2602,6 +2603,11 @@ button.home-stat:hover {
   background: rgba(248, 252, 251, 0.98);
 }
 
+.connector-choice-card.mounted {
+  border-color: rgba(37, 124, 93, 0.18);
+  background: rgba(247, 249, 251, 0.86);
+}
+
 .connector-choice-card.disabled {
   opacity: 0.72;
 }
@@ -2634,11 +2640,19 @@ button.home-stat:hover {
   letter-spacing: 0;
 }
 
+.connector-icon svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
 .connector-icon.notion {
-  border: 1px solid #d7dde3;
   background: #ffffff;
   color: #111827;
-  box-shadow: inset 0 0 0 2px #ffffff;
+}
+
+.connector-icon.notion svg path {
+  fill: #111827;
 }
 
 .connector-icon.google-docs {
@@ -2646,40 +2660,33 @@ button.home-stat:hover {
   color: #ffffff;
 }
 
-.connector-icon.google-docs::after {
-  position: absolute;
-  top: 0;
-  right: 0;
-  border-width: 0 9px 9px 0;
-  border-style: solid;
-  border-color: transparent rgba(255, 255, 255, 0.45) transparent transparent;
-  content: "";
+.connector-icon.google-docs svg path {
+  fill: #4285f4;
 }
 
 .connector-icon.gmail {
   background: #ffffff;
-  color: #c5221f;
-  border: 1px solid #f1c8c6;
+  color: #202124;
 }
 
-.connector-icon.gmail::before,
-.connector-icon.gmail::after {
-  position: absolute;
-  top: 10px;
-  width: 12px;
-  height: 2px;
-  background: #c5221f;
-  content: "";
+.connector-icon.gmail .gmail-envelope {
+  fill: #ffffff;
 }
 
-.connector-icon.gmail::before {
-  left: 6px;
-  transform: rotate(35deg);
+.connector-icon.gmail .gmail-blue {
+  fill: #4285f4;
 }
 
-.connector-icon.gmail::after {
-  right: 6px;
-  transform: rotate(-35deg);
+.connector-icon.gmail .gmail-green {
+  fill: #34a853;
+}
+
+.connector-icon.gmail .gmail-yellow {
+  fill: #fbbc04;
+}
+
+.connector-icon.gmail .gmail-red {
+  fill: #ea4335;
 }
 
 .connector-choice-facts {
@@ -2698,6 +2705,30 @@ button.home-stat:hover {
 
 .connector-choice-facts .setting-row:last-child {
   border-bottom: 0;
+}
+
+.source-inline-field {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.source-inline-field input {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.source-inline-field input:focus {
+  border-color: rgba(8, 123, 114, 0.34);
+  box-shadow: 0 0 0 3px rgba(8, 123, 114, 0.1);
 }
 
 .compact-settings {

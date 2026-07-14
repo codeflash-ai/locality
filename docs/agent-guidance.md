@@ -28,12 +28,13 @@ The skill tells agents:
 
 - Notion files live under `~/Library/CloudStorage/Locality/notion` on macOS by default.
 - Online-only files hydrate automatically when opened.
-- Agents should edit Markdown files directly and leave changes pending for Locality review.
+- Agents should edit Markdown files directly and leave changes pending for Locality review unless the user asks them to sync back to Notion.
 - Agents should not edit Locality identity frontmatter, block IDs, `::loc{...}` directives, `_schema.yaml`, `AGENTS.md`, or `CLAUDE.md` unless explicitly asked.
 - For Notion, agents should read the mount-local `AGENTS.md` for the concrete page and row creation contract. Prefer `loc create page --title "New Page" --parent <parent-directory>` for new pages, and add `--private` when the remote page should be created in Notion's Private section; manually, pages are directories, a new child page is created by writing `parent-page/new-page/page.md`, new page frontmatter needs `title: "..."`, and generated `loc:` identity frontmatter is omitted until Locality adds it after push.
 - `loc status` is optional and only needed when the agent needs to inspect pending changes.
 - If desktop Live Mode is on, agents should expect safe local edits and clean remote changes to sync in the background. They should not run routine `loc pull` or `loc push` after every edit.
-- Agents should only push when the user explicitly asks or when Live Mode pauses for review. The safe sequence is `loc diff <file>`, then `loc push <file> -y` for safe plans.
+- If the user asks the agent to sync back to Notion, update Notion, publish, or apply the edit remotely, the agent should not stop after local edits. The safe sequence is `loc diff <file>`, then `loc push <file> -y` for safe plans.
+- Agents should also push when Live Mode pauses for review and the user approves the scoped plan.
 - If push reports that the remote changed since last sync, the recovery sequence is `loc pull <file>`, resolve any inline conflict markers, rerun `loc diff <file>`, then push again.
 - If the agent sandbox cannot execute the host `loc` CLI, it should use the MCP fallback tool named `loc` with CLI-style `argv` arguments. Locality installs the required local MCP credentials for supported agents.
 
@@ -65,7 +66,7 @@ install uses: the package-local Roaming path for MSIX installs, or
 After the Notion mount is created, the desktop app runs the installer and shows which local agents were updated. The final onboarding screen also offers this suggested prompt:
 
 ```text
-Use Locality to edit my Notion workspace. Open the Notion files under ~/Library/CloudStorage/Locality/notion-main, make the requested edits directly in Markdown, and leave the changes pending for Locality review.
+Use Locality to edit my Notion workspace. Open the Notion files under ~/Library/CloudStorage/Locality/notion-main, make the requested edits directly in Markdown, and leave the changes pending for Locality review unless I ask you to sync back to Notion. When I do, run `loc diff <file>` and then `loc push <file> -y` for safe plans.
 ```
 
 Users can rerun the installer from Settings > Agent Instructions after installing

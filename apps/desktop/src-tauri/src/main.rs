@@ -20,7 +20,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use loc_cli::connect::DEFAULT_NOTION_PROFILE_ID;
-use loc_cli::connect::{BrokerOAuthConnectOptions, run_connect_notion_broker_oauth};
+use loc_cli::connect::{
+    BrokerOAuthConnectOptions, GmailBrokerOAuthConnectOptions, GoogleDocsBrokerOAuthConnectOptions,
+    run_connect_gmail_broker_oauth, run_connect_google_docs_broker_oauth,
+    run_connect_notion_broker_oauth,
+};
 use loc_cli::daemon::{DaemonRunState, run_daemon_control};
 use loc_cli::diff::{DiffReport, run_diff};
 #[cfg(target_os = "windows")]
@@ -47,6 +51,7 @@ use loc_cli::search::{
 use loc_cli::status::{StatusOptions, StatusState, StatusSyncState, run_status};
 #[cfg(test)]
 use locality_connector::ConnectorCapabilities;
+use locality_connector::oauth_broker::OAuthBrokerStart;
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::conflict::{
     has_unresolved_conflict_markers, render_inline_conflict_markdown_with_base,
@@ -55,6 +60,14 @@ use locality_core::freshness::RemoteVersion;
 use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::journal::{JournalEntry, JournalStatus};
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId, TreeEntry};
+use locality_gmail::{
+    DEFAULT_GMAIL_OAUTH_BROKER_URL, DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID,
+    HttpGmailOAuthBrokerClient,
+};
+use locality_google_docs::{
+    DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
+    GOOGLE_DOCS_CONNECTOR_ID, HttpGoogleDocsOAuthBrokerClient,
+};
 #[cfg(test)]
 use locality_notion::NotionConfig;
 #[cfg(test)]
@@ -88,6 +101,7 @@ use locality_store::{
 use locality_store::{ConnectorProfileId, ConnectorProfileRecord, ConnectorProfileRepository};
 use localityd::autosave::auto_save_timestamp;
 use localityd::file_provider::{self as daemon_file_provider, ROOT_CONTAINER_IDENTIFIER};
+use localityd::google_docs::resolve_google_docs_connector_for_mount;
 use localityd::hydration::HydrationSource;
 use localityd::ipc::{
     DaemonBuildInfo, DaemonDebugQueueStatus, DaemonRequest, DaemonStatusReport, send_request,
@@ -493,6 +507,8 @@ struct MountLiveModeChange {
 }
 
 static CONNECT_NOTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static CONNECT_GOOGLE_DOCS_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static CONNECT_GMAIL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static DAEMON_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static NOTION_LOGIN_LINK: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static DESKTOP_SNAPSHOT_CACHE: OnceLock<Mutex<DesktopSnapshotCache>> = OnceLock::new();
@@ -916,6 +932,16 @@ async fn change_notion_access(app: AppHandle) -> ActionReport {
     run_notion_connection_flow(app, NotionConnectionAction::ChangeAccess, true).await
 }
 
+#[tauri::command]
+async fn connect_google_docs(app: AppHandle) -> ActionReport {
+    run_google_docs_connection_flow(app, true).await
+}
+
+#[tauri::command]
+async fn connect_gmail(app: AppHandle) -> ActionReport {
+    run_gmail_connection_flow(app, true).await
+}
+
 #[derive(Clone, Copy)]
 enum NotionConnectionAction {
     Connect,
@@ -990,6 +1016,103 @@ async fn run_notion_connection_flow(
                 "warn",
                 "notion_access.failed",
                 format!("{} failed: {message}", action.failure_label()),
+            );
+            ActionReport { ok: false, message }
+        }
+    };
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+async fn run_google_docs_connection_flow(app: AppHandle, open_browser: bool) -> ActionReport {
+    if CONNECT_GOOGLE_DOCS_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return ActionReport {
+            ok: false,
+            message: "A Google Docs connection flow is already waiting for browser approval."
+                .to_string(),
+        };
+    }
+
+    let state_root = default_state_root();
+    let activity_state_root = state_root.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        connect_google_docs_with_broker(state_root, open_browser)
+    })
+    .await
+    .map_err(|error| format!("Google Docs OAuth worker failed: {error}"));
+    CONNECT_GOOGLE_DOCS_IN_PROGRESS.store(false, Ordering::Release);
+
+    let report = match result {
+        Ok(Ok(message)) => {
+            if let Err(error) = record_desktop_activity(
+                &activity_state_root,
+                "Connected Google Docs",
+                &message,
+                "connect",
+            ) {
+                desktop_log(
+                    "warn",
+                    "activity.record_failed",
+                    format!("could not record Google Docs access activity: {error}"),
+                );
+            }
+            ActionReport { ok: true, message }
+        }
+        Ok(Err(message)) | Err(message) => {
+            desktop_log(
+                "warn",
+                "google_docs_access.failed",
+                format!("connect google docs failed: {message}"),
+            );
+            ActionReport { ok: false, message }
+        }
+    };
+    if report.ok {
+        refresh_desktop_surfaces(&app);
+    }
+    report
+}
+
+async fn run_gmail_connection_flow(app: AppHandle, open_browser: bool) -> ActionReport {
+    if CONNECT_GMAIL_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return ActionReport {
+            ok: false,
+            message: "A Gmail connection flow is already waiting for browser approval.".to_string(),
+        };
+    }
+
+    let state_root = default_state_root();
+    let activity_state_root = state_root.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        connect_gmail_with_broker(state_root, open_browser)
+    })
+    .await
+    .map_err(|error| format!("Gmail OAuth worker failed: {error}"));
+    CONNECT_GMAIL_IN_PROGRESS.store(false, Ordering::Release);
+
+    let report = match result {
+        Ok(Ok(message)) => {
+            if let Err(error) = record_desktop_activity(
+                &activity_state_root,
+                "Connected Gmail",
+                &message,
+                "connect",
+            ) {
+                desktop_log(
+                    "warn",
+                    "activity.record_failed",
+                    format!("could not record Gmail access activity: {error}"),
+                );
+            }
+            ActionReport { ok: true, message }
+        }
+        Ok(Err(message)) | Err(message) => {
+            desktop_log(
+                "warn",
+                "gmail_access.failed",
+                format!("connect gmail failed: {message}"),
             );
             ActionReport { ok: false, message }
         }
@@ -5705,7 +5828,7 @@ fn resolve_desktop_mount_root(path: &str) -> Result<PathBuf, String> {
     {
         let path = path.trim();
         if path.is_empty() {
-            return Err("Choose a CloudStorage folder for the Notion mount.".to_string());
+            return Err("Choose a CloudStorage folder for the source mount.".to_string());
         }
         if !path.contains('/') && !path.starts_with('~') {
             return Ok(macos_locality_cloud_storage_root().join(path));
@@ -6494,8 +6617,27 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 .ok_or_else(|| {
                     "Google Docs mounts need a workspace folder name or ID.".to_string()
                 })?;
-            Some(RemoteId::new(workspace.to_string()))
+            let temp_mount = MountConfig {
+                mount_id: mount_id.clone(),
+                connector: connector.clone(),
+                root: root.clone(),
+                remote_root_id: None,
+                connection_id: connection_id.clone(),
+                read_only: request.read_only,
+                projection: projection.clone(),
+            };
+            let credentials = open_credential_store(&state_root);
+            let connector =
+                resolve_google_docs_connector_for_mount(&store, credentials.as_ref(), &temp_mount)
+                    .map_err(|error| error.message())?;
+            let folder_id = connector
+                .resolve_workspace_folder(workspace)
+                .map_err(|error| {
+                    format!("Failed to resolve Google Docs workspace folder `{workspace}`: {error}")
+                })?;
+            Some(folder_id)
         }
+        "gmail" => None,
         other => {
             return Err(format!(
                 "Desktop mount creation does not support connector `{other}`."
@@ -8946,6 +9088,112 @@ fn connect_notion_with_broker(state_root: PathBuf, open_browser: bool) -> Result
         _ => "Connected Notion workspace.".to_string(),
     };
     Ok(format!("{connected_message} {refresh_message}"))
+}
+
+fn connect_google_docs_with_broker(
+    state_root: PathBuf,
+    open_browser: bool,
+) -> Result<String, String> {
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let broker_url = env_first(&[
+        "LOCALITY_GOOGLE_DOCS_OAUTH_BROKER_URL",
+        "LOCALITY_AUTH_BROKER_URL",
+    ])
+    .unwrap_or_else(|| DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = env_first(&[
+        "LOCALITY_GOOGLE_DOCS_OAUTH_REDIRECT_URI",
+        "GOOGLE_DOCS_OAUTH_REDIRECT_URI",
+    ])
+    .unwrap_or_else(|| DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI.to_string());
+    let broker = HttpGoogleDocsOAuthBrokerClient::new(broker_url.clone());
+    let start = broker
+        .start(&OAuthBrokerStart {
+            connector: GOOGLE_DOCS_CONNECTOR_ID.to_string(),
+            redirect_uri,
+        })
+        .map_err(|error| format!("Could not start Google Docs OAuth broker flow: {error}"))?;
+    let authorization = run_local_oauth_authorization(
+        "Google Docs",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        !open_browser,
+        true,
+    )
+    .map_err(|error| error.message)?;
+    let options = GoogleDocsBrokerOAuthConnectOptions {
+        connection_id: None,
+        broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+
+    let report =
+        run_connect_google_docs_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
+            .map_err(|error| error.message())?;
+    let connected_message = match report.workspace_name.or(report.account_label) {
+        Some(label) if !label.is_empty() => format!("Connected Google Docs account {label}."),
+        _ => "Connected Google Docs.".to_string(),
+    };
+    Ok(format!(
+        "{connected_message} Create a Google Docs source folder to mount a Drive workspace."
+    ))
+}
+
+fn connect_gmail_with_broker(state_root: PathBuf, open_browser: bool) -> Result<String, String> {
+    let mut store = SqliteStateStore::open(state_root.clone())
+        .map_err(|error| format!("Could not open Locality state: {error}"))?;
+    let credentials = open_credential_store(&state_root);
+    let broker_url = env_first(&[
+        "LOCALITY_GMAIL_OAUTH_BROKER_URL",
+        "LOCALITY_AUTH_BROKER_URL",
+    ])
+    .unwrap_or_else(|| DEFAULT_GMAIL_OAUTH_BROKER_URL.to_string());
+    let redirect_uri = env_first(&[
+        "LOCALITY_GMAIL_OAUTH_REDIRECT_URI",
+        "GMAIL_OAUTH_REDIRECT_URI",
+    ])
+    .unwrap_or_else(|| DEFAULT_GMAIL_OAUTH_REDIRECT_URI.to_string());
+    let broker = HttpGmailOAuthBrokerClient::new(broker_url.clone());
+    let start = broker
+        .start(&OAuthBrokerStart {
+            connector: GMAIL_CONNECTOR_ID.to_string(),
+            redirect_uri,
+        })
+        .map_err(|error| format!("Could not start Gmail OAuth broker flow: {error}"))?;
+    let authorization = run_local_oauth_authorization(
+        "Gmail",
+        &start.authorization_url,
+        &start.redirect_uri,
+        &start.state,
+        !open_browser,
+        true,
+    )
+    .map_err(|error| error.message)?;
+    let options = GmailBrokerOAuthConnectOptions {
+        connection_id: None,
+        broker_url,
+        client_id: start.client_id,
+        session: start.session,
+        state: start.state,
+        code: authorization.code,
+        redirect_uri: start.redirect_uri,
+    };
+
+    let report = run_connect_gmail_broker_oauth(&mut store, credentials.as_ref(), options, &broker)
+        .map_err(|error| error.message())?;
+    let connected_message = match report.workspace_name.or(report.account_label) {
+        Some(label) if !label.is_empty() => format!("Connected Gmail account {label}."),
+        _ => "Connected Gmail.".to_string(),
+    };
+    Ok(format!(
+        "{connected_message} Create a Gmail source folder to mount inbox, sent, and draft mailboxes."
+    ))
 }
 
 fn notion_login_link_slot() -> &'static Mutex<Option<String>> {
@@ -15741,6 +15989,8 @@ fn main() {
             connect_notion,
             connect_notion_without_browser,
             change_notion_access,
+            connect_google_docs,
+            connect_gmail,
             notion_login_link,
             install_state_review,
             acknowledge_install_state,
