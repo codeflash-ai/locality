@@ -7,6 +7,7 @@ import {
   type GoogleDocsTokenResponse
 } from "./oauth/google-docs";
 import { exchangeGmailCode, gmailAuthorizeUrl, refreshGmailToken, type GmailTokenResponse } from "./oauth/gmail";
+import { googleClientId } from "./oauth/google";
 import { exchangeNotionCode, notionAuthorizeUrl, refreshNotionToken, type NotionTokenResponse } from "./oauth/notion";
 import { randomBase64Url, decryptJsonHandle, encryptJsonHandle } from "./security/crypto";
 import { validateGmailRedirectUri, validateGoogleDocsRedirectUri, validateNotionRedirectUri } from "./security/redirects";
@@ -144,7 +145,7 @@ app.post("/v1/oauth/google-docs/start", async (c) => {
   );
   return c.json({
     connector: "google-docs",
-    client_id: c.env.LOCALITY_GOOGLE_DOCS_CLIENT_ID,
+    client_id: googleClientId(c.env),
     authorization_url: googleDocsAuthorizeUrl(c.env, redirectUri, state),
     redirect_uri: redirectUri,
     session,
@@ -199,7 +200,7 @@ app.post("/v1/oauth/gmail/start", async (c) => {
   );
   return c.json({
     connector: "gmail",
-    client_id: c.env.LOCALITY_GMAIL_CLIENT_ID,
+    client_id: googleClientId(c.env),
     authorization_url: gmailAuthorizeUrl(c.env, redirectUri, state),
     redirect_uri: redirectUri,
     session,

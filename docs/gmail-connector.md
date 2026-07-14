@@ -41,6 +41,10 @@ The broker allowlist also supports:
 http://127.0.0.1:8757/oauth/gmail/callback
 ```
 
+Gmail and Google Docs use the same broker-configured Google OAuth client:
+`LOCALITY_GOOGLE_CLIENT_ID` and `LOCALITY_GOOGLE_CLIENT_SECRET`. Register both
+the Gmail and Google Docs localhost callbacks on that Google OAuth client.
+
 The default connection ID is `gmail-default`, the default mount ID is
 `gmail-main`, and the default OAuth profile is `gmail-oauth-default`.
 

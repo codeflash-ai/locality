@@ -205,10 +205,8 @@ npm run check
 - `LOCALITY_REFRESH_HANDLE_KEY`: encrypts opaque refresh handles in `handle` mode.
 - `LOCALITY_NOTION_CLIENT_ID`: Notion OAuth client ID.
 - `LOCALITY_NOTION_CLIENT_SECRET`: Notion OAuth client secret.
-- `LOCALITY_GOOGLE_DOCS_CLIENT_ID`: Google OAuth client ID.
-- `LOCALITY_GOOGLE_DOCS_CLIENT_SECRET`: Google OAuth client secret.
-- `LOCALITY_GMAIL_CLIENT_ID`: Google OAuth client ID for Gmail.
-- `LOCALITY_GMAIL_CLIENT_SECRET`: Google OAuth client secret for Gmail.
+- `LOCALITY_GOOGLE_CLIENT_ID`: Google OAuth client ID shared by Google Docs and Gmail.
+- `LOCALITY_GOOGLE_CLIENT_SECRET`: Google OAuth client secret shared by Google Docs and Gmail.
 
 Optional connector overrides:
 

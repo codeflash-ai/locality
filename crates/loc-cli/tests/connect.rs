@@ -194,7 +194,7 @@ fn connect_google_docs_broker_oauth_stores_refresh_handle_without_secrets() {
         GoogleDocsBrokerOAuthConnectOptions {
             connection_id: Some(ConnectionId::new("docs-work")),
             broker_url: "https://auth.example.test".to_string(),
-            client_id: "client-id".to_string(),
+            client_id: "google-client-id".to_string(),
             session: "broker-session".to_string(),
             state: "state-1".to_string(),
             code: "oauth-code".to_string(),
@@ -222,6 +222,7 @@ fn connect_google_docs_broker_oauth_stores_refresh_handle_without_secrets() {
         stored.oauth_broker_url.as_deref(),
         Some("https://auth.example.test")
     );
+    assert_eq!(stored.oauth_client_id.as_deref(), Some("google-client-id"));
 
     let json = serde_json::to_string(&report).expect("json");
     assert!(!json.contains("oauth-access-token"));
@@ -242,7 +243,7 @@ fn connect_gmail_broker_oauth_stores_refresh_handle_without_secrets() {
         GmailBrokerOAuthConnectOptions {
             connection_id: Some(ConnectionId::new("gmail-default")),
             broker_url: "https://auth.example.test".to_string(),
-            client_id: "gmail-client-id".to_string(),
+            client_id: "google-client-id".to_string(),
             session: "broker-session".to_string(),
             state: "state-1".to_string(),
             code: "oauth-code".to_string(),
@@ -270,6 +271,7 @@ fn connect_gmail_broker_oauth_stores_refresh_handle_without_secrets() {
         stored.oauth_broker_url.as_deref(),
         Some("https://auth.example.test")
     );
+    assert_eq!(stored.oauth_client_id.as_deref(), Some("google-client-id"));
 
     let json = serde_json::to_string(&report).expect("json");
     assert!(!json.contains("oauth-access-token"));
@@ -924,7 +926,7 @@ fn gmail_connect_options() -> GmailBrokerOAuthConnectOptions {
     GmailBrokerOAuthConnectOptions {
         connection_id: Some(ConnectionId::new("gmail-default")),
         broker_url: "https://auth.example.test".to_string(),
-        client_id: "gmail-client-id".to_string(),
+        client_id: "google-client-id".to_string(),
         session: "broker-session".to_string(),
         state: "state-1".to_string(),
         code: "oauth-code".to_string(),
