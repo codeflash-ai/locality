@@ -22,6 +22,10 @@ pub const GMAIL_OAUTH_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
 ];
+const REQUIRED_GMAIL_API_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.compose",
+];
 pub const GMAIL_FULL_MAILBOX_SCOPE: &str = "https://mail.google.com/";
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
@@ -168,7 +172,7 @@ pub fn validate_gmail_oauth_scopes(scopes: &[String]) -> Result<(), GmailOAuthSc
     }
 
     let granted = scopes.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    for required in GMAIL_OAUTH_SCOPES {
+    for required in REQUIRED_GMAIL_API_SCOPES {
         if !granted.contains(required) {
             return Err(GmailOAuthScopeError::MissingRequiredScope(required));
         }
@@ -291,6 +295,17 @@ mod tests {
     #[test]
     fn gmail_scope_validation_allows_required_scopes() {
         validate_gmail_oauth_scopes(&gmail_scopes()).expect("valid Gmail scopes");
+    }
+
+    #[test]
+    fn gmail_scope_validation_allows_google_token_scope_without_identity_scopes() {
+        let scopes = GMAIL_OAUTH_SCOPES
+            .iter()
+            .filter(|scope| !matches!(**scope, "openid" | "email" | "profile"))
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>();
+
+        validate_gmail_oauth_scopes(&scopes).expect("valid Gmail API scopes");
     }
 
     #[test]

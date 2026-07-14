@@ -303,6 +303,29 @@ fn connect_gmail_broker_oauth_accepts_worker_scope_string() {
 }
 
 #[test]
+fn connect_gmail_broker_oauth_accepts_google_token_scope_without_identity_scopes() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let scopes = GMAIL_OAUTH_SCOPES
+        .iter()
+        .filter(|scope| !matches!(**scope, "openid" | "email" | "profile"))
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    let exchange = ScopedFakeGmailBrokerOAuthExchange {
+        scopes: scopes.clone(),
+    };
+
+    run_connect_gmail_broker_oauth(&mut store, &credentials, gmail_connect_options(), &exchange)
+        .expect("connect gmail oauth");
+
+    let secret = credentials
+        .get("connection:gmail-default")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredGmailCredential>(&secret).expect("stored oauth");
+    assert_eq!(stored.scopes, scopes);
+}
+
+#[test]
 fn connect_gmail_broker_oauth_rejects_missing_required_scope() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
