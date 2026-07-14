@@ -2320,6 +2320,21 @@ button.home-stat:hover {
   justify-content: flex-end;
 }
 
+.settings-danger-accordion {
+  align-self: start;
+}
+
+.settings-danger-body {
+  display: grid;
+  gap: 10px;
+  padding: 0 14px 14px;
+}
+
+.settings-danger-body .setting-row {
+  padding-right: 0;
+  padding-left: 0;
+}
+
 .compact-settings {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }

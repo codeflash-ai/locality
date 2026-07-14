@@ -4345,28 +4345,38 @@ function SettingsView({
           {diagnosticMessage && <p className="quiet-note inline-note">{diagnosticMessage}</p>}
         </div>
 
-        <div className="panel">
-          <PanelTitle title="Developer" />
-          <SettingRow title="Local database" value="~/.loc/state.sqlite3" />
-          <SettingRow title="Reset behavior" value="Preserve local files" />
-          <SecondaryButton
-            compact
-            icon={resettingState ? <Loader2 className="spin-icon" /> : <RotateCcw />}
-            disabled={resettingState || preparingUninstall}
-            onClick={() => void resetLocalState()}
-          >
-            {resettingState ? "Resetting" : "Reset Local State"}
-          </SecondaryButton>
-          <SecondaryButton
-            compact
-            icon={preparingUninstall ? <Loader2 className="spin-icon" /> : <Trash2 />}
-            disabled={resettingState || preparingUninstall}
-            onClick={() => void prepareUninstall()}
-          >
-            {preparingUninstall ? "Preparing" : "Prepare for Uninstall"}
-          </SecondaryButton>
-          {resetMessage && <p className="quiet-note inline-note">{resetMessage}</p>}
-        </div>
+        <details className="danger-accordion settings-danger-accordion">
+          <summary>
+            <span>
+              <AlertTriangle />
+              Danger Zone
+            </span>
+            <small>Reset and uninstall tools</small>
+          </summary>
+          <div className="settings-danger-body">
+            <SettingRow title="Local database" value="~/.loc/state.sqlite3" />
+            <SettingRow title="Reset behavior" value="Preserve local files" />
+            <div className="button-row">
+              <SecondaryButton
+                compact
+                icon={resettingState ? <Loader2 className="spin-icon" /> : <RotateCcw />}
+                disabled={resettingState || preparingUninstall}
+                onClick={() => void resetLocalState()}
+              >
+                {resettingState ? "Resetting" : "Reset Local State"}
+              </SecondaryButton>
+              <SecondaryButton
+                compact
+                icon={preparingUninstall ? <Loader2 className="spin-icon" /> : <Trash2 />}
+                disabled={resettingState || preparingUninstall}
+                onClick={() => void prepareUninstall()}
+              >
+                {preparingUninstall ? "Preparing" : "Prepare for Uninstall"}
+              </SecondaryButton>
+            </div>
+            {resetMessage && <p className="quiet-note inline-note">{resetMessage}</p>}
+          </div>
+        </details>
 
         <div className="panel">
           <PanelTitle title="Quit Options" />
