@@ -190,6 +190,26 @@ struct LocalityItemMetadata: Decodable {
   }
 }
 
+extension LocalityItemMetadata {
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+
+    identifier = try container.decode(String.self, forKey: .identifier)
+    parentIdentifier = try container.decodeIfPresent(String.self, forKey: .parentIdentifier)
+    filename = try container.decode(String.self, forKey: .filename)
+    kind = try container.decode(String.self, forKey: .kind)
+    entityKind = try container.decodeIfPresent(String.self, forKey: .entityKind)
+    readOnly = try container.decodeIfPresent(Bool.self, forKey: .readOnly) ?? false
+    remoteId = try container.decodeIfPresent(String.self, forKey: .remoteId)
+    path = try container.decode(String.self, forKey: .path)
+    hydration = try container.decodeIfPresent(String.self, forKey: .hydration)
+    contentType = try container.decode(String.self, forKey: .contentType)
+    remoteEditedAt = try container.decodeIfPresent(String.self, forKey: .remoteEditedAt)
+    materializedPath = try container.decodeIfPresent(String.self, forKey: .materializedPath)
+    byteSize = try container.decodeIfPresent(UInt64.self, forKey: .byteSize)
+  }
+}
+
 final class LocalityDaemonClient: @unchecked Sendable {
   private let transport: LocalityDaemonTransport
 

@@ -106,6 +106,32 @@ final class LocalityFileProviderItemTests: XCTestCase {
     XCTAssertFalse(item.capabilities.contains(.allowsRenaming))
   }
 
+  func testMetadataDecodingDefaultsMissingReadOnlyToFalse() throws {
+    let json = Data(
+      """
+      {
+        "identifier": "page-1",
+        "parent_identifier": "root",
+        "filename": "page.md",
+        "kind": "file",
+        "entity_kind": "page",
+        "remote_id": "remote-page-1",
+        "path": "page.md",
+        "hydration": "clean",
+        "content_type": "net.daringfireball.markdown",
+        "remote_edited_at": "2026-07-14T10:00:00Z",
+        "materialized_path": "/tmp/page.md",
+        "byte_size": 42
+      }
+      """.utf8
+    )
+
+    let metadata = try JSONDecoder().decode(LocalityItemMetadata.self, from: json)
+
+    XCTAssertEqual(metadata.filename, "page.md")
+    XCTAssertFalse(metadata.readOnly)
+  }
+
   private func metadata(
     identifier: String,
     filename: String,
