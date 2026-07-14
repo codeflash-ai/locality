@@ -24,7 +24,9 @@ use crate::hydration::{
     HydrationExecutor, HydrationOutcome, HydrationSource, write_parent_database_schema_cache,
 };
 use crate::shadow_match::parsed_matches_shadow;
-use crate::source::source_descriptor;
+use crate::source::{
+    source_create_decision_for_parent_path, source_descriptor, source_write_decision_for_path,
+};
 
 pub const ROOT_CONTAINER_IDENTIFIER: &str = "root";
 pub const SOURCE_ROOT_PREFIX: &str = "source:";
@@ -277,6 +279,8 @@ pub struct VirtualFsItem {
     pub parent_identifier: Option<String>,
     pub filename: String,
     pub kind: VirtualFsItemKind,
+    #[serde(default)]
+    pub read_only: bool,
     pub entity_kind: Option<EntityKind>,
     pub remote_id: Option<String>,
     pub path: String,
@@ -790,6 +794,7 @@ where
                 "only pending-created local files can be written by local virtual identifier",
             ));
         }
+        ensure_source_path_writable(&mount, &mutation.projected_path)?;
         let path = content_path_for_relative(content_root, &mutation.projected_path)?;
         write_binary_atomic(&path, contents)?;
         mutation.content_path = Some(path.clone());
@@ -818,6 +823,7 @@ where
             "only page.md files can be written by the virtual filesystem",
         ));
     }
+    ensure_source_path_writable(&mount, &entity.path)?;
     let path = content_path_for_relative(content_root, &entity.path)?;
     write_binary_atomic(&path, contents)?;
 
@@ -912,6 +918,7 @@ where
     }
 
     let parent_path = container_path(&mount, &entities, &mutations, parent_identifier)?;
+    ensure_source_parent_accepts_create(&mount, &parent_path)?;
     let projected_path = parent_path.join(filename);
     if let Some(item) = existing_file_create_item(&mount, &entities, &mutations, &projected_path) {
         return Ok(mutation_report_for_existing_item(mount_id, item));
@@ -975,6 +982,7 @@ where
         .list_virtual_mutations(mount_id)
         .map_err(LocalityError::from)?;
     let parent_path = container_path(&mount, &entities, &mutations, parent_identifier)?;
+    ensure_source_parent_accepts_create(&mount, &parent_path)?;
     let page_dir = parent_path.join(dirname);
     let projected_path = page_document_path(&page_dir);
     if let Some(item) = existing_directory_create_item(&mount, &entities, &mutations, &page_dir) {
@@ -1112,6 +1120,7 @@ where
                     "only pending-created page directories can be renamed by the virtual filesystem",
                 ));
             }
+            ensure_source_path_writable(&mount, &mutation.projected_path)?;
             ensure_virtual_page_directory_available_for_rename(
                 store,
                 mount_id,
@@ -1147,6 +1156,7 @@ where
                 "only page directories can be renamed by the virtual filesystem",
             ));
         }
+        ensure_source_path_writable(&mount, &entity.path)?;
         ensure_virtual_page_directory_available_for_rename(
             store,
             mount_id,
@@ -1225,6 +1235,7 @@ where
     let new_parent = move_parent_remote(&mount, &entities, new_parent_identifier)?;
 
     if let Some(mut mutation) = local_mutation(store, mount_id, identifier)? {
+        ensure_source_path_writable(&mount, &mutation.projected_path)?;
         let old_path = content_path_for_relative(content_root, &mutation.projected_path)?;
         let new_content_path = content_path_for_relative(content_root, &new_path)?;
         rename_cached_file_if_present(&old_path, &new_content_path)?;
@@ -1253,6 +1264,7 @@ where
             "only page.md files can be renamed by the virtual filesystem",
         ));
     }
+    ensure_source_path_writable(&mount, &entity.path)?;
     let old_path = content_path_for_relative(content_root, &entity.path)?;
     let new_content_path = content_path_for_relative(content_root, &new_path)?;
     rename_cached_file_if_present(&old_path, &new_content_path)?;
@@ -1431,6 +1443,7 @@ where
                 "only page directories can be deleted by the virtual filesystem",
             ));
         }
+        ensure_source_path_writable(&mount, &entity.path)?;
         return record_virtual_fs_page_delete(store, content_root, &mount, &entities, entity, true);
     }
 
@@ -1456,6 +1469,7 @@ where
             "only page.md files can be deleted by the virtual filesystem",
         ));
     }
+    ensure_source_path_writable(&mount, &entity.path)?;
     record_virtual_fs_page_delete(store, content_root, &mount, &entities, entity, false)
 }
 
@@ -1697,13 +1711,15 @@ fn create_parent_remote_id(
         .iter()
         .find(|entity| entity.remote_id == remote_id)
         .ok_or_else(|| missing_identifier(parent_identifier))?;
-    match entity.kind {
-        EntityKind::Page | EntityKind::Database => Ok(remote_id),
-        EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => {
-            Err(LocalityError::Unsupported(
-                "new virtual filesystem files must be created inside a page or database directory",
-            ))
-        }
+    if source_descriptor(&mount.connector)
+        .create_entity_parent_kinds()
+        .contains(&entity.kind)
+    {
+        Ok(remote_id)
+    } else {
+        Err(LocalityError::Unsupported(
+            "new virtual filesystem files cannot be created under this source item",
+        ))
     }
 }
 
@@ -2180,6 +2196,7 @@ fn root_item(mount: &MountConfig) -> VirtualFsItem {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| mount.mount_id.0.clone()),
         kind: VirtualFsItemKind::Folder,
+        read_only: false,
         entity_kind: None,
         remote_id: None,
         path: String::new(),
@@ -2225,6 +2242,7 @@ fn guidance_item(mount: &MountConfig, filename: &str, identifier: &str) -> Virtu
         parent_identifier: Some(mount_point_identifier(mount)),
         filename: filename.to_string(),
         kind: VirtualFsItemKind::File,
+        read_only: true,
         entity_kind: None,
         remote_id: None,
         path: filename.to_string(),
@@ -2243,6 +2261,7 @@ fn source_root_item(mount: &MountConfig) -> VirtualFsItem {
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: filename.clone(),
         kind: VirtualFsItemKind::Folder,
+        read_only: false,
         entity_kind: None,
         remote_id: None,
         path: filename,
@@ -2279,6 +2298,7 @@ fn entity_item(mount: &MountConfig, entity: &EntityRecord, index: &ProviderIndex
         )),
         filename: filename(&entity.path),
         kind,
+        read_only: !source_write_decision_for_path(mount, &entity.path).is_writable(),
         entity_kind: Some(entity.kind.clone()),
         remote_id: Some(entity.remote_id.0.clone()),
         path: path_string(&entity.path),
@@ -2305,6 +2325,7 @@ fn pending_item(
         parent_identifier: Some(parent_identifier),
         filename: filename(&mutation.projected_path),
         kind: VirtualFsItemKind::File,
+        read_only: !source_write_decision_for_path(mount, &mutation.projected_path).is_writable(),
         entity_kind: Some(EntityKind::Page),
         remote_id: None,
         path: path_string(&mutation.projected_path),
@@ -2350,6 +2371,7 @@ fn pending_page_child_dir_item(
         )),
         filename: filename(&path),
         kind: VirtualFsItemKind::Folder,
+        read_only: !source_write_decision_for_path(mount, &path).is_writable(),
         entity_kind: Some(EntityKind::Page),
         remote_id: None,
         path: path_string(&path),
@@ -2373,6 +2395,7 @@ fn pending_temp_item(
         parent_identifier: Some(pending_page_child_dir_identifier(&mutation.local_id)),
         filename: filename.to_string(),
         kind: VirtualFsItemKind::File,
+        read_only: !source_write_decision_for_path(mount, &path).is_writable(),
         entity_kind: Some(EntityKind::Page),
         remote_id: None,
         path: path_string(&path),
@@ -2446,6 +2469,7 @@ fn schema_item(
         parent_identifier: Some(entity.remote_id.0.clone()),
         filename: "_schema.yaml".to_string(),
         kind: VirtualFsItemKind::File,
+        read_only: true,
         entity_kind: None,
         remote_id: Some(entity.remote_id.0.clone()),
         path: path_string(&path),
@@ -2574,6 +2598,7 @@ fn page_child_dir_item(
         )),
         filename: filename(path),
         kind: VirtualFsItemKind::Folder,
+        read_only: !source_write_decision_for_path(mount, path).is_writable(),
         entity_kind: None,
         remote_id: Some(remote_id.0.clone()),
         path: path_string(path),
@@ -2595,6 +2620,7 @@ fn path_dir_item(mount: &MountConfig, path: &Path, index: &ProviderIndex) -> Vir
         )),
         filename: filename(path),
         kind: VirtualFsItemKind::Folder,
+        read_only: !source_write_decision_for_path(mount, path).is_writable(),
         entity_kind: None,
         remote_id: None,
         path: path_string(path),
@@ -2777,6 +2803,27 @@ fn missing_identifier(identifier: &str) -> LocalityError {
     LocalityError::InvalidState(format!(
         "virtual filesystem item `{identifier}` is not present in daemon state"
     ))
+}
+
+fn ensure_source_path_writable(mount: &MountConfig, relative_path: &Path) -> LocalityResult<()> {
+    match source_write_decision_for_path(mount, relative_path) {
+        crate::source::SourceWriteDecision::Writable => Ok(()),
+        crate::source::SourceWriteDecision::ReadOnly { reason } => {
+            Err(LocalityError::Unsupported(reason))
+        }
+    }
+}
+
+fn ensure_source_parent_accepts_create(
+    mount: &MountConfig,
+    parent_path: &Path,
+) -> LocalityResult<()> {
+    match source_create_decision_for_parent_path(mount, parent_path) {
+        crate::source::SourceWriteDecision::Writable => Ok(()),
+        crate::source::SourceWriteDecision::ReadOnly { reason } => {
+            Err(LocalityError::Unsupported(reason))
+        }
+    }
 }
 
 fn is_missing_identifier_error(error: &LocalityError) -> bool {
@@ -3067,6 +3114,80 @@ mod tests {
                 RemoteId::new("gmail-folder:inbox")
             ))
         );
+    }
+
+    #[test]
+    fn gmail_inbox_message_rejects_virtual_write_without_dirtying_entity() {
+        let mount_id = MountId::new("gmail-main");
+        let content_root = temp_root("loc-gmail-readonly").join("content/gmail-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "gmail"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("msg-inbox-1"),
+                kind: EntityKind::Page,
+                title: "Inbox One".to_string(),
+                path: "inbox/2026-07-14-inbox-one-msg-inbox-1.md".into(),
+                hydration: HydrationState::Hydrated,
+                content_hash: None,
+                remote_edited_at: Some("gmail:msg-inbox-1:1".to_string()),
+            })
+            .expect("save entity");
+
+        let error = commit_virtual_fs_write(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "msg-inbox-1",
+            b"edited",
+        )
+        .expect_err("inbox writes are rejected");
+
+        assert!(
+            matches!(error, LocalityError::Unsupported(message) if message.contains("Gmail inbox and sent items are read-only"))
+        );
+        let entity = store
+            .get_entity(&mount_id, &RemoteId::new("msg-inbox-1"))
+            .expect("load entity")
+            .expect("entity");
+        assert_eq!(entity.hydration, HydrationState::Hydrated);
+    }
+
+    #[test]
+    fn gmail_draft_folder_accepts_virtual_create() {
+        let mount_id = MountId::new("gmail-main");
+        let content_root = temp_root("loc-gmail-draft-create").join("content/gmail-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "gmail"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("gmail-folder:draft"),
+                kind: EntityKind::Directory,
+                title: "draft".to_string(),
+                path: "draft".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: Some("folder:draft".to_string()),
+            })
+            .expect("save draft folder");
+
+        let report = create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "gmail-folder:draft",
+            "reply.md",
+        )
+        .expect("draft create");
+
+        assert_eq!(report.item.path, "draft/reply.md");
+        assert_eq!(report.item.entity_kind, Some(EntityKind::Page));
     }
 
     #[test]

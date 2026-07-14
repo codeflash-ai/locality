@@ -256,6 +256,7 @@ fn directory_metadata_item() -> VirtualFsItem {
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: DIRECTORY_METADATA_FILENAME.to_string(),
         kind: VirtualFsItemKind::File,
+        read_only: true,
         entity_kind: None,
         remote_id: None,
         path: DIRECTORY_METADATA_FILENAME.to_string(),
@@ -563,6 +564,7 @@ impl DaemonClient {
             parent_identifier: None,
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,
+            read_only: false,
             entity_kind: None,
             remote_id: None,
             path: String::new(),
@@ -1543,6 +1545,9 @@ fn open_is_writable(flags: u32) -> bool {
 }
 
 fn ensure_writable_item(item: &VirtualFsItem) -> Result<(), FuseError> {
+    if item.read_only {
+        return Err(FuseError::ReadOnly);
+    }
     if item.identifier == DIRECTORY_METADATA_IDENTIFIER {
         return Err(FuseError::ReadOnly);
     }
@@ -1578,10 +1583,11 @@ fn attr_for_item(item: &VirtualFsItem) -> FileAttr {
         #[cfg(target_os = "macos")]
         crtime: attr_time,
         kind: file_type(item),
-        perm: if item.kind == VirtualFsItemKind::Folder {
-            0o755
-        } else {
-            0o644
+        perm: match (&item.kind, item.read_only) {
+            (VirtualFsItemKind::Folder, true) => 0o555,
+            (VirtualFsItemKind::Folder, false) => 0o755,
+            (VirtualFsItemKind::File, true) => 0o444,
+            (VirtualFsItemKind::File, false) => 0o644,
         },
         nlink: if item.kind == VirtualFsItemKind::Folder {
             2
@@ -1699,6 +1705,27 @@ mod tests {
 
         assert_eq!(attr.mtime, UNIX_EPOCH);
         assert_eq!(attr.ctime, UNIX_EPOCH);
+    }
+
+    #[test]
+    fn read_only_attrs_use_read_only_permissions_and_reject_writes() {
+        let mut file = test_item(VirtualFsItemKind::File, None, Some(10));
+        file.read_only = true;
+        let file_attr = attr_for_item(&file);
+        assert_eq!(file_attr.perm, 0o444);
+        assert!(matches!(
+            ensure_writable_item(&file),
+            Err(FuseError::ReadOnly)
+        ));
+
+        let mut folder = test_item(VirtualFsItemKind::Folder, None, None);
+        folder.read_only = true;
+        let folder_attr = attr_for_item(&folder);
+        assert_eq!(folder_attr.perm, 0o555);
+        assert!(matches!(
+            ensure_writable_item(&folder),
+            Err(FuseError::ReadOnly)
+        ));
     }
 
     #[test]
@@ -2184,6 +2211,7 @@ mod tests {
             parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
             filename: "Item".to_string(),
             kind,
+            read_only: false,
             entity_kind: None,
             remote_id: None,
             path: "Item".to_string(),
@@ -2201,6 +2229,7 @@ mod tests {
             parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
             filename: filename.to_string(),
             kind,
+            read_only: false,
             entity_kind: None,
             remote_id: None,
             path: filename.to_string(),
@@ -2218,6 +2247,7 @@ mod tests {
             parent_identifier: None,
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,
+            read_only: false,
             entity_kind: None,
             remote_id: None,
             path: String::new(),
@@ -2235,6 +2265,7 @@ mod tests {
             parent_identifier: None,
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,
+            read_only: false,
             entity_kind: None,
             remote_id: None,
             path: String::new(),

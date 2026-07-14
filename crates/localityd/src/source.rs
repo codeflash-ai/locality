@@ -96,6 +96,7 @@ pub struct SourceDescriptor {
     supports_oauth: bool,
     mount_guidance: Cow<'static, str>,
     source_root_create_parent_kind: Option<EntityKind>,
+    create_entity_parent_kinds: Vec<EntityKind>,
 }
 
 impl SourceDescriptor {
@@ -130,9 +131,16 @@ impl SourceDescriptor {
     pub fn source_root_create_parent_kind(&self) -> Option<EntityKind> {
         self.source_root_create_parent_kind.clone()
     }
+
+    pub fn create_entity_parent_kinds(&self) -> &[EntityKind] {
+        &self.create_entity_parent_kinds
+    }
 }
 
 pub fn source_descriptor(connector: &str) -> SourceDescriptor {
+    if connector == "gmail" {
+        return gmail_source_descriptor();
+    }
     source_registration(connector)
         .map(|registration| (registration.descriptor)())
         .unwrap_or_else(|| generic_source_descriptor(connector))
@@ -140,6 +148,61 @@ pub fn source_descriptor(connector: &str) -> SourceDescriptor {
 
 pub fn source_display_name(connector: &str) -> String {
     source_descriptor(connector).display_name().to_string()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceWriteDecision {
+    Writable,
+    ReadOnly { reason: &'static str },
+}
+
+impl SourceWriteDecision {
+    pub fn is_writable(self) -> bool {
+        matches!(self, Self::Writable)
+    }
+
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Writable => None,
+            Self::ReadOnly { reason } => Some(reason),
+        }
+    }
+}
+
+pub fn source_write_decision_for_path(
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> SourceWriteDecision {
+    if mount.read_only {
+        return SourceWriteDecision::ReadOnly {
+            reason: "mount is read-only",
+        };
+    }
+    if mount.connector == "gmail" {
+        return gmail_write_decision_for_path(relative_path);
+    }
+    SourceWriteDecision::Writable
+}
+
+pub fn source_create_decision_for_parent_path(
+    mount: &MountConfig,
+    parent_path: &Path,
+) -> SourceWriteDecision {
+    if mount.read_only {
+        return SourceWriteDecision::ReadOnly {
+            reason: "mount is read-only",
+        };
+    }
+    if mount.connector == "gmail" {
+        return if parent_path == Path::new("draft") {
+            SourceWriteDecision::Writable
+        } else {
+            SourceWriteDecision::ReadOnly {
+                reason: "Gmail creates are only supported directly inside draft/",
+            }
+        };
+    }
+    SourceWriteDecision::Writable
 }
 
 pub fn supported_source_connectors() -> Vec<&'static str> {
@@ -165,6 +228,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         supports_oauth: true,
         mount_guidance: Cow::Borrowed(NOTION_AGENT_GUIDANCE),
         source_root_create_parent_kind: None,
+        create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
     }
 }
 
@@ -178,6 +242,21 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         supports_oauth: true,
         mount_guidance: Cow::Owned(google_docs_mount_guidance()),
         source_root_create_parent_kind: Some(EntityKind::Directory),
+        create_entity_parent_kinds: vec![EntityKind::Directory],
+    }
+}
+
+fn gmail_source_descriptor() -> SourceDescriptor {
+    SourceDescriptor {
+        id: Cow::Borrowed("gmail"),
+        display_name: Cow::Borrowed("Gmail"),
+        default_mount_id: Cow::Borrowed("gmail-main"),
+        connect_command: None,
+        auth_env_var: None,
+        supports_oauth: true,
+        mount_guidance: Cow::Owned(generic_mount_guidance("Gmail")),
+        source_root_create_parent_kind: None,
+        create_entity_parent_kinds: vec![EntityKind::Directory],
     }
 }
 
@@ -208,6 +287,25 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         supports_oauth: false,
         mount_guidance: Cow::Owned(generic_mount_guidance(connector)),
         source_root_create_parent_kind: None,
+        create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
+    }
+}
+
+fn gmail_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
+    match relative_path
+        .components()
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        }) {
+        Some("draft") => SourceWriteDecision::Writable,
+        Some("inbox") | Some("sent") => SourceWriteDecision::ReadOnly {
+            reason: "Gmail inbox and sent items are read-only",
+        },
+        _ => SourceWriteDecision::ReadOnly {
+            reason: "Gmail writes are only supported under draft/",
+        },
     }
 }
 

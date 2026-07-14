@@ -125,6 +125,7 @@ fn shared_domain_mount_point_item(mount: &MountConfig) -> FileProviderItem {
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: filename.clone(),
         kind: FileProviderItemKind::Folder,
+        read_only: false,
         entity_kind: None,
         remote_id: None,
         path: filename,
