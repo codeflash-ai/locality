@@ -1,10 +1,10 @@
 use loc_cli::connect::{
-    BrokerOAuthConnectOptions, ConnectOptions, DEFAULT_GMAIL_OAUTH_PROFILE_ID,
-    DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID, DEFAULT_NOTION_OAUTH_PROFILE_ID,
-    DEFAULT_NOTION_PROFILE_ID, GmailBrokerOAuthConnectOptions, GmailOAuthBrokerExchange,
-    GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange, NotionConnectionProbe,
-    NotionConnectionProbeResult, NotionOAuthBrokerExchange, NotionOAuthExchange,
-    OAuthConnectOptions, OAuthExchangeFailure, run_connect_gmail_broker_oauth,
+    BrokerOAuthConnectOptions, ConnectOptions, CredentialEncodeFailure, CredentialStorageFailure,
+    DEFAULT_GMAIL_OAUTH_PROFILE_ID, DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID,
+    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID, GmailBrokerOAuthConnectOptions,
+    GmailOAuthBrokerExchange, GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange,
+    NotionConnectionProbe, NotionConnectionProbeResult, NotionOAuthBrokerExchange,
+    NotionOAuthExchange, OAuthConnectOptions, OAuthExchangeFailure, run_connect_gmail_broker_oauth,
     run_connect_google_docs_broker_oauth, run_connect_notion, run_connect_notion_broker_oauth,
     run_connect_notion_oauth, run_disconnect, run_profiles,
 };
@@ -17,7 +17,7 @@ use locality_notion::oauth::{
 };
 use locality_store::{
     ConnectionId, ConnectionRepository, ConnectorProfileId, ConnectorProfileRepository,
-    CredentialStore, InMemoryCredentialStore, InMemoryStateStore,
+    CredentialError, CredentialStore, InMemoryCredentialStore, InMemoryStateStore,
 };
 
 #[test]
@@ -410,6 +410,105 @@ fn connect_oauth_exchange_errors_report_connector_guidance() {
 }
 
 #[test]
+fn connect_gmail_broker_oauth_credential_store_failure_reports_gmail_guidance() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = FailingCredentialStore {
+        error: CredentialError::Unavailable("keychain locked".to_string()),
+    };
+    let exchange = FakeGmailBrokerOAuthExchange;
+
+    let error = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        gmail_connect_options(),
+        &exchange,
+    )
+    .expect_err("credential store failure must be reported");
+    let message = error.message();
+
+    assert_eq!(error.code(), "credential_store_unavailable");
+    assert!(
+        message.starts_with("failed to store Gmail credential: "),
+        "{message}"
+    );
+    assert!(!message.contains("Notion"), "{message}");
+    assert_eq!(error.suggested_command(), Some("loc connect gmail"));
+    assert!(
+        store
+            .get_connection(&ConnectionId::new("gmail-default"))
+            .expect("lookup connection")
+            .is_none()
+    );
+}
+
+#[test]
+fn connect_credential_encode_errors_report_connector_guidance() {
+    let notion = loc_cli::connect::ConnectError::CredentialEncode(CredentialEncodeFailure::notion(
+        "serialization failed",
+    ));
+    assert_eq!(
+        notion.message(),
+        "failed to encode Notion credential: serialization failed"
+    );
+    assert_eq!(notion.suggested_command(), Some("loc connect notion"));
+
+    let google_docs = loc_cli::connect::ConnectError::CredentialEncode(
+        CredentialEncodeFailure::google_docs("serialization failed"),
+    );
+    assert_eq!(
+        google_docs.message(),
+        "failed to encode Google Docs credential: serialization failed"
+    );
+    assert_eq!(
+        google_docs.suggested_command(),
+        Some("loc connect google-docs")
+    );
+
+    let gmail = loc_cli::connect::ConnectError::CredentialEncode(CredentialEncodeFailure::gmail(
+        "serialization failed",
+    ));
+    assert_eq!(
+        gmail.message(),
+        "failed to encode Gmail credential: serialization failed"
+    );
+    assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
+}
+
+#[test]
+fn connect_credential_store_errors_report_connector_guidance() {
+    let notion = loc_cli::connect::ConnectError::Credential(CredentialStorageFailure::notion(
+        CredentialError::Unavailable("keychain locked".to_string()),
+    ));
+    assert_eq!(
+        notion.message(),
+        "credential store unavailable: keychain locked"
+    );
+    assert_eq!(notion.suggested_command(), Some("loc connect notion"));
+
+    let google_docs =
+        loc_cli::connect::ConnectError::Credential(CredentialStorageFailure::google_docs(
+            CredentialError::Unavailable("keychain locked".to_string()),
+        ));
+    assert_eq!(
+        google_docs.message(),
+        "failed to store Google Docs credential: credential store unavailable: keychain locked"
+    );
+    assert_eq!(
+        google_docs.suggested_command(),
+        Some("loc connect google-docs")
+    );
+
+    let gmail = loc_cli::connect::ConnectError::Credential(CredentialStorageFailure::gmail(
+        CredentialError::Unavailable("keychain locked".to_string()),
+    ));
+    assert_eq!(
+        gmail.message(),
+        "failed to store Gmail credential: credential store unavailable: keychain locked"
+    );
+    assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
+}
+
+#[test]
 fn connect_gmail_broker_oauth_rejects_full_mailbox_scope() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
@@ -776,6 +875,25 @@ impl GmailOAuthBrokerExchange for JsonGmailBrokerOAuthExchange {
             "http://localhost:8757/oauth/gmail/callback"
         );
         Ok(serde_json::from_value(self.payload.clone()).expect("decode worker-shaped token"))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FailingCredentialStore {
+    error: CredentialError,
+}
+
+impl CredentialStore for FailingCredentialStore {
+    fn put(&self, _secret_ref: &str, _secret: &str) -> Result<(), CredentialError> {
+        Err(self.error.clone())
+    }
+
+    fn get(&self, _secret_ref: &str) -> Result<String, CredentialError> {
+        Err(self.error.clone())
+    }
+
+    fn delete(&self, _secret_ref: &str) -> Result<(), CredentialError> {
+        Err(self.error.clone())
     }
 }
 

@@ -273,7 +273,7 @@ where
     let secret_ref = format!("connection:{}", connection_id.0);
     credentials
         .put(&secret_ref, &options.token)
-        .map_err(ConnectError::Credential)?;
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::notion(error)))?;
 
     let now = timestamp();
     let profile_id = ConnectorProfileId::new(DEFAULT_NOTION_PROFILE_ID);
@@ -346,11 +346,12 @@ where
         exchange_request.client_secret,
         acquired_at,
     );
-    let secret = serde_json::to_string(&stored)
-        .map_err(|error| ConnectError::CredentialEncode(error.to_string()))?;
+    let secret = serde_json::to_string(&stored).map_err(|error| {
+        ConnectError::CredentialEncode(CredentialEncodeFailure::notion(error.to_string()))
+    })?;
     credentials
         .put(&secret_ref, &secret)
-        .map_err(ConnectError::Credential)?;
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::notion(error)))?;
 
     let now = timestamp();
     let profile_id = ConnectorProfileId::new(DEFAULT_NOTION_OAUTH_PROFILE_ID);
@@ -428,11 +429,12 @@ where
         options.broker_url,
         acquired_at,
     );
-    let secret = serde_json::to_string(&stored)
-        .map_err(|error| ConnectError::CredentialEncode(error.to_string()))?;
+    let secret = serde_json::to_string(&stored).map_err(|error| {
+        ConnectError::CredentialEncode(CredentialEncodeFailure::notion(error.to_string()))
+    })?;
     credentials
         .put(&secret_ref, &secret)
-        .map_err(ConnectError::Credential)?;
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::notion(error)))?;
 
     let now = timestamp();
     let profile_id = ConnectorProfileId::new(DEFAULT_NOTION_OAUTH_PROFILE_ID);
@@ -516,11 +518,12 @@ where
         options.broker_url,
         acquired_at,
     );
-    let secret = serde_json::to_string(&stored)
-        .map_err(|error| ConnectError::CredentialEncode(error.to_string()))?;
+    let secret = serde_json::to_string(&stored).map_err(|error| {
+        ConnectError::CredentialEncode(CredentialEncodeFailure::google_docs(error.to_string()))
+    })?;
     credentials
         .put(&secret_ref, &secret)
-        .map_err(ConnectError::Credential)?;
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::google_docs(error)))?;
 
     let now = timestamp();
     let profile_id = ConnectorProfileId::new(DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID);
@@ -545,8 +548,9 @@ where
         auth_kind: "oauth".to_string(),
         secret_ref,
         scopes: token.scopes.clone(),
-        capabilities_json: google_docs_capabilities_json()
-            .map_err(|error| ConnectError::CredentialEncode(error.to_string()))?,
+        capabilities_json: google_docs_capabilities_json().map_err(|error| {
+            ConnectError::CredentialEncode(CredentialEncodeFailure::google_docs(error.to_string()))
+        })?,
         status: "active".to_string(),
         created_at: now.clone(),
         updated_at: now,
@@ -608,11 +612,12 @@ where
         options.broker_url,
         acquired_at,
     );
-    let secret = serde_json::to_string(&stored)
-        .map_err(|error| ConnectError::CredentialEncode(error.to_string()))?;
+    let secret = serde_json::to_string(&stored).map_err(|error| {
+        ConnectError::CredentialEncode(CredentialEncodeFailure::gmail(error.to_string()))
+    })?;
     credentials
         .put(&secret_ref, &secret)
-        .map_err(ConnectError::Credential)?;
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::gmail(error)))?;
 
     let now = timestamp();
     let profile_id = ConnectorProfileId::new(DEFAULT_GMAIL_OAUTH_PROFILE_ID);
@@ -637,8 +642,9 @@ where
         auth_kind: "oauth".to_string(),
         secret_ref,
         scopes: token.scopes.clone(),
-        capabilities_json: gmail_capabilities_json()
-            .map_err(|error| ConnectError::CredentialEncode(error.to_string()))?,
+        capabilities_json: gmail_capabilities_json().map_err(|error| {
+            ConnectError::CredentialEncode(CredentialEncodeFailure::gmail(error.to_string()))
+        })?,
         status: "active".to_string(),
         created_at: now.clone(),
         updated_at: now,
@@ -730,7 +736,12 @@ where
         .ok_or_else(|| ConnectError::ConnectionMissing(connection_id.0.clone()))?;
     credentials
         .delete(&connection.secret_ref)
-        .map_err(ConnectError::Credential)?;
+        .map_err(|error| {
+            ConnectError::Credential(CredentialStorageFailure::for_connector_id(
+                &connection.connector,
+                error,
+            ))
+        })?;
     connection.status = "revoked".to_string();
     connection.updated_at = timestamp();
     store
@@ -797,13 +808,135 @@ impl OAuthExchangeFailure {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialEncodeFailure {
+    connector: CredentialFailureConnector,
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialStorageFailure {
+    connector: CredentialFailureConnector,
+    error: CredentialError,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CredentialFailureConnector {
+    Notion,
+    GoogleDocs,
+    Gmail,
+}
+
+impl CredentialEncodeFailure {
+    pub fn notion(message: impl Into<String>) -> Self {
+        Self::new(CredentialFailureConnector::Notion, message)
+    }
+
+    pub fn google_docs(message: impl Into<String>) -> Self {
+        Self::new(CredentialFailureConnector::GoogleDocs, message)
+    }
+
+    pub fn gmail(message: impl Into<String>) -> Self {
+        Self::new(CredentialFailureConnector::Gmail, message)
+    }
+
+    fn new(connector: CredentialFailureConnector, message: impl Into<String>) -> Self {
+        Self {
+            connector,
+            message: message.into(),
+        }
+    }
+
+    fn message(&self) -> String {
+        format!(
+            "failed to encode {} credential: {}",
+            self.connector.display_name(),
+            self.message
+        )
+    }
+
+    fn suggested_command(&self) -> &'static str {
+        self.connector.suggested_command()
+    }
+}
+
+impl CredentialStorageFailure {
+    pub fn notion(error: CredentialError) -> Self {
+        Self::new(CredentialFailureConnector::Notion, error)
+    }
+
+    pub fn google_docs(error: CredentialError) -> Self {
+        Self::new(CredentialFailureConnector::GoogleDocs, error)
+    }
+
+    pub fn gmail(error: CredentialError) -> Self {
+        Self::new(CredentialFailureConnector::Gmail, error)
+    }
+
+    fn new(connector: CredentialFailureConnector, error: CredentialError) -> Self {
+        Self { connector, error }
+    }
+
+    fn for_connector_id(connector: &str, error: CredentialError) -> Self {
+        Self::new(
+            CredentialFailureConnector::from_connector_id(connector),
+            error,
+        )
+    }
+
+    fn code(&self) -> &'static str {
+        self.error.code()
+    }
+
+    fn message(&self) -> String {
+        match self.connector {
+            CredentialFailureConnector::Notion => self.error.to_string(),
+            _ => format!(
+                "failed to store {} credential: {}",
+                self.connector.display_name(),
+                self.error
+            ),
+        }
+    }
+
+    fn suggested_command(&self) -> &'static str {
+        self.connector.suggested_command()
+    }
+}
+
+impl CredentialFailureConnector {
+    fn from_connector_id(connector: &str) -> Self {
+        match connector {
+            GOOGLE_DOCS_CONNECTOR_ID => Self::GoogleDocs,
+            GMAIL_CONNECTOR_ID => Self::Gmail,
+            _ => Self::Notion,
+        }
+    }
+
+    fn display_name(&self) -> &'static str {
+        match self {
+            Self::Notion => "Notion",
+            Self::GoogleDocs => "Google Docs",
+            Self::Gmail => "Gmail",
+        }
+    }
+
+    fn suggested_command(&self) -> &'static str {
+        match self {
+            Self::Notion => "loc connect notion",
+            Self::GoogleDocs => "loc connect google-docs",
+            Self::Gmail => "loc connect gmail",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectError {
     ConnectionMissing(String),
     ConnectionNameRequired(String),
     ConnectionProbeFailed(String),
     OAuthExchangeFailed(OAuthExchangeFailure),
-    CredentialEncode(String),
-    Credential(CredentialError),
+    CredentialEncode(CredentialEncodeFailure),
+    Credential(CredentialStorageFailure),
     Store(StoreError),
 }
 
@@ -815,7 +948,7 @@ impl ConnectError {
             Self::ConnectionProbeFailed(_) => "connection_probe_failed",
             Self::OAuthExchangeFailed(_) => "oauth_exchange_failed",
             Self::CredentialEncode(_) => "credential_store_unavailable",
-            Self::Credential(error) => error.code(),
+            Self::Credential(failure) => failure.code(),
             Self::Store(_) => "store_error",
         }
     }
@@ -838,10 +971,8 @@ impl ConnectError {
                     failure.message
                 )
             }
-            Self::CredentialEncode(message) => {
-                format!("failed to encode Notion credential: {message}")
-            }
-            Self::Credential(error) => error.to_string(),
+            Self::CredentialEncode(failure) => failure.message(),
+            Self::Credential(failure) => failure.message(),
             Self::Store(error) => error.to_string(),
         }
     }
@@ -852,7 +983,8 @@ impl ConnectError {
                 Some("loc connect notion")
             }
             Self::OAuthExchangeFailed(failure) => Some(failure.suggested_command()),
-            Self::Credential(_) | Self::CredentialEncode(_) => Some("loc connect notion"),
+            Self::Credential(failure) => Some(failure.suggested_command()),
+            Self::CredentialEncode(failure) => Some(failure.suggested_command()),
             Self::ConnectionNameRequired(_) | Self::Store(_) => None,
         }
     }
@@ -976,8 +1108,9 @@ fn notion_capabilities_json() -> Result<String, ConnectError> {
         supports_undo: true,
         supports_batch_observation: false,
     };
-    serde_json::to_string(&capabilities)
-        .map_err(|error| ConnectError::CredentialEncode(error.to_string()))
+    serde_json::to_string(&capabilities).map_err(|error| {
+        ConnectError::CredentialEncode(CredentialEncodeFailure::notion(error.to_string()))
+    })
 }
 
 fn default_connection_id<S>(store: &S) -> Result<ConnectionId, ConnectError>
