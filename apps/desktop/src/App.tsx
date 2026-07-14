@@ -4419,6 +4419,7 @@ function TrayPopover({
   const { results: searchResults, searching } = useNotionSearchResults(url);
   const visibleChanges = snapshot.pendingChanges.slice(0, 3);
   const visibleSearchResults = locateState === "ready" ? [] : searchResults.slice(0, 3);
+  const trayReviewCounts = reviewQueueCounts(snapshot.pendingChanges);
 
   useEffect(() => {
     if (!quitOptionsOpen) {
@@ -4498,18 +4499,23 @@ function TrayPopover({
       </header>
 
       <section className="tray-section tray-workspace">
-        <p className="label">Notion</p>
+        <div className="tray-section-heading">
+          <span>{PRODUCT_TERMS.connectedSource}</span>
+          <button onClick={() => openMain("mount")}>Sources</button>
+        </div>
         <h2>{snapshot.mount.workspaceName}</h2>
-        <button className="path-button" onClick={() => copyText(snapshot.mount.localPath)}>
-          {snapshot.mount.localPath}
-        </button>
-        <PrimaryButton
-          compact
-          icon={<FolderOpen />}
-          onClick={() => void callCommand("open_path", { path: snapshot.mount.localPath }, { ok: true })}
-        >
-          Open Notion Folder
-        </PrimaryButton>
+        <div className="tray-path-row">
+          <button className="path-button" title="Copy path" onClick={() => copyText(snapshot.mount.localPath)}>
+            {compactPath(snapshot.mount.localPath, 46)}
+          </button>
+          <button
+            className="icon-button has-tooltip"
+            data-tooltip="Open folder"
+            onClick={() => void callCommand("open_path", { path: snapshot.mount.localPath }, { ok: true })}
+          >
+            <FolderOpen />
+          </button>
+        </div>
       </section>
 
       <section className="tray-section tray-live-mode">
@@ -4536,6 +4542,22 @@ function TrayPopover({
             {liveModeMessage}
           </p>
         )}
+      </section>
+
+      <section className="tray-section tray-review-summary">
+        <button className="tray-review-button" type="button" onClick={() => openMain("pending")}>
+          <span>
+            <strong>{PRODUCT_TERMS.reviewCenter}</strong>
+            <small>
+              {trayReviewCounts.total > 0
+                ? `${trayReviewCounts.approvals} approvals · ${trayReviewCounts.problems} problems`
+                : liveModeEnabled
+                  ? "Safe edits sync automatically"
+                  : "No review needed"}
+            </small>
+          </span>
+          <b>{trayReviewCounts.total}</b>
+        </button>
       </section>
 
       <section className="tray-section">
@@ -4599,18 +4621,18 @@ function TrayPopover({
             >
               <strong>{item.title}</strong>
               <small>{item.localPath}</small>
+              <span className={`search-state ${item.state}`}>{locatedStateLabel(item.state)}</span>
             </button>
           ))}
         </section>
       )}
 
-      <button className="tray-row-button" onClick={() => openMain("pending")}>
-        <span>{PRODUCT_TERMS.reviewCenter}</span>
-        <strong>{snapshot.pendingChanges.length}</strong>
-      </button>
-
       {visibleChanges.length > 0 && (
         <section className="tray-change-list">
+          <div className="tray-section-heading">
+            <span>Needs attention</span>
+            <button onClick={() => openMain("pending")}>Review</button>
+          </div>
           {visibleChanges.map((change) => (
             <button
               key={change.localPath}
@@ -4634,6 +4656,7 @@ function TrayPopover({
       </section>
 
       <footer className="tray-footer">
+        <button onClick={() => openMain("activity")}>Activity</button>
         <button onClick={() => openMain("settings")}>Settings</button>
         <div className="tray-quit-options" ref={quitOptionsRef}>
           <button onClick={() => setQuitOptionsOpen((open) => !open)}>Quit Options</button>

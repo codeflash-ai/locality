@@ -3472,14 +3472,12 @@ button.home-stat:hover {
 
 .tray-header,
 .tray-title,
-.tray-row-button,
 .tray-footer {
   display: flex;
   align-items: center;
 }
 
 .tray-header,
-.tray-row-button,
 .tray-footer {
   justify-content: space-between;
 }
@@ -3501,8 +3499,25 @@ button.home-stat:hover {
   font-size: 17px;
 }
 
-.tray-workspace .primary-button {
-  margin-top: 4px;
+.tray-path-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 8px;
+}
+
+.tray-path-row .path-button {
+  min-width: 0;
+  margin-top: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tray-path-row .icon-button {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
 }
 
 .tray-live-mode {
@@ -3595,7 +3610,7 @@ button.home-stat:hover {
 .tray-result button,
 .tray-suggestion button,
 .tray-footer button,
-.tray-row-button,
+.tray-review-button,
 .tray-change-list button {
   border: 0;
   background: transparent;
@@ -3658,6 +3673,53 @@ button.home-stat:hover {
   font-size: 10px;
 }
 
+.tray-review-summary {
+  padding: 10px;
+  border-color: rgba(192, 138, 0, 0.22);
+  background: var(--amber-soft);
+}
+
+.tray-review-button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 42px;
+  text-align: left;
+}
+
+.tray-review-button span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.tray-review-button strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.tray-review-button small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tray-review-button b {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--amber);
+  font-size: 12px;
+}
+
 .tray-recent-files {
   display: grid;
   gap: 6px;
@@ -3693,6 +3755,13 @@ button.home-stat:hover {
   font-size: 10px;
 }
 
+.tray-recent-files .search-state {
+  justify-self: start;
+  margin-top: 2px;
+  padding: 2px 6px;
+  font-size: 9px;
+}
+
 .tray-result {
   display: grid;
   gap: 5px;
@@ -3713,18 +3782,6 @@ button.home-stat:hover {
 .tray-result button {
   justify-self: start;
   color: var(--accent);
-}
-
-.tray-row-button {
-  min-height: 42px;
-  padding: 0 12px;
-  border: 1px solid rgba(217, 140, 31, 0.18);
-  border-radius: 12px;
-  background: rgba(255, 250, 241, 0.86);
-}
-
-.tray-row-button strong {
-  color: #9d6515;
 }
 
 .tray-change-list {
