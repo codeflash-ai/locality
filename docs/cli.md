@@ -6,12 +6,14 @@ The `loc` command is the single supported control surface for users and coding a
 
 - `loc connect notion [--name <id>] [--token-stdin|--no-browser|--direct-oauth] [--broker-url <url>] [--redirect-uri <uri>] [--json]`
 - `loc connect google-docs [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>] [--json]`
+- `loc connect gmail [--name <id>] [--no-browser] [--broker-url <url>] [--redirect-uri <uri>] [--json]`
 - `loc connections [--json]`
 - `loc profiles [--json]`
 - `loc connection show <id> [--json]`
 - `loc disconnect <id> [--json]`
 - `loc mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
+- `loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `loc daemon status [--json]`
 - `loc info [path] [--json]`
 - `loc status [path] [--json]`
@@ -75,6 +77,12 @@ The default connection ID is `notion-default` when no Notion connection exists. 
 `loc mount google-docs <path> --workspace-folder <name-or-id>` registers a Google Docs mount rooted at a Locality-owned Google Drive folder. Folder URLs and ids are verified through Drive; names reuse an accessible matching folder or create a new Locality workspace folder. The resolved Drive folder id is stored as the mount `remote_root_id`. Google Docs files project as page directories containing `page.md`, and Drive folders project as local directories.
 
 Google Docs mounts use Google Docs document access plus Drive `drive.file` and Drive metadata access. Pull enumerates Google Docs and Drive folders under the configured workspace folder, including Docs manually added inside that workspace folder. Non-Google-Docs Drive files are ignored by this connector in V1.
+
+`loc connect gmail [--name <id>]` uses the Locality OAuth broker flow for Gmail. The default connection ID is `gmail-default` and the default OAuth profile is `gmail-oauth-default`. The default broker is `https://afs-oauth-broker.saurabh-b07.workers.dev`; override it with `--broker-url <url>`, `LOCALITY_GMAIL_OAUTH_BROKER_URL`, or `LOCALITY_AUTH_BROKER_URL`. The default callback is `http://localhost:8757/oauth/gmail/callback`; override it with `--redirect-uri <uri>` or `LOCALITY_GMAIL_OAUTH_REDIRECT_URI`. The Google OAuth client and broker allowlist should include both `http://localhost:8757/oauth/gmail/callback` and `http://127.0.0.1:8757/oauth/gmail/callback`.
+
+Gmail OAuth uses `openid`, `email`, `profile`, `https://www.googleapis.com/auth/gmail.readonly`, and `https://www.googleapis.com/auth/gmail.compose`. No broader Gmail account scope is required.
+
+`loc mount gmail <path>` registers a Gmail mount. If `--connection` is omitted, the daemon resolves the mount through the only active Gmail connection at runtime; with multiple active Gmail connections, pass `--connection <id>`. When `--mount-id` is omitted, Locality uses `gmail-main` when available. Gmail mounts project `inbox/`, `sent/`, and `draft/` folders. `inbox/` and `sent/` are read-only; create a Markdown file directly under `draft/` to send mail on push.
 
 `loc connections` and `loc connection show <id>` list connected-account metadata only, including the profile ID but never credentials. `loc profiles` lists connector auth profiles and contains no account secrets. `loc disconnect <id>` deletes the credential and marks the connection `revoked`; mounts remain registered and will report `connection_revoked` on the next pull/push until reconnected or remounted.
 
@@ -437,12 +445,14 @@ Concrete shared-root examples:
   notion-main/
   notion-my-company/
   google-docs-main/
+  gmail-main/
 ```
 
 ```bash
 loc mount notion ~/Locality/notion-main --workspace --projection linux-fuse
 loc mount notion ~/Locality/notion-my-company --workspace --connection notion-company --projection linux-fuse
 loc mount google-docs ~/Locality/google-docs-main --workspace-folder "Locality" --projection linux-fuse
+loc mount gmail ~/Locality/gmail-main --projection linux-fuse
 loc file-provider register ~/Locality/notion-main
 loc file-provider open notion-main
 ```
@@ -528,6 +538,10 @@ directories below it across projection modes. `loc pull <page-file>` hydrates
 one known entity and downloads its file-like media. Pull refuses to overwrite a
 hydrated file if its body no longer matches the Synced Tree shadow, returning a
 dirty skip instead.
+
+For Gmail mounts, pull enumerates the recent 100 inbox messages and recent 100
+sent messages. `draft/` is present for local sends, but v1 does not enumerate
+remote Gmail drafts.
 
 The JSON report includes `via`, `enumerated`, `stubbed`, `hydrated`, and `skipped_dirty` counts. `via` is `daemon` when the Unix socket handled the job and `cli` when the command executed directly.
 
@@ -734,6 +748,12 @@ The JSON report has the same validation, plan, degradation, guardrail, and stage
 - `apply_failed`.
 
 Reports also include `via`, `push_id`, `journal_status`, changed/reconciled remote IDs, and `apply_effect_count` when execution starts. The Notion connector now applies the supported block and page-property write subset, local file-like media updates, block moves, and new database-row creation through the live API. Connector capability preflight runs before journaling, so unsupported operations return `unsupported_operations` without appending a journal. Once a journaled push starts, the daemon performs connector metadata checks and verifies the current Remote Tree render still matches the Synced Tree shadow before applying Local Tree edits.
+
+For Gmail, `loc push` supports creating a new Markdown file directly under
+`draft/`. Push creates a Gmail draft and immediately sends it; push is the send
+action. Gmail draft files require `to` frontmatter and either `subject` or
+`title`; `cc` and `bcc` are optional. Nested draft files and edits or deletes in
+`inbox/` and `sent/` are rejected.
 
 Unsupported-operation JSON shape:
 

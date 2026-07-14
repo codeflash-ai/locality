@@ -13050,6 +13050,7 @@ mod tests {
             parent_identifier: Some("source:notion".to_string()),
             filename: filename.to_string(),
             kind: localityd::virtual_fs::VirtualFsItemKind::Folder,
+            read_only: false,
             entity_kind: None,
             remote_id: remote_id.map(str::to_string),
             path: filename.to_string(),
@@ -13282,7 +13283,8 @@ mod tests {
                     })
                 }
                 locality_connector::ChildContainer::PageChildren(_)
-                | locality_connector::ChildContainer::DatabaseRows(_) => {
+                | locality_connector::ChildContainer::DatabaseRows(_)
+                | locality_connector::ChildContainer::DirectoryChildren(_) => {
                     Ok(locality_connector::ListChildrenResult::default())
                 }
             }

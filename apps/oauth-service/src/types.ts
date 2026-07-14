@@ -13,9 +13,14 @@ export interface BrokerEnv {
   LOCALITY_GOOGLE_DOCS_REDIRECT_URIS?: string;
   LOCALITY_GOOGLE_DOCS_AUTH_BASE_URL?: string;
   LOCALITY_GOOGLE_DOCS_API_BASE_URL?: string;
+  LOCALITY_GMAIL_CLIENT_ID?: string;
+  LOCALITY_GMAIL_CLIENT_SECRET?: string;
+  LOCALITY_GMAIL_REDIRECT_URIS?: string;
+  LOCALITY_GMAIL_AUTH_BASE_URL?: string;
+  LOCALITY_GMAIL_API_BASE_URL?: string;
 }
 
-export type ConnectorId = "notion" | "google-docs";
+export type ConnectorId = "notion" | "google-docs" | "gmail";
 
 export interface ApiErrorBody {
   error: {

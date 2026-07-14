@@ -164,6 +164,7 @@ struct LocalityItemMetadata: Decodable {
   let filename: String
   let kind: String
   let entityKind: String?
+  let readOnly: Bool
   let remoteId: String?
   let path: String
   let hydration: String?
@@ -178,6 +179,7 @@ struct LocalityItemMetadata: Decodable {
     case filename
     case kind
     case entityKind = "entity_kind"
+    case readOnly = "read_only"
     case remoteId = "remote_id"
     case path
     case hydration
@@ -185,6 +187,26 @@ struct LocalityItemMetadata: Decodable {
     case remoteEditedAt = "remote_edited_at"
     case materializedPath = "materialized_path"
     case byteSize = "byte_size"
+  }
+}
+
+extension LocalityItemMetadata {
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+
+    identifier = try container.decode(String.self, forKey: .identifier)
+    parentIdentifier = try container.decodeIfPresent(String.self, forKey: .parentIdentifier)
+    filename = try container.decode(String.self, forKey: .filename)
+    kind = try container.decode(String.self, forKey: .kind)
+    entityKind = try container.decodeIfPresent(String.self, forKey: .entityKind)
+    readOnly = try container.decodeIfPresent(Bool.self, forKey: .readOnly) ?? false
+    remoteId = try container.decodeIfPresent(String.self, forKey: .remoteId)
+    path = try container.decode(String.self, forKey: .path)
+    hydration = try container.decodeIfPresent(String.self, forKey: .hydration)
+    contentType = try container.decode(String.self, forKey: .contentType)
+    remoteEditedAt = try container.decodeIfPresent(String.self, forKey: .remoteEditedAt)
+    materializedPath = try container.decodeIfPresent(String.self, forKey: .materializedPath)
+    byteSize = try container.decodeIfPresent(UInt64.self, forKey: .byteSize)
   }
 }
 

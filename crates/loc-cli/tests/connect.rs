@@ -1,12 +1,15 @@
 use loc_cli::connect::{
-    BrokerOAuthConnectOptions, ConnectOptions, DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID,
-    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID,
-    GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange, NotionConnectionProbe,
-    NotionConnectionProbeResult, NotionOAuthBrokerExchange, NotionOAuthExchange,
-    OAuthConnectOptions, run_connect_google_docs_broker_oauth, run_connect_notion,
-    run_connect_notion_broker_oauth, run_connect_notion_oauth, run_disconnect, run_profiles,
+    BrokerOAuthConnectOptions, ConnectOptions, CredentialEncodeFailure, CredentialStorageFailure,
+    DEFAULT_GMAIL_OAUTH_PROFILE_ID, DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID,
+    DEFAULT_NOTION_OAUTH_PROFILE_ID, DEFAULT_NOTION_PROFILE_ID, GmailBrokerOAuthConnectOptions,
+    GmailOAuthBrokerExchange, GoogleDocsBrokerOAuthConnectOptions, GoogleDocsOAuthBrokerExchange,
+    NotionConnectionProbe, NotionConnectionProbeResult, NotionOAuthBrokerExchange,
+    NotionOAuthExchange, OAuthConnectOptions, OAuthExchangeFailure, run_connect_gmail_broker_oauth,
+    run_connect_google_docs_broker_oauth, run_connect_notion, run_connect_notion_broker_oauth,
+    run_connect_notion_oauth, run_disconnect, run_profiles,
 };
 use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
+use locality_gmail::{GMAIL_OAUTH_SCOPES, StoredGmailCredential};
 use locality_google_docs::{GOOGLE_DOCS_OAUTH_SCOPES, StoredGoogleDocsCredential};
 use locality_notion::oauth::{
     NotionOAuthBrokerCodeExchange, NotionOAuthCodeExchange, NotionOAuthToken,
@@ -14,7 +17,7 @@ use locality_notion::oauth::{
 };
 use locality_store::{
     ConnectionId, ConnectionRepository, ConnectorProfileId, ConnectorProfileRepository,
-    CredentialStore, InMemoryCredentialStore, InMemoryStateStore,
+    CredentialError, CredentialStore, InMemoryCredentialStore, InMemoryStateStore,
 };
 
 #[test]
@@ -225,6 +228,377 @@ fn connect_google_docs_broker_oauth_stores_refresh_handle_without_secrets() {
     assert!(!json.contains("opaque-refresh-handle"));
     assert!(!json.contains("client-secret"));
     assert!(!json.contains("secret_ref"));
+}
+
+#[test]
+fn connect_gmail_broker_oauth_stores_refresh_handle_without_secrets() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = FakeGmailBrokerOAuthExchange;
+
+    let report = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        GmailBrokerOAuthConnectOptions {
+            connection_id: Some(ConnectionId::new("gmail-default")),
+            broker_url: "https://auth.example.test".to_string(),
+            client_id: "gmail-client-id".to_string(),
+            session: "broker-session".to_string(),
+            state: "state-1".to_string(),
+            code: "oauth-code".to_string(),
+            redirect_uri: "http://localhost:8757/oauth/gmail/callback".to_string(),
+        },
+        &exchange,
+    )
+    .expect("connect gmail oauth");
+
+    assert_eq!(report.connection_id, "gmail-default");
+    assert_eq!(report.profile_id, DEFAULT_GMAIL_OAUTH_PROFILE_ID);
+    assert_eq!(report.connector, "gmail");
+    assert_eq!(report.auth_kind, "oauth");
+    assert_eq!(report.account_label.as_deref(), Some("user@example.com"));
+
+    let secret = credentials
+        .get("connection:gmail-default")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredGmailCredential>(&secret).expect("stored oauth");
+    assert_eq!(
+        stored.refresh_token_handle.as_deref(),
+        Some("opaque-refresh-handle")
+    );
+    assert_eq!(
+        stored.oauth_broker_url.as_deref(),
+        Some("https://auth.example.test")
+    );
+
+    let json = serde_json::to_string(&report).expect("json");
+    assert!(!json.contains("oauth-access-token"));
+    assert!(!json.contains("opaque-refresh-handle"));
+    assert!(!json.contains("client-secret"));
+    assert!(!json.contains("secret_ref"));
+}
+
+#[test]
+fn connect_gmail_broker_oauth_accepts_worker_scope_string() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = JsonGmailBrokerOAuthExchange {
+        payload: gmail_worker_token_payload(GMAIL_OAUTH_SCOPES.join(" ")),
+    };
+
+    run_connect_gmail_broker_oauth(&mut store, &credentials, gmail_connect_options(), &exchange)
+        .expect("connect gmail oauth");
+
+    let secret = credentials
+        .get("connection:gmail-default")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredGmailCredential>(&secret).expect("stored oauth");
+    assert_eq!(
+        stored.scopes,
+        GMAIL_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn connect_gmail_broker_oauth_accepts_google_token_scope_without_identity_scopes() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let scopes = GMAIL_OAUTH_SCOPES
+        .iter()
+        .filter(|scope| !matches!(**scope, "openid" | "email" | "profile"))
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    let exchange = ScopedFakeGmailBrokerOAuthExchange {
+        scopes: scopes.clone(),
+    };
+
+    run_connect_gmail_broker_oauth(&mut store, &credentials, gmail_connect_options(), &exchange)
+        .expect("connect gmail oauth");
+
+    let secret = credentials
+        .get("connection:gmail-default")
+        .expect("credential saved");
+    let stored = serde_json::from_str::<StoredGmailCredential>(&secret).expect("stored oauth");
+    assert_eq!(stored.scopes, scopes);
+}
+
+#[test]
+fn connect_gmail_broker_oauth_rejects_missing_required_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = ScopedFakeGmailBrokerOAuthExchange {
+        scopes: GMAIL_OAUTH_SCOPES
+            .iter()
+            .filter(|scope| **scope != "https://www.googleapis.com/auth/gmail.compose")
+            .map(|scope| scope.to_string())
+            .collect(),
+    };
+
+    let error = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        gmail_connect_options(),
+        &exchange,
+    )
+    .expect_err("missing Gmail compose scope must be rejected");
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        error
+            .message()
+            .contains("missing required Gmail OAuth scope")
+    );
+    assert!(
+        error
+            .message()
+            .contains("https://www.googleapis.com/auth/gmail.compose")
+    );
+    assert!(credentials.get("connection:gmail-default").is_err());
+    assert!(
+        store
+            .get_connection(&ConnectionId::new("gmail-default"))
+            .expect("lookup connection")
+            .is_none()
+    );
+}
+
+#[test]
+fn connect_gmail_broker_oauth_scope_validation_reports_gmail_guidance() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = ScopedFakeGmailBrokerOAuthExchange {
+        scopes: GMAIL_OAUTH_SCOPES
+            .iter()
+            .filter(|scope| **scope != "https://www.googleapis.com/auth/gmail.compose")
+            .map(|scope| scope.to_string())
+            .collect(),
+    };
+
+    let error = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        gmail_connect_options(),
+        &exchange,
+    )
+    .expect_err("missing Gmail compose scope must be rejected");
+    let message = error.message();
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        message.starts_with("Gmail OAuth exchange failed: "),
+        "{message}"
+    );
+    assert!(!message.contains("Notion OAuth"), "{message}");
+    assert_eq!(error.suggested_command(), Some("loc connect gmail"));
+}
+
+#[test]
+fn connect_oauth_exchange_errors_report_connector_guidance() {
+    let notion = loc_cli::connect::ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::notion(
+        "authorization code was rejected",
+    ));
+    assert_eq!(
+        notion.message(),
+        "Notion OAuth exchange failed: authorization code was rejected"
+    );
+    assert_eq!(notion.suggested_command(), Some("loc connect notion"));
+
+    let google_docs = loc_cli::connect::ConnectError::OAuthExchangeFailed(
+        OAuthExchangeFailure::google_docs("authorization code was rejected"),
+    );
+    let google_docs_message = google_docs.message();
+    assert_eq!(
+        google_docs_message,
+        "Google Docs OAuth exchange failed: authorization code was rejected"
+    );
+    assert!(!google_docs_message.contains("Notion OAuth"));
+    assert_eq!(
+        google_docs.suggested_command(),
+        Some("loc connect google-docs")
+    );
+
+    let gmail = loc_cli::connect::ConnectError::OAuthExchangeFailed(OAuthExchangeFailure::gmail(
+        "authorization code was rejected",
+    ));
+    let gmail_message = gmail.message();
+    assert_eq!(
+        gmail_message,
+        "Gmail OAuth exchange failed: authorization code was rejected"
+    );
+    assert!(!gmail_message.contains("Notion OAuth"));
+    assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
+}
+
+#[test]
+fn connect_gmail_broker_oauth_credential_store_failure_reports_gmail_guidance() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = FailingCredentialStore {
+        error: CredentialError::Unavailable("keychain locked".to_string()),
+    };
+    let exchange = FakeGmailBrokerOAuthExchange;
+
+    let error = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        gmail_connect_options(),
+        &exchange,
+    )
+    .expect_err("credential store failure must be reported");
+    let message = error.message();
+
+    assert_eq!(error.code(), "credential_store_unavailable");
+    assert!(
+        message.starts_with("failed to store Gmail credential: "),
+        "{message}"
+    );
+    assert!(!message.contains("Notion"), "{message}");
+    assert_eq!(error.suggested_command(), Some("loc connect gmail"));
+    assert!(
+        store
+            .get_connection(&ConnectionId::new("gmail-default"))
+            .expect("lookup connection")
+            .is_none()
+    );
+}
+
+#[test]
+fn connect_credential_encode_errors_report_connector_guidance() {
+    let notion = loc_cli::connect::ConnectError::CredentialEncode(CredentialEncodeFailure::notion(
+        "serialization failed",
+    ));
+    assert_eq!(
+        notion.message(),
+        "failed to encode Notion credential: serialization failed"
+    );
+    assert_eq!(notion.suggested_command(), Some("loc connect notion"));
+
+    let google_docs = loc_cli::connect::ConnectError::CredentialEncode(
+        CredentialEncodeFailure::google_docs("serialization failed"),
+    );
+    assert_eq!(
+        google_docs.message(),
+        "failed to encode Google Docs credential: serialization failed"
+    );
+    assert_eq!(
+        google_docs.suggested_command(),
+        Some("loc connect google-docs")
+    );
+
+    let gmail = loc_cli::connect::ConnectError::CredentialEncode(CredentialEncodeFailure::gmail(
+        "serialization failed",
+    ));
+    assert_eq!(
+        gmail.message(),
+        "failed to encode Gmail credential: serialization failed"
+    );
+    assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
+}
+
+#[test]
+fn connect_credential_store_errors_report_connector_guidance() {
+    let notion = loc_cli::connect::ConnectError::Credential(CredentialStorageFailure::notion(
+        CredentialError::Unavailable("keychain locked".to_string()),
+    ));
+    assert_eq!(
+        notion.message(),
+        "credential store unavailable: keychain locked"
+    );
+    assert_eq!(notion.suggested_command(), Some("loc connect notion"));
+
+    let google_docs =
+        loc_cli::connect::ConnectError::Credential(CredentialStorageFailure::google_docs(
+            CredentialError::Unavailable("keychain locked".to_string()),
+        ));
+    assert_eq!(
+        google_docs.message(),
+        "failed to store Google Docs credential: credential store unavailable: keychain locked"
+    );
+    assert_eq!(
+        google_docs.suggested_command(),
+        Some("loc connect google-docs")
+    );
+
+    let gmail = loc_cli::connect::ConnectError::Credential(CredentialStorageFailure::gmail(
+        CredentialError::Unavailable("keychain locked".to_string()),
+    ));
+    assert_eq!(
+        gmail.message(),
+        "failed to store Gmail credential: credential store unavailable: keychain locked"
+    );
+    assert_eq!(gmail.suggested_command(), Some("loc connect gmail"));
+}
+
+#[test]
+fn connect_gmail_broker_oauth_rejects_full_mailbox_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let mut scopes = GMAIL_OAUTH_SCOPES
+        .iter()
+        .rev()
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    scopes.push("https://mail.google.com/".to_string());
+    let exchange = ScopedFakeGmailBrokerOAuthExchange { scopes };
+
+    let error = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        gmail_connect_options(),
+        &exchange,
+    )
+    .expect_err("full Gmail mailbox scope must be rejected");
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        error
+            .message()
+            .contains("Gmail OAuth broker returned unsupported full mailbox scope")
+    );
+    assert!(error.message().contains("https://mail.google.com/"));
+    assert!(credentials.get("connection:gmail-default").is_err());
+    assert!(
+        store
+            .get_connection(&ConnectionId::new("gmail-default"))
+            .expect("lookup connection")
+            .is_none()
+    );
+}
+
+#[test]
+fn connect_gmail_broker_oauth_rejects_full_mailbox_scope_from_worker_scope_string() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let mut scope = GMAIL_OAUTH_SCOPES.join(" ");
+    scope.push_str(" https://mail.google.com/");
+    let exchange = JsonGmailBrokerOAuthExchange {
+        payload: gmail_worker_token_payload(scope),
+    };
+
+    let error = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        gmail_connect_options(),
+        &exchange,
+    )
+    .expect_err("full Gmail mailbox scope must be rejected");
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        error
+            .message()
+            .contains("Gmail OAuth broker returned unsupported full mailbox scope")
+    );
+    assert!(error.message().contains("https://mail.google.com/"));
+    assert!(credentials.get("connection:gmail-default").is_err());
+    assert!(
+        store
+            .get_connection(&ConnectionId::new("gmail-default"))
+            .expect("lookup connection")
+            .is_none()
+    );
 }
 
 #[test]
@@ -447,4 +821,141 @@ impl GoogleDocsOAuthBrokerExchange for FakeGoogleDocsBrokerOAuthExchange {
                 .collect(),
         })
     }
+}
+
+#[derive(Clone, Debug)]
+struct FakeGmailBrokerOAuthExchange;
+
+impl GmailOAuthBrokerExchange for FakeGmailBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "gmail");
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/gmail/callback"
+        );
+        Ok(OAuthBrokerToken {
+            access_token: "oauth-access-token".to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: Some(3600),
+            refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+            account_id: Some("acct-1".to_string()),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("gmail".to_string()),
+            workspace_name: Some("Gmail".to_string()),
+            scopes: GMAIL_OAUTH_SCOPES
+                .iter()
+                .rev()
+                .map(|scope| scope.to_string())
+                .collect(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScopedFakeGmailBrokerOAuthExchange {
+    scopes: Vec<String>,
+}
+
+impl GmailOAuthBrokerExchange for ScopedFakeGmailBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "gmail");
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/gmail/callback"
+        );
+        Ok(gmail_broker_token(self.scopes.clone()))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct JsonGmailBrokerOAuthExchange {
+    payload: serde_json::Value,
+}
+
+impl GmailOAuthBrokerExchange for JsonGmailBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "gmail");
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/gmail/callback"
+        );
+        Ok(serde_json::from_value(self.payload.clone()).expect("decode worker-shaped token"))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FailingCredentialStore {
+    error: CredentialError,
+}
+
+impl CredentialStore for FailingCredentialStore {
+    fn put(&self, _secret_ref: &str, _secret: &str) -> Result<(), CredentialError> {
+        Err(self.error.clone())
+    }
+
+    fn get(&self, _secret_ref: &str) -> Result<String, CredentialError> {
+        Err(self.error.clone())
+    }
+
+    fn delete(&self, _secret_ref: &str) -> Result<(), CredentialError> {
+        Err(self.error.clone())
+    }
+}
+
+fn gmail_connect_options() -> GmailBrokerOAuthConnectOptions {
+    GmailBrokerOAuthConnectOptions {
+        connection_id: Some(ConnectionId::new("gmail-default")),
+        broker_url: "https://auth.example.test".to_string(),
+        client_id: "gmail-client-id".to_string(),
+        session: "broker-session".to_string(),
+        state: "state-1".to_string(),
+        code: "oauth-code".to_string(),
+        redirect_uri: "http://localhost:8757/oauth/gmail/callback".to_string(),
+    }
+}
+
+fn gmail_broker_token(scopes: Vec<String>) -> OAuthBrokerToken {
+    OAuthBrokerToken {
+        access_token: "oauth-access-token".to_string(),
+        token_type: Some("Bearer".to_string()),
+        expires_in: Some(3600),
+        refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+        account_id: Some("acct-1".to_string()),
+        account_label: Some("user@example.com".to_string()),
+        workspace_id: Some("gmail".to_string()),
+        workspace_name: Some("Gmail".to_string()),
+        scopes,
+    }
+}
+
+fn gmail_worker_token_payload(scope: String) -> serde_json::Value {
+    serde_json::json!({
+        "access_token": "oauth-access-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token_handle": "opaque-refresh-handle",
+        "account_id": "acct-1",
+        "account_label": "user@example.com",
+        "workspace_id": "gmail",
+        "workspace_name": "Gmail",
+        "scope": scope,
+    })
 }

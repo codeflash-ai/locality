@@ -27,7 +27,7 @@ use locality_core::path_projection::{
     is_page_document_path, page_container_path, page_document_path,
 };
 use locality_core::planner::GuardrailDecision;
-use locality_core::planner::{GuardrailPolicy, PushOperation, PushPlan};
+use locality_core::planner::{GuardrailPolicy, PropertyValue, PushOperation, PushPlan};
 use locality_core::push::{
     PushApplier, PushApplyRequest, PushApplyResult, PushApproval, PushConcurrencyCheck,
     PushConcurrencyRequest, PushExecutionRequest, PushExecutionResult, PushPipelineAction,
@@ -159,7 +159,7 @@ where
     let prepared = preflight_push(source, prepare_push(store, &job, state_root, &validator)?);
     let relative_path = auto_save_relative_path(&prepared);
 
-    if let Some(reason) = auto_save_block_reason(&prepared.pipeline) {
+    if let Some(reason) = auto_save_block_reason_for_prepared(&prepared) {
         mark_auto_save_blocked(
             store,
             &prepared.mount.mount_id,
@@ -305,6 +305,15 @@ where
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
+    if let Some(report) = block_ambiguous_gmail_send_replay(store, &prepared)? {
+        return Ok(report);
+    }
+    if let Some(report) =
+        resume_failed_created_entity_reconciliation(store, source, &prepared, state_root)?
+    {
+        return Ok(report);
+    }
+
     let push_id = generate_push_id();
     let remote_preconditions = remote_preconditions_for_plan(
         store,
@@ -395,6 +404,309 @@ where
     }
 }
 
+fn block_ambiguous_gmail_send_replay<S>(
+    store: &S,
+    prepared: &PreparedPush,
+) -> LocalityResult<Option<PushJobReport>>
+where
+    S: JournalRepository,
+{
+    if prepared.mount.connector != "gmail"
+        || prepared.pipeline.action != PushPipelineAction::ProceedToApply
+    {
+        return Ok(None);
+    }
+    let Some(plan) = prepared.pipeline.plan.as_ref() else {
+        return Ok(None);
+    };
+    if plan.operations.is_empty()
+        || !plan
+            .operations
+            .iter()
+            .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+    {
+        return Ok(None);
+    }
+
+    let Some(journal) = latest_ambiguous_gmail_send_journal(store, &prepared.mount.mount_id, plan)?
+    else {
+        return Ok(None);
+    };
+    let error = LocalityError::Guardrail(
+        "a previous Gmail send for this draft has an ambiguous result and may have already sent; inspect Gmail Sent Mail and the Locality journal before retrying"
+            .to_string(),
+    );
+
+    Ok(Some(PushJobReport {
+        target_path: prepared.absolute_path.clone(),
+        mount_id: prepared.mount.mount_id.clone(),
+        entity_id: prepared.entity.remote_id.clone(),
+        pipeline: prepared.pipeline.clone(),
+        readable_diff: prepared.readable_diff.clone(),
+        action: PushJobAction::Failed,
+        execution: None,
+        push_id: Some(journal.push_id),
+        journal_status: Some(journal.status),
+        error: Some(PushJobError::from(error)),
+    }))
+}
+
+fn latest_ambiguous_gmail_send_journal<S>(
+    store: &S,
+    mount_id: &MountId,
+    plan: &PushPlan,
+) -> LocalityResult<Option<JournalEntry>>
+where
+    S: JournalRepository,
+{
+    let mut latest = None;
+    for journal in store.list_journal().map_err(LocalityError::from)? {
+        if journal.mount_id != *mount_id
+            || !journal_created_entity_source_paths_match(&journal.plan, plan)
+        {
+            continue;
+        }
+        if latest
+            .as_ref()
+            .is_none_or(|current| journal_is_newer(&journal, current))
+        {
+            latest = Some(journal);
+        }
+    }
+
+    Ok(latest.filter(|journal: &JournalEntry| {
+        journal.apply_effects.is_empty() && ambiguous_gmail_send_status(&journal.status)
+    }))
+}
+
+fn ambiguous_gmail_send_status(status: &JournalStatus) -> bool {
+    match status {
+        JournalStatus::Applying => true,
+        JournalStatus::Failed(message) => message.contains("gmail draft send"),
+        _ => false,
+    }
+}
+
+fn resume_failed_created_entity_reconciliation<S, Source>(
+    store: &mut S,
+    source: &Source,
+    prepared: &PreparedPush,
+    state_root: Option<&Path>,
+) -> LocalityResult<Option<PushJobReport>>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + VirtualMutationRepository,
+    Source: HydrationSource + ?Sized,
+{
+    if prepared.pipeline.action != PushPipelineAction::ProceedToApply {
+        return Ok(None);
+    }
+    let Some(plan) = prepared.pipeline.plan.as_ref() else {
+        return Ok(None);
+    };
+    let Some(journal) =
+        latest_resumable_created_entity_journal(store, &prepared.mount.mount_id, plan)?
+    else {
+        return Ok(None);
+    };
+
+    let changed_remote_ids = created_entity_effect_ids(&journal.apply_effects);
+    let mut completed_stages = prepared.pipeline.completed_stages.clone();
+    completed_stages.push(PushStage::ConcurrencyCheckAndApply);
+    completed_stages.push(PushStage::JournalAndReconcile);
+
+    let reconcile_result = {
+        let mut host = DaemonPushHost {
+            store,
+            source,
+            state_root: state_root.map(Path::to_path_buf),
+        };
+        host.update_status(&journal.push_id, JournalStatus::Applied)?;
+        match host.reconcile(PushReconcileRequest {
+            push_id: &journal.push_id,
+            mount_id: &journal.mount_id,
+            plan: &journal.plan,
+            changed_remote_ids: &changed_remote_ids,
+            apply_effects: &journal.apply_effects,
+        }) {
+            Ok(result) => {
+                host.update_status(&journal.push_id, JournalStatus::Reconciled)?;
+                Ok(result)
+            }
+            Err(error) => {
+                host.update_status(&journal.push_id, JournalStatus::Failed(error.to_string()))?;
+                Err(error)
+            }
+        }
+    };
+
+    match reconcile_result {
+        Ok(result) => Ok(Some(PushJobReport {
+            target_path: prepared.absolute_path.clone(),
+            mount_id: prepared.mount.mount_id.clone(),
+            entity_id: prepared.entity.remote_id.clone(),
+            pipeline: prepared.pipeline.clone(),
+            readable_diff: prepared.readable_diff.clone(),
+            action: PushJobAction::Reconciled,
+            execution: Some(PushExecutionResult {
+                push_id: journal.push_id.clone(),
+                action: locality_core::push::PushExecutionAction::Reconciled,
+                changed_remote_ids,
+                apply_effects: journal.apply_effects.clone(),
+                reconciled_remote_ids: result.reconciled_remote_ids,
+                journal_status: Some(JournalStatus::Reconciled),
+                completed_stages,
+            }),
+            push_id: Some(journal.push_id),
+            journal_status: Some(JournalStatus::Reconciled),
+            error: None,
+        })),
+        Err(error) => Ok(Some(PushJobReport {
+            target_path: prepared.absolute_path.clone(),
+            mount_id: prepared.mount.mount_id.clone(),
+            entity_id: prepared.entity.remote_id.clone(),
+            pipeline: prepared.pipeline.clone(),
+            readable_diff: prepared.readable_diff.clone(),
+            action: PushJobAction::Failed,
+            execution: None,
+            push_id: Some(journal.push_id.clone()),
+            journal_status: journal_status_after_error(store, &journal.push_id),
+            error: Some(PushJobError::from(error)),
+        })),
+    }
+}
+
+fn latest_resumable_created_entity_journal<S>(
+    store: &S,
+    mount_id: &MountId,
+    plan: &PushPlan,
+) -> LocalityResult<Option<JournalEntry>>
+where
+    S: JournalRepository,
+{
+    let mut latest = None;
+    for journal in store.list_journal().map_err(LocalityError::from)? {
+        if journal.mount_id != *mount_id
+            || !matches!(
+                journal.status,
+                JournalStatus::Failed(_) | JournalStatus::Applied
+            )
+            || !resumable_created_entity_effects(&journal)
+            || !plan
+                .operations
+                .iter()
+                .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+            || !journal_created_entity_sources_match(&journal, plan)
+        {
+            continue;
+        }
+        if latest
+            .as_ref()
+            .is_none_or(|current| journal_is_newer(&journal, current))
+        {
+            latest = Some(journal);
+        }
+    }
+
+    Ok(latest)
+}
+
+fn resumable_created_entity_effects(journal: &JournalEntry) -> bool {
+    !journal.apply_effects.is_empty()
+        && journal
+            .apply_effects
+            .iter()
+            .all(|effect| matches!(effect, JournalApplyEffect::CreatedEntity { .. }))
+}
+
+fn journal_created_entity_sources_match(journal: &JournalEntry, plan: &PushPlan) -> bool {
+    let mut current_sources = plan_create_entity_sources(plan);
+
+    for effect in &journal.apply_effects {
+        let JournalApplyEffect::CreatedEntity {
+            operation_index, ..
+        } = effect
+        else {
+            return false;
+        };
+        let Some(PushOperation::CreateEntity {
+            parent_id,
+            source_path,
+            ..
+        }) = journal.plan.operations.get(*operation_index)
+        else {
+            return false;
+        };
+
+        let Some(matched_index) =
+            current_sources
+                .iter()
+                .position(|(current_parent_id, current_source_path)| {
+                    *current_parent_id == parent_id && *current_source_path == source_path
+                })
+        else {
+            return false;
+        };
+        current_sources.remove(matched_index);
+    }
+
+    current_sources.is_empty()
+}
+
+fn journal_created_entity_source_paths_match(left: &PushPlan, right: &PushPlan) -> bool {
+    let mut left_sources = plan_create_entity_sources(left);
+    let mut right_sources = plan_create_entity_sources(right);
+    left_sources.sort();
+    right_sources.sort();
+    left_sources == right_sources
+}
+
+fn plan_create_entity_sources(plan: &PushPlan) -> Vec<(&RemoteId, &PathBuf)> {
+    plan.operations
+        .iter()
+        .filter_map(|operation| match operation {
+            PushOperation::CreateEntity {
+                parent_id,
+                source_path,
+                ..
+            } => Some((parent_id, source_path)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn created_entity_effect_ids(effects: &[JournalApplyEffect]) -> Vec<RemoteId> {
+    let mut ids = Vec::new();
+    for effect in effects {
+        if let JournalApplyEffect::CreatedEntity { entity_id, .. } = effect
+            && !ids.iter().any(|id| id == entity_id)
+        {
+            ids.push(entity_id.clone());
+        }
+    }
+    ids
+}
+
+fn journal_is_newer(candidate: &JournalEntry, current: &JournalEntry) -> bool {
+    match (
+        candidate.metadata.created_at_unix_ms,
+        current.metadata.created_at_unix_ms,
+    ) {
+        (Some(candidate_time), Some(current_time)) if candidate_time != current_time => {
+            candidate_time > current_time
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        _ => candidate.push_id.0 > current.push_id.0,
+    }
+}
+
 fn auto_save_relative_path(prepared: &PreparedPush) -> PathBuf {
     prepared
         .pipeline
@@ -409,6 +721,25 @@ fn auto_save_relative_path(prepared: &PreparedPush) -> PathBuf {
                 })
         })
         .unwrap_or_else(|| prepared.entity.path.clone())
+}
+
+fn auto_save_block_reason_for_prepared(prepared: &PreparedPush) -> Option<String> {
+    gmail_auto_save_block_reason(prepared).or_else(|| auto_save_block_reason(&prepared.pipeline))
+}
+
+fn gmail_auto_save_block_reason(prepared: &PreparedPush) -> Option<String> {
+    if prepared.mount.connector != "gmail" {
+        return None;
+    }
+    let plan = prepared.pipeline.plan.as_ref()?;
+    if plan
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+    {
+        return Some("Gmail draft sends require review".to_string());
+    }
+    None
 }
 
 fn created_entity_id(report: &PushJobReport) -> Option<RemoteId> {
@@ -2279,12 +2610,7 @@ fn create_entity_pipeline(
             Some("remove the `loc` block or set `loc.type` to `page`".to_string()),
         ));
     }
-    if parsed
-        .frontmatter
-        .title
-        .as_ref()
-        .is_none_or(|title| title.trim().is_empty())
-    {
+    if create_entity_title_required(parsed, mount) {
         validation.push(ValidationIssue::new(
             "create_entity_missing_title",
             relative_path,
@@ -2347,13 +2673,14 @@ fn create_entity_pipeline(
     } else {
         Some(parent.kind.clone())
     };
+    let title = create_entity_title(relative_path, parsed, mount);
     let plan = PushPlan::new(
         affected_entities,
         vec![PushOperation::CreateEntity {
             parent_id,
             parent_kind,
             parent_workspace: private_create,
-            title: parsed.frontmatter.title.clone().unwrap_or_default(),
+            title,
             properties,
             body: parsed.document.body.clone(),
             source_path: relative_path.to_path_buf(),
@@ -2379,6 +2706,54 @@ fn create_entity_pipeline(
         action,
         completed_stages,
     }
+}
+
+fn create_entity_title_required(
+    parsed: &locality_core::canonical::ParsedCanonicalDocument,
+    mount: &MountConfig,
+) -> bool {
+    mount.connector != "gmail"
+        && parsed
+            .frontmatter
+            .title
+            .as_ref()
+            .is_none_or(|title| title.trim().is_empty())
+}
+
+fn create_entity_title(
+    relative_path: &Path,
+    parsed: &locality_core::canonical::ParsedCanonicalDocument,
+    mount: &MountConfig,
+) -> String {
+    if let Some(title) = parsed.frontmatter.title.as_ref()
+        && !title.trim().is_empty()
+    {
+        return title.clone();
+    }
+    if mount.connector == "gmail"
+        && let Some(subject) = frontmatter_string(&parsed.frontmatter.properties, "subject")
+        && !subject.trim().is_empty()
+    {
+        return subject.trim().to_string();
+    }
+    relative_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn frontmatter_string(
+    properties: &locality_core::canonical::FrontmatterProperties,
+    key: &str,
+) -> Option<String> {
+    properties
+        .get(key)
+        .map(property_value_from_frontmatter)
+        .and_then(|value| match value {
+            PropertyValue::String(value) => Some(value),
+            _ => None,
+        })
 }
 
 fn private_create_requested(parsed: &locality_core::canonical::ParsedCanonicalDocument) -> bool {
@@ -2583,11 +2958,14 @@ where
             match effect {
                 JournalApplyEffect::CreatedEntity {
                     operation_index,
+                    parent_id,
                     entity_id,
                     ..
                 } => {
                     let Some(PushOperation::CreateEntity {
                         title,
+                        properties,
+                        body,
                         source_path,
                         parent_kind,
                         ..
@@ -2595,7 +2973,13 @@ where
                     else {
                         continue;
                     };
-                    let entity_path = created_entity_reconcile_path(source_path, parent_kind);
+                    let entity_path = created_entity_reconcile_path(
+                        self.store,
+                        request.mount_id,
+                        source_path,
+                        parent_kind,
+                        parent_id,
+                    )?;
                     let mut entity = EntityRecord::new(
                         request.mount_id.clone(),
                         entity_id.clone(),
@@ -2604,11 +2988,6 @@ where
                         entity_path,
                     )
                     .with_hydration(HydrationState::Stub);
-                    self.store
-                        .save_entity(entity.clone())
-                        .map_err(LocalityError::from)?;
-                    let path =
-                        projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
                     let rendered = self.source.fetch_render(
                         &locality_core::hydration::HydrationRequest::new(
                             request.mount_id.clone(),
@@ -2618,6 +2997,17 @@ where
                             locality_core::hydration::HydrationReason::ExplicitPull,
                         ),
                     )?;
+                    entity.path = created_entity_reconcile_path_from_rendered(
+                        self.store,
+                        request.mount_id,
+                        &entity.path,
+                        parent_kind,
+                        parent_id,
+                        entity_id,
+                        &rendered,
+                    )?;
+                    let path =
+                        projection_write_path(self.state_root.as_deref(), &mount, &entity.path);
                     let output_root = projection_output_root(self.state_root.as_deref(), &mount)?;
                     accept_post_apply_remote(
                         self.store,
@@ -2627,16 +3017,20 @@ where
                         &output_root,
                         rendered,
                     )?;
-                    remove_stale_created_entity_source_path(
+                    let clear_source_mutation = remove_stale_created_entity_source_path(
                         self.state_root.as_deref(),
                         &mount,
+                        title,
+                        properties,
+                        body,
                         source_path,
                         &entity.path,
                     )?;
-                    if let Some(mutation) = self
-                        .store
-                        .find_virtual_mutation_by_path(request.mount_id, source_path)
-                        .map_err(LocalityError::from)?
+                    if clear_source_mutation
+                        && let Some(mutation) = self
+                            .store
+                            .find_virtual_mutation_by_path(request.mount_id, source_path)
+                            .map_err(LocalityError::from)?
                     {
                         self.store
                             .delete_virtual_mutation(request.mount_id, &mutation.local_id)
@@ -2738,35 +3132,197 @@ where
     }
 }
 
-fn created_entity_reconcile_path(source_path: &Path, parent_kind: &Option<EntityKind>) -> PathBuf {
+fn created_entity_reconcile_path<S>(
+    store: &S,
+    mount_id: &MountId,
+    source_path: &Path,
+    parent_kind: &Option<EntityKind>,
+    parent_id: &RemoteId,
+) -> LocalityResult<PathBuf>
+where
+    S: EntityRepository,
+{
     if matches!(parent_kind, Some(EntityKind::Database)) && !is_page_document_path(source_path) {
-        return page_document_path(&page_container_path(source_path));
+        return Ok(page_document_path(&page_container_path(source_path)));
     }
 
-    source_path.to_path_buf()
+    if matches!(parent_kind, Some(EntityKind::Directory))
+        && let Some(parent) = store
+            .get_entity(mount_id, parent_id)
+            .map_err(LocalityError::from)?
+        && parent.kind == EntityKind::Directory
+        && let Some(filename) = source_path.file_name()
+    {
+        return Ok(parent.path.join(filename));
+    }
+
+    Ok(source_path.to_path_buf())
+}
+
+fn created_entity_reconcile_path_from_rendered<S>(
+    store: &S,
+    mount_id: &MountId,
+    current_path: &Path,
+    parent_kind: &Option<EntityKind>,
+    parent_id: &RemoteId,
+    entity_id: &RemoteId,
+    rendered: &HydratedEntity,
+) -> LocalityResult<PathBuf>
+where
+    S: EntityRepository,
+{
+    if !matches!(parent_kind, Some(EntityKind::Directory)) {
+        return Ok(current_path.to_path_buf());
+    }
+
+    let Some(parent) = store
+        .get_entity(mount_id, parent_id)
+        .map_err(LocalityError::from)?
+    else {
+        return Ok(current_path.to_path_buf());
+    };
+    if parent.kind != EntityKind::Directory {
+        return Ok(current_path.to_path_buf());
+    }
+
+    if let Some(filename) = gmail_rendered_message_filename(entity_id, rendered) {
+        return Ok(parent.path.join(filename));
+    }
+
+    Ok(current_path.to_path_buf())
+}
+
+fn gmail_rendered_message_filename(
+    entity_id: &RemoteId,
+    rendered: &HydratedEntity,
+) -> Option<String> {
+    let rendered_markdown = render_canonical_markdown(&rendered.document);
+    let parsed = parse_canonical_markdown(&rendered_markdown).ok()?;
+    let frontmatter_remote_edited_at = parsed
+        .frontmatter
+        .loc
+        .as_ref()
+        .and_then(|loc| loc.remote_edited_at.as_deref());
+    let remote_edited_at = rendered
+        .remote_edited_at
+        .as_deref()
+        .or(frontmatter_remote_edited_at)?;
+    let internal_date = gmail_internal_date(entity_id, remote_edited_at)?;
+    let subject = frontmatter_string(&parsed.frontmatter.properties, "subject");
+    let title = parsed
+        .frontmatter
+        .title
+        .as_deref()
+        .or(subject.as_deref())
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("(no subject)");
+
+    Some(format!(
+        "{}-{}-{}.md",
+        gmail_safe_slug(internal_date),
+        gmail_safe_slug(title),
+        gmail_safe_slug(entity_id.as_str())
+    ))
+}
+
+fn gmail_internal_date<'a>(entity_id: &RemoteId, remote_version: &'a str) -> Option<&'a str> {
+    let rest = remote_version.strip_prefix("gmail:")?;
+    let rest = rest.strip_prefix(entity_id.as_str())?;
+    let rest = rest.strip_prefix(':')?;
+    let internal_date = rest.split(':').next().unwrap_or("unknown");
+    Some(if internal_date.is_empty() {
+        "unknown"
+    } else {
+        internal_date
+    })
+}
+
+fn gmail_safe_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "untitled".to_string()
+    } else {
+        slug.to_string()
+    }
 }
 
 fn remove_stale_created_entity_source_path(
     state_root: Option<&Path>,
     mount: &MountConfig,
+    title: &str,
+    properties: &BTreeMap<String, PropertyValue>,
+    body: &str,
     source_path: &Path,
     entity_path: &Path,
-) -> LocalityResult<()> {
+) -> LocalityResult<bool> {
     if source_path == entity_path {
-        return Ok(());
+        return Ok(true);
     }
 
     let stale_path = projection_write_path(state_root, mount, source_path);
     let canonical_path = projection_write_path(state_root, mount, entity_path);
     if stale_path == canonical_path {
-        return Ok(());
+        return Ok(true);
+    }
+
+    // A Gmail draft may have been edited after the send succeeded but before
+    // reconciliation finished. Preserve that edited draft as a new pending send.
+    if mount.connector == "gmail"
+        && !created_entity_source_matches_plan(
+            mount,
+            source_path,
+            &stale_path,
+            title,
+            properties,
+            body,
+        )
+    {
+        return Ok(false);
     }
 
     match std::fs::remove_file(&stale_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error.into()),
     }
+}
+
+fn created_entity_source_matches_plan(
+    mount: &MountConfig,
+    source_path: &Path,
+    stale_path: &Path,
+    title: &str,
+    properties: &BTreeMap<String, PropertyValue>,
+    body: &str,
+) -> bool {
+    let Ok(contents) = std::fs::read_to_string(stale_path) else {
+        return true;
+    };
+    let Ok(parsed) = parse_canonical_markdown(&contents) else {
+        return false;
+    };
+    let parsed_properties = parsed
+        .frontmatter
+        .properties
+        .iter()
+        .map(|(key, value)| (key.clone(), property_value_from_frontmatter(value)))
+        .collect::<BTreeMap<_, _>>();
+
+    create_entity_title(source_path, &parsed, mount) == title
+        && parsed_properties == *properties
+        && parsed.document.body == body
 }
 
 fn accept_post_apply_remote<S>(
