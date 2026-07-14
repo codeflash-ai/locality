@@ -597,7 +597,7 @@ p {
 .tray-result button:active:not(:disabled),
 .tray-suggestion button:active:not(:disabled),
 .tray-footer button:active:not(:disabled),
-.tray-row-button:active:not(:disabled),
+.tray-review-button:active:not(:disabled),
 .tray-change-list button:active:not(:disabled) {
   transform: translateY(1px) scale(0.99);
 }
