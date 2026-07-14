@@ -4,7 +4,7 @@ use locality_core::canonical::parse_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationIssue;
-use locality_gmail::{GMAIL_CONNECTOR_ID, StoredGmailCredential};
+use locality_gmail::{GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredential};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
 use locality_store::{
@@ -230,6 +230,30 @@ fn stored_gmail_credential(access_token: &str) -> StoredGmailCredential {
     )
 }
 
+fn expired_gmail_credential(access_token: &str, broker_url: String) -> StoredGmailCredential {
+    let mut stored = StoredGmailCredential::from_broker_token(
+        OAuthBrokerToken {
+            access_token: access_token.to_string(),
+            token_type: Some("Bearer".to_string()),
+            expires_in: Some(1),
+            refresh_token_handle: Some("handle-1".to_string()),
+            account_id: Some("acct-1".to_string()),
+            account_label: Some("user@example.com".to_string()),
+            workspace_id: Some("gmail".to_string()),
+            workspace_name: Some("Gmail".to_string()),
+            scopes: GMAIL_OAUTH_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
+        },
+        "client-id".to_string(),
+        broker_url,
+        1,
+    );
+    stored.expires_at = Some(1);
+    stored
+}
+
 fn gmail_mount() -> MountConfig {
     MountConfig::new(MountId::new("gmail-main"), GMAIL_CONNECTOR_ID, "/tmp/gmail")
 }
@@ -326,6 +350,107 @@ fn resolving_gmail_mount_uses_active_oauth_connection_credentials() {
         panic!("expected gmail source");
     };
     assert_eq!(connector.config().access_token, "gmail-access-token");
+}
+
+#[test]
+fn resolving_expired_gmail_credential_rejects_refresh_missing_required_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "gmail-default", GMAIL_CONNECTOR_ID, "oauth");
+    let refresh_scopes = GMAIL_OAUTH_SCOPES
+        .iter()
+        .filter(|scope| **scope != "https://www.googleapis.com/auth/gmail.compose")
+        .collect::<Vec<_>>();
+    let refresh_response = serde_json::json!({
+        "access_token": "new-access-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token_handle": "handle-2",
+        "account_id": "acct-1",
+        "account_label": "user@example.com",
+        "workspace_id": "gmail",
+        "workspace_name": "Gmail",
+        "scopes": refresh_scopes,
+    })
+    .to_string();
+    let (broker_url, broker) = spawn_refresh_broker("HTTP/1.1 200 OK", refresh_response);
+    let stored = expired_gmail_credential("expired-access-token", broker_url);
+    let original_secret = serde_json::to_string(&stored).expect("credential json");
+    credentials
+        .put(&secret_ref, &original_secret)
+        .expect("save credential");
+    let mount = gmail_mount().with_connection_id(connection_id);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("missing refreshed Gmail compose scope must be rejected");
+    broker.join().expect("broker thread");
+
+    assert_eq!(error.code(), "auth_required");
+    assert!(
+        error
+            .message()
+            .contains("missing required Gmail OAuth scope")
+    );
+    assert!(
+        error
+            .message()
+            .contains("https://www.googleapis.com/auth/gmail.compose")
+    );
+    assert_eq!(error.suggested_command(), Some("loc connect gmail"));
+    assert_eq!(
+        credentials.get(&secret_ref).expect("saved credential"),
+        original_secret
+    );
+}
+
+#[test]
+fn resolving_expired_gmail_credential_rejects_refresh_full_mailbox_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "gmail-default", GMAIL_CONNECTOR_ID, "oauth");
+    let mut refresh_scopes = GMAIL_OAUTH_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    refresh_scopes.push("https://mail.google.com/".to_string());
+    let refresh_response = serde_json::json!({
+        "access_token": "new-access-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token_handle": "handle-2",
+        "account_id": "acct-1",
+        "account_label": "user@example.com",
+        "workspace_id": "gmail",
+        "workspace_name": "Gmail",
+        "scopes": refresh_scopes,
+    })
+    .to_string();
+    let (broker_url, broker) = spawn_refresh_broker("HTTP/1.1 200 OK", refresh_response);
+    let stored = expired_gmail_credential("expired-access-token", broker_url);
+    let original_secret = serde_json::to_string(&stored).expect("credential json");
+    credentials
+        .put(&secret_ref, &original_secret)
+        .expect("save credential");
+    let mount = gmail_mount().with_connection_id(connection_id);
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("full Gmail mailbox refresh scope must be rejected");
+    broker.join().expect("broker thread");
+
+    assert_eq!(error.code(), "auth_required");
+    assert!(
+        error
+            .message()
+            .contains("Gmail OAuth broker returned unsupported full mailbox scope")
+    );
+    assert!(error.message().contains("https://mail.google.com/"));
+    assert_eq!(error.suggested_command(), Some("loc connect gmail"));
+    assert_eq!(
+        credentials.get(&secret_ref).expect("saved credential"),
+        original_secret
+    );
 }
 
 #[test]

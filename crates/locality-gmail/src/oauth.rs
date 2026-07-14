@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -21,6 +22,7 @@ pub const GMAIL_OAUTH_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
 ];
+pub const GMAIL_FULL_MAILBOX_SCOPE: &str = "https://mail.google.com/";
 
 static REQWEST_CRYPTO_PROVIDER: OnceLock<()> = OnceLock::new();
 
@@ -94,11 +96,21 @@ impl StoredGmailCredential {
         }
     }
 
-    pub fn refreshed(&self, token: OAuthBrokerToken, acquired_at: u64) -> Self {
+    pub fn refreshed(
+        &self,
+        token: OAuthBrokerToken,
+        acquired_at: u64,
+    ) -> Result<Self, GmailOAuthScopeError> {
         let expires_at = token
             .expires_in
             .and_then(|expires_in| acquired_at.checked_add(expires_in));
-        Self {
+        let scopes = if token.scopes.is_empty() {
+            self.scopes.clone()
+        } else {
+            validate_gmail_oauth_scopes(&token.scopes)?;
+            token.scopes
+        };
+        Ok(Self {
             kind: "oauth".to_string(),
             connector: GMAIL_CONNECTOR_ID.to_string(),
             access_token: token.access_token,
@@ -109,23 +121,60 @@ impl StoredGmailCredential {
             account_label: token.account_label.or_else(|| self.account_label.clone()),
             workspace_id: token.workspace_id.or_else(|| self.workspace_id.clone()),
             workspace_name: token.workspace_name.or_else(|| self.workspace_name.clone()),
-            scopes: if token.scopes.is_empty() {
-                self.scopes.clone()
-            } else {
-                token.scopes
-            },
+            scopes,
             refresh_token_handle: token
                 .refresh_token_handle
                 .or_else(|| self.refresh_token_handle.clone()),
             acquired_at,
             expires_at,
-        }
+        })
     }
 
     pub fn expires_soon(&self, now: u64) -> bool {
         self.expires_at
             .is_some_and(|expires_at| expires_at <= now.saturating_add(60))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GmailOAuthScopeError {
+    FullMailboxScope,
+    MissingRequiredScope(&'static str),
+}
+
+impl fmt::Display for GmailOAuthScopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FullMailboxScope => write!(
+                f,
+                "Gmail OAuth broker returned unsupported full mailbox scope `{GMAIL_FULL_MAILBOX_SCOPE}`; reconnect with scoped Gmail readonly and compose access"
+            ),
+            Self::MissingRequiredScope(scope) => write!(
+                f,
+                "Gmail OAuth broker response missing required Gmail OAuth scope `{scope}`; reconnect with the default Gmail OAuth broker configuration"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GmailOAuthScopeError {}
+
+pub fn validate_gmail_oauth_scopes(scopes: &[String]) -> Result<(), GmailOAuthScopeError> {
+    if scopes
+        .iter()
+        .any(|scope| scope.as_str() == GMAIL_FULL_MAILBOX_SCOPE)
+    {
+        return Err(GmailOAuthScopeError::FullMailboxScope);
+    }
+
+    let granted = scopes.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    for required in GMAIL_OAUTH_SCOPES {
+        if !granted.contains(required) {
+            return Err(GmailOAuthScopeError::MissingRequiredScope(required));
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -218,8 +267,16 @@ mod tests {
     use locality_connector::oauth_broker::OAuthBrokerToken;
 
     use super::{
-        GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredential, gmail_capabilities_json,
+        GMAIL_CONNECTOR_ID, GMAIL_FULL_MAILBOX_SCOPE, GMAIL_OAUTH_SCOPES, GmailOAuthScopeError,
+        StoredGmailCredential, gmail_capabilities_json, validate_gmail_oauth_scopes,
     };
+
+    fn gmail_scopes() -> Vec<String> {
+        GMAIL_OAUTH_SCOPES
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect()
+    }
 
     #[test]
     fn oauth_scopes_cover_read_and_compose_without_full_mailbox_scope() {
@@ -229,6 +286,45 @@ mod tests {
         assert!(GMAIL_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/gmail.readonly"));
         assert!(GMAIL_OAUTH_SCOPES.contains(&"https://www.googleapis.com/auth/gmail.compose"));
         assert!(!GMAIL_OAUTH_SCOPES.contains(&"https://mail.google.com/"));
+    }
+
+    #[test]
+    fn gmail_scope_validation_allows_required_scopes() {
+        validate_gmail_oauth_scopes(&gmail_scopes()).expect("valid Gmail scopes");
+    }
+
+    #[test]
+    fn gmail_scope_validation_rejects_missing_required_scope() {
+        let scopes = GMAIL_OAUTH_SCOPES
+            .iter()
+            .filter(|scope| **scope != "https://www.googleapis.com/auth/gmail.compose")
+            .map(|scope| scope.to_string())
+            .collect::<Vec<_>>();
+
+        let error = validate_gmail_oauth_scopes(&scopes).expect_err("missing compose scope");
+
+        assert_eq!(
+            error,
+            GmailOAuthScopeError::MissingRequiredScope(
+                "https://www.googleapis.com/auth/gmail.compose"
+            )
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("missing required Gmail OAuth scope")
+        );
+    }
+
+    #[test]
+    fn gmail_scope_validation_rejects_full_mailbox_scope() {
+        let mut scopes = gmail_scopes();
+        scopes.push(GMAIL_FULL_MAILBOX_SCOPE.to_string());
+
+        let error = validate_gmail_oauth_scopes(&scopes).expect_err("full mailbox scope");
+
+        assert_eq!(error, GmailOAuthScopeError::FullMailboxScope);
+        assert!(error.to_string().contains(GMAIL_FULL_MAILBOX_SCOPE));
     }
 
     #[test]
@@ -277,5 +373,87 @@ mod tests {
         let json = serde_json::to_string(&stored).expect("serialize");
         assert!(!json.contains("\"refresh_token\":"));
         assert!(!json.contains("client_secret"));
+    }
+
+    #[test]
+    fn refreshed_broker_credential_preserves_scopes_when_broker_omits_scopes() {
+        let stored = StoredGmailCredential::from_broker_token(
+            OAuthBrokerToken {
+                access_token: "access-token".to_string(),
+                token_type: Some("Bearer".to_string()),
+                expires_in: Some(3600),
+                refresh_token_handle: Some("handle-1".to_string()),
+                account_id: Some("acct-1".to_string()),
+                account_label: Some("me@example.com".to_string()),
+                workspace_id: Some("gmail".to_string()),
+                workspace_name: Some("Gmail".to_string()),
+                scopes: gmail_scopes(),
+            },
+            "client-id".to_string(),
+            "https://auth.example.test".to_string(),
+            100,
+        );
+
+        let refreshed = stored
+            .refreshed(
+                OAuthBrokerToken {
+                    access_token: "new-access-token".to_string(),
+                    token_type: Some("Bearer".to_string()),
+                    expires_in: Some(3600),
+                    refresh_token_handle: Some("handle-2".to_string()),
+                    account_id: None,
+                    account_label: None,
+                    workspace_id: None,
+                    workspace_name: None,
+                    scopes: vec![],
+                },
+                200,
+            )
+            .expect("refresh with omitted scopes");
+
+        assert_eq!(refreshed.access_token, "new-access-token");
+        assert_eq!(refreshed.scopes, stored.scopes);
+        assert_eq!(refreshed.refresh_token_handle.as_deref(), Some("handle-2"));
+    }
+
+    #[test]
+    fn refreshed_broker_credential_rejects_invalid_non_empty_scopes() {
+        let stored = StoredGmailCredential::from_broker_token(
+            OAuthBrokerToken {
+                access_token: "access-token".to_string(),
+                token_type: Some("Bearer".to_string()),
+                expires_in: Some(3600),
+                refresh_token_handle: Some("handle-1".to_string()),
+                account_id: Some("acct-1".to_string()),
+                account_label: Some("me@example.com".to_string()),
+                workspace_id: Some("gmail".to_string()),
+                workspace_name: Some("Gmail".to_string()),
+                scopes: gmail_scopes(),
+            },
+            "client-id".to_string(),
+            "https://auth.example.test".to_string(),
+            100,
+        );
+        let mut refreshed_scopes = gmail_scopes();
+        refreshed_scopes.push(GMAIL_FULL_MAILBOX_SCOPE.to_string());
+
+        let error = stored
+            .refreshed(
+                OAuthBrokerToken {
+                    access_token: "new-access-token".to_string(),
+                    token_type: Some("Bearer".to_string()),
+                    expires_in: Some(3600),
+                    refresh_token_handle: Some("handle-2".to_string()),
+                    account_id: None,
+                    account_label: None,
+                    workspace_id: None,
+                    workspace_name: None,
+                    scopes: refreshed_scopes,
+                },
+                200,
+            )
+            .expect_err("invalid refreshed scopes");
+
+        assert_eq!(error, GmailOAuthScopeError::FullMailboxScope);
     }
 }

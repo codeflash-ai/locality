@@ -11,8 +11,8 @@ use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
 use locality_gmail::render::{GmailNativeBundle, remote_version, render_gmail_message};
 use locality_gmail::{
-    GMAIL_CONNECTOR_ID, GmailConfig, GmailConnector, HttpGmailOAuthBrokerClient,
-    StoredGmailCredential,
+    GMAIL_CONNECTOR_ID, GmailConfig, GmailConnector, GmailOAuthScopeError,
+    HttpGmailOAuthBrokerClient, StoredGmailCredential,
 };
 use locality_store::{
     ConnectionRecord, ConnectionRepository, ConnectorProfileRepository, CredentialError,
@@ -111,7 +111,9 @@ fn connection_access_token(
         .map_err(|error| ConnectorResolveError::CredentialStoreUnavailable(error.to_string()))?;
     if stored.expires_soon(timestamp_secs()) {
         let refreshed = refresh_oauth_credential(connection, &stored)?;
-        stored = stored.refreshed(refreshed, timestamp_secs());
+        stored = stored
+            .refreshed(refreshed, timestamp_secs())
+            .map_err(|error| gmail_refresh_scope_error(connection, error))?;
         let secret = serde_json::to_string(&stored).map_err(|error| {
             ConnectorResolveError::CredentialStoreUnavailable(error.to_string())
         })?;
@@ -147,6 +149,20 @@ fn refresh_oauth_credential(
             refresh_token_handle: Some(refresh_token_handle),
         })
         .map_err(|error| gmail_refresh_error(connection, &broker_url, error))
+}
+
+fn gmail_refresh_scope_error(
+    connection: &ConnectionRecord,
+    error: GmailOAuthScopeError,
+) -> ConnectorResolveError {
+    ConnectorResolveError::AuthRequired {
+        connection_id: connection.connection_id.0.clone(),
+        message: Some(format!(
+            "Gmail credential for connection `{}` could not be refreshed through OAuth broker: {error}",
+            connection.connection_id.0
+        )),
+        suggested_command: GMAIL_CONNECT_COMMAND.to_string(),
+    }
 }
 
 fn gmail_refresh_error(

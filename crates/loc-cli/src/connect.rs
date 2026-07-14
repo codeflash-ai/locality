@@ -1,11 +1,10 @@
-use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_connector::ConnectorCapabilities;
 use locality_connector::oauth_broker::{OAuthBrokerCodeExchange, OAuthBrokerToken};
 use locality_gmail::{
     GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, HttpGmailOAuthBrokerClient, StoredGmailCredential,
-    gmail_capabilities_json,
+    gmail_capabilities_json, validate_gmail_oauth_scopes,
 };
 use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, HttpGoogleDocsOAuthBrokerClient,
@@ -28,7 +27,6 @@ pub const DEFAULT_NOTION_PROFILE_ID: &str = "notion-token-default";
 pub const DEFAULT_NOTION_OAUTH_PROFILE_ID: &str = "notion-oauth-default";
 pub const DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID: &str = "google-docs-oauth-default";
 pub const DEFAULT_GMAIL_OAUTH_PROFILE_ID: &str = "gmail-oauth-default";
-const GMAIL_FULL_MAILBOX_SCOPE: &str = "https://mail.google.com/";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
@@ -595,7 +593,8 @@ where
         redirect_uri: options.redirect_uri,
     };
     let token = exchange.exchange_code(&exchange_request)?;
-    validate_gmail_oauth_scopes(&token.scopes)?;
+    validate_gmail_oauth_scopes(&token.scopes)
+        .map_err(|error| ConnectError::OAuthExchangeFailed(error.to_string()))?;
     let acquired_at = timestamp_secs();
     let secret_ref = format!("connection:{}", connection_id.0);
     let stored = StoredGmailCredential::from_broker_token(
@@ -656,28 +655,6 @@ where
         workspace_name: token.workspace_name,
         auth_kind: "oauth".to_string(),
     })
-}
-
-fn validate_gmail_oauth_scopes(scopes: &[String]) -> Result<(), ConnectError> {
-    if scopes
-        .iter()
-        .any(|scope| scope.as_str() == GMAIL_FULL_MAILBOX_SCOPE)
-    {
-        return Err(ConnectError::OAuthExchangeFailed(format!(
-            "Gmail OAuth broker returned unsupported full mailbox scope `{GMAIL_FULL_MAILBOX_SCOPE}`; reconnect with scoped Gmail readonly and compose access"
-        )));
-    }
-
-    let granted = scopes.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    for required in GMAIL_OAUTH_SCOPES {
-        if !granted.contains(required) {
-            return Err(ConnectError::OAuthExchangeFailed(format!(
-                "Gmail OAuth broker response missing required Gmail OAuth scope `{required}`; reconnect with the default Gmail OAuth broker configuration"
-            )));
-        }
-    }
-
-    Ok(())
 }
 
 pub fn run_profiles<S>(store: &S) -> Result<ProfilesReport, ConnectError>
