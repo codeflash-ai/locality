@@ -2127,6 +2127,7 @@ dependencies = [
 name = "locality-desktop"
 version = "0.3.0"
 dependencies = [
+ "block2",
  "loc-cli",
  "locality-connector",
  "locality-core",
@@ -2137,6 +2138,9 @@ dependencies = [
  "locality-store",
  "localityd",
  "notify",
+ "objc2",
+ "objc2-file-provider",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "tauri",
@@ -2581,6 +2585,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7a1c5fbb72d7735b076bb47b578523aedc40f3c439bea6dfd595c089d79d98a"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "objc2-file-provider"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e75524f6dcc079d5722a85797b2d29079ebecb0b88352f0ecb18011f7d84655"
+dependencies = [
+ "bitflags 2.13.0",
+ "block2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]

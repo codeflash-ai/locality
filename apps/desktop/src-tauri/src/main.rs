@@ -137,6 +137,8 @@ use tauri::{
 use tauri_plugin_dialog::DialogExt;
 
 mod agent_guidance;
+#[cfg(target_os = "macos")]
+mod macos_file_provider;
 
 use agent_guidance::{
     AgentGuidanceInstallReport, install_agent_guidance as install_guidance_files,

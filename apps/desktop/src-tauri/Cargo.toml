@@ -27,6 +27,24 @@ tauri-plugin-dialog = "2"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-file-provider = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "Extension",
+  "NSFileProviderDomain",
+  "block2",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "FoundationErrors",
+  "NSArray",
+  "NSError",
+  "NSEnumerator",
+  "NSString",
+] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
