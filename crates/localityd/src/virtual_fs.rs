@@ -1107,6 +1107,7 @@ where
         let new_page_dir = new_parent_path.join(new_filename);
         let new_path = page_document_path(&new_page_dir);
         let title = title_from_filename(new_filename);
+        ensure_source_path_writable(&mount, &new_path)?;
 
         if child_identifier.starts_with(LOCAL_PREFIX) {
             let mut mutation = store
@@ -1218,6 +1219,7 @@ where
         ));
     }
     let new_path = new_parent_path.join(new_filename);
+    ensure_source_path_writable(&mount, &new_path)?;
     if let Some(report) = reconcile_atomic_temp_rename(
         store,
         content_root,
@@ -1686,7 +1688,12 @@ fn create_parent_remote_id(
                 "new virtual filesystem files cannot be created under an unpushed local page",
             ));
         }
-        return Ok(RemoteId::new(remote_id));
+        let remote_id = RemoteId::new(remote_id);
+        let entity = entities
+            .iter()
+            .find(|entity| entity.remote_id == remote_id)
+            .ok_or_else(|| missing_identifier(parent_identifier))?;
+        return create_parent_remote_id_for_entity(mount, remote_id, entity);
     }
     if parent_identifier == mount_point_identifier(mount) {
         if source_descriptor(&mount.connector)
@@ -1711,6 +1718,14 @@ fn create_parent_remote_id(
         .iter()
         .find(|entity| entity.remote_id == remote_id)
         .ok_or_else(|| missing_identifier(parent_identifier))?;
+    create_parent_remote_id_for_entity(mount, remote_id, entity)
+}
+
+fn create_parent_remote_id_for_entity(
+    mount: &MountConfig,
+    remote_id: RemoteId,
+    entity: &EntityRecord,
+) -> LocalityResult<RemoteId> {
     if source_descriptor(&mount.connector)
         .create_entity_parent_kinds()
         .contains(&entity.kind)
@@ -3188,6 +3203,138 @@ mod tests {
 
         assert_eq!(report.item.path, "draft/reply.md");
         assert_eq!(report.item.entity_kind, Some(EntityKind::Page));
+    }
+
+    #[test]
+    fn gmail_draft_message_rejects_rename_or_move_to_non_draft_without_dirtying_entity() {
+        for (folder_remote_id, folder_path, new_filename) in [
+            ("gmail-folder:inbox", "inbox", "reply-msg-draft-1.md"),
+            ("gmail-folder:sent", "sent", "sent-reply-msg-draft-1.md"),
+            ("gmail-folder:archive", "archive", "reply-msg-draft-1.md"),
+        ] {
+            let mount_id = MountId::new("gmail-main");
+            let state_root = temp_root(&format!("loc-gmail-rename-{folder_path}"));
+            let content_root = state_root.join("content/gmail-main/files");
+            let mut store = InMemoryStateStore::new();
+            store
+                .save_mount(virtual_mount_with_connector(&mount_id, "gmail"))
+                .expect("save mount");
+            store
+                .save_entity(EntityRecord {
+                    mount_id: mount_id.clone(),
+                    remote_id: RemoteId::new("gmail-folder:draft"),
+                    kind: EntityKind::Directory,
+                    title: "draft".to_string(),
+                    path: "draft".into(),
+                    hydration: HydrationState::Stub,
+                    content_hash: None,
+                    remote_edited_at: Some("folder:draft".to_string()),
+                })
+                .expect("save draft folder");
+            store
+                .save_entity(EntityRecord {
+                    mount_id: mount_id.clone(),
+                    remote_id: RemoteId::new(folder_remote_id),
+                    kind: EntityKind::Directory,
+                    title: folder_path.to_string(),
+                    path: folder_path.into(),
+                    hydration: HydrationState::Stub,
+                    content_hash: None,
+                    remote_edited_at: Some(format!("folder:{folder_path}")),
+                })
+                .expect("save target folder");
+            store
+                .save_entity(EntityRecord {
+                    mount_id: mount_id.clone(),
+                    remote_id: RemoteId::new("msg-draft-1"),
+                    kind: EntityKind::Page,
+                    title: "Draft One".to_string(),
+                    path: "draft/reply-msg-draft-1.md".into(),
+                    hydration: HydrationState::Hydrated,
+                    content_hash: None,
+                    remote_edited_at: Some("gmail:msg-draft-1:1".to_string()),
+                })
+                .expect("save draft message");
+
+            let error = rename_virtual_fs_item(
+                &mut store,
+                &content_root,
+                &mount_id,
+                "msg-draft-1",
+                folder_remote_id,
+                new_filename,
+            )
+            .expect_err("rename into non-draft Gmail folder is rejected");
+
+            assert!(
+                matches!(error, LocalityError::Unsupported(message) if message.contains("Gmail"))
+            );
+            let entity = store
+                .get_entity(&mount_id, &RemoteId::new("msg-draft-1"))
+                .expect("load entity")
+                .expect("entity");
+            assert_eq!(entity.path, PathBuf::from("draft/reply-msg-draft-1.md"));
+            assert_eq!(entity.hydration, HydrationState::Hydrated);
+            assert!(
+                store
+                    .list_virtual_mutations(&mount_id)
+                    .expect("list mutations")
+                    .is_empty()
+            );
+
+            let _ = std::fs::remove_dir_all(state_root);
+        }
+    }
+
+    #[test]
+    fn google_docs_page_child_container_rejects_virtual_create_parent_kind() {
+        let mount_id = MountId::new("google-docs-main");
+        let state_root = temp_root("loc-google-docs-page-child-create");
+        let content_root = state_root.join("content/google-docs-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "google-docs", "/tmp/loc/google-docs")
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("doc-page"),
+                kind: EntityKind::Page,
+                title: "Doc".to_string(),
+                path: "Doc/page.md".into(),
+                hydration: HydrationState::Hydrated,
+                content_hash: None,
+                remote_edited_at: Some("google-docs:doc-page:1".to_string()),
+            })
+            .expect("save page");
+
+        let error = create_virtual_fs_file(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "children:doc-page",
+            "Nested.md",
+        )
+        .expect_err("google docs page children are not create parents");
+
+        assert!(matches!(
+            error,
+            LocalityError::Unsupported(
+                "new virtual filesystem files cannot be created under this source item"
+            )
+        ));
+        assert!(
+            store
+                .list_virtual_mutations(&mount_id)
+                .expect("list mutations")
+                .is_empty()
+        );
+        assert!(!content_root.join("Doc/Nested.md").exists());
+
+        let _ = std::fs::remove_dir_all(state_root);
     }
 
     #[test]
