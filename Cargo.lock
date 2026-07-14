@@ -2172,6 +2172,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "yaml_serde",
 ]
 
 [[package]]
