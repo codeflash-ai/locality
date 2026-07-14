@@ -137,7 +137,7 @@ pub fn build_draft_mime(draft: &GmailDraftDocument) -> LocalityResult<String> {
     mime.push_str("Content-Type: text/plain; charset=\"UTF-8\"\r\n");
     mime.push_str("Content-Transfer-Encoding: 8bit\r\n");
     mime.push_str("\r\n");
-    mime.push_str(&draft.body);
+    mime.push_str(&normalize_mime_body_line_endings(&draft.body));
 
     Ok(mime)
 }
@@ -150,6 +150,7 @@ fn message_body(message: &GmailMessage) -> Option<String> {
     let payload = message.payload.as_ref()?;
     text_part(payload, "text/plain")
         .or_else(|| text_part(payload, "text/html").map(strip_html_tags))
+        .map(escape_locality_directive_lines)
         .map(ensure_trailing_newline)
 }
 
@@ -198,6 +199,66 @@ fn strip_html_tags(input: String) -> String {
     }
 
     output
+}
+
+fn escape_locality_directive_lines(value: String) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    let mut line_start = 0;
+
+    while line_start < value.len() {
+        let Some((line_end, terminator_end)) = next_line_bounds(&value, line_start) else {
+            escape_locality_directive_line(&value[line_start..], &mut escaped);
+            break;
+        };
+
+        escape_locality_directive_line(&value[line_start..line_end], &mut escaped);
+        escaped.push_str(&value[line_end..terminator_end]);
+        line_start = terminator_end;
+    }
+
+    escaped
+}
+
+fn next_line_bounds(value: &str, line_start: usize) -> Option<(usize, usize)> {
+    for (offset, ch) in value[line_start..].char_indices() {
+        let index = line_start + offset;
+        match ch {
+            '\n' => return Some((index, index + ch.len_utf8())),
+            '\r' => {
+                let terminator_end = if value[index + ch.len_utf8()..].starts_with('\n') {
+                    index + "\r\n".len()
+                } else {
+                    index + ch.len_utf8()
+                };
+                return Some((index, terminator_end));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn escape_locality_directive_line(line: &str, output: &mut String) {
+    let Some((index, _)) = line
+        .char_indices()
+        .find(|(_, ch)| !matches!(ch, ' ' | '\t'))
+    else {
+        output.push_str(line);
+        return;
+    };
+
+    if locality_directive_marker_needs_escape(&line[index..]) {
+        output.push_str(&line[..index]);
+        output.push('\\');
+        output.push_str(&line[index..]);
+    } else {
+        output.push_str(line);
+    }
+}
+
+fn locality_directive_marker_needs_escape(value: &str) -> bool {
+    value.starts_with("::loc") || value.starts_with("::afs")
 }
 
 fn ensure_trailing_newline(mut value: String) -> String {
@@ -270,6 +331,26 @@ fn sanitize_recipients(values: &[String]) -> String {
 
 fn sanitize_header(value: &str) -> String {
     value.replace(['\r', '\n'], " ").trim().to_string()
+}
+
+fn normalize_mime_body_line_endings(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                normalized.push_str("\r\n");
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            '\n' => normalized.push_str("\r\n"),
+            ch => normalized.push(ch),
+        }
+    }
+
+    normalized
 }
 
 fn yaml_scalar(value: &str) -> String {
@@ -467,8 +548,52 @@ mod tests {
         assert!(mime.contains("Cc: copy@example.com\r\n"));
         assert!(mime.contains("Subject: Hello\r\n"));
         assert!(mime.contains("Content-Type: text/plain; charset=\"UTF-8\"\r\n"));
-        assert!(mime.ends_with("\r\n\r\nThanks.\n"));
+        assert!(mime.ends_with("\r\n\r\nThanks.\r\n"));
         assert!(!mime.contains("Bcc:"));
+    }
+
+    #[test]
+    fn normalizes_draft_mime_body_line_endings_to_crlf() {
+        let draft = GmailDraftDocument {
+            to: vec!["ann@example.com".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Hello".to_string(),
+            body: "Line 1\nLine 2\n".to_string(),
+        };
+
+        let mime = build_draft_mime(&draft).expect("mime");
+
+        assert!(mime.ends_with("\r\n\r\nLine 1\r\nLine 2\r\n"));
+    }
+
+    #[test]
+    fn render_escapes_literal_locality_directives_in_remote_body() {
+        let message: GmailMessage = serde_json::from_value(serde_json::json!({
+            "id": "msg-directives",
+            "threadId": "thread-directives",
+            "labelIds": ["INBOX"],
+            "internalDate": "1720900000000",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    { "name": "Subject", "value": "Directive text" }
+                ],
+                "body": { "data": "SGVsbG8KOjpsb2N7aWQ9eCB0eXBlPXBhcmFncmFwaH0KICA6OmFmc3tpZD15IHR5cGU9cGFyYWdyYXBofQo" }
+            }
+        }))
+        .expect("message");
+
+        let rendered = render_gmail_message(&GmailNativeBundle {
+            mailbox: "inbox".to_string(),
+            message,
+        })
+        .expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "Hello\n\\::loc{id=x type=paragraph}\n  \\::afs{id=y type=paragraph}\n"
+        );
     }
 
     #[test]
