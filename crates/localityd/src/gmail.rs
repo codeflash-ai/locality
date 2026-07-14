@@ -346,6 +346,26 @@ pub(crate) fn validate_gmail_create_frontmatter(
         ));
     }
 
+    if context
+        .parsed
+        .frontmatter
+        .properties
+        .contains_key("attachment")
+        || context
+            .parsed
+            .frontmatter
+            .properties
+            .contains_key("attachments")
+    {
+        report.push(ValidationIssue::new(
+            "gmail_attachments_unsupported",
+            context.relative_path,
+            Some(1),
+            "Gmail draft sends do not support attachments",
+            Some("remove `attachment` or `attachments` frontmatter".to_string()),
+        ));
+    }
+
     Ok(report)
 }
 

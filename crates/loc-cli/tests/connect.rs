@@ -279,6 +279,82 @@ fn connect_gmail_broker_oauth_stores_refresh_handle_without_secrets() {
 }
 
 #[test]
+fn connect_gmail_broker_oauth_rejects_missing_required_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let exchange = ScopedFakeGmailBrokerOAuthExchange {
+        scopes: GMAIL_OAUTH_SCOPES
+            .iter()
+            .filter(|scope| **scope != "https://www.googleapis.com/auth/gmail.compose")
+            .map(|scope| scope.to_string())
+            .collect(),
+    };
+
+    let error = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        gmail_connect_options(),
+        &exchange,
+    )
+    .expect_err("missing Gmail compose scope must be rejected");
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        error
+            .message()
+            .contains("missing required Gmail OAuth scope")
+    );
+    assert!(
+        error
+            .message()
+            .contains("https://www.googleapis.com/auth/gmail.compose")
+    );
+    assert!(credentials.get("connection:gmail-default").is_err());
+    assert!(
+        store
+            .get_connection(&ConnectionId::new("gmail-default"))
+            .expect("lookup connection")
+            .is_none()
+    );
+}
+
+#[test]
+fn connect_gmail_broker_oauth_rejects_full_mailbox_scope() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let mut scopes = GMAIL_OAUTH_SCOPES
+        .iter()
+        .rev()
+        .map(|scope| scope.to_string())
+        .collect::<Vec<_>>();
+    scopes.push("https://mail.google.com/".to_string());
+    let exchange = ScopedFakeGmailBrokerOAuthExchange { scopes };
+
+    let error = run_connect_gmail_broker_oauth(
+        &mut store,
+        &credentials,
+        gmail_connect_options(),
+        &exchange,
+    )
+    .expect_err("full Gmail mailbox scope must be rejected");
+
+    assert_eq!(error.code(), "oauth_exchange_failed");
+    assert!(
+        error
+            .message()
+            .contains("Gmail OAuth broker returned unsupported full mailbox scope")
+    );
+    assert!(error.message().contains("https://mail.google.com/"));
+    assert!(credentials.get("connection:gmail-default").is_err());
+    assert!(
+        store
+            .get_connection(&ConnectionId::new("gmail-default"))
+            .expect("lookup connection")
+            .is_none()
+    );
+}
+
+#[test]
 fn connect_google_docs_reuses_default_id_when_previous_default_is_revoked() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();
@@ -527,8 +603,57 @@ impl GmailOAuthBrokerExchange for FakeGmailBrokerOAuthExchange {
             workspace_name: Some("Gmail".to_string()),
             scopes: GMAIL_OAUTH_SCOPES
                 .iter()
+                .rev()
                 .map(|scope| scope.to_string())
                 .collect(),
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScopedFakeGmailBrokerOAuthExchange {
+    scopes: Vec<String>,
+}
+
+impl GmailOAuthBrokerExchange for ScopedFakeGmailBrokerOAuthExchange {
+    fn exchange_code(
+        &self,
+        request: &OAuthBrokerCodeExchange,
+    ) -> Result<OAuthBrokerToken, loc_cli::connect::ConnectError> {
+        assert_eq!(request.connector, "gmail");
+        assert_eq!(request.session, "broker-session");
+        assert_eq!(request.state, "state-1");
+        assert_eq!(request.code, "oauth-code");
+        assert_eq!(
+            request.redirect_uri,
+            "http://localhost:8757/oauth/gmail/callback"
+        );
+        Ok(gmail_broker_token(self.scopes.clone()))
+    }
+}
+
+fn gmail_connect_options() -> GmailBrokerOAuthConnectOptions {
+    GmailBrokerOAuthConnectOptions {
+        connection_id: Some(ConnectionId::new("gmail-default")),
+        broker_url: "https://auth.example.test".to_string(),
+        client_id: "gmail-client-id".to_string(),
+        session: "broker-session".to_string(),
+        state: "state-1".to_string(),
+        code: "oauth-code".to_string(),
+        redirect_uri: "http://localhost:8757/oauth/gmail/callback".to_string(),
+    }
+}
+
+fn gmail_broker_token(scopes: Vec<String>) -> OAuthBrokerToken {
+    OAuthBrokerToken {
+        access_token: "oauth-access-token".to_string(),
+        token_type: Some("Bearer".to_string()),
+        expires_in: Some(3600),
+        refresh_token_handle: Some("opaque-refresh-handle".to_string()),
+        account_id: Some("acct-1".to_string()),
+        account_label: Some("user@example.com".to_string()),
+        workspace_id: Some("gmail".to_string()),
+        workspace_name: Some("Gmail".to_string()),
+        scopes,
     }
 }

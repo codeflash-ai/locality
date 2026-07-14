@@ -3,6 +3,7 @@ use locality_connector::oauth_broker::OAuthBrokerToken;
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
 use locality_core::shadow::ShadowDocument;
+use locality_core::validation::ValidationIssue;
 use locality_gmail::{GMAIL_CONNECTOR_ID, StoredGmailCredential};
 use locality_google_docs::{GOOGLE_DOCS_CONNECTOR_ID, StoredGoogleDocsCredential};
 use locality_notion::client::DEFAULT_NOTION_TOKEN_ENV;
@@ -233,7 +234,7 @@ fn gmail_mount() -> MountConfig {
     MountConfig::new(MountId::new("gmail-main"), GMAIL_CONNECTOR_ID, "/tmp/gmail")
 }
 
-fn validate_gmail_create(path: &str, markdown: &str) -> Vec<String> {
+fn validate_gmail_create_issues(path: &str, markdown: &str) -> Vec<ValidationIssue> {
     let mount = gmail_mount();
     let parsed = parse_canonical_markdown(markdown).expect("parse gmail markdown");
 
@@ -248,6 +249,10 @@ fn validate_gmail_create(path: &str, markdown: &str) -> Vec<String> {
         })
         .expect("validate gmail create")
         .issues
+}
+
+fn validate_gmail_create(path: &str, markdown: &str) -> Vec<String> {
+    validate_gmail_create_issues(path, markdown)
         .into_iter()
         .map(|issue| issue.code)
         .collect()
@@ -600,6 +605,30 @@ fn local_gmail_validator_allows_empty_subject_with_non_empty_title() {
     );
 
     assert!(issues.is_empty());
+}
+
+#[test]
+fn local_gmail_validator_blocks_attachment_frontmatter_on_draft_create() {
+    for (field, markdown) in [
+        (
+            "attachment",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\nattachment: invoice.pdf\n---\nBody\n",
+        ),
+        (
+            "attachments",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\nattachments: [\"invoice.pdf\"]\n---\nBody\n",
+        ),
+    ] {
+        let issues = validate_gmail_create_issues("draft/foo.md", markdown);
+
+        assert_eq!(issues.len(), 1, "{field}");
+        assert_eq!(issues[0].code, "gmail_attachments_unsupported", "{field}");
+        assert_eq!(
+            issues[0].suggested_fix.as_deref(),
+            Some("remove `attachment` or `attachments` frontmatter"),
+            "{field}"
+        );
+    }
 }
 
 #[test]
