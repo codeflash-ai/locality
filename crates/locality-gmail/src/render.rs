@@ -1,7 +1,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use locality_core::model::{CanonicalDocument, RemoteId};
-use locality_core::shadow::ShadowDocument;
+use locality_core::shadow::{ShadowDocument, segment_markdown_body};
 use locality_core::validation::ValidationIssue;
 use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Serialize};
@@ -42,11 +42,7 @@ pub fn render_gmail_message(bundle: &GmailNativeBundle) -> LocalityResult<GmailR
         });
     let frontmatter = message_frontmatter(bundle);
     let document = CanonicalDocument::new(frontmatter.clone(), body.clone());
-    let native_block_ids = if body.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![RemoteId::new(format!("{}:body", bundle.message.id))]
-    };
+    let native_block_ids = synthetic_body_block_ids(&bundle.message.id, &body);
     let shadow = ShadowDocument::from_synced_body(
         RemoteId::new(bundle.message.id.clone()),
         body,
@@ -57,6 +53,15 @@ pub fn render_gmail_message(bundle: &GmailNativeBundle) -> LocalityResult<GmailR
     .with_frontmatter(frontmatter);
 
     Ok(GmailRenderedEntity { document, shadow })
+}
+
+fn synthetic_body_block_ids(message_id: &str, body: &str) -> Vec<RemoteId> {
+    segment_markdown_body(body, 1)
+        .into_iter()
+        .filter(|block| !block.is_directive())
+        .enumerate()
+        .map(|(index, _)| RemoteId::new(format!("{message_id}:body:{index}")))
+        .collect()
 }
 
 pub fn message_frontmatter(bundle: &GmailNativeBundle) -> String {
@@ -439,6 +444,36 @@ mod tests {
     }
 
     #[test]
+    fn renders_multi_paragraph_body_with_matching_shadow_blocks() {
+        let message: GmailMessage = serde_json::from_value(serde_json::json!({
+            "id": "msg-multi-paragraph",
+            "threadId": "thread-multi-paragraph",
+            "labelIds": ["INBOX"],
+            "internalDate": "1720900000000",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    { "name": "Subject", "value": "Multi paragraph" }
+                ],
+                "body": { "data": "Rmlyc3QgcGFyYWdyYXBoLgoKU2Vjb25kIHBhcmFncmFwaC4K" }
+            }
+        }))
+        .expect("message");
+
+        let rendered = render_gmail_message(&GmailNativeBundle {
+            mailbox: "inbox".to_string(),
+            message,
+        })
+        .expect("render");
+
+        assert_eq!(
+            rendered.document.body,
+            "First paragraph.\n\nSecond paragraph.\n"
+        );
+        assert_eq!(rendered.shadow.blocks.len(), 2);
+    }
+
+    #[test]
     fn escapes_control_chars_in_frontmatter_scalars() {
         let message: GmailMessage = serde_json::from_value(serde_json::json!({
             "id": "msg-control",
@@ -579,7 +614,7 @@ mod tests {
                 "headers": [
                     { "name": "Subject", "value": "Directive text" }
                 ],
-                "body": { "data": "SGVsbG8KOjpsb2N7aWQ9eCB0eXBlPXBhcmFncmFwaH0KICA6OmFmc3tpZD15IHR5cGU9cGFyYWdyYXBofQo" }
+                "body": { "data": "Ojpsb2N7aWQ9eCB0eXBlPXBhcmFncmFwaH0KCjo6YWZze2lkPXkgdHlwZT1wYXJhZ3JhcGh9Cg" }
             }
         }))
         .expect("message");
@@ -592,8 +627,9 @@ mod tests {
 
         assert_eq!(
             rendered.document.body,
-            "Hello\n\\::loc{id=x type=paragraph}\n  \\::afs{id=y type=paragraph}\n"
+            "\\::loc{id=x type=paragraph}\n\n\\::afs{id=y type=paragraph}\n"
         );
+        assert_eq!(rendered.shadow.blocks.len(), 2);
     }
 
     #[test]
