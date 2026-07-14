@@ -1211,6 +1211,22 @@ async fn create_desktop_mount_command(
 fn run_workspace_mount_onboarding_blocking(
     request: WorkspaceMountOnboardingRequest,
 ) -> WorkspaceMountOnboardingReport {
+    run_workspace_mount_onboarding_with(
+        request,
+        create_desktop_mount_blocking,
+        launch_macos_file_provider_approval_surface,
+    )
+}
+
+fn run_workspace_mount_onboarding_with<CreateMount, LaunchApproval>(
+    request: WorkspaceMountOnboardingRequest,
+    mut create_mount: CreateMount,
+    mut launch_approval: LaunchApproval,
+) -> WorkspaceMountOnboardingReport
+where
+    CreateMount: FnMut(CreateDesktopMountRequest) -> Result<String, String>,
+    LaunchApproval: FnMut() -> WorkspaceMountOnboardingLaunchStrategy,
+{
     let action = match WorkspaceMountOnboardingAction::parse(request.action.trim()) {
         Ok(action) => action,
         Err(message) => {
@@ -1226,16 +1242,7 @@ fn run_workspace_mount_onboarding_blocking(
     if matches!(action, WorkspaceMountOnboardingAction::AllowInMacos) {
         #[cfg(target_os = "macos")]
         {
-            let launch_strategy = launch_macos_file_provider_approval_surface();
-            return workspace_mount_onboarding_report(
-                MacosWorkspaceMountOnboardingState::ApprovalRequired,
-                workspace_mount_onboarding_curated_message(
-                    MacosWorkspaceMountOnboardingState::ApprovalRequired,
-                )
-                .expect("approval_required message"),
-                WorkspaceMountOnboardingPrimaryAction::CheckAgain,
-                launch_strategy,
-            );
+            let _ = launch_approval();
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1248,7 +1255,7 @@ fn run_workspace_mount_onboarding_blocking(
         }
     }
 
-    match create_desktop_mount_blocking(CreateDesktopMountRequest {
+    match create_mount(CreateDesktopMountRequest {
         connector: "notion".to_string(),
         path: request.path,
         mount_id: "notion-main".to_string(),
@@ -9104,7 +9111,7 @@ fn workspace_mount_onboarding_curated_message(
 ) -> Option<&'static str> {
     match state {
         MacosWorkspaceMountOnboardingState::ApprovalRequired => {
-            Some("Enable Locality in Finder, then return here and click Check again.")
+            Some("Click OK in the macOS \"Start Syncing\" prompt. Locality will continue once macOS enables the CloudStorage folder.")
         }
         MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot => {
             Some("Locality is still waiting for the CloudStorage folder to appear.")
@@ -12478,12 +12485,85 @@ mod tests {
     }
 
     #[test]
+    fn workspace_mount_onboarding_allow_action_retries_mount_setup_after_native_prompt() {
+        let mut launch_count = 0usize;
+        let mut requests = Vec::new();
+
+        let report = super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "~/Library/CloudStorage/Locality/notion-main".to_string(),
+                action: "allow_in_macos".to_string(),
+            },
+            |request| {
+                requests.push((
+                    request.connector.clone(),
+                    request.path.clone(),
+                    request.mount_id.clone(),
+                ));
+                Ok("Mounted Notion at /Users/test/Library/CloudStorage/Locality/notion-main with macOS File Provider.".to_string())
+            },
+            || {
+                launch_count += 1;
+                super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly
+            },
+        );
+
+        assert_eq!(launch_count, 1);
+        assert_eq!(
+            requests,
+            vec![(
+                "notion".to_string(),
+                "~/Library/CloudStorage/Locality/notion-main".to_string(),
+                "notion-main".to_string(),
+            )]
+        );
+        assert_eq!(report.state, "created");
+        assert_eq!(
+            report.message,
+            "Mounted Notion at /Users/test/Library/CloudStorage/Locality/notion-main with macOS File Provider."
+        );
+    }
+
+    #[test]
+    fn workspace_mount_onboarding_allow_action_stays_approval_required_when_domain_remains_disabled(
+    ) {
+        let mut launch_count = 0usize;
+
+        let report = super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "~/Library/CloudStorage/Locality/notion-main".to_string(),
+                action: "allow_in_macos".to_string(),
+            },
+            |_request| {
+                Err("Could not open macOS File Provider domain `loc`: The Locality File Provider is registered but not enabled. Click OK in the macOS Start Syncing prompt, then try again.".to_string())
+            },
+            || {
+                launch_count += 1;
+                super::WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly
+            },
+        );
+
+        let expected_state = if cfg!(target_os = "macos") {
+            assert_eq!(launch_count, 1);
+            "approval_required"
+        } else {
+            assert_eq!(launch_count, 0);
+            "failed"
+        };
+        assert_eq!(report.state, expected_state);
+        if cfg!(target_os = "macos") {
+            assert_eq!(report.primary_action, "allow_in_macos");
+            assert!(report.message.contains("Start Syncing"));
+        }
+    }
+
+    #[test]
     fn workspace_mount_onboarding_curated_message_matches_recoverable_state() {
         assert_eq!(
             super::workspace_mount_onboarding_curated_message(
                 super::MacosWorkspaceMountOnboardingState::ApprovalRequired
             ),
-            Some("Enable Locality in Finder, then return here and click Check again.")
+            Some("Click OK in the macOS \"Start Syncing\" prompt. Locality will continue once macOS enables the CloudStorage folder.")
         );
         assert_eq!(
             super::workspace_mount_onboarding_curated_message(
