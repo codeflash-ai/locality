@@ -16,6 +16,8 @@ wrangler secret put LOCALITY_NOTION_CLIENT_ID
 wrangler secret put LOCALITY_NOTION_CLIENT_SECRET
 wrangler secret put LOCALITY_GOOGLE_DOCS_CLIENT_ID
 wrangler secret put LOCALITY_GOOGLE_DOCS_CLIENT_SECRET
+wrangler secret put LOCALITY_GMAIL_CLIENT_ID
+wrangler secret put LOCALITY_GMAIL_CLIENT_SECRET
 wrangler deploy
 ```
 
@@ -28,11 +30,19 @@ http://127.0.0.1:8757/oauth/notion/callback
 ```
 
 Configure the Google OAuth client with the exact localhost callback used by
-Locality:
+Locality for Google Docs:
 
 ```text
 http://localhost:8757/oauth/google-docs/callback
 http://127.0.0.1:8757/oauth/google-docs/callback
+```
+
+Configure the same Google OAuth client, or a separate Gmail OAuth client, with
+the exact localhost callback used by Locality for Gmail:
+
+```text
+http://localhost:8757/oauth/gmail/callback
+http://127.0.0.1:8757/oauth/gmail/callback
 ```
 
 Use a stable production URL such as:
@@ -48,8 +58,17 @@ LOCALITY_AUTH_BROKER_URL=https://auth.locality.dev
 LOCALITY_NOTION_OAUTH_CLIENT_ID=<public client id>
 ```
 
-The client ID may also be fetched from `/v1/oauth/notion/start`; keeping it in
-the Locality binary is fine because it is not confidential.
+The client ID may also be fetched from `/v1/oauth/notion/start`,
+`/v1/oauth/google-docs/start`, or `/v1/oauth/gmail/start`; keeping it in the
+Locality binary is fine because it is not confidential.
+
+Optional broker environment overrides for Gmail local testing:
+
+```text
+LOCALITY_GMAIL_REDIRECT_URIS=http://localhost:8757/oauth/gmail/callback,http://127.0.0.1:8757/oauth/gmail/callback
+LOCALITY_GMAIL_AUTH_BASE_URL=https://accounts.google.com
+LOCALITY_GMAIL_API_BASE_URL=https://oauth2.googleapis.com
+```
 
 ## GitHub Actions
 

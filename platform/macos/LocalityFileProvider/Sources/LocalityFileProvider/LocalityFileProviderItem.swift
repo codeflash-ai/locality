@@ -3,7 +3,7 @@ import Foundation
 import UniformTypeIdentifiers
 
 final class LocalityFileProviderItem: NSObject, NSFileProviderItem {
-  private static let metadataSchemaVersion = "metadata-v3"
+  private static let metadataSchemaVersion = "metadata-v4"
 
   let itemIdentifier: NSFileProviderItemIdentifier
   let parentItemIdentifier: NSFileProviderItemIdentifier
@@ -22,12 +22,12 @@ final class LocalityFileProviderItem: NSObject, NSFileProviderItem {
     self.filename = metadata.filename
     self.contentType = UTType(metadata.contentType) ?? .data
     if metadata.kind == "folder" {
-      if Self.allowsAddingSubItems(metadata) {
+      if !metadata.readOnly {
         self.capabilities = [.allowsReading, .allowsContentEnumerating, .allowsAddingSubItems]
       } else {
         self.capabilities = [.allowsReading, .allowsContentEnumerating]
       }
-    } else if metadata.entityKind == "page" {
+    } else if metadata.entityKind == "page", !metadata.readOnly {
       self.capabilities = [.allowsReading, .allowsWriting, .allowsRenaming]
     } else {
       self.capabilities = [.allowsReading]
@@ -52,21 +52,10 @@ final class LocalityFileProviderItem: NSObject, NSFileProviderItem {
         metadata.filename,
         metadata.kind,
         metadata.entityKind ?? "",
+        metadata.readOnly ? "read_only" : "writable",
       ])
     )
     super.init()
-  }
-
-  private static func allowsAddingSubItems(_ metadata: LocalityItemMetadata) -> Bool {
-    if metadata.entityKind == "database" || metadata.entityKind == "page" {
-      return true
-    }
-    return daemonIdentifierString(metadata.identifier).hasPrefix("children:")
-  }
-
-  private static func daemonIdentifierString(_ identifier: String) -> String {
-    LocalitySharedDomain.resolve(NSFileProviderItemIdentifier(identifier))?.daemonIdentifier
-      ?? identifier
   }
 
   static func daemonIdentifier(_ identifier: NSFileProviderItemIdentifier) -> String {
@@ -103,6 +92,7 @@ extension LocalityItemMetadata {
       filename: filename,
       kind: kind,
       entityKind: entityKind,
+      readOnly: readOnly,
       remoteId: remoteId,
       path: path,
       hydration: hydration,

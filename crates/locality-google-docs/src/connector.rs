@@ -221,7 +221,8 @@ impl Connector for GoogleDocsConnector {
         let parent_id = match request.container {
             locality_connector::ChildContainer::Root => self.workspace_folder_id()?.0.clone(),
             locality_connector::ChildContainer::PageChildren(remote_id)
-            | locality_connector::ChildContainer::DatabaseRows(remote_id) => remote_id.0,
+            | locality_connector::ChildContainer::DatabaseRows(remote_id)
+            | locality_connector::ChildContainer::DirectoryChildren(remote_id) => remote_id.0,
         };
         Ok(ListChildrenResult {
             entries: list_drive_children(

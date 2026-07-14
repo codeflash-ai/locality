@@ -73,6 +73,8 @@ pub enum ChildContainer {
     PageChildren(RemoteId),
     /// Row pages under a database-like collection.
     DatabaseRows(RemoteId),
+    /// Child entities under a source folder/directory.
+    DirectoryChildren(RemoteId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -256,6 +256,7 @@ fn directory_metadata_item() -> VirtualFsItem {
         parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
         filename: DIRECTORY_METADATA_FILENAME.to_string(),
         kind: VirtualFsItemKind::File,
+        read_only: true,
         entity_kind: None,
         remote_id: None,
         path: DIRECTORY_METADATA_FILENAME.to_string(),
@@ -563,6 +564,7 @@ impl DaemonClient {
             parent_identifier: None,
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,
+            read_only: false,
             entity_kind: None,
             remote_id: None,
             path: String::new(),
@@ -878,9 +880,7 @@ where
         let item = self.resolve_path(old_path)?;
         ensure_writable_item(&item)?;
         let new_parent = self.resolve_path(new_parent_path)?;
-        if new_parent.kind != VirtualFsItemKind::Folder {
-            return Err(FuseError::NotDirectory);
-        }
+        ensure_creatable_parent(&new_parent)?;
         let report = self
             .client
             .rename(&item.identifier, &new_parent.identifier, filename)?;
@@ -895,9 +895,7 @@ where
         filename: &str,
     ) -> Result<VirtualFsMutationReport, FuseError> {
         let parent_item = self.resolve_path(parent)?;
-        if parent_item.kind != VirtualFsItemKind::Folder {
-            return Err(FuseError::NotDirectory);
-        }
+        ensure_creatable_parent(&parent_item)?;
         let report = self.client.create_file(&parent_item.identifier, filename)?;
         self.cache_item_at(child_path(parent, filename), report.item.clone());
         Ok(report)
@@ -1325,9 +1323,7 @@ where
         _umask: u32,
     ) -> FuseResult<ReplyEntry> {
         let parent_item = self.resolve_path(Path::new(parent))?;
-        if parent_item.kind != VirtualFsItemKind::Folder {
-            return Err(FuseError::NotDirectory.into());
-        }
+        ensure_creatable_parent(&parent_item)?;
         let dirname = name.to_str().ok_or(FuseError::Invalid)?;
         let report = self
             .client
@@ -1502,7 +1498,8 @@ where
     }
 
     async fn access(&self, _req: Request, path: &OsStr, _mask: u32) -> FuseResult<()> {
-        self.resolve_path(Path::new(path))?;
+        let item = self.resolve_path(Path::new(path))?;
+        ensure_access_allowed(&item, _mask)?;
         Ok(())
     }
 
@@ -1543,6 +1540,9 @@ fn open_is_writable(flags: u32) -> bool {
 }
 
 fn ensure_writable_item(item: &VirtualFsItem) -> Result<(), FuseError> {
+    if item.read_only {
+        return Err(FuseError::ReadOnly);
+    }
     if item.identifier == DIRECTORY_METADATA_IDENTIFIER {
         return Err(FuseError::ReadOnly);
     }
@@ -1557,6 +1557,29 @@ fn ensure_writable_item(item: &VirtualFsItem) -> Result<(), FuseError> {
         return Err(FuseError::ReadOnly);
     }
     Ok(())
+}
+
+fn ensure_creatable_parent(item: &VirtualFsItem) -> Result<(), FuseError> {
+    if item.kind != VirtualFsItemKind::Folder {
+        return Err(FuseError::NotDirectory);
+    }
+    if item.read_only {
+        return Err(FuseError::ReadOnly);
+    }
+    Ok(())
+}
+
+fn ensure_access_allowed(item: &VirtualFsItem, mask: u32) -> Result<(), FuseError> {
+    if mask & libc::W_OK as u32 == 0 {
+        return Ok(());
+    }
+    if item.kind == VirtualFsItemKind::Folder {
+        if item.read_only {
+            return Err(FuseError::ReadOnly);
+        }
+        return Ok(());
+    }
+    ensure_writable_item(item)
 }
 
 fn file_type(item: &VirtualFsItem) -> FileType {
@@ -1578,10 +1601,11 @@ fn attr_for_item(item: &VirtualFsItem) -> FileAttr {
         #[cfg(target_os = "macos")]
         crtime: attr_time,
         kind: file_type(item),
-        perm: if item.kind == VirtualFsItemKind::Folder {
-            0o755
-        } else {
-            0o644
+        perm: match (&item.kind, item.read_only) {
+            (VirtualFsItemKind::Folder, true) => 0o555,
+            (VirtualFsItemKind::Folder, false) => 0o755,
+            (VirtualFsItemKind::File, true) => 0o444,
+            (VirtualFsItemKind::File, false) => 0o644,
         },
         nlink: if item.kind == VirtualFsItemKind::Folder {
             2
@@ -1626,8 +1650,7 @@ fn attr_time_for_item(item: &VirtualFsItem) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-
+    use locality_store::InMemoryStateStore;
     #[test]
     fn folder_attrs_do_not_stat_materialized_path() {
         let path = std::env::temp_dir().join(format!(
@@ -1702,6 +1725,251 @@ mod tests {
     }
 
     #[test]
+    fn read_only_attrs_use_read_only_permissions_and_reject_writes() {
+        let mut file = test_item(VirtualFsItemKind::File, None, Some(10));
+        file.read_only = true;
+        let file_attr = attr_for_item(&file);
+        assert_eq!(file_attr.perm, 0o444);
+        assert!(matches!(
+            ensure_writable_item(&file),
+            Err(FuseError::ReadOnly)
+        ));
+
+        let mut folder = test_item(VirtualFsItemKind::Folder, None, None);
+        folder.read_only = true;
+        let folder_attr = attr_for_item(&folder);
+        assert_eq!(folder_attr.perm, 0o555);
+        assert!(matches!(
+            ensure_writable_item(&folder),
+            Err(FuseError::ReadOnly)
+        ));
+    }
+
+    #[test]
+    fn read_only_parent_rejects_create_file_before_daemon_create() {
+        let mut root = test_root_item();
+        root.read_only = true;
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::new(),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([(PathBuf::from(ROOT_PATH), root)])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let error = fs
+            .create_file_at_parent_path(Path::new(ROOT_PATH), "Draft.md")
+            .expect_err("read-only parent rejects creates");
+
+        assert!(matches!(error, FuseError::ReadOnly));
+        assert!(
+            fs.client
+                .created_files
+                .lock()
+                .expect("created files")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_parent_rejects_mkdir_with_erofs() {
+        let mut root = test_root_item();
+        root.read_only = true;
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::new(),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([(PathBuf::from(ROOT_PATH), root)])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let error = fs
+            .mkdir(
+                Request::default(),
+                OsStr::new(ROOT_PATH),
+                OsStr::new("Draft"),
+                0,
+                0,
+            )
+            .await
+            .expect_err("read-only parent rejects mkdir");
+
+        assert_eq!(error, libc::EROFS.into());
+    }
+
+    #[tokio::test]
+    async fn read_only_destination_parent_rejects_rename_before_daemon_rename() {
+        let root = test_root_item();
+        let source = test_named_item("draft-page", "Draft.md", VirtualFsItemKind::File);
+        let mut read_only_parent =
+            test_named_item("gmail-folder:inbox", "Inbox", VirtualFsItemKind::Folder);
+        read_only_parent.read_only = true;
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::new(),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Draft.md"), source),
+                (PathBuf::from("/Inbox"), read_only_parent),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let error = fs
+            .rename(
+                Request::default(),
+                OsStr::new(ROOT_PATH),
+                OsStr::new("Draft.md"),
+                OsStr::new("/Inbox"),
+                OsStr::new("Moved.md"),
+            )
+            .await
+            .expect_err("read-only destination parent rejects rename");
+
+        assert_eq!(error, libc::EROFS.into());
+        assert!(fs.client.renamed.lock().expect("renamed").is_empty());
+    }
+
+    #[tokio::test]
+    async fn access_write_mask_rejects_read_only_item_with_erofs() {
+        let root = test_root_item();
+        let mut item = test_named_item("msg-inbox-1", "Inbox.md", VirtualFsItemKind::File);
+        item.read_only = true;
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::new(),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Inbox.md"), item),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let error = fs
+            .access(
+                Request::default(),
+                OsStr::new("/Inbox.md"),
+                libc::W_OK as u32,
+            )
+            .await
+            .expect_err("read-only item rejects write access");
+
+        assert_eq!(error, libc::EROFS.into());
+    }
+
+    #[tokio::test]
+    async fn read_only_shared_mount_point_metadata_rejects_create_mkdir_and_write_access() {
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(ProjectionMode::LinuxFuse)
+        .read_only(true);
+        store.save_mount(mount).expect("save mount");
+        let projection_children = localityd::virtual_projection::virtual_projection_root_children(
+            &store,
+            Path::new("/tmp/Locality"),
+            ProjectionMode::LinuxFuse,
+        )
+        .expect("projection root children");
+        let mount_item = projection_children
+            .children
+            .into_iter()
+            .next()
+            .expect("shared mount point item");
+        assert!(mount_item.read_only);
+
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: shared_test_root_item(),
+                children: BTreeMap::new(),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), shared_test_root_item()),
+                (PathBuf::from("/notion-main"), mount_item),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let create_error = fs
+            .create_file_at_parent_path(Path::new("/notion-main"), "Draft.md")
+            .expect_err("read-only shared mount rejects creates");
+        assert!(matches!(create_error, FuseError::ReadOnly));
+        assert!(
+            fs.client
+                .created_files
+                .lock()
+                .expect("created files")
+                .is_empty()
+        );
+
+        let mkdir_error = fs
+            .mkdir(
+                Request::default(),
+                OsStr::new("/notion-main"),
+                OsStr::new("Draft"),
+                0,
+                0,
+            )
+            .await
+            .expect_err("read-only shared mount rejects mkdir");
+        assert_eq!(mkdir_error, libc::EROFS.into());
+
+        let access_error = fs
+            .access(
+                Request::default(),
+                OsStr::new("/notion-main"),
+                libc::W_OK as u32,
+            )
+            .await
+            .expect_err("read-only shared mount rejects write access");
+        assert_eq!(access_error, libc::EROFS.into());
+    }
+
+    #[test]
     fn shared_root_readdir_items_include_directory_metadata() {
         let root = shared_test_root_item();
         let mount = test_named_item(
@@ -1769,10 +2037,10 @@ mod tests {
                 mount_id: String::new(),
                 root: root.clone(),
                 children: BTreeMap::from([(ROOT_CONTAINER_IDENTIFIER.to_string(), Vec::new())]),
-                created_files: RefCell::new(Vec::new()),
+                created_files: Mutex::new(Vec::new()),
                 created_item: None,
-                renamed: RefCell::new(Vec::new()),
-                trashed: RefCell::new(Vec::new()),
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([(PathBuf::from(ROOT_PATH), root)])),
             handles: Mutex::new(BTreeMap::new()),
@@ -1886,10 +2154,10 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
-                created_files: RefCell::new(Vec::new()),
+                created_files: Mutex::new(Vec::new()),
                 created_item: None,
-                renamed: RefCell::new(Vec::new()),
-                trashed: RefCell::new(Vec::new()),
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::new()),
             handles: Mutex::new(BTreeMap::new()),
@@ -1919,10 +2187,10 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
-                created_files: RefCell::new(Vec::new()),
+                created_files: Mutex::new(Vec::new()),
                 created_item: Some(created.clone()),
-                renamed: RefCell::new(Vec::new()),
-                trashed: RefCell::new(Vec::new()),
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([(PathBuf::from(ROOT_PATH), root)])),
             handles: Mutex::new(BTreeMap::new()),
@@ -1935,7 +2203,11 @@ mod tests {
 
         assert_eq!(report.item, created);
         assert_eq!(
-            fs.client.created_files.borrow().as_slice(),
+            fs.client
+                .created_files
+                .lock()
+                .expect("created files")
+                .as_slice(),
             &[("mount:notion-main".to_string(), "Draft.md".to_string())]
         );
     }
@@ -1969,10 +2241,10 @@ mod tests {
                         )],
                     ),
                 ]),
-                created_files: RefCell::new(Vec::new()),
+                created_files: Mutex::new(Vec::new()),
                 created_item: None,
-                renamed: RefCell::new(Vec::new()),
-                trashed: RefCell::new(Vec::new()),
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([
                 (PathBuf::from(ROOT_PATH), root),
@@ -2010,10 +2282,10 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
-                created_files: RefCell::new(Vec::new()),
+                created_files: Mutex::new(Vec::new()),
                 created_item: None,
-                renamed: RefCell::new(Vec::new()),
-                trashed: RefCell::new(Vec::new()),
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([
                 (PathBuf::from(ROOT_PATH), root),
@@ -2048,10 +2320,10 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
-                created_files: RefCell::new(Vec::new()),
+                created_files: Mutex::new(Vec::new()),
                 created_item: None,
-                renamed: RefCell::new(Vec::new()),
-                trashed: RefCell::new(Vec::new()),
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([
                 (PathBuf::from(ROOT_PATH), root),
@@ -2066,7 +2338,7 @@ mod tests {
             .expect("trash folder");
 
         assert_eq!(
-            fs.client.trashed.borrow().as_slice(),
+            fs.client.trashed.lock().expect("trashed").as_slice(),
             &["children:page-draft".to_string()]
         );
         assert!(
@@ -2093,10 +2365,10 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::from([("mount:notion-main".to_string(), Vec::new())]),
-                created_files: RefCell::new(Vec::new()),
+                created_files: Mutex::new(Vec::new()),
                 created_item: None,
-                renamed: RefCell::new(Vec::new()),
-                trashed: RefCell::new(Vec::new()),
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([
                 (PathBuf::from(ROOT_PATH), root),
@@ -2109,7 +2381,7 @@ mod tests {
         fs.trash_path(Path::new("/Draft"), VirtualFsItemKind::Folder)
             .expect("stale pending folder was already removed");
 
-        assert!(fs.client.trashed.borrow().is_empty());
+        assert!(fs.client.trashed.lock().expect("trashed").is_empty());
         assert!(
             !fs.cache
                 .lock()
@@ -2129,10 +2401,10 @@ mod tests {
                 mount_id: "notion-main".to_string(),
                 root: root.clone(),
                 children: BTreeMap::new(),
-                created_files: RefCell::new(Vec::new()),
+                created_files: Mutex::new(Vec::new()),
                 created_item: None,
-                renamed: RefCell::new(Vec::new()),
-                trashed: RefCell::new(Vec::new()),
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
             },
             cache: Mutex::new(BTreeMap::from([
                 (PathBuf::from(ROOT_PATH), root),
@@ -2147,7 +2419,7 @@ mod tests {
             .expect("rename folder");
 
         assert_eq!(
-            fs.client.renamed.borrow().as_slice(),
+            fs.client.renamed.lock().expect("renamed").as_slice(),
             &[(
                 "children:page-draft".to_string(),
                 "mount:notion-main".to_string(),
@@ -2184,6 +2456,7 @@ mod tests {
             parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
             filename: "Item".to_string(),
             kind,
+            read_only: false,
             entity_kind: None,
             remote_id: None,
             path: "Item".to_string(),
@@ -2201,6 +2474,7 @@ mod tests {
             parent_identifier: Some(ROOT_CONTAINER_IDENTIFIER.to_string()),
             filename: filename.to_string(),
             kind,
+            read_only: false,
             entity_kind: None,
             remote_id: None,
             path: filename.to_string(),
@@ -2218,6 +2492,7 @@ mod tests {
             parent_identifier: None,
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,
+            read_only: false,
             entity_kind: None,
             remote_id: None,
             path: String::new(),
@@ -2235,6 +2510,7 @@ mod tests {
             parent_identifier: None,
             filename: String::new(),
             kind: VirtualFsItemKind::Folder,
+            read_only: false,
             entity_kind: None,
             remote_id: None,
             path: String::new(),
@@ -2251,10 +2527,10 @@ mod tests {
         mount_id: String,
         root: VirtualFsItem,
         children: BTreeMap<String, Vec<VirtualFsItem>>,
-        created_files: RefCell<Vec<(String, String)>>,
+        created_files: Mutex<Vec<(String, String)>>,
         created_item: Option<VirtualFsItem>,
-        renamed: RefCell<Vec<(String, String, String)>>,
-        trashed: RefCell<Vec<String>>,
+        renamed: Mutex<Vec<(String, String, String)>>,
+        trashed: Mutex<Vec<String>>,
     }
 
     impl VirtualFsClient for FakeClient {
@@ -2316,7 +2592,8 @@ mod tests {
             filename: &str,
         ) -> Result<VirtualFsMutationReport, FuseError> {
             self.created_files
-                .borrow_mut()
+                .lock()
+                .expect("created files")
                 .push((parent_identifier.to_string(), filename.to_string()));
             let item = self.created_item.clone().unwrap_or_else(|| {
                 test_named_item("local:created", filename, VirtualFsItemKind::File)
@@ -2345,7 +2622,7 @@ mod tests {
             new_parent_identifier: &str,
             new_filename: &str,
         ) -> Result<VirtualFsMutationReport, FuseError> {
-            self.renamed.borrow_mut().push((
+            self.renamed.lock().expect("renamed").push((
                 identifier.to_string(),
                 new_parent_identifier.to_string(),
                 new_filename.to_string(),
@@ -2364,7 +2641,10 @@ mod tests {
         }
 
         fn trash(&self, _identifier: &str) -> Result<VirtualFsMutationReport, FuseError> {
-            self.trashed.borrow_mut().push(_identifier.to_string());
+            self.trashed
+                .lock()
+                .expect("trashed")
+                .push(_identifier.to_string());
             Ok(VirtualFsMutationReport {
                 mount_id: self.mount_id.clone(),
                 identifier: _identifier.to_string(),
