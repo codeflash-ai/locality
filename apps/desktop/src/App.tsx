@@ -15,7 +15,6 @@ import {
   Download,
   EyeOff,
   FolderOpen,
-  History,
   Home,
   ListChecks,
   Loader2,
@@ -2068,9 +2067,6 @@ function MainShell({
             <SidebarButton active={view === "home"} icon={<Home />} onClick={() => onViewChange("home")}>
               {PRODUCT_TERMS.home}
             </SidebarButton>
-            <SidebarButton active={view === "files"} icon={<Search />} onClick={() => onViewChange("files")}>
-              {PRODUCT_TERMS.files}
-            </SidebarButton>
             <SidebarButton active={view === "mount"} icon={<FolderOpen />} onClick={openMountsView}>
               {PRODUCT_TERMS.sources}
             </SidebarButton>
@@ -2080,13 +2076,6 @@ function MainShell({
               onClick={() => onViewChange("pending")}
             >
               {PRODUCT_TERMS.reviewCenter}
-            </SidebarButton>
-            <SidebarButton
-              active={view === "activity"}
-              icon={<History />}
-              onClick={() => onViewChange("activity")}
-            >
-              {PRODUCT_TERMS.activity}
             </SidebarButton>
             <SidebarButton
               active={view === "settings"}
@@ -2177,6 +2166,7 @@ function MainShell({
               onCheckForUpdate={onCheckForUpdate}
               onInstallUpdate={onInstallUpdate}
               appStoreDistribution={appStoreDistribution}
+              onActivity={() => onViewChange("activity")}
               onResetComplete={onResetComplete}
             />
           )}
@@ -3844,6 +3834,7 @@ function SettingsView({
   onCheckForUpdate,
   onInstallUpdate,
   appStoreDistribution,
+  onActivity,
   onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
@@ -3853,6 +3844,7 @@ function SettingsView({
   onCheckForUpdate: (options?: AppUpdateCheckOptions) => Promise<void>;
   onInstallUpdate: () => Promise<void>;
   appStoreDistribution: boolean;
+  onActivity: () => void;
   onResetComplete: () => void;
 }) {
   const [diagnosticMessage, setDiagnosticMessage] = useState("");
@@ -4055,6 +4047,15 @@ function SettingsView({
           <SettingRow title="Local edits" value="Review when needed" />
           <SettingRow title="Push confirmation" value="Require for large changes" />
           <SettingRow title="Default new source mode" value="Edit enabled" />
+        </div>
+
+        <div className="panel">
+          <PanelTitle title="Activity" />
+          <SettingRow title="Recent events" value={`${snapshot.activity.length} recorded`} />
+          <SettingRow title="Debug queue" value="Available from Activity" />
+          <SecondaryButton compact icon={<Clock3 />} onClick={onActivity}>
+            Open Activity Log
+          </SecondaryButton>
         </div>
 
         <div className="panel">
