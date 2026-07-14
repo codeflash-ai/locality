@@ -88,6 +88,7 @@ const onboardingDemoVideoUrl = import.meta.env.VITE_LOCALITY_ONBOARDING_DEMO_VID
 type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
 type OnboardingStep = 1 | 2 | 3 | 4 | 5;
+type ReviewFilter = "all" | "approvals" | "problems";
 
 const PRODUCT_TERMS = {
   home: "Home",
@@ -743,6 +744,33 @@ function sourceSyncModeLabel(liveMode: MountLiveMode, active: boolean) {
     return "Live Mode needs attention";
   }
   return "Live Mode";
+}
+
+function reviewQueueCounts(changes: PendingChange[]) {
+  const problems = changes.filter((change) => change.state === "conflict" || change.state === "blocked").length;
+  return {
+    total: changes.length,
+    approvals: changes.length - problems,
+    problems,
+  };
+}
+
+function reviewFilterLabel(filter: ReviewFilter) {
+  if (filter === "approvals") {
+    return "Approvals";
+  }
+  if (filter === "problems") {
+    return "Problems";
+  }
+  return "All";
+}
+
+function changeMatchesReviewFilter(change: PendingChange, filter: ReviewFilter) {
+  if (filter === "all") {
+    return true;
+  }
+  const isProblem = change.state === "conflict" || change.state === "blocked";
+  return filter === "problems" ? isProblem : !isProblem;
 }
 
 function useMountLiveModeController(
@@ -3269,8 +3297,11 @@ function PendingView({
   onRefresh: () => Promise<void>;
 }) {
   const hasPendingChanges = snapshot.pendingChanges.length > 0;
+  const [filter, setFilter] = useState<ReviewFilter>("all");
   const [pushState, setPushState] = useState<"idle" | "pushing" | "success" | "error">("idle");
   const [pushMessage, setPushMessage] = useState("");
+  const reviewCounts = reviewQueueCounts(snapshot.pendingChanges);
+  const visibleChanges = snapshot.pendingChanges.filter((change) => changeMatchesReviewFilter(change, filter));
 
   async function pushAll() {
     if (!hasPendingChanges || pushState === "pushing") {
@@ -3328,15 +3359,57 @@ function PendingView({
       )}
       {hasPendingChanges ? (
         <>
-          <p className="view-copy">
-            {snapshot.pendingChanges.length} files need approval, conflict resolution, or a sync decision.
-          </p>
-          <FileChangeList
-            changes={snapshot.pendingChanges}
-            mountPath={snapshot.mount.localPath}
-            onReview={onReview}
-            onRefresh={onRefresh}
-          />
+          <section className="panel review-overview-panel">
+            <div className="review-mode-copy">
+              <p className="label">{snapshot.liveMode.enabled ? "Live Mode on" : "Review mode"}</p>
+              <h2>{reviewCounts.total} items need attention</h2>
+              <p>
+                Safe edits can sync automatically. Review Center keeps approvals, conflicts, failed syncs,
+                and policy-paused files in one place.
+              </p>
+            </div>
+            <div className="review-counts">
+              <Metric label="Approvals" value={reviewCounts.approvals} />
+              <Metric label="Problems" value={reviewCounts.problems} />
+              <Metric label="Live tracked" value={snapshot.liveMode.coveredCount} />
+            </div>
+          </section>
+          <div className="review-filter-bar" role="tablist" aria-label="Review Center filters">
+            {(["all", "approvals", "problems"] as const).map((nextFilter) => (
+              <button
+                key={nextFilter}
+                className={`review-filter-button ${filter === nextFilter ? "active" : ""}`}
+                role="tab"
+                aria-selected={filter === nextFilter}
+                onClick={() => setFilter(nextFilter)}
+              >
+                {reviewFilterLabel(nextFilter)}
+                <span>
+                  {nextFilter === "all"
+                    ? reviewCounts.total
+                    : nextFilter === "approvals"
+                      ? reviewCounts.approvals
+                      : reviewCounts.problems}
+                </span>
+              </button>
+            ))}
+          </div>
+          {visibleChanges.length > 0 ? (
+            <FileChangeList
+              changes={visibleChanges}
+              mountPath={snapshot.mount.localPath}
+              onReview={onReview}
+              onRefresh={onRefresh}
+            />
+          ) : (
+            <section className="panel muted-panel review-empty-filter">
+              <Check />
+              <div>
+                <h2>No {reviewFilterLabel(filter).toLowerCase()} in this queue</h2>
+                <p>Switch filters to see other review items.</p>
+              </div>
+            </section>
+          )}
         </>
       ) : (
         <section className="panel muted-panel">
@@ -3368,6 +3441,7 @@ function ReviewView({
   const [complete, setComplete] = useState(false);
   const [pushState, setPushState] = useState<"idle" | "pushing" | "success" | "error">("idle");
   const [pushMessage, setPushMessage] = useState("");
+  const [destructiveAccepted, setDestructiveAccepted] = useState(false);
 
   useEffect(() => {
     void callCommand<PushPlan>("review_push_plan", undefined, samplePushPlan)
@@ -3429,6 +3503,8 @@ function ReviewView({
 
   const isPushing = pushState === "pushing";
   const pushSucceeded = pushState === "success";
+  const needsDeletionApproval = plan.pagesDeleted > 0;
+  const pushBlockedByDeletion = needsDeletionApproval && !destructiveAccepted;
 
   return (
     <div className="view-stack">
@@ -3466,6 +3542,17 @@ function ReviewView({
         <Metric label="Database rows updated" value={plan.databaseRowsUpdated} />
         <Metric label="Pages deleted" value={plan.pagesDeleted} />
       </section>
+      {needsDeletionApproval && (
+        <label className="destructive-check">
+          <input
+            type="checkbox"
+            checked={destructiveAccepted}
+            disabled={isPushing || pushSucceeded}
+            onChange={(event) => setDestructiveAccepted(event.target.checked)}
+          />
+          <span>I understand {plan.pagesDeleted} Notion {plan.pagesDeleted === 1 ? "page" : "pages"} will be deleted.</span>
+        </label>
+      )}
 
       <FileChangeList
         changes={plan.files}
@@ -3476,13 +3563,13 @@ function ReviewView({
 
       <div className="footer-actions">
         <PrimaryButton
-          disabled={!plan.canPush || isPushing || pushSucceeded}
+          disabled={!plan.canPush || isPushing || pushSucceeded || pushBlockedByDeletion}
           icon={isPushing ? <Loader2 className="spin-icon" /> : pushSucceeded ? <Check /> : <ShieldCheck />}
           onClick={push}
         >
           {isPushing ? "Pushing..." : pushSucceeded ? "Pushed" : "Approve and Push"}
         </PrimaryButton>
-        <SecondaryButton disabled={isPushing || pushSucceeded}>Cancel</SecondaryButton>
+        <SecondaryButton disabled={isPushing || pushSucceeded} onClick={onPending}>Cancel</SecondaryButton>
       </div>
     </div>
   );
