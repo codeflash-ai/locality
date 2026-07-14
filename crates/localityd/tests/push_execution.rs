@@ -928,6 +928,113 @@ fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
 }
 
 #[test]
+fn daemon_push_resumes_failed_gmail_send_reconciliation_without_reapplying() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/reply.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\ntitle: Reply\nto: [\"user@example.com\"]\nsubject: Reply\n---\nBody.\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("gmail-folder:draft");
+    let sent_folder_id = RemoteId::new("gmail-folder:sent");
+    let created_remote_id = RemoteId::new("gmail-message:sent-1");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "gmail", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            sent_folder_id.clone(),
+            EntityKind::Directory,
+            "sent",
+            "sent",
+        ))
+        .expect("save sent folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:gmail-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/reply.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            created_remote_id.clone(),
+            rendered_entity("gmail-message:sent-1", "Body."),
+        )
+        .with_created_fetch_failures(created_remote_id.clone(), 1)
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-gmail-draft".to_string()),
+            operation_index: 0,
+            parent_id: sent_folder_id,
+            entity_id: created_remote_id.clone(),
+        }]);
+    let job = || PushJob {
+        target_path: fixture.root.join(source_path),
+        assume_yes: true,
+        confirm_dangerous: false,
+    };
+
+    let first = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
+        .expect("first push");
+
+    assert_eq!(first.action, PushJobAction::Failed);
+    assert_eq!(source.applied_count(), 1);
+    let first_push_id = first.push_id.expect("first push id");
+    let journal = store.list_journal().expect("journal");
+    assert_eq!(journal.len(), 1);
+    assert!(matches!(journal[0].status, JournalStatus::Failed(_)));
+    assert_eq!(journal[0].apply_effects.len(), 1);
+
+    let second = execute_push_job_with_content_root(&mut store, job(), &source, Some(&state_root))
+        .expect("retry push");
+
+    assert_eq!(second.action, PushJobAction::Reconciled);
+    assert_eq!(source.applied_count(), 1, "retry must not resend Gmail");
+    assert_eq!(second.push_id.as_ref(), Some(&first_push_id));
+    let journal = store.list_journal().expect("journal");
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].status, JournalStatus::Reconciled);
+    let message = store
+        .get_entity(&fixture.mount_id, &created_remote_id)
+        .expect("get sent message")
+        .expect("sent message entity");
+    assert_eq!(message.path, PathBuf::from("sent/reply.md"));
+    assert!(content_root.join("sent/reply.md").exists());
+    assert!(!content_root.join(source_path).exists());
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
+            .expect("find mutation")
+            .is_none()
+    );
+}
+
+#[test]
 fn daemon_push_job_plans_pending_virtual_delete_from_scope() {
     let fixture = PushFixture::new();
     let mut store = InMemoryStateStore::new();
@@ -1309,6 +1416,7 @@ struct FakePushSource {
     requested_paths: std::cell::RefCell<Vec<PathBuf>>,
     supported_operations: Option<BTreeSet<PushOperationKind>>,
     created_entities: BTreeMap<RemoteId, HydratedEntity>,
+    created_fetch_failures: std::cell::RefCell<BTreeMap<RemoteId, usize>>,
     apply_effects: Vec<JournalApplyEffect>,
 }
 
@@ -1353,6 +1461,13 @@ impl FakePushSource {
         self
     }
 
+    fn with_created_fetch_failures(mut self, remote_id: RemoteId, failures: usize) -> Self {
+        self.created_fetch_failures
+            .get_mut()
+            .insert(remote_id, failures);
+        self
+    }
+
     fn with_apply_effects(mut self, effects: Vec<JournalApplyEffect>) -> Self {
         self.apply_effects = effects;
         self
@@ -1365,6 +1480,17 @@ impl HydrationSource for FakePushSource {
         request: &locality_core::hydration::HydrationRequest,
     ) -> LocalityResult<HydratedEntity> {
         self.requested_paths.borrow_mut().push(request.path.clone());
+        if let Some(remaining) = self
+            .created_fetch_failures
+            .borrow_mut()
+            .get_mut(&request.remote_id)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Err(LocalityError::InvalidState(
+                "injected created entity fetch failure".to_string(),
+            ));
+        }
         if let Some(rendered) = self.created_entities.get(&request.remote_id) {
             return Ok(rendered.clone());
         }

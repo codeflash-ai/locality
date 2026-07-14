@@ -305,6 +305,12 @@ where
         + VirtualMutationRepository,
     Source: Connector + HydrationSource + ?Sized,
 {
+    if let Some(report) =
+        resume_failed_created_entity_reconciliation(store, source, &prepared, state_root)?
+    {
+        return Ok(report);
+    }
+
     let push_id = generate_push_id();
     let remote_preconditions = remote_preconditions_for_plan(
         store,
@@ -392,6 +398,167 @@ where
             journal_status: journal_status_after_error(store, &push_id),
             error: Some(PushJobError::from(error)),
         }),
+    }
+}
+
+fn resume_failed_created_entity_reconciliation<S, Source>(
+    store: &mut S,
+    source: &Source,
+    prepared: &PreparedPush,
+    state_root: Option<&Path>,
+) -> LocalityResult<Option<PushJobReport>>
+where
+    S: MountRepository
+        + EntityRepository
+        + ShadowRepository
+        + JournalRepository
+        + JournalStore
+        + RemoteObservationRepository
+        + FreshnessStateRepository
+        + VirtualMutationRepository,
+    Source: HydrationSource + ?Sized,
+{
+    if prepared.pipeline.action != PushPipelineAction::ProceedToApply {
+        return Ok(None);
+    }
+    let Some(plan) = prepared.pipeline.plan.as_ref() else {
+        return Ok(None);
+    };
+    let Some(journal) =
+        latest_resumable_created_entity_journal(store, &prepared.mount.mount_id, plan)?
+    else {
+        return Ok(None);
+    };
+
+    let changed_remote_ids = created_entity_effect_ids(&journal.apply_effects);
+    let mut completed_stages = prepared.pipeline.completed_stages.clone();
+    completed_stages.push(PushStage::ConcurrencyCheckAndApply);
+    completed_stages.push(PushStage::JournalAndReconcile);
+
+    let reconcile_result = {
+        let mut host = DaemonPushHost {
+            store,
+            source,
+            state_root: state_root.map(Path::to_path_buf),
+        };
+        host.update_status(&journal.push_id, JournalStatus::Applied)?;
+        match host.reconcile(PushReconcileRequest {
+            push_id: &journal.push_id,
+            mount_id: &journal.mount_id,
+            plan: &journal.plan,
+            changed_remote_ids: &changed_remote_ids,
+            apply_effects: &journal.apply_effects,
+        }) {
+            Ok(result) => {
+                host.update_status(&journal.push_id, JournalStatus::Reconciled)?;
+                Ok(result)
+            }
+            Err(error) => {
+                host.update_status(&journal.push_id, JournalStatus::Failed(error.to_string()))?;
+                Err(error)
+            }
+        }
+    };
+
+    match reconcile_result {
+        Ok(result) => Ok(Some(PushJobReport {
+            target_path: prepared.absolute_path.clone(),
+            mount_id: prepared.mount.mount_id.clone(),
+            entity_id: prepared.entity.remote_id.clone(),
+            pipeline: prepared.pipeline.clone(),
+            readable_diff: prepared.readable_diff.clone(),
+            action: PushJobAction::Reconciled,
+            execution: Some(PushExecutionResult {
+                push_id: journal.push_id.clone(),
+                action: locality_core::push::PushExecutionAction::Reconciled,
+                changed_remote_ids,
+                apply_effects: journal.apply_effects.clone(),
+                reconciled_remote_ids: result.reconciled_remote_ids,
+                journal_status: Some(JournalStatus::Reconciled),
+                completed_stages,
+            }),
+            push_id: Some(journal.push_id),
+            journal_status: Some(JournalStatus::Reconciled),
+            error: None,
+        })),
+        Err(error) => Ok(Some(PushJobReport {
+            target_path: prepared.absolute_path.clone(),
+            mount_id: prepared.mount.mount_id.clone(),
+            entity_id: prepared.entity.remote_id.clone(),
+            pipeline: prepared.pipeline.clone(),
+            readable_diff: prepared.readable_diff.clone(),
+            action: PushJobAction::Failed,
+            execution: None,
+            push_id: Some(journal.push_id.clone()),
+            journal_status: journal_status_after_error(store, &journal.push_id),
+            error: Some(PushJobError::from(error)),
+        })),
+    }
+}
+
+fn latest_resumable_created_entity_journal<S>(
+    store: &S,
+    mount_id: &MountId,
+    plan: &PushPlan,
+) -> LocalityResult<Option<JournalEntry>>
+where
+    S: JournalRepository,
+{
+    let mut latest = None;
+    for journal in store.list_journal().map_err(LocalityError::from)? {
+        if journal.mount_id != *mount_id
+            || !matches!(journal.status, JournalStatus::Failed(_))
+            || journal.plan != *plan
+            || !resumable_created_entity_effects(&journal)
+            || !plan
+                .operations
+                .iter()
+                .all(|operation| matches!(operation, PushOperation::CreateEntity { .. }))
+        {
+            continue;
+        }
+        if latest
+            .as_ref()
+            .is_none_or(|current| journal_is_newer(&journal, current))
+        {
+            latest = Some(journal);
+        }
+    }
+
+    Ok(latest)
+}
+
+fn resumable_created_entity_effects(journal: &JournalEntry) -> bool {
+    !journal.apply_effects.is_empty()
+        && journal
+            .apply_effects
+            .iter()
+            .all(|effect| matches!(effect, JournalApplyEffect::CreatedEntity { .. }))
+}
+
+fn created_entity_effect_ids(effects: &[JournalApplyEffect]) -> Vec<RemoteId> {
+    let mut ids = Vec::new();
+    for effect in effects {
+        if let JournalApplyEffect::CreatedEntity { entity_id, .. } = effect
+            && !ids.iter().any(|id| id == entity_id)
+        {
+            ids.push(entity_id.clone());
+        }
+    }
+    ids
+}
+
+fn journal_is_newer(candidate: &JournalEntry, current: &JournalEntry) -> bool {
+    match (
+        candidate.metadata.created_at_unix_ms,
+        current.metadata.created_at_unix_ms,
+    ) {
+        (Some(candidate_time), Some(current_time)) if candidate_time != current_time => {
+            candidate_time > current_time
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        _ => candidate.push_id.0 > current.push_id.0,
     }
 }
 
