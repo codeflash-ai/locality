@@ -2135,6 +2135,58 @@ p {
   gap: 16px;
 }
 
+.source-sync-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.source-sync-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.source-sync-heading h2 {
+  margin-top: 4px;
+  font-size: var(--type-title-md);
+}
+
+.source-sync-heading p:not(.label) {
+  max-width: 620px;
+  margin-top: 4px;
+  color: var(--muted);
+}
+
+.source-sync-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.source-sync-grid .setting-row {
+  min-height: 40px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.source-sync-grid .setting-row:nth-last-child(-n + 2) {
+  border-bottom: 0;
+}
+
+.source-sync-grid .setting-row:nth-child(odd) {
+  border-right: 1px solid var(--line-soft);
+}
+
+.source-sync-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
 .safety-strip {
   border-color: rgba(8, 123, 114, 0.14);
   background: rgba(239, 250, 247, 0.74);
@@ -2162,6 +2214,61 @@ p {
 
 .advanced-panel[open] summary {
   margin-bottom: 14px;
+}
+
+.danger-accordion {
+  border: 1px solid rgba(220, 38, 38, 0.18);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 8px 24px rgba(20, 30, 43, 0.04);
+}
+
+.danger-accordion summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px;
+  color: var(--red);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.danger-accordion summary span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.danger-accordion summary small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.danger-body {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 0 14px 14px;
+  color: var(--muted);
+}
+
+.danger-body h3 {
+  color: var(--ink);
+  font-size: var(--type-body-large);
+}
+
+.danger-body p {
+  max-width: 560px;
+  margin-top: 4px;
+}
+
+.danger-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
 }
 
 .compact-settings {

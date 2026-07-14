@@ -708,7 +708,7 @@ function errorMessage(error: unknown) {
 function liveModeTooltip(enabled: boolean) {
   return enabled
     ? "Live Mode is watching safe local edits, pushing them to Notion, and pulling remote Notion changes when no review is needed. It pauses when a change needs review."
-    : "Turn on Live Mode to keep this Notion mount point in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
+    : "Turn on Live Mode to keep this Notion source in sync while you work. Locality still pauses for conflicts, large changes, or anything that needs review.";
 }
 
 function trayLiveModeLabel(liveMode: MountLiveMode, busy: boolean) {
@@ -728,6 +728,22 @@ function trayLiveModeLabel(liveMode: MountLiveMode, busy: boolean) {
     return `${liveMode.coveredCount} safe pending`;
   }
   return "On";
+}
+
+function sourceSyncModeLabel(liveMode: MountLiveMode, active: boolean) {
+  if (!active) {
+    return "Managed when active";
+  }
+  if (!liveMode.enabled) {
+    return "Review mode";
+  }
+  if (liveMode.state === "syncing") {
+    return "Live Mode syncing";
+  }
+  if (liveMode.state === "error") {
+    return "Live Mode needs attention";
+  }
+  return "Live Mode";
 }
 
 function useMountLiveModeController(
@@ -2590,6 +2606,7 @@ function MountsView({
                 </div>
                 <div className="mount-card-meta">
                   {row.active && <span className="primary">Primary</span>}
+                  {row.active && <span>{sourceSyncModeLabel(snapshot.liveMode, row.active)}</span>}
                   <span>{row.projection}</span>
                   <span>{row.access}</span>
                   <span>{row.content}</span>
@@ -2870,6 +2887,15 @@ function MountDetailView({
   const showAccount = accountLabel.length > 0 && accountLabel !== mount.workspaceName;
   const providerState = mount.provider?.state ?? "Not registered";
   const providerMessage = mount.provider?.message ?? providerState;
+  const {
+    liveModeEnabled,
+    liveModeBusy,
+    liveModeState,
+    liveModeMessage,
+    toggleLiveMode,
+  } = useMountLiveModeController(snapshot, onRefresh);
+  const liveModeAppliesToSource = isActiveMount && mount.connector === "notion";
+  const sourceSyncMode = sourceSyncModeLabel(snapshot.liveMode, liveModeAppliesToSource);
 
   async function openFolder() {
     setActionError("");
@@ -3031,6 +3057,68 @@ function MountDetailView({
         </div>
       </section>
 
+      <section className="panel source-sync-panel">
+        <div className="source-sync-heading">
+          <div>
+            <p className="label">Sync for this source</p>
+            <h2>{sourceSyncMode}</h2>
+            <p>
+              Clean remote pulls and safe local pushes can run in the background. Conflicts,
+              destructive changes, and large plans still go to Review Center.
+            </p>
+          </div>
+          <StatusPill
+            tone={liveModeAppliesToSource && liveModeState === "error" ? "danger" : liveModeEnabled ? "ready" : "warn"}
+            title={liveModeAppliesToSource ? liveModeTooltip(liveModeEnabled) : "Only the active source can change Live Mode from this view."}
+          >
+            {liveModeAppliesToSource ? (liveModeEnabled ? "Live" : "Review") : "Inactive"}
+          </StatusPill>
+        </div>
+        <div className="source-sync-grid">
+          <SettingRow title="Clean remote pulls" value={liveModeAppliesToSource && liveModeEnabled ? "Automatic when safe" : "Manual sync"} />
+          <SettingRow title="Safe local pushes" value={liveModeAppliesToSource && liveModeEnabled ? "Live Mode" : "Review first"} />
+          <SettingRow title="Review rules" value="Conflict, destructive, large plan" />
+          <SettingRow title="Last run" value={snapshot.liveMode.lastRunAt ?? "Not available"} />
+        </div>
+        <div className="source-sync-actions">
+          <button
+            className={`live-mode-control has-tooltip ${liveModeEnabled && liveModeAppliesToSource ? "active" : ""}`}
+            aria-pressed={liveModeEnabled && liveModeAppliesToSource}
+            aria-label={`${liveModeEnabled ? "Turn off" : "Turn on"} Live Mode for this source`}
+            data-tooltip={liveModeAppliesToSource ? liveModeTooltip(liveModeEnabled) : "Open the active source to change Live Mode"}
+            title={liveModeAppliesToSource ? liveModeTooltip(liveModeEnabled) : "Open the active source to change Live Mode"}
+            disabled={!liveModeAppliesToSource || liveModeBusy}
+            onClick={() => void toggleLiveMode()}
+          >
+            <span className="live-mode-copy">
+              {liveModeBusy ? <span className="live-mode-spinner" aria-hidden="true" /> : <Zap />}
+              <span>{liveModeEnabled && liveModeAppliesToSource ? "Live Mode On" : "Live Mode Off"}</span>
+            </span>
+            <span className={`toggle ${liveModeEnabled && liveModeAppliesToSource ? "enabled" : ""}`} aria-hidden="true">
+              <i />
+            </span>
+          </button>
+          {showNotionPullAction && (
+            <SecondaryButton
+              compact
+              disabled={!mount.localPath.trim() || accessState === "changing" || pullState === "pulling"}
+              icon={pullState === "pulling" ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+              onClick={() => void pullChanges()}
+            >
+              {pullState === "pulling" ? "Syncing" : "Sync Now"}
+            </SecondaryButton>
+          )}
+          <SecondaryButton compact disabled>
+            Use Global Default
+          </SecondaryButton>
+        </div>
+        {liveModeMessage && liveModeAppliesToSource && (
+          <p className={liveModeState === "error" ? "field-error" : "quiet-note inline-note"}>
+            {liveModeMessage}
+          </p>
+        )}
+      </section>
+
       <section className="safety-strip">
         <ShieldCheck />
         <div>
@@ -3059,6 +3147,33 @@ function MountDetailView({
             <SettingRow title="Mount status" value={mount.status} />
             <SettingRow title="Provider" value={providerMessage} />
             <SettingRow title="Primary mount" value={isActiveMount ? "Yes" : "No"} />
+          </div>
+        </div>
+      </details>
+
+      <details className="danger-accordion">
+        <summary>
+          <span>
+            <AlertTriangle />
+            Danger Zone
+          </span>
+          <small>Closed by default</small>
+        </summary>
+        <div className="danger-body">
+          <div>
+            <h3>Source-scoped destructive actions</h3>
+            <p>
+              Disconnect and reset actions need typed confirmation before they are safe to expose.
+              Until then, use Settings for all-machine maintenance.
+            </p>
+          </div>
+          <div className="danger-actions">
+            <SecondaryButton compact disabled>
+              Reset Source State
+            </SecondaryButton>
+            <SecondaryButton compact disabled>
+              Disconnect Source
+            </SecondaryButton>
           </div>
         </div>
       </details>
