@@ -1103,11 +1103,12 @@ where
     let new_parent_path = container_path(&mount, &entities, &mutations, new_parent_identifier)?;
 
     if let Some(child_identifier) = identifier.strip_prefix(CHILDREN_PREFIX) {
-        let new_parent = move_parent_remote(&mount, &entities, new_parent_identifier)?;
         let new_page_dir = new_parent_path.join(new_filename);
         let new_path = page_document_path(&new_page_dir);
         let title = title_from_filename(new_filename);
         ensure_source_path_writable(&mount, &new_path)?;
+        let new_parent =
+            move_parent_remote(&mount, &entities, new_parent_identifier, &new_parent_path)?;
 
         if child_identifier.starts_with(LOCAL_PREFIX) {
             let mut mutation = store
@@ -1233,8 +1234,9 @@ where
     )? {
         return Ok(report);
     }
+    let new_parent =
+        move_parent_remote(&mount, &entities, new_parent_identifier, &new_parent_path)?;
     ensure_virtual_path_available_for_rename(store, mount_id, identifier, &new_path)?;
-    let new_parent = move_parent_remote(&mount, &entities, new_parent_identifier)?;
 
     if let Some(mut mutation) = local_mutation(store, mount_id, identifier)? {
         ensure_source_path_writable(&mount, &mutation.projected_path)?;
@@ -1744,7 +1746,10 @@ fn move_parent_remote(
     mount: &MountConfig,
     entities: &[EntityRecord],
     parent_identifier: &str,
+    parent_path: &Path,
 ) -> LocalityResult<MoveParent> {
+    ensure_source_parent_accepts_create(mount, parent_path)?;
+
     if let Some(remote_id) = parent_identifier.strip_prefix(CHILDREN_PREFIX) {
         if remote_id.starts_with(LOCAL_PREFIX) {
             return Err(LocalityError::Unsupported(
@@ -1761,6 +1766,7 @@ fn move_parent_remote(
                 "children containers can only target page parents",
             ));
         }
+        let remote_id = create_parent_remote_id_for_entity(mount, remote_id, entity)?;
         return Ok(MoveParent { remote_id });
     }
 
@@ -1788,14 +1794,8 @@ fn move_parent_remote(
         .iter()
         .find(|entity| entity.remote_id == remote_id)
         .ok_or_else(|| missing_identifier(parent_identifier))?;
-    match entity.kind {
-        EntityKind::Page | EntityKind::Database | EntityKind::Directory => {
-            Ok(MoveParent { remote_id })
-        }
-        EntityKind::Asset | EntityKind::Unknown(_) => Err(LocalityError::Unsupported(
-            "virtual filesystem pages must be moved inside a page, database, or folder directory",
-        )),
-    }
+    let remote_id = create_parent_remote_id_for_entity(mount, remote_id, entity)?;
+    Ok(MoveParent { remote_id })
 }
 
 fn existing_move_original_path(
@@ -3537,6 +3537,157 @@ mod tests {
                 .is_empty()
         );
         assert!(!content_root.join("Doc/Nested.md").exists());
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn rename_rejects_destination_parents_that_do_not_accept_creates_without_dirtying_entity() {
+        for (connector, mount_name, source_path, target_parent_id, target_kind, target_path) in [
+            (
+                "gmail",
+                "gmail-main-nested",
+                "draft/reply.md",
+                "target-parent",
+                EntityKind::Directory,
+                "draft/nested",
+            ),
+            (
+                "gmail",
+                "gmail-main-page-child",
+                "draft/reply.md",
+                "children:target-parent",
+                EntityKind::Page,
+                "draft/parent.md",
+            ),
+            (
+                "google-docs",
+                "google-docs-main-page-child",
+                "Moving/page.md",
+                "children:target-parent",
+                EntityKind::Page,
+                "Parent/page.md",
+            ),
+        ] {
+            let mount_id = MountId::new(mount_name);
+            let state_root = temp_root(&format!("loc-rename-destination-policy-{mount_name}"));
+            let content_root = state_root.join(format!("content/{mount_name}/files"));
+            let mut store = InMemoryStateStore::new();
+            store
+                .save_mount(virtual_mount_with_connector(&mount_id, connector))
+                .expect("save mount");
+            store
+                .save_entity(EntityRecord {
+                    mount_id: mount_id.clone(),
+                    remote_id: RemoteId::new("target-parent"),
+                    kind: target_kind,
+                    title: "Target Parent".to_string(),
+                    path: target_path.into(),
+                    hydration: HydrationState::Hydrated,
+                    content_hash: None,
+                    remote_edited_at: Some(format!("{connector}:target-parent:1")),
+                })
+                .expect("save target parent");
+            store
+                .save_entity(EntityRecord {
+                    mount_id: mount_id.clone(),
+                    remote_id: RemoteId::new("moving-page"),
+                    kind: EntityKind::Page,
+                    title: "Moving".to_string(),
+                    path: source_path.into(),
+                    hydration: HydrationState::Hydrated,
+                    content_hash: None,
+                    remote_edited_at: Some(format!("{connector}:moving-page:1")),
+                })
+                .expect("save moving page");
+
+            let error = rename_virtual_fs_item(
+                &mut store,
+                &content_root,
+                &mount_id,
+                "moving-page",
+                target_parent_id,
+                "Moved.md",
+            )
+            .expect_err("rename destination parent policy rejects move");
+
+            assert!(matches!(error, LocalityError::Unsupported(_)));
+            let entity = store
+                .get_entity(&mount_id, &RemoteId::new("moving-page"))
+                .expect("load entity")
+                .expect("entity");
+            assert_eq!(entity.path, PathBuf::from(source_path));
+            assert_eq!(entity.hydration, HydrationState::Hydrated);
+            assert!(
+                store
+                    .list_virtual_mutations(&mount_id)
+                    .expect("list mutations")
+                    .is_empty()
+            );
+
+            let _ = std::fs::remove_dir_all(state_root);
+        }
+    }
+
+    #[test]
+    fn google_docs_directory_accepts_virtual_move_destination_parent() {
+        let mount_id = MountId::new("google-docs-main");
+        let state_root = temp_root("loc-google-docs-directory-move");
+        let content_root = state_root.join("content/google-docs-main/files");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "google-docs"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("folder-parent"),
+                kind: EntityKind::Directory,
+                title: "Folder".to_string(),
+                path: "Folder".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: Some("google-docs:folder-parent:1".to_string()),
+            })
+            .expect("save folder");
+        store
+            .save_entity(EntityRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("doc-moving"),
+                kind: EntityKind::Page,
+                title: "Moving".to_string(),
+                path: "Moving/page.md".into(),
+                hydration: HydrationState::Hydrated,
+                content_hash: None,
+                remote_edited_at: Some("google-docs:doc-moving:1".to_string()),
+            })
+            .expect("save moving doc");
+
+        let moved = rename_virtual_fs_item(
+            &mut store,
+            &content_root,
+            &mount_id,
+            "doc-moving",
+            "folder-parent",
+            "Moved.md",
+        )
+        .expect("google docs directory accepts moves");
+
+        assert_eq!(moved.path, "Folder/Moved.md");
+        let entity = store
+            .get_entity(&mount_id, &RemoteId::new("doc-moving"))
+            .expect("load entity")
+            .expect("entity");
+        assert_eq!(entity.path, PathBuf::from("Folder/Moved.md"));
+        assert_eq!(entity.hydration, HydrationState::Dirty);
+        let mutation = store
+            .get_virtual_mutation(&mount_id, "move:doc-moving")
+            .expect("load move mutation")
+            .expect("move mutation");
+        assert_eq!(
+            mutation.parent_remote_id.as_ref().map(RemoteId::as_str),
+            Some("folder-parent")
+        );
 
         let _ = std::fs::remove_dir_all(state_root);
     }

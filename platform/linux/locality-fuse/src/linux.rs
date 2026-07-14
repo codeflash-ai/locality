@@ -880,9 +880,7 @@ where
         let item = self.resolve_path(old_path)?;
         ensure_writable_item(&item)?;
         let new_parent = self.resolve_path(new_parent_path)?;
-        if new_parent.kind != VirtualFsItemKind::Folder {
-            return Err(FuseError::NotDirectory);
-        }
+        ensure_creatable_parent(&new_parent)?;
         let report = self
             .client
             .rename(&item.identifier, &new_parent.identifier, filename)?;
@@ -1813,6 +1811,48 @@ mod tests {
             .expect_err("read-only parent rejects mkdir");
 
         assert_eq!(error, libc::EROFS.into());
+    }
+
+    #[tokio::test]
+    async fn read_only_destination_parent_rejects_rename_before_daemon_rename() {
+        let root = test_root_item();
+        let source = test_named_item("draft-page", "Draft.md", VirtualFsItemKind::File);
+        let mut read_only_parent =
+            test_named_item("gmail-folder:inbox", "Inbox", VirtualFsItemKind::Folder);
+        read_only_parent.read_only = true;
+        let fs = AgentFuse {
+            client: FakeClient {
+                state_root: std::env::temp_dir(),
+                mount_id: "notion-main".to_string(),
+                root: root.clone(),
+                children: BTreeMap::new(),
+                created_files: Mutex::new(Vec::new()),
+                created_item: None,
+                renamed: Mutex::new(Vec::new()),
+                trashed: Mutex::new(Vec::new()),
+            },
+            cache: Mutex::new(BTreeMap::from([
+                (PathBuf::from(ROOT_PATH), root),
+                (PathBuf::from("/Draft.md"), source),
+                (PathBuf::from("/Inbox"), read_only_parent),
+            ])),
+            handles: Mutex::new(BTreeMap::new()),
+            next_handle: AtomicU64::new(1),
+        };
+
+        let error = fs
+            .rename(
+                Request::default(),
+                OsStr::new(ROOT_PATH),
+                OsStr::new("Draft.md"),
+                OsStr::new("/Inbox"),
+                OsStr::new("Moved.md"),
+            )
+            .await
+            .expect_err("read-only destination parent rejects rename");
+
+        assert_eq!(error, libc::EROFS.into());
+        assert!(fs.client.renamed.lock().expect("renamed").is_empty());
     }
 
     #[tokio::test]
