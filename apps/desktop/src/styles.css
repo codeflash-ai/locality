@@ -2535,6 +2535,90 @@ button.home-stat:hover {
   color: rgba(153, 27, 27, 0.55);
 }
 
+.source-modal {
+  display: grid;
+  gap: 16px;
+  width: min(680px, calc(100vw - 48px));
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--paper);
+  box-shadow: 0 28px 90px rgba(20, 30, 43, 0.24);
+}
+
+.source-modal h2 {
+  margin-top: 4px;
+  font-size: var(--type-title-md);
+}
+
+.source-modal p:not(.label) {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.connector-choice-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.connector-choice-card {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.84);
+}
+
+.connector-choice-card.active {
+  border-color: rgba(8, 123, 114, 0.24);
+  background: rgba(248, 252, 251, 0.98);
+}
+
+.connector-choice-card.disabled {
+  opacity: 0.72;
+}
+
+.connector-choice-heading {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.connector-choice-heading h3 {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.connector-choice-heading p {
+  max-width: 420px;
+}
+
+.connector-choice-heading .brand-tile {
+  width: 42px;
+  height: 42px;
+}
+
+.connector-choice-facts {
+  display: grid;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.connector-choice-facts .setting-row {
+  min-height: 34px;
+  padding: 7px 10px;
+  border-top: 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.connector-choice-facts .setting-row:last-child {
+  border-bottom: 0;
+}
+
 .compact-settings {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -3421,6 +3505,129 @@ button.home-stat:hover {
   gap: 16px;
 }
 
+.settings-shell {
+  display: grid;
+  grid-template-columns: 210px minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+  max-width: 980px;
+}
+
+.settings-nav {
+  position: sticky;
+  top: 0;
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.76);
+  box-shadow: 0 8px 24px rgba(20, 30, 43, 0.04);
+}
+
+.settings-nav button {
+  display: grid;
+  gap: 3px;
+  min-height: 48px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  text-align: left;
+}
+
+.settings-nav button:hover,
+.settings-nav button.active {
+  border-color: rgba(8, 123, 114, 0.14);
+  background: rgba(239, 250, 247, 0.76);
+  color: var(--accent);
+}
+
+.settings-nav span {
+  color: inherit;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.settings-nav small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1.25;
+}
+
+.settings-content-panel {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.settings-section-panel {
+  max-width: 720px;
+}
+
+.settings-activity-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 12px;
+}
+
+.settings-activity-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+}
+
+.settings-activity-row:hover {
+  border-color: rgba(8, 123, 114, 0.22);
+  background: rgba(248, 252, 251, 0.96);
+}
+
+.settings-activity-row svg {
+  width: 15px;
+  height: 15px;
+  color: var(--accent);
+}
+
+.settings-activity-row strong,
+.settings-activity-row small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-activity-row strong {
+  font-size: 12px;
+}
+
+.settings-activity-row small,
+.settings-activity-row em,
+.settings-empty-state {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 750;
+}
+
+.settings-empty-state {
+  padding: 14px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: rgba(247, 249, 251, 0.82);
+}
+
 .panel-title {
   margin-bottom: 12px;
   font-size: 14px;
@@ -4094,8 +4301,13 @@ button.home-stat:hover {
   }
 
   .settings-grid,
+  .settings-shell,
   .detail-grid,
   .summary-grid {
     grid-template-columns: 1fr;
+  }
+
+  .settings-nav {
+    position: static;
   }
 }

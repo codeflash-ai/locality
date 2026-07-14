@@ -93,6 +93,8 @@ type OnboardingStep = 1 | 2 | 3 | 4 | 5;
 type ReviewFilter = "all" | "approvals" | "problems";
 type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
+type SettingsSection = "general" | "sources" | "sync" | "activity" | "agents" | "advanced" | "about";
+type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
 
 const PRODUCT_TERMS = {
   home: "Home",
@@ -2289,6 +2291,7 @@ function MainShell({
               onInstallUpdate={onInstallUpdate}
               appStoreDistribution={appStoreDistribution}
               onActivity={() => onViewChange("activity")}
+              onSources={openMountsView}
               onResetComplete={onResetComplete}
             />
           )}
@@ -2598,10 +2601,20 @@ function MountsView({
   const [actionError, setActionError] = useState("");
   const [creating, setCreating] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [sourceDialogOpen, setSourceDialogOpen] = useState(false);
+  const [sourceDialogState, setSourceDialogState] = useState<SourceSetupState>("idle");
+  const [sourceDialogMessage, setSourceDialogMessage] = useState("");
 
-  async function createMount() {
+  function openAddSourceDialog() {
+    setActionError("");
+    setSourceDialogMessage("");
+    setSourceDialogState("idle");
+    setSourceDialogOpen(true);
+  }
+
+  async function createMount(): Promise<ActionReport> {
     if (creating) {
-      return;
+      return { ok: false, message: "Source setup is already running." };
     }
     setActionError("");
     setCreating(true);
@@ -2613,13 +2626,72 @@ function MountsView({
       );
       if (!report.ok) {
         setActionError(report.message);
-        return;
+        return report;
       }
       await onRefresh();
+      return report;
     } catch (error) {
-      setActionError(errorMessage(error));
+      const message = errorMessage(error);
+      setActionError(message);
+      return { ok: false, message };
     } finally {
       setCreating(false);
+    }
+  }
+
+  async function connectNotionSource(): Promise<ActionReport> {
+    setActionError("");
+    const report = await callCommand<ActionReport>(
+      "connect_notion",
+      undefined,
+      { ok: true, message: "Connected demo workspace." },
+    );
+    if (!report.ok) {
+      setActionError(report.message);
+      return report;
+    }
+    await onRefresh();
+    return report;
+  }
+
+  async function changeNotionSourceAccess(): Promise<ActionReport> {
+    setActionError("");
+    const report = await callCommand<ActionReport>(
+      "change_notion_access",
+      undefined,
+      { ok: true, message: "Changed demo Notion access." },
+    );
+    if (!report.ok) {
+      setActionError(report.message);
+      return report;
+    }
+    await onRefresh();
+    return report;
+  }
+
+  async function runSourceDialogAction() {
+    if (sourceDialogState === "connecting" || sourceDialogState === "creating" || sourceDialogState === "changing") {
+      return;
+    }
+
+    setSourceDialogMessage("");
+    const nextState = connectionMissing(snapshot)
+      ? "connecting"
+      : mountMissing(snapshot)
+        ? "creating"
+        : "changing";
+    setSourceDialogState(nextState);
+    try {
+      const report = connectionMissing(snapshot)
+        ? await connectNotionSource()
+        : mountMissing(snapshot)
+          ? await createMount()
+          : await changeNotionSourceAccess();
+      setSourceDialogMessage(report.message);
+      setSourceDialogState(report.ok ? "success" : "error");
+    } catch (error) {
+      setSourceDialogMessage(errorMessage(error));
+      setSourceDialogState("error");
     }
   }
 
@@ -2656,10 +2728,9 @@ function MountsView({
       <ViewHeader title={PRODUCT_TERMS.sources}>
         <SecondaryButton
           compact
-          busy={creating}
-          disabled={connectionMissing(snapshot)}
+          busy={sourceDialogState === "connecting" || sourceDialogState === "creating" || sourceDialogState === "changing"}
           icon={<Plus />}
-          onClick={() => void createMount()}
+          onClick={openAddSourceDialog}
         >
           Add Source
         </SecondaryButton>
@@ -2682,9 +2753,8 @@ function MountsView({
           </div>
           <PrimaryButton
             busy={creating}
-            disabled={connectionMissing(snapshot)}
             icon={<FolderOpen />}
-            onClick={() => void createMount()}
+            onClick={openAddSourceDialog}
           >
             Add Notion Source
           </PrimaryButton>
@@ -2753,6 +2823,102 @@ function MountsView({
         </>
       )}
       {actionError && <p className="field-error">{actionError}</p>}
+      {sourceDialogOpen && (
+        <AddSourceDialog
+          snapshot={snapshot}
+          state={sourceDialogState}
+          message={sourceDialogMessage}
+          onAction={() => void runSourceDialogAction()}
+          onClose={() => setSourceDialogOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function AddSourceDialog({
+  snapshot,
+  state,
+  message,
+  onAction,
+  onClose,
+}: {
+  snapshot: DesktopSnapshot;
+  state: SourceSetupState;
+  message: string;
+  onAction: () => void;
+  onClose: () => void;
+}) {
+  const needsConnection = connectionMissing(snapshot);
+  const needsFolder = !needsConnection && mountMissing(snapshot);
+  const busy = state === "connecting" || state === "creating" || state === "changing";
+  const actionLabel = needsConnection
+    ? "Connect Notion"
+    : needsFolder
+      ? "Create Local Folder"
+      : "Change Notion Access";
+  const actionIcon = busy ? <Loader2 className="spin-icon" /> : needsConnection ? <ShieldCheck /> : <FolderOpen />;
+  const sourceStatus = needsConnection
+    ? "Not connected"
+    : needsFolder
+      ? "Connected, folder needed"
+      : "Ready";
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="source-modal" role="dialog" aria-modal="true" aria-labelledby="add-source-title">
+        <div className="destructive-modal-header">
+          <div>
+            <p className="label">Add source</p>
+            <h2 id="add-source-title">Connect a workspace</h2>
+            <p>Choose the system Locality should expose as local files.</p>
+          </div>
+          <button className="icon-button has-tooltip" data-tooltip="Close" disabled={busy} onClick={onClose}>
+            <X />
+          </button>
+        </div>
+
+        <div className="connector-choice-grid">
+          <article className="connector-choice-card active">
+            <div className="connector-choice-heading">
+              <BrandTile variant="notion">N</BrandTile>
+              <div>
+                <h3>Notion</h3>
+                <p>Pages and databases become folders with page.md files.</p>
+              </div>
+              <StatusPill tone={needsConnection || needsFolder ? "warn" : "ready"} title={sourceStatus}>
+                {sourceStatus}
+              </StatusPill>
+            </div>
+            <div className="connector-choice-facts">
+              <SettingRow title="Workspace" value={snapshot.connection.workspaceName || "Not connected"} />
+              <SettingRow title="Local folder" value={snapshot.mount.localPath || "Not created yet"} />
+              <SettingRow title="Access" value={snapshot.mount.accessScope || "Not requested"} />
+            </div>
+            <PrimaryButton compact busy={busy} icon={actionIcon} onClick={onAction}>
+              {busy ? "Working" : actionLabel}
+            </PrimaryButton>
+          </article>
+
+          <article className="connector-choice-card disabled" aria-disabled="true">
+            <div className="connector-choice-heading">
+              <BrandTile variant="folder" />
+              <div>
+                <h3>Google Docs</h3>
+                <p>Document connectors will use the same local file workflow.</p>
+              </div>
+              <StatusPill tone="warn" title="Coming soon">
+                Coming Soon
+              </StatusPill>
+            </div>
+            <SecondaryButton compact disabled>
+              Coming Soon
+            </SecondaryButton>
+          </article>
+        </div>
+
+        {message && <p className={state === "error" ? "field-error" : "quiet-note inline-note"}>{message}</p>}
+      </section>
     </div>
   );
 }
@@ -4067,6 +4233,7 @@ function SettingsView({
   onInstallUpdate,
   appStoreDistribution,
   onActivity,
+  onSources,
   onResetComplete,
 }: {
   snapshot: DesktopSnapshot;
@@ -4077,6 +4244,7 @@ function SettingsView({
   onInstallUpdate: () => Promise<void>;
   appStoreDistribution: boolean;
   onActivity: () => void;
+  onSources: () => void;
   onResetComplete: () => void;
 }) {
   const [diagnosticMessage, setDiagnosticMessage] = useState("");
@@ -4088,6 +4256,7 @@ function SettingsView({
   const [preparingUninstall, setPreparingUninstall] = useState(false);
   const [destructiveAction, setDestructiveAction] = useState<DestructiveSettingsAction | null>(null);
   const [destructiveConfirmation, setDestructiveConfirmation] = useState("");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [busySetting, setBusySetting] = useState("");
   const [localSettings, setLocalSettings] = useState(snapshot.settings);
   const daemonStopped = snapshot.health.state === "stopped";
@@ -4265,162 +4434,258 @@ function SettingsView({
     }
   }
 
+  const settingsSections: Array<{ id: SettingsSection; label: string; description: string }> = [
+    { id: "general", label: "General", description: "Startup and desktop behavior" },
+    { id: "sources", label: "Sources", description: "Connected workspaces and local folders" },
+    { id: "sync", label: "Sync", description: "Live Mode and review policy" },
+    { id: "activity", label: "Activity", description: "Recent events and debug queue" },
+    { id: "agents", label: "Agents", description: "Local agent instructions" },
+    { id: "advanced", label: "Advanced", description: "Diagnostics, reset, and uninstall" },
+    { id: "about", label: "About", description: "Updates and distribution channel" },
+  ];
+  const activeSettingsSection = settingsSections.find((section) => section.id === settingsSection) ?? settingsSections[0];
+  const activeSourceCount = snapshot.mounts.length || (mountMissing(snapshot) ? 0 : 1);
+  const recentActivity = snapshot.activity.slice(0, 4);
+  const sourceStatus = connectionMissing(snapshot)
+    ? "Not connected"
+    : mountMissing(snapshot)
+      ? "Folder needed"
+      : mountStatusLabel(snapshot.mount);
+  const sourceLocalPath = snapshot.mount.localPath.trim() || "Not created yet";
+  const liveModeStatus = sourceSyncModeLabel(snapshot.liveMode, !mountMissing(snapshot));
+
   return (
     <div className="view-stack">
       <Breadcrumbs items={[{ label: PRODUCT_TERMS.home, onClick: onHome }, { label: PRODUCT_TERMS.settings }]} />
-      <ViewHeader title="Locality controls" />
+      <ViewHeader eyebrow={PRODUCT_TERMS.settings} title={activeSettingsSection.label}>
+        <StatusPill tone={healthTone(snapshot.health.state)} title={healthDescription(snapshot.health.state, snapshot.health.attentionCount)}>
+          {healthLabel(snapshot.health.state)}
+        </StatusPill>
+      </ViewHeader>
 
-      <section className="settings-grid">
-        <div className="panel">
-          <PanelTitle title="Startup" />
-          <ToggleRow
-            title="Launch Locality at login"
-            enabled={localSettings.launchAtLogin}
-            busy={busySetting === "launch_at_login"}
-            onToggle={(enabled) => void updateDesktopSetting("launch_at_login", enabled)}
-          />
-          <ToggleRow
-            title="Show Locality in the menu bar"
-            enabled={localSettings.showMenuBar}
-            busy={busySetting === "show_menu_bar"}
-            onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
-          />
-          <SettingRow title="Default Notion folder" value="~/Library/CloudStorage/Locality/notion" />
-          {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
-        </div>
+      <section className="settings-shell">
+        <nav className="settings-nav" aria-label="Settings sections">
+          {settingsSections.map((section) => (
+            <button
+              key={section.id}
+              className={settingsSection === section.id ? "active" : ""}
+              type="button"
+              onClick={() => setSettingsSection(section.id)}
+            >
+              <span>{section.label}</span>
+              <small>{section.description}</small>
+            </button>
+          ))}
+        </nav>
 
-        <div className="panel">
-          <PanelTitle title="Safety" />
-          <SettingRow title="Local edits" value="Review when needed" />
-          <SettingRow title="Push confirmation" value="Require for large changes" />
-          <SettingRow title="Default new source mode" value="Edit enabled" />
-        </div>
-
-        <div className="panel">
-          <PanelTitle title="Activity" />
-          <SettingRow title="Recent events" value={`${snapshot.activity.length} recorded`} />
-          <SettingRow title="Debug queue" value="Available from Activity" />
-          <SecondaryButton compact icon={<Clock3 />} onClick={onActivity}>
-            Open Activity Log
-          </SecondaryButton>
-        </div>
-
-        <div className="panel">
-          <PanelTitle title="Updates" />
-          <SettingRow title="Channel" value={updateChannelLabel} />
-          <SettingRow
-            title="Status"
-            value={updateStatusValue}
-          />
-          {updateStatus.version && <SettingRow title="Available version" value={updateStatus.version} />}
-          {!appStoreDistribution && (
-            <div className="button-row">
-              <SecondaryButton
-                compact
-                icon={checkingForUpdate ? <Loader2 className="spin-icon" /> : <RefreshCw />}
-                disabled={checkingForUpdate || updateAvailable}
-                onClick={() => void onCheckForUpdate()}
-              >
-                {checkingForUpdate ? "Checking" : "Check"}
-              </SecondaryButton>
-              <PrimaryButton
-                compact
-                icon={
-                  updateStatus.state === "downloading" || updateStatus.state === "installing"
-                    ? <Loader2 className="spin-icon" />
-                    : <Download />
-                }
-                disabled={!updateAvailable || installActionDisabled}
-                onClick={() => void onInstallUpdate()}
-              >
-                {updateInstallActionLabel(updateStatus)}
-              </PrimaryButton>
-            </div>
+        <div className="settings-content-panel">
+          {settingsSection === "general" && (
+            <section className="panel settings-section-panel">
+              <PanelTitle title="Desktop behavior" />
+              <ToggleRow
+                title="Launch Locality at login"
+                enabled={localSettings.launchAtLogin}
+                busy={busySetting === "launch_at_login"}
+                onToggle={(enabled) => void updateDesktopSetting("launch_at_login", enabled)}
+              />
+              <ToggleRow
+                title="Show Locality in the menu bar"
+                enabled={localSettings.showMenuBar}
+                busy={busySetting === "show_menu_bar"}
+                onToggle={(enabled) => void updateDesktopSetting("show_menu_bar", enabled)}
+              />
+              <SettingRow title="Default Notion folder" value="~/Library/CloudStorage/Locality/notion" />
+              {settingsMessage && <p className="quiet-note inline-note">{settingsMessage}</p>}
+            </section>
           )}
-        </div>
 
-        <div className="panel">
-          <PanelTitle title="Agent Instructions" />
-          <SettingRow title="Local agents" value="Claude, Codex, Warp, Cursor, Gemini, Cline/Roo" />
-          <SettingRow title="Notion guidance" value="Installed under /Locality/notion" />
-          <SecondaryButton
-            compact
-            icon={installingAgents ? <Loader2 className="spin-icon" /> : <Bot />}
-            disabled={installingAgents}
-            onClick={() => void installAgentInstructions()}
-          >
-            {installingAgents ? "Installing" : "Install Agent Skills"}
-          </SecondaryButton>
-          {agentMessage && <p className="quiet-note inline-note">{agentMessage}</p>}
-        </div>
-
-        <div className="panel">
-          <PanelTitle title="Diagnostics" />
-          <SettingRow title="Locality process" value={daemonStopped ? "Stopped" : "Running"} />
-          {snapshot.mount.provider && (
-            <SettingRow title="Provider" value={providerStatusLabel(snapshot.mount.provider)} />
+          {settingsSection === "sources" && (
+            <section className="panel settings-section-panel">
+              <PanelTitle title="Connected sources" />
+              <SettingRow title="Sources" value={`${activeSourceCount} registered`} />
+              <SettingRow title="Primary source" value={snapshot.mount.workspaceName} />
+              <SettingRow title="Connector" value={snapshot.mount.connectorName} />
+              <SettingRow title="Status" value={sourceStatus} />
+              <SettingRow title="Local folder" value={sourceLocalPath} />
+              <SettingRow title="Access" value={snapshot.mount.accessScope} />
+              <div className="button-row">
+                <PrimaryButton compact icon={<FolderOpen />} onClick={onSources}>
+                  Manage Sources
+                </PrimaryButton>
+                <SecondaryButton compact icon={<RefreshCw />} onClick={() => void onRefresh()}>
+                  Refresh
+                </SecondaryButton>
+              </div>
+            </section>
           )}
-          <SettingRow title="State folder" value="~/.loc" />
-          <SettingRow title="Projection" value={snapshot.mount.projection} />
-          <div className="button-row">
-            <SecondaryButton compact onClick={copyDiagnostics}>
-              Copy Summary
-            </SecondaryButton>
-            <SecondaryButton compact icon={<FolderOpen />} onClick={() => void openLogsFolder()}>
-              Open Logs
-            </SecondaryButton>
-            <SecondaryButton compact disabled={!runtimeNeedsRepair} onClick={() => void repairRuntime()}>
-              {runtimeNeedsRepair ? "Start Locality" : "Repair Locality"}
-            </SecondaryButton>
-          </div>
-          {diagnosticMessage && <p className="quiet-note inline-note">{diagnosticMessage}</p>}
-        </div>
 
-        <details className="danger-accordion settings-danger-accordion">
-          <summary>
-            <span>
-              <AlertTriangle />
-              Danger Zone
-            </span>
-            <small>Reset and uninstall tools</small>
-          </summary>
-          <div className="settings-danger-body">
-            <SettingRow title="Local database" value="~/.loc/state.sqlite3" />
-            <SettingRow title="Reset behavior" value="Preserve local files" />
-            <div className="button-row">
+          {settingsSection === "sync" && (
+            <section className="panel settings-section-panel">
+              <PanelTitle title="Sync and review policy" />
+              <SettingRow title="Live Mode" value={liveModeStatus} />
+              <SettingRow title="Local edits" value="Review when needed" />
+              <SettingRow title="Push confirmation" value="Required for large or risky changes" />
+              <SettingRow title="Remote drift" value="Pause and ask for review" />
+              <SettingRow title="Pending changes" value={`${snapshot.liveMode.pendingCount} tracked`} />
+              <SettingRow title="Needs review" value={`${snapshot.liveMode.reviewCount} item(s)`} />
+            </section>
+          )}
+
+          {settingsSection === "activity" && (
+            <section className="panel settings-section-panel">
+              <PanelTitle title="Activity" />
+              <SettingRow title="Recent events" value={`${snapshot.activity.length} recorded`} />
+              <SettingRow title="Debug queue" value="Available in Activity" />
+              <div className="settings-activity-list">
+                {recentActivity.length ? (
+                  recentActivity.map((item, index) => (
+                    <button
+                      key={`${item.title}-${item.when}-${index}`}
+                      className="settings-activity-row"
+                      type="button"
+                      onClick={onActivity}
+                    >
+                      <Clock3 />
+                      <span>
+                        <strong>{item.title}</strong>
+                        <small>{item.detail}</small>
+                      </span>
+                      <em>{item.when}</em>
+                    </button>
+                  ))
+                ) : (
+                  <div className="settings-empty-state">No activity recorded yet.</div>
+                )}
+              </div>
+              <SecondaryButton compact icon={<Clock3 />} onClick={onActivity}>
+                Open Activity Log
+              </SecondaryButton>
+            </section>
+          )}
+
+          {settingsSection === "agents" && (
+            <section className="panel settings-section-panel">
+              <PanelTitle title="Agent instructions" />
+              <SettingRow title="Local agents" value="Claude, Codex, Warp, Cursor, Gemini, Cline/Roo" />
+              <SettingRow title="Notion guidance" value="Installed under /Locality/notion" />
+              <SettingRow title="Behavior" value="Edit mounted Markdown directly, review when needed" />
               <SecondaryButton
                 compact
-                icon={resettingState ? <Loader2 className="spin-icon" /> : <RotateCcw />}
-                disabled={resettingState || preparingUninstall}
-                onClick={() => requestDestructiveAction("reset")}
+                icon={installingAgents ? <Loader2 className="spin-icon" /> : <Bot />}
+                disabled={installingAgents}
+                onClick={() => void installAgentInstructions()}
               >
-                {resettingState ? "Resetting" : "Reset Local State"}
+                {installingAgents ? "Installing" : "Install Agent Skills"}
               </SecondaryButton>
-              <SecondaryButton
-                compact
-                icon={preparingUninstall ? <Loader2 className="spin-icon" /> : <Trash2 />}
-                disabled={resettingState || preparingUninstall}
-                onClick={() => requestDestructiveAction("uninstall")}
-              >
-                {preparingUninstall ? "Preparing" : "Prepare for Uninstall"}
-              </SecondaryButton>
-            </div>
-            {resetMessage && <p className="quiet-note inline-note">{resetMessage}</p>}
-          </div>
-        </details>
+              {agentMessage && <p className="quiet-note inline-note">{agentMessage}</p>}
+            </section>
+          )}
 
-        <div className="panel">
-          <PanelTitle title="Quit Options" />
-          <button className="option-row" onClick={() => void callCommand("hide_menubar", undefined, { ok: true })}>
-            <EyeOff />
-            <span>Don't Show in Menubar</span>
-            <ChevronRight />
-          </button>
-          <button className="option-row danger" onClick={() => void callCommand("quit_completely", undefined, { ok: true })}>
-            <Power />
-            <span>Quit Completely</span>
-            <ChevronRight />
-          </button>
+          {settingsSection === "advanced" && (
+            <>
+              <section className="panel settings-section-panel">
+                <PanelTitle title="Diagnostics" />
+                <SettingRow title="Locality process" value={daemonStopped ? "Stopped" : "Running"} />
+                {snapshot.mount.provider && (
+                  <SettingRow title="Provider" value={providerStatusLabel(snapshot.mount.provider)} />
+                )}
+                <SettingRow title="State folder" value="~/.loc" />
+                <SettingRow title="Projection" value={snapshot.mount.projection} />
+                <div className="button-row">
+                  <SecondaryButton compact onClick={copyDiagnostics}>
+                    Copy Summary
+                  </SecondaryButton>
+                  <SecondaryButton compact icon={<FolderOpen />} onClick={() => void openLogsFolder()}>
+                    Open Logs
+                  </SecondaryButton>
+                  <SecondaryButton compact disabled={!runtimeNeedsRepair} onClick={() => void repairRuntime()}>
+                    {runtimeNeedsRepair ? "Start Locality" : "Repair Locality"}
+                  </SecondaryButton>
+                </div>
+                {diagnosticMessage && <p className="quiet-note inline-note">{diagnosticMessage}</p>}
+              </section>
+
+              <details className="danger-accordion settings-danger-accordion">
+                <summary>
+                  <span>
+                    <AlertTriangle />
+                    Danger Zone
+                  </span>
+                  <small>Reset and uninstall tools</small>
+                </summary>
+                <div className="settings-danger-body">
+                  <SettingRow title="Local database" value="~/.loc/state.sqlite3" />
+                  <SettingRow title="Reset behavior" value="Preserve local files" />
+                  <div className="button-row">
+                    <SecondaryButton
+                      compact
+                      icon={resettingState ? <Loader2 className="spin-icon" /> : <RotateCcw />}
+                      disabled={resettingState || preparingUninstall}
+                      onClick={() => requestDestructiveAction("reset")}
+                    >
+                      {resettingState ? "Resetting" : "Reset Local State"}
+                    </SecondaryButton>
+                    <SecondaryButton
+                      compact
+                      icon={preparingUninstall ? <Loader2 className="spin-icon" /> : <Trash2 />}
+                      disabled={resettingState || preparingUninstall}
+                      onClick={() => requestDestructiveAction("uninstall")}
+                    >
+                      {preparingUninstall ? "Preparing" : "Prepare for Uninstall"}
+                    </SecondaryButton>
+                  </div>
+                  {resetMessage && <p className="quiet-note inline-note">{resetMessage}</p>}
+                </div>
+              </details>
+
+              <section className="panel settings-section-panel">
+                <PanelTitle title="Quit options" />
+                <button className="option-row" onClick={() => void callCommand("hide_menubar", undefined, { ok: true })}>
+                  <EyeOff />
+                  <span>Don't Show in Menubar</span>
+                  <ChevronRight />
+                </button>
+                <button className="option-row danger" onClick={() => void callCommand("quit_completely", undefined, { ok: true })}>
+                  <Power />
+                  <span>Quit Completely</span>
+                  <ChevronRight />
+                </button>
+              </section>
+            </>
+          )}
+
+          {settingsSection === "about" && (
+            <section className="panel settings-section-panel">
+              <PanelTitle title="Updates" />
+              <SettingRow title="Channel" value={updateChannelLabel} />
+              <SettingRow title="Status" value={updateStatusValue} />
+              {updateStatus.version && <SettingRow title="Available version" value={updateStatus.version} />}
+              {!appStoreDistribution && (
+                <div className="button-row">
+                  <SecondaryButton
+                    compact
+                    icon={checkingForUpdate ? <Loader2 className="spin-icon" /> : <RefreshCw />}
+                    disabled={checkingForUpdate || updateAvailable}
+                    onClick={() => void onCheckForUpdate()}
+                  >
+                    {checkingForUpdate ? "Checking" : "Check"}
+                  </SecondaryButton>
+                  <PrimaryButton
+                    compact
+                    icon={
+                      updateStatus.state === "downloading" || updateStatus.state === "installing"
+                        ? <Loader2 className="spin-icon" />
+                        : <Download />
+                    }
+                    disabled={!updateAvailable || installActionDisabled}
+                    onClick={() => void onInstallUpdate()}
+                  >
+                    {updateInstallActionLabel(updateStatus)}
+                  </PrimaryButton>
+                </div>
+              )}
+            </section>
+          )}
         </div>
       </section>
       {destructiveAction && (
