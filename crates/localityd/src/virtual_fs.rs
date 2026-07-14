@@ -2688,7 +2688,8 @@ fn child_container_for_identifier(
     Ok(match entity.kind {
         EntityKind::Page => Some(ChildContainer::PageChildren(remote_id)),
         EntityKind::Database => Some(ChildContainer::DatabaseRows(remote_id)),
-        EntityKind::Directory | EntityKind::Asset | EntityKind::Unknown(_) => None,
+        EntityKind::Directory => Some(ChildContainer::DirectoryChildren(remote_id)),
+        EntityKind::Asset | EntityKind::Unknown(_) => None,
     })
 }
 
@@ -3027,6 +3028,45 @@ mod tests {
             super::entity_identifier("mount:notion-main"),
             Err(LocalityError::InvalidState(_))
         ));
+    }
+
+    #[test]
+    fn directory_entities_refresh_with_directory_child_container() {
+        let mount_id = MountId::new("gmail-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount_with_connector(&mount_id, "gmail"))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("gmail-folder:inbox"),
+                kind: EntityKind::Directory,
+                title: "inbox".to_string(),
+                path: "inbox".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: Some("folder:inbox".to_string()),
+            })
+            .expect("save inbox");
+
+        let entities = store.list_entities(&mount_id).expect("entities");
+        let container = super::child_container_for_identifier(
+            &store
+                .get_mount(&mount_id)
+                .expect("mount load")
+                .expect("mount"),
+            &entities,
+            "gmail-folder:inbox",
+        )
+        .expect("child container");
+
+        assert_eq!(
+            container,
+            Some(locality_connector::ChildContainer::DirectoryChildren(
+                RemoteId::new("gmail-folder:inbox")
+            ))
+        );
     }
 
     #[test]
@@ -4945,6 +4985,15 @@ mod tests {
     fn virtual_mount(mount_id: &MountId) -> MountConfig {
         MountConfig::new(mount_id.clone(), "notion", "/tmp/loc/notion")
             .projection(ProjectionMode::LinuxFuse)
+    }
+
+    fn virtual_mount_with_connector(mount_id: &MountId, connector: &str) -> MountConfig {
+        MountConfig::new(
+            mount_id.clone(),
+            connector,
+            format!("/tmp/Locality/{}", mount_id.0),
+        )
+        .projection(ProjectionMode::LinuxFuse)
     }
 
     fn temp_root(prefix: &str) -> PathBuf {

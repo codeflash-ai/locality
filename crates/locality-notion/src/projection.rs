@@ -123,6 +123,9 @@ pub fn list_container_children(
             let database = api.retrieve_database(database_id.as_str())?;
             list_database_rows(api, &mount_id, &database, parent_path)
         }
+        ChildContainer::DirectoryChildren(_) => Err(LocalityError::Unsupported(
+            "listing directory children with the Notion connector",
+        )),
     }
 }
 
