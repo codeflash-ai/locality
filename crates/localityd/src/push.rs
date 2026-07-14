@@ -2583,6 +2583,7 @@ where
             match effect {
                 JournalApplyEffect::CreatedEntity {
                     operation_index,
+                    parent_id,
                     entity_id,
                     ..
                 } => {
@@ -2595,7 +2596,13 @@ where
                     else {
                         continue;
                     };
-                    let entity_path = created_entity_reconcile_path(source_path, parent_kind);
+                    let entity_path = created_entity_reconcile_path(
+                        self.store,
+                        request.mount_id,
+                        source_path,
+                        parent_kind,
+                        parent_id,
+                    )?;
                     let mut entity = EntityRecord::new(
                         request.mount_id.clone(),
                         entity_id.clone(),
@@ -2738,12 +2745,31 @@ where
     }
 }
 
-fn created_entity_reconcile_path(source_path: &Path, parent_kind: &Option<EntityKind>) -> PathBuf {
+fn created_entity_reconcile_path<S>(
+    store: &S,
+    mount_id: &MountId,
+    source_path: &Path,
+    parent_kind: &Option<EntityKind>,
+    parent_id: &RemoteId,
+) -> LocalityResult<PathBuf>
+where
+    S: EntityRepository,
+{
     if matches!(parent_kind, Some(EntityKind::Database)) && !is_page_document_path(source_path) {
-        return page_document_path(&page_container_path(source_path));
+        return Ok(page_document_path(&page_container_path(source_path)));
     }
 
-    source_path.to_path_buf()
+    if matches!(parent_kind, Some(EntityKind::Directory))
+        && let Some(parent) = store
+            .get_entity(mount_id, parent_id)
+            .map_err(LocalityError::from)?
+        && parent.kind == EntityKind::Directory
+        && let Some(filename) = source_path.file_name()
+    {
+        return Ok(parent.path.join(filename));
+    }
+
+    Ok(source_path.to_path_buf())
 }
 
 fn remove_stale_created_entity_source_path(

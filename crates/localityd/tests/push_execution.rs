@@ -825,6 +825,109 @@ fn daemon_push_reconciles_direct_database_row_create_to_page_document_path() {
 }
 
 #[test]
+fn daemon_push_reconciles_sent_gmail_draft_create_to_sent_folder() {
+    let fixture = PushFixture::new();
+    let state_root = fixture.root.join(".state");
+    let source_path = Path::new("draft/reply.md");
+    let content_root = virtual_fs_content_root(&state_root, &fixture.mount_id);
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, source_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("cache parent");
+    fs::write(
+        &cache_path,
+        "---\ntitle: Reply\nto: [\"user@example.com\"]\nsubject: Reply\n---\nBody.\n",
+    )
+    .expect("cache file");
+
+    let draft_folder_id = RemoteId::new("gmail-folder:draft");
+    let sent_folder_id = RemoteId::new("gmail-folder:sent");
+    let created_remote_id = RemoteId::new("gmail-message:sent-1");
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "gmail", &fixture.root)
+                .projection(ProjectionMode::LinuxFuse),
+        )
+        .expect("save mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            draft_folder_id.clone(),
+            EntityKind::Directory,
+            "draft",
+            "draft",
+        ))
+        .expect("save draft folder");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            sent_folder_id.clone(),
+            EntityKind::Directory,
+            "sent",
+            "sent",
+        ))
+        .expect("save sent folder");
+    store
+        .save_virtual_mutation(virtual_mutation(
+            &fixture.mount_id,
+            "local:gmail-draft",
+            VirtualMutationKind::Create,
+            None,
+            Some(draft_folder_id),
+            "draft/reply.md",
+            Some(cache_path),
+        ))
+        .expect("save mutation");
+    store
+        .save_auto_save_enrollment(AutoSaveEnrollmentRecord::new(
+            fixture.mount_id.clone(),
+            source_path,
+            AutoSaveOrigin::LocalityCreated,
+            "now",
+        ))
+        .expect("save enrollment");
+    let source = FakePushSource::default()
+        .with_created_entity(
+            created_remote_id.clone(),
+            rendered_entity("gmail-message:sent-1", "Body."),
+        )
+        .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+            operation_id: PushOperationId("create-gmail-draft".to_string()),
+            operation_index: 0,
+            parent_id: sent_folder_id,
+            entity_id: created_remote_id.clone(),
+        }]);
+
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        PushJob {
+            target_path: fixture.root.join(source_path),
+            assume_yes: false,
+            confirm_dangerous: false,
+        },
+        &source,
+        Some(&state_root),
+    )
+    .expect("push gmail draft");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    let message = store
+        .get_entity(&fixture.mount_id, &created_remote_id)
+        .expect("get sent message")
+        .expect("sent message entity");
+    assert_eq!(message.path, PathBuf::from("sent/reply.md"));
+    assert_eq!(source.requested_paths(), vec![message.path.clone()]);
+    assert!(content_root.join("sent/reply.md").exists());
+    assert!(!content_root.join(source_path).exists());
+    assert!(
+        store
+            .find_virtual_mutation_by_path(&fixture.mount_id, source_path)
+            .expect("find mutation")
+            .is_none()
+    );
+}
+
+#[test]
 fn daemon_push_job_plans_pending_virtual_delete_from_scope() {
     let fixture = PushFixture::new();
     let mut store = InMemoryStateStore::new();
