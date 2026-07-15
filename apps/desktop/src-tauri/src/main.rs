@@ -165,6 +165,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const VIRTUAL_PROJECTION_SOURCE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const VIRTUAL_PROJECTION_SOURCE_READY_POLL: Duration = Duration::from_millis(250);
 const VIRTUAL_PROJECTION_SOURCE_READY_LOG_EVERY: Duration = Duration::from_secs(2);
+#[cfg(target_os = "macos")]
+const MACOS_FILE_PROVIDER_MOUNT_ROOT_APPEAR_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const MACOS_FILE_PROVIDER_MOUNT_ROOT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_MODE_RUNNER_ACTIVE_INTERVAL: Duration = Duration::from_millis(500);
 const LIVE_MODE_RUNNER_IDLE_RECHECK: Duration = Duration::from_secs(5 * 60);
 const LIVE_MODE_RUNNER_PERIODIC_RECHECK: Duration = LIVE_MODE_ACTIVE_REMOTE_CHECK_INTERVAL;
@@ -1323,14 +1327,17 @@ fn connect_granola_blocking(api_key: String) -> Result<String, String> {
         &HttpGranolaConnectionProbe,
     )
     .map_err(|error| error.message())?;
-    let mount_exists = store
+    let existing_mount = store
         .get_mount(&MountId::new("granola-main"))
         .map_err(|error| format!("Could not inspect Granola mount: {error}"))?
-        .is_some_and(|mount| mount.connector == "granola");
+        .filter(|mount| mount.connector == "granola");
     drop(store);
-    if mount_exists {
+    if let Some(mount) = existing_mount {
         ensure_daemon_running(&state_root)?;
         reload_daemon_mounts(&state_root)?;
+        if mount.projection.uses_virtual_filesystem() {
+            activate_virtual_projection_mount(&state_root, &mount, true)?;
+        }
         return Ok("Reconnected the existing Granola source.".to_string());
     }
 
@@ -7886,13 +7893,28 @@ fn recover_macos_file_provider_mount_root_if_needed(
     let expected_child_count =
         expected_virtual_projection_mount_point_child_count(state_root, mount)?;
     let root = mount_access_root(mount);
-    let details = evaluate_macos_file_provider_mount_root(&root)?;
-
-    let Some(reason) =
-        macos_file_provider_mount_root_recovery_reason(&root, &details, Some(expected_child_count))
-    else {
+    let inspection = evaluate_macos_file_provider_mount_root(&root);
+    let Some(mut reason) = macos_file_provider_mount_root_inspection_recovery_reason(
+        &root,
+        inspection
+            .as_ref()
+            .map(String::as_str)
+            .map_err(String::as_str),
+        Some(expected_child_count),
+    ) else {
         return Ok(());
     };
+
+    if inspection.is_err() && macos_file_provider_mount_root_is_missing(&reason) {
+        match wait_for_macos_file_provider_mount_root_recovery(
+            &root,
+            expected_child_count,
+            MACOS_FILE_PROVIDER_MOUNT_ROOT_APPEAR_TIMEOUT,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(latest_reason) => reason = latest_reason,
+        }
+    }
 
     desktop_log(
         "warn",
@@ -7916,7 +7938,11 @@ fn recover_macos_file_provider_mount_root_if_needed(
     ensure_virtual_projection_runtime(state_root, mount)?;
     signal_virtual_projection_refresh(mount);
 
-    wait_for_macos_file_provider_mount_root_recovery(&root, expected_child_count)?;
+    wait_for_macos_file_provider_mount_root_recovery(
+        &root,
+        expected_child_count,
+        MACOS_FILE_PROVIDER_MOUNT_ROOT_RECOVERY_TIMEOUT,
+    )?;
 
     desktop_log(
         "info",
@@ -7933,8 +7959,9 @@ fn recover_macos_file_provider_mount_root_if_needed(
 fn wait_for_macos_file_provider_mount_root_recovery(
     root: &Path,
     expected_child_count: usize,
+    timeout: Duration,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + timeout;
 
     loop {
         let reason = match evaluate_macos_file_provider_mount_root(root) {
@@ -7957,6 +7984,23 @@ fn wait_for_macos_file_provider_mount_root_recovery(
         }
         std::thread::sleep(VIRTUAL_PROJECTION_SOURCE_READY_POLL);
     }
+}
+
+fn macos_file_provider_mount_root_inspection_recovery_reason(
+    root: &Path,
+    inspection: Result<&str, &str>,
+    expected_child_count: Option<usize>,
+) -> Option<String> {
+    match inspection {
+        Ok(details) => {
+            macos_file_provider_mount_root_recovery_reason(root, details, expected_child_count)
+        }
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+fn macos_file_provider_mount_root_is_missing(message: &str) -> bool {
+    message.contains("NSPOSIXErrorDomain Code=2") || message.contains("Couldn't find a file")
 }
 
 #[cfg(target_os = "macos")]
@@ -10752,20 +10796,22 @@ mod tests {
         live_mode_tick_from_snapshot, live_mode_wake_generation, load_desktop_activity,
         macos_app_bundle_for_exe, macos_file_provider_child_item_count,
         macos_file_provider_mount_root_health_error,
-        macos_file_provider_mount_root_recovery_reason, mark_mount_live_mode_syncing,
-        mount_has_pending_local_changes, mount_has_unfinished_journals, notion_id_from_url,
-        parse_daemon_build_info_json, pending_changes_from_status,
-        prepare_existing_workspace_mount_for_remount, preserve_mount_pending_local_changes,
-        pull_error_message, pull_report_message, push_action_message,
-        record_current_install_marker, record_desktop_activity, record_mount_live_mode_tick_result,
-        refresh_mount_root_after_access_change, refresh_visible_target_from_cache,
-        reset_to_remote_message, sample_live_mode_status, sample_snapshot,
-        screen_bounds_for_anchor_from_monitors, shell_single_quote, should_hide_tray_popover,
-        should_prioritize_located_result, state_event_path_requires_refresh,
-        state_event_path_wakes_live_mode, summarize_virtual_projection_children,
-        terminal_cli_link_state, tray_icon_image, tray_icon_should_use_template,
-        tray_popover_anchor, tray_popover_position, unsupported_notion_locator_url_message,
-        validate_mount_root, virtual_projection_prefetch_container_identifiers,
+        macos_file_provider_mount_root_inspection_recovery_reason,
+        macos_file_provider_mount_root_is_missing, macos_file_provider_mount_root_recovery_reason,
+        mark_mount_live_mode_syncing, mount_has_pending_local_changes,
+        mount_has_unfinished_journals, notion_id_from_url, parse_daemon_build_info_json,
+        pending_changes_from_status, prepare_existing_workspace_mount_for_remount,
+        preserve_mount_pending_local_changes, pull_error_message, pull_report_message,
+        push_action_message, record_current_install_marker, record_desktop_activity,
+        record_mount_live_mode_tick_result, refresh_mount_root_after_access_change,
+        refresh_visible_target_from_cache, reset_to_remote_message, sample_live_mode_status,
+        sample_snapshot, screen_bounds_for_anchor_from_monitors, shell_single_quote,
+        should_hide_tray_popover, should_prioritize_located_result,
+        state_event_path_requires_refresh, state_event_path_wakes_live_mode,
+        summarize_virtual_projection_children, terminal_cli_link_state, tray_icon_image,
+        tray_icon_should_use_template, tray_popover_anchor, tray_popover_position,
+        unsupported_notion_locator_url_message, validate_mount_root,
+        virtual_projection_prefetch_container_identifiers,
         virtual_projection_refresh_signal_identifiers,
         virtual_projection_waits_for_mount_point_children_before_registration,
         wait_for_live_mode_state_change, wake_live_mode_runner, write_terminal_cli_path_section,
@@ -13286,6 +13332,42 @@ mod tests {
                 Path::new("/tmp/Locality/notion"),
                 details,
                 Some(11),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_missing_mount_root_triggers_recovery() {
+        let error = r#"Could not inspect macOS File Provider mount root `/tmp/Locality/granola`: Error Domain=NSPOSIXErrorDomain Code=2 "Couldn't find a file for /tmp/Locality/granola""#;
+
+        assert!(macos_file_provider_mount_root_is_missing(error));
+        assert_eq!(
+            macos_file_provider_mount_root_inspection_recovery_reason(
+                Path::new("/tmp/Locality/granola"),
+                Err(error),
+                Some(705),
+            ),
+            Some(error.to_string())
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_mount_root_inspection_accepts_healthy_item() {
+        let details = r#"
+            fileproviderItems = (
+              {
+                childItemCount = 705;
+                displayName = granola;
+              }
+            );
+        "#;
+
+        assert_eq!(
+            macos_file_provider_mount_root_inspection_recovery_reason(
+                Path::new("/tmp/Locality/granola"),
+                Ok(details),
+                Some(705),
             ),
             None
         );
