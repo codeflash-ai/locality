@@ -1772,7 +1772,21 @@ async fn activate_macos_file_provider_for_user_action(
             )?;
         }
 
+        let open_after_add = action == WorkspaceMountOnboardingAction::AllowInMacos;
         let activation = tauri::async_runtime::spawn_blocking(move || {
+            if open_after_add {
+                return macos_file_provider::register_domain_and_wait_opening_after_add(
+                    &app,
+                    localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+                    localityd::file_provider::MACOS_FILE_PROVIDER_DISPLAY_NAME,
+                    || {
+                        open_in_file_manager(&macos_file_provider_approval_root(
+                            localityd::file_provider::MACOS_FILE_PROVIDER_DISPLAY_NAME,
+                        ))
+                    },
+                );
+            }
+
             macos_file_provider::register_domain_and_wait(
                 &app,
                 localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
@@ -6205,6 +6219,46 @@ fn macos_cloud_storage_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("Library")
         .join("CloudStorage")
+}
+
+fn macos_file_provider_directory_name(display_name: &str) -> String {
+    if display_name.is_empty() {
+        return "Locality".to_string();
+    }
+    if display_name == "Locality" || display_name.starts_with("Locality-") {
+        return display_name.to_string();
+    }
+    format!("Locality-{display_name}")
+}
+
+fn macos_file_provider_compatibility_directory_name(display_name: &str) -> Option<String> {
+    if display_name.is_empty() {
+        return None;
+    }
+    Some(format!("Locality-{display_name}"))
+}
+
+fn macos_file_provider_approval_root_in(cloud_storage: &Path, display_name: &str) -> PathBuf {
+    let primary = cloud_storage.join(macos_file_provider_directory_name(display_name));
+    if primary.exists() {
+        return primary;
+    }
+
+    if let Some(compatibility) = macos_file_provider_compatibility_directory_name(display_name)
+        .map(|directory_name| cloud_storage.join(directory_name))
+        .filter(|candidate| candidate != &primary)
+    {
+        if compatibility.exists() {
+            return compatibility;
+        }
+    }
+
+    primary
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_approval_root(display_name: &str) -> PathBuf {
+    macos_file_provider_approval_root_in(&macos_cloud_storage_dir(), display_name)
 }
 
 #[cfg(target_os = "macos")]
@@ -13620,6 +13674,35 @@ mod tests {
                 super::MacosWorkspaceMountOnboardingState::Created
             ),
             None
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_directory_name_matches_helper_policy() {
+        assert_eq!(super::macos_file_provider_directory_name(""), "Locality");
+        assert_eq!(
+            super::macos_file_provider_directory_name("Locality"),
+            "Locality"
+        );
+        assert_eq!(
+            super::macos_file_provider_directory_name("Locality-Team"),
+            "Locality-Team"
+        );
+        assert_eq!(
+            super::macos_file_provider_directory_name("Team"),
+            "Locality-Team"
+        );
+    }
+
+    #[test]
+    fn macos_file_provider_approval_root_prefers_existing_compatibility_root() {
+        let temp = TestTempDir::new("file-provider-approval-root");
+        let compatibility_root = temp.path().join("Locality-Locality");
+        fs::create_dir_all(&compatibility_root).expect("create compatibility root");
+
+        assert_eq!(
+            super::macos_file_provider_approval_root_in(temp.path(), "Locality"),
+            compatibility_root
         );
     }
 

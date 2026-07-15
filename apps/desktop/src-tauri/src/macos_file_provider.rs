@@ -34,11 +34,24 @@ pub(crate) fn register_domain_and_wait(
     identifier: &str,
     display_name: &str,
 ) -> Result<DomainActivation, String> {
-    register_domain_and_wait_with(
+    register_domain_and_wait_opening_after_add(app, identifier, display_name, || Ok(()))
+}
+
+pub(crate) fn register_domain_and_wait_opening_after_add<OpenAfterAdd>(
+    app: &tauri::AppHandle,
+    identifier: &str,
+    display_name: &str,
+    open_after_add: OpenAfterAdd,
+) -> Result<DomainActivation, String>
+where
+    OpenAfterAdd: FnMut() -> Result<(), String>,
+{
+    register_domain_and_wait_with_open_after_add(
         |sender| schedule_domain_add(app, identifier, display_name, sender),
         ADD_CALLBACK_TIMEOUT,
         DOMAIN_POLL_TIMEOUT,
         DOMAIN_POLL_INTERVAL,
+        open_after_add,
         |remaining| query_domain_state(identifier, remaining.min(DOMAIN_QUERY_TIMEOUT)),
         std::thread::sleep,
         {
@@ -77,17 +90,47 @@ where
     }
 }
 
+#[cfg(test)]
 fn register_domain_and_wait_with<Schedule, Query, Sleep, Now>(
     schedule_add: Schedule,
     callback_timeout: Duration,
     poll_timeout: Duration,
     poll_interval: Duration,
+    query: Query,
+    sleep: Sleep,
+    now: Now,
+) -> Result<DomainActivation, String>
+where
+    Schedule: FnOnce(SyncSender<Result<(), String>>) -> Result<(), String>,
+    Query: FnMut(Duration) -> Result<Option<DomainState>, String>,
+    Sleep: FnMut(Duration),
+    Now: FnMut() -> Duration,
+{
+    register_domain_and_wait_with_open_after_add(
+        schedule_add,
+        callback_timeout,
+        poll_timeout,
+        poll_interval,
+        || Ok(()),
+        query,
+        sleep,
+        now,
+    )
+}
+
+fn register_domain_and_wait_with_open_after_add<Schedule, OpenAfterAdd, Query, Sleep, Now>(
+    schedule_add: Schedule,
+    callback_timeout: Duration,
+    poll_timeout: Duration,
+    poll_interval: Duration,
+    mut open_after_add: OpenAfterAdd,
     mut query: Query,
     mut sleep: Sleep,
     mut now: Now,
 ) -> Result<DomainActivation, String>
 where
     Schedule: FnOnce(SyncSender<Result<(), String>>) -> Result<(), String>,
+    OpenAfterAdd: FnMut() -> Result<(), String>,
     Query: FnMut(Duration) -> Result<Option<DomainState>, String>,
     Sleep: FnMut(Duration),
     Now: FnMut() -> Duration,
@@ -109,6 +152,8 @@ where
             );
         }
     }
+
+    open_after_add()?;
 
     let poll_started = now();
     loop {
@@ -365,6 +410,46 @@ mod tests {
 
         assert_eq!(result, Ok(DomainActivation::Enabled));
         assert_eq!(sleeps.into_inner(), vec![Duration::from_millis(1); 2]);
+    }
+
+    #[test]
+    fn approval_retry_opens_domain_after_registration_before_polling() {
+        let clock = Cell::new(Duration::ZERO);
+        let opened = Cell::new(false);
+        let query_saw_open = Cell::new(false);
+        let states = RefCell::new(VecDeque::from([
+            Some(DomainState {
+                user_enabled: false,
+                disconnected: false,
+                hidden: false,
+            }),
+            Some(DomainState {
+                user_enabled: true,
+                disconnected: false,
+                hidden: false,
+            }),
+        ]));
+
+        let result = register_domain_and_wait_with_open_after_add(
+            successful_add,
+            Duration::from_millis(10),
+            Duration::from_millis(3),
+            Duration::from_millis(1),
+            || {
+                opened.set(true);
+                Ok(())
+            },
+            |_| {
+                query_saw_open.set(opened.get());
+                Ok(states.borrow_mut().pop_front().expect("poll state"))
+            },
+            |duration| clock.set(clock.get() + duration),
+            || clock.get(),
+        );
+
+        assert_eq!(result, Ok(DomainActivation::Enabled));
+        assert!(opened.get());
+        assert!(query_saw_open.get());
     }
 
     #[test]
