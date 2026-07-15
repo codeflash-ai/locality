@@ -19,7 +19,7 @@ use locality_core::path_projection::{
 };
 use locality_gmail::{
     DEFAULT_GMAIL_OAUTH_BROKER_URL, DEFAULT_GMAIL_OAUTH_REDIRECT_URI, GMAIL_CONNECTOR_ID,
-    HttpGmailOAuthBrokerClient,
+    GmailMountSettings, GmailProjectionView, HttpGmailOAuthBrokerClient,
 };
 use locality_google_docs::{
     DEFAULT_GOOGLE_DOCS_OAUTH_BROKER_URL, DEFAULT_GOOGLE_DOCS_OAUTH_REDIRECT_URI,
@@ -476,6 +476,24 @@ struct MountGmailArgs {
         help = "Register the mount as read-only and block push operations."
     )]
     read_only: bool,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Fetch Gmail messages on or after this date. Must be paired with --before."
+    )]
+    after: Option<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Fetch Gmail messages before this date. Must be paired with --after."
+    )]
+    before: Option<String>,
+    #[arg(
+        long,
+        value_name = "messages|threads",
+        help = "Gmail projection view. Defaults to messages."
+    )]
+    view: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1009,6 +1027,9 @@ fn legacy_args_for_command(command: &LocalityCommand) -> Vec<String> {
                         "--projection",
                         options.projection.as_deref(),
                     );
+                    push_optional_flag_value(&mut args, "--after", options.after.as_deref());
+                    push_optional_flag_value(&mut args, "--before", options.before.as_deref());
+                    push_optional_flag_value(&mut args, "--view", options.view.as_deref());
                     push_flag(&mut args, "--read-only", options.read_only);
                 }
             }
@@ -2466,6 +2487,14 @@ fn mount(args: &[String], json: bool) -> i32 {
             Err(error) => return command_error(json, error, EXIT_INTERNAL),
         };
     }
+    let settings_json = if descriptor.id() == GMAIL_CONNECTOR_ID {
+        match gmail_mount_settings_json(args) {
+            Ok(settings_json) => settings_json,
+            Err(error) => return command_error(json, error, EXIT_USAGE),
+        }
+    } else {
+        "{}".to_string()
+    };
 
     let options = MountOptions {
         mount_id,
@@ -2475,6 +2504,7 @@ fn mount(args: &[String], json: bool) -> i32 {
         connection_id,
         read_only,
         projection,
+        settings_json,
     };
     let mount_id = options.mount_id.clone();
 
@@ -2493,6 +2523,36 @@ fn mount(args: &[String], json: bool) -> i32 {
         }
         Err(error) => mount_command_error(json, error),
     }
+}
+
+fn gmail_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
+    let after = flag_value(args, "--after");
+    let before = flag_value(args, "--before");
+    let view = flag_value(args, "--view")
+        .map(GmailProjectionView::parse)
+        .transpose()
+        .map_err(|error| CommandError::new("mount", "gmail_view_invalid", error.to_string()))?
+        .unwrap_or(GmailProjectionView::Messages);
+
+    let settings = match (after, before) {
+        (None, None) => GmailMountSettings::default().with_view(view),
+        (Some(after), Some(before)) => GmailMountSettings::with_date_window(after, before)
+            .map_err(|error| {
+                CommandError::new("mount", "gmail_date_window_invalid", error.to_string())
+            })?
+            .with_view(view),
+        _ => {
+            return Err(CommandError::new(
+                "mount",
+                "gmail_date_window_requires_after_and_before",
+                "Gmail date windows require both --after and --before",
+            ));
+        }
+    };
+
+    settings.to_json().map_err(|error| {
+        CommandError::new("mount", "gmail_settings_encode_failed", error.to_string())
+    })
 }
 
 fn mount_remote_root_id(
@@ -5024,6 +5084,9 @@ fn print_mount_report(report: &MountReport) {
     );
     if let Some(connection_id) = &report.connection_id {
         println!("connection: {connection_id}");
+    }
+    if report.settings_json != "{}" {
+        println!("settings: {}", report.settings_json);
     }
     println!(
         "agent guidance: {} {}, {} {}",

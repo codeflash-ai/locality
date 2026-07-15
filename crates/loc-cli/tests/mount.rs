@@ -130,6 +130,7 @@ fn macos_file_provider_mount_keeps_source_root_virtual() {
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::MacosFileProvider,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -170,6 +171,7 @@ fn linux_fuse_mount_keeps_mount_point_virtual() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -213,6 +215,7 @@ fn virtual_mount_rejects_direct_home_child_mount_point() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
         },
     )
     .expect_err("unsafe virtual parent rejected");
@@ -240,6 +243,7 @@ fn mount_persists_connection_id() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -270,6 +274,7 @@ fn mount_can_persist_workspace_root() {
             connection_id: Some(ConnectionId::new("work")),
             read_only: false,
             projection: ProjectionMode::MacosFileProvider,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -301,6 +306,7 @@ fn mount_can_persist_google_docs_workspace_folder() {
             connection_id: Some(ConnectionId::new("google-docs-default")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount");
@@ -332,6 +338,7 @@ fn mount_options_preserve_google_docs_workspace_folder_id_from_resolver() {
             connection_id: Some(ConnectionId::new("google-docs-default")),
             read_only: false,
             projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount google docs");
@@ -500,6 +507,88 @@ fn cli_mount_gmail_persists_requested_registration() {
 }
 
 #[test]
+fn cli_mount_gmail_persists_date_window_and_thread_view() {
+    let fixture = MountFixture::new("loc-cli-gmail-mount-settings");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_gmail_connection(&state_root, "gmail-work");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("gmail");
+    let mount_root_arg = mount_root.display().to_string();
+
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "gmail",
+        mount_root_arg.as_str(),
+        "--connection",
+        "gmail-work",
+        "--mount-id",
+        "gmail-main",
+        "--projection",
+        "plain-files",
+        "--after",
+        "2026-07-01",
+        "--before",
+        "2026-07-15",
+        "--view",
+        "threads",
+        "--json",
+    ]));
+
+    assert_eq!(report["connector"], "gmail", "{report:#?}");
+    assert_eq!(
+        report["settings_json"],
+        r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#,
+        "{report:#?}"
+    );
+
+    let store = SqliteStateStore::open(state_root).expect("open state");
+    let mount = store
+        .get_mount(&MountId::new("gmail-main"))
+        .expect("load mount")
+        .expect("mount exists");
+    assert_eq!(
+        mount.settings_json,
+        r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#
+    );
+}
+
+#[test]
+fn cli_mount_gmail_rejects_partial_date_window() {
+    for args in [
+        vec!["--after", "2026-07-01"],
+        vec!["--before", "2026-07-15"],
+    ] {
+        let fixture = MountFixture::new("loc-cli-gmail-partial-date-window");
+        fs::create_dir_all(&fixture.root).expect("create fixture root");
+        let state_root = fixture.root.join("state");
+        seed_cli_gmail_connection(&state_root, "gmail-work");
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("gmail");
+        let mount_root_arg = mount_root.display().to_string();
+        let mut command = loc_command(loc, &state_root);
+        command.args([
+            "mount",
+            "gmail",
+            mount_root_arg.as_str(),
+            "--connection",
+            "gmail-work",
+            "--projection",
+            "plain-files",
+            "--json",
+        ]);
+        command.args(args);
+
+        let output = command.output().expect("run loc mount gmail");
+        assert!(!output.status.success());
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("json error response");
+        assert_eq!(body["code"], "gmail_date_window_requires_after_and_before");
+    }
+}
+
+#[test]
 fn cli_mount_gmail_rejects_remote_root_selectors() {
     let cases: &[&[&str]] = &[
         &["--workspace"],
@@ -564,6 +653,7 @@ fn virtual_mount_rejects_duplicate_mount_point_under_same_root() {
             connection_id: Some(ConnectionId::new("work-a")),
             read_only: false,
             projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("first mount");
@@ -578,6 +668,7 @@ fn virtual_mount_rejects_duplicate_mount_point_under_same_root() {
             connection_id: Some(ConnectionId::new("work-b")),
             read_only: false,
             projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
         },
     )
     .expect_err("duplicate mount point rejected");
@@ -627,6 +718,7 @@ impl MountFixture {
                 connection_id: None,
                 read_only: false,
                 projection: ProjectionMode::PlainFiles,
+                settings_json: "{}".to_string(),
             },
         )
         .expect("mount")

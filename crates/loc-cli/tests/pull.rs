@@ -823,6 +823,7 @@ fn pull_workspace_virtual_mount_root_lists_immediate_children_without_recursive_
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::LinuxFuse,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount workspace");
@@ -1997,6 +1998,7 @@ impl PullFixture {
                 connection_id: None,
                 read_only: false,
                 projection,
+                settings_json: "{}".to_string(),
             },
         )
         .expect("mount");
