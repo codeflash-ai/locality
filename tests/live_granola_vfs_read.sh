@@ -154,6 +154,10 @@ if value is not True:
 PY
 }
 
+state_query() {
+  sqlite3 -cmd '.timeout 10000' "$state_root/state.sqlite3" "$1"
+}
+
 validate_mounted_documents() {
   python3 - "$summary_copy" "$transcript_copy" <<'PY'
 import json
@@ -245,10 +249,8 @@ wait_for_fuse
 step="enumerating live Granola meetings through the mounted filesystem"
 meeting_count="0"
 for _ in {1..120}; do
-  find "$granola_mount" -mindepth 1 -maxdepth 1 -type d -print0 \
-    >/dev/null 2>>"$command_log" || true
-  meeting_count="$(sqlite3 "$state_root/state.sqlite3" \
-    "SELECT count(*) FROM entities WHERE mount_id = '$mount_id' AND kind_json = '\"directory\"';")"
+  meeting_count="$(find "$granola_mount" -mindepth 1 -maxdepth 1 -type d -printf '.' \
+    2>>"$command_log" | wc -c)"
   if [[ "$meeting_count" =~ ^[0-9]+$ ]] && (( meeting_count > 0 )); then
     break
   fi
@@ -258,7 +260,7 @@ if [[ ! "$meeting_count" =~ ^[0-9]+$ ]] || (( meeting_count < 1 )); then
   echo "live Granola enumeration produced no meeting directories" >&2
   exit 1
 fi
-checkpoint_count="$(sqlite3 "$state_root/state.sqlite3" \
+checkpoint_count="$(state_query \
   "SELECT count(*) FROM connector_state WHERE connector = 'granola' AND scope_kind = 'mount' AND scope_id = '$mount_id';")"
 if [[ "$checkpoint_count" != "1" ]]; then
   echo "mounted Granola discovery did not record its incremental checkpoint" >&2
@@ -269,7 +271,7 @@ step="running an explicit incremental Granola pull"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull "$granola_mount" --json \
   >"$first_pull_report" 2>>"$command_log"
 assert_json_true "$first_pull_report" ok
-entity_count_before="$(sqlite3 "$state_root/state.sqlite3" \
+entity_count_before="$(state_query \
   "SELECT count(*) FROM entities WHERE mount_id = '$mount_id';")"
 
 step="hydrating one retained transcript through the mounted filesystem"
@@ -279,7 +281,7 @@ if [[ -n "$live_note_id" ]]; then
     echo "LOCALITY_GRANOLA_LIVE_NOTE_ID has an invalid shape" >&2
     exit 1
   fi
-  selected_relative_path="$(sqlite3 "$state_root/state.sqlite3" \
+  selected_relative_path="$(state_query \
     "SELECT path FROM entities WHERE mount_id = '$mount_id' AND remote_id = '$live_note_id' AND kind_json = '\"directory\"' LIMIT 1;")"
   if [[ -n "$selected_relative_path" ]]; then
     if [[ "$selected_relative_path" == "." || "$selected_relative_path" == ".." || "$selected_relative_path" == */* ]]; then
@@ -361,16 +363,16 @@ step="repeating live discovery without duplicating state"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" pull "$granola_mount" --json \
   >"$second_pull_report" 2>>"$command_log"
 assert_json_true "$second_pull_report" ok
-entity_count_after="$(sqlite3 "$state_root/state.sqlite3" \
+entity_count_after="$(state_query \
   "SELECT count(*) FROM entities WHERE mount_id = '$mount_id';")"
 if [[ ! "$entity_count_before" =~ ^[0-9]+$ || ! "$entity_count_after" =~ ^[0-9]+$ ]] \
   || (( entity_count_after < entity_count_before )); then
   echo "repeated incremental discovery discarded existing Granola entities" >&2
   exit 1
 fi
-duplicate_remote_ids="$(sqlite3 "$state_root/state.sqlite3" \
+duplicate_remote_ids="$(state_query \
   "SELECT count(*) FROM (SELECT remote_id FROM entities WHERE mount_id = '$mount_id' GROUP BY remote_id HAVING count(*) > 1);")"
-duplicate_paths="$(sqlite3 "$state_root/state.sqlite3" \
+duplicate_paths="$(state_query \
   "SELECT count(*) FROM (SELECT path FROM entities WHERE mount_id = '$mount_id' GROUP BY path HAVING count(*) > 1);")"
 if [[ "$duplicate_remote_ids" != "0" || "$duplicate_paths" != "0" ]]; then
   echo "repeated Granola discovery created duplicate identities or paths" >&2
