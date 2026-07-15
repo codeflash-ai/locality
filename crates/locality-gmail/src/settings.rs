@@ -1,7 +1,7 @@
 use std::fmt;
 
 use locality_core::{LocalityError, LocalityResult};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -103,10 +103,26 @@ impl GmailProjectionView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GmailDateWindow {
     pub after: GmailSearchDate,
     pub before: GmailSearchDate,
+}
+
+impl<'de> Deserialize<'de> for GmailDateWindow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawGmailDateWindow {
+            after: String,
+            before: String,
+        }
+
+        let raw = RawGmailDateWindow::deserialize(deserializer)?;
+        Self::new(&raw.after, &raw.before).map_err(|error| de::Error::custom(error_message(error)))
+    }
 }
 
 impl GmailDateWindow {
@@ -132,8 +148,18 @@ impl GmailDateWindow {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct GmailSearchDate(String);
+
+impl<'de> Deserialize<'de> for GmailSearchDate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(|error| de::Error::custom(error_message(error)))
+    }
+}
 
 impl GmailSearchDate {
     pub fn parse(value: &str) -> LocalityResult<Self> {
@@ -208,9 +234,21 @@ fn settings_validation(
     )])
 }
 
+fn error_message(error: LocalityError) -> String {
+    match error {
+        LocalityError::Validation(issues) => issues
+            .into_iter()
+            .map(|issue| issue.message)
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GmailMountSettings, GmailProjectionView, GmailSearchDate};
+    use locality_core::LocalityError;
 
     #[test]
     fn default_settings_keep_message_view_without_date_window() {
@@ -218,6 +256,21 @@ mod tests {
 
         assert_eq!(settings.gmail.date_window, None);
         assert_eq!(settings.gmail.view, GmailProjectionView::Messages);
+    }
+
+    #[test]
+    fn blank_settings_decode_as_default() {
+        let settings = GmailMountSettings::from_json(" \n\t ").expect("settings");
+
+        assert_eq!(settings.gmail.date_window, None);
+        assert_eq!(settings.gmail.view, GmailProjectionView::Messages);
+    }
+
+    #[test]
+    fn invalid_json_maps_to_settings_validation_issue() {
+        let error = GmailMountSettings::from_json("{").expect_err("invalid json");
+
+        assert_settings_json_error(error, "Gmail mount settings JSON is invalid");
     }
 
     #[test]
@@ -244,6 +297,26 @@ mod tests {
     }
 
     #[test]
+    fn json_date_window_rejects_invalid_date_strings() {
+        let error = GmailMountSettings::from_json(
+            r#"{"gmail":{"date_window":{"after":"2026-02-31","before":"2026-03-01"}}}"#,
+        )
+        .expect_err("invalid date");
+
+        assert_settings_json_error(error, "not a calendar date");
+    }
+
+    #[test]
+    fn json_date_window_rejects_reversed_windows() {
+        let error = GmailMountSettings::from_json(
+            r#"{"gmail":{"date_window":{"after":"2026-07-15","before":"2026-07-01"}}}"#,
+        )
+        .expect_err("reversed date window");
+
+        assert_settings_json_error(error, "`--before` must be later than `--after`");
+    }
+
+    #[test]
     fn view_parser_accepts_only_known_views() {
         assert_eq!(
             GmailProjectionView::parse("messages").expect("messages"),
@@ -254,5 +327,19 @@ mod tests {
             GmailProjectionView::Threads
         );
         assert!(GmailProjectionView::parse("conversation").is_err());
+    }
+
+    fn assert_settings_json_error(error: LocalityError, expected_message: &str) {
+        let LocalityError::Validation(issues) = error else {
+            panic!("expected validation error");
+        };
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
+        assert_eq!(issue.code, "gmail_mount_settings_invalid");
+        assert!(
+            issue.message.contains(expected_message),
+            "unexpected message: {}",
+            issue.message
+        );
     }
 }
