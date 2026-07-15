@@ -2428,6 +2428,14 @@ fn mount(args: &[String], json: bool) -> i32 {
             );
         }
     };
+    let settings_json = if descriptor.id() == GMAIL_CONNECTOR_ID {
+        match gmail_mount_settings_json(args) {
+            Ok(settings_json) => settings_json,
+            Err(error) => return command_error(json, error, EXIT_USAGE),
+        }
+    } else {
+        "{}".to_string()
+    };
 
     let state_root = default_state_root();
     let mut store = match SqliteStateStore::open(state_root.clone()) {
@@ -2487,14 +2495,6 @@ fn mount(args: &[String], json: bool) -> i32 {
             Err(error) => return command_error(json, error, EXIT_INTERNAL),
         };
     }
-    let settings_json = if descriptor.id() == GMAIL_CONNECTOR_ID {
-        match gmail_mount_settings_json(args) {
-            Ok(settings_json) => settings_json,
-            Err(error) => return command_error(json, error, EXIT_USAGE),
-        }
-    } else {
-        "{}".to_string()
-    };
 
     let options = MountOptions {
         mount_id,
@@ -2531,14 +2531,24 @@ fn gmail_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
     let view = flag_value(args, "--view")
         .map(GmailProjectionView::parse)
         .transpose()
-        .map_err(|error| CommandError::new("mount", "gmail_view_invalid", error.to_string()))?
+        .map_err(|error| {
+            CommandError::new("mount", "gmail_view_invalid", locality_error_message(error))
+        })?
         .unwrap_or(GmailProjectionView::Messages);
+
+    if after.is_none() && before.is_none() && view == GmailProjectionView::Messages {
+        return Ok("{}".to_string());
+    }
 
     let settings = match (after, before) {
         (None, None) => GmailMountSettings::default().with_view(view),
         (Some(after), Some(before)) => GmailMountSettings::with_date_window(after, before)
             .map_err(|error| {
-                CommandError::new("mount", "gmail_date_window_invalid", error.to_string())
+                CommandError::new(
+                    "mount",
+                    "gmail_date_window_invalid",
+                    locality_error_message(error),
+                )
             })?
             .with_view(view),
         _ => {
@@ -2553,6 +2563,17 @@ fn gmail_mount_settings_json(args: &[String]) -> Result<String, CommandError> {
     settings.to_json().map_err(|error| {
         CommandError::new("mount", "gmail_settings_encode_failed", error.to_string())
     })
+}
+
+fn locality_error_message(error: LocalityError) -> String {
+    match error {
+        LocalityError::Validation(issues) => issues
+            .into_iter()
+            .map(|issue| issue.message)
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => other.to_string(),
+    }
 }
 
 fn mount_remote_root_id(
@@ -7486,7 +7507,7 @@ fn projection_mode_for_target(args: &[String], target_os: &str) -> Result<Projec
 
 fn mount_usage() -> String {
     format!(
-        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]",
+        "usage: loc mount notion <path> (--workspace|--root-page <page-id>) [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection {0}] [--read-only] [--json]\n       loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection {0}] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--read-only] [--json]",
         projection_usage_options_for_target(std::env::consts::OS)
     )
 }
@@ -7950,14 +7971,14 @@ mod tests {
         guard_linux_fuse_shared_root_unregister, guard_unresolved_linux_fuse_unregister,
         guard_unresolved_windows_cloud_files_unregister,
         guard_windows_cloud_files_shared_root_unregister, legacy_args_for_command,
-        locate_result_from_report, mounted_projection_preflight_error, notion_authorize_url,
-        notion_oauth_broker_config, print_push_confirmation_preview, projection_mode_for_target,
-        projection_usage_options_for_target, prompt_for_push_confirmation,
-        pull_direct_fallback_error, push_confirmation_preview_matches_displayed,
-        push_preview_plan_matches, should_prompt_for_push_confirmation,
-        should_refresh_notion_url_search, spinner_config_for_command, spinner_enabled,
-        status as run_status_command, validate_virtual_projection_registration,
-        write_connect_report, write_log_report,
+        locate_result_from_report, mount_usage, mounted_projection_preflight_error,
+        notion_authorize_url, notion_oauth_broker_config, print_push_confirmation_preview,
+        projection_mode_for_target, projection_usage_options_for_target,
+        prompt_for_push_confirmation, pull_direct_fallback_error,
+        push_confirmation_preview_matches_displayed, push_preview_plan_matches,
+        should_prompt_for_push_confirmation, should_refresh_notion_url_search,
+        spinner_config_for_command, spinner_enabled, status as run_status_command,
+        validate_virtual_projection_registration, write_connect_report, write_log_report,
     };
 
     #[test]
@@ -8369,6 +8390,14 @@ mod tests {
         assert!(help.contains("Usage: loc push"));
         assert!(help.contains("Push local changes"));
         assert!(!help.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn mount_usage_mentions_gmail_settings_flags() {
+        let usage = mount_usage();
+
+        assert!(usage.contains("--after YYYY-MM-DD --before YYYY-MM-DD"));
+        assert!(usage.contains("--view messages|threads"));
     }
 
     #[test]

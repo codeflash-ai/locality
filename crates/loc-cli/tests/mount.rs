@@ -589,6 +589,190 @@ fn cli_mount_gmail_rejects_partial_date_window() {
 }
 
 #[test]
+fn cli_mount_gmail_rejects_invalid_view_before_connection_resolution() {
+    let fixture = MountFixture::new("loc-cli-gmail-invalid-view-no-connection");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let mount_root = fixture.root.join("gmail");
+    let mount_root_arg = mount_root.display().to_string();
+
+    let body = loc_json_with_exit(
+        loc_command(loc, &state_root).args([
+            "mount",
+            "gmail",
+            mount_root_arg.as_str(),
+            "--projection",
+            "plain-files",
+            "--view",
+            "bogus",
+            "--json",
+        ]),
+        2,
+    );
+
+    assert_eq!(body["code"], "gmail_view_invalid", "{body:#?}");
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("unsupported Gmail view `bogus`"),
+        "{body:#?}"
+    );
+}
+
+#[test]
+fn cli_mount_gmail_invalid_date_window_errors_include_validation_detail() {
+    for (args, expected_message) in [
+        (
+            vec!["--after", "2026/07/01", "--before", "2026-07-15"],
+            "must use YYYY-MM-DD",
+        ),
+        (
+            vec!["--after", "2026-02-30", "--before", "2026-07-15"],
+            "is not a calendar date",
+        ),
+    ] {
+        let fixture = MountFixture::new("loc-cli-gmail-invalid-date-window");
+        fs::create_dir_all(&fixture.root).expect("create fixture root");
+        let state_root = fixture.root.join("state");
+        seed_cli_gmail_connection(&state_root, "gmail-work");
+
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("gmail");
+        let mount_root_arg = mount_root.display().to_string();
+        let mut command = loc_command(loc, &state_root);
+        command.args([
+            "mount",
+            "gmail",
+            mount_root_arg.as_str(),
+            "--connection",
+            "gmail-work",
+            "--projection",
+            "plain-files",
+            "--json",
+        ]);
+        command.args(args);
+
+        let body = loc_json_with_exit(&mut command, 2);
+
+        assert_eq!(body["code"], "gmail_date_window_invalid", "{body:#?}");
+        assert!(
+            body["message"]
+                .as_str()
+                .expect("message")
+                .contains(expected_message),
+            "{body:#?}"
+        );
+    }
+}
+
+#[test]
+fn cli_mount_gmail_rejects_reversed_or_equal_date_windows_with_detail() {
+    for args in [
+        vec!["--after", "2026-07-15", "--before", "2026-07-01"],
+        vec!["--after", "2026-07-15", "--before", "2026-07-15"],
+    ] {
+        let fixture = MountFixture::new("loc-cli-gmail-reversed-date-window");
+        fs::create_dir_all(&fixture.root).expect("create fixture root");
+        let state_root = fixture.root.join("state");
+        seed_cli_gmail_connection(&state_root, "gmail-work");
+
+        let loc = env!("CARGO_BIN_EXE_loc");
+        let mount_root = fixture.root.join("gmail");
+        let mount_root_arg = mount_root.display().to_string();
+        let mut command = loc_command(loc, &state_root);
+        command.args([
+            "mount",
+            "gmail",
+            mount_root_arg.as_str(),
+            "--connection",
+            "gmail-work",
+            "--projection",
+            "plain-files",
+            "--json",
+        ]);
+        command.args(args);
+
+        let body = loc_json_with_exit(&mut command, 2);
+
+        assert_eq!(body["code"], "gmail_date_window_invalid", "{body:#?}");
+        assert!(
+            body["message"]
+                .as_str()
+                .expect("message")
+                .contains("`--before` must be later than `--after`"),
+            "{body:#?}"
+        );
+    }
+}
+
+#[test]
+fn cli_mount_gmail_default_settings_are_suppressed() {
+    let fixture = MountFixture::new("loc-cli-gmail-default-settings");
+    fs::create_dir_all(&fixture.root).expect("create fixture root");
+    let state_root = fixture.root.join("state");
+    seed_cli_gmail_connection(&state_root, "gmail-work");
+
+    let loc = env!("CARGO_BIN_EXE_loc");
+    let json_mount_root = fixture.root.join("gmail-json");
+    let json_mount_root_arg = json_mount_root.display().to_string();
+
+    let report = loc_json_ok(loc_command(loc, &state_root).args([
+        "mount",
+        "gmail",
+        json_mount_root_arg.as_str(),
+        "--connection",
+        "gmail-work",
+        "--mount-id",
+        "gmail-json",
+        "--projection",
+        "plain-files",
+        "--json",
+    ]));
+
+    assert_eq!(report["settings_json"], "{}", "{report:#?}");
+
+    let human_mount_root = fixture.root.join("gmail-human");
+    let human_mount_root_arg = human_mount_root.display().to_string();
+    let output = loc_command(loc, &state_root)
+        .args([
+            "mount",
+            "gmail",
+            human_mount_root_arg.as_str(),
+            "--connection",
+            "gmail-work",
+            "--mount-id",
+            "gmail-human",
+            "--projection",
+            "plain-files",
+        ])
+        .output()
+        .expect("run loc mount gmail");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("settings:"), "{stdout}");
+
+    let store = SqliteStateStore::open(state_root).expect("open state");
+    let json_mount = store
+        .get_mount(&MountId::new("gmail-json"))
+        .expect("load JSON mount")
+        .expect("JSON mount exists");
+    let human_mount = store
+        .get_mount(&MountId::new("gmail-human"))
+        .expect("load human mount")
+        .expect("human mount exists");
+    assert_eq!(json_mount.settings_json, "{}");
+    assert_eq!(human_mount.settings_json, "{}");
+}
+
+#[test]
 fn cli_mount_gmail_rejects_remote_root_selectors() {
     let cases: &[&[&str]] = &[
         &["--workspace"],
