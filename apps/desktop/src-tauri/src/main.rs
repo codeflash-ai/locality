@@ -9513,12 +9513,12 @@ fn workspace_mount_onboarding_should_refresh_surfaces(
 #[cfg(target_os = "macos")]
 fn macos_workspace_mount_onboarding_state(
     message: &str,
-    user_enabled: bool,
+    domain_usable: bool,
 ) -> Option<MacosWorkspaceMountOnboardingState> {
     if message.contains("registered but not enabled") {
         return Some(MacosWorkspaceMountOnboardingState::ApprovalRequired);
     }
-    if user_enabled
+    if domain_usable
         && (message.contains("did not return a CloudStorage URL")
             || message.contains("macOS has not created"))
     {
@@ -9530,7 +9530,7 @@ fn macos_workspace_mount_onboarding_state(
 #[cfg(not(target_os = "macos"))]
 fn macos_workspace_mount_onboarding_state(
     _message: &str,
-    _user_enabled: bool,
+    _domain_usable: bool,
 ) -> Option<MacosWorkspaceMountOnboardingState> {
     None
 }
@@ -9539,8 +9539,8 @@ fn classify_workspace_mount_onboarding_failure(message: &str) -> WorkspaceMountO
     #[cfg(target_os = "macos")]
     {
         if recoverable_macos_file_provider_activation_error(message) {
-            let user_enabled = macos_workspace_mount_domain_user_enabled().unwrap_or(false);
-            if let Some(state) = macos_workspace_mount_onboarding_state(message, user_enabled) {
+            let domain_usable = macos_workspace_mount_domain_usable().unwrap_or(false);
+            if let Some(state) = macos_workspace_mount_onboarding_state(message, domain_usable) {
                 let primary_action = match state {
                     MacosWorkspaceMountOnboardingState::ApprovalRequired => {
                         WorkspaceMountOnboardingPrimaryAction::AllowInMacos
@@ -9568,12 +9568,10 @@ fn classify_workspace_mount_onboarding_failure(message: &str) -> WorkspaceMountO
     )
 }
 
-#[cfg(target_os = "macos")]
-fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
-    let report =
-        run_macos_file_provider_helper("list", Vec::new()).map_err(|error| error.message())?;
-    Ok(report
-        .helper_report
+fn macos_workspace_mount_domain_usable_from_helper_report(
+    helper_report: &serde_json::Value,
+) -> bool {
+    helper_report
         .get("domains")
         .and_then(serde_json::Value::as_array)
         .and_then(|domains| {
@@ -9582,13 +9580,31 @@ fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
                     == Some(localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID)
             })
         })
-        .and_then(|domain| domain.get("userEnabled"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false))
+        .map(|domain| {
+            domain
+                .get("userEnabled")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && domain
+                    .get("disconnected")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+                && domain.get("hidden").and_then(serde_json::Value::as_bool) == Some(false)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_workspace_mount_domain_usable() -> Result<bool, String> {
+    let report =
+        run_macos_file_provider_helper("list", Vec::new()).map_err(|error| error.message())?;
+    Ok(macos_workspace_mount_domain_usable_from_helper_report(
+        &report.helper_report,
+    ))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
+fn macos_workspace_mount_domain_usable() -> Result<bool, String> {
     Ok(false)
 }
 
@@ -13075,6 +13091,54 @@ mod tests {
                 true,
             ),
             expected
+        );
+    }
+
+    #[test]
+    fn macos_workspace_mount_onboarding_state_does_not_wait_for_hidden_cloudstorage_root() {
+        let domain_usable =
+            super::macos_workspace_mount_domain_usable_from_helper_report(&serde_json::json!({
+                "domains": [
+                    {
+                        "identifier": "loc",
+                        "userEnabled": true,
+                        "disconnected": false,
+                        "hidden": true
+                    }
+                ]
+            }));
+
+        assert!(!domain_usable);
+        assert_eq!(
+            super::macos_workspace_mount_onboarding_state(
+                "Could not open macOS File Provider domain `loc`: File Provider domain loc exists but macOS has not created /Users/test/Library/CloudStorage/Locality",
+                domain_usable,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_workspace_mount_onboarding_state_does_not_wait_for_disconnected_cloudstorage_root() {
+        let domain_usable =
+            super::macos_workspace_mount_domain_usable_from_helper_report(&serde_json::json!({
+                "domains": [
+                    {
+                        "identifier": "loc",
+                        "userEnabled": true,
+                        "disconnected": true,
+                        "hidden": false
+                    }
+                ]
+            }));
+
+        assert!(!domain_usable);
+        assert_eq!(
+            super::macos_workspace_mount_onboarding_state(
+                "Could not open macOS File Provider domain `loc`: locality-file-providerctl did not return a CloudStorage URL",
+                domain_usable,
+            ),
+            None
         );
     }
 

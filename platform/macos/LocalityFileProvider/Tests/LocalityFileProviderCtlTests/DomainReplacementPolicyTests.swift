@@ -32,3 +32,19 @@ import Testing
       visibleURLState: .available(url)
     ))
 }
+
+@Test func userEnabledVisibleDomainIsUsable() {
+  #expect(fileProviderDomainIsUsable(userEnabled: true, disconnected: false, hidden: false))
+}
+
+@Test func disabledDomainIsNotUsable() {
+  #expect(!fileProviderDomainIsUsable(userEnabled: false, disconnected: false, hidden: false))
+}
+
+@Test func disconnectedDomainIsNotUsableEvenWhenUserEnabled() {
+  #expect(!fileProviderDomainIsUsable(userEnabled: true, disconnected: true, hidden: false))
+}
+
+@Test func hiddenDomainIsNotUsableEvenWhenUserEnabled() {
+  #expect(!fileProviderDomainIsUsable(userEnabled: true, disconnected: false, hidden: true))
+}

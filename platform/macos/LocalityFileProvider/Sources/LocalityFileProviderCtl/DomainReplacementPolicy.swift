@@ -39,3 +39,11 @@ func fileProviderDirectoryName(for displayName: String) -> String {
   }
   return "Locality-\(displayName)"
 }
+
+func fileProviderDomainIsUsable(
+  userEnabled: Bool,
+  disconnected: Bool,
+  hidden: Bool
+) -> Bool {
+  userEnabled && !disconnected && !hidden
+}

@@ -135,7 +135,11 @@ private enum Command {
       guard let domain = try getDomains().first(where: { $0.identifier.rawValue == mountId }) else {
         throw UsageError("File Provider domain \(mountId) is not registered")
       }
-      guard domain.userEnabled else {
+      guard fileProviderDomainIsUsable(
+        userEnabled: domain.userEnabled,
+        disconnected: domain.isDisconnected,
+        hidden: domain.isHidden
+      ) else {
         throw UsageError(
           "The Locality File Provider is registered but not enabled. Enable Locality in Finder or System Settings, then try again."
         )
