@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -143,6 +144,8 @@ impl GmailApi for HttpGmailApiClient {
         message_id: &str,
         attachment_id: &str,
     ) -> LocalityResult<GmailMessagePartBody> {
+        let message_id = percent_encode_path_segment(message_id);
+        let attachment_id = percent_encode_path_segment(attachment_id);
         self.get_json(
             &format!("/users/me/messages/{message_id}/attachments/{attachment_id}"),
             Vec::new(),
@@ -196,6 +199,18 @@ fn ensure_reqwest_crypto_provider() {
     REQWEST_CRYPTO_PROVIDER.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            let _ = write!(&mut encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -302,6 +317,30 @@ mod tests {
             request.starts_with("GET /users/me/messages/msg-1/attachments/attach-1 "),
             "{request}"
         );
+    }
+
+    #[test]
+    fn get_attachment_percent_encodes_message_and_attachment_path_segments() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"attachmentId":"attach/1?x","size":5,"data":"SGVsbG8"}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        client
+            .get_attachment("msg/1", "attach/1?x")
+            .expect("attachment response");
+
+        let request = request_rx.recv().expect("request line");
+        server.join().expect("server exits");
+        let target = request.split_whitespace().nth(1).expect("request target");
+        assert_eq!(
+            target,
+            "/users/me/messages/msg%2F1/attachments/attach%2F1%3Fx"
+        );
+        assert!(!target.contains("msg/1"), "{target}");
+        assert!(!target.contains("attach/1"), "{target}");
+        assert!(!target.contains("?x"), "{target}");
     }
 
     fn request_error_for_status(status_line: &'static str, body: &'static str) -> LocalityError {
