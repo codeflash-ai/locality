@@ -190,6 +190,47 @@ fn remounting_same_mount_id_to_different_remote_root_clears_source_scoped_state(
 }
 
 #[test]
+fn remounting_same_mount_id_with_different_settings_json_clears_source_scoped_state() {
+    let mut store = InMemoryStateStore::new();
+    store
+        .save_mount(
+            MountConfig::new(mount_id(), "gmail", "/tmp/loc/gmail")
+                .with_connection_id(ConnectionId::new("gmail-default"))
+                .with_settings_json(r#"{"gmail":{"view":"messages"}}"#),
+        )
+        .expect("save original mount");
+    seed_source_scoped_state(&mut store);
+
+    store
+        .save_mount(
+            MountConfig::new(mount_id(), "gmail", "/tmp/loc/gmail")
+                .with_connection_id(ConnectionId::new("gmail-default"))
+                .with_settings_json(r#"{"gmail":{"view":"threads"}}"#),
+        )
+        .expect("remount with new settings");
+
+    assert_eq!(
+        store
+            .get_mount(&mount_id())
+            .expect("get mount")
+            .expect("mount")
+            .settings_json,
+        r#"{"gmail":{"view":"threads"}}"#
+    );
+    assert!(
+        store
+            .list_entities(&mount_id())
+            .expect("list entities")
+            .is_empty()
+    );
+    assert!(store.list_journal().expect("list journal").is_empty());
+    assert!(matches!(
+        store.load_shadow(&mount_id(), &RemoteId::new("page-1")),
+        Err(StoreError::ShadowMissing { .. })
+    ));
+}
+
+#[test]
 fn remounting_same_source_keeps_source_scoped_state() {
     let mut store = InMemoryStateStore::new();
     let mount = MountConfig::new(mount_id(), "notion", "/tmp/loc/notion")

@@ -22,6 +22,13 @@ pub struct GmailThreadNativeBundle {
     pub thread: GmailThread,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GmailThreadMessageNativeBundle {
+    pub mailbox: String,
+    pub thread_id: String,
+    pub message: GmailMessage,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GmailRenderedEntity {
     pub document: CanonicalDocument,
@@ -39,6 +46,13 @@ pub struct GmailDraftDocument {
 }
 
 pub fn render_gmail_message(bundle: &GmailNativeBundle) -> LocalityResult<GmailRenderedEntity> {
+    render_gmail_message_with_entity_id(bundle, RemoteId::new(bundle.message.id.clone()))
+}
+
+fn render_gmail_message_with_entity_id(
+    bundle: &GmailNativeBundle,
+    entity_id: RemoteId,
+) -> LocalityResult<GmailRenderedEntity> {
     let attachment_specs = collect_attachment_specs(&bundle.message);
     let body = message_body(&bundle.message)
         .filter(|body| !body.is_empty())
@@ -49,17 +63,13 @@ pub fn render_gmail_message(bundle: &GmailNativeBundle) -> LocalityResult<GmailR
                 String::new()
             }
         });
-    let frontmatter = message_frontmatter_with_attachments(bundle, &attachment_specs);
+    let frontmatter =
+        message_frontmatter_with_attachment_state(bundle, Some(&attachment_specs), &entity_id);
     let document = CanonicalDocument::new(frontmatter.clone(), body.clone());
     let native_block_ids = synthetic_body_block_ids(&bundle.message.id, &body);
-    let shadow = ShadowDocument::from_synced_body(
-        RemoteId::new(bundle.message.id.clone()),
-        body,
-        1,
-        native_block_ids,
-    )
-    .map_err(|error| LocalityError::InvalidState(error.to_string()))?
-    .with_frontmatter(frontmatter);
+    let shadow = ShadowDocument::from_synced_body(entity_id, body, 1, native_block_ids)
+        .map_err(|error| LocalityError::InvalidState(error.to_string()))?
+        .with_frontmatter(frontmatter);
 
     Ok(GmailRenderedEntity {
         document,
@@ -75,6 +85,31 @@ pub fn thread_remote_id(mailbox: &str, thread_id: &str) -> RemoteId {
 pub fn parse_thread_remote_id(remote_id: &RemoteId) -> Option<(&str, &str)> {
     let rest = remote_id.as_str().strip_prefix("gmail-thread:")?;
     rest.split_once(':')
+}
+
+pub fn thread_message_remote_id(mailbox: &str, thread_id: &str, message_id: &str) -> RemoteId {
+    RemoteId::new(format!(
+        "gmail-thread-message:{mailbox}:{thread_id}:{message_id}"
+    ))
+}
+
+pub fn parse_thread_message_remote_id(remote_id: &RemoteId) -> Option<(&str, &str, &str)> {
+    let rest = remote_id.as_str().strip_prefix("gmail-thread-message:")?;
+    let (mailbox, rest) = rest.split_once(':')?;
+    let (thread_id, message_id) = rest.split_once(':')?;
+    Some((mailbox, thread_id, message_id))
+}
+
+pub fn render_gmail_thread_message(
+    bundle: &GmailThreadMessageNativeBundle,
+) -> LocalityResult<GmailRenderedEntity> {
+    render_gmail_message_with_entity_id(
+        &GmailNativeBundle {
+            mailbox: bundle.mailbox.clone(),
+            message: bundle.message.clone(),
+        },
+        thread_message_remote_id(&bundle.mailbox, &bundle.thread_id, &bundle.message.id),
+    )
 }
 
 pub fn render_gmail_thread(
@@ -148,19 +183,17 @@ fn thread_frontmatter(
 }
 
 pub fn message_frontmatter(bundle: &GmailNativeBundle) -> String {
-    message_frontmatter_with_attachment_state(bundle, None)
-}
-
-fn message_frontmatter_with_attachments(
-    bundle: &GmailNativeBundle,
-    attachment_specs: &[GmailAttachmentSpec],
-) -> String {
-    message_frontmatter_with_attachment_state(bundle, Some(attachment_specs))
+    message_frontmatter_with_attachment_state(
+        bundle,
+        None,
+        &RemoteId::new(bundle.message.id.clone()),
+    )
 }
 
 fn message_frontmatter_with_attachment_state(
     bundle: &GmailNativeBundle,
     attachment_specs: Option<&[GmailAttachmentSpec]>,
+    entity_id: &RemoteId,
 ) -> String {
     let message = &bundle.message;
     let version = remote_version(message);
@@ -175,7 +208,7 @@ fn message_frontmatter_with_attachment_state(
 
     format!(
         "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\ngmail:\n  mailbox: {}\n  message_id: {}\n  thread_id: {}\n  labels: [{}]\n{}from: {}\nto: [{}]\ncc: [{}]\nbcc: []\nsubject: {}\ndate: {}\n",
-        yaml_scalar(&message.id),
+        yaml_scalar(entity_id.as_str()),
         GMAIL_CONNECTOR_ID,
         yaml_scalar(&version),
         yaml_scalar(&version),

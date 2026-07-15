@@ -1630,6 +1630,52 @@ fn remounting_same_mount_id_to_different_remote_root_clears_source_scoped_state(
 }
 
 #[test]
+fn remounting_same_mount_id_with_different_settings_json_clears_source_scoped_state() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    store
+        .save_mount(
+            fixture
+                .mount_config()
+                .with_connection_id(ConnectionId::new("gmail-default"))
+                .with_settings_json(r#"{"gmail":{"view":"messages"}}"#),
+        )
+        .expect("save original mount");
+    seed_source_scoped_state(&mut store, &fixture.mount_id);
+
+    store
+        .save_mount(
+            fixture
+                .mount_config()
+                .with_connection_id(ConnectionId::new("gmail-default"))
+                .with_settings_json(r#"{"gmail":{"view":"threads"}}"#),
+        )
+        .expect("remount with new settings");
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .get_mount(&fixture.mount_id)
+            .expect("get mount")
+            .expect("mount")
+            .settings_json,
+        r#"{"gmail":{"view":"threads"}}"#
+    );
+    assert!(
+        reopened
+            .list_entities(&fixture.mount_id)
+            .expect("list entities")
+            .is_empty()
+    );
+    assert!(reopened.list_journal().expect("list journal").is_empty());
+    assert!(matches!(
+        reopened.load_shadow(&fixture.mount_id, &RemoteId::new("page-1")),
+        Err(StoreError::ShadowMissing { .. })
+    ));
+}
+
+#[test]
 fn virtual_mutations_round_trip_and_delete_after_reopen() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();

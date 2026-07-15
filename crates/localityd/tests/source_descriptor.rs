@@ -769,6 +769,10 @@ fn local_gmail_validator_blocks_attachment_frontmatter_on_draft_create() {
             "attachments",
             "---\nto: [\"user@example.com\"]\nsubject: Hello\nattachments: [\"invoice.pdf\"]\n---\nBody\n",
         ),
+        (
+            "gmail.attachments",
+            "---\nto: [\"user@example.com\"]\nsubject: Hello\ngmail:\n  attachments:\n    - filename: invoice.pdf\n---\nBody\n",
+        ),
     ] {
         let issues = validate_gmail_create_issues("draft/foo.md", markdown);
 
@@ -776,7 +780,7 @@ fn local_gmail_validator_blocks_attachment_frontmatter_on_draft_create() {
         assert_eq!(issues[0].code, "gmail_attachments_unsupported", "{field}");
         assert_eq!(
             issues[0].suggested_fix.as_deref(),
-            Some("remove `attachment` or `attachments` frontmatter"),
+            Some("remove attachment frontmatter"),
             "{field}"
         );
     }

@@ -393,27 +393,29 @@ pub(crate) fn validate_gmail_create_frontmatter(
         ));
     }
 
-    if context
-        .parsed
-        .frontmatter
-        .properties
-        .contains_key("attachment")
-        || context
-            .parsed
-            .frontmatter
-            .properties
-            .contains_key("attachments")
-    {
+    if gmail_draft_frontmatter_has_attachments(&context.parsed.frontmatter.properties) {
         report.push(ValidationIssue::new(
             "gmail_attachments_unsupported",
             context.relative_path,
             Some(1),
             "Gmail draft sends do not support attachments",
-            Some("remove `attachment` or `attachments` frontmatter".to_string()),
+            Some("remove attachment frontmatter".to_string()),
         ));
     }
 
     Ok(report)
+}
+
+fn gmail_draft_frontmatter_has_attachments(
+    properties: &locality_core::canonical::FrontmatterProperties,
+) -> bool {
+    properties.contains_key("attachment")
+        || properties.contains_key("attachments")
+        || matches!(
+            properties.get("gmail").map(property_value_from_frontmatter),
+            Some(PropertyValue::Object(gmail))
+                if gmail.contains_key("attachment") || gmail.contains_key("attachments")
+        )
 }
 
 fn frontmatter_string_list(

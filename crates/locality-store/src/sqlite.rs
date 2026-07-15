@@ -1478,6 +1478,7 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
     existing.connector != next.connector
         || existing.remote_root_id != next.remote_root_id
         || existing.connection_id != next.connection_id
+        || existing.settings_json != next.settings_json
 }
 
 fn clear_mount_source_state(connection: &Connection, mount_id: &MountId) -> StoreResult<()> {
