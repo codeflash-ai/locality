@@ -3052,9 +3052,19 @@ fn sqlite_store_migrates_v17_mounts_with_default_settings_json() {
             |row| row.get(0),
         )
         .expect("settings json");
+    let migration_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM state_migrations
+             WHERE migration_id = 'schema-17-to-18'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema migration count");
 
     assert_eq!(user_version, 18);
     assert_eq!(settings_json, "{}");
+    assert_eq!(migration_count, 1);
 }
 
 fn query_state_components(connection: &Connection) -> Vec<(String, String, i64, i64, i64, i64)> {

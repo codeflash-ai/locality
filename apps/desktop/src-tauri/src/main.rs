@@ -6625,6 +6625,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 connection_id: connection_id.clone(),
                 read_only: request.read_only,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             };
             let credentials = open_credential_store(&state_root);
             let connector =

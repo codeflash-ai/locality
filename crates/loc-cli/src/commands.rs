@@ -2533,6 +2533,7 @@ fn mount_remote_root_id(
                 connection_id: connection_id.clone(),
                 read_only,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             };
             let credentials = open_credential_store(state_root);
             resolve_notion_connector_for_mount(store, credentials.as_ref(), &temp_mount)
@@ -2562,6 +2563,7 @@ fn mount_remote_root_id(
                 connection_id: connection_id.clone(),
                 read_only,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             };
             let credentials = open_credential_store(state_root);
             let connector =

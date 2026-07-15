@@ -59,6 +59,21 @@ fn repository_persists_mount_settings_json() {
             loaded.settings_json,
             r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#
         );
+
+        let updated_mount = MountConfig::new(mount_id.clone(), "gmail", "/tmp/Locality/gmail-main")
+            .with_settings_json(
+                r#"{"gmail":{"date_window":{"after":"2026-07-08","before":"2026-07-22"},"view":"messages"}}"#,
+            );
+        store.save_mount(updated_mount).expect("update mount");
+
+        let updated = store
+            .get_mount(&mount_id)
+            .expect("load updated mount")
+            .expect("mount exists");
+        assert_eq!(
+            updated.settings_json,
+            r#"{"gmail":{"date_window":{"after":"2026-07-08","before":"2026-07-22"},"view":"messages"}}"#
+        );
     }
 
     let mut memory = InMemoryStateStore::new();
