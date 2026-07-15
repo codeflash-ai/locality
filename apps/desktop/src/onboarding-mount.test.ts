@@ -46,17 +46,15 @@ describe("mount onboarding helpers", () => {
 
   it("switches to progress copy while the action is running", () => {
     expect(mountOnboardingPrimaryLabel(report({ primaryAction: "allow_in_macos" }), true)).toBe(
-      "Opening Finder",
+      "Waiting for macOS",
     );
   });
 
-  it("shows instructions only when Finder could not be opened directly", () => {
+  it("shows instructions only when the backend asks for manual recovery", () => {
     expect(mountOnboardingNeedsInstructions(report({ launchStrategy: "instructions_only" }))).toBe(
       true,
     );
-    expect(mountOnboardingNeedsInstructions(report({ launchStrategy: "open_finder" }))).toBe(
-      false,
-    );
+    expect(mountOnboardingNeedsInstructions(report({ launchStrategy: "none" }))).toBe(false);
   });
 
   it("does not show approval instructions while waiting for the CloudStorage root", () => {
@@ -75,15 +73,15 @@ describe("mount onboarding helpers", () => {
     expect(
       mountOnboardingInstructions?.(report({ launchStrategy: "instructions_only" })) ?? null,
     ).toBe(
-      "Open Finder, choose Locality under Locations, enable the File Provider, then return here " +
-        "and click Check again. If Finder does not show Locality, open System Settings, go to " +
-        "Privacy & Security, then enable Locality under Extensions or File Providers.",
+      "Approve the macOS File Provider prompt. If it no longer appears, choose Locality under " +
+        "Locations in Finder and enable it, or enable Locality under Extensions or File Providers " +
+        "in System Settings, then return here and click Allow in macOS.",
     );
   });
 
   it("maps backend states to the step 4 headline", () => {
     expect(mountOnboardingHeadline(report({ state: "approval_required" }))).toBe(
-      "Allow Locality in Finder.",
+      "Allow Locality to sync.",
     );
     expect(mountOnboardingHeadline(report({ state: "waiting_for_cloudstorage_root" }))).toBe(
       "Waiting for the Locality folder to appear.",

@@ -169,10 +169,14 @@ The app can track setup internally with human concepts:
 
 On macOS, this step is a blocked File Provider gate. If the Locality File
 Provider is registered but not yet enabled, the onboarding screen stays on step
-4, offers an `Allow in macOS` action, and opens Finder at the Locality File
-Provider root when possible. If macOS has accepted approval but has not yet
-materialized `~/Library/CloudStorage/Locality`, the screen remains blocked with
-`Check again` until the folder exists and the mount root passes verification.
+4 and offers an `Allow in macOS` action that asks macOS for File Provider
+approval while the app is in the foreground. If the prompt is dismissed or no
+longer visible, the user can recover by choosing Locality under Locations in
+Finder and enabling it, or by enabling Locality under File Providers or
+Extensions in System Settings, then returning to the app. If macOS has accepted
+approval but has not yet materialized `~/Library/CloudStorage/Locality`, the
+screen remains blocked with `Check again` until the folder exists and the mount
+root passes verification.
 
 The final ready screen must not appear until File Provider approval, the
 CloudStorage root, and the mount root are all verified successfully.

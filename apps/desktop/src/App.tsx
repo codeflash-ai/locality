@@ -1945,7 +1945,7 @@ function Onboarding({
                 <FolderOpen />
               )}
               {mounting
-                ? "Checking File Provider approval"
+                ? "Waiting for macOS approval"
                 : mountOnboarding?.message ?? "Creating folder and preparing Notion files"}
             </div>
             <div className="path-field ready-path-field">
