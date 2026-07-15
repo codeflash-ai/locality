@@ -397,9 +397,6 @@ Layout:
 │                                      │
 │ Review Center                    0   │
 │                                      │
-│ Suggestions                          │
-│ Connect Linear                       │
-│                                      │
 │ Settings                             │
 │ Quit Options ›                       │
 └──────────────────────────────────────┘
@@ -502,9 +499,6 @@ Standups with Locality
 
 Review Center
 No review needed
-
-Suggestions
-Connect Linear
 ```
 
 Attention state:
@@ -859,29 +853,6 @@ Allowed technical terms here:
 - File Provider;
 - logs;
 - socket.
-
-## Connector Suggestion
-
-Goal: point to future connectors without making first-run feel incomplete.
-
-Placement:
-
-- Home lower section;
-- tray popover lower section;
-- Settings > Connections.
-
-Layout:
-
-```text
-Suggestions
-
-Linear
-Mount issues and projects as local files.
-
-[ Join waitlist ] or [ Connect ] when available
-```
-
-Do not show a full connector marketplace during first-run.
 
 ## Component Inventory
 

@@ -28,7 +28,6 @@ import {
   Search,
   Settings,
   ShieldCheck,
-  Sparkles,
   Square,
   PanelLeftClose,
   PanelLeftOpen,
@@ -2590,17 +2589,6 @@ function HomeView({
         </section>
       )}
 
-      <section className="suggestion-card">
-        <Sparkles />
-        <div>
-          <p className="label">Suggestion</p>
-          <h3>Connect {snapshot.suggestions[0]?.connector ?? "Linear"}</h3>
-          <p>{snapshot.suggestions[0]?.description ?? "Connect more workspaces as local files."}</p>
-        </div>
-        <SecondaryButton compact disabled>
-          Coming Soon
-        </SecondaryButton>
-      </section>
     </div>
   );
 }
