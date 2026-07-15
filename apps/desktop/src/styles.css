@@ -1067,12 +1067,12 @@ p {
   height: 32px;
 }
 
-.onboarding-api-key-field {
+.onboarding-source-field {
   max-width: 440px;
   margin-top: 0;
 }
 
-.onboarding-api-key-field span {
+.onboarding-source-field span {
   color: var(--muted);
 }
 
@@ -2785,63 +2785,20 @@ button.home-stat:hover {
   height: 34px;
   place-items: center;
   border-radius: 8px;
+  overflow: hidden;
+  background: transparent;
+  color: inherit;
   font-size: 13px;
   font-weight: 950;
   letter-spacing: 0;
 }
 
-.connector-icon svg {
+.connector-icon img {
   display: block;
   width: 100%;
   height: 100%;
-}
-
-.connector-icon.notion {
-  background: #ffffff;
-  color: #111827;
-}
-
-.connector-icon.notion svg path {
-  fill: #111827;
-}
-
-.connector-icon.google-docs {
-  background: #2b7de9;
-  color: #ffffff;
-}
-
-.connector-icon.google-docs svg path {
-  fill: #4285f4;
-}
-
-.connector-icon.gmail {
-  background: #ffffff;
-  color: #202124;
-}
-
-.connector-icon.gmail .gmail-envelope {
-  fill: #ffffff;
-}
-
-.connector-icon.gmail .gmail-blue {
-  fill: #4285f4;
-}
-
-.connector-icon.gmail .gmail-green {
-  fill: #34a853;
-}
-
-.connector-icon.gmail .gmail-yellow {
-  fill: #fbbc04;
-}
-
-.connector-icon.gmail .gmail-red {
-  fill: #ea4335;
-}
-
-.connector-icon.granola {
-  background: #eee9df;
-  color: #443f37;
+  object-fit: contain;
+  user-select: none;
 }
 
 .connector-choice-facts {

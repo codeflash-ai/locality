@@ -91,6 +91,10 @@ import {
   type SourceConnectorId,
   type SourceSetupState,
 } from "./source-setup";
+import gmailIconUrl from "./assets/connectors/gmail.svg";
+import googleDocsIconUrl from "./assets/connectors/google-docs.svg";
+import granolaIconUrl from "./assets/connectors/granola.svg";
+import notionIconUrl from "./assets/connectors/notion.svg";
 import localityShortDarkUrl from "./assets/brand/locality-short-dark.svg";
 import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
 
@@ -101,7 +105,7 @@ const onboardingDemoVideoUrl = import.meta.env.VITE_LOCALITY_ONBOARDING_DEMO_VID
 type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
 type OnboardingStep = 1 | 2 | 3 | 4 | 5;
-type OnboardingConnectorId = "notion" | "granola";
+type OnboardingConnectorId = SourceConnectorId;
 type ReviewFilter = "all" | "approvals" | "problems";
 type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
@@ -114,6 +118,13 @@ type ConnectorOption = {
   status: string;
   keywords: string[];
   mounted: boolean;
+};
+
+const CONNECTOR_ICON_URLS: Record<SourceConnectorId, string> = {
+  notion: notionIconUrl,
+  "google-docs": googleDocsIconUrl,
+  gmail: gmailIconUrl,
+  granola: granolaIconUrl,
 };
 
 const PRODUCT_TERMS = {
@@ -658,10 +669,130 @@ const sampleSearchResults: LocatedItem[] = [
 ];
 
 function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorId = "notion") {
-  if (connector === "granola") {
-    return `Use Locality to read my Granola meetings. Open the files under ${mountPath}, search summaries and transcripts with normal file tools, and cite the meeting files you used. Granola is read-only in Locality, so do not try to push edits back.`;
+  switch (connector) {
+    case "granola":
+      return `Use Locality to read my Granola meetings. Open the files under ${mountPath}, search summaries and transcripts with normal file tools, and cite the meeting files you used. Granola is read-only in Locality, so do not try to push edits back.`;
+    case "google-docs":
+      return `Use Locality to edit my Google Docs workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review before pushing.`;
+    case "gmail":
+      return `Use Locality to inspect my Gmail source. Open the files under ${mountPath}, search mail with normal file tools, and prepare draft updates only when the mounted draft files support it. Leave outbound changes for Locality review.`;
+    case "notion":
+      return `Use Locality to edit my Notion workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review.`;
   }
-  return `Use Locality to edit my Notion workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review.`;
+}
+
+function isOnboardingConnector(value?: string | null): value is OnboardingConnectorId {
+  return value === "notion" || value === "google-docs" || value === "gmail" || value === "granola";
+}
+
+function onboardingConnectorFromSnapshot(snapshot: DesktopSnapshot): OnboardingConnectorId {
+  if (isOnboardingConnector(snapshot.mount.connector)) {
+    return snapshot.mount.connector;
+  }
+  if (isOnboardingConnector(snapshot.connection.connector)) {
+    return snapshot.connection.connector;
+  }
+  return "notion";
+}
+
+function connectorUsesOAuth(connector: OnboardingConnectorId) {
+  return connector === "notion" || connector === "google-docs" || connector === "gmail";
+}
+
+function connectorSkipsMountStep(connector: OnboardingConnectorId) {
+  return connector !== "notion";
+}
+
+function onboardingConnectorTitle(
+  connector: OnboardingConnectorId,
+  ready: boolean,
+  busy: boolean,
+) {
+  if (ready) {
+    return `Your ${sourceDisplayName(connector)} source is connected`;
+  }
+  if (busy) {
+    return connector === "granola"
+      ? "Checking Granola access."
+      : `Finish connecting in ${sourceDisplayName(connector)}.`;
+  }
+  return `Start with ${sourceDisplayName(connector)}.`;
+}
+
+function onboardingConnectorDescription(
+  connector: OnboardingConnectorId,
+  ready: boolean,
+  busy: boolean,
+  workspaceLabel: string,
+) {
+  if (ready) {
+    switch (connector) {
+      case "notion":
+        return `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare the local workspace.`;
+      case "google-docs":
+        return "Google Docs is ready. Locality mounted the selected Drive folder as local files under CloudStorage.";
+      case "gmail":
+        return "Gmail is ready. Locality mounted mailboxes as local files under CloudStorage.";
+      case "granola":
+        return "Granola is ready. Locality mounted meeting summaries and transcripts as read-only files under CloudStorage.";
+    }
+  }
+
+  if (busy) {
+    switch (connector) {
+      case "notion":
+        return "A browser window is open. Choose the workspace and pages Locality can access, then approve.";
+      case "google-docs":
+        return "A browser window is open. Approve Google Docs access, then Locality will create the local folder.";
+      case "gmail":
+        return "A browser window is open. Approve Gmail access, then Locality will create the local mailbox folder.";
+      case "granola":
+        return "Locality is validating the API key and creating a read-only Granola folder.";
+    }
+  }
+
+  switch (connector) {
+    case "notion":
+      return "Connect the source you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain.";
+    case "google-docs":
+      return "Connect Google Docs during setup so agents can work with docs through the same local file workflow.";
+    case "gmail":
+      return "Connect Gmail during setup so agents can search mailboxes and prepare reviewed draft work from local files.";
+    case "granola":
+      return "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store.";
+  }
+}
+
+function onboardingConnectorPills(connector: OnboardingConnectorId) {
+  switch (connector) {
+    case "notion":
+      return ["Scoped access", "Credentials in Keychain", "Direct app connection"];
+    case "google-docs":
+      return ["Google OAuth", "Drive folder", "Markdown edits"];
+    case "gmail":
+      return ["Google OAuth", "Mailbox files", "Draft review"];
+    case "granola":
+      return ["Read-only", "Meeting summaries", "Transcripts"];
+  }
+}
+
+function onboardingReadyCopy(connector: OnboardingConnectorId) {
+  switch (connector) {
+    case "notion":
+      return "Your local workspace is ready. Agents can open this folder, edit Markdown, and leave changes for Review Center. Open the app to review changes, manage sync, and turn on Live Mode when you want file saves to update Notion and new Notion changes to appear locally.";
+    case "google-docs":
+      return "Your Google Docs workspace is ready as local files. Agents can edit docs in Markdown and leave changes for Review Center before anything is pushed back.";
+    case "gmail":
+      return "Your Gmail source is ready as local files. Agents can search mailbox content and prepare reviewed draft work without leaving the filesystem.";
+    case "granola":
+      return "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits.";
+  }
+}
+
+function onboardingPromptHint(connector: OnboardingConnectorId) {
+  return connector === "granola"
+    ? "Ask an agent to use the mounted meeting files."
+    : "Claude and Codex are now set up to use Locality.";
 }
 
 function sampleAgentGuidanceReport(mountPath: string): AgentGuidanceInstallReport {
@@ -1425,14 +1556,16 @@ function Onboarding({
   const [oauthError, setOauthError] = useState("");
   const [loginUrl, setLoginUrl] = useState("");
   const [loginCopyMessage, setLoginCopyMessage] = useState("");
-  const [selectedOnboardingConnector, setSelectedOnboardingConnector] = useState<OnboardingConnectorId>(
-    snapshot.mount.connector === "granola" || snapshot.connection.connector === "granola" ? "granola" : "notion",
+  const [selectedOnboardingConnector, setSelectedOnboardingConnector] = useState<OnboardingConnectorId>(() =>
+    onboardingConnectorFromSnapshot(snapshot),
   );
+  const [connectedOnboardingConnector, setConnectedOnboardingConnector] = useState<OnboardingConnectorId | null>(() => {
+    const connector = onboardingConnectorFromSnapshot(snapshot);
+    return connectionReady(snapshot) && !mountMissing(snapshot) ? connector : null;
+  });
   const [granolaApiKey, setGranolaApiKey] = useState("");
-  const [granolaReady, setGranolaReady] = useState(
-    snapshot.mount.connector === "granola" && connectionReady(snapshot),
-  );
-  const [granolaConnecting, setGranolaConnecting] = useState(false);
+  const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
+  const [connectorConnecting, setConnectorConnecting] = useState(false);
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
   const [mountPathDirty, setMountPathDirty] = useState(false);
@@ -1446,11 +1579,23 @@ function Onboarding({
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
   const mountStartRequestedRef = useRef(false);
-  const snapshotConnectionConnector = snapshot.connection.connector || "notion";
+  const snapshotConnectionConnector = isOnboardingConnector(snapshot.connection.connector)
+    ? snapshot.connection.connector
+    : null;
+  const snapshotMountConnector = isOnboardingConnector(snapshot.mount.connector)
+    ? snapshot.mount.connector
+    : null;
   const connectionReadyNow = selectedOnboardingConnector === "notion"
     ? oauthReady || (connectionReady(snapshot) && snapshotConnectionConnector === "notion")
-    : granolaReady || (connectionReady(snapshot) && snapshotConnectionConnector === "granola");
-  const selectedSourceName = selectedOnboardingConnector === "granola" ? "Granola" : "Notion";
+    : connectedOnboardingConnector === selectedOnboardingConnector ||
+      (
+        connectionReady(snapshot) &&
+        snapshotConnectionConnector === selectedOnboardingConnector &&
+        snapshotMountConnector === selectedOnboardingConnector &&
+        !mountMissing(snapshot)
+      );
+  const selectedSourceName = sourceDisplayName(selectedOnboardingConnector);
+  const selectedConnectorBusy = oauthInFlight || connectorConnecting;
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -1485,11 +1630,20 @@ function Onboarding({
   }, [snapshot.connection.workspaceName]);
 
   useEffect(() => {
-    if (snapshot.connection.connector === "granola" || snapshot.mount.connector === "granola") {
-      setSelectedOnboardingConnector("granola");
-      setGranolaReady(connectionReady(snapshot));
+    const connector = onboardingConnectorFromSnapshot(snapshot);
+    if (!connectionReady(snapshot)) {
+      return;
     }
-  }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.connector]);
+    if (connector === "notion") {
+      setOauthReady(true);
+    }
+    if (snapshot.mount.connector === connector && !mountMissing(snapshot)) {
+      setConnectedOnboardingConnector(connector);
+      if (connector !== "notion") {
+        setSelectedOnboardingConnector(connector);
+      }
+    }
+  }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.connector, snapshot.mount.status]);
 
   useEffect(() => {
     if (!mountPathDirty) {
@@ -1534,20 +1688,23 @@ function Onboarding({
       return;
     }
 
-    if (snapshot.connection.connector === "granola") {
-      setSelectedOnboardingConnector("granola");
-      setGranolaReady(true);
-    } else {
-      setSelectedOnboardingConnector("notion");
+    const connector = onboardingConnectorFromSnapshot(snapshot);
+    setSelectedOnboardingConnector(connector);
+    if (connector === "notion") {
       setOauthReady(true);
+    } else if (!mountMissing(snapshot)) {
+      setConnectedOnboardingConnector(connector);
     }
     setStep((current) => {
       if (mountMissing(snapshot)) {
+        if (connectorSkipsMountStep(connector)) {
+          return current < 3 ? 3 : current;
+        }
         return current < 4 ? 4 : current;
       }
       return current < 5 ? 5 : current;
     });
-  }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
+  }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.connector, snapshot.mount.status, snapshotLoaded]);
 
   useEffect(() => {
     if (
@@ -1666,8 +1823,100 @@ function Onboarding({
     await runConnectFlow({ openBrowser: true });
   }
 
+  async function createOnboardingConnectorMount(connector: Exclude<OnboardingConnectorId, "notion">) {
+    return callCommand<ActionReport>(
+      "create_desktop_mount",
+      {
+        request: {
+          connector,
+          path: sourceDefaultPath(snapshot, connector),
+          mountId: sourceMountId(connector),
+          connectionId: null,
+          readOnly: connector === "granola",
+          notionRootPage: null,
+          googleDocsWorkspaceFolder: connector === "google-docs"
+            ? googleDocsWorkspaceFolder.trim() || "Locality"
+            : null,
+        },
+      },
+      { ok: true, message: `Mounted demo ${sourceDisplayName(connector)} source.` },
+    );
+  }
+
+  async function connectGoogleOnboarding(connector: "google-docs" | "gmail") {
+    if (selectedConnectorBusy) {
+      return;
+    }
+    if (connector === "google-docs" && !googleDocsWorkspaceFolder.trim()) {
+      setOauthError("Enter a Google Drive folder name, URL, or ID.");
+      return;
+    }
+
+    setOauthError("");
+    setLoginCopyMessage("");
+    setMountOnboarding(null);
+    setOauthInFlight(true);
+    setStep(3);
+    try {
+      const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
+      const connectReport = await callCommand<ActionReport>(
+        command,
+        undefined,
+        { ok: true, message: `Connected demo ${sourceDisplayName(connector)} account.` },
+      );
+      if (!connectReport.ok) {
+        setOauthError(connectReport.message);
+        return;
+      }
+
+      const mountReport = await createOnboardingConnectorMount(connector);
+      if (!mountReport.ok) {
+        setOauthError(mountReport.message);
+        return;
+      }
+
+      const nextSnapshot = await callCommand<DesktopSnapshot>(
+        "desktop_snapshot",
+        undefined,
+        sampleSnapshot,
+      );
+      const sourceMount = nextSnapshot.mounts.find((mount) => mount.connector === connector)
+        ?? (nextSnapshot.mount.connector === connector ? nextSnapshot.mount : null);
+      setMountPathDirty(false);
+      setMountPath(sourceMount?.localPath || sourceDefaultPath(nextSnapshot, connector));
+      setConnectedWorkspace(sourceDisplayName(connector));
+      setConnectedOnboardingConnector(connector);
+      const cliReady = await ensureCliAvailable();
+      if (!cliReady) {
+        setOauthError(
+          `${sourceDisplayName(connector)} is connected, but Locality could not prepare the terminal command. Open Settings to repair Locality, then open the app.`,
+        );
+        return;
+      }
+      setStep(5);
+    } catch (error) {
+      setOauthError(errorMessage(error));
+    } finally {
+      setOauthInFlight(false);
+    }
+  }
+
+  async function connectSelectedOnboardingConnector() {
+    switch (selectedOnboardingConnector) {
+      case "notion":
+        await startConnect();
+        return;
+      case "google-docs":
+      case "gmail":
+        await connectGoogleOnboarding(selectedOnboardingConnector);
+        return;
+      case "granola":
+        await connectGranolaOnboarding();
+    }
+  }
+
   function selectOnboardingConnector(connector: OnboardingConnectorId) {
-    if (oauthInFlight || granolaConnecting || mounting) {
+    if (selectedConnectorBusy || mounting) {
       return;
     }
     setSelectedOnboardingConnector(connector);
@@ -1677,7 +1926,7 @@ function Onboarding({
   }
 
   async function connectGranolaOnboarding() {
-    if (granolaConnecting || !granolaApiKey.trim()) {
+    if (connectorConnecting || !granolaApiKey.trim()) {
       if (!granolaApiKey.trim()) {
         setOauthError("Enter a Granola API key.");
       }
@@ -1687,7 +1936,7 @@ function Onboarding({
     setOauthError("");
     setLoginCopyMessage("");
     setMountOnboarding(null);
-    setGranolaConnecting(true);
+    setConnectorConnecting(true);
     setStep(3);
     try {
       const report = await callCommand<ActionReport>(
@@ -1711,7 +1960,7 @@ function Onboarding({
       setMountPathDirty(false);
       setMountPath(nextMountPath);
       setConnectedWorkspace("Granola");
-      setGranolaReady(true);
+      setConnectedOnboardingConnector("granola");
       const cliReady = await ensureCliAvailable();
       if (!cliReady) {
         setOauthError(
@@ -1723,7 +1972,7 @@ function Onboarding({
     } catch (error) {
       setOauthError(errorMessage(error));
     } finally {
-      setGranolaConnecting(false);
+      setConnectorConnecting(false);
     }
   }
 
@@ -1876,7 +2125,7 @@ function Onboarding({
     }
     setOptionalGuideReturnStep(null);
     if (connectionReadyNow) {
-      setStep(selectedOnboardingConnector === "granola" ? 5 : 4);
+      setStep(connectorSkipsMountStep(selectedOnboardingConnector) ? 5 : 4);
       return;
     }
     setStep(3);
@@ -1973,89 +2222,89 @@ function Onboarding({
               <ConnectorOptions
                 selected={selectedOnboardingConnector}
                 connectedConnector={connectionReadyNow ? selectedOnboardingConnector : null}
-                busy={oauthInFlight || granolaConnecting}
+                busy={selectedConnectorBusy}
                 onSelect={selectOnboardingConnector}
               />
             }
           >
             <div>
               <div className="eyebrow">Connect source</div>
-              {(oauthInFlight || granolaConnecting || connectionReadyNow) && (
+              {(selectedConnectorBusy || connectionReadyNow) && (
                 <div className={`sync-note ${connectionReadyNow ? "connected" : ""}`}>
                   {connectionReadyNow ? <Check /> : <Loader2 className="spin-icon" />}
                   {connectionReadyNow ? `${selectedSourceName} connected` : `Waiting for ${selectedSourceName}`}
                 </div>
               )}
-              <h1>
-                {selectedOnboardingConnector === "granola"
-                  ? connectionReadyNow
-                    ? "Your Granola source is connected"
-                    : granolaConnecting
-                      ? "Checking Granola access."
-                      : "Start with Granola."
-                  : connectionReadyNow
-                    ? "Your Notion workspace is connected"
-                    : oauthInFlight
-                      ? "Finish connecting in Notion."
-                      : "Start with Notion."}
-              </h1>
+              <h1>{onboardingConnectorTitle(selectedOnboardingConnector, connectionReadyNow, selectedConnectorBusy)}</h1>
               <p>
-                {selectedOnboardingConnector === "granola"
-                  ? connectionReadyNow
-                    ? "Granola is ready. Locality mounted meeting summaries and transcripts as read-only files under CloudStorage."
-                    : granolaConnecting
-                      ? "Locality is validating the API key and creating a read-only Granola folder."
-                      : "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store."
-                  : connectionReadyNow
-                    ? `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare the local workspace.`
-                    : oauthInFlight
-                      ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
-                      : "Connect the source you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
+                {onboardingConnectorDescription(
+                  selectedOnboardingConnector,
+                  connectionReadyNow,
+                  selectedConnectorBusy,
+                  workspaceLabel,
+                )}
               </p>
             </div>
-            {selectedOnboardingConnector === "notion" && oauthInFlight && !connectionReadyNow && (
+            {connectorUsesOAuth(selectedOnboardingConnector) && oauthInFlight && !connectionReadyNow && (
               <ProgressList
-                items={[
-                  { label: "Browser opened", state: oauthError ? "idle" : "done" },
-                  { label: "Select workspace and pages", state: "active" },
-                  { label: "Approve access", state: "idle" },
-                ]}
+                items={selectedOnboardingConnector === "notion"
+                  ? [
+                      { label: "Browser opened", state: oauthError ? "idle" : "done" },
+                      { label: "Select workspace and pages", state: "active" },
+                      { label: "Approve access", state: "idle" },
+                    ]
+                  : [
+                      { label: "Browser opened", state: oauthError ? "idle" : "done" },
+                      { label: `Approve ${selectedSourceName} access`, state: "active" },
+                      { label: "Create local folder", state: "idle" },
+                    ]}
               />
             )}
             {selectedOnboardingConnector === "granola" && !connectionReadyNow && (
-              <label className="source-inline-field onboarding-api-key-field">
+              <label className="source-inline-field onboarding-source-field">
                 <span>Granola API key</span>
                 <input
                   type="password"
                   autoComplete="off"
                   value={granolaApiKey}
                   placeholder="Paste API key"
-                  disabled={granolaConnecting}
+                  disabled={connectorConnecting}
                   onChange={(event) => setGranolaApiKey(event.target.value)}
+                />
+              </label>
+            )}
+            {selectedOnboardingConnector === "google-docs" && !connectionReadyNow && (
+              <label className="source-inline-field onboarding-source-field">
+                <span>Drive folder</span>
+                <input
+                  value={googleDocsWorkspaceFolder}
+                  placeholder="Folder name, URL, or ID"
+                  disabled={oauthInFlight}
+                  onChange={(event) => setGoogleDocsWorkspaceFolder(event.target.value)}
                 />
               </label>
             )}
             <div className="button-row">
               <PrimaryButton
-                busy={(oauthInFlight || granolaConnecting) && !connectionReadyNow}
-                disabled={selectedOnboardingConnector === "granola" && !connectionReadyNow && !granolaApiKey.trim()}
+                busy={selectedConnectorBusy && !connectionReadyNow}
+                disabled={
+                  !connectionReadyNow &&
+                  (
+                    (selectedOnboardingConnector === "granola" && !granolaApiKey.trim()) ||
+                    (selectedOnboardingConnector === "google-docs" && !googleDocsWorkspaceFolder.trim())
+                  )
+                }
                 onClick={
                   connectionReadyNow
-                    ? () => setStep(selectedOnboardingConnector === "granola" ? 5 : 4)
-                    : selectedOnboardingConnector === "granola"
-                      ? () => void connectGranolaOnboarding()
-                      : startConnect
+                    ? () => setStep(connectorSkipsMountStep(selectedOnboardingConnector) ? 5 : 4)
+                    : () => void connectSelectedOnboardingConnector()
                 }
               >
                 {connectionReadyNow
                   ? "Continue"
-                  : selectedOnboardingConnector === "granola"
-                    ? granolaConnecting
-                      ? "Connecting Granola"
-                      : "Connect Granola"
-                    : oauthInFlight
-                      ? "Waiting for Notion"
-                      : "Connect Notion"}
+                  : selectedConnectorBusy
+                    ? `Connecting ${selectedSourceName}`
+                    : `Connect ${selectedSourceName}`}
               </PrimaryButton>
               {selectedOnboardingConnector === "notion" && (
                 <SecondaryButton
@@ -2070,19 +2319,9 @@ function Onboarding({
               )}
             </div>
             <div className="onboarding-pill-row">
-              {selectedOnboardingConnector === "granola" ? (
-                <>
-                  <span>Read-only</span>
-                  <span>Meeting summaries</span>
-                  <span>Transcripts</span>
-                </>
-              ) : (
-                <>
-                  <span>Scoped access</span>
-                  <span>Credentials in Keychain</span>
-                  <span>Direct app connection</span>
-                </>
-              )}
+              {onboardingConnectorPills(selectedOnboardingConnector).map((label) => (
+                <span key={label}>{label}</span>
+              ))}
             </div>
             {loginCopyMessage && <p className="quiet-note inline-note">{loginCopyMessage}</p>}
             {oauthError && <p className="field-error">{oauthError}</p>}
@@ -2156,11 +2395,7 @@ function Onboarding({
           <SetupContent mark={<BrandTile variant="ready" />} variant="final">
             <div>
               <h1>Locality is ready!</h1>
-              <p>
-                {selectedOnboardingConnector === "granola"
-                  ? "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits."
-                  : "Your local workspace is ready. Agents can open this folder, edit Markdown, and leave changes for Review Center. Open the app to review changes, manage sync, and turn on Live Mode when you want file saves to update Notion and new Notion changes to appear locally."}
-              </p>
+              <p>{onboardingReadyCopy(selectedOnboardingConnector)}</p>
             </div>
             {mountOnboarding && <p className="field-error">{mountOnboarding.message}</p>}
             <div className="final-actions">
@@ -2190,11 +2425,7 @@ function Onboarding({
               <div className="agent-demo-header">
                 <div>
                   <strong>Try this agent prompt</strong>
-                  <p>
-                    {selectedOnboardingConnector === "granola"
-                      ? "Ask an agent to use the mounted meeting files."
-                      : "Claude and Codex are now set up to use Locality."}
-                  </p>
+                  <p>{onboardingPromptHint(selectedOnboardingConnector)}</p>
                 </div>
                 <SecondaryButton
                   onClick={() => copyText(finalPrompt)}
@@ -3433,26 +3664,7 @@ function sourceActionIcon(connector: SourceConnectorId, needsConnection: boolean
 function ConnectorIcon({ connector }: { connector: SourceConnectorId }) {
   return (
     <span className={`connector-icon ${connector}`} aria-hidden="true">
-      {connector === "notion" && (
-        <svg viewBox="0 0 24 24" role="img">
-          <path d="M4.459 4.208c.746.606 1.026.56 2.428.466l13.215-.793c.28 0 .047-.28-.046-.326L17.86 1.968c-.42-.326-.981-.7-2.055-.607L3.01 2.295c-.466.046-.56.28-.374.466zm.793 3.08v13.904c0 .747.373 1.027 1.214.98l14.523-.84c.841-.046.935-.56.935-1.167V6.354c0-.606-.233-.933-.748-.887l-15.177.887c-.56.047-.747.327-.747.933zm14.337.745c.093.42 0 .84-.42.888l-.7.14v10.264c-.608.327-1.168.514-1.635.514-.748 0-.935-.234-1.495-.933l-4.577-7.186v6.952L12.21 19s0 .84-1.168.84l-3.222.186c-.093-.186 0-.653.327-.746l.84-.233V9.854L7.822 9.76c-.094-.42.14-1.026.793-1.073l3.456-.233 4.764 7.279v-6.44l-1.215-.139c-.093-.514.28-.887.747-.933zM1.936 1.035l13.31-.98c1.634-.14 2.055-.047 3.082.7l4.249 2.986c.7.513.934.653.934 1.213v16.378c0 1.026-.373 1.634-1.68 1.726l-15.458.934c-.98.047-1.448-.093-1.962-.747l-3.129-4.06c-.56-.747-.793-1.306-.793-1.96V2.667c0-.839.374-1.54 1.447-1.632z" />
-        </svg>
-      )}
-      {connector === "google-docs" && (
-        <svg viewBox="0 0 24 24" role="img">
-          <path d="M14.727 6.727H14V0H4.91c-.905 0-1.637.732-1.637 1.636v20.728c0 .904.732 1.636 1.636 1.636h14.182c.904 0 1.636-.732 1.636-1.636V6.727h-6zm-.545 10.455H7.09v-1.364h7.09v1.364zm2.727-3.273H7.091v-1.364h9.818v1.364zm0-3.273H7.091V9.273h9.818v1.363zM14.727 6h6l-6-6v6z" />
-        </svg>
-      )}
-      {connector === "gmail" && (
-        <svg viewBox="0 0 32 32" role="img">
-          <path className="gmail-envelope" d="M6.5 9.2h19v13.6c0 1-.8 1.8-1.8 1.8H8.3c-1 0-1.8-.8-1.8-1.8V9.2Z" />
-          <path className="gmail-blue" d="M6.5 10.1v12.7c0 1 .8 1.8 1.8 1.8h2.6V13.4L6.5 10.1Z" />
-          <path className="gmail-green" d="M21.1 13.4v11.2h2.6c1 0 1.8-.8 1.8-1.8V10.1l-4.4 3.3Z" />
-          <path className="gmail-yellow" d="M21.1 13.4 16 17.2v3.2l5.1-3.8v-3.2Z" />
-          <path className="gmail-red" d="M6.5 9.2c0-1.5 1.8-2.4 3-1.5L16 12.6l6.5-4.9c1.2-.9 3 .0 3 1.5v.9L16 17.2 6.5 10.1v-.9Z" />
-        </svg>
-      )}
-      {connector === "granola" && <span>G</span>}
+      <img src={CONNECTOR_ICON_URLS[connector]} alt="" draggable="false" />
     </span>
   );
 }
@@ -6688,7 +6900,33 @@ function ConnectorOptions({
           <strong>Notion</strong>
           <small>Pages, databases, properties, and Markdown edits.</small>
         </div>
-        <span>{connectedConnector === "notion" ? "Connected" : "Available"}</span>
+        <span>{connectedConnector === "notion" ? "Connected" : "OAuth"}</span>
+      </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "google-docs" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("google-docs")}
+      >
+        <ConnectorIcon connector="google-docs" />
+        <div>
+          <strong>Google Docs</strong>
+          <small>Docs and Drive folders through the same local model.</small>
+        </div>
+        <span>{connectedConnector === "google-docs" ? "Connected" : "OAuth"}</span>
+      </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "gmail" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("gmail")}
+      >
+        <ConnectorIcon connector="gmail" />
+        <div>
+          <strong>Gmail</strong>
+          <small>Inbox and sent as files, drafts as reviewed outbound mail.</small>
+        </div>
+        <span>{connectedConnector === "gmail" ? "Connected" : "OAuth"}</span>
       </button>
       <button
         type="button"
@@ -6703,22 +6941,6 @@ function ConnectorOptions({
         </div>
         <span>{connectedConnector === "granola" ? "Connected" : "API key"}</span>
       </button>
-      <div className="connector-option muted">
-        <ConnectorIcon connector="google-docs" />
-        <div>
-          <strong>Google Docs</strong>
-          <small>Docs and Drive folders through the same local model.</small>
-        </div>
-        <span>Add later</span>
-      </div>
-      <div className="connector-option muted">
-        <ConnectorIcon connector="gmail" />
-        <div>
-          <strong>Gmail</strong>
-          <small>Inbox and sent as files, drafts as reviewed outbound mail.</small>
-        </div>
-        <span>Add later</span>
-      </div>
     </div>
   );
 }
