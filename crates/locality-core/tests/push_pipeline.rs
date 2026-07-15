@@ -332,7 +332,7 @@ fn whole_entity_body_mode_omits_body_operation_when_body_is_unchanged() {
 
 #[test]
 fn whole_entity_body_erase_requires_destructive_confirmation() {
-    let parsed = parsed_doc("");
+    let parsed = parsed_doc(" \n\t");
     let shadow = shadow("Existing description.", ["paragraph-1"]);
 
     let output = plan_push_pipeline(
@@ -353,7 +353,7 @@ fn whole_entity_body_erase_requires_destructive_confirmation() {
     );
     assert!(matches!(
         output.plan.expect("plan").operations.as_slice(),
-        [PushOperation::UpdateEntityBody { body, .. }] if body.is_empty()
+        [PushOperation::UpdateEntityBody { body, .. }] if body == " \n\t"
     ));
 }
 

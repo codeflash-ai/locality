@@ -449,9 +449,12 @@ fn move_entity_reverses_from_shadow_parent_and_title() {
 
 #[test]
 fn archive_entity_reverses_to_restore_archived_entity() {
-    let entry = journal_entry(vec![PushOperation::ArchiveEntity {
-        entity_id: RemoteId::new("page-1"),
-    }]);
+    let entry = journal_entry_with_shadow(
+        vec![PushOperation::ArchiveEntity {
+            entity_id: RemoteId::new("page-1"),
+        }],
+        shadow_with_frontmatter(),
+    );
 
     let plan = plan_journal_undo(&entry);
 
@@ -483,6 +486,38 @@ fn archive_entity_without_entity_preimage_is_blocked() {
     assert_eq!(plan.status, UndoPlanStatus::Blocked);
     assert!(plan.operations.is_empty());
     assert_eq!(plan.unsupported[0].code, "missing_entity_preimage");
+}
+
+#[test]
+fn archive_entity_with_incomplete_entity_preimage_is_blocked() {
+    let incomplete_frontmatter = [
+        "",
+        "loc: [\n",
+        "loc:\n  type: page\n  parent: old-parent\ntitle: Roadmap\n",
+        "loc:\n  id: page-1\n  parent: old-parent\ntitle: Roadmap\n",
+        "loc:\n  id: page-1\n  type: page\ntitle: Roadmap\n",
+        "loc:\n  id: page-1\n  type: page\n  parent: old-parent\n",
+        "loc:\n  id: another-page\n  type: page\n  parent: old-parent\ntitle: Roadmap\n",
+        "loc:\n  id: page-1\n  type: future_kind\n  parent: old-parent\ntitle: Roadmap\n",
+    ];
+
+    for frontmatter in incomplete_frontmatter {
+        let entry = journal_entry_with_shadow(
+            vec![PushOperation::ArchiveEntity {
+                entity_id: RemoteId::new("page-1"),
+            }],
+            shadow().with_frontmatter(frontmatter),
+        );
+
+        let plan = plan_journal_undo(&entry);
+
+        assert_eq!(plan.status, UndoPlanStatus::Blocked, "{frontmatter:?}");
+        assert!(plan.operations.is_empty(), "{frontmatter:?}");
+        assert_eq!(
+            plan.unsupported[0].code, "missing_entity_preimage",
+            "{frontmatter:?}"
+        );
+    }
 }
 
 #[test]

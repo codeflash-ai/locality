@@ -630,41 +630,16 @@ fn sqlite_store_migrates_journals_component_v2_to_v3_without_rewriting_rows() {
     store
         .save_mount(fixture.mount_config())
         .expect("save mount");
-    let entry = journal_entry("push-v2", JournalStatus::Reconciled)
-        .with_apply_effects(apply_effects("push-v2"));
-    store
-        .append_journal(entry.clone())
-        .expect("append v2 journal");
     let connection = Connection::open(&store.db_path).expect("raw connection");
+    insert_released_v2_journal(&connection);
     connection
         .execute(
             "UPDATE state_components
-             SET version = 2, min_reader_version = 2
+             SET version = 2, min_reader_version = 1
              WHERE component_id = 'durable:journals'",
             [],
         )
         .expect("mark journal component v2");
-    let plan_json: String = connection
-        .query_row(
-            "SELECT plan_json FROM journals WHERE push_id = 'push-v2'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("v3 plan json");
-    let mut v2_plan: serde_json::Value = serde_json::from_str(&plan_json).expect("parse plan json");
-    assert!(
-        v2_plan["summary"]
-            .as_object_mut()
-            .expect("plan summary")
-            .remove("entity_bodies_updated")
-            .is_some()
-    );
-    connection
-        .execute(
-            "UPDATE journals SET plan_json = ?1 WHERE push_id = 'push-v2'",
-            params![serde_json::to_string(&v2_plan).expect("serialize v2 plan")],
-        )
-        .expect("install released-v2-shaped plan json");
     let before_row = journal_json_row(&connection, "push-v2");
     let before_user_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -708,7 +683,62 @@ fn sqlite_store_migrates_journals_component_v2_to_v3_without_rewriting_rows() {
     assert_eq!(before_user_version, 18);
     assert_eq!(after_user_version, before_user_version);
     assert_eq!(after_row, before_row);
-    assert_eq!(loaded, entry);
+    assert_eq!(
+        loaded,
+        journal_entry("push-v2", JournalStatus::Reconciled)
+            .with_apply_effects(apply_effects("push-v2"))
+    );
+}
+
+#[test]
+fn sqlite_store_migrates_journals_component_v1_to_v3_at_current_schema() {
+    let fixture = SqliteFixture::new();
+    let store = fixture.open();
+    let connection = Connection::open(&store.db_path).expect("raw connection");
+    let before_user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    connection
+        .execute(
+            "UPDATE state_components
+             SET version = 1, min_reader_version = 1
+             WHERE component_id = 'durable:journals'",
+            [],
+        )
+        .expect("mark journal component v1");
+    drop(connection);
+    drop(store);
+
+    let before =
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v1");
+    assert_eq!(before.status, StateCompatibilityStatus::Migratable);
+    assert_eq!(
+        before.issues,
+        vec![StateCompatibilityIssue::OlderComponent {
+            component_id: "durable:journals".to_string(),
+            found: 1,
+            current: 3,
+        }]
+    );
+
+    let reopened = fixture.open();
+    let connection = Connection::open(&reopened.db_path).expect("raw reopened connection");
+    let component: (i64, i64) = connection
+        .query_row(
+            "SELECT version, min_reader_version
+             FROM state_components
+             WHERE component_id = 'durable:journals'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("journal component metadata");
+    let after_user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+
+    assert_eq!(component, (3, 3));
+    assert_eq!(before_user_version, 18);
+    assert_eq!(after_user_version, before_user_version);
 }
 
 #[test]
@@ -3738,14 +3768,52 @@ fn sqlite_table_exists(connection: &Connection, table_name: &str) -> bool {
     table_count > 0
 }
 
+fn insert_released_v2_journal(connection: &Connection) {
+    let remote_ids_json = r#"["page-1"]"#;
+    let plan_json = r#"{"affected_entities":["page-1"],"operations":[{"type":"update_block","block_id":"paragraph-1","content":"Updated paragraph."}],"summary":{"blocks_created":0,"blocks_updated":1,"blocks_replaced":0,"blocks_moved":0,"media_updated":0,"blocks_archived":0,"entities_created":0,"entities_archived":0,"entities_moved":0,"properties_updated":0},"degradations":[]}"#;
+    let preimages_json = r##"[{"entity_id":"page-1","shadow":{"entity_id":"page-1","frontmatter":"","body_hash":"d05d9331a801383f","rendered_body":"# Roadmap\n\nOriginal paragraph.","blocks":[{"remote_id":"heading-1","kind":{"kind":"heading"},"source_span":{"start_line":9,"end_line":9},"content_hash":"5257459b6984ca92","text":"# Roadmap"},{"remote_id":"paragraph-1","kind":{"kind":"paragraph"},"source_span":{"start_line":11,"end_line":11},"content_hash":"4133f128f2b4432a","text":"Original paragraph."}]}}]"##;
+    let apply_effects_json = r#"[{"type":"updated_block","operation_id":"push-v2:0:update_block:paragraph-1","operation_index":0,"block_id":"paragraph-1"}]"#;
+    let status_json = r#""reconciled""#;
+    let metadata_json = r#"{"author":{"kind":"anonymous","display_name":"anonymous"}}"#;
+
+    connection
+        .execute(
+            "INSERT INTO journals (
+                push_id, mount_id, remote_ids_json, plan_json, preimages_json,
+                apply_effects_json, status_json, metadata_json, readable_diff_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+            params![
+                "push-v2",
+                "notion-main",
+                remote_ids_json,
+                plan_json,
+                preimages_json,
+                apply_effects_json,
+                status_json,
+                metadata_json,
+            ],
+        )
+        .expect("insert released v2 journal");
+}
+
 fn journal_json_row(
     connection: &Connection,
     push_id: &str,
-) -> (String, String, String, String, String, Option<String>) {
+) -> (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+) {
     connection
         .query_row(
-            "SELECT plan_json, preimages_json, apply_effects_json, status_json,
-                    metadata_json, readable_diff_json
+            "SELECT push_id, mount_id, remote_ids_json, plan_json, preimages_json,
+                    apply_effects_json, status_json, metadata_json, readable_diff_json
              FROM journals
              WHERE push_id = ?1",
             params![push_id],
@@ -3757,6 +3825,9 @@ fn journal_json_row(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )

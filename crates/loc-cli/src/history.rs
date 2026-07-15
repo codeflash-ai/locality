@@ -24,10 +24,11 @@ use locality_store::{
 };
 use localityd::contents_match_shadow;
 use localityd::file_provider;
-use localityd::virtual_fs::virtual_fs_content_path;
+use localityd::virtual_fs::{virtual_fs_ancestor_container_identifiers, virtual_fs_content_path};
 use serde::Serialize;
 
 use crate::diff::{PlanSummaryOutput, PropertyUpdateOutput, PropertyValueOutput};
+use crate::file_provider as file_provider_helper;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogOptions {
@@ -236,6 +237,7 @@ where
         });
     }
 
+    ensure_undo_target_is_latest(store, &entry, &undo_plan)?;
     preflight_undo_local_state(store, &entry, &undo_plan, state_root)?;
 
     let apply_result = match applier.apply_undo(UndoApplyRequest {
@@ -264,7 +266,9 @@ where
         }
     };
 
-    reconcile_undo_preimages(
+    ensure_complete_undo_apply_result(&entry, &undo_plan, &apply_result.changed_remote_ids)?;
+
+    let projection_refreshes = reconcile_undo_preimages(
         store,
         &entry,
         &undo_plan,
@@ -273,9 +277,12 @@ where
         state_root,
     )?;
 
-    store
-        .update_journal_status(&push_id, JournalStatus::Reverted)
-        .map_err(HistoryError::Store)?;
+    finalize_undo_after_reconcile(
+        store,
+        &push_id,
+        &projection_refreshes,
+        apply_undo_projection_refresh,
+    )?;
     let mut reverted = entry;
     reverted.status = JournalStatus::Reverted;
 
@@ -294,6 +301,164 @@ where
         undo_plan: Some(UndoPlanOutput::from(undo_plan)),
         entry: Some(JournalEntryOutput::from_entry(reverted, false)),
     })
+}
+
+#[derive(Clone, Debug)]
+enum UndoProjectionRefresh {
+    VisibleEntity {
+        state_root: PathBuf,
+        mount_id: MountId,
+        entity_id: RemoteId,
+        previous_shadow: locality_core::shadow::ShadowDocument,
+    },
+    MacosContainers {
+        mount: MountConfig,
+        identifiers: Vec<String>,
+    },
+}
+
+fn finalize_undo_after_reconcile<S, F>(
+    store: &mut S,
+    push_id: &PushId,
+    refreshes: &[UndoProjectionRefresh],
+    mut refresh: F,
+) -> Result<(), HistoryError>
+where
+    S: JournalRepository,
+    F: FnMut(&S, &UndoProjectionRefresh) -> Result<(), HistoryError>,
+{
+    store
+        .update_journal_status(push_id, JournalStatus::Reverted)
+        .map_err(HistoryError::Store)?;
+
+    let mut first_error = None;
+    for request in refreshes {
+        if let Err(error) = refresh(store, request)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn apply_undo_projection_refresh<S>(
+    store: &S,
+    refresh: &UndoProjectionRefresh,
+) -> Result<(), HistoryError>
+where
+    S: MountRepository + EntityRepository,
+{
+    match refresh {
+        UndoProjectionRefresh::VisibleEntity {
+            state_root,
+            mount_id,
+            entity_id,
+            previous_shadow,
+        } => {
+            let report = file_provider::refresh_visible_entity_projection_if_clean(
+                store,
+                state_root,
+                mount_id,
+                entity_id,
+                previous_shadow,
+            )
+            .map_err(|error| HistoryError::Store(StoreError::Io(error.to_string())))?;
+            if report.skipped_local_changes > 0 {
+                return Err(unsafe_undo_local_state(
+                    entity_id,
+                    "visible provider replica changed while remote undo was applying",
+                ));
+            }
+            Ok(())
+        }
+        UndoProjectionRefresh::MacosContainers { mount, identifiers } => {
+            signal_macos_projection_identifiers(mount, identifiers.clone())
+        }
+    }
+}
+
+fn ensure_undo_target_is_latest<S>(
+    store: &S,
+    entry: &JournalEntry,
+    undo_plan: &UndoPlan,
+) -> Result<(), HistoryError>
+where
+    S: JournalRepository,
+{
+    for entity_id in undo_touched_entity_ids(entry, undo_plan) {
+        let latest_push_id = store
+            .latest_journal_for_entities(&entry.mount_id, std::slice::from_ref(&entity_id))
+            .map_err(HistoryError::Store)?;
+        if latest_push_id.as_ref() != Some(&entry.push_id) {
+            return Err(HistoryError::UndoNotLatest {
+                push_id: entry.push_id.clone(),
+                entity_id,
+                latest_push_id,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn undo_touched_entity_ids(entry: &JournalEntry, undo_plan: &UndoPlan) -> BTreeSet<RemoteId> {
+    let mut entity_ids = entry.remote_ids.iter().cloned().collect::<BTreeSet<_>>();
+    entity_ids.extend(entry.plan.affected_entities.iter().cloned());
+    entity_ids.extend(
+        entry
+            .preimages
+            .iter()
+            .map(|preimage| preimage.entity_id.clone()),
+    );
+    entity_ids.extend(
+        undo_plan
+            .operations
+            .iter()
+            .filter_map(entity_undo_operation_id),
+    );
+    entity_ids
+}
+
+fn entity_undo_operation_id(operation: &UndoOperation) -> Option<RemoteId> {
+    match operation {
+        UndoOperation::ArchiveCreatedEntity { entity_id, .. }
+        | UndoOperation::RestoreEntityBody { entity_id, .. }
+        | UndoOperation::RestoreProperties { entity_id, .. }
+        | UndoOperation::RestoreEntityLocation { entity_id, .. }
+        | UndoOperation::RestoreArchivedEntity { entity_id } => Some(entity_id.clone()),
+        UndoOperation::RestoreBlockContent { .. }
+        | UndoOperation::MoveBlock { .. }
+        | UndoOperation::RestoreArchivedBlock { .. }
+        | UndoOperation::ArchiveCreatedBlock { .. } => None,
+    }
+}
+
+fn ensure_complete_undo_apply_result(
+    entry: &JournalEntry,
+    undo_plan: &UndoPlan,
+    changed_remote_ids: &[RemoteId],
+) -> Result<(), HistoryError> {
+    let mut required = entry
+        .preimages
+        .iter()
+        .map(|preimage| preimage.entity_id.clone())
+        .collect::<BTreeSet<_>>();
+    required.extend(
+        undo_plan
+            .operations
+            .iter()
+            .filter_map(entity_undo_operation_id),
+    );
+    let changed = changed_remote_ids.iter().collect::<BTreeSet<_>>();
+    let missing = required
+        .into_iter()
+        .filter(|entity_id| !changed.contains(entity_id))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(HistoryError::IncompleteUndoApplyResult { missing })
+    }
 }
 
 fn preflight_undo_local_state<S>(
@@ -332,6 +497,15 @@ where
         .map_err(HistoryError::Store)?;
 
     for entity_id in entity_ids {
+        if mutations
+            .iter()
+            .any(|mutation| mutation.target_remote_id.as_ref() == Some(&entity_id))
+        {
+            return Err(unsafe_undo_local_state(
+                &entity_id,
+                "entity has a pending local filesystem mutation",
+            ));
+        }
         let entity = store
             .get_entity(&entry.mount_id, &entity_id)
             .map_err(HistoryError::Store)?;
@@ -362,10 +536,10 @@ where
                 "entity is dirty, conflicted, or not fully hydrated",
             ));
         }
-        if mutations.iter().any(|mutation| {
-            mutation.target_remote_id.as_ref() == Some(&entity_id)
-                || mutation.projected_path == entity.path
-        }) {
+        if mutations
+            .iter()
+            .any(|mutation| mutation.projected_path == entity.path)
+        {
             return Err(unsafe_undo_local_state(
                 &entity_id,
                 "entity has a pending local filesystem mutation",
@@ -384,13 +558,13 @@ where
                 "entity content hash does not match its synced shadow",
             ));
         }
-        let (content_path, visible_path) =
+        let (content_path, visible_paths) =
             undo_entity_projection_paths(state_root, &mount, &entity)?;
         verify_projection_matches_shadow(&entity_id, &content_path, &shadow)?;
-        if let Some(visible_path) = visible_path
-            && visible_path.exists()
-        {
-            verify_projection_matches_shadow(&entity_id, &visible_path, &shadow)?;
+        for visible_path in visible_paths {
+            if visible_path.exists() {
+                verify_projection_matches_shadow(&entity_id, &visible_path, &shadow)?;
+            }
         }
     }
 
@@ -401,14 +575,20 @@ fn undo_entity_projection_paths(
     state_root: Option<&Path>,
     mount: &MountConfig,
     entity: &EntityRecord,
-) -> Result<(PathBuf, Option<PathBuf>), HistoryError> {
+) -> Result<(PathBuf, Vec<PathBuf>), HistoryError> {
     let content_path = undo_projection_write_path(state_root, mount, &entity.path)?;
-    let visible_path = mount
-        .projection
-        .uses_virtual_filesystem()
-        .then(|| mount.root.join(&entity.path))
-        .filter(|path| path != &content_path);
-    Ok((content_path, visible_path))
+    let mut visible_paths = if mount.projection.uses_virtual_filesystem() {
+        file_provider::mount_access_roots(mount)
+            .into_iter()
+            .map(|root| root.join(&entity.path))
+            .filter(|path| path != &content_path)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    visible_paths.sort();
+    visible_paths.dedup();
+    Ok((content_path, visible_paths))
 }
 
 fn verify_projection_matches_shadow(
@@ -448,10 +628,11 @@ fn reconcile_undo_preimages<S>(
     changed_remote_ids: &[RemoteId],
     observations: &[RemoteObservation],
     state_root: Option<&Path>,
-) -> Result<(), HistoryError>
+) -> Result<Vec<UndoProjectionRefresh>, HistoryError>
 where
     S: MountRepository + EntityRepository + ShadowRepository + VirtualMutationRepository,
 {
+    let mut projection_refreshes = Vec::new();
     let entity_observations = validate_entity_undo_observations(
         store,
         entry,
@@ -461,7 +642,7 @@ where
     )?;
     preflight_undo_local_state(store, entry, undo_plan, state_root)?;
     if changed_remote_ids.is_empty() {
-        return Ok(());
+        return Ok(projection_refreshes);
     }
     let mounts = store.load_mounts().map_err(HistoryError::Store)?;
     let mount = mounts
@@ -469,6 +650,14 @@ where
         .find(|mount| mount.mount_id == entry.mount_id)
         .ok_or_else(|| HistoryError::MountNotFound(PathBuf::from(entry.mount_id.0.clone())))?
         .clone();
+    preflight_undo_reconciliation_paths(
+        store,
+        entry,
+        changed_remote_ids,
+        &entity_observations,
+        state_root,
+        &mount,
+    )?;
 
     for preimage in entry
         .preimages
@@ -479,6 +668,19 @@ where
             .get_entity(&entry.mount_id, &preimage.entity_id)
             .map_err(HistoryError::Store)?;
         let previous_path = existing.as_ref().map(|entity| entity.path.clone());
+        let previous_shadow = existing
+            .as_ref()
+            .map(|_| store.load_shadow(&entry.mount_id, &preimage.entity_id))
+            .transpose()
+            .map_err(HistoryError::Store)?;
+        let previous_refresh_identifiers = if mount.projection.uses_virtual_filesystem()
+            && existing.is_some()
+        {
+            virtual_fs_ancestor_container_identifiers(store, &entry.mount_id, &preimage.entity_id)
+                .map_err(|error| HistoryError::Store(StoreError::Io(error.to_string())))?
+        } else {
+            Vec::new()
+        };
         let mut entity = match existing {
             Some(entity) => entity,
             None if undo_plan.operations.iter().any(|operation| {
@@ -519,19 +721,6 @@ where
             );
         }
         let write_path = undo_projection_write_path(state_root, &mount, &entity.path)?;
-        if previous_path
-            .as_ref()
-            .is_none_or(|previous_path| previous_path != &entity.path)
-            && write_path.exists()
-        {
-            return Err(invalid_undo_observation(
-                &preimage.entity_id,
-                format!(
-                    "restored projection path `{}` already exists",
-                    entity.path.display()
-                ),
-            ));
-        }
         let frontmatter = if preimage.shadow.frontmatter.trim().is_empty() {
             frontmatter_from_entity(&entity)
         } else {
@@ -569,6 +758,24 @@ where
             .save_shadow(&entry.mount_id, preimage.shadow.clone())
             .map_err(HistoryError::Store)?;
         store.save_entity(entity).map_err(HistoryError::Store)?;
+        if let (Some(state_root), Some(previous_shadow)) = (state_root, previous_shadow.as_ref())
+            && direct_visible_undo_refresh_enabled(&mount.projection)
+        {
+            projection_refreshes.push(UndoProjectionRefresh::VisibleEntity {
+                state_root: state_root.to_path_buf(),
+                mount_id: entry.mount_id.clone(),
+                entity_id: preimage.entity_id.clone(),
+                previous_shadow: previous_shadow.clone(),
+            });
+        }
+        if let Some(refresh) = undo_projection_refresh_request(
+            store,
+            &mount,
+            &preimage.entity_id,
+            previous_refresh_identifiers,
+        )? {
+            projection_refreshes.push(refresh);
+        }
     }
 
     for operation in &undo_plan.operations {
@@ -581,19 +788,228 @@ where
             .ok_or_else(|| {
                 unsafe_undo_local_state(entity_id, "created entity disappeared during undo")
             })?;
-        let (content_path, visible_path) =
+        let refresh_identifiers = if mount.projection.uses_virtual_filesystem() {
+            virtual_fs_ancestor_container_identifiers(store, &entry.mount_id, entity_id)
+                .map_err(|error| HistoryError::Store(StoreError::Io(error.to_string())))?
+        } else {
+            Vec::new()
+        };
+        let (content_path, visible_paths) =
             undo_entity_projection_paths(state_root, &mount, &entity)?;
         remove_undo_projection(&content_path)?;
-        if let Some(visible_path) = visible_path
-            && visible_path.exists()
-        {
-            remove_undo_projection(&visible_path)?;
+        if !mount.projection.uses_virtual_filesystem() {
+            for visible_path in visible_paths {
+                if visible_path.exists() {
+                    remove_undo_projection(&visible_path)?;
+                }
+            }
         }
         store
             .delete_entity(&entry.mount_id, entity_id)
             .map_err(HistoryError::Store)?;
+        if mount.projection == locality_store::ProjectionMode::MacosFileProvider {
+            projection_refreshes.push(UndoProjectionRefresh::MacosContainers {
+                mount: mount.clone(),
+                identifiers: refresh_identifiers,
+            });
+        }
     }
 
+    Ok(projection_refreshes)
+}
+
+fn direct_visible_undo_refresh_enabled(projection: &locality_store::ProjectionMode) -> bool {
+    matches!(
+        projection,
+        locality_store::ProjectionMode::WindowsCloudFiles
+    )
+}
+
+fn preflight_undo_reconciliation_paths<S>(
+    store: &S,
+    entry: &JournalEntry,
+    changed_remote_ids: &[RemoteId],
+    entity_observations: &BTreeMap<RemoteId, (RemoteObservation, PathBuf)>,
+    state_root: Option<&Path>,
+    mount: &MountConfig,
+) -> Result<(), HistoryError>
+where
+    S: EntityRepository + VirtualMutationRepository,
+{
+    let entities = store
+        .list_entities(&entry.mount_id)
+        .map_err(HistoryError::Store)?;
+    let mutations = store
+        .list_virtual_mutations(&entry.mount_id)
+        .map_err(HistoryError::Store)?;
+
+    for preimage in entry
+        .preimages
+        .iter()
+        .filter(|preimage| changed_remote_ids.contains(&preimage.entity_id))
+    {
+        let existing = store
+            .get_entity(&entry.mount_id, &preimage.entity_id)
+            .map_err(HistoryError::Store)?;
+        let destination = entity_observations
+            .get(&preimage.entity_id)
+            .map(|(_, path)| path.clone())
+            .or_else(|| existing.as_ref().map(|entity| entity.path.clone()));
+        let Some(destination) = destination else {
+            continue;
+        };
+        if existing
+            .as_ref()
+            .is_some_and(|entity| entity.path == destination)
+        {
+            continue;
+        }
+
+        if let Some(mutation) = mutations
+            .iter()
+            .find(|mutation| mutation.projected_path == destination)
+        {
+            return Err(invalid_undo_observation(
+                &preimage.entity_id,
+                format!(
+                    "restored projection path `{}` is reserved by local mutation `{}`",
+                    destination.display(),
+                    mutation.local_id
+                ),
+            ));
+        }
+        if is_page_document_destination(&destination)
+            && page_container_owned_by_another(
+                &entities,
+                &mutations,
+                &preimage.entity_id,
+                &destination,
+            )
+        {
+            return Err(invalid_undo_observation(
+                &preimage.entity_id,
+                format!(
+                    "restored page container `{}` is already owned",
+                    page_container_path(&destination).display()
+                ),
+            ));
+        }
+
+        let backing_path = undo_projection_write_path(state_root, mount, &destination)?;
+        preflight_undo_destination_path(&preimage.entity_id, &destination, &backing_path)?;
+        if mount.projection.uses_virtual_filesystem() {
+            for root in file_provider::mount_access_roots(mount) {
+                let visible_path = root.join(&destination);
+                if visible_path != backing_path {
+                    preflight_undo_destination_path(
+                        &preimage.entity_id,
+                        &destination,
+                        &visible_path,
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_page_document_destination(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "page.md")
+}
+
+fn page_container_owned_by_another(
+    entities: &[EntityRecord],
+    mutations: &[locality_store::VirtualMutationRecord],
+    entity_id: &RemoteId,
+    destination: &Path,
+) -> bool {
+    let container = page_container_path(destination);
+    entities.iter().any(|entity| {
+        entity.remote_id != *entity_id
+            && entity.kind == locality_core::model::EntityKind::Page
+            && page_container_path(&entity.path) == container
+    }) || mutations.iter().any(|mutation| {
+        is_page_document_destination(&mutation.projected_path)
+            && page_container_path(&mutation.projected_path) == container
+    })
+}
+
+fn preflight_undo_destination_path(
+    entity_id: &RemoteId,
+    relative_path: &Path,
+    path: &Path,
+) -> Result<(), HistoryError> {
+    let page_container_exists = is_page_document_destination(relative_path)
+        && path.parent().is_some_and(|parent| parent.exists());
+    if path.exists() || page_container_exists {
+        return Err(invalid_undo_observation(
+            entity_id,
+            format!(
+                "restored projection path `{}` already exists at `{}`",
+                relative_path.display(),
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn undo_projection_refresh_request<S>(
+    store: &S,
+    mount: &MountConfig,
+    entity_id: &RemoteId,
+    mut identifiers: Vec<String>,
+) -> Result<Option<UndoProjectionRefresh>, HistoryError>
+where
+    S: MountRepository + EntityRepository,
+{
+    if mount.projection != locality_store::ProjectionMode::MacosFileProvider {
+        return Ok(None);
+    }
+    let current = virtual_fs_ancestor_container_identifiers(store, &mount.mount_id, entity_id)
+        .map_err(|error| HistoryError::Store(StoreError::Io(error.to_string())))?;
+    identifiers.extend(current);
+    Ok(Some(UndoProjectionRefresh::MacosContainers {
+        mount: mount.clone(),
+        identifiers,
+    }))
+}
+
+fn signal_macos_projection_identifiers(
+    mount: &MountConfig,
+    identifiers: Vec<String>,
+) -> Result<(), HistoryError> {
+    signal_macos_projection_identifiers_with(mount, identifiers, |mount_id, identifier| {
+        file_provider_helper::refresh_macos_file_provider_container(mount_id, identifier)
+            .map(|_| ())
+            .map_err(|error| error.message())
+    })
+}
+
+fn signal_macos_projection_identifiers_with<F>(
+    mount: &MountConfig,
+    mut identifiers: Vec<String>,
+    mut refresh: F,
+) -> Result<(), HistoryError>
+where
+    F: FnMut(&str, &str) -> Result<(), String>,
+{
+    if mount.projection != locality_store::ProjectionMode::MacosFileProvider {
+        return Ok(());
+    }
+    identifiers.push("working-set".to_string());
+    identifiers.sort();
+    identifiers.dedup();
+    for identifier in identifiers {
+        refresh(&mount.mount_id.0, &identifier).map_err(|reason| {
+            HistoryError::UndoProjectionRefreshFailed {
+                mount_id: mount.mount_id.clone(),
+                identifier,
+                reason,
+            }
+        })?;
+    }
     Ok(())
 }
 
@@ -609,35 +1025,47 @@ where
 {
     let mut validated = BTreeMap::new();
     for operation in &undo_plan.operations {
-        let (entity_id, expected_deleted, expected_parent_id, expected_title) = match operation {
-            UndoOperation::RestoreEntityLocation {
-                entity_id,
-                previous_parent_id,
-                previous_title,
-                ..
-            } => (
-                entity_id,
-                false,
-                Some(previous_parent_id.clone()),
-                Some(previous_title.as_str()),
-            ),
-            UndoOperation::RestoreArchivedEntity { entity_id } => (
-                entity_id,
-                false,
-                journal_preimage_parent_id(entry, entity_id),
-                None,
-            ),
-            UndoOperation::ArchiveCreatedEntity {
-                entity_id,
-                expected,
-            } => (
-                entity_id,
-                true,
-                archive_created_expected_parent_id(entry, entity_id, expected.as_ref()),
-                None,
-            ),
-            _ => continue,
-        };
+        let (entity_id, expected_deleted, expected_parent_id, expected_title, expected_kind) =
+            match operation {
+                UndoOperation::RestoreEntityLocation {
+                    entity_id,
+                    previous_parent_id,
+                    previous_title,
+                    ..
+                } => {
+                    let kind = indexed_entity_kind(store, &entry.mount_id, entity_id)?;
+                    (
+                        entity_id,
+                        false,
+                        Some(previous_parent_id.clone()),
+                        Some(previous_title.as_str()),
+                        kind,
+                    )
+                }
+                UndoOperation::RestoreArchivedEntity { entity_id } => (
+                    entity_id,
+                    false,
+                    journal_preimage_parent_id(entry, entity_id),
+                    None,
+                    journal_preimage_entity_kind(entry, entity_id).ok_or_else(|| {
+                        invalid_undo_observation(entity_id, "entity preimage has no valid kind")
+                    })?,
+                ),
+                UndoOperation::ArchiveCreatedEntity {
+                    entity_id,
+                    expected,
+                } => {
+                    let kind = indexed_entity_kind(store, &entry.mount_id, entity_id)?;
+                    (
+                        entity_id,
+                        true,
+                        archive_created_expected_parent_id(entry, entity_id, expected.as_ref()),
+                        None,
+                        kind,
+                    )
+                }
+                _ => continue,
+            };
 
         if !changed_remote_ids.contains(entity_id) {
             return Err(invalid_undo_observation(
@@ -672,15 +1100,16 @@ where
                 },
             ));
         }
-        if expected_parent_id
-            .as_ref()
-            .is_some_and(|expected_parent_id| {
-                observation.parent_remote_id.as_ref() != Some(expected_parent_id)
-            })
-        {
+        if observation.parent_remote_id != expected_parent_id {
             return Err(invalid_undo_observation(
                 entity_id,
                 "observation does not report the expected parent",
+            ));
+        }
+        if observation.kind != expected_kind {
+            return Err(invalid_undo_observation(
+                entity_id,
+                "observation does not report the expected entity kind",
             ));
         }
         if expected_title.is_some_and(|expected_title| observation.title != expected_title) {
@@ -700,6 +1129,21 @@ where
         validated.insert(entity_id.clone(), (observation.clone(), path));
     }
     Ok(validated)
+}
+
+fn indexed_entity_kind<S>(
+    store: &S,
+    mount_id: &MountId,
+    entity_id: &RemoteId,
+) -> Result<locality_core::model::EntityKind, HistoryError>
+where
+    S: EntityRepository,
+{
+    store
+        .get_entity(mount_id, entity_id)
+        .map_err(HistoryError::Store)?
+        .map(|entity| entity.kind)
+        .ok_or_else(|| invalid_undo_observation(entity_id, "entity is not indexed locally"))
 }
 
 fn validated_undo_observation_path<S>(
@@ -724,13 +1168,6 @@ where
             "observation contains an invalid projected path",
         ));
     }
-    let is_relative_page_container = kind == &locality_core::model::EntityKind::Page
-        && projected_path.components().count() == 2
-        && projected_path
-            .file_name()
-            .is_some_and(|name| name == "page.md");
-    let relative_shape_is_valid =
-        projected_path.components().count() == 1 || is_relative_page_container;
     let resolved_path = if let Some(parent_id) = parent_id {
         let parent = store
             .get_entity(mount_id, parent_id)
@@ -742,9 +1179,15 @@ where
             parent.path
         };
 
-        if projected_path.starts_with(&parent_path) {
+        if let Ok(relative) = projected_path.strip_prefix(&parent_path) {
+            if !valid_observation_leaf_shape(relative, kind) {
+                return Err(invalid_undo_observation(
+                    entity_id,
+                    "observation projected path is nested too deeply below the restored parent",
+                ));
+            }
             projected_path.to_path_buf()
-        } else if relative_shape_is_valid {
+        } else if valid_observation_leaf_shape(projected_path, kind) {
             parent_path.join(projected_path)
         } else {
             Err(invalid_undo_observation(
@@ -752,7 +1195,7 @@ where
                 "observation projected path does not belong to the restored parent",
             ))?
         }
-    } else if relative_shape_is_valid {
+    } else if valid_observation_leaf_shape(projected_path, kind) {
         projected_path.to_path_buf()
     } else {
         return Err(invalid_undo_observation(
@@ -777,6 +1220,13 @@ where
     Ok(resolved_path)
 }
 
+fn valid_observation_leaf_shape(path: &Path, kind: &locality_core::model::EntityKind) -> bool {
+    path.components().count() == 1
+        || (kind == &locality_core::model::EntityKind::Page
+            && path.components().count() == 2
+            && path.file_name().is_some_and(|name| name == "page.md"))
+}
+
 fn journal_preimage_parent_id(entry: &JournalEntry, entity_id: &RemoteId) -> Option<RemoteId> {
     let shadow = entry
         .preimages
@@ -791,6 +1241,25 @@ fn journal_preimage_parent_id(entry: &JournalEntry, entity_id: &RemoteId) -> Opt
     .frontmatter
     .loc?
     .parent
+}
+
+fn journal_preimage_entity_kind(
+    entry: &JournalEntry,
+    entity_id: &RemoteId,
+) -> Option<locality_core::model::EntityKind> {
+    let shadow = entry
+        .preimages
+        .iter()
+        .find(|preimage| &preimage.entity_id == entity_id)
+        .map(|preimage| &preimage.shadow)?;
+    parse_canonical_markdown(&render_canonical_markdown(&CanonicalDocument::new(
+        shadow.frontmatter.clone(),
+        shadow.rendered_body.clone(),
+    )))
+    .ok()?
+    .frontmatter
+    .loc?
+    .entity_type
 }
 
 fn archive_created_expected_parent_id(
@@ -1168,8 +1637,27 @@ impl From<UnsupportedUndoOperation> for UnsupportedUndoOutput {
 pub enum HistoryError {
     MountNotFound(PathBuf),
     JournalNotFound(PushId),
-    InvalidUndoObservation { entity_id: RemoteId, reason: String },
-    UnsafeUndoLocalState { entity_id: RemoteId, reason: String },
+    UndoNotLatest {
+        push_id: PushId,
+        entity_id: RemoteId,
+        latest_push_id: Option<PushId>,
+    },
+    IncompleteUndoApplyResult {
+        missing: Vec<RemoteId>,
+    },
+    UndoProjectionRefreshFailed {
+        mount_id: MountId,
+        identifier: String,
+        reason: String,
+    },
+    InvalidUndoObservation {
+        entity_id: RemoteId,
+        reason: String,
+    },
+    UnsafeUndoLocalState {
+        entity_id: RemoteId,
+        reason: String,
+    },
     Store(StoreError),
 }
 
@@ -1178,6 +1666,9 @@ impl HistoryError {
         match self {
             Self::MountNotFound(_) => "mount_not_found",
             Self::JournalNotFound(_) => "journal_not_found",
+            Self::UndoNotLatest { .. } => "undo_not_latest",
+            Self::IncompleteUndoApplyResult { .. } => "incomplete_undo_apply_result",
+            Self::UndoProjectionRefreshFailed { .. } => "undo_projection_refresh_failed",
             Self::InvalidUndoObservation { .. } => "invalid_undo_observation",
             Self::UnsafeUndoLocalState { .. } => "unsafe_undo_local_state",
             Self::Store(StoreError::EntityPathMissing { .. }) => "entity_path_missing",
@@ -1193,6 +1684,36 @@ impl HistoryError {
             Self::JournalNotFound(push_id) => {
                 format!("journal entry `{}` was not found", push_id.0)
             }
+            Self::UndoNotLatest {
+                push_id,
+                entity_id,
+                latest_push_id,
+            } => match latest_push_id {
+                Some(latest_push_id) => format!(
+                    "cannot undo journal `{}` because later journal `{}` touches entity `{}`",
+                    push_id.0, latest_push_id.0, entity_id.0
+                ),
+                None => format!(
+                    "cannot undo journal `{}` because it is not the active latest journal for entity `{}`",
+                    push_id.0, entity_id.0
+                ),
+            },
+            Self::IncompleteUndoApplyResult { missing } => format!(
+                "undo apply result omitted changed entity ids required for reconciliation: {}",
+                missing
+                    .iter()
+                    .map(|entity_id| entity_id.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::UndoProjectionRefreshFailed {
+                mount_id,
+                identifier,
+                reason,
+            } => format!(
+                "undo updated provider state for mount `{}` but could not refresh container `{identifier}`: {reason}",
+                mount_id.0
+            ),
             Self::InvalidUndoObservation { entity_id, reason } => {
                 format!(
                     "undo observation for entity `{}` is invalid: {reason}",
@@ -1378,6 +1899,76 @@ mod tests {
         ReadableDiffFileOutput, ReadableDiffFileStatus, ReadableDiffOutput,
     };
     use locality_store::{InMemoryStateStore, JournalRepository};
+
+    #[test]
+    fn macos_undo_projection_refresh_failure_is_not_silenced() {
+        let mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            "/tmp/Locality/notion-main",
+        )
+        .projection(locality_store::ProjectionMode::MacosFileProvider);
+
+        let error = signal_macos_projection_identifiers_with(
+            &mount,
+            vec!["children:page-1".to_string()],
+            |_, _| Err("injected provider failure".to_string()),
+        )
+        .expect_err("missing platform helper must fail the correctness path");
+
+        assert_eq!(error.code(), "undo_projection_refresh_failed");
+        assert!(error.message().contains("children:page-1"));
+    }
+
+    #[test]
+    fn provider_refresh_failure_happens_after_journal_finalization() {
+        let mut store = InMemoryStateStore::new();
+        let push_id = PushId("push-1".to_string());
+        store
+            .append_journal(journal_entry("push-1"))
+            .expect("append journal");
+        let refreshes = vec![UndoProjectionRefresh::MacosContainers {
+            mount: MountConfig::new(
+                MountId::new("notion-main"),
+                "notion",
+                "/tmp/Locality/notion-main",
+            )
+            .projection(locality_store::ProjectionMode::MacosFileProvider),
+            identifiers: vec!["children:page-1".to_string()],
+        }];
+
+        let error = finalize_undo_after_reconcile(&mut store, &push_id, &refreshes, |_, _| {
+            Err(HistoryError::UndoProjectionRefreshFailed {
+                mount_id: MountId::new("notion-main"),
+                identifier: "children:page-1".to_string(),
+                reason: "injected".to_string(),
+            })
+        })
+        .expect_err("refresh failure must be reported");
+
+        assert_eq!(error.code(), "undo_projection_refresh_failed");
+        assert_eq!(
+            store
+                .get_journal(&push_id)
+                .expect("get journal")
+                .expect("journal")
+                .status,
+            JournalStatus::Reverted
+        );
+    }
+
+    #[test]
+    fn macos_undo_never_directly_rewrites_visible_replica() {
+        assert!(!direct_visible_undo_refresh_enabled(
+            &locality_store::ProjectionMode::MacosFileProvider
+        ));
+        assert!(direct_visible_undo_refresh_enabled(
+            &locality_store::ProjectionMode::WindowsCloudFiles
+        ));
+        assert!(!direct_visible_undo_refresh_enabled(
+            &locality_store::ProjectionMode::LinuxFuse
+        ));
+    }
 
     #[test]
     fn log_report_can_include_readable_diff_for_single_push() {

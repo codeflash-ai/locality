@@ -130,7 +130,7 @@ pub fn auto_save_plan_block_reason(plan: &PushPlan) -> Option<String> {
 
     for operation in &plan.operations {
         match operation {
-            PushOperation::UpdateEntityBody { body, .. } if body.is_empty() => {
+            PushOperation::UpdateEntityBody { body, .. } if body.trim().is_empty() => {
                 return Some("clearing entity bodies requires review".to_string());
             }
             PushOperation::CreateEntity { .. }
@@ -357,7 +357,7 @@ mod tests {
             vec![RemoteId::new("page-1")],
             vec![PushOperation::UpdateEntityBody {
                 entity_id: RemoteId::new("page-1"),
-                body: String::new(),
+                body: " \n\t".to_string(),
             }],
         );
         assert_eq!(

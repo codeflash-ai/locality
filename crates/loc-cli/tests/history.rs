@@ -4,21 +4,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use loc_cli::history::{
-    HistoryError, LogOptions, run_log, run_undo, run_undo_with_applier, undo_report_exit_code,
+    HistoryError, LogOptions, run_log, run_undo, run_undo_with_applier,
+    run_undo_with_applier_at_state_root, undo_report_exit_code,
 };
+use locality_core::canonical::render_canonical_markdown;
 use locality_core::freshness::RemoteObservation;
 use locality_core::journal::{
     JournalApplyEffect, JournalEntry, JournalPreimage, JournalStatus, PushId, PushOperationId,
 };
-use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
+use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::{PushOperation, PushPlan};
 use locality_core::shadow::ShadowDocument;
 use locality_core::undo::{UndoApplier, UndoApplyRequest, UndoApplyResult};
 use locality_core::{LocalityError, LocalityResult};
 use locality_store::{
     EntityRecord, EntityRepository, InMemoryStateStore, JournalRepository, MountConfig,
-    MountRepository, ShadowRepository, SqliteStateStore,
+    MountRepository, ProjectionMode, ShadowRepository, SqliteStateStore, VirtualMutationKind,
+    VirtualMutationRecord, VirtualMutationRepository,
 };
+use localityd::virtual_fs::virtual_fs_content_path;
 
 #[test]
 fn log_lists_journal_entries_newest_first() {
@@ -314,6 +318,171 @@ fn undo_with_applier_reverses_complete_plan_and_marks_journal_reverted() {
 }
 
 #[test]
+fn undo_with_applier_rejects_target_that_is_not_latest_for_every_touched_entity() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    store
+        .append_journal(journal_entry("push-1", "page-1", JournalStatus::Reconciled))
+        .expect("append target journal");
+    store
+        .append_journal(journal_entry("push-2", "page-1", JournalStatus::Reconciled))
+        .expect("append later journal");
+    let mut applier = FakeUndoApplier::default();
+
+    let error = run_undo_with_applier(&mut store, "push-1", &mut applier)
+        .expect_err("later journal must block undo");
+
+    assert_eq!(error.code(), "undo_not_latest");
+    assert!(error.message().contains("push-2"), "{}", error.message());
+    assert!(applier.applied_push_ids.is_empty());
+    assert_eq!(
+        store
+            .get_journal(&PushId("push-1".to_string()))
+            .expect("get journal")
+            .expect("journal")
+            .status,
+        JournalStatus::Reconciled
+    );
+}
+
+#[test]
+fn undo_latest_check_covers_disjoint_affected_preimage_and_entity_operation_ids() {
+    for later_id in ["affected-only", "preimage-only", "created-only"] {
+        let fixture = HistoryFixture::new();
+        let mut store = fixture.store();
+        let operation = PushOperation::CreateEntity {
+            parent_id: RemoteId::new("affected-only"),
+            parent_kind: Some(EntityKind::Page),
+            parent_workspace: false,
+            title: "Created".to_string(),
+            properties: Default::default(),
+            body: String::new(),
+            source_path: PathBuf::from("Created/page.md"),
+        };
+        let push_id = PushId("push-disjoint".to_string());
+        let operation_id = PushOperationId::for_operation(&push_id, 0, &operation);
+        store
+            .append_journal(
+                JournalEntry::new(
+                    push_id.clone(),
+                    fixture.mount_id.clone(),
+                    vec![RemoteId::new("affected-only")],
+                    PushPlan::new(vec![RemoteId::new("affected-only")], vec![operation]),
+                    JournalStatus::Reconciled,
+                )
+                .with_preimages(vec![JournalPreimage::from_shadow(shadow("preimage-only"))])
+                .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+                    operation_id,
+                    operation_index: 0,
+                    parent_id: RemoteId::new("affected-only"),
+                    entity_id: RemoteId::new("created-only"),
+                }]),
+            )
+            .expect("append target journal");
+        store
+            .append_journal(journal_entry(
+                "push-z-later",
+                later_id,
+                JournalStatus::Reconciled,
+            ))
+            .expect("append later journal");
+        let mut applier = FakeUndoApplier::default();
+
+        let error = run_undo_with_applier(&mut store, push_id.0, &mut applier)
+            .expect_err("later touched id must block undo");
+
+        assert_eq!(error.code(), "undo_not_latest", "{later_id}");
+        assert!(applier.applied_push_ids.is_empty(), "{later_id}");
+    }
+}
+
+#[test]
+fn undo_with_applier_ignores_later_reverted_journal_for_latest_check() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    store
+        .append_journal(journal_entry("push-1", "page-1", JournalStatus::Reconciled))
+        .expect("append target journal");
+    store
+        .append_journal(journal_entry("push-2", "page-1", JournalStatus::Reverted))
+        .expect("append reverted journal");
+    let mut applier = FakeUndoApplier::default();
+
+    let report = run_undo_with_applier(&mut store, "push-1", &mut applier)
+        .expect("reverted later journal does not block");
+
+    assert!(report.ok);
+    assert_eq!(applier.applied_push_ids, vec![PushId("push-1".to_string())]);
+}
+
+#[test]
+fn undo_with_applier_requires_changed_id_for_block_preimage() {
+    assert_incomplete_apply_result_is_rejected(journal_entry(
+        "push-1",
+        "page-1",
+        JournalStatus::Reconciled,
+    ));
+}
+
+#[test]
+fn undo_with_applier_requires_changed_id_for_body_preimage() {
+    assert_incomplete_apply_result_is_rejected(journal_entry_with_operations(
+        "push-1",
+        "page-1",
+        JournalStatus::Reconciled,
+        vec![PushOperation::UpdateEntityBody {
+            entity_id: RemoteId::new("page-1"),
+            body: "Updated body.".to_string(),
+        }],
+    ));
+}
+
+#[test]
+fn undo_with_applier_requires_changed_id_for_property_preimage() {
+    let mut entry = journal_entry_with_operations(
+        "push-1",
+        "page-1",
+        JournalStatus::Reconciled,
+        vec![PushOperation::UpdateProperties {
+            entity_id: RemoteId::new("page-1"),
+            properties: std::collections::BTreeMap::from([(
+                "Status".to_string(),
+                locality_core::planner::PropertyValue::String("Done".to_string()),
+            )]),
+        }],
+    );
+    entry.preimages = vec![JournalPreimage::from_shadow(
+        shadow("page-1").with_frontmatter(
+            "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\nStatus: Todo\n",
+        ),
+    )];
+
+    assert_incomplete_apply_result_is_rejected(entry);
+}
+
+#[test]
+fn undo_with_applier_requires_changed_id_for_entity_operation() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    seed_created_entity_undo(&fixture, &mut store);
+    let mut applier = FakeUndoApplier::default().with_changed_remote_ids(Vec::new());
+
+    let error = run_undo_with_applier(&mut store, "push-create", &mut applier)
+        .expect_err("missing created entity id must fail closed");
+
+    assert_eq!(error.code(), "incomplete_undo_apply_result");
+    assert!(error.message().contains("created-page-1"));
+    assert_eq!(
+        store
+            .get_journal(&PushId("push-create".to_string()))
+            .expect("get journal")
+            .expect("journal")
+            .status,
+        JournalStatus::Reconciled
+    );
+}
+
+#[test]
 fn undo_with_applier_restores_local_projection_from_preimage() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();
@@ -346,8 +515,13 @@ fn undo_with_applier_restores_local_projection_from_preimage() {
     assert!(report.ok);
     assert_eq!(report.action, "reverse_applied");
     let restored = fs::read_to_string(fixture.root.join("Roadmap.md")).expect("restored file");
-    assert!(restored.contains("# Roadmap\n\nOriginal paragraph."));
-    assert!(!restored.contains("Updated paragraph."));
+    assert_eq!(
+        restored,
+        render_canonical_markdown(&CanonicalDocument::new(
+            "loc:\n  id: page-1\n  type: page\ntitle: Roadmap\n",
+            "# Roadmap\n\nOriginal paragraph.",
+        ))
+    );
     let shadow = store
         .load_shadow(&fixture.mount_id, &RemoteId::new("page-1"))
         .expect("restored shadow");
@@ -430,7 +604,13 @@ fn undo_with_applier_reconciles_restored_entity_location_from_observation() {
     assert!(!fixture.root.join(current_path).exists());
     assert!(fixture.root.join(&restored_path).exists());
     let restored = fs::read_to_string(fixture.root.join(&restored_path)).expect("restored file");
-    assert!(restored.contains("Original body"));
+    assert_eq!(
+        restored,
+        render_canonical_markdown(&CanonicalDocument::new(
+            "loc:\n  id: page-1\n  type: page\n  parent: team-old\n  synced_at: now\n  remote_edited_at: now\ntitle: Old title\n",
+            "# Roadmap\n\nOriginal body",
+        ))
+    );
     let entity = store
         .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
         .expect("read entity")
@@ -469,6 +649,116 @@ fn undo_with_applier_accepts_notion_page_container_observation_path() {
             .path,
         restored_path
     );
+}
+
+#[test]
+fn virtual_undo_move_relocates_cache_without_recording_local_mutation() {
+    let fixture = HistoryFixture::new();
+    let mut store = InMemoryStateStore::new();
+    let (visible_root, state_root, current_path) =
+        seed_virtual_move_undo(&fixture, &mut store, ProjectionMode::LinuxFuse);
+    let restored_path = PathBuf::from("teams/old/ENG-42 Old title.md");
+    let observation = RemoteObservation::new(
+        fixture.mount_id.clone(),
+        RemoteId::new("page-1"),
+        EntityKind::Page,
+        "Old title",
+        "ENG-42 Old title.md",
+    )
+    .with_parent(RemoteId::new("team-old"));
+    let mut applier = FakeUndoApplier::default().with_observations(vec![observation]);
+
+    let report = run_undo_with_applier_at_state_root(
+        &mut store,
+        "push-move",
+        &mut applier,
+        Some(&state_root),
+    )
+    .expect("undo virtual move");
+
+    assert!(report.ok);
+    let old_cache = virtual_fs_content_path(&state_root, &fixture.mount_id, &current_path)
+        .expect("old cache path");
+    let restored_cache = virtual_fs_content_path(&state_root, &fixture.mount_id, &restored_path)
+        .expect("restored cache path");
+    assert!(!old_cache.exists());
+    let cached = fs::read_to_string(restored_cache).expect("restored cache");
+    assert_eq!(
+        cached,
+        render_canonical_markdown(&CanonicalDocument::new(
+            "loc:\n  id: page-1\n  type: page\n  parent: team-old\n  synced_at: now\n  remote_edited_at: now\ntitle: Old title\n",
+            "# Roadmap\n\nOriginal body",
+        ))
+    );
+    assert!(
+        store
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list virtual mutations")
+            .is_empty(),
+        "undo reconciliation must not replay as a local move"
+    );
+    assert_eq!(
+        store
+            .get_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+            .expect("read entity")
+            .expect("entity")
+            .path,
+        restored_path
+    );
+    assert!(!visible_root.join(&current_path).exists());
+}
+
+#[test]
+fn virtual_undo_move_preflights_backing_and_visible_destination_collisions() {
+    for collision in ["backing", "visible"] {
+        let fixture = HistoryFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let (visible_root, state_root, current_path) =
+            seed_virtual_move_undo(&fixture, &mut store, ProjectionMode::WindowsCloudFiles);
+        let restored_path = PathBuf::from("teams/old/ENG-42 Old title.md");
+        let collision_path = if collision == "backing" {
+            virtual_fs_content_path(&state_root, &fixture.mount_id, &restored_path)
+                .expect("collision cache path")
+        } else {
+            visible_root.join(&restored_path)
+        };
+        fs::create_dir_all(collision_path.parent().expect("collision parent"))
+            .expect("create collision parent");
+        fs::write(&collision_path, format!("{collision} collision")).expect("write collision");
+        let observation = RemoteObservation::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("page-1"),
+            EntityKind::Page,
+            "Old title",
+            "ENG-42 Old title.md",
+        )
+        .with_parent(RemoteId::new("team-old"));
+        let mut applier = FakeUndoApplier::default().with_observations(vec![observation]);
+
+        let error = run_undo_with_applier_at_state_root(
+            &mut store,
+            "push-move",
+            &mut applier,
+            Some(&state_root),
+        )
+        .expect_err("destination collision must fail closed");
+
+        assert_eq!(error.code(), "invalid_undo_observation", "{collision}");
+        assert_eq!(
+            fs::read_to_string(&collision_path).expect("read collision"),
+            format!("{collision} collision")
+        );
+        assert!(visible_root.join(&current_path).exists(), "{collision}");
+        assert_eq!(
+            store
+                .get_journal(&PushId("push-move".to_string()))
+                .expect("get journal")
+                .expect("journal")
+                .status,
+            JournalStatus::Reconciled,
+            "{collision}"
+        );
+    }
 }
 
 #[test]
@@ -514,8 +804,10 @@ fn undo_with_applier_rejects_missing_or_mismatched_move_observations() {
         "wrong_entity",
         "wrong_parent",
         "wrong_title",
+        "wrong_kind",
         "deleted",
         "wrong_path",
+        "deep_path",
     ] {
         let fixture = HistoryFixture::new();
         let mut store = fixture.store();
@@ -546,9 +838,17 @@ fn undo_with_applier_rejects_missing_or_mismatched_move_observations() {
                 observation.title = "New title".to_string();
                 vec![observation]
             }
+            "wrong_kind" => {
+                observation.kind = EntityKind::Directory;
+                vec![observation]
+            }
             "deleted" => vec![observation.deleted(true)],
             "wrong_path" => {
                 observation.projected_path = "teams/other/ENG-42 Old title.md".into();
+                vec![observation]
+            }
+            "deep_path" => {
+                observation.projected_path = "teams/old/nested/deeper/page.md".into();
                 vec![observation]
             }
             _ => unreachable!(),
@@ -624,6 +924,7 @@ fn undo_with_applier_rejects_observation_path_owned_by_another_entity() {
 fn undo_with_applier_recreates_archived_entity_from_observation_and_preimage() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();
+    seed_archived_parent(&fixture, &mut store);
     let entry = archived_entity_journal(&fixture);
     store
         .delete_entity(&fixture.mount_id, &RemoteId::new("page-1"))
@@ -636,7 +937,8 @@ fn undo_with_applier_recreates_archived_entity_from_observation_and_preimage() {
         EntityKind::Page,
         "Roadmap",
         "Roadmap.md",
-    );
+    )
+    .with_parent(RemoteId::new("archive-root"));
     let mut applier = FakeUndoApplier::default().with_observations(vec![observation]);
 
     let report = run_undo_with_applier(&mut store, "push-archive", &mut applier)
@@ -651,13 +953,20 @@ fn undo_with_applier_recreates_archived_entity_from_observation_and_preimage() {
     assert_eq!(entity.hydration, HydrationState::Hydrated);
     let contents =
         fs::read_to_string(fixture.root.join("Roadmap.md")).expect("restored archived projection");
-    assert!(contents.contains("Original archived body."));
+    assert_eq!(
+        contents,
+        render_canonical_markdown(&CanonicalDocument::new(
+            "loc:\n  id: page-1\n  type: page\n  parent: archive-root\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+            "Original archived body.",
+        ))
+    );
 }
 
 #[test]
 fn undo_with_applier_requires_observation_to_restore_archived_entity() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();
+    seed_archived_parent(&fixture, &mut store);
     let entry = archived_entity_journal(&fixture);
     store
         .delete_entity(&fixture.mount_id, &RemoteId::new("page-1"))
@@ -687,6 +996,41 @@ fn undo_with_applier_requires_observation_to_restore_archived_entity() {
 }
 
 #[test]
+fn undo_restore_archived_entity_blocks_pending_target_mutation_before_remote_apply() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    seed_archived_parent(&fixture, &mut store);
+    let entry = archived_entity_journal(&fixture);
+    store
+        .delete_entity(&fixture.mount_id, &RemoteId::new("page-1"))
+        .expect("delete archived entity record");
+    fs::remove_file(fixture.root.join("Roadmap.md")).expect("remove archived projection");
+    store
+        .save_virtual_mutation(VirtualMutationRecord {
+            mount_id: fixture.mount_id.clone(),
+            local_id: "move:page-1".to_string(),
+            mutation_kind: VirtualMutationKind::Move,
+            target_remote_id: Some(RemoteId::new("page-1")),
+            parent_remote_id: Some(RemoteId::new("archive-root")),
+            original_path: Some(PathBuf::from("Old Roadmap.md")),
+            projected_path: PathBuf::from("Roadmap.md"),
+            title: "Roadmap".to_string(),
+            content_path: None,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        })
+        .expect("save pending mutation");
+    store.append_journal(entry).expect("append archive journal");
+    let mut applier = FakeUndoApplier::default();
+
+    let error = run_undo_with_applier(&mut store, "push-archive", &mut applier)
+        .expect_err("pending archived-entity mutation must block undo");
+
+    assert_eq!(error.code(), "unsafe_undo_local_state");
+    assert!(applier.applied_push_ids.is_empty());
+}
+
+#[test]
 fn undo_with_applier_archives_clean_created_entity_and_removes_projection() {
     let fixture = HistoryFixture::new();
     let mut store = fixture.store();
@@ -708,6 +1052,74 @@ fn undo_with_applier_archives_clean_created_entity_and_removes_projection() {
             .expect("read entity")
             .is_none()
     );
+}
+
+#[test]
+fn virtual_undo_archive_removes_cache_without_replaying_local_delete() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    let created_path = seed_created_entity_undo(&fixture, &mut store);
+    let mut mount = store
+        .get_mount(&fixture.mount_id)
+        .expect("get mount")
+        .expect("mount");
+    mount.projection = ProjectionMode::WindowsCloudFiles;
+    store.save_mount(mount).expect("save virtual mount");
+    let state_root = fixture.root.join("state");
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, &created_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("create cache parent");
+    fs::copy(fixture.root.join(&created_path), &cache_path).expect("seed cache");
+    let observation = created_entity_observation(&fixture).deleted(true);
+    let mut applier = FakeUndoApplier::default()
+        .with_changed_remote_ids(vec![RemoteId::new("created-page-1")])
+        .with_observations(vec![observation]);
+
+    let report = run_undo_with_applier_at_state_root(
+        &mut store,
+        "push-create",
+        &mut applier,
+        Some(&state_root),
+    )
+    .expect("undo virtual created entity");
+
+    assert!(report.ok);
+    assert!(!cache_path.exists());
+    assert!(
+        fixture.root.join(created_path).exists(),
+        "provider-visible replicas are removed by provider invalidation, not direct filesystem delete"
+    );
+    assert!(
+        store
+            .list_virtual_mutations(&fixture.mount_id)
+            .expect("list virtual mutations")
+            .is_empty()
+    );
+}
+
+#[test]
+fn undo_with_applier_requires_absent_parent_for_workspace_created_entity() {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    seed_workspace_created_entity_undo(&fixture, &mut store);
+    let observation = RemoteObservation::new(
+        fixture.mount_id.clone(),
+        RemoteId::new("workspace-page-1"),
+        EntityKind::Page,
+        "Workspace page",
+        "Workspace page/page.md",
+    )
+    .with_parent(RemoteId::new("unexpected-parent"))
+    .deleted(true);
+    let mut applier = FakeUndoApplier::default()
+        .with_changed_remote_ids(vec![RemoteId::new("workspace-page-1")])
+        .with_observations(vec![observation]);
+
+    let error = run_undo_with_applier(&mut store, "push-workspace-create", &mut applier)
+        .expect_err("workspace entity observation must have no parent");
+
+    assert_eq!(error.code(), "invalid_undo_observation");
+    assert!(error.message().contains("expected parent"));
 }
 
 #[test]
@@ -979,6 +1391,28 @@ impl UndoApplier for FakeUndoApplier {
     }
 }
 
+fn assert_incomplete_apply_result_is_rejected(entry: JournalEntry) {
+    let fixture = HistoryFixture::new();
+    let mut store = fixture.store();
+    let push_id = entry.push_id.clone();
+    store.append_journal(entry).expect("append journal");
+    let mut applier = FakeUndoApplier::default().with_changed_remote_ids(Vec::new());
+
+    let error = run_undo_with_applier(&mut store, push_id.0.clone(), &mut applier)
+        .expect_err("incomplete apply result must fail closed");
+
+    assert_eq!(error.code(), "incomplete_undo_apply_result");
+    assert!(error.message().contains("page-1"), "{}", error.message());
+    assert_eq!(
+        store
+            .get_journal(&push_id)
+            .expect("get journal")
+            .expect("journal")
+            .status,
+        JournalStatus::Reconciled
+    );
+}
+
 fn seed_store<S>(store: &mut S, fixture: &HistoryFixture)
 where
     S: MountRepository + EntityRepository + ShadowRepository,
@@ -1095,9 +1529,94 @@ fn seed_move_undo_at(
     current_path
 }
 
+fn seed_virtual_move_undo(
+    fixture: &HistoryFixture,
+    store: &mut InMemoryStateStore,
+    projection: ProjectionMode,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let materialize_visible = projection == ProjectionMode::WindowsCloudFiles;
+    let visible_root = fixture.root.join("provider").join("notion-main");
+    let state_root = fixture.root.join("state");
+    let current_path = PathBuf::from("teams/new/ENG-42 New title.md");
+    store
+        .save_mount(
+            MountConfig::new(fixture.mount_id.clone(), "notion", visible_root.clone())
+                .projection(projection),
+        )
+        .expect("save virtual mount");
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("team-old"),
+            EntityKind::Directory,
+            "Old team",
+            "teams/old",
+        ))
+        .expect("save old parent");
+    let current_shadow = single_block_shadow("page-1", "New body").with_frontmatter(
+        "loc:\n  id: page-1\n  type: page\n  parent: team-new\n  synced_at: now\n  remote_edited_at: now\ntitle: New title\n",
+    );
+    let current_contents = render_canonical_markdown(&CanonicalDocument::new(
+        current_shadow.frontmatter.clone(),
+        current_shadow.rendered_body.clone(),
+    ));
+    if materialize_visible {
+        let visible_path = visible_root.join(&current_path);
+        fs::create_dir_all(visible_path.parent().expect("visible parent"))
+            .expect("create visible parent");
+        fs::write(&visible_path, &current_contents).expect("write visible projection");
+    }
+    let cache_path =
+        virtual_fs_content_path(&state_root, &fixture.mount_id, &current_path).expect("cache path");
+    fs::create_dir_all(cache_path.parent().expect("cache parent")).expect("create cache parent");
+    fs::write(&cache_path, current_contents).expect("write cached projection");
+    store
+        .save_shadow(&fixture.mount_id, current_shadow.clone())
+        .expect("save current shadow");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("page-1"),
+                EntityKind::Page,
+                "New title",
+                current_path.clone(),
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_content_hash(current_shadow.body_hash),
+        )
+        .expect("save current entity");
+    let preimage = shadow_with_body("page-1", "# Roadmap\n\nOriginal body").with_frontmatter(
+        "loc:\n  id: page-1\n  type: page\n  parent: team-old\n  synced_at: now\n  remote_edited_at: now\ntitle: Old title\n",
+    );
+    store
+        .append_journal(
+            JournalEntry::new(
+                PushId("push-move".to_string()),
+                fixture.mount_id.clone(),
+                vec![RemoteId::new("page-1")],
+                PushPlan::new(
+                    vec![RemoteId::new("page-1")],
+                    vec![PushOperation::MoveEntity {
+                        entity_id: RemoteId::new("page-1"),
+                        new_parent_id: RemoteId::new("team-new"),
+                        new_parent_kind: EntityKind::Directory,
+                        new_title: "New title".to_string(),
+                        projected_path: current_path.clone(),
+                    }],
+                ),
+                JournalStatus::Reconciled,
+            )
+            .with_preimages(vec![JournalPreimage::from_shadow(preimage)]),
+        )
+        .expect("append move journal");
+
+    (visible_root, state_root, current_path)
+}
+
 fn archived_entity_journal(fixture: &HistoryFixture) -> JournalEntry {
     let preimage = single_block_shadow("page-1", "Original archived body.").with_frontmatter(
-        "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
+        "loc:\n  id: page-1\n  type: page\n  parent: archive-root\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n",
     );
     JournalEntry::new(
         PushId("push-archive".to_string()),
@@ -1112,6 +1631,18 @@ fn archived_entity_journal(fixture: &HistoryFixture) -> JournalEntry {
         JournalStatus::Reconciled,
     )
     .with_preimages(vec![JournalPreimage::from_shadow(preimage)])
+}
+
+fn seed_archived_parent(fixture: &HistoryFixture, store: &mut InMemoryStateStore) {
+    store
+        .save_entity(EntityRecord::new(
+            fixture.mount_id.clone(),
+            RemoteId::new("archive-root"),
+            EntityKind::Directory,
+            "Archive root",
+            "",
+        ))
+        .expect("save archive parent");
 }
 
 fn seed_created_entity_undo(fixture: &HistoryFixture, store: &mut InMemoryStateStore) -> PathBuf {
@@ -1172,6 +1703,71 @@ fn seed_created_entity_undo(fixture: &HistoryFixture, store: &mut InMemoryStateS
     }]);
     store.append_journal(entry).expect("append create journal");
     created_path
+}
+
+fn seed_workspace_created_entity_undo(fixture: &HistoryFixture, store: &mut InMemoryStateStore) {
+    let created_path = PathBuf::from("Workspace page/page.md");
+    fs::create_dir_all(
+        fixture
+            .root
+            .join(created_path.parent().expect("created parent")),
+    )
+    .expect("create workspace projection directory");
+    let shadow = single_block_shadow("workspace-page-1", "Created body.").with_frontmatter(
+        "loc:\n  id: workspace-page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Workspace page\n",
+    );
+    fs::write(
+        fixture.root.join(&created_path),
+        render_canonical_markdown(&CanonicalDocument::new(
+            shadow.frontmatter.clone(),
+            shadow.rendered_body.clone(),
+        )),
+    )
+    .expect("write workspace projection");
+    store
+        .save_shadow(&fixture.mount_id, shadow.clone())
+        .expect("save workspace shadow");
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("workspace-page-1"),
+                EntityKind::Page,
+                "Workspace page",
+                created_path.clone(),
+            )
+            .with_hydration(HydrationState::Hydrated)
+            .with_content_hash(shadow.body_hash),
+        )
+        .expect("save workspace entity");
+    let operation = PushOperation::CreateEntity {
+        parent_id: RemoteId::new("workspace"),
+        parent_kind: None,
+        parent_workspace: true,
+        title: "Workspace page".to_string(),
+        properties: Default::default(),
+        body: "Created body.".to_string(),
+        source_path: created_path,
+    };
+    let push_id = PushId("push-workspace-create".to_string());
+    let operation_id = PushOperationId::for_operation(&push_id, 0, &operation);
+    store
+        .append_journal(
+            JournalEntry::new(
+                push_id,
+                fixture.mount_id.clone(),
+                Vec::new(),
+                PushPlan::new(Vec::new(), vec![operation]),
+                JournalStatus::Reconciled,
+            )
+            .with_apply_effects(vec![JournalApplyEffect::CreatedEntity {
+                operation_id,
+                operation_index: 0,
+                parent_id: RemoteId::new("workspace"),
+                entity_id: RemoteId::new("workspace-page-1"),
+            }]),
+        )
+        .expect("append workspace create journal");
 }
 
 fn created_entity_observation(fixture: &HistoryFixture) -> RemoteObservation {

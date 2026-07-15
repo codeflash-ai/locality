@@ -368,6 +368,34 @@ pub fn signal_macos_file_provider_container(
     )
 }
 
+#[cfg(target_os = "macos")]
+pub fn refresh_macos_file_provider_container(
+    mount_id: &str,
+    container_identifier: &str,
+) -> Result<FileProviderHelperReport, FileProviderHelperError> {
+    if container_identifier == "working-set" {
+        return signal_macos_file_provider_container(mount_id, container_identifier);
+    }
+    run_macos_file_provider_helper(
+        "reimport",
+        vec![
+            "--mount-id".to_string(),
+            localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
+            "--identifier".to_string(),
+            macos_file_provider_item_identifier(mount_id, container_identifier),
+        ],
+    )
+    .or_else(|_| signal_macos_file_provider_container(mount_id, container_identifier))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn refresh_macos_file_provider_container(
+    _mount_id: &str,
+    _container_identifier: &str,
+) -> Result<FileProviderHelperReport, FileProviderHelperError> {
+    Err(FileProviderHelperError::Missing)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn signal_macos_file_provider_container(
     _mount_id: &str,
@@ -378,8 +406,11 @@ pub fn signal_macos_file_provider_container(
 
 #[cfg(target_os = "macos")]
 fn macos_file_provider_item_identifier(mount_id: &str, identifier: &str) -> String {
-    if identifier == localityd::file_provider::ROOT_CONTAINER_IDENTIFIER {
-        return localityd::file_provider::ROOT_CONTAINER_IDENTIFIER.to_string();
+    if matches!(
+        identifier,
+        localityd::file_provider::ROOT_CONTAINER_IDENTIFIER | "working-set"
+    ) {
+        return identifier.to_string();
     }
     format!(
         "m:{}:{}",
@@ -3039,6 +3070,10 @@ mod tests {
         assert_eq!(
             super::macos_file_provider_item_identifier("notion-main", "root"),
             "root"
+        );
+        assert_eq!(
+            super::macos_file_provider_item_identifier("notion-main", "working-set"),
+            "working-set"
         );
         assert_eq!(
             super::macos_file_provider_item_identifier(

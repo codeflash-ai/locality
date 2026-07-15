@@ -241,7 +241,7 @@ pub fn plan_journal_undo(entry: &JournalEntry) -> UndoPlan {
                 }
             }
             PushOperation::ArchiveEntity { entity_id } => {
-                if find_entity_preimage(entry, entity_id).is_some() {
+                if has_complete_entity_preimage(entry, entity_id) {
                     operations.push(UndoOperation::RestoreArchivedEntity {
                         entity_id: entity_id.clone(),
                     });
@@ -420,6 +420,27 @@ fn parsed_entity_preimage(
         shadow.rendered_body.clone(),
     )))
     .ok()
+}
+
+fn has_complete_entity_preimage(entry: &JournalEntry, entity_id: &RemoteId) -> bool {
+    let Some(parsed) = parsed_entity_preimage(entry, entity_id) else {
+        return false;
+    };
+    let Some(loc) = parsed.frontmatter.loc else {
+        return false;
+    };
+
+    loc.id.as_ref() == Some(entity_id)
+        && loc.parent.is_some()
+        && loc
+            .entity_type
+            .as_ref()
+            .is_some_and(|kind| !matches!(kind, crate::model::EntityKind::Unknown(_)))
+        && parsed
+            .frontmatter
+            .title
+            .as_deref()
+            .is_some_and(|title| !title.trim().is_empty())
 }
 
 fn previous_property_values(

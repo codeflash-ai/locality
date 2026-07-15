@@ -2,6 +2,7 @@ use locality_connector::Connector;
 use locality_connector::oauth_broker::OAuthBrokerToken;
 use locality_core::canonical::parse_canonical_markdown;
 use locality_core::model::{EntityKind, MountId, RemoteId};
+use locality_core::push::BodyDiffMode;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationIssue;
 use locality_gmail::{GMAIL_CONNECTOR_ID, GMAIL_OAUTH_SCOPES, StoredGmailCredential};
@@ -134,6 +135,12 @@ fn generic_descriptor_preserves_source_id_in_guidance() {
             .contains("# Locality linear Mount")
     );
     assert!(descriptor.mount_guidance().contains("to linear"));
+    assert_eq!(descriptor.body_diff_mode(), BodyDiffMode::WholeEntity);
+
+    assert_eq!(
+        source_descriptor("custom").body_diff_mode(),
+        BodyDiffMode::Block
+    );
 }
 
 #[test]

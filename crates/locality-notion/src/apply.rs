@@ -15,7 +15,7 @@ use locality_core::journal::JournalApplyEffect;
 use locality_core::model::RemoteId;
 use locality_core::planner::{PropertyValue, PushOperation};
 use locality_core::shadow::{rendered_bodies_equivalent, segment_markdown_body};
-use locality_core::undo::{UndoOperation, UndoPlanStatus};
+use locality_core::undo::{UndoOperation, UndoPlan, UndoPlanStatus};
 use locality_core::{LocalityError, LocalityResult};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -456,6 +456,8 @@ pub fn apply_undo(
         ));
     }
 
+    prevalidate_undo_plan(api, request.plan)?;
+
     for operation in &request.plan.operations {
         match operation {
             UndoOperation::RestoreBlockContent { block_id, content } => {
@@ -589,6 +591,111 @@ pub fn apply_undo(
         changed_remote_ids,
         observations,
     })
+}
+
+fn prevalidate_undo_plan(api: &dyn NotionApi, plan: &UndoPlan) -> LocalityResult<()> {
+    for operation in &plan.operations {
+        match operation {
+            UndoOperation::RestoreBlockContent { block_id, content } => {
+                if looks_like_markdown_table(content) {
+                    let bundles =
+                        fetch_affected_bundles(api, &plan.affected_entities, &BTreeSet::new())?;
+                    let current_blocks = block_map(&bundles);
+                    if let Ok(current) = current_block(&current_blocks, block_id)
+                        && current.kind == "table"
+                    {
+                        prevalidate_table_update(&bundles, block_id, current, content)?;
+                        continue;
+                    }
+                }
+                parse_supported_block(content, None, None)?;
+            }
+            UndoOperation::RestoreArchivedBlock {
+                content,
+                native_kind,
+                ..
+            } => {
+                restore_archived_block_child(api, content, native_kind.as_deref())?;
+            }
+            UndoOperation::RestoreProperties {
+                entity_id,
+                previous,
+                ..
+            } => {
+                let page = api.retrieve_page(entity_id.as_str())?;
+                update_properties_body(&page, previous)?;
+            }
+            UndoOperation::RestoreEntityLocation {
+                entity_id,
+                previous_title,
+                ..
+            } => {
+                let page = api.retrieve_page(entity_id.as_str())?;
+                update_properties_body(
+                    &page,
+                    &BTreeMap::from([(
+                        "title".to_string(),
+                        PropertyValue::String(previous_title.clone()),
+                    )]),
+                )?;
+            }
+            UndoOperation::RestoreEntityBody { .. } => {
+                return Err(LocalityError::Unsupported(
+                    "restoring whole-entity bodies in Notion",
+                ));
+            }
+            UndoOperation::MoveBlock { .. } => {
+                return Err(LocalityError::Unsupported(unsupported_undo_name(operation)));
+            }
+            UndoOperation::ArchiveCreatedBlock { .. }
+            | UndoOperation::ArchiveCreatedEntity { .. }
+            | UndoOperation::RestoreArchivedEntity { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn prevalidate_table_update(
+    bundles: &[NotionPageBundle],
+    table_id: &RemoteId,
+    current: &BlockDto,
+    markdown: &str,
+) -> LocalityResult<()> {
+    let table = current.table.as_ref().ok_or_else(|| {
+        LocalityError::InvalidState(format!(
+            "notion table block `{}` is missing its `table` payload",
+            current.id
+        ))
+    })?;
+    let current_rows = current_table_rows(bundles, table_id)?;
+    let parsed = parse_markdown_table(markdown, table)?;
+
+    for (row_block, cells) in current_rows.iter().zip(&parsed.rows) {
+        let current_row = row_block.table_row.as_ref().ok_or_else(|| {
+            LocalityError::InvalidState(format!(
+                "notion table row block `{}` is missing its `table_row` payload",
+                row_block.id
+            ))
+        })?;
+        if cells.len() != current_row.cells.len() {
+            return Err(LocalityError::Unsupported(
+                "writing Notion table width changes",
+            ));
+        }
+        for (index, cell) in cells.iter().enumerate() {
+            rich_text_payload(
+                cell,
+                current_row.cells.get(index).map(|cell| cell.as_slice()),
+            )?;
+        }
+    }
+    for cells in parsed.rows.iter().skip(current_rows.len()) {
+        for cell in cells {
+            rich_text_payload(cell, None)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn restore_archived_block_child(

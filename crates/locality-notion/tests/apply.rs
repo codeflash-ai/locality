@@ -2505,6 +2505,42 @@ fn apply_undo_rejects_whole_entity_body_restore_for_notion() {
 }
 
 #[test]
+fn apply_undo_prevalidates_entire_plan_before_first_write() {
+    let api = Arc::new(RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false));
+    let connector = NotionConnector::with_api(NotionConfig::default(), api.clone());
+    let push_id = PushId("push-1".to_string());
+    let mount_id = MountId::new("notion-main");
+    let undo_plan = UndoPlan {
+        target_push_id: push_id.clone(),
+        mount_id: mount_id.clone(),
+        affected_entities: vec![RemoteId::new("page-1")],
+        operations: vec![
+            UndoOperation::RestoreArchivedEntity {
+                entity_id: RemoteId::new("page-1"),
+            },
+            UndoOperation::RestoreEntityBody {
+                entity_id: RemoteId::new("page-1"),
+                expected_current: "New body".to_string(),
+                previous: "Old body".to_string(),
+            },
+        ],
+        unsupported: vec![],
+        status: UndoPlanStatus::Complete,
+    };
+
+    let error = connector
+        .apply_undo(ApplyUndoRequest {
+            target_push_id: &push_id,
+            mount_id: &mount_id,
+            plan: &undo_plan,
+        })
+        .expect_err("later unsupported operation must reject the whole plan");
+
+    assert!(matches!(error, LocalityError::Unsupported(_)));
+    assert!(api.writes.lock().expect("writes").is_empty());
+}
+
+#[test]
 fn apply_undo_observes_database_row_parent_as_database_id() {
     let mut recording = RecordingNotionApi::new("2026-06-10T00:00:00.000Z", false);
     recording.page.parent = Some(ParentDto {

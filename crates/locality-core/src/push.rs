@@ -187,7 +187,7 @@ pub fn evaluate_guardrails(
         .operations
         .iter()
         .filter(|operation| {
-            matches!(operation, PushOperation::UpdateEntityBody { body, .. } if body.is_empty())
+            matches!(operation, PushOperation::UpdateEntityBody { body, .. } if body.trim().is_empty())
         })
         .count();
 

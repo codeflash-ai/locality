@@ -877,11 +877,15 @@ hint for each entry that has a saved diff.
 - `prepared` entries become `reverted` because no remote mutation has started;
 - `reverted` entries return `already_reverted`;
 - `applied` and `reconciled` entries derive an `undo_plan` from journaled preimages and apply effects;
-- complete plans are handed to the connector reverse-apply hook, then marked `reverted` on success;
-- Notion reverse apply supports block content restore, archiving journaled created blocks/entities, and restoring archived block content by appending a replacement at the original position when the public API cannot unarchive the original block;
+- complete plans are handed to the connector reverse-apply hook only when the target is still the latest non-reverted journal for every affected, preimage, and entity-operation ID;
+- connector apply results must report every entity required for local reconciliation as changed. Missing IDs, invalid entity observations, dirty local projections, pending virtual mutations, and cache or visible-provider destination collisions fail closed without marking the journal reverted;
+- successful virtual-projection undo updates the daemon cache and entity index, then refreshes the old and new provider containers instead of replaying the remote undo as a local filesystem move or delete;
+- Notion reverse apply supports block content and property restore, archiving journaled created blocks/entities, restoring archived entities when a complete identity preimage is available, and restoring archived block content by appending a replacement at the original position when the public API cannot unarchive the original block;
 - `applying` and `failed` entries return `undo_unsafe_journal_status` because partial remote effects may still be in flight or unknown.
 
-Undo plans are `complete`, `partial`, or `blocked`. Complete plans currently include reverse operations for block updates, block moves, archived blocks, appended blocks with journaled created IDs, and created entities with journaled created IDs. Property updates and archived entities remain explicitly unsupported until richer property/entity preimages are journaled.
+Undo plans are `complete`, `partial`, or `blocked`. Complete plans can include reverse operations for block updates, block moves, archived blocks, appended blocks with journaled created IDs, whole-entity body updates, property updates, entity moves, archived entities with complete identity preimages, and created entities with journaled created IDs. Whole-entity body reverse apply is connector-specific and remains unsupported by Notion's block API.
+
+Notion entity-location undo currently records the previous parent ID and title but not the previous parent kind. Current real Notion shadows also omit `loc.parent`, so ordinary real move journals are blocked while deriving the undo plan. A synthetic or future preimage with an explicit parent can be lowered only when that parent is known to be a page; database, data-source, and workspace parents remain unsupported until the journal payload carries the parent kind.
 
 ## Manual / Live Verification
 

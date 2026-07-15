@@ -125,6 +125,7 @@ pub struct SourceDescriptor {
     source_root_create_parent_kind: Option<EntityKind>,
     create_entity_parent_kinds: Vec<EntityKind>,
     periodic_discovery_interval: Option<Duration>,
+    body_diff_mode: BodyDiffMode,
 }
 
 impl SourceDescriptor {
@@ -167,12 +168,19 @@ impl SourceDescriptor {
     pub fn periodic_discovery_interval(&self) -> Option<Duration> {
         self.periodic_discovery_interval
     }
+
+    pub fn body_diff_mode(&self) -> BodyDiffMode {
+        self.body_diff_mode
+    }
 }
 
 pub fn source_descriptor(connector: &str) -> SourceDescriptor {
     source_registration(connector)
         .map(|registration| (registration.descriptor)())
-        .unwrap_or_else(|| generic_source_descriptor(connector))
+        .unwrap_or_else(|| match connector {
+            "linear" => linear_source_descriptor(),
+            _ => generic_source_descriptor(connector),
+        })
 }
 
 pub fn source_display_name(connector: &str) -> String {
@@ -269,6 +277,7 @@ fn notion_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
+        body_diff_mode: BodyDiffMode::Block,
     }
 }
 
@@ -284,6 +293,7 @@ fn google_docs_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: Some(EntityKind::Directory),
         create_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
+        body_diff_mode: BodyDiffMode::Block,
     }
 }
 
@@ -299,6 +309,7 @@ fn gmail_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Directory],
         periodic_discovery_interval: None,
+        body_diff_mode: BodyDiffMode::Block,
     }
 }
 
@@ -314,6 +325,7 @@ fn granola_source_descriptor() -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: Vec::new(),
         periodic_discovery_interval: Some(Duration::from_secs(300)),
+        body_diff_mode: BodyDiffMode::Block,
     }
 }
 
@@ -362,7 +374,14 @@ fn generic_source_descriptor(connector: &str) -> SourceDescriptor {
         source_root_create_parent_kind: None,
         create_entity_parent_kinds: vec![EntityKind::Page, EntityKind::Database],
         periodic_discovery_interval: None,
+        body_diff_mode: BodyDiffMode::Block,
     }
+}
+
+fn linear_source_descriptor() -> SourceDescriptor {
+    let mut descriptor = generic_source_descriptor("linear");
+    descriptor.body_diff_mode = BodyDiffMode::WholeEntity;
+    descriptor
 }
 
 fn gmail_write_decision_for_path(relative_path: &Path) -> SourceWriteDecision {
@@ -675,10 +694,6 @@ impl HydrationSource for ResolvedSource {
 }
 
 pub trait SourcePushValidator {
-    fn body_diff_mode(&self) -> BodyDiffMode {
-        BodyDiffMode::Block
-    }
-
     fn validate_changed_frontmatter(
         &self,
         _context: SourceValidationContext<'_>,
@@ -718,15 +733,6 @@ pub struct SourceValidationContext<'a> {
 }
 
 impl SourcePushValidator for ResolvedSource {
-    fn body_diff_mode(&self) -> BodyDiffMode {
-        match self {
-            Self::Notion(source) => source.body_diff_mode(),
-            Self::GoogleDocs(source) => source.body_diff_mode(),
-            Self::Gmail(source) => source.body_diff_mode(),
-            Self::Granola(source) => source.body_diff_mode(),
-        }
-    }
-
     fn validate_changed_frontmatter(
         &self,
         context: SourceValidationContext<'_>,

@@ -116,6 +116,29 @@ fn daemon_push_job_applies_and_reconciles_through_single_store_owner() {
 }
 
 #[test]
+fn explicit_push_uses_linear_whole_entity_body_policy() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store_with_connector("Old body.", "linear");
+    fixture.write_page("New body.");
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "New body."),
+    );
+
+    let report =
+        execute_push_job_with_content_root(&mut store, fixture.push_job(true), &source, None)
+            .expect("execute push");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert!(matches!(
+        report.pipeline.plan.expect("plan").operations.as_slice(),
+        [PushOperation::UpdateEntityBody { entity_id, body }]
+            if entity_id == &fixture.remote_id
+                && body == "# Roadmap\n\nNew body.\n"
+    ));
+}
+
+#[test]
 fn auto_save_push_applies_safe_update_and_keeps_enrollment_active() {
     let fixture = PushFixture::new();
     let mut store = fixture.store("Old body.");
@@ -154,6 +177,44 @@ fn auto_save_push_applies_safe_update_and_keeps_enrollment_active() {
     assert_eq!(enrollment.state, AutoSaveState::Active);
     assert_eq!(enrollment.remote_id, Some(fixture.remote_id.clone()));
     assert!(enrollment.last_push_id.is_some());
+}
+
+#[test]
+fn auto_save_push_uses_linear_whole_entity_body_policy() {
+    let fixture = PushFixture::new();
+    let mut store = fixture.store_with_connector("Old body.", "linear");
+    store
+        .save_auto_save_enrollment(
+            AutoSaveEnrollmentRecord::new(
+                fixture.mount_id.clone(),
+                "Roadmap.md",
+                AutoSaveOrigin::LocalityCreated,
+                "now",
+            )
+            .active("now"),
+        )
+        .expect("save enrollment");
+    fixture.write_page("New body.");
+    let source = FakePushSource::with_remote_transition(
+        rendered_entity("page-1", "Old body."),
+        rendered_entity("page-1", "New body."),
+    );
+
+    let report = execute_auto_save_push_job_with_content_root(
+        &mut store,
+        fixture.push_job(false),
+        &source,
+        None,
+    )
+    .expect("auto-save push");
+
+    assert_eq!(report.action, PushJobAction::Reconciled);
+    assert!(matches!(
+        report.pipeline.plan.expect("plan").operations.as_slice(),
+        [PushOperation::UpdateEntityBody { entity_id, body }]
+            if entity_id == &fixture.remote_id
+                && body == "# Roadmap\n\nNew body.\n"
+    ));
 }
 
 #[test]
@@ -1943,8 +2004,12 @@ impl PushFixture {
     }
 
     fn store(&self, synced_body: &str) -> InMemoryStateStore {
+        self.store_with_connector(synced_body, "notion")
+    }
+
+    fn store_with_connector(&self, synced_body: &str, connector: &str) -> InMemoryStateStore {
         let mut store = InMemoryStateStore::new();
-        let mount = MountConfig::new(self.mount_id.clone(), "notion", self.root.clone());
+        let mount = MountConfig::new(self.mount_id.clone(), connector, self.root.clone());
         store.save_mount(mount).expect("save mount");
         store
             .save_entity(
@@ -2113,6 +2178,7 @@ impl Connector for FakePushSource {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             supports_block_updates: true,
+            supports_entity_body_updates: true,
             supports_databases: false,
             supports_oauth: false,
             ..ConnectorCapabilities::default()

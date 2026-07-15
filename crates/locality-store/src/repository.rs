@@ -277,10 +277,40 @@ fn journal_touches_any_entity(journal: &JournalEntry, remote_ids: &[RemoteId]) -
             .affected_entities
             .iter()
             .any(|id| remote_ids.iter().any(|target| target == id))
+        || journal.preimages.iter().any(|preimage| {
+            remote_ids
+                .iter()
+                .any(|target| target == &preimage.entity_id)
+        })
+        || journal
+            .plan
+            .operations
+            .iter()
+            .any(|operation| push_operation_touches_any_entity(operation, remote_ids))
         || journal
             .apply_effects
             .iter()
             .any(|effect| apply_effect_touches_any_entity(effect, remote_ids))
+}
+
+fn push_operation_touches_any_entity(
+    operation: &locality_core::planner::PushOperation,
+    remote_ids: &[RemoteId],
+) -> bool {
+    let entity_id = match operation {
+        locality_core::planner::PushOperation::ArchiveEntity { entity_id }
+        | locality_core::planner::PushOperation::UpdateEntityBody { entity_id, .. }
+        | locality_core::planner::PushOperation::UpdateProperties { entity_id, .. }
+        | locality_core::planner::PushOperation::MoveEntity { entity_id, .. } => Some(entity_id),
+        locality_core::planner::PushOperation::CreateEntity { parent_id, .. }
+        | locality_core::planner::PushOperation::AppendBlock { parent_id, .. } => Some(parent_id),
+        locality_core::planner::PushOperation::UpdateBlock { .. }
+        | locality_core::planner::PushOperation::ReplaceBlock { .. }
+        | locality_core::planner::PushOperation::MoveBlock { .. }
+        | locality_core::planner::PushOperation::UpdateMedia { .. }
+        | locality_core::planner::PushOperation::ArchiveBlock { .. } => None,
+    };
+    entity_id.is_some_and(|entity_id| remote_ids.iter().any(|target| target == entity_id))
 }
 
 fn apply_effect_touches_any_entity(effect: &JournalApplyEffect, remote_ids: &[RemoteId]) -> bool {

@@ -1897,7 +1897,7 @@ where
     let mut pipeline = if schema_validation.is_clean() {
         plan_push_pipeline(
             PushPipelineRequest::new(&relative_path, &parsed, &shadow)
-                .with_body_diff_mode(validator.body_diff_mode())
+                .with_body_diff_mode(source_descriptor(&mount.connector).body_diff_mode())
                 .with_approval(PushApproval {
                     assume_yes: job.assume_yes,
                     confirm_dangerous: job.confirm_dangerous,

@@ -7546,8 +7546,12 @@ fn history_error_exit_code(error: &HistoryError) -> i32 {
         HistoryError::MountNotFound(_)
         | HistoryError::JournalNotFound(_)
         | HistoryError::Store(locality_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
-        HistoryError::UnsafeUndoLocalState { .. } => EXIT_VALIDATION,
-        HistoryError::InvalidUndoObservation { .. } => EXIT_INTERNAL,
+        HistoryError::UnsafeUndoLocalState { .. } | HistoryError::UndoNotLatest { .. } => {
+            EXIT_VALIDATION
+        }
+        HistoryError::InvalidUndoObservation { .. }
+        | HistoryError::IncompleteUndoApplyResult { .. }
+        | HistoryError::UndoProjectionRefreshFailed { .. } => EXIT_INTERNAL,
         HistoryError::Store(_) => EXIT_INTERNAL,
     }
 }

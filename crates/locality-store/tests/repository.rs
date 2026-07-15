@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::freshness::{FreshnessTier, RemoteVersion};
 use locality_core::journal::{
-    JournalApplyEffect, JournalEntry, JournalMetadata, JournalStatus, JournalStore, PushId,
-    PushOperationId,
+    JournalApplyEffect, JournalEntry, JournalMetadata, JournalPreimage, JournalStatus,
+    JournalStore, PushId, PushOperationId,
 };
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::{PushOperation, PushPlan};
@@ -666,6 +666,47 @@ fn journal_repository_finds_previous_journal_by_created_entity_apply_effect() {
         .expect("latest");
 
     assert_eq!(previous, Some(PushId("push-create".to_string())));
+}
+
+#[test]
+fn journal_repository_matches_preimage_and_entity_operation_only_ids() {
+    let mut store = InMemoryStateStore::new();
+    let mount_id = MountId::new("notion-main");
+    let preimage = ShadowDocument::from_synced_body(
+        RemoteId::new("preimage-only"),
+        "Original body.",
+        7,
+        [RemoteId::new("block-1")],
+    )
+    .expect("preimage shadow");
+    store
+        .append_journal(
+            JournalEntry::new(
+                PushId("push-disjoint".to_string()),
+                mount_id.clone(),
+                vec![RemoteId::new("affected-only")],
+                PushPlan::new(
+                    vec![RemoteId::new("affected-only")],
+                    vec![PushOperation::UpdateEntityBody {
+                        entity_id: RemoteId::new("operation-only"),
+                        body: "Updated body.".to_string(),
+                    }],
+                ),
+                JournalStatus::Reconciled,
+            )
+            .with_preimages(vec![JournalPreimage::from_shadow(preimage)]),
+        )
+        .expect("append disjoint journal");
+
+    for remote_id in ["affected-only", "preimage-only", "operation-only"] {
+        assert_eq!(
+            store
+                .latest_journal_for_entities(&mount_id, &[RemoteId::new(remote_id)])
+                .expect("latest journal"),
+            Some(PushId("push-disjoint".to_string())),
+            "{remote_id}"
+        );
+    }
 }
 
 #[test]
