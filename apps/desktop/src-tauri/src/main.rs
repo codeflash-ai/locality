@@ -11015,6 +11015,7 @@ mod tests {
         assert!(
             snapshot.recent_files[0]
                 .local_path
+                .replace('\\', "/")
                 .ends_with("Standups with Locality/page.md")
         );
         assert_eq!(
@@ -16131,6 +16132,16 @@ fn configure_main_window_chrome(app: &mut tauri::App) {
     }
 }
 
+#[cfg(windows)]
+fn main_window_native_decorations() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+fn main_window_native_decorations() -> bool {
+    true
+}
+
 fn build_main_window(app: &AppHandle) -> tauri::Result<()> {
     if app.get_webview_window("main").is_some() {
         return Ok(());
@@ -16141,7 +16152,7 @@ fn build_main_window(app: &AppHandle) -> tauri::Result<()> {
         .min_inner_size(860.0, 620.0)
         .resizable(true)
         .center()
-        .decorations(true)
+        .decorations(main_window_native_decorations())
         .transparent(false)
         .shadow(true)
         .visible(false);
