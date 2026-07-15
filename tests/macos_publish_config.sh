@@ -10,6 +10,7 @@ DMG_BACKGROUND="${ROOT}/apps/desktop/src-tauri/assets/dmg-background.png"
 MOUNT_LOGO_ICNS="${ROOT}/apps/desktop/src-tauri/icons/locality-mount-logo.icns"
 MOUNT_LOGO_SVG="${ROOT}/apps/desktop/src-tauri/icons/locality-mount-logo.svg"
 FILE_PROVIDER_BUILD_SCRIPT="${ROOT}/platform/macos/LocalityFileProvider/scripts/build-dev-bundle.sh"
+FILE_PROVIDER_BUILD_TEST="${ROOT}/platform/macos/LocalityFileProvider/scripts/build-dev-bundle.test.sh"
 FILE_PROVIDER_HOST_PLIST="${ROOT}/platform/macos/LocalityFileProvider/App/Locality.Info.plist"
 FILE_PROVIDER_EXTENSION_PLIST="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityFileProvider.Info.plist"
 
@@ -92,6 +93,7 @@ grep -F -q 'Contents/Resources/locality-mount-logo.icns' "${FILE_PROVIDER_BUILD_
   || fail "File Provider build must copy mount logo ICNS into bundle resources"
 grep -F -q 'Contents/Resources/locality-mount-logo.svg' "${FILE_PROVIDER_BUILD_SCRIPT}" \
   || fail "File Provider build must copy mount logo SVG into bundle resources"
+bash "${FILE_PROVIDER_BUILD_TEST}" >/dev/null
 jq -e '.bundle.macOS.files["Resources/locality-mount-logo.icns"] == "icons/locality-mount-logo.icns"' "${TAURI_CONF}" >/dev/null \
   || fail "Tauri macOS host app must package the mount logo ICNS resource"
 jq -e '.bundle.macOS.dmg.background == "assets/dmg-background.png"' "${TAURI_CONF}" >/dev/null \
@@ -108,6 +110,214 @@ cleanup() {
   rm -rf "${tmp_root}"
 }
 trap cleanup EXIT
+
+source_guard_bin="${tmp_root}/source-guard-bin"
+mkdir -p "${source_guard_bin}"
+cat >"${source_guard_bin}/uname" <<'STUB'
+#!/usr/bin/env bash
+printf 'Linux\n'
+STUB
+chmod +x "${source_guard_bin}/uname"
+
+source_status=0
+source_output="$(
+  PATH="${source_guard_bin}:${PATH}" source "${PUBLISH_SCRIPT}"
+)" || source_status=$?
+[[ "${source_status}" == "0" ]] \
+  || fail "sourcing publish-macos.sh must not execute main"
+[[ -z "${source_output}" ]] \
+  || fail "sourcing publish-macos.sh should not produce publish output"
+
+publish_stub_bin="${tmp_root}/publish-stub-bin"
+mkdir -p "${publish_stub_bin}"
+cat >"${publish_stub_bin}/codesign" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${!#}"
+args=" $* "
+
+if [[ "${args}" == *" --entitlements "* ]]; then
+  if [[ "${LOCALITY_CODESIGN_ENTITLEMENTS_FAIL:-0}" == "1" ]]; then
+    printf 'codesign entitlement inspection failed for %s\n' "${target}" >&2
+    exit 42
+  fi
+
+  if [[ -n "${LOCALITY_CODESIGN_TESTING_PATH_SUFFIX:-}" && "${target}" == *"${LOCALITY_CODESIGN_TESTING_PATH_SUFFIX}" ]]; then
+    cat <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.developer.fileprovider.testing-mode</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+    exit 0
+  fi
+
+  cat <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict/>
+</plist>
+PLIST
+  exit 0
+fi
+
+if [[ "${args}" == *" -dv "* || "${args}" == *" --verbose=4 "* ]]; then
+  identifier_file="${target}.identifier"
+  if [[ -f "${identifier_file}" ]]; then
+    identifier="$(<"${identifier_file}")"
+  elif [[ "${target}" == *"LocalityFileProvider.appex" ]]; then
+    identifier="ai.codeflash.locality.Locality.FileProvider"
+  elif [[ "${target}" == *"locality-file-providerctl" ]]; then
+    identifier="ai.codeflash.locality.Locality.file-providerctl"
+  elif [[ "${target}" == *".app" ]]; then
+    identifier="ai.codeflash.locality.Locality"
+  else
+    identifier="ai.codeflash.locality.Locality.helper"
+  fi
+  printf 'Identifier=%s\n' "${identifier}" >&2
+  exit 0
+fi
+
+exit 0
+STUB
+chmod +x "${publish_stub_bin}/codesign"
+
+run_publish_function_tests() (
+  set -euo pipefail
+  PATH="${publish_stub_bin}:${PATH}"
+  source "${PUBLISH_SCRIPT}"
+
+  test_fail() {
+    printf 'macos publish config test: %s\n' "$*" >&2
+    exit 1
+  }
+
+  expect_publish_failure() {
+    local description="$1"
+    shift
+    local output status
+    status=0
+    output="$(
+      ( "$@" ) 2>&1
+    )" || status=$?
+    [[ "${status}" != "0" ]] || test_fail "${description}"
+    [[ -n "${output}" ]] || test_fail "${description} should explain the failure"
+  }
+
+  make_file_provider_fixture() {
+    local fixture_root="$1"
+    local app="${fixture_root}/Locality.app"
+    local appex="${app}/Contents/PlugIns/LocalityFileProvider.appex"
+    mkdir -p \
+      "${app}/Contents/MacOS" \
+      "${app}/Contents/PlugIns" \
+      "${appex}/Contents" \
+      "${appex}/Contents/MacOS"
+    touch \
+      "${app}/Contents/MacOS/loc" \
+      "${app}/Contents/MacOS/localityd" \
+      "${app}/Contents/MacOS/locality-file-providerctl" \
+      "${appex}/Contents/MacOS/LocalityFileProvider"
+    chmod +x \
+      "${app}/Contents/MacOS/loc" \
+      "${app}/Contents/MacOS/localityd" \
+      "${app}/Contents/MacOS/locality-file-providerctl" \
+      "${appex}/Contents/MacOS/LocalityFileProvider"
+    printf 'ai.codeflash.locality.Locality\n' >"${app}.identifier"
+    printf 'ai.codeflash.locality.Locality.file-providerctl\n' >"${app}/Contents/MacOS/locality-file-providerctl.identifier"
+    printf 'ai.codeflash.locality.Locality.FileProvider\n' >"${appex}.identifier"
+    cat >"${app}/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>ai.codeflash.locality.Locality</string>
+</dict>
+</plist>
+PLIST
+    cat >"${appex}/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>BuildMachineOSBuild</key>
+  <string>23F79</string>
+  <key>CFBundleIdentifier</key>
+  <string>ai.codeflash.locality.Locality.FileProvider</string>
+  <key>CFBundleSupportedPlatforms</key>
+  <array>
+    <string>MacOSX</string>
+  </array>
+  <key>DTCompiler</key>
+  <string>com.apple.compilers.llvm.clang.1_0</string>
+  <key>DTPlatformBuild</key>
+  <string>24F74</string>
+  <key>DTPlatformName</key>
+  <string>macosx</string>
+  <key>DTPlatformVersion</key>
+  <string>15.5</string>
+  <key>DTSDKBuild</key>
+  <string>24F74</string>
+  <key>DTSDKName</key>
+  <string>macosx15.5</string>
+</dict>
+</plist>
+PLIST
+    printf '%s\n' "${app}"
+  }
+
+  good_app="$(make_file_provider_fixture "${tmp_root}/publish-good")"
+  assert_file_provider_bundle_metadata "${good_app}"
+  assert_no_file_provider_testing_mode "${good_app}"
+
+  bad_containment_app="$(make_file_provider_fixture "${tmp_root}/publish-bad-containment")"
+  /usr/libexec/PlistBuddy \
+    -c 'Set :CFBundleIdentifier ai.codeflash.locality.FileProvider' \
+    "${bad_containment_app}/Contents/PlugIns/LocalityFileProvider.appex/Contents/Info.plist"
+  expect_publish_failure \
+    "malformed File Provider bundle identifier containment should fail" \
+    assert_file_provider_bundle_metadata "${bad_containment_app}"
+
+  missing_sdk_app="$(make_file_provider_fixture "${tmp_root}/publish-missing-sdk")"
+  /usr/libexec/PlistBuddy \
+    -c 'Delete :DTSDKBuild' \
+    "${missing_sdk_app}/Contents/PlugIns/LocalityFileProvider.appex/Contents/Info.plist"
+  expect_publish_failure \
+    "missing File Provider SDK metadata should fail" \
+    assert_file_provider_bundle_metadata "${missing_sdk_app}"
+
+  bad_platform_app="$(make_file_provider_fixture "${tmp_root}/publish-bad-platform")"
+  /usr/libexec/PlistBuddy \
+    -c 'Set :CFBundleSupportedPlatforms:0 NotMacOSX' \
+    "${bad_platform_app}/Contents/PlugIns/LocalityFileProvider.appex/Contents/Info.plist"
+  expect_publish_failure \
+    "File Provider supported platforms must require an exact MacOSX entry" \
+    assert_file_provider_bundle_metadata "${bad_platform_app}"
+
+  entitlement_inspection_failure() {
+    LOCALITY_CODESIGN_ENTITLEMENTS_FAIL=1 assert_no_file_provider_testing_mode "$1"
+  }
+
+  expect_publish_failure \
+    "File Provider entitlement inspection failure should fail closed" \
+    entitlement_inspection_failure "${good_app}"
+
+  testing_entitlement_failure() {
+    LOCALITY_CODESIGN_TESTING_PATH_SUFFIX='LocalityFileProvider.appex' assert_no_file_provider_testing_mode "$1"
+  }
+
+  expect_publish_failure \
+    "File Provider testing mode entitlement should fail publish validation" \
+    testing_entitlement_failure "${good_app}"
+)
+run_publish_function_tests
 
 dmg_dir="${tmp_root}/dmg"
 cask_output="${tmp_root}/loc.rb"

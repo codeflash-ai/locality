@@ -12,6 +12,8 @@ NOTARY_PROFILE="${APPLE_NOTARY_KEYCHAIN_PROFILE:-${NOTARY_KEYCHAIN_PROFILE:-loc-
 UPDATER_ENDPOINT="${TAURI_UPDATER_ENDPOINT:-https://github.com/codeflash-ai/locality/releases/latest/download/latest-macos.json}"
 HOST_ENTITLEMENTS="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityDeveloperId.entitlements"
 HOST_APP_GROUP="C484HB7Q6S.group.ai.codeflash.locality"
+PLISTBUDDY="/usr/libexec/PlistBuddy"
+FILE_PROVIDER_TESTING_ENTITLEMENT="com.apple.developer.fileprovider.testing-mode"
 
 log() {
   printf 'publish: %s\n' "$*"
@@ -28,6 +30,10 @@ skip_notarization() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
+}
+
+require_plistbuddy() {
+  [[ -x "${PLISTBUDDY}" ]] || fail "missing required command: ${PLISTBUDDY}"
 }
 
 json_escape() {
@@ -184,6 +190,123 @@ assert_app_group_entitlement() {
     || fail "${path} is missing ${HOST_APP_GROUP} entitlement"
 }
 
+plist_print() {
+  "${PLISTBUDDY}" -c "Print :$2" "$1" 2>/dev/null
+}
+
+assert_plist_string() {
+  local plist="$1"
+  local key="$2"
+  local value
+  value="$(plist_print "${plist}" "${key}")" \
+    || fail "${plist} is missing ${key}"
+  [[ -n "${value}" ]] || fail "${plist} has empty ${key}"
+  printf '%s\n' "${value}"
+}
+
+assert_identifier_contained_by_app() {
+  local child_identifier="$1"
+  local app_identifier="$2"
+  local label="$3"
+  [[ "${child_identifier}" == "${app_identifier}."* ]] \
+    || fail "${label} bundle identifier ${child_identifier} is not contained by ${app_identifier}"
+}
+
+signed_code_identifier() {
+  local path="$1"
+  local signature identifier
+  signature="$(codesign -dv --verbose=4 "${path}" 2>&1)" \
+    || fail "could not inspect code signature identifier for ${path}"
+  identifier="$(sed -n 's/^Identifier=//p' <<<"${signature}" | head -n 1)"
+  [[ -n "${identifier}" ]] \
+    || fail "could not determine code signature identifier for ${path}"
+  printf '%s\n' "${identifier}"
+}
+
+assert_supported_platforms_include_macos() {
+  local plist="$1"
+  local index platform
+  plist_print "${plist}" CFBundleSupportedPlatforms >/dev/null \
+    || fail "${plist} is missing CFBundleSupportedPlatforms"
+  index=0
+  while platform="$(plist_print "${plist}" "CFBundleSupportedPlatforms:${index}")"; do
+    if [[ "${platform}" == "MacOSX" ]]; then
+      return 0
+    fi
+    index=$((index + 1))
+  done
+  fail "${plist} does not declare MacOSX support"
+}
+
+assert_file_provider_bundle_metadata() {
+  local app="$1"
+  local appex="${app}/Contents/PlugIns/LocalityFileProvider.appex"
+  local helper="${app}/Contents/MacOS/locality-file-providerctl"
+  local app_plist="${app}/Contents/Info.plist"
+  local appex_plist="${appex}/Contents/Info.plist"
+  local app_identifier appex_identifier helper_identifier compiler platform_name platform_version sdk_name
+
+  require_plistbuddy
+  [[ -f "${app_plist}" ]] || fail "${app} is missing Contents/Info.plist"
+  [[ -f "${appex_plist}" ]] || fail "${appex} is missing Contents/Info.plist"
+  [[ -e "${helper}" ]] || fail "${app} is missing locality-file-providerctl"
+
+  app_identifier="$(assert_plist_string "${app_plist}" CFBundleIdentifier)"
+  appex_identifier="$(assert_plist_string "${appex_plist}" CFBundleIdentifier)"
+  helper_identifier="$(signed_code_identifier "${helper}")"
+  assert_identifier_contained_by_app "${appex_identifier}" "${app_identifier}" "LocalityFileProvider.appex"
+  assert_identifier_contained_by_app "${helper_identifier}" "${app_identifier}" "locality-file-providerctl"
+
+  assert_supported_platforms_include_macos "${appex_plist}"
+
+  assert_plist_string "${appex_plist}" BuildMachineOSBuild >/dev/null
+  assert_plist_string "${appex_plist}" DTPlatformBuild >/dev/null
+  assert_plist_string "${appex_plist}" DTSDKBuild >/dev/null
+  compiler="$(assert_plist_string "${appex_plist}" DTCompiler)"
+  platform_name="$(assert_plist_string "${appex_plist}" DTPlatformName)"
+  platform_version="$(assert_plist_string "${appex_plist}" DTPlatformVersion)"
+  sdk_name="$(assert_plist_string "${appex_plist}" DTSDKName)"
+
+  [[ "${compiler}" == "com.apple.compilers.llvm.clang.1_0" ]] \
+    || fail "LocalityFileProvider.appex has unexpected DTCompiler ${compiler}"
+  [[ "${platform_name}" == "macosx" ]] \
+    || fail "LocalityFileProvider.appex has unexpected DTPlatformName ${platform_name}"
+  [[ "${platform_version}" =~ ^[0-9]+([.][0-9]+)*$ ]] \
+    || fail "LocalityFileProvider.appex has invalid DTPlatformVersion ${platform_version}"
+  [[ "${sdk_name}" == macosx* ]] \
+    || fail "LocalityFileProvider.appex has invalid DTSDKName ${sdk_name}"
+}
+
+assert_no_file_provider_testing_mode_for_path() {
+  local path="$1"
+  local entitlements
+  entitlements="$(codesign -d --entitlements - "${path}" 2>/dev/null)" \
+    || fail "could not inspect entitlements for ${path}"
+  [[ "${entitlements}" != *"${FILE_PROVIDER_TESTING_ENTITLEMENT}"* ]] \
+    || fail "${path} carries ${FILE_PROVIDER_TESTING_ENTITLEMENT}"
+}
+
+assert_no_file_provider_testing_mode() {
+  local app="$1"
+  local appex="${app}/Contents/PlugIns/LocalityFileProvider.appex"
+  local helper="${app}/Contents/MacOS/locality-file-providerctl"
+  local path
+  [[ -e "${app}" ]] || fail "missing app for entitlement inspection: ${app}"
+  [[ -e "${appex}" ]] || fail "missing File Provider appex for entitlement inspection: ${appex}"
+  [[ -e "${helper}" ]] || fail "missing File Provider helper for entitlement inspection: ${helper}"
+
+  local -a paths=("${app}" "${helper}" "${appex}")
+  for path in "${app}/Contents/MacOS/loc" "${app}/Contents/MacOS/localityd"; do
+    if [[ -e "${path}" ]]; then
+      paths+=("${path}")
+    fi
+  done
+
+  for path in "${paths[@]}"; do
+    assert_no_file_provider_testing_mode_for_path "${path}"
+  done
+}
+
 verify_signed_app_in_dmg() (
   local dmg="$1"
   local expected_build="$2"
@@ -208,6 +331,8 @@ verify_signed_app_in_dmg() (
     || fail "${PRODUCT_NAME}.app does not include an executable loc CLI"
   [[ -x "${app}/Contents/MacOS/localityd" ]] \
     || fail "${PRODUCT_NAME}.app does not include an executable localityd sidecar"
+  codesign --verify --strict --verbose=2 "${app}/Contents/MacOS/locality-file-providerctl"
+  codesign --verify --deep --strict --verbose=2 "${app}/Contents/PlugIns/LocalityFileProvider.appex"
   local app_signature appex_signature
   app_signature="$(codesign -dv --verbose=4 "${app}" 2>&1)"
   appex_signature="$(codesign -dv --verbose=4 "${app}/Contents/PlugIns/LocalityFileProvider.appex" 2>&1)"
@@ -221,6 +346,8 @@ verify_signed_app_in_dmg() (
     assert_app_group_entitlement "${app}/Contents/MacOS/localityd"
     assert_app_group_entitlement "${app}/Contents/MacOS/locality-file-providerctl"
   fi
+  assert_file_provider_bundle_metadata "${app}"
+  assert_no_file_provider_testing_mode "${app}"
   grep -a -F -q "${expected_build}" "${app}/Contents/MacOS/localityd"
   smoke_test_desktop_app "${app}"
 )
@@ -303,6 +430,7 @@ main() {
   require_command codesign
   require_command security
   require_command strings
+  require_plistbuddy
   if ! skip_notarization; then
     require_command xcrun
     require_command spctl
@@ -407,4 +535,6 @@ main() {
   fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
