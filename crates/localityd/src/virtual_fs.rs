@@ -729,7 +729,28 @@ where
         }
         let path = content_path_for_relative(content_root, &mutation.projected_path)?;
         if !path.exists() {
-            write_binary_atomic(&path, b"")?;
+            let visible_path = mount.root.join(&mutation.projected_path);
+            if visible_path.is_file() {
+                let contents = std::fs::read(&visible_path).map_err(|error| {
+                    LocalityError::Io(format!(
+                        "failed to read pending create visible file `{}`: {error}",
+                        visible_path.display()
+                    ))
+                })?;
+                write_binary_atomic(&path, &contents)?;
+            } else if mutation
+                .content_path
+                .as_ref()
+                .is_some_and(|stored_path| stored_path != &path)
+            {
+                return Err(LocalityError::InvalidState(format!(
+                    "pending create `{}` current content cache is missing at `{}`",
+                    mutation.local_id,
+                    path.display()
+                )));
+            } else {
+                write_binary_atomic(&path, b"")?;
+            }
         }
         return Ok(VirtualFsMaterializeReport {
             mount_id: mount_id.0.clone(),
@@ -1002,12 +1023,7 @@ where
         } else {
             pending_temp_item(&mount, mutation, filename)
         };
-        return Ok(VirtualFsMutationReport {
-            mount_id: mount_id.0.clone(),
-            identifier: mutation.local_id.clone(),
-            path: item.path.clone(),
-            item,
-        });
+        return mutation_report_for_content_item(mount_id, content_root, item);
     }
 
     let parent_path = container_path(&mount, &entities, &mutations, parent_identifier)?;
@@ -1041,12 +1057,7 @@ where
         .map_err(LocalityError::from)?;
     let index = ProviderIndex::new(&entities);
     let item = pending_item(&mount, &mutation, &index);
-    Ok(VirtualFsMutationReport {
-        mount_id: mount_id.0.clone(),
-        identifier: mutation.local_id,
-        path: item.path.clone(),
-        item,
-    })
+    mutation_report_for_content_item(mount_id, content_root, item)
 }
 
 pub fn create_virtual_fs_directory<S>(
@@ -1167,6 +1178,15 @@ fn mutation_report_for_existing_item(
         path: item.path.clone(),
         item,
     }
+}
+
+fn mutation_report_for_content_item(
+    mount_id: &MountId,
+    content_root: &Path,
+    mut item: VirtualFsItem,
+) -> LocalityResult<VirtualFsMutationReport> {
+    rewrite_item_materialized_path(content_root, &mut item)?;
+    Ok(mutation_report_for_existing_item(mount_id, item))
 }
 
 pub fn rename_virtual_fs_item<S>(
@@ -1347,12 +1367,7 @@ where
             .map_err(LocalityError::from)?;
         let index = ProviderIndex::new(&entities);
         let item = pending_item(&mount, &mutation, &index);
-        return Ok(VirtualFsMutationReport {
-            mount_id: mount_id.0.clone(),
-            identifier: mutation.local_id,
-            path: item.path.clone(),
-            item,
-        });
+        return mutation_report_for_content_item(mount_id, content_root, item);
     }
 
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
@@ -1437,12 +1452,11 @@ where
     {
         let index = ProviderIndex::new(entities);
         let item = pending_item(mount, &mutation, &index);
-        return Ok(Some(VirtualFsMutationReport {
-            mount_id: mount_id.0.clone(),
-            identifier: mutation.local_id,
-            path: item.path.clone(),
+        return Ok(Some(mutation_report_for_content_item(
+            mount_id,
+            content_root,
             item,
-        }));
+        )?));
     }
 
     if !is_atomic_temp_filename(&filename(&mutation.projected_path)) {
@@ -1553,12 +1567,7 @@ where
             .map_err(LocalityError::from)?;
         let index = ProviderIndex::new(&entities);
         let item = pending_item(&mount, &mutation, &index);
-        return Ok(VirtualFsMutationReport {
-            mount_id: mount_id.0.clone(),
-            identifier: mutation.local_id,
-            path: item.path.clone(),
-            item,
-        });
+        return mutation_report_for_content_item(mount_id, content_root, item);
     }
     let remote_id = RemoteId::new(entity_identifier(identifier)?);
     let entity = require_entity(store, mount_id, &remote_id)?;
@@ -1627,37 +1636,75 @@ pub fn virtual_fs_content_root(state_root: &Path, mount_id: &MountId) -> PathBuf
         .join("files")
 }
 
+#[cfg(target_os = "macos")]
 pub fn virtual_fs_content_base(state_root: &Path) -> PathBuf {
-    if let Ok(root) = std::env::var("LOCALITY_VIRTUAL_FS_CONTENT_ROOT") {
-        return PathBuf::from(root);
+    let override_root = std::env::var_os("LOCALITY_VIRTUAL_FS_CONTENT_ROOT").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    virtual_fs_content_base_from_config(
+        state_root,
+        override_root.as_deref(),
+        home.as_deref(),
+        macos_app_sandbox_enabled(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn virtual_fs_content_base(state_root: &Path) -> PathBuf {
+    let override_root = std::env::var_os("LOCALITY_VIRTUAL_FS_CONTENT_ROOT").map(PathBuf::from);
+    virtual_fs_content_base_from_config(state_root, override_root.as_deref())
+}
+
+#[cfg(target_os = "macos")]
+fn virtual_fs_content_base_from_config(
+    state_root: &Path,
+    override_root: Option<&Path>,
+    home: Option<&Path>,
+    app_sandbox_enabled: bool,
+) -> PathBuf {
+    if let Some(root) = override_root {
+        return root.to_path_buf();
     }
 
-    #[cfg(target_os = "macos")]
-    if is_default_state_root(state_root)
-        && let Some(group_container) = macos_app_group_container()
+    if home.is_some_and(|home| is_default_state_root_for_home(state_root, home))
+        && app_sandbox_enabled
     {
-        return group_container.join("content");
+        return macos_app_group_container_for_home(home.expect("checked home")).join("content");
     }
 
     state_root.join("content")
 }
 
-#[cfg(target_os = "macos")]
-fn is_default_state_root(state_root: &Path) -> bool {
-    std::env::var("HOME")
-        .ok()
-        .map(|home| PathBuf::from(home).join(".loc") == state_root)
-        .unwrap_or(false)
+#[cfg(not(target_os = "macos"))]
+fn virtual_fs_content_base_from_config(state_root: &Path, override_root: Option<&Path>) -> PathBuf {
+    override_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| state_root.join("content"))
 }
 
 #[cfg(target_os = "macos")]
-fn macos_app_group_container() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(|home| {
-        PathBuf::from(home)
-            .join("Library")
-            .join("Group Containers")
-            .join("C484HB7Q6S.group.ai.codeflash.locality")
-    })
+fn is_default_state_root_for_home(state_root: &Path, home: &Path) -> bool {
+    home.join(".loc") == state_root
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_group_container_for_home(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Group Containers")
+        .join("C484HB7Q6S.group.ai.codeflash.locality")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_group_container_for_state_root(state_root: &Path) -> Option<PathBuf> {
+    if state_root.file_name().and_then(|name| name.to_str()) != Some(".loc") {
+        return None;
+    }
+    state_root.parent().map(macos_app_group_container_for_home)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_sandbox_enabled() -> bool {
+    std::env::var_os("APP_SANDBOX_CONTAINER_ID").is_some_and(|value| !value.is_empty())
 }
 
 pub fn virtual_fs_content_path(
@@ -1669,6 +1716,44 @@ pub fn virtual_fs_content_path(
         &virtual_fs_content_root(state_root, mount_id),
         relative_path,
     )
+}
+
+pub(crate) fn virtual_mutation_content_path_for_read(
+    state_root: Option<&Path>,
+    mount_id: &MountId,
+    mutation: &VirtualMutationRecord,
+) -> LocalityResult<Option<PathBuf>> {
+    let current_path = state_root
+        .map(|root| virtual_fs_content_path(root, mount_id, &mutation.projected_path))
+        .transpose()?;
+
+    if let Some(stored_path) = mutation.content_path.as_ref() {
+        if let (Some(state_root), Some(current_path)) = (state_root, current_path.as_ref())
+            && legacy_macos_app_group_content_path(stored_path, state_root)
+        {
+            return Ok(Some(current_path.clone()));
+        }
+
+        return Ok(Some(stored_path.clone()));
+    }
+
+    Ok(current_path)
+}
+
+#[cfg(target_os = "macos")]
+fn legacy_macos_app_group_content_path(stored_path: &Path, state_root: &Path) -> bool {
+    let Some(group_content_base) = macos_app_group_container_for_state_root(state_root)
+        .map(|container| container.join("content"))
+    else {
+        return false;
+    };
+    stored_path.starts_with(&group_content_base)
+        && !virtual_fs_content_base(state_root).starts_with(&group_content_base)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn legacy_macos_app_group_content_path(_stored_path: &Path, _state_root: &Path) -> bool {
+    false
 }
 
 fn local_mutation<S>(
@@ -2470,15 +2555,8 @@ fn pending_item(
         hydration: Some(HydrationState::Dirty),
         content_type: "net.daringfireball.markdown".to_string(),
         remote_edited_at: None,
-        materialized_path: mutation
-            .content_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        byte_size: mutation
-            .content_path
-            .as_ref()
-            .and_then(|path| path.metadata().ok())
-            .map(|metadata| metadata.len()),
+        materialized_path: None,
+        byte_size: None,
     }
 }
 
@@ -2540,16 +2618,8 @@ fn pending_temp_item(
         hydration: Some(HydrationState::Dirty),
         content_type: "public.data".to_string(),
         remote_edited_at: None,
-        materialized_path: mutation
-            .content_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .or_else(|| Some(mount.root.join(path).display().to_string())),
-        byte_size: mutation
-            .content_path
-            .as_ref()
-            .and_then(|path| path.metadata().ok())
-            .map(|metadata| metadata.len()),
+        materialized_path: Some(mount.root.join(path).display().to_string()),
+        byte_size: None,
     }
 }
 
@@ -3355,6 +3425,7 @@ impl ProviderIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use locality_connector::{
@@ -3371,7 +3442,8 @@ mod tests {
     };
     use locality_store::{
         EntityRecord, EntityRepository, FreshnessStateRepository, InMemoryStateStore, MountConfig,
-        MountRepository, ProjectionMode, VirtualMutationKind, VirtualMutationRepository,
+        MountRepository, ProjectionMode, VirtualMutationKind, VirtualMutationRecord,
+        VirtualMutationRepository,
     };
 
     use crate::hydration::{HydratedEntity, HydrationSource};
@@ -3384,8 +3456,8 @@ mod tests {
         refresh_virtual_fs_children, refresh_virtual_fs_children_with_content_root,
         rename_virtual_fs_item, trash_virtual_fs_item, validate_virtual_projection_root,
         virtual_fs_ancestor_container_identifiers, virtual_fs_children,
-        virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_item,
-        virtual_fs_item_with_content_root, virtual_projection_root,
+        virtual_fs_children_with_content_root, virtual_fs_content_path, virtual_fs_content_root,
+        virtual_fs_item, virtual_fs_item_with_content_root, virtual_projection_root,
     };
 
     #[test]
@@ -5309,6 +5381,285 @@ mod tests {
         assert!(
             virtual_fs_content_path(state_root, &mount_id, std::path::Path::new("/escape.md"))
                 .is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_macos_content_cache_stays_in_state_root_outside_app_sandbox() {
+        let home = std::env::temp_dir().join(format!("loc-virtual-fs-home-{}", std::process::id()));
+        let state_root = home.join(".loc");
+
+        assert_eq!(
+            super::virtual_fs_content_base_from_config(&state_root, None, Some(&home), false),
+            state_root.join("content")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_macos_content_cache_uses_app_group_inside_app_sandbox() {
+        let home = std::env::temp_dir().join(format!(
+            "loc-virtual-fs-sandbox-home-{}",
+            std::process::id()
+        ));
+        let state_root = home.join(".loc");
+
+        assert_eq!(
+            super::virtual_fs_content_base_from_config(&state_root, None, Some(&home), true),
+            home.join("Library")
+                .join("Group Containers")
+                .join("C484HB7Q6S.group.ai.codeflash.locality")
+                .join("content")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn content_root_override_wins_inside_app_sandbox() {
+        let home = std::env::temp_dir().join(format!(
+            "loc-virtual-fs-override-home-{}",
+            std::process::id()
+        ));
+        let state_root = home.join(".loc");
+        let override_root = home.join("override-content");
+
+        assert_eq!(
+            super::virtual_fs_content_base_from_config(
+                &state_root,
+                Some(&override_root),
+                Some(&home),
+                true
+            ),
+            override_root
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_create_listing_does_not_expose_legacy_app_group_content_path_outside_sandbox() {
+        let home = std::env::temp_dir().join(format!(
+            "loc-virtual-fs-legacy-pending-home-{}",
+            std::process::id()
+        ));
+        let state_root = home.join(".loc");
+
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-root"),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            ))
+            .expect("save parent page");
+        let legacy_path = home
+            .join("Library")
+            .join("Group Containers")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
+            .join("content")
+            .join(&mount_id.0)
+            .join("files")
+            .join("Home/Draft.md");
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("legacy parent");
+        fs::write(&legacy_path, b"legacy app-group bytes").expect("write legacy cache");
+        store
+            .save_virtual_mutation(VirtualMutationRecord {
+                mount_id: mount_id.clone(),
+                local_id: "local:draft".to_string(),
+                mutation_kind: VirtualMutationKind::Create,
+                target_remote_id: None,
+                parent_remote_id: Some(RemoteId::new("page-root")),
+                original_path: None,
+                projected_path: PathBuf::from("Home/Draft.md"),
+                title: "Draft".to_string(),
+                content_path: Some(legacy_path.clone()),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .expect("save pending mutation");
+
+        let children =
+            virtual_fs_children(&store, &mount_id, "children:page-root").expect("children");
+        let draft = children
+            .children
+            .iter()
+            .find(|child| child.identifier == "local:draft")
+            .expect("pending draft");
+        assert_eq!(draft.materialized_path, None);
+        assert_eq!(draft.byte_size, None);
+        assert_ne!(
+            draft.materialized_path.as_deref(),
+            Some(legacy_path.to_string_lossy().as_ref())
+        );
+
+        let current_content_root = virtual_fs_content_root(&state_root, &mount_id);
+        let rooted = virtual_fs_children_with_content_root(
+            &store,
+            &current_content_root,
+            &mount_id,
+            "children:page-root",
+        )
+        .expect("children with content root");
+        let draft = rooted
+            .children
+            .iter()
+            .find(|child| child.identifier == "local:draft")
+            .expect("pending draft");
+        assert_eq!(
+            draft.materialized_path.as_deref(),
+            Some(
+                current_content_root
+                    .join("Home/Draft.md")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(draft.byte_size, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn materialize_pending_create_copies_visible_file_when_legacy_cache_is_ignored() {
+        let home = std::env::temp_dir().join(format!(
+            "loc-virtual-fs-legacy-materialize-home-{}",
+            std::process::id()
+        ));
+        let state_root = home.join(".loc");
+        let visible_root = home.join("visible");
+        let mount_id = MountId::new("notion-main");
+        let current_content_root = virtual_fs_content_root(&state_root, &mount_id);
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(
+                MountConfig::new(mount_id.clone(), "notion", &visible_root)
+                    .projection(ProjectionMode::LinuxFuse),
+            )
+            .expect("save mount");
+        let visible_path = visible_root.join("Home/Draft.md");
+        fs::create_dir_all(visible_path.parent().expect("visible parent")).expect("visible parent");
+        fs::write(&visible_path, b"visible pending body").expect("write visible file");
+        let legacy_path = home
+            .join("Library")
+            .join("Group Containers")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
+            .join("content")
+            .join(&mount_id.0)
+            .join("files")
+            .join("Home/Draft.md");
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("legacy parent");
+        fs::write(&legacy_path, b"legacy app-group bytes").expect("write legacy cache");
+        store
+            .save_virtual_mutation(VirtualMutationRecord {
+                mount_id: mount_id.clone(),
+                local_id: "local:draft".to_string(),
+                mutation_kind: VirtualMutationKind::Create,
+                target_remote_id: None,
+                parent_remote_id: None,
+                original_path: None,
+                projected_path: PathBuf::from("Home/Draft.md"),
+                title: "Draft".to_string(),
+                content_path: Some(legacy_path),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .expect("save pending mutation");
+
+        let report = materialize_virtual_fs_item_with_content_root(
+            &mut store,
+            &FailingHydrationSource,
+            &current_content_root,
+            &mount_id,
+            "local:draft",
+        )
+        .expect("materialize pending create");
+
+        let current_path = current_content_root.join("Home/Draft.md");
+        assert_eq!(PathBuf::from(&report.path), current_path);
+        assert_eq!(
+            report.outcome,
+            VirtualFsMaterializeOutcome::AlreadyMaterialized
+        );
+        assert_eq!(report.hydration, HydrationState::Dirty);
+        assert_eq!(
+            fs::read(current_content_root.join("Home/Draft.md")).expect("read current cache"),
+            b"visible pending body"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_page_temp_create_uses_current_content_root_not_legacy_content_path() {
+        let home = std::env::temp_dir().join(format!(
+            "loc-virtual-fs-legacy-temp-home-{}",
+            std::process::id()
+        ));
+        let state_root = home.join(".loc");
+
+        let mount_id = MountId::new("notion-main");
+        let current_content_root = virtual_fs_content_root(&state_root, &mount_id);
+        let mut store = InMemoryStateStore::new();
+        store
+            .save_mount(virtual_mount(&mount_id))
+            .expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("page-root"),
+                EntityKind::Page,
+                "Home",
+                "Home/page.md",
+            ))
+            .expect("save parent page");
+        let legacy_path = home
+            .join("Library")
+            .join("Group Containers")
+            .join("C484HB7Q6S.group.ai.codeflash.locality")
+            .join("content")
+            .join(&mount_id.0)
+            .join("files")
+            .join("Home/Draft/page.md");
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("legacy parent");
+        fs::write(&legacy_path, b"legacy app-group bytes").expect("write legacy cache");
+        store
+            .save_virtual_mutation(VirtualMutationRecord {
+                mount_id: mount_id.clone(),
+                local_id: "local:draft".to_string(),
+                mutation_kind: VirtualMutationKind::Create,
+                target_remote_id: None,
+                parent_remote_id: Some(RemoteId::new("page-root")),
+                original_path: None,
+                projected_path: PathBuf::from("Home/Draft/page.md"),
+                title: "Draft".to_string(),
+                content_path: Some(legacy_path.clone()),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .expect("save pending mutation");
+
+        let temp = create_virtual_fs_file(
+            &mut store,
+            &current_content_root,
+            &mount_id,
+            "children:local:draft",
+            "page.md.tmp.1234.abcd",
+        )
+        .expect("create page temp");
+
+        let expected = current_content_root.join("Home/Draft/page.md.tmp.1234.abcd");
+        assert_eq!(
+            temp.item.materialized_path.as_deref(),
+            Some(expected.to_string_lossy().as_ref())
+        );
+        assert_eq!(temp.item.byte_size, None);
+        assert_ne!(
+            temp.item.materialized_path.as_deref(),
+            Some(legacy_path.to_string_lossy().as_ref())
         );
     }
 

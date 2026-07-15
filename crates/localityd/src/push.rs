@@ -69,7 +69,9 @@ use crate::shadow_match::shadows_match;
 use crate::source::{
     LocalSourceValidator, SourcePushValidator, SourceValidationContext, source_descriptor,
 };
-use crate::virtual_fs::{virtual_fs_content_path, virtual_fs_content_root};
+use crate::virtual_fs::{
+    virtual_fs_content_path, virtual_fs_content_root, virtual_mutation_content_path_for_read,
+};
 
 pub fn execute_push_job<S, Source>(
     store: &mut S,
@@ -2374,13 +2376,12 @@ fn pending_create_read_path(
     state_root: Option<&Path>,
     absolute_path: &Path,
 ) -> Result<PathBuf, PushPrepareError> {
-    let content_path = pending.content_path.clone().or_else(|| {
-        state_root.map(|root| {
-            virtual_fs_content_root(root, &mount.mount_id).join(&pending.projected_path)
-        })
-    });
+    let content_path = virtual_mutation_content_path_for_read(state_root, &mount.mount_id, pending)
+        .map_err(PushPrepareError::Core)?;
 
-    if mount.projection.uses_virtual_filesystem() && state_root.is_none() && absolute_path.is_file()
+    if mount.projection.uses_virtual_filesystem()
+        && absolute_path.is_file()
+        && (state_root.is_none() || content_path.as_ref().is_some_and(|path| !path.is_file()))
     {
         return Ok(absolute_path.to_path_buf());
     }

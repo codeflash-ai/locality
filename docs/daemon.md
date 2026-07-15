@@ -249,6 +249,12 @@ Linux equivalent because Locality directly serves the read.
 Virtual projection contents are materialized under `~/.loc/content/<mount-id>/`
 instead of under the mounted root. This avoids recursive FUSE calls when the root
 is itself a virtual mount and gives macOS/Linux adapters one stable byte source.
+Sandboxed macOS builds may instead use the Locality app-group container for this
+content root; direct Developer ID builds keep the cache in `~/.loc/content` so
+normal startup and sync do not touch protected app-container data.
+When older pending virtual mutations still store app-group cache paths, daemon
+read paths recompute the current content-cache location outside the sandbox
+instead of reopening the legacy app-group file.
 
 Scheduled reconciliation skips writing placeholder Markdown files for virtual
 filesystem projection modes such as `macos_file_provider` and `linux_fuse`; it

@@ -139,6 +139,12 @@ Required Apple-side setup:
 - Application group `C484HB7Q6S.group.ai.codeflash.locality`.
 - Notary credentials, preferably an App Store Connect API key in CI.
 
+Direct-download Developer ID builds are not app-sandboxed, so daemon-owned
+virtual projection content stays under `~/.loc/content`. The app group is still
+part of the File Provider/App Store entitlement set, but non-sandboxed startup
+paths should not create or watch the group container because macOS can classify
+that as app-data access.
+
 Find the local signing identity:
 
 ```sh
