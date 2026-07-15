@@ -249,8 +249,13 @@ wait_for_fuse
 step="enumerating live Granola meetings through the mounted filesystem"
 meeting_count="0"
 for _ in {1..120}; do
-  meeting_count="$(find "$granola_mount" -mindepth 1 -maxdepth 1 -type d -printf '.' \
-    2>>"$command_log" | wc -c)"
+  if listing_dots="$(find "$granola_mount" -mindepth 1 -maxdepth 1 -type d -printf '.' \
+    2>>"$command_log")"; then
+    meeting_count="${#listing_dots}"
+  else
+    sleep 0.25
+    continue
+  fi
   if [[ "$meeting_count" =~ ^[0-9]+$ ]] && (( meeting_count > 0 )); then
     break
   fi
