@@ -7,11 +7,46 @@ separates:
 
 - **Live Notion e2e**: runs against the real Notion API and creates scratch
   Notion content.
+- **Live Granola e2e**: runs read-only against a stable meeting through the real
+  Granola public API, CLI, daemon, and Linux FUSE filesystem path.
 - **Local behavior e2e**: exercises the Locality architecture with fake connectors,
   local state, or seeded filesystem mounts.
 - **Manual macOS coverage**: requires a signed app, File Provider approval, and
   a user session. GitHub-hosted macOS runners compile this code but do not
   register a real File Provider domain.
+
+## How To Run Live Granola E2E
+
+Required environment:
+
+```sh
+export GRANOLA_API_KEY=...
+export LOCALITY_GRANOLA_LIVE_NOTE_ID=not_...
+```
+
+The note ID should refer to a stable meeting with a retained transcript. It is
+the preferred fixture; if retention removes its transcript or the note is
+deleted, the suite selects another retained transcript without logging its
+identity. The live suite is read-only, creates an isolated Locality state
+directory, and does not print or upload meeting names, filenames, summaries,
+transcripts, API payloads, daemon/provider logs, or credentials.
+
+Run the public API test on any platform:
+
+```sh
+cargo test -p locality-granola --test live_integrity -- --ignored --test-threads=1
+```
+
+Run the complete CLI, daemon, and kernel-mounted filesystem test on Linux with
+FUSE available:
+
+```sh
+LOCALITY_LIVE_GRANOLA_VFS=1 tests/live_granola_vfs_read.sh
+```
+
+GitHub Actions runs `.github/workflows/granola-live-e2e.yml` for relevant
+changes on `main`, weekly, and on manual dispatch. The workflow uses the
+`granola-live-e2e` environment and uploads no artifacts.
 
 ## How To Run Live Notion E2E
 
@@ -117,6 +152,14 @@ Coverage labels:
 | E2E-036 | Mount setup writes concise agent guidance that explains filesystem-first editing, Live Mode behavior, review/push commands, Notion page/database shape, and untrusted remote content boundaries without turning guidance files into synced entities. | Local only | `crates/loc-cli/tests/mount.rs`; `crates/loc-cli/tests/e2e_push_workflow.rs::mount_agent_guidance_matches_filesystem_workflow_and_does_not_dirty_status`. | Local e2e coverage mounts through the workflow path, verifies `AGENTS.md`/`CLAUDE.md` content and custom-guidance preservation, pulls a page, and verifies guidance files do not dirty status or appear as synced entries. |
 | E2E-037 | Google Docs workspace-folder mounts enumerate Drive folders/docs as online-only Markdown stubs, hydrate docs on explicit open/pull, create new docs from local Markdown, push supported document text edits through the Google Docs connector, and reconcile status clean. | Local only | `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_workspace_folder_pull_stubs_nested_docs_without_hydrating_folder`; `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_mount_pull_edit_push_reconciles_clean_with_real_connector`; `crates/loc-cli/tests/e2e_push_workflow.rs::google_docs_mount_create_push_reconciles_clean_with_real_connector`. | Local e2e uses the real Google Docs connector with fake Drive/Docs APIs to verify folder mounts do not hydrate folders as docs, nested docs remain online-only until explicitly pulled, local Markdown creates resolve to the workspace folder parent, supported text edits produce Docs batch updates, and daemon-backed push reconciles clean. Live Google Docs API e2e remains a gap. |
 | E2E-038 | Credential-backed mounted setup and commands fail closed when the stored secret is missing, report reconnect guidance without leaking credential storage internals, and do not materialize, rewrite, or journal local work. | Local only | `crates/loc-cli/tests/e2e_push_workflow.rs::cli_mount_blocks_missing_connection_credential_before_creating_mount`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_status_and_info_missing_mount_credential_stay_local_without_leaking_secret_ref`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_search_missing_mount_credential_returns_local_index_without_leaking_secret_ref`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_log_and_undo_prepared_journal_missing_credential_stay_local_without_secret_ref`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_connection_reports_and_disconnect_missing_credential_without_leaking_secret_ref`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_pull_missing_mount_credential_blocks_before_writing_files`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_push_missing_mount_credential_blocks_before_journal`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_inspect_missing_mount_credential_reports_reconnect_without_mutating`; `crates/loc-cli/tests/e2e_push_workflow.rs::cli_doctor_reports_missing_mount_credential_without_leaking_secret_ref`; `crates/loc-cli/tests/doctor.rs`. | Live binary workflow covers the healthy stored-credential path; local e2e covers missing-credential local read/navigation surfaces (`status`, `info`, `search`, `connections`, `connection show`, `log`), local recovery (`diff`, `restore`, local prepared-journal `undo`, `disconnect`), and fail-closed remote-dependent commands: mount setup before mount state writes, diagnostics, pull before connector fetch or local writes, push before journal creation, and inspect before remote comparison or local mutation. |
+| E2E-039 | Granola connects with an API key, paginates and incrementally lists real notes, retrieves and renders a stable summary/transcript pair, mounts meetings through the real CLI/daemon/Linux FUSE path, remains clean on repeat discovery, and rejects filesystem writes. | Covered live | `crates/locality-granola/tests/live_integrity.rs::live_public_api_paginates_fetches_transcript_and_renders_canonical_files`; `tests/live_granola_vfs_read.sh`; Granola connector, renderer, discovery-checkpoint, and virtual read-only tests. | The live suite is read-only against an existing generic meeting, runs with isolated local state, verifies no credential appears in reports or SQLite, and emits privacy-safe failure diagnostics. Real macOS File Provider remains a signed-app manual smoke because hosted runners cannot exercise a logged-in Finder session reliably. |
+
+## Live Granola Test Coverage Map
+
+| Test | Kind | Behaviors covered |
+|---|---|---|
+| `crates/locality-granola/tests/live_integrity.rs::live_public_api_paginates_fetches_transcript_and_renders_canonical_files` | Live connector | Uses the official public API to verify the first page, cursor pagination when present, stable-note metadata and transcript retrieval, canonical summary/transcript frontmatter, speaker-first compact transcript headings, and an `updated_after` request. Covers the connector-facing part of E2E-039. |
+| `tests/live_granola_vfs_read.sh` | Live Linux FUSE product path | Uses an isolated state root and the real `loc`, `localityd`, and `locality-fuse` binaries to connect, register a read-only mount, enumerate meetings through a kernel directory listing, verify the durable incremental checkpoint, hydrate the encrypted-ID fixture through filesystem reads, verify canonical files and clean status, reject a filesystem write without changing bytes, repeat incremental discovery without duplicate identities/paths, and run `loc doctor`. Covers the mounted product path of E2E-039. |
 
 ## Live Notion Test Coverage Map
 

@@ -92,6 +92,49 @@ also read-only. Write support must wait for a supported public API rather than
 depending on the private `update-document` implementation used by Granola's
 desktop client.
 
+## Live E2E
+
+The live suite is deliberately read-only and uses an isolated Locality state
+directory. It never prints meeting titles, filenames, summary/transcript text,
+API payloads, the API key, or daemon/provider logs. It has two layers:
+
+- `crates/locality-granola/tests/live_integrity.rs` exercises the real public
+  API, cursor pagination, metadata and transcript retrieval, incremental
+  filtering, and canonical summary/transcript rendering.
+- `tests/live_granola_vfs_read.sh` connects and mounts through the real `loc`
+  binary, starts `localityd` and Linux FUSE, discovers meetings, hydrates the
+  configured meeting through filesystem reads, verifies the incremental
+  checkpoint and clean/read-only state, repeats discovery, and runs `loc doctor`.
+
+Required environment:
+
+```bash
+export GRANOLA_API_KEY=...
+export LOCALITY_GRANOLA_LIVE_NOTE_ID=not_...
+```
+
+`LOCALITY_GRANOLA_LIVE_NOTE_ID` should identify a stable, generic meeting with a
+retained transcript. The suite uses only its opaque ID; its title and content
+are not placed in repository or workflow configuration. If transcript retention
+removes that fixture or the note is deleted, the test falls back to another
+accessible retained transcript without logging its identity or content.
+
+Run the public API check on any platform:
+
+```bash
+cargo test -p locality-granola --test live_integrity -- --ignored --test-threads=1
+```
+
+On Linux with `/dev/fuse`, run the complete product-path check:
+
+```bash
+LOCALITY_LIVE_GRANOLA_VFS=1 tests/live_granola_vfs_read.sh
+```
+
+GitHub Actions runs `.github/workflows/granola-live-e2e.yml` for relevant
+changes on `main`, every Tuesday, and on manual dispatch. Its secrets live in
+the dedicated `granola-live-e2e` environment, and it uploads no artifacts.
+
 ## API References
 
 - <https://docs.granola.ai/api-reference/list-notes>
