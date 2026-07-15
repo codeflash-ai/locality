@@ -53,6 +53,7 @@ doctor_report="$tmp_root/doctor.json"
 status_report="$tmp_root/status.json"
 info_report="$tmp_root/info.json"
 summary_copy="$tmp_root/summary.md"
+summary_reopen_copy="$tmp_root/summary-reopen.md"
 transcript_copy="$tmp_root/transcript.md"
 localityd_pid=""
 fuse_pid=""
@@ -317,9 +318,26 @@ if [[ -z "$selected_meeting" ]]; then
   exit 1
 fi
 
-step="hydrating the matching summary through the mounted filesystem"
-cp "$selected_meeting/summary.md" "$summary_copy" >/dev/null 2>&1
+step="validating the hydrated summary and transcript"
 validate_mounted_documents
+
+step="reopening the materialized summary through the mounted filesystem"
+summary_reopened=0
+for _ in {1..20}; do
+  if cp "$selected_meeting/summary.md" "$summary_reopen_copy" >/dev/null 2>&1; then
+    summary_reopened=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$summary_reopened" != "1" ]]; then
+  echo "materialized Granola summary could not be reopened through FUSE" >&2
+  exit 1
+fi
+if ! cmp -s "$summary_copy" "$summary_reopen_copy"; then
+  echo "reopened Granola summary did not match its first mounted read" >&2
+  exit 1
+fi
 
 step="verifying the mount remains clean and read-only"
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" info "$selected_meeting/summary.md" --json \
