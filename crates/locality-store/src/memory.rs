@@ -177,6 +177,7 @@ fn mount_source_identity_changed(existing: &MountConfig, next: &MountConfig) -> 
     existing.connector != next.connector
         || existing.remote_root_id != next.remote_root_id
         || existing.connection_id != next.connection_id
+        || existing.settings_json != next.settings_json
 }
 
 impl ConnectionRepository for InMemoryStateStore {

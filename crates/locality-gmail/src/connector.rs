@@ -22,15 +22,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::{GmailApi, HttpGmailApiClient};
 use crate::dto::{
-    GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailRawMessage, header_map,
+    GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailRawMessage, GmailThread,
+    header_map,
 };
 use crate::oauth::GMAIL_CONNECTOR_ID;
 use crate::render::{
-    GmailDraftDocument, GmailNativeBundle, build_draft_mime_with_message_id, message_frontmatter,
-    raw_message_base64url, remote_version, render_gmail_message,
+    GmailDraftDocument, GmailNativeBundle, GmailThreadMessageNativeBundle, GmailThreadNativeBundle,
+    build_draft_mime_with_message_id, message_frontmatter, parse_thread_message_remote_id,
+    parse_thread_remote_id, raw_message_base64url, remote_version, render_gmail_message,
+    render_gmail_thread, render_gmail_thread_message, thread_message_remote_id, thread_remote_id,
+    thread_remote_version,
 };
+use crate::settings::{GmailMountSettings, GmailProjectionView};
 
-const RECENT_LIMIT: u32 = 100;
+const GMAIL_PAGE_SIZE: u32 = 100;
 const INBOX_FOLDER_ID: &str = "gmail-folder:inbox";
 const SENT_FOLDER_ID: &str = "gmail-folder:sent";
 const DRAFT_FOLDER_ID: &str = "gmail-folder:draft";
@@ -38,13 +43,20 @@ const DRAFT_FOLDER_ID: &str = "gmail-folder:draft";
 #[derive(Clone, PartialEq, Eq)]
 pub struct GmailConfig {
     pub access_token: String,
+    pub settings: GmailMountSettings,
 }
 
 impl GmailConfig {
     pub fn new(access_token: impl Into<String>) -> Self {
         Self {
             access_token: access_token.into(),
+            settings: GmailMountSettings::default(),
         }
+    }
+
+    pub fn with_settings(mut self, settings: GmailMountSettings) -> Self {
+        self.settings = settings;
+        self
     }
 }
 
@@ -52,6 +64,7 @@ impl fmt::Debug for GmailConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GmailConfig")
             .field("access_token", &"<redacted>")
+            .field("settings", &self.settings)
             .finish()
     }
 }
@@ -83,6 +96,10 @@ impl GmailConnector {
     pub fn config(&self) -> &GmailConfig {
         &self.config
     }
+
+    pub fn api(&self) -> &dyn GmailApi {
+        self.api.as_ref()
+    }
 }
 
 impl Connector for GmailConnector {
@@ -108,9 +125,31 @@ impl Connector for GmailConnector {
     }
 
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>> {
+        if self.config.settings.gmail.view == GmailProjectionView::Threads {
+            let mut entries = gmail_folder_entries(&request.mount_id, Path::new(""));
+            entries.extend(list_thread_entries(
+                self.api.as_ref(),
+                &self.config.settings,
+                &request.mount_id,
+                "INBOX",
+                "inbox",
+                Path::new("inbox"),
+            )?);
+            entries.extend(list_thread_entries(
+                self.api.as_ref(),
+                &self.config.settings,
+                &request.mount_id,
+                "SENT",
+                "sent",
+                Path::new("sent"),
+            )?);
+            return Ok(entries);
+        }
+
         let mut entries = gmail_folder_entries(&request.mount_id, Path::new(""));
         entries.extend(list_label_entries(
             self.api.as_ref(),
+            &self.config.settings,
             &request.mount_id,
             "INBOX",
             "inbox",
@@ -118,6 +157,7 @@ impl Connector for GmailConnector {
         )?);
         entries.extend(list_label_entries(
             self.api.as_ref(),
+            &self.config.settings,
             &request.mount_id,
             "SENT",
             "sent",
@@ -132,29 +172,74 @@ impl Connector for GmailConnector {
             ChildContainer::DirectoryChildren(remote_id)
                 if remote_id.as_str() == INBOX_FOLDER_ID =>
             {
-                list_label_entries(
-                    self.api.as_ref(),
-                    &request.mount_id,
-                    "INBOX",
-                    "inbox",
-                    &request.parent_path,
-                )?
+                if self.config.settings.gmail.view == GmailProjectionView::Threads {
+                    list_thread_entries(
+                        self.api.as_ref(),
+                        &self.config.settings,
+                        &request.mount_id,
+                        "INBOX",
+                        "inbox",
+                        &request.parent_path,
+                    )?
+                } else {
+                    list_label_entries(
+                        self.api.as_ref(),
+                        &self.config.settings,
+                        &request.mount_id,
+                        "INBOX",
+                        "inbox",
+                        &request.parent_path,
+                    )?
+                }
             }
             ChildContainer::DirectoryChildren(remote_id)
                 if remote_id.as_str() == SENT_FOLDER_ID =>
             {
-                list_label_entries(
-                    self.api.as_ref(),
-                    &request.mount_id,
-                    "SENT",
-                    "sent",
-                    &request.parent_path,
-                )?
+                if self.config.settings.gmail.view == GmailProjectionView::Threads {
+                    list_thread_entries(
+                        self.api.as_ref(),
+                        &self.config.settings,
+                        &request.mount_id,
+                        "SENT",
+                        "sent",
+                        &request.parent_path,
+                    )?
+                } else {
+                    list_label_entries(
+                        self.api.as_ref(),
+                        &self.config.settings,
+                        &request.mount_id,
+                        "SENT",
+                        "sent",
+                        &request.parent_path,
+                    )?
+                }
             }
             ChildContainer::DirectoryChildren(remote_id)
                 if remote_id.as_str() == DRAFT_FOLDER_ID =>
             {
                 Vec::new()
+            }
+            ChildContainer::PageChildren(remote_id) => {
+                let Some((mailbox, thread_id)) = parse_thread_remote_id(&remote_id) else {
+                    return Ok(ListChildrenResult {
+                        entries: Vec::new(),
+                    });
+                };
+                let thread = self.api.get_thread_metadata(thread_id)?;
+                thread
+                    .messages
+                    .into_iter()
+                    .map(|message| {
+                        Ok(thread_message_entry(
+                            &request.mount_id,
+                            &request.parent_path,
+                            mailbox,
+                            thread_id,
+                            message,
+                        ))
+                    })
+                    .collect::<LocalityResult<Vec<_>>>()?
             }
             _ => Vec::new(),
         };
@@ -167,6 +252,72 @@ impl Connector for GmailConnector {
                 request.mount_id,
                 &request.remote_id,
                 folder,
+            ));
+        }
+
+        if let Some((mailbox, thread_id, message_id)) =
+            parse_thread_message_remote_id(&request.remote_id)
+        {
+            let mailbox = mailbox.to_string();
+            let thread_id = thread_id.to_string();
+            let message_id = message_id.to_string();
+            let thread = self.api.get_thread_metadata(&thread_id)?;
+            let thread_title = thread
+                .messages
+                .first()
+                .map(message_subject)
+                .unwrap_or_else(|| "(no subject)".to_string());
+            let thread_path =
+                Path::new(&mailbox).join(thread_directory_name(&thread, &thread_title));
+            let message = thread
+                .messages
+                .iter()
+                .find(|message| message.id == message_id)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| self.api.get_message_metadata(&message_id))?;
+            let entry = thread_message_entry(
+                &request.mount_id,
+                &thread_path,
+                &mailbox,
+                &thread_id,
+                message.clone(),
+            );
+            return Ok(RemoteObservation::new(
+                request.mount_id,
+                request.remote_id,
+                EntityKind::Page,
+                entry.title,
+                entry.path,
+            )
+            .with_parent(thread_remote_id(&mailbox, &thread_id))
+            .with_remote_version(RemoteVersion::new(remote_version(&message)))
+            .with_raw_metadata_json(
+                serde_json::to_string(&message).unwrap_or_else(|_| "{}".to_string()),
+            ));
+        }
+
+        if let Some((mailbox, thread_id)) = parse_thread_remote_id(&request.remote_id) {
+            let mailbox = mailbox.to_string();
+            let thread_id = thread_id.to_string();
+            let thread = self.api.get_thread_metadata(&thread_id)?;
+            let entry = thread_entry(
+                &request.mount_id,
+                Path::new(&mailbox),
+                &mailbox,
+                thread.clone(),
+            );
+            return Ok(RemoteObservation::new(
+                request.mount_id,
+                request.remote_id,
+                EntityKind::Page,
+                entry.title,
+                entry.path,
+            )
+            .with_parent(RemoteId::new(mailbox_folder_id(&mailbox)))
+            .with_remote_version(RemoteVersion::new(thread_remote_version(&thread)))
+            .with_raw_metadata_json(
+                serde_json::to_string(&thread).unwrap_or_else(|_| "{}".to_string()),
             ));
         }
 
@@ -194,6 +345,42 @@ impl Connector for GmailConnector {
     }
 
     fn fetch(&self, request: FetchRequest) -> LocalityResult<NativeEntity> {
+        if let Some((mailbox, thread_id, message_id)) =
+            parse_thread_message_remote_id(&request.remote_id)
+        {
+            let message = self.api.get_message_full(message_id)?;
+            let bundle = GmailThreadMessageNativeBundle {
+                mailbox: mailbox.to_string(),
+                thread_id: thread_id.to_string(),
+                message,
+            };
+            let raw = serde_json::to_vec(&bundle).map_err(|error| {
+                LocalityError::Io(format!(
+                    "gmail thread message native encode failed: {error}"
+                ))
+            })?;
+            return Ok(NativeEntity {
+                remote_id: request.remote_id,
+                kind: "gmail_thread_message".to_string(),
+                raw,
+            });
+        }
+
+        if let Some((mailbox, thread_id)) = parse_thread_remote_id(&request.remote_id) {
+            let mailbox = mailbox.to_string();
+            let thread_id = thread_id.to_string();
+            let thread = self.api.get_thread_full(&thread_id)?;
+            let bundle = GmailThreadNativeBundle { mailbox, thread };
+            let raw = serde_json::to_vec(&bundle).map_err(|error| {
+                LocalityError::Io(format!("gmail thread native encode failed: {error}"))
+            })?;
+            return Ok(NativeEntity {
+                remote_id: request.remote_id,
+                kind: "gmail_thread".to_string(),
+                raw,
+            });
+        }
+
         let message = self.api.get_message_full(request.remote_id.as_str())?;
         let bundle = GmailNativeBundle {
             mailbox: mailbox_from_labels(&message.label_ids).to_string(),
@@ -209,6 +396,23 @@ impl Connector for GmailConnector {
     }
 
     fn render(&self, entity: &NativeEntity) -> LocalityResult<CanonicalDocument> {
+        if entity.kind == "gmail_thread" {
+            let bundle = serde_json::from_slice::<GmailThreadNativeBundle>(&entity.raw).map_err(
+                |error| LocalityError::Io(format!("gmail thread native decode failed: {error}")),
+            )?;
+            return render_gmail_thread(&bundle).map(|rendered| rendered.document);
+        }
+
+        if entity.kind == "gmail_thread_message" {
+            let bundle = serde_json::from_slice::<GmailThreadMessageNativeBundle>(&entity.raw)
+                .map_err(|error| {
+                    LocalityError::Io(format!(
+                        "gmail thread message native decode failed: {error}"
+                    ))
+                })?;
+            return render_gmail_thread_message(&bundle).map(|rendered| rendered.document);
+        }
+
         let bundle = serde_json::from_slice::<GmailNativeBundle>(&entity.raw)
             .map_err(|error| LocalityError::Io(format!("gmail native decode failed: {error}")))?;
         render_gmail_message(&bundle).map(|rendered| rendered.document)
@@ -410,19 +614,119 @@ fn folder_observation(
 
 fn list_label_entries(
     api: &dyn GmailApi,
+    settings: &GmailMountSettings,
     mount_id: &MountId,
     label_id: &str,
     mailbox: &str,
     parent_path: &Path,
 ) -> LocalityResult<Vec<TreeEntry>> {
-    let list = api.list_messages(label_id, RECENT_LIMIT, None, None)?;
-    list.messages
+    let messages = list_message_refs(api, settings, label_id)?;
+    messages
         .into_iter()
         .map(|message_ref| {
             let message = api.get_message_metadata(&message_ref.id)?;
             Ok(message_entry(mount_id, parent_path, mailbox, message))
         })
         .collect()
+}
+
+fn list_thread_entries(
+    api: &dyn GmailApi,
+    settings: &GmailMountSettings,
+    mount_id: &MountId,
+    label_id: &str,
+    mailbox: &str,
+    parent_path: &Path,
+) -> LocalityResult<Vec<TreeEntry>> {
+    let threads = list_thread_refs(api, settings, label_id)?;
+    let mut entries = Vec::new();
+    for thread_ref in threads {
+        let thread = api.get_thread_metadata(&thread_ref.id)?;
+        if thread_starts_in_date_window(settings, &thread) {
+            entries.push(thread_entry(mount_id, parent_path, mailbox, thread));
+        }
+    }
+    Ok(entries)
+}
+
+fn list_message_refs(
+    api: &dyn GmailApi,
+    settings: &GmailMountSettings,
+    label_id: &str,
+) -> LocalityResult<Vec<crate::dto::GmailMessageRef>> {
+    let Some(query) = settings
+        .gmail
+        .date_window
+        .as_ref()
+        .map(|window| window.query())
+    else {
+        return Ok(api
+            .list_messages(label_id, GMAIL_PAGE_SIZE, None, None)?
+            .messages);
+    };
+
+    let mut page_token = None;
+    let mut seen_page_tokens = BTreeSet::new();
+    let mut messages = Vec::new();
+    loop {
+        let page = api.list_messages(
+            label_id,
+            GMAIL_PAGE_SIZE,
+            page_token.as_deref(),
+            Some(&query),
+        )?;
+        messages.extend(page.messages);
+        let Some(next) = page.next_page_token else {
+            break;
+        };
+        if !seen_page_tokens.insert(next.clone()) {
+            return Err(LocalityError::InvalidState(format!(
+                "gmail pagination returned repeated page token `{next}` for label `{label_id}`"
+            )));
+        }
+        page_token = Some(next);
+    }
+    Ok(messages)
+}
+
+fn list_thread_refs(
+    api: &dyn GmailApi,
+    settings: &GmailMountSettings,
+    label_id: &str,
+) -> LocalityResult<Vec<crate::dto::GmailThreadRef>> {
+    let Some(query) = settings
+        .gmail
+        .date_window
+        .as_ref()
+        .map(|window| window.query())
+    else {
+        return Ok(api
+            .list_threads(label_id, GMAIL_PAGE_SIZE, None, None)?
+            .threads);
+    };
+
+    let mut page_token = None;
+    let mut seen_page_tokens = BTreeSet::new();
+    let mut threads = Vec::new();
+    loop {
+        let page = api.list_threads(
+            label_id,
+            GMAIL_PAGE_SIZE,
+            page_token.as_deref(),
+            Some(&query),
+        )?;
+        threads.extend(page.threads);
+        let Some(next) = page.next_page_token else {
+            break;
+        };
+        if !seen_page_tokens.insert(next.clone()) {
+            return Err(LocalityError::InvalidState(format!(
+                "gmail pagination returned repeated page token `{next}` for thread label `{label_id}`"
+            )));
+        }
+        page_token = Some(next);
+    }
+    Ok(threads)
 }
 
 fn message_entry(
@@ -451,6 +755,75 @@ fn message_entry(
     }
 }
 
+fn thread_message_entry(
+    mount_id: &MountId,
+    parent_path: &Path,
+    mailbox: &str,
+    thread_id: &str,
+    message: GmailMessage,
+) -> TreeEntry {
+    let title = message_subject(&message);
+    let version = remote_version(&message);
+    let path = parent_path.join(message_filename(&message, &title));
+    let remote_id = thread_message_remote_id(mailbox, thread_id, &message.id);
+    let bundle = GmailThreadMessageNativeBundle {
+        mailbox: mailbox.to_string(),
+        thread_id: thread_id.to_string(),
+        message,
+    };
+    let stub_frontmatter = render_gmail_thread_message(&bundle)
+        .ok()
+        .map(|rendered| rendered.document.frontmatter);
+
+    TreeEntry {
+        mount_id: mount_id.clone(),
+        remote_id,
+        kind: EntityKind::Page,
+        title,
+        path,
+        hydration: HydrationState::Stub,
+        content_hash: None,
+        remote_edited_at: Some(version),
+        stub_frontmatter,
+    }
+}
+
+fn thread_entry(
+    mount_id: &MountId,
+    parent_path: &Path,
+    mailbox: &str,
+    thread: GmailThread,
+) -> TreeEntry {
+    let title = thread
+        .messages
+        .first()
+        .map(message_subject)
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let version = thread_remote_version(&thread);
+    let path = parent_path
+        .join(thread_directory_name(&thread, &title))
+        .join("page.md");
+    let bundle = GmailThreadNativeBundle {
+        mailbox: mailbox.to_string(),
+        thread: thread.clone(),
+    };
+    let stub_frontmatter = render_gmail_thread(&bundle)
+        .ok()
+        .map(|rendered| rendered.document.frontmatter);
+
+    TreeEntry {
+        mount_id: mount_id.clone(),
+        remote_id: thread_remote_id(mailbox, &thread.id),
+        kind: EntityKind::Page,
+        title,
+        path,
+        hydration: HydrationState::Stub,
+        content_hash: None,
+        remote_edited_at: Some(version),
+        stub_frontmatter,
+    }
+}
+
 fn message_subject(message: &GmailMessage) -> String {
     message
         .payload
@@ -469,6 +842,70 @@ fn message_filename(message: &GmailMessage, title: &str) -> String {
         safe_slug(title),
         safe_slug(&message.id)
     )
+}
+
+fn thread_directory_name(thread: &GmailThread, title: &str) -> String {
+    let date = thread
+        .messages
+        .iter()
+        .filter_map(|message| message.internal_date.as_deref())
+        .min()
+        .unwrap_or("unknown");
+    format!(
+        "{}-{}-{}",
+        safe_slug(date),
+        safe_slug(title),
+        safe_slug(&thread.id)
+    )
+}
+
+fn thread_starts_in_date_window(settings: &GmailMountSettings, thread: &GmailThread) -> bool {
+    let Some(window) = settings.gmail.date_window.as_ref() else {
+        return true;
+    };
+    let Some(start_date) = thread_start_utc_date_key(thread) else {
+        return true;
+    };
+    let after = gmail_search_date_key(window.after().as_str());
+    let before = gmail_search_date_key(window.before().as_str());
+    start_date >= after && start_date < before
+}
+
+fn thread_start_utc_date_key(thread: &GmailThread) -> Option<i32> {
+    thread
+        .messages
+        .iter()
+        .filter_map(|message| message.internal_date.as_deref())
+        .filter_map(gmail_internal_date_utc_key)
+        .min()
+}
+
+fn gmail_search_date_key(value: &str) -> i32 {
+    let year = value[0..4].parse::<i32>().unwrap_or(0);
+    let month = value[5..7].parse::<i32>().unwrap_or(0);
+    let day = value[8..10].parse::<i32>().unwrap_or(0);
+    year * 10_000 + month * 100 + day
+}
+
+fn gmail_internal_date_utc_key(value: &str) -> Option<i32> {
+    let millis = value.parse::<i64>().ok()?;
+    let days = millis.div_euclid(86_400_000);
+    let (year, month, day) = civil_date_from_unix_days(days);
+    Some(year * 10_000 + month as i32 * 100 + day as i32)
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (year as i32, month as u32, day as u32)
 }
 
 fn mailbox_from_labels(labels: &[String]) -> &'static str {
@@ -527,6 +964,13 @@ struct RawDraftFrontmatter {
     subject: Option<String>,
     attachment: Option<yaml_serde::Value>,
     attachments: Option<yaml_serde::Value>,
+    gmail: Option<RawDraftGmailFrontmatter>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawDraftGmailFrontmatter {
+    attachment: Option<yaml_serde::Value>,
+    attachments: Option<yaml_serde::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -550,7 +994,7 @@ fn parse_gmail_draft_document(document: &CanonicalDocument) -> LocalityResult<Gm
             )])
         })?
     };
-    if frontmatter.attachment.is_some() || frontmatter.attachments.is_some() {
+    if raw_draft_frontmatter_has_attachments(&frontmatter) {
         return Err(LocalityError::Unsupported("gmail attachments"));
     }
     Ok(GmailDraftDocument {
@@ -565,6 +1009,15 @@ fn parse_gmail_draft_document(document: &CanonicalDocument) -> LocalityResult<Gm
     })
 }
 
+fn raw_draft_frontmatter_has_attachments(frontmatter: &RawDraftFrontmatter) -> bool {
+    frontmatter.attachment.is_some()
+        || frontmatter.attachments.is_some()
+        || frontmatter
+            .gmail
+            .as_ref()
+            .is_some_and(|gmail| gmail.attachment.is_some() || gmail.attachments.is_some())
+}
+
 fn raw_recipients(value: RawRecipients) -> Vec<String> {
     match value {
         RawRecipients::One(value) => vec![value],
@@ -577,7 +1030,7 @@ fn draft_from_push_create(
     properties: &BTreeMap<String, PropertyValue>,
     body: &str,
 ) -> LocalityResult<GmailDraftDocument> {
-    if properties.contains_key("attachments") || properties.contains_key("attachment") {
+    if draft_properties_have_attachments(properties) {
         return Err(LocalityError::Unsupported("gmail attachments"));
     }
     Ok(GmailDraftDocument {
@@ -589,6 +1042,16 @@ fn draft_from_push_create(
             .unwrap_or_else(|| title.to_string()),
         body: body.to_string(),
     })
+}
+
+fn draft_properties_have_attachments(properties: &BTreeMap<String, PropertyValue>) -> bool {
+    properties.contains_key("attachments")
+        || properties.contains_key("attachment")
+        || matches!(
+            properties.get("gmail"),
+            Some(PropertyValue::Object(gmail))
+                if gmail.contains_key("attachments") || gmail.contains_key("attachment")
+        )
 }
 
 fn recipients_property(properties: &BTreeMap<String, PropertyValue>, key: &str) -> Vec<String> {
@@ -633,7 +1096,10 @@ mod tests {
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use locality_connector::{ChildContainer, Connector, EnumerateRequest, ListChildrenRequest};
+    use locality_connector::{
+        ChildContainer, Connector, EnumerateRequest, FetchRequest, ListChildrenRequest,
+        ObserveRequest,
+    };
     use locality_core::LocalityError;
     use locality_core::journal::{PushId, PushOperationId};
     use locality_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId};
@@ -644,8 +1110,9 @@ mod tests {
     use crate::client::GmailApi;
     use crate::dto::{
         GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-        GmailMessageRef,
+        GmailMessagePartBody, GmailMessageRef, GmailThread, GmailThreadList,
     };
+    use crate::settings::GmailMountSettings;
 
     #[test]
     fn enumerate_projects_three_folders_and_recent_inbox_sent_messages() {
@@ -686,6 +1153,171 @@ mod tests {
     }
 
     #[test]
+    fn enumerate_with_date_window_pages_all_matching_messages_with_gmail_query() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), None),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-1".to_string(),
+                        thread_id: Some("thread-1".to_string()),
+                    }],
+                    next_page_token: Some("next-inbox".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), Some("next-inbox".to_string())),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-2".to_string(),
+                        thread_id: Some("thread-2".to_string()),
+                    }],
+                    next_page_token: None,
+                    result_size_estimate: Some(2),
+                },
+            );
+        }
+        let settings =
+            crate::settings::GmailMountSettings::with_date_window("2026-07-01", "2026-07-15")
+                .expect("date window");
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let entries = connector
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("gmail-main"),
+                cursor: None,
+            })
+            .expect("enumerate");
+
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.remote_id == RemoteId::new("inbox-msg-1"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.remote_id == RemoteId::new("inbox-msg-2"))
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(
+            calls.list_queries,
+            vec![
+                "after:2026/07/01 before:2026/07/15".to_string(),
+                "after:2026/07/01 before:2026/07/15".to_string(),
+                "after:2026/07/01 before:2026/07/15".to_string(),
+            ]
+        );
+        assert_eq!(
+            calls.list_page_tokens,
+            vec![None, Some("next-inbox".to_string()), None]
+        );
+    }
+
+    #[test]
+    fn enumerate_without_date_window_keeps_recent_100_single_page_behavior() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+
+        connector
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("gmail-main"),
+                cursor: None,
+            })
+            .expect("enumerate");
+
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.list_max_results, vec![100, 100]);
+        assert_eq!(calls.list_page_tokens, vec![None, None]);
+        assert!(calls.list_queries.is_empty());
+    }
+
+    #[test]
+    fn enumerate_with_date_window_rejects_repeated_page_token() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.panic_after_list_calls = Some(2);
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), None),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-1".to_string(),
+                        thread_id: Some("thread-1".to_string()),
+                    }],
+                    next_page_token: Some("same-token".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), Some("same-token".to_string())),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-2".to_string(),
+                        thread_id: Some("thread-2".to_string()),
+                    }],
+                    next_page_token: Some("same-token".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+        }
+        let settings =
+            GmailMountSettings::with_date_window("2026-07-01", "2026-07-15").expect("settings");
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let error = connector
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("gmail-main"),
+                cursor: None,
+            })
+            .expect_err("repeated page token should fail");
+
+        let message = error.to_string();
+        assert!(message.contains("repeated page token"));
+        assert!(message.contains("same-token"));
+    }
+
+    #[test]
+    fn enumerate_projects_threads_when_thread_view_enabled() {
+        let api = Arc::new(FakeGmailApi::default());
+        let settings = crate::settings::GmailMountSettings::default()
+            .with_view(crate::settings::GmailProjectionView::Threads);
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let entries = connector
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("gmail-main"),
+                cursor: None,
+            })
+            .expect("enumerate");
+
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.remote_id == RemoteId::new("gmail-thread:inbox:thread-inbox-1"))
+        );
+        assert!(entries.iter().any(|entry| entry.path
+            == std::path::PathBuf::from("inbox/1720900000000-hello-thread-inbox-1/page.md")));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.remote_id == RemoteId::new("gmail-thread:sent:thread-sent-1"))
+        );
+    }
+
+    #[test]
     fn list_children_for_draft_folder_returns_empty_remote_entries() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
@@ -699,6 +1331,151 @@ mod tests {
             .expect("list draft");
 
         assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn list_children_for_thread_page_returns_message_files() {
+        let api = Arc::new(FakeGmailApi::default());
+        let settings = crate::settings::GmailMountSettings::default()
+            .with_view(crate::settings::GmailProjectionView::Threads);
+        let connector =
+            GmailConnector::with_api(GmailConfig::new("token").with_settings(settings), api);
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("gmail-main"),
+                container: ChildContainer::PageChildren(RemoteId::new(
+                    "gmail-thread:inbox:thread-inbox-1",
+                )),
+                parent_path: "inbox/1720900000000-hello-thread-inbox-1".into(),
+            })
+            .expect("children");
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(
+            result.entries[0].remote_id,
+            crate::render::thread_message_remote_id("inbox", "thread-inbox-1", "inbox-msg-1")
+        );
+        assert_eq!(
+            result.entries[0].path,
+            std::path::PathBuf::from(
+                "inbox/1720900000000-hello-thread-inbox-1/1720900000000-hello-inbox-msg-1.md"
+            )
+        );
+    }
+
+    #[test]
+    fn thread_child_message_remote_ids_are_namespaced_by_mailbox_and_thread() {
+        let api = Arc::new(FakeGmailApi::default());
+        let settings = crate::settings::GmailMountSettings::default()
+            .with_view(crate::settings::GmailProjectionView::Threads);
+        let connector =
+            GmailConnector::with_api(GmailConfig::new("token").with_settings(settings), api);
+
+        let inbox_children = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("gmail-main"),
+                container: ChildContainer::PageChildren(RemoteId::new(
+                    "gmail-thread:inbox:thread-shared",
+                )),
+                parent_path: "inbox/1720900000000-hello-thread-shared".into(),
+            })
+            .expect("inbox children");
+        let sent_children = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("gmail-main"),
+                container: ChildContainer::PageChildren(RemoteId::new(
+                    "gmail-thread:sent:thread-shared",
+                )),
+                parent_path: "sent/1720900000000-hello-thread-shared".into(),
+            })
+            .expect("sent children");
+
+        assert_eq!(
+            inbox_children.entries[0].remote_id,
+            crate::render::thread_message_remote_id("inbox", "thread-shared", "inbox-msg-1")
+        );
+        assert_eq!(
+            sent_children.entries[0].remote_id,
+            crate::render::thread_message_remote_id("sent", "thread-shared", "inbox-msg-1")
+        );
+        assert_ne!(
+            inbox_children.entries[0].remote_id,
+            sent_children.entries[0].remote_id
+        );
+    }
+
+    #[test]
+    fn fetch_returns_thread_native_entity_for_thread_remote_id() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+        let remote_id = RemoteId::new("gmail-thread:inbox:thread-inbox-1");
+
+        let native = connector
+            .fetch(FetchRequest {
+                remote_id: remote_id.clone(),
+            })
+            .expect("fetch thread");
+
+        assert_eq!(native.remote_id, remote_id);
+        assert_eq!(native.kind, "gmail_thread");
+        let bundle: crate::render::GmailThreadNativeBundle =
+            serde_json::from_slice(&native.raw).expect("thread bundle");
+        assert_eq!(bundle.mailbox, "inbox");
+        assert_eq!(bundle.thread.id, "thread-inbox-1");
+        assert_eq!(bundle.thread.messages[0].id, "inbox-msg-1");
+    }
+
+    #[test]
+    fn fetch_and_render_thread_child_message_preserves_namespaced_remote_id() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+        let remote_id =
+            crate::render::thread_message_remote_id("inbox", "thread-inbox-1", "inbox-msg-1");
+
+        let native = connector
+            .fetch(FetchRequest {
+                remote_id: remote_id.clone(),
+            })
+            .expect("fetch thread child message");
+        assert_eq!(native.remote_id, remote_id);
+        assert_eq!(native.kind, "gmail_thread_message");
+
+        let rendered = connector
+            .render(&native)
+            .expect("render thread child message");
+        assert!(
+            rendered
+                .frontmatter
+                .contains(&format!("id: \"{}\"", remote_id.as_str()))
+        );
+        assert!(rendered.frontmatter.contains("message_id: \"inbox-msg-1\""));
+    }
+
+    #[test]
+    fn observe_thread_remote_id_returns_thread_page_metadata() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+        let remote_id = RemoteId::new("gmail-thread:inbox:thread-inbox-1");
+
+        let observation = connector
+            .observe(ObserveRequest {
+                mount_id: MountId::new("gmail-main"),
+                remote_id: remote_id.clone(),
+            })
+            .expect("observe thread");
+
+        assert_eq!(observation.remote_id, remote_id);
+        assert_eq!(
+            observation.parent_remote_id,
+            Some(RemoteId::new("gmail-folder:inbox"))
+        );
+        assert_eq!(observation.title, "Hello");
+        assert_eq!(
+            observation.projected_path,
+            std::path::PathBuf::from("inbox/1720900000000-hello-thread-inbox-1/page.md")
+        );
+        assert!(observation.raw_metadata_json.contains("thread-inbox-1"));
     }
 
     #[test]
@@ -754,6 +1531,158 @@ mod tests {
         let frontmatter = entry.stub_frontmatter.as_ref().expect("frontmatter");
         assert!(frontmatter.contains("mailbox: \"inbox\""));
         assert!(!frontmatter.contains("mailbox: \"sent\""));
+    }
+
+    #[test]
+    fn list_children_for_inbox_with_date_window_pages_messages_with_gmail_query() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), None),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-1".to_string(),
+                        thread_id: Some("thread-1".to_string()),
+                    }],
+                    next_page_token: Some("inbox-page-2".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), Some("inbox-page-2".to_string())),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-2".to_string(),
+                        thread_id: Some("thread-2".to_string()),
+                    }],
+                    next_page_token: None,
+                    result_size_estimate: Some(2),
+                },
+            );
+        }
+        let settings =
+            GmailMountSettings::with_date_window("2026-07-01", "2026-07-15").expect("settings");
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("gmail-main"),
+                container: ChildContainer::DirectoryChildren(RemoteId::new("gmail-folder:inbox")),
+                parent_path: "inbox".into(),
+            })
+            .expect("list inbox");
+
+        assert!(result.entries.iter().any(|entry| {
+            entry.remote_id == RemoteId::new("inbox-msg-1") && entry.path.starts_with("inbox/")
+        }));
+        assert!(result.entries.iter().any(|entry| {
+            entry.remote_id == RemoteId::new("inbox-msg-2") && entry.path.starts_with("inbox/")
+        }));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(
+            calls.list_queries,
+            vec![
+                "after:2026/07/01 before:2026/07/15".to_string(),
+                "after:2026/07/01 before:2026/07/15".to_string(),
+            ]
+        );
+        assert_eq!(
+            calls.list_page_tokens,
+            vec![None, Some("inbox-page-2".to_string())]
+        );
+    }
+
+    #[test]
+    fn list_children_for_thread_view_date_window_filters_by_thread_start_date() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.paged_thread_ids.insert(
+                ("INBOX".to_string(), None),
+                GmailThreadList {
+                    threads: vec![
+                        crate::dto::GmailThreadRef {
+                            id: "thread-start-before-window".to_string(),
+                            snippet: Some("older start".to_string()),
+                            history_id: Some("h-before".to_string()),
+                        },
+                        crate::dto::GmailThreadRef {
+                            id: "thread-start-in-window".to_string(),
+                            snippet: Some("inside start".to_string()),
+                            history_id: Some("h-inside".to_string()),
+                        },
+                    ],
+                    next_page_token: None,
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.thread_metadata.insert(
+                "thread-start-before-window".to_string(),
+                thread_fixture_with_messages(
+                    "thread-start-before-window",
+                    [
+                        ("old-start-msg", "1782820800000"),
+                        ("matching-later-msg", "1782993600000"),
+                    ],
+                ),
+            );
+            calls.thread_metadata.insert(
+                "thread-start-in-window".to_string(),
+                thread_fixture_with_messages(
+                    "thread-start-in-window",
+                    [
+                        ("window-start-msg", "1782993600000"),
+                        ("newer-after-window-msg", "1784548800000"),
+                    ],
+                ),
+            );
+        }
+        let settings = GmailMountSettings::with_date_window("2026-07-01", "2026-07-15")
+            .expect("settings")
+            .with_view(crate::settings::GmailProjectionView::Threads);
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("gmail-main"),
+                container: ChildContainer::DirectoryChildren(RemoteId::new("gmail-folder:inbox")),
+                parent_path: "inbox".into(),
+            })
+            .expect("list inbox threads");
+
+        assert!(!result.entries.iter().any(|entry| {
+            entry.remote_id == RemoteId::new("gmail-thread:inbox:thread-start-before-window")
+        }));
+        let included = result
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.remote_id == RemoteId::new("gmail-thread:inbox:thread-start-in-window")
+            })
+            .expect("thread whose start is in range");
+        assert_eq!(
+            included.path,
+            std::path::PathBuf::from("inbox/1782993600000-hello-thread-start-in-window/page.md")
+        );
+        assert!(
+            included
+                .stub_frontmatter
+                .as_ref()
+                .expect("thread frontmatter")
+                .contains("message_count: 2")
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(
+            calls.thread_list_queries,
+            vec!["after:2026/07/01 before:2026/07/15".to_string()]
+        );
     }
 
     #[test]
@@ -1031,6 +1960,71 @@ mod tests {
     }
 
     #[test]
+    fn apply_create_entity_rejects_nested_gmail_attachment_metadata() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let plan = PushPlan::new(
+            vec![RemoteId::new("gmail-folder:draft")],
+            vec![PushOperation::CreateEntity {
+                parent_id: RemoteId::new("gmail-folder:draft"),
+                parent_kind: Some(EntityKind::Directory),
+                parent_workspace: false,
+                title: "Hello".to_string(),
+                properties: std::collections::BTreeMap::from([
+                    (
+                        "to".to_string(),
+                        PropertyValue::List(vec!["ann@example.com".to_string()]),
+                    ),
+                    (
+                        "subject".to_string(),
+                        PropertyValue::String("Explicit subject".to_string()),
+                    ),
+                    (
+                        "gmail".to_string(),
+                        PropertyValue::Object(std::collections::BTreeMap::from([(
+                            "attachments".to_string(),
+                            PropertyValue::List(vec!["invoice.pdf".to_string()]),
+                        )])),
+                    ),
+                ]),
+                body: "Body\n".to_string(),
+                source_path: "draft/hello.md".into(),
+            }],
+        );
+
+        let error = connector
+            .apply(locality_connector::ApplyPlanRequest {
+                push_id: &PushId("push-1".to_string()),
+                mount_id: &MountId::new("gmail-main"),
+                plan: &plan,
+                operation_ids: &[PushOperationId("op-1".to_string())],
+                remote_preconditions: &[] as &[RemotePrecondition],
+                local_root: None,
+            })
+            .expect_err("nested gmail attachments should be unsupported");
+
+        assert!(matches!(error, LocalityError::Unsupported(_)));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(calls.created_drafts, 0);
+        assert!(calls.sent_drafts.is_empty());
+    }
+
+    #[test]
+    fn parse_draft_rejects_nested_gmail_attachment_metadata() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+
+        let error = connector
+            .parse(&CanonicalDocument::new(
+                "to: [\"ann@example.com\"]\nsubject: Hello\ngmail:\n  attachments:\n    - filename: invoice.pdf\n",
+                "Body",
+            ))
+            .expect_err("nested gmail attachments should be unsupported");
+
+        assert!(matches!(error, LocalityError::Unsupported(_)));
+    }
+
+    #[test]
     fn parse_invalid_draft_frontmatter_returns_validation_error() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
@@ -1065,6 +2059,12 @@ mod tests {
     struct FakeCalls {
         list_max_results: Vec<u32>,
         list_queries: Vec<String>,
+        paged_message_ids: std::collections::BTreeMap<(String, Option<String>), GmailMessageList>,
+        thread_list_queries: Vec<String>,
+        paged_thread_ids: std::collections::BTreeMap<(String, Option<String>), GmailThreadList>,
+        thread_metadata: std::collections::BTreeMap<String, GmailThread>,
+        list_page_tokens: Vec<Option<String>>,
+        panic_after_list_calls: Option<usize>,
         sent_search_results: std::collections::BTreeMap<String, String>,
         sent_search_results_after_send: std::collections::BTreeMap<String, String>,
         send_error: Option<LocalityError>,
@@ -1085,8 +2085,22 @@ mod tests {
         ) -> locality_core::LocalityResult<GmailMessageList> {
             let mut calls = self.calls.lock().expect("calls");
             calls.list_max_results.push(max_results);
+            calls.list_page_tokens.push(_page_token.map(str::to_string));
+            if let Some(limit) = calls.panic_after_list_calls {
+                assert!(
+                    calls.list_max_results.len() <= limit,
+                    "list_messages exceeded call limit {limit}"
+                );
+            }
             if let Some(query) = query {
                 calls.list_queries.push(query.to_string());
+            }
+            if let Some(page) = calls
+                .paged_message_ids
+                .get(&(label_id.to_string(), _page_token.map(str::to_string)))
+                .cloned()
+            {
+                return Ok(page);
             }
             if let Some(sent_message_id) = calls.sent_search_results.get(query.unwrap_or_default())
             {
@@ -1140,6 +2154,48 @@ mod tests {
             })
         }
 
+        fn list_threads(
+            &self,
+            label_id: &str,
+            max_results: u32,
+            page_token: Option<&str>,
+            query: Option<&str>,
+        ) -> locality_core::LocalityResult<GmailThreadList> {
+            let _ = max_results;
+            let mut calls = self.calls.lock().expect("calls");
+            if let Some(query) = query {
+                calls.thread_list_queries.push(query.to_string());
+            }
+            if let Some(page) = calls
+                .paged_thread_ids
+                .get(&(label_id.to_string(), page_token.map(str::to_string)))
+                .cloned()
+            {
+                return Ok(page);
+            }
+            if query.is_some() {
+                return Ok(GmailThreadList {
+                    threads: Vec::new(),
+                    next_page_token: None,
+                    result_size_estimate: Some(0),
+                });
+            }
+            let id = match label_id {
+                "INBOX" => "thread-inbox-1",
+                "SENT" => "thread-sent-1",
+                other => panic!("unexpected label {other}"),
+            };
+            Ok(GmailThreadList {
+                threads: vec![crate::dto::GmailThreadRef {
+                    id: id.to_string(),
+                    snippet: Some("hello".to_string()),
+                    history_id: Some("h1".to_string()),
+                }],
+                next_page_token: None,
+                result_size_estimate: Some(1),
+            })
+        }
+
         fn get_message_metadata(
             &self,
             message_id: &str,
@@ -1159,6 +2215,35 @@ mod tests {
             message_id: &str,
         ) -> locality_core::LocalityResult<GmailMessage> {
             Ok(message_fixture(message_id))
+        }
+
+        fn get_thread_metadata(
+            &self,
+            thread_id: &str,
+        ) -> locality_core::LocalityResult<GmailThread> {
+            if let Some(thread) = self
+                .calls
+                .lock()
+                .expect("calls")
+                .thread_metadata
+                .get(thread_id)
+                .cloned()
+            {
+                return Ok(thread);
+            }
+            Ok(thread_fixture(thread_id))
+        }
+
+        fn get_thread_full(&self, thread_id: &str) -> locality_core::LocalityResult<GmailThread> {
+            Ok(thread_fixture(thread_id))
+        }
+
+        fn get_attachment(
+            &self,
+            _message_id: &str,
+            _attachment_id: &str,
+        ) -> locality_core::LocalityResult<GmailMessagePartBody> {
+            Ok(GmailMessagePartBody::default())
         }
 
         fn create_draft(
@@ -1194,6 +2279,38 @@ mod tests {
             Some(vec!["INBOX".to_string()])
         };
         message_fixture_with_labels(id, labels)
+    }
+
+    fn thread_fixture(thread_id: &str) -> crate::dto::GmailThread {
+        let message_id = if thread_id.contains("sent") {
+            "sent-msg-1"
+        } else {
+            "inbox-msg-1"
+        };
+        crate::dto::GmailThread {
+            id: thread_id.to_string(),
+            history_id: Some("h1".to_string()),
+            messages: vec![message_fixture(message_id)],
+        }
+    }
+
+    fn thread_fixture_with_messages<const N: usize>(
+        thread_id: &str,
+        messages: [(&str, &str); N],
+    ) -> crate::dto::GmailThread {
+        crate::dto::GmailThread {
+            id: thread_id.to_string(),
+            history_id: Some("h1".to_string()),
+            messages: messages
+                .into_iter()
+                .map(|(id, internal_date)| {
+                    let mut message = message_fixture(id);
+                    message.thread_id = Some(thread_id.to_string());
+                    message.internal_date = Some(internal_date.to_string());
+                    message
+                })
+                .collect(),
+        }
     }
 
     fn message_fixture_with_labels(id: &str, labels: Option<Vec<String>>) -> GmailMessage {

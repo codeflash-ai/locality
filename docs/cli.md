@@ -14,7 +14,7 @@ The `loc` command is the single supported control surface for users and coding a
 - `loc disconnect <id> [--json]`
 - `loc mount notion <path> --root-page <page-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
 - `loc mount google-docs <path> --workspace-folder <name-or-id> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
-- `loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--json]`
+- `loc mount gmail <path> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--read-only] [--after YYYY-MM-DD --before YYYY-MM-DD] [--view messages|threads] [--json]`
 - `loc mount granola <path> [--connection <id>] [--mount-id <id>] [--projection plain-files|macos-file-provider|linux-fuse|windows-cloud-files] [--json]`
 - `loc daemon status [--json]`
 - `loc info [path] [--json]`
@@ -85,6 +85,14 @@ Google Docs mounts use Google Docs document access plus Drive `drive.file` and D
 Gmail OAuth uses `openid`, `email`, `profile`, `https://www.googleapis.com/auth/gmail.readonly`, and `https://www.googleapis.com/auth/gmail.compose`. No broader Gmail account scope is required.
 
 `loc mount gmail <path>` registers a Gmail mount. If `--connection` is omitted, the daemon resolves the mount through the only active Gmail connection at runtime; with multiple active Gmail connections, pass `--connection <id>`. When `--mount-id` is omitted, Locality uses `gmail-main` when available. Gmail mounts project `inbox/`, `sent/`, and `draft/` folders. `inbox/` and `sent/` are read-only; create a Markdown file directly under `draft/` to send mail on push.
+
+Gmail mount options:
+
+- `--after YYYY-MM-DD --before YYYY-MM-DD`: persist a Gmail date window for
+  inbox and sent enumeration. The flags must be used together.
+- `--view messages`: keep the default flat message-file projection.
+- `--view threads`: project Gmail threads as page directories with child message
+  files.
 
 `loc connect granola --api-key-stdin [--name <id>]` validates a Granola Business or Enterprise API key against the official public API and stores it in Locality's credential store. The default connection is `granola-default`; the connector profile is `granola-api-key-default` at semantic version `granola.v1`. The key is never written to SQLite or command output.
 
@@ -551,6 +559,7 @@ hydrated file if its body no longer matches the Synced Tree shadow, returning a
 dirty skip instead.
 
 For Gmail mounts, pull enumerates the recent 100 inbox messages and recent 100
+sent messages by default. Date-window mounts page through all matching inbox and
 sent messages. `draft/` is present for local sends, but v1 does not enumerate
 remote Gmail drafts.
 

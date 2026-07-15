@@ -409,6 +409,46 @@ fn executor_writes_hydrated_assets_under_mount_root() {
 }
 
 #[test]
+fn executor_prunes_stale_gmail_attachment_assets_in_same_message_cache() {
+    let fixture = HydrationFixture::new();
+    let mut store = fixture.store(HydrationState::Stub);
+    fixture.write_stub();
+    let stale_path = fixture
+        .root
+        .join(".loc/gmail/attachments/msg-1/stale-name.png");
+    fs::create_dir_all(stale_path.parent().expect("stale asset parent"))
+        .expect("create stale asset parent");
+    fs::write(&stale_path, b"stale-image").expect("write stale asset");
+
+    let mut rendered = rendered_entity("Remote body.");
+    rendered.assets.push(HydratedAsset {
+        path: PathBuf::from(".loc/gmail/attachments/msg-1/current-name.png"),
+        bytes: b"current-image".to_vec(),
+        media: None,
+    });
+    let source = FakeHydrationSource::with_entity("page-1", rendered);
+
+    let mut executor = HydrationExecutor::new(&mut store, &source);
+    executor
+        .hydrate_request(fixture.request())
+        .expect("hydrate request");
+
+    assert_eq!(
+        fs::read(
+            fixture
+                .root
+                .join(".loc/gmail/attachments/msg-1/current-name.png")
+        )
+        .expect("current asset"),
+        b"current-image"
+    );
+    assert!(
+        !stale_path.exists(),
+        "stale Gmail attachment cache remained"
+    );
+}
+
+#[test]
 fn executor_writes_absolute_media_hrefs_under_output_root() {
     let fixture = HydrationFixture::new();
     let mut store = fixture.store(HydrationState::Stub);

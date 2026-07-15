@@ -6847,6 +6847,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
                 connection_id: connection_id.clone(),
                 read_only: request.read_only,
                 projection: projection.clone(),
+                settings_json: "{}".to_string(),
             };
             let credentials = open_credential_store(&state_root);
             let connector =
@@ -6882,6 +6883,7 @@ fn create_desktop_mount_blocking(request: CreateDesktopMountRequest) -> Result<S
             connection_id,
             read_only: request.read_only,
             projection: projection.clone(),
+            settings_json: "{}".to_string(),
         },
     )
     .map_err(|error| error.message())?;
@@ -15772,6 +15774,7 @@ fn live_mode_e2e_provision_scratch_context() -> LiveModeE2eContext {
             connection_id: Some(ConnectionId::new("notion-default")),
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         },
     )
     .expect("mount live desktop scratch page");
