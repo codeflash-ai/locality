@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use locality_core::model::CanonicalDocument;
 use locality_core::{LocalityError, LocalityResult};
 use serde::{Deserialize, Serialize};
@@ -41,7 +42,7 @@ pub fn render_granola_note(bundle: &GranolaNativeBundle) -> LocalityResult<Canon
 }
 
 pub fn remote_version(note: &GranolaNote) -> String {
-    format!("granola:{}:{}", note.id, note.updated_at)
+    format!("granola:render-v2:{}:{}", note.id, note.updated_at)
 }
 
 pub fn child_remote_id(note_id: &str, kind: GranolaContentKind) -> String {
@@ -153,10 +154,8 @@ fn render_transcript(note: &GranolaNote) -> String {
     let mut output = String::new();
     for chunk in chunks {
         let speaker = speaker_label(&chunk.speaker);
-        output.push_str(&format!(
-            "**{} – {} · {} ({})**\n\n",
-            chunk.start_time, chunk.end_time, speaker, chunk.speaker.source
-        ));
+        let time = transcript_time_range(&chunk.start_time, &chunk.end_time);
+        output.push_str(&format!("**{} · {}**\n\n", speaker, time));
         output.push_str(&escape_locality_directive_lines(&chunk.text));
         output.push_str("\n\n");
     }
@@ -164,7 +163,12 @@ fn render_transcript(note: &GranolaNote) -> String {
 }
 
 fn speaker_label(speaker: &GranolaSpeaker) -> String {
-    speaker
+    let role = if speaker.source.eq_ignore_ascii_case("microphone") {
+        "Me"
+    } else {
+        "Them"
+    };
+    let detail = speaker
         .name
         .as_deref()
         .filter(|value| !value.trim().is_empty())
@@ -174,14 +178,27 @@ fn speaker_label(speaker: &GranolaSpeaker) -> String {
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
         })
-        .unwrap_or_else(|| {
-            if speaker.source == "microphone" {
-                "Me"
-            } else {
-                "Them"
-            }
-        })
-        .to_string()
+        .filter(|value| !value.eq_ignore_ascii_case(role));
+    detail
+        .map(|value| format!("{role} ({})", value.trim()))
+        .unwrap_or_else(|| role.to_string())
+}
+
+fn transcript_time_range(start: &str, end: &str) -> String {
+    let start = compact_transcript_time(start);
+    let end = compact_transcript_time(end);
+    if start == end {
+        format!("{start} UTC")
+    } else {
+        format!("{start}–{end} UTC")
+    }
+}
+
+fn compact_transcript_time(value: &str) -> String {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map(|value| value.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|_| value.to_string())
 }
 
 pub fn note_title(note: &GranolaNote) -> String {
@@ -221,7 +238,7 @@ fn ensure_trailing_newline(mut value: String) -> String {
 mod tests {
     use crate::dto::{GranolaNote, GranolaSpeaker, GranolaTranscriptChunk, GranolaUser};
 
-    use super::{GranolaContentKind, GranolaNativeBundle, render_granola_note};
+    use super::{GranolaContentKind, GranolaNativeBundle, remote_version, render_granola_note};
 
     fn note() -> GranolaNote {
         GranolaNote {
@@ -267,10 +284,14 @@ mod tests {
                 .contains("id: \"not_1d3tmYTlCICgjy:summary\"")
         );
         assert!(document.frontmatter.contains("calendar: null"));
+        assert_eq!(
+            remote_version(&note()),
+            "granola:render-v2:not_1d3tmYTlCICgjy:2026-07-14T18:30:00Z"
+        );
     }
 
     #[test]
-    fn transcript_keeps_timestamps_speaker_source_and_text() {
+    fn transcript_leads_with_speaker_role_and_compact_time() {
         let document = render_granola_note(&GranolaNativeBundle {
             content_kind: GranolaContentKind::Transcript,
             note: note(),
@@ -278,8 +299,30 @@ mod tests {
         .expect("render");
         assert_eq!(
             document.body,
-            "**2026-07-14T17:30:01Z – 2026-07-14T17:30:03Z · Oat Benson (microphone)**\n\nHello there.\n\n"
+            "**Me (Oat Benson) · 17:30:01–17:30:03 UTC**\n\nHello there.\n\n"
         );
+        assert!(!document.body.contains("2026-07-14"));
+        assert!(!document.body.contains("microphone"));
+    }
+
+    #[test]
+    fn transcript_uses_them_without_repeating_the_capture_source() {
+        let mut note = note();
+        let chunk = note.transcript.as_mut().unwrap().first_mut().unwrap();
+        chunk.speaker = GranolaSpeaker {
+            source: "speaker".to_string(),
+            diarization_label: None,
+            name: None,
+        };
+        chunk.start_time = "2026-07-14T17:30:01.100Z".to_string();
+        chunk.end_time = "2026-07-14T17:30:01.900Z".to_string();
+
+        let document = render_granola_note(&GranolaNativeBundle {
+            content_kind: GranolaContentKind::Transcript,
+            note,
+        })
+        .expect("render");
+        assert_eq!(document.body, "**Them · 17:30:01 UTC**\n\nHello there.\n\n");
     }
 
     #[test]

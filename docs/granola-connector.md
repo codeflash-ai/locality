@@ -40,9 +40,18 @@ for the owner, attendees, calendar event, folder ancestry, timestamps, and web
 URL.
 
 `summary.md` prefers Granola's Markdown summary and falls back to its plain-text
-summary. `transcript.md` preserves every returned chunk in order with absolute
-timestamps, speaker identity or diarization label, and microphone/speaker
-source. Chunks are not combined or rewritten.
+summary. `transcript.md` preserves every returned chunk in order. Turn headings
+lead with `Me` or `Them`, include a known name or diarization label when useful,
+and show compact UTC times without repeating the meeting date or capture source:
+
+```markdown
+**Me (Saurabh Misra) · 16:03:28–16:03:34 UTC**
+
+Basically, I think.
+```
+
+The meeting date and full source timestamps remain in Granola metadata/native
+state. Chunks are not combined or rewritten.
 
 Granola can permanently delete transcripts under an individual or workspace
 retention policy while retaining the note summary. Locality therefore keeps a

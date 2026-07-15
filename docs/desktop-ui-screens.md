@@ -108,7 +108,11 @@ preferred Notion folder.
 
 The list uses compact source cards so long filesystem paths do not dominate the
 screen. The header includes a `+ Add Source` action for adding future connectors
-from the same place. Each card shows:
+from the same place. Source setup is serialized, but progress belongs only to
+the connector being configured: other source actions retain their normal labels
+while disabled. The dialog Close action remains available during setup; closing
+the dialog does not cancel the background connection and File Provider work.
+Each card shows:
 
 - Source: connector name, workspace label, mount id, and a `Primary` marker for
   the preferred source used by Home, tray, and Review Center.
@@ -133,6 +137,20 @@ Home / Sources / <mount-id>
 The `Sources` breadcrumb returns to the table without changing the selected
 source in backend state. No backend source selection command is introduced by
 this screen.
+
+Source Detail keeps destructive maintenance inside a collapsed Danger Zone.
+Both actions require a phrase containing the selected mount id:
+
+- `Reset Source State` preserves pending local changes in the recovery folder,
+  clears only that mount's cached/source-scoped state, and rebuilds it from the
+  remote connector. It does not change remote data or other mounts.
+- `Disconnect Source` deletes and revokes the selected mount's saved connection
+  credential while retaining cached files and mount registration for a later
+  reconnect. If several mounts explicitly share that connection, the
+  confirmation explains that they will all require reconnection.
+
+The backend validates the typed phrase as well as the UI; invoking the desktop
+command directly cannot bypass confirmation.
 
 ## First-Run Onboarding
 
