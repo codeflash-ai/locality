@@ -1402,6 +1402,34 @@ where
     CreateMount: FnOnce(CreateDesktopMountRequest) -> MountFuture,
     MountFuture: Future<Output = Result<String, String>>,
 {
+    run_workspace_mount_onboarding_with_domain_status(
+        request,
+        activate,
+        create_mount,
+        macos_workspace_mount_domain_usable,
+    )
+    .await
+}
+
+async fn run_workspace_mount_onboarding_with_domain_status<
+    Activate,
+    ActivationFuture,
+    CreateMount,
+    MountFuture,
+    DomainStatus,
+>(
+    request: WorkspaceMountOnboardingRequest,
+    activate: Activate,
+    create_mount: CreateMount,
+    domain_usable: DomainStatus,
+) -> WorkspaceMountOnboardingReport
+where
+    Activate: FnOnce(WorkspaceMountOnboardingAction) -> ActivationFuture,
+    ActivationFuture: Future<Output = Result<MacosFileProviderActivation, String>>,
+    CreateMount: FnOnce(CreateDesktopMountRequest) -> MountFuture,
+    MountFuture: Future<Output = Result<String, String>>,
+    DomainStatus: FnOnce() -> Result<bool, String>,
+{
     let action = match WorkspaceMountOnboardingAction::parse(request.action.trim()) {
         Ok(action) => action,
         Err(message) => {
@@ -1413,6 +1441,15 @@ where
             );
         }
     };
+
+    if action == WorkspaceMountOnboardingAction::Restore
+        && workspace_restore_should_wait_for_macos_approval(
+            action,
+            domain_usable().unwrap_or(false),
+        )
+    {
+        return workspace_mount_approval_required_report();
+    }
 
     let mount_request = CreateDesktopMountRequest {
         connector: "notion".to_string(),
@@ -1432,19 +1469,30 @@ where
             WorkspaceMountOnboardingPrimaryAction::RetrySetup,
             WorkspaceMountOnboardingLaunchStrategy::None,
         ),
-        DesktopMountCreationOutcome::ApprovalRequired => workspace_mount_onboarding_report(
-            MacosWorkspaceMountOnboardingState::ApprovalRequired,
-            workspace_mount_onboarding_curated_message(
-                MacosWorkspaceMountOnboardingState::ApprovalRequired,
-            )
-            .expect("approval_required message"),
-            WorkspaceMountOnboardingPrimaryAction::AllowInMacos,
-            WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
-        ),
+        DesktopMountCreationOutcome::ApprovalRequired => workspace_mount_approval_required_report(),
         DesktopMountCreationOutcome::Failed(message) => {
             classify_workspace_mount_onboarding_failure(&message)
         }
     }
+}
+
+fn workspace_restore_should_wait_for_macos_approval(
+    action: WorkspaceMountOnboardingAction,
+    domain_usable: bool,
+) -> bool {
+    cfg!(target_os = "macos") && action == WorkspaceMountOnboardingAction::Restore && !domain_usable
+}
+
+fn workspace_mount_approval_required_report() -> WorkspaceMountOnboardingReport {
+    workspace_mount_onboarding_report(
+        MacosWorkspaceMountOnboardingState::ApprovalRequired,
+        workspace_mount_onboarding_curated_message(
+            MacosWorkspaceMountOnboardingState::ApprovalRequired,
+        )
+        .expect("approval_required message"),
+        WorkspaceMountOnboardingPrimaryAction::AllowInMacos,
+        WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+    )
 }
 
 async fn create_desktop_mount_command_with<Activate, ActivationFuture, CreateMount, MountFuture>(
@@ -12840,24 +12888,55 @@ mod tests {
     #[test]
     fn onboarding_restore_attempts_mount_without_native_activation() {
         let events = std::cell::RefCell::new(Vec::new());
-        let report = tauri::async_runtime::block_on(super::run_workspace_mount_onboarding_with(
-            super::WorkspaceMountOnboardingRequest {
-                path: "/tmp/locality".to_string(),
-                action: "restore".to_string(),
-            },
-            |_| {
-                events.borrow_mut().push("activate");
-                std::future::ready(Ok(super::MacosFileProviderActivation::Enabled))
-            },
-            |_| {
-                events.borrow_mut().push("mount");
-                std::future::ready(Ok("mount created".to_string()))
-            },
-        ));
+        let report = tauri::async_runtime::block_on(
+            super::run_workspace_mount_onboarding_with_domain_status(
+                super::WorkspaceMountOnboardingRequest {
+                    path: "/tmp/locality".to_string(),
+                    action: "restore".to_string(),
+                },
+                |_| {
+                    events.borrow_mut().push("activate");
+                    std::future::ready(Ok(super::MacosFileProviderActivation::Enabled))
+                },
+                |_| {
+                    events.borrow_mut().push("mount");
+                    std::future::ready(Ok("mount created".to_string()))
+                },
+                || Ok(true),
+            ),
+        );
 
         assert_eq!(events.into_inner(), vec!["mount"]);
         assert_eq!(report.state, "created");
         assert_eq!(report.message, "mount created");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn onboarding_restore_waits_for_explicit_native_approval_when_domain_is_not_usable() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(
+            super::run_workspace_mount_onboarding_with_domain_status(
+                super::WorkspaceMountOnboardingRequest {
+                    path: "/tmp/locality".to_string(),
+                    action: "restore".to_string(),
+                },
+                |_| {
+                    events.borrow_mut().push("activate");
+                    std::future::ready(Ok(super::MacosFileProviderActivation::Enabled))
+                },
+                |_| {
+                    events.borrow_mut().push("mount");
+                    std::future::ready(Ok("mount created".to_string()))
+                },
+                || Ok(false),
+            ),
+        );
+
+        assert!(events.into_inner().is_empty());
+        assert_eq!(report.state, "approval_required");
+        assert_eq!(report.primary_action, "allow_in_macos");
+        assert_eq!(report.launch_strategy, "instructions_only");
     }
 
     #[cfg(target_os = "macos")]
