@@ -424,6 +424,7 @@ struct WorkspaceMountOnboardingRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceMountOnboardingAction {
     Start,
+    Restore,
     AllowInMacos,
     CheckAgain,
 }
@@ -445,6 +446,7 @@ impl WorkspaceMountOnboardingAction {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
             "start" => Ok(Self::Start),
+            "restore" => Ok(Self::Restore),
             "allow_in_macos" => Ok(Self::AllowInMacos),
             "check_again" => Ok(Self::CheckAgain),
             other => Err(format!("Unsupported onboarding mount action `{other}`.")),
@@ -1483,7 +1485,10 @@ async fn activate_macos_file_provider_for_user_action(
 ) -> Result<MacosFileProviderActivation, String> {
     #[cfg(target_os = "macos")]
     {
-        if matches!(action, WorkspaceMountOnboardingAction::CheckAgain) {
+        if matches!(
+            action,
+            WorkspaceMountOnboardingAction::Restore | WorkspaceMountOnboardingAction::CheckAgain
+        ) {
             return Ok(MacosFileProviderActivation::NotRequested);
         }
 
@@ -1520,7 +1525,9 @@ fn non_macos_file_provider_activation(
         WorkspaceMountOnboardingAction::AllowInMacos => {
             Err("macOS File Provider approval is only available on macOS.".to_string())
         }
-        WorkspaceMountOnboardingAction::Start | WorkspaceMountOnboardingAction::CheckAgain => {
+        WorkspaceMountOnboardingAction::Start
+        | WorkspaceMountOnboardingAction::Restore
+        | WorkspaceMountOnboardingAction::CheckAgain => {
             Ok(MacosFileProviderActivation::NotRequested)
         }
     }
@@ -12814,6 +12821,29 @@ mod tests {
         assert_eq!(report.message, "main thread unavailable");
     }
 
+    #[test]
+    fn onboarding_restore_attempts_mount_without_native_activation() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "/tmp/locality".to_string(),
+                action: "restore".to_string(),
+            },
+            |_| {
+                events.borrow_mut().push("activate");
+                std::future::ready(Ok(super::MacosFileProviderActivation::Enabled))
+            },
+            |_| {
+                events.borrow_mut().push("mount");
+                std::future::ready(Ok("mount created".to_string()))
+            },
+        ));
+
+        assert_eq!(events.into_inner(), vec!["mount"]);
+        assert_eq!(report.state, "created");
+        assert_eq!(report.message, "mount created");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn onboarding_check_again_queries_existing_domain_without_native_registration() {
@@ -12969,6 +12999,12 @@ mod tests {
     fn non_macos_file_provider_activation_covers_all_onboarding_actions() {
         assert_eq!(
             super::non_macos_file_provider_activation(super::WorkspaceMountOnboardingAction::Start),
+            Ok(super::MacosFileProviderActivation::NotRequested)
+        );
+        assert_eq!(
+            super::non_macos_file_provider_activation(
+                super::WorkspaceMountOnboardingAction::Restore
+            ),
             Ok(super::MacosFileProviderActivation::NotRequested)
         );
         assert_eq!(

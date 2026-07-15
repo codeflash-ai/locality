@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import * as onboardingMount from "./onboarding-mount";
 import {
+  automaticMountOnboardingAction,
   failedMountOnboardingReport,
   mountOnboardingHeadline,
   mountOnboardingNeedsInstructions,
@@ -109,6 +110,10 @@ describe("mount onboarding helpers", () => {
       "check_again",
     );
     expect(mountOnboardingNextAction(report({ primaryAction: "retry_setup" }))).toBe("start");
+  });
+
+  it("uses a non-approval command for automatic restore checks", () => {
+    expect(automaticMountOnboardingAction()).toBe("restore");
   });
 
   it("wraps generic failures into a retryable onboarding report", () => {

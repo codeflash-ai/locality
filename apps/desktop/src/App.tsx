@@ -56,6 +56,7 @@ import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
 import { mountRecoveryEnabled, shouldAutoCreateMount } from "./onboarding-flow";
 import { classifyMountSetupError } from "./onboarding-errors";
 import {
+  automaticMountOnboardingAction,
   failedMountOnboardingReport,
   mountOnboardingHeadline,
   mountOnboardingInstructions,
@@ -63,6 +64,7 @@ import {
   mountOnboardingNextAction,
   mountOnboardingPrimaryLabel,
   mountOnboardingSupplementaryNote,
+  type WorkspaceMountOnboardingCommandAction,
   type WorkspaceMountOnboardingReport,
 } from "./onboarding-mount";
 import {
@@ -1527,7 +1529,7 @@ function Onboarding({
     ) {
       return;
     }
-    void runMountOnboarding("start");
+    void runMountOnboarding(automaticMountOnboardingAction());
   }, [connectionReadyNow, mountOnboarding, mountPath, mounting, snapshot.mount.status, step]);
 
   useEffect(() => {
@@ -1655,7 +1657,7 @@ function Onboarding({
     setLoginCopyMessage("Copied login link.");
   }
 
-  async function runMountOnboarding(action: "start" | "allow_in_macos" | "check_again") {
+  async function runMountOnboarding(action: WorkspaceMountOnboardingCommandAction) {
     if (mountStartRequestedRef.current || mounting) {
       return;
     }

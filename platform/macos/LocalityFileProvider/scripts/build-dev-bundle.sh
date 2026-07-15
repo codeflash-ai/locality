@@ -43,7 +43,7 @@ swiftc \
   -Xlinker __TEXT \
   -Xlinker __info_plist \
   -Xlinker "${ROOT}/App/LocalityFileProviderCtl.Info.plist" \
-  "${ROOT}/Sources/LocalityFileProviderCtl/main.swift" \
+  "${ROOT}"/Sources/LocalityFileProviderCtl/*.swift \
   -o "${APP}/Contents/MacOS/locality-file-providerctl"
 
 swiftc \

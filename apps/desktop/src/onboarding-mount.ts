@@ -9,6 +9,12 @@ export type WorkspaceMountOnboardingPrimaryAction =
   | "check_again"
   | "retry_setup";
 
+export type WorkspaceMountOnboardingCommandAction =
+  | "start"
+  | "restore"
+  | "allow_in_macos"
+  | "check_again";
+
 export type WorkspaceMountOnboardingLaunchStrategy =
   | "open_finder"
   | "instructions_only"
@@ -88,7 +94,7 @@ export function mountOnboardingSupplementaryNote(
 
 export function mountOnboardingNextAction(
   report: WorkspaceMountOnboardingReport | null,
-): "start" | "allow_in_macos" | "check_again" {
+): WorkspaceMountOnboardingCommandAction {
   switch (report?.primaryAction) {
     case "allow_in_macos":
       return "allow_in_macos";
@@ -97,6 +103,10 @@ export function mountOnboardingNextAction(
     default:
       return "start";
   }
+}
+
+export function automaticMountOnboardingAction(): WorkspaceMountOnboardingCommandAction {
+  return "restore";
 }
 
 export function failedMountOnboardingReport(
