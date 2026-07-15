@@ -24,7 +24,7 @@ pub struct GmailAttachmentSpec {
 pub fn collect_attachment_specs(message: &GmailMessage) -> Vec<GmailAttachmentSpec> {
     let mut specs = Vec::new();
     if let Some(payload) = &message.payload {
-        collect_part_specs(&message.id, payload, &mut specs);
+        collect_part_specs(&message.id, payload, "root", &mut specs);
     }
     specs
 }
@@ -32,6 +32,7 @@ pub fn collect_attachment_specs(message: &GmailMessage) -> Vec<GmailAttachmentSp
 fn collect_part_specs(
     message_id: &str,
     part: &GmailMessagePart,
+    part_path: &str,
     specs: &mut Vec<GmailAttachmentSpec>,
 ) {
     if let Some(filename) = part
@@ -50,17 +51,30 @@ fn collect_part_specs(
                         .clone()
                         .unwrap_or_else(|| "application/octet-stream".to_string()),
                     size: body.size,
-                    local_path: attachment_local_path(message_id, attachment_id, filename),
+                    local_path: attachment_local_path_for_cache_key(
+                        message_id,
+                        &attachment_cache_key(part, part_path),
+                        filename,
+                    ),
                 });
             }
         }
     }
-    for child in &part.parts {
-        collect_part_specs(message_id, child, specs);
+    for (index, child) in part.parts.iter().enumerate() {
+        let child_path = format!("{part_path}.{index}");
+        collect_part_specs(message_id, child, &child_path, specs);
     }
 }
 
 pub fn attachment_local_path(message_id: &str, attachment_id: &str, filename: &str) -> PathBuf {
+    attachment_local_path_for_cache_key(message_id, attachment_id, filename)
+}
+
+fn attachment_local_path_for_cache_key(
+    message_id: &str,
+    cache_key: &str,
+    filename: &str,
+) -> PathBuf {
     let extension = std::path::Path::new(filename)
         .extension()
         .and_then(|value| value.to_str())
@@ -69,7 +83,7 @@ pub fn attachment_local_path(message_id: &str, attachment_id: &str, filename: &s
         .filter(|value| !value.is_empty())
         .map(|value| format!(".{value}"))
         .unwrap_or_default();
-    let attachment_component = bounded_opaque_id_component(attachment_id);
+    let attachment_component = bounded_opaque_id_component(cache_key);
     let stem_budget = MAX_ATTACHMENT_FILENAME_LEN
         .saturating_sub(1)
         .saturating_sub(attachment_component.len())
@@ -81,6 +95,14 @@ pub fn attachment_local_path(message_id: &str, attachment_id: &str, filename: &s
         .join("attachments")
         .join(bounded_opaque_id_component(message_id))
         .join(format!("{stem}-{attachment_component}{extension}"))
+}
+
+fn attachment_cache_key(part: &GmailMessagePart, part_path: &str) -> String {
+    part.part_id
+        .as_deref()
+        .filter(|part_id| !part_id.trim().is_empty())
+        .map(|part_id| format!("part-id:{part_id}"))
+        .unwrap_or_else(|| format!("part-path:{part_path}"))
 }
 
 pub fn decode_attachment_body(body: &GmailMessagePartBody) -> LocalityResult<Vec<u8>> {
@@ -238,6 +260,35 @@ mod tests {
             "invoice-july-",
             ".pdf",
         ));
+    }
+
+    #[test]
+    fn collect_attachment_specs_uses_stable_part_identity_for_local_path() {
+        let message_with_attachment = |attachment_id: &str| {
+            serde_json::from_value::<GmailMessage>(serde_json::json!({
+                "id": "msg-1",
+                "payload": {
+                    "mimeType": "multipart/mixed",
+                    "parts": [
+                        {
+                            "partId": "1",
+                            "filename": "Screenshot.png",
+                            "mimeType": "image/png",
+                            "body": { "attachmentId": attachment_id, "size": 69553 }
+                        }
+                    ]
+                }
+            }))
+            .expect("message")
+        };
+
+        let first = collect_attachment_specs(&message_with_attachment("volatile-a"));
+        let second = collect_attachment_specs(&message_with_attachment("volatile-b"));
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].attachment_id, second[0].attachment_id);
+        assert_eq!(first[0].local_path, second[0].local_path);
     }
 
     #[test]

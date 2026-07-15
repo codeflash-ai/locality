@@ -587,7 +587,7 @@ mod tests {
         );
 
         let hydrated = connector.fetch_render(&request).expect("hydrate");
-        let expected_path = attachment_local_path("msg-attach", "attach-1", "Invoice.pdf");
+        let expected_path = attachment_local_path("msg-attach", "part-id:2", "Invoice.pdf");
 
         assert_eq!(hydrated.assets.len(), 1);
         assert_eq!(hydrated.assets[0].path, expected_path);
@@ -639,7 +639,7 @@ mod tests {
         );
 
         let hydrated = connector.fetch_render(&request).expect("hydrate thread");
-        let expected_path = attachment_local_path("msg-attach", "attach-1", "Invoice.pdf");
+        let expected_path = attachment_local_path("msg-attach", "part-id:2", "Invoice.pdf");
 
         assert_eq!(hydrated.assets.len(), 1);
         assert_eq!(hydrated.assets[0].path, expected_path);
@@ -816,6 +816,7 @@ mod tests {
                         "body": { "data": "Qm9keQo" }
                     },
                     {
+                        "partId": "2",
                         "filename": "Invoice.pdf",
                         "mimeType": "application/pdf",
                         "body": { "attachmentId": "attach-1", "size": 16 }

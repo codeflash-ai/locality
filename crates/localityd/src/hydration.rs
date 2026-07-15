@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use locality_core::canonical::parse_canonical_markdown;
@@ -221,10 +222,7 @@ where
             return Ok(HydrationOutcome::Hydrated);
         }
 
-        for asset in &rendered.assets {
-            let path = mount_relative_path(&output_root, &asset.path)?;
-            write_binary_atomic(&path, &asset.bytes)?;
-        }
+        write_hydrated_asset_files(&output_root, &rendered.assets)?;
         replace_hydrated_media_manifest(&output_root, &rendered.assets)?;
         write_atomic(
             &path,
@@ -395,10 +393,7 @@ where
         local_contents: String,
         use_base_shadow: bool,
     ) -> LocalityResult<DirtyRemoteDriftOutcome> {
-        for asset in &rendered.assets {
-            let path = mount_relative_path(output_root, &asset.path)?;
-            write_binary_atomic(&path, &asset.bytes)?;
-        }
+        write_hydrated_asset_files(output_root, &rendered.assets)?;
         update_hydrated_media_manifest(output_root, &rendered.assets)?;
         let base_shadow = if use_base_shadow {
             match self.store.load_shadow(&mount.mount_id, &entity.remote_id) {
@@ -796,6 +791,91 @@ fn hydration_target_rank(state: &HydrationState) -> u8 {
         HydrationState::Dirty => 3,
         HydrationState::Conflicted => 4,
     }
+}
+
+pub(crate) fn write_hydrated_asset_files(
+    output_root: &Path,
+    assets: &[HydratedAsset],
+) -> LocalityResult<()> {
+    for asset in assets {
+        let path = mount_relative_path(output_root, &asset.path)?;
+        write_binary_atomic(&path, &asset.bytes)?;
+    }
+    prune_stale_gmail_attachment_assets(output_root, assets)
+}
+
+fn prune_stale_gmail_attachment_assets(
+    output_root: &Path,
+    assets: &[HydratedAsset],
+) -> LocalityResult<()> {
+    let mut keep_by_parent: BTreeMap<PathBuf, BTreeSet<OsString>> = BTreeMap::new();
+    for asset in assets {
+        let Some((parent, filename)) = gmail_attachment_asset_parent_and_filename(&asset.path)
+        else {
+            continue;
+        };
+        keep_by_parent.entry(parent).or_default().insert(filename);
+    }
+
+    for (parent, keep_names) in keep_by_parent {
+        let absolute_parent = mount_relative_path(output_root, &parent)?;
+        let entries = match std::fs::read_dir(&absolute_parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(LocalityError::Io(format!(
+                    "failed to read Gmail attachment cache directory `{}`: {error}",
+                    absolute_parent.display()
+                )));
+            }
+        };
+
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                LocalityError::Io(format!(
+                    "failed to read Gmail attachment cache entry in `{}`: {error}",
+                    absolute_parent.display()
+                ))
+            })?;
+            let name = entry.file_name();
+            if keep_names.contains(&name) || is_hydration_asset_temp_name(&name) {
+                continue;
+            }
+            let file_type = entry.file_type().map_err(|error| {
+                LocalityError::Io(format!(
+                    "failed to inspect Gmail attachment cache entry `{}`: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if file_type.is_file() {
+                std::fs::remove_file(entry.path()).map_err(|error| {
+                    LocalityError::Io(format!(
+                        "failed to remove stale Gmail attachment cache file `{}`: {error}",
+                        entry.path().display()
+                    ))
+                })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn gmail_attachment_asset_parent_and_filename(path: &Path) -> Option<(PathBuf, OsString)> {
+    if !path.starts_with(Path::new(".loc/gmail/attachments")) {
+        return None;
+    }
+    let parent = path.parent()?.to_path_buf();
+    if parent == Path::new(".loc/gmail/attachments") {
+        return None;
+    }
+    let filename = path.file_name()?.to_os_string();
+    Some((parent, filename))
+}
+
+fn is_hydration_asset_temp_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with('.') && name.ends_with(".loc-tmp"))
 }
 
 fn require_mount<S>(store: &S, mount_id: &MountId) -> LocalityResult<MountConfig>

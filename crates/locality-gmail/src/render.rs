@@ -773,6 +773,7 @@ mod tests {
                         "body": { "data": "Qm9keQo" }
                     },
                     {
+                        "partId": "2",
                         "filename": "Invoice.pdf",
                         "mimeType": "application/pdf",
                         "body": { "attachmentId": "attach-1", "size": 12 }
@@ -789,7 +790,7 @@ mod tests {
         .expect("render");
 
         let expected_path =
-            crate::attachments::attachment_local_path("msg-attach", "attach-1", "Invoice.pdf");
+            crate::attachments::attachment_local_path("msg-attach", "part-id:2", "Invoice.pdf");
 
         assert_eq!(rendered.document.body, "Body\n");
         assert_eq!(rendered.attachment_specs.len(), 1);

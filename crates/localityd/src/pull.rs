@@ -5,7 +5,7 @@
 //! stubs; page-file pulls hydrate one entity and persist its shadow snapshot.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use locality_connector::{ChildContainer, EnumerateRequest, ListChildrenRequest};
 use locality_core::canonical::{parse_canonical_markdown, render_canonical_markdown};
@@ -28,7 +28,7 @@ use locality_store::{
 use serde::{Deserialize, Serialize};
 
 use crate::file_provider::{self, ProjectionRefreshBase};
-use crate::hydration::{HydratedAsset, HydratedEntity};
+use crate::hydration::{HydratedAsset, HydratedEntity, write_hydrated_asset_files};
 use crate::media::{
     document_with_absolute_media_hrefs, has_missing_local_media_hrefs,
     render_document_with_absolute_media_hrefs, replace_hydrated_media_manifest,
@@ -1559,10 +1559,7 @@ where
 }
 
 fn write_assets(root: &Path, assets: &[HydratedAsset]) -> Result<(), PullError> {
-    for asset in assets {
-        let path = mount_relative_path(root, &asset.path)?;
-        write_binary_atomic(&path, &asset.bytes)?;
-    }
+    write_hydrated_asset_files(root, assets).map_err(PullError::Connector)?;
     update_hydrated_media_manifest(root, assets).map_err(PullError::Connector)?;
     Ok(())
 }
@@ -2040,46 +2037,6 @@ fn write_atomic(path: &Path, contents: String) -> Result<(), PullError> {
         message: error.to_string(),
     })?;
     Ok(())
-}
-
-fn write_binary_atomic(path: &Path, contents: &[u8]) -> Result<(), PullError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| PullError::WriteFile {
-            path: parent.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    }
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("loc-asset");
-    let temp_path = path.with_file_name(format!(".{file_name}.loc-tmp"));
-    std::fs::write(&temp_path, contents).map_err(|error| PullError::WriteFile {
-        path: temp_path.clone(),
-        message: error.to_string(),
-    })?;
-    std::fs::rename(&temp_path, path).map_err(|error| PullError::WriteFile {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
-    Ok(())
-}
-
-fn mount_relative_path(root: &Path, path: &Path) -> Result<PathBuf, PullError> {
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir
-        )
-    }) {
-        return Err(PullError::WriteFile {
-            path: path.to_path_buf(),
-            message: "hydrated asset path is not mount-relative".to_string(),
-        });
-    }
-
-    Ok(root.join(path))
 }
 
 fn rename_projected_path(from: &Path, to: &Path) -> Result<(), PullError> {
