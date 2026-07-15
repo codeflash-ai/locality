@@ -1008,15 +1008,19 @@ p {
 }
 
 .connector-option {
-  display: flex;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
   min-height: 72px;
   align-items: center;
-  justify-content: space-between;
   gap: 14px;
+  width: 100%;
   padding: 14px;
   border: 1px solid var(--line);
   border-radius: 15px;
   background: #ffffff;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
 }
 
 .connector-option > div {
@@ -1028,6 +1032,25 @@ p {
   background: var(--accent-soft);
 }
 
+.connector-option.selectable {
+  cursor: pointer;
+}
+
+.connector-option.selectable:hover:not(:disabled),
+.connector-option.selectable.selected {
+  border-color: rgba(8, 123, 114, 0.42);
+  background: rgba(232, 248, 244, 0.96);
+  box-shadow: 0 12px 26px rgba(8, 123, 114, 0.12);
+}
+
+.connector-option.selectable:disabled {
+  cursor: default;
+}
+
+.connector-option.muted {
+  background: rgba(255, 255, 255, 0.72);
+}
+
 .connector-option strong,
 .connector-option small {
   display: block;
@@ -1037,6 +1060,20 @@ p {
   margin-top: 4px;
   color: var(--muted);
   line-height: 1.35;
+}
+
+.connector-option .connector-icon {
+  width: 32px;
+  height: 32px;
+}
+
+.onboarding-api-key-field {
+  max-width: 440px;
+  margin-top: 0;
+}
+
+.onboarding-api-key-field span {
+  color: var(--muted);
 }
 
 .path-field,

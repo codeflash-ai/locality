@@ -101,6 +101,7 @@ const onboardingDemoVideoUrl = import.meta.env.VITE_LOCALITY_ONBOARDING_DEMO_VID
 type AppView = "home" | "files" | "mount" | "pending" | "review" | "activity" | "settings";
 type LocateState = "idle" | "preparing" | "ready" | "error";
 type OnboardingStep = 1 | 2 | 3 | 4 | 5;
+type OnboardingConnectorId = "notion" | "granola";
 type ReviewFilter = "all" | "approvals" | "problems";
 type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
@@ -656,7 +657,10 @@ const sampleSearchResults: LocatedItem[] = [
   },
 ];
 
-function suggestedAgentPrompt(mountPath: string) {
+function suggestedAgentPrompt(mountPath: string, connector: OnboardingConnectorId = "notion") {
+  if (connector === "granola") {
+    return `Use Locality to read my Granola meetings. Open the files under ${mountPath}, search summaries and transcripts with normal file tools, and cite the meeting files you used. Granola is read-only in Locality, so do not try to push edits back.`;
+  }
   return `Use Locality to edit my Notion workspace. Open the files under ${mountPath}, make the requested edits directly in Markdown, and leave changes pending for Locality review.`;
 }
 
@@ -1421,6 +1425,14 @@ function Onboarding({
   const [oauthError, setOauthError] = useState("");
   const [loginUrl, setLoginUrl] = useState("");
   const [loginCopyMessage, setLoginCopyMessage] = useState("");
+  const [selectedOnboardingConnector, setSelectedOnboardingConnector] = useState<OnboardingConnectorId>(
+    snapshot.mount.connector === "granola" || snapshot.connection.connector === "granola" ? "granola" : "notion",
+  );
+  const [granolaApiKey, setGranolaApiKey] = useState("");
+  const [granolaReady, setGranolaReady] = useState(
+    snapshot.mount.connector === "granola" && connectionReady(snapshot),
+  );
+  const [granolaConnecting, setGranolaConnecting] = useState(false);
   const [connectedWorkspace, setConnectedWorkspace] = useState(snapshot.connection.workspaceName);
   const [mountPath, setMountPath] = useState(snapshot.mount.localPath);
   const [mountPathDirty, setMountPathDirty] = useState(false);
@@ -1434,7 +1446,11 @@ function Onboarding({
   const [agentGuidanceReport, setAgentGuidanceReport] = useState<AgentGuidanceInstallReport | null>(null);
   const [agentGuidanceState, setAgentGuidanceState] = useState<"idle" | "installing" | "ready" | "error">("idle");
   const mountStartRequestedRef = useRef(false);
-  const connectionReadyNow = oauthReady || connectionReady(snapshot);
+  const snapshotConnectionConnector = snapshot.connection.connector || "notion";
+  const connectionReadyNow = selectedOnboardingConnector === "notion"
+    ? oauthReady || (connectionReady(snapshot) && snapshotConnectionConnector === "notion")
+    : granolaReady || (connectionReady(snapshot) && snapshotConnectionConnector === "granola");
+  const selectedSourceName = selectedOnboardingConnector === "granola" ? "Granola" : "Notion";
 
   async function installAgentGuidance(path: string) {
     setAgentGuidanceState("installing");
@@ -1469,13 +1485,20 @@ function Onboarding({
   }, [snapshot.connection.workspaceName]);
 
   useEffect(() => {
+    if (snapshot.connection.connector === "granola" || snapshot.mount.connector === "granola") {
+      setSelectedOnboardingConnector("granola");
+      setGranolaReady(connectionReady(snapshot));
+    }
+  }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.connector]);
+
+  useEffect(() => {
     if (!mountPathDirty) {
       setMountPath(snapshot.mount.localPath);
     }
   }, [mountPathDirty, snapshot.mount.localPath]);
 
   useEffect(() => {
-    if (step !== 3 || !oauthInFlight || oauthReady) {
+    if (selectedOnboardingConnector !== "notion" || step !== 3 || !oauthInFlight || oauthReady) {
       return;
     }
 
@@ -1493,7 +1516,7 @@ function Onboarding({
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [oauthInFlight, oauthReady, step]);
+  }, [oauthInFlight, oauthReady, selectedOnboardingConnector, step]);
 
   useEffect(() => {
     if (!oauthInFlight) {
@@ -1511,17 +1534,24 @@ function Onboarding({
       return;
     }
 
-    setOauthReady(true);
+    if (snapshot.connection.connector === "granola") {
+      setSelectedOnboardingConnector("granola");
+      setGranolaReady(true);
+    } else {
+      setSelectedOnboardingConnector("notion");
+      setOauthReady(true);
+    }
     setStep((current) => {
       if (mountMissing(snapshot)) {
         return current < 4 ? 4 : current;
       }
       return current < 5 ? 5 : current;
     });
-  }, [snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
+  }, [snapshot.connection.connector, snapshot.connection.status, snapshot.mount.status, snapshotLoaded]);
 
   useEffect(() => {
     if (
+      selectedOnboardingConnector !== "notion" ||
       !shouldAutoCreateMount({
         step,
         connectionReady: connectionReadyNow,
@@ -1535,14 +1565,19 @@ function Onboarding({
       return;
     }
     void runMountOnboarding("start");
-  }, [connectionReadyNow, mountOnboarding, mountPath, mounting, snapshot.mount.status, step]);
+  }, [connectionReadyNow, mountOnboarding, mountPath, mounting, selectedOnboardingConnector, snapshot.mount.status, step]);
 
   useEffect(() => {
-    if (step !== 5 || mountMissing(snapshot) || agentGuidanceState !== "idle") {
+    if (
+      selectedOnboardingConnector !== "notion" ||
+      step !== 5 ||
+      mountMissing(snapshot) ||
+      agentGuidanceState !== "idle"
+    ) {
       return;
     }
     void installAgentGuidance(mountPath);
-  }, [agentGuidanceState, mountPath, snapshot.mount.status, step]);
+  }, [agentGuidanceState, mountPath, selectedOnboardingConnector, snapshot.mount.status, step]);
 
   async function readLoginUrl() {
     return callCommand<string | null>("notion_login_link", undefined, null).catch(() => null);
@@ -1629,6 +1664,67 @@ function Onboarding({
 
   async function startConnect() {
     await runConnectFlow({ openBrowser: true });
+  }
+
+  function selectOnboardingConnector(connector: OnboardingConnectorId) {
+    if (oauthInFlight || granolaConnecting || mounting) {
+      return;
+    }
+    setSelectedOnboardingConnector(connector);
+    setOauthError("");
+    setLoginCopyMessage("");
+    setMountOnboarding(null);
+  }
+
+  async function connectGranolaOnboarding() {
+    if (granolaConnecting || !granolaApiKey.trim()) {
+      if (!granolaApiKey.trim()) {
+        setOauthError("Enter a Granola API key.");
+      }
+      return;
+    }
+
+    setOauthError("");
+    setLoginCopyMessage("");
+    setMountOnboarding(null);
+    setGranolaConnecting(true);
+    setStep(3);
+    try {
+      const report = await callCommand<ActionReport>(
+        "connect_granola",
+        { apiKey: granolaApiKey },
+        { ok: true, message: "Connected demo Granola source." },
+      );
+      if (!report.ok) {
+        setOauthError(report.message);
+        return;
+      }
+
+      const nextSnapshot = await callCommand<DesktopSnapshot>(
+        "desktop_snapshot",
+        undefined,
+        sampleSnapshot,
+      );
+      const granolaMount = nextSnapshot.mounts.find((mount) => mount.connector === "granola")
+        ?? (nextSnapshot.mount.connector === "granola" ? nextSnapshot.mount : null);
+      const nextMountPath = granolaMount?.localPath || sourceDefaultPath(nextSnapshot, "granola");
+      setMountPathDirty(false);
+      setMountPath(nextMountPath);
+      setConnectedWorkspace("Granola");
+      setGranolaReady(true);
+      const cliReady = await ensureCliAvailable();
+      if (!cliReady) {
+        setOauthError(
+          "Granola is connected, but Locality could not prepare the terminal command. Open Settings to repair Locality, then open the app.",
+        );
+        return;
+      }
+      setStep(5);
+    } catch (error) {
+      setOauthError(errorMessage(error));
+    } finally {
+      setGranolaConnecting(false);
+    }
   }
 
   async function copyLoginLink() {
@@ -1779,7 +1875,11 @@ function Onboarding({
       return;
     }
     setOptionalGuideReturnStep(null);
-    setStep(connectionReadyNow ? 4 : 3);
+    if (connectionReadyNow) {
+      setStep(selectedOnboardingConnector === "granola" ? 5 : 4);
+      return;
+    }
+    setStep(3);
   }
 
   async function locatePage() {
@@ -1810,7 +1910,9 @@ function Onboarding({
   }
 
   const workspaceLabel = connectedWorkspace || snapshot.connection.workspaceName || "Your workspace";
-  const finalPrompt = agentGuidanceReport?.prompt || suggestedAgentPrompt(mountPath);
+  const finalPrompt = selectedOnboardingConnector === "notion" && agentGuidanceReport?.prompt
+    ? agentGuidanceReport.prompt
+    : suggestedAgentPrompt(mountPath, selectedOnboardingConnector);
   const mountSetupError =
     mountOnboarding?.state === "failed"
       ? classifyMountSetupError(mountOnboarding.message)
@@ -1867,32 +1969,51 @@ function Onboarding({
 
         {step === 3 && (
           <SetupContent
-            side={<ConnectorOptions connected={connectionReadyNow} />}
+            side={
+              <ConnectorOptions
+                selected={selectedOnboardingConnector}
+                connectedConnector={connectionReadyNow ? selectedOnboardingConnector : null}
+                busy={oauthInFlight || granolaConnecting}
+                onSelect={selectOnboardingConnector}
+              />
+            }
           >
             <div>
               <div className="eyebrow">Connect source</div>
-              {(oauthInFlight || connectionReadyNow) && (
+              {(oauthInFlight || granolaConnecting || connectionReadyNow) && (
                 <div className={`sync-note ${connectionReadyNow ? "connected" : ""}`}>
                   {connectionReadyNow ? <Check /> : <Loader2 className="spin-icon" />}
-                  {connectionReadyNow ? "Notion connected" : "Waiting for Notion"}
+                  {connectionReadyNow ? `${selectedSourceName} connected` : `Waiting for ${selectedSourceName}`}
                 </div>
               )}
               <h1>
-                {connectionReadyNow
-                  ? "Your Notion workspace is connected"
-                  : oauthInFlight
-                    ? "Finish connecting in Notion."
-                    : "Start with Notion."}
+                {selectedOnboardingConnector === "granola"
+                  ? connectionReadyNow
+                    ? "Your Granola source is connected"
+                    : granolaConnecting
+                      ? "Checking Granola access."
+                      : "Start with Granola."
+                  : connectionReadyNow
+                    ? "Your Notion workspace is connected"
+                    : oauthInFlight
+                      ? "Finish connecting in Notion."
+                      : "Start with Notion."}
               </h1>
               <p>
-                {connectionReadyNow
-                  ? `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare the local workspace.`
-                  : oauthInFlight
-                    ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
-                    : "Connect the source you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
+                {selectedOnboardingConnector === "granola"
+                  ? connectionReadyNow
+                    ? "Granola is ready. Locality mounted meeting summaries and transcripts as read-only files under CloudStorage."
+                    : granolaConnecting
+                      ? "Locality is validating the API key and creating a read-only Granola folder."
+                      : "Paste a Granola API key to mount meeting summaries and transcripts as local read-only files. Keys are stored in your local credential store."
+                  : connectionReadyNow
+                    ? `${workspaceLabel} is ready. Locality will now create the Notion folder under CloudStorage and prepare the local workspace.`
+                    : oauthInFlight
+                      ? "A browser window is open. Choose the workspace and pages Locality can access, then approve."
+                      : "Connect the source you want agents to help with. Your machine talks directly to Notion, and app credentials are protected by macOS Keychain."}
               </p>
             </div>
-            {oauthInFlight && !connectionReadyNow && (
+            {selectedOnboardingConnector === "notion" && oauthInFlight && !connectionReadyNow && (
               <ProgressList
                 items={[
                   { label: "Browser opened", state: oauthError ? "idle" : "done" },
@@ -1901,27 +2022,67 @@ function Onboarding({
                 ]}
               />
             )}
+            {selectedOnboardingConnector === "granola" && !connectionReadyNow && (
+              <label className="source-inline-field onboarding-api-key-field">
+                <span>Granola API key</span>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  value={granolaApiKey}
+                  placeholder="Paste API key"
+                  disabled={granolaConnecting}
+                  onChange={(event) => setGranolaApiKey(event.target.value)}
+                />
+              </label>
+            )}
             <div className="button-row">
               <PrimaryButton
-                busy={oauthInFlight && !connectionReadyNow}
-                onClick={connectionReadyNow ? () => setStep(4) : startConnect}
+                busy={(oauthInFlight || granolaConnecting) && !connectionReadyNow}
+                disabled={selectedOnboardingConnector === "granola" && !connectionReadyNow && !granolaApiKey.trim()}
+                onClick={
+                  connectionReadyNow
+                    ? () => setStep(selectedOnboardingConnector === "granola" ? 5 : 4)
+                    : selectedOnboardingConnector === "granola"
+                      ? () => void connectGranolaOnboarding()
+                      : startConnect
+                }
               >
-                {connectionReadyNow ? "Continue" : oauthInFlight ? "Waiting for Notion" : "Connect Notion"}
+                {connectionReadyNow
+                  ? "Continue"
+                  : selectedOnboardingConnector === "granola"
+                    ? granolaConnecting
+                      ? "Connecting Granola"
+                      : "Connect Granola"
+                    : oauthInFlight
+                      ? "Waiting for Notion"
+                      : "Connect Notion"}
               </PrimaryButton>
-              <SecondaryButton
-                disabled={copyLoginLinkDisabled({
-                  connectionReady: connectionReadyNow,
-                  oauthInFlight,
-                })}
-                onClick={() => void copyLoginLink()}
-              >
-                Copy login link
-              </SecondaryButton>
+              {selectedOnboardingConnector === "notion" && (
+                <SecondaryButton
+                  disabled={copyLoginLinkDisabled({
+                    connectionReady: connectionReadyNow,
+                    oauthInFlight,
+                  })}
+                  onClick={() => void copyLoginLink()}
+                >
+                  Copy login link
+                </SecondaryButton>
+              )}
             </div>
             <div className="onboarding-pill-row">
-              <span>Scoped access</span>
-              <span>Credentials in Keychain</span>
-              <span>Direct app connection</span>
+              {selectedOnboardingConnector === "granola" ? (
+                <>
+                  <span>Read-only</span>
+                  <span>Meeting summaries</span>
+                  <span>Transcripts</span>
+                </>
+              ) : (
+                <>
+                  <span>Scoped access</span>
+                  <span>Credentials in Keychain</span>
+                  <span>Direct app connection</span>
+                </>
+              )}
             </div>
             {loginCopyMessage && <p className="quiet-note inline-note">{loginCopyMessage}</p>}
             {oauthError && <p className="field-error">{oauthError}</p>}
@@ -1938,7 +2099,7 @@ function Onboarding({
               <h1>{mountOnboardingHeadline(mountOnboarding)}</h1>
               <p>
                 {mountOnboarding?.message ??
-                  "Locality is creating your Notion folder under the default CloudStorage root and verifying that files appear locally."}
+                  `Locality is creating your ${selectedSourceName} folder under the default CloudStorage root and verifying that files appear locally.`}
               </p>
             </div>
             <div className="sync-note">
@@ -1951,7 +2112,7 @@ function Onboarding({
               )}
               {mounting
                 ? "Checking File Provider approval"
-                : mountOnboarding?.message ?? "Creating folder and preparing Notion files"}
+                : mountOnboarding?.message ?? `Creating folder and preparing ${selectedSourceName} files`}
             </div>
             <div className="path-field ready-path-field">
               <span>{mountPath}</span>
@@ -1986,7 +2147,7 @@ function Onboarding({
             )}
             <p className="quiet-note">
               Locality uses the default CloudStorage location so Finder and your agents see the
-              same Notion folder automatically.
+              same source folder automatically.
             </p>
           </SetupContent>
         )}
@@ -1996,10 +2157,9 @@ function Onboarding({
             <div>
               <h1>Locality is ready!</h1>
               <p>
-                Your local workspace is ready. Agents can open this folder, edit
-                Markdown, and leave changes for Review Center. Open the app to review changes,
-                manage sync, and turn on Live Mode when you want file saves to update Notion and
-                new Notion changes to appear locally.
+                {selectedOnboardingConnector === "granola"
+                  ? "Your Granola meetings are ready as local read-only files. Agents can search summaries and transcripts with normal file tools, while Locality keeps the remote notes protected from edits."
+                  : "Your local workspace is ready. Agents can open this folder, edit Markdown, and leave changes for Review Center. Open the app to review changes, manage sync, and turn on Live Mode when you want file saves to update Notion and new Notion changes to appear locally."}
               </p>
             </div>
             {mountOnboarding && <p className="field-error">{mountOnboarding.message}</p>}
@@ -2015,7 +2175,7 @@ function Onboarding({
               <div className="ready-head">
                 <div>
                   <strong>Folder</strong>
-                  <p>Your Notion files are mounted here.</p>
+                  <p>Your {selectedSourceName} files are mounted here.</p>
                 </div>
                 <span className="onboarding-pill">Mounted</span>
               </div>
@@ -2030,7 +2190,11 @@ function Onboarding({
               <div className="agent-demo-header">
                 <div>
                   <strong>Try this agent prompt</strong>
-                  <p>Claude and Codex are now set up to use Locality.</p>
+                  <p>
+                    {selectedOnboardingConnector === "granola"
+                      ? "Ask an agent to use the mounted meeting files."
+                      : "Claude and Codex are now set up to use Locality."}
+                  </p>
                 </div>
                 <SecondaryButton
                   onClick={() => copyText(finalPrompt)}
@@ -6500,29 +6664,60 @@ loc: notion-page`}</pre>
   );
 }
 
-function ConnectorOptions({ connected }: { connected: boolean }) {
+function ConnectorOptions({
+  selected,
+  connectedConnector,
+  busy,
+  onSelect,
+}: {
+  selected: OnboardingConnectorId;
+  connectedConnector: OnboardingConnectorId | null;
+  busy: boolean;
+  onSelect: (connector: OnboardingConnectorId) => void;
+}) {
   return (
     <div className="connector-options">
-      <div className="connector-option available">
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "notion" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("notion")}
+      >
+        <ConnectorIcon connector="notion" />
         <div>
           <strong>Notion</strong>
           <small>Pages, databases, properties, and Markdown edits.</small>
         </div>
-        <span>{connected ? "Connected" : "Available"}</span>
-      </div>
-      <div className="connector-option">
+        <span>{connectedConnector === "notion" ? "Connected" : "Available"}</span>
+      </button>
+      <button
+        type="button"
+        className={`connector-option available selectable ${selected === "granola" ? "selected" : ""}`}
+        disabled={busy}
+        onClick={() => onSelect("granola")}
+      >
+        <ConnectorIcon connector="granola" />
+        <div>
+          <strong>Granola</strong>
+          <small>Meeting summaries and transcripts as read-only files.</small>
+        </div>
+        <span>{connectedConnector === "granola" ? "Connected" : "API key"}</span>
+      </button>
+      <div className="connector-option muted">
+        <ConnectorIcon connector="google-docs" />
         <div>
           <strong>Google Docs</strong>
           <small>Docs and Drive folders through the same local model.</small>
         </div>
-        <span>Next</span>
+        <span>Add later</span>
       </div>
-      <div className="connector-option">
+      <div className="connector-option muted">
+        <ConnectorIcon connector="gmail" />
         <div>
-          <strong>Linear</strong>
-          <small>Issues and projects as agent-editable files.</small>
+          <strong>Gmail</strong>
+          <small>Inbox and sent as files, drafts as reviewed outbound mail.</small>
         </div>
-        <span>Planned</span>
+        <span>Add later</span>
       </div>
     </div>
   );
