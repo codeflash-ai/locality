@@ -5,7 +5,7 @@ describe("classifyMountSetupError", () => {
   it("detects disabled macOS File Provider setup", () => {
     expect(
       classifyMountSetupError(
-        "Could not open macOS File Provider domain `loc`: The Locality File Provider is registered but not enabled. Enable Locality in Finder or System Settings, then try again.",
+        "Could not open macOS File Provider domain `loc`: The Locality File Provider is registered but not enabled. Click OK in the macOS \"Start Syncing\" prompt, then try again.",
       ),
     ).toMatchObject({ kind: "file-provider-disabled" });
   });

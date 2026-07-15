@@ -141,13 +141,13 @@ private enum Command {
         hidden: domain.isHidden
       ) else {
         throw UsageError(
-          "The Locality File Provider is registered but not enabled. Enable Locality in Finder or System Settings, then try again."
+          "The Locality File Provider is registered but not enabled. Click OK in the macOS \"Start Syncing\" prompt, then try again."
         )
       }
       let url = try userVisibleDomainURL(for: domain)
       guard FileManager.default.fileExists(atPath: url.path) else {
         throw UsageError(
-          "File Provider domain \(mountId) exists but macOS has not created \(url.path). Enable the Locality File Provider extension in System Settings, then try again."
+          "File Provider domain \(mountId) exists but macOS has not created \(url.path). Click OK in the macOS \"Start Syncing\" prompt if it is still visible, then try again."
         )
       }
       return FileProviderCtlReport(

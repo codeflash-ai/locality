@@ -190,6 +190,34 @@ assert_app_group_entitlement() {
     || fail "${path} is missing ${HOST_APP_GROUP} entitlement"
 }
 
+assert_host_file_provider_entitlements() {
+  local path="$1"
+  local entitlements
+  entitlements="$(codesign -d --entitlements - "${path}" 2>/dev/null || true)"
+  [[ "${entitlements}" == *"com.apple.security.app-sandbox"* ]] \
+    || fail "${path} is missing com.apple.security.app-sandbox entitlement"
+  [[ "${entitlements}" == *"com.apple.security.application-groups"* ]] \
+    || fail "${path} is missing com.apple.security.application-groups entitlement"
+  [[ "${entitlements}" == *"${HOST_APP_GROUP}"* ]] \
+    || fail "${path} is missing ${HOST_APP_GROUP} entitlement"
+  [[ "${entitlements}" == *"com.apple.security.network.client"* ]] \
+    || fail "${path} is missing com.apple.security.network.client entitlement"
+  [[ "${entitlements}" == *"com.apple.security.network.server"* ]] \
+    || fail "${path} is missing com.apple.security.network.server entitlement"
+}
+
+assert_daemon_sidecar_entitlements() {
+  local path="$1"
+  local entitlements
+  entitlements="$(codesign -d --entitlements - "${path}" 2>/dev/null || true)"
+  [[ "${entitlements}" == *"com.apple.security.application-groups"* ]] \
+    || fail "${path} is missing com.apple.security.application-groups entitlement"
+  [[ "${entitlements}" == *"${HOST_APP_GROUP}"* ]] \
+    || fail "${path} is missing ${HOST_APP_GROUP} entitlement"
+  [[ "${entitlements}" == *"com.apple.security.network.server"* ]] \
+    || fail "${path} is missing com.apple.security.network.server entitlement"
+}
+
 plist_print() {
   "${PLISTBUDDY}" -c "Print :$2" "$1" 2>/dev/null
 }
@@ -341,9 +369,10 @@ verify_signed_app_in_dmg() (
       || fail "${PRODUCT_NAME}.app is not signed with a Developer ID Application identity"
     [[ "${appex_signature}" == *"Developer ID Application"* ]] \
       || fail "LocalityFileProvider.appex is not signed with a Developer ID Application identity"
-    assert_app_group_entitlement "${app}"
-    assert_app_group_entitlement "${app}/Contents/MacOS/loc"
-    assert_app_group_entitlement "${app}/Contents/MacOS/localityd"
+    assert_host_file_provider_entitlements "${app}"
+    assert_host_file_provider_entitlements "${app}/Contents/MacOS/locality-desktop"
+    assert_daemon_sidecar_entitlements "${app}/Contents/MacOS/loc"
+    assert_daemon_sidecar_entitlements "${app}/Contents/MacOS/localityd"
     assert_app_group_entitlement "${app}/Contents/MacOS/locality-file-providerctl"
   fi
   assert_file_provider_bundle_metadata "${app}"

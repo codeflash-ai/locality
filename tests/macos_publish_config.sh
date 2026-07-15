@@ -13,6 +13,8 @@ FILE_PROVIDER_BUILD_SCRIPT="${ROOT}/platform/macos/LocalityFileProvider/scripts/
 FILE_PROVIDER_BUILD_TEST="${ROOT}/platform/macos/LocalityFileProvider/scripts/build-dev-bundle.test.sh"
 FILE_PROVIDER_HOST_PLIST="${ROOT}/platform/macos/LocalityFileProvider/App/Locality.Info.plist"
 FILE_PROVIDER_EXTENSION_PLIST="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityFileProvider.Info.plist"
+DEVELOPER_ID_HOST_ENTITLEMENTS="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityDeveloperId.entitlements"
+DEVELOPER_ID_SIDECAR_ENTITLEMENTS="${ROOT}/platform/macos/LocalityFileProvider/App/LocalityDeveloperIdSidecar.entitlements"
 
 fail() {
   printf 'macos publish config test: %s\n' "$*" >&2
@@ -42,6 +44,18 @@ grep -q 'PUBLISH_SKIP_NOTARIZATION' "${PUBLISH_SCRIPT}" \
   || fail "publish-macos must read PUBLISH_SKIP_NOTARIZATION"
 grep -q 'notary_args' "${PUBLISH_SCRIPT}" \
   || fail "publish-macos must keep notarized publish support"
+grep -F -q 'LocalityDeveloperId.entitlements' "${PUBLISH_SCRIPT}" \
+  || fail "publish-macos must sign the Developer ID host app with the production File Provider entitlements"
+grep -F -q 'LocalityDeveloperIdSidecar.entitlements' "${ROOT}/apps/desktop/scripts/prepare-macos-file-provider.sh" \
+  || fail "macOS bundle preparation must keep terminal sidecars on their separate Developer ID entitlements"
+grep -F -q 'assert_host_file_provider_entitlements "${app}"' "${PUBLISH_SCRIPT}" \
+  || fail "publish-macos must validate the sandboxed File Provider host app entitlements"
+grep -F -q 'assert_host_file_provider_entitlements "${app}/Contents/MacOS/locality-desktop"' "${PUBLISH_SCRIPT}" \
+  || fail "publish-macos must validate the sandboxed File Provider host executable entitlements"
+grep -F -q 'assert_daemon_sidecar_entitlements "${app}/Contents/MacOS/loc"' "${PUBLISH_SCRIPT}" \
+  || fail "publish-macos must validate the loc CLI sidecar entitlements"
+grep -F -q 'assert_daemon_sidecar_entitlements "${app}/Contents/MacOS/localityd"' "${PUBLISH_SCRIPT}" \
+  || fail "publish-macos must validate the daemon sidecar entitlements"
 grep -q 'skipping notarization and stapling' "${PUBLISH_SCRIPT}" \
   || fail "publish-macos must skip notarization and stapling in unnotarized mode"
 grep -q 'dmg_status="unnotarized"' "${PUBLISH_SCRIPT}" \
@@ -58,6 +72,26 @@ grep -F -q 'DMG Finder layout did not create metadata' "${ROOT}/apps/desktop/scr
   || fail "DMG postprocess must fail when Finder does not create layout metadata"
 grep -F -q 'strings "${MOUNTPOINT}/.DS_Store" | grep -F -q "${DMG_BACKGROUND_NAME}"' "${ROOT}/apps/desktop/scripts/postprocess-dmg-volume-icon.sh" \
   || fail "DMG postprocess must verify the instructional background metadata is present"
+
+grep -q '<key>com.apple.security.app-sandbox</key>' "${DEVELOPER_ID_HOST_ENTITLEMENTS}" \
+  || fail "Developer ID host app entitlements must enable App Sandbox for File Provider registration"
+grep -q '<key>com.apple.security.application-groups</key>' "${DEVELOPER_ID_HOST_ENTITLEMENTS}" \
+  || fail "Developer ID host app entitlements must include the File Provider app group"
+grep -q '<string>C484HB7Q6S.group.ai.codeflash.locality</string>' "${DEVELOPER_ID_HOST_ENTITLEMENTS}" \
+  || fail "Developer ID host app entitlements must include the production File Provider app group"
+grep -q '<key>com.apple.security.network.client</key>' "${DEVELOPER_ID_HOST_ENTITLEMENTS}" \
+  || fail "Developer ID host app entitlements must preserve outbound network access"
+grep -q '<key>com.apple.security.network.server</key>' "${DEVELOPER_ID_HOST_ENTITLEMENTS}" \
+  || fail "Developer ID host app entitlements must allow the bundled daemon listener"
+grep -q '<key>com.apple.security.application-groups</key>' "${DEVELOPER_ID_SIDECAR_ENTITLEMENTS}" \
+  || fail "Developer ID sidecar entitlements must keep the File Provider app group"
+grep -q '<string>C484HB7Q6S.group.ai.codeflash.locality</string>' "${DEVELOPER_ID_SIDECAR_ENTITLEMENTS}" \
+  || fail "Developer ID sidecar entitlements must include the production File Provider app group"
+grep -q '<key>com.apple.security.network.server</key>' "${DEVELOPER_ID_SIDECAR_ENTITLEMENTS}" \
+  || fail "Developer ID daemon sidecar entitlements must allow the desktop-launched listener"
+if grep -q '<key>com.apple.security.app-sandbox</key>' "${DEVELOPER_ID_SIDECAR_ENTITLEMENTS}"; then
+  fail "Developer ID sidecar entitlements must not sandbox terminal binaries"
+fi
 
 [[ -f "${DMG_BACKGROUND}" ]] \
   || fail "DMG installer background asset is missing"

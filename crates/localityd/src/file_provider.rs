@@ -42,7 +42,7 @@ pub use crate::virtual_fs::{
 };
 
 pub const MACOS_FILE_PROVIDER_DOMAIN_ID: &str = "loc";
-pub const MACOS_FILE_PROVIDER_DISPLAY_NAME: &str = "";
+pub const MACOS_FILE_PROVIDER_DISPLAY_NAME: &str = "Locality";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileProviderReadReport {
@@ -1608,6 +1608,11 @@ mod tests {
             macos_file_provider_item_identifier("notion-main", "mount:notion-main"),
             "m:bm90aW9uLW1haW4:bW91bnQ6bm90aW9uLW1haW4"
         );
+    }
+
+    #[test]
+    fn macos_file_provider_domain_display_name_is_user_visible() {
+        assert_eq!(MACOS_FILE_PROVIDER_DISPLAY_NAME, "Locality");
     }
 
     #[test]
