@@ -116,8 +116,9 @@ export LOCALITY_GRANOLA_LIVE_NOTE_ID=not_...
 `LOCALITY_GRANOLA_LIVE_NOTE_ID` should identify a stable, generic meeting with a
 retained transcript. The suite uses only its opaque ID; its title and content
 are not placed in repository or workflow configuration. If transcript retention
-removes that fixture or the note is deleted, the test falls back to another
-accessible retained transcript without logging its identity or content.
+removes that fixture or the note is deleted, the mounted test fails with a safe
+fixture-status message; update the encrypted note-ID secret to another generic
+meeting after verifying it with the public-API test.
 
 Run the public API check on any platform:
 

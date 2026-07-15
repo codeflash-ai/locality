@@ -28,6 +28,14 @@ if [[ -z "$granola_api_key" ]]; then
   echo "missing GRANOLA_API_KEY" >&2
   exit 1
 fi
+if [[ -z "$live_note_id" ]]; then
+  echo "missing LOCALITY_GRANOLA_LIVE_NOTE_ID" >&2
+  exit 1
+fi
+if [[ ! "$live_note_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "LOCALITY_GRANOLA_LIVE_NOTE_ID has an invalid shape" >&2
+  exit 1
+fi
 
 loc_bin="${LOCALITY_BIN:-./target/debug/loc}"
 localityd_bin="${LOCALITYD_BIN:-./target/debug/localityd}"
@@ -155,7 +163,19 @@ PY
 }
 
 state_query() {
-  sqlite3 -cmd '.timeout 10000' "$state_root/state.sqlite3" "$1"
+  sqlite3 -cmd '.timeout 10000' "$state_root/state.sqlite3" "$1" 2>>"$command_log"
+}
+
+copy_mounted_file() {
+  local source="$1"
+  local destination="$2"
+  for _ in {1..20}; do
+    if cp "$source" "$destination" >/dev/null 2>>"$command_log"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
 }
 
 validate_mounted_documents() {
@@ -249,7 +269,7 @@ wait_for_fuse
 step="enumerating live Granola meetings through the mounted filesystem"
 meeting_count="0"
 for _ in {1..120}; do
-  if listing_dots="$(find "$granola_mount" -mindepth 1 -maxdepth 1 -type d -printf '.' \
+  if listing_dots="$(find "$granola_mount" -mindepth 1 -maxdepth 1 -printf '.' \
     2>>"$command_log")"; then
     meeting_count="${#listing_dots}"
   else
@@ -265,8 +285,16 @@ if [[ ! "$meeting_count" =~ ^[0-9]+$ ]] || (( meeting_count < 1 )); then
   echo "live Granola enumeration produced no meeting directories" >&2
   exit 1
 fi
-checkpoint_count="$(state_query \
-  "SELECT count(*) FROM connector_state WHERE connector = 'granola' AND scope_kind = 'mount' AND scope_id = '$mount_id';")"
+checkpoint_count="0"
+for _ in {1..120}; do
+  checkpoint_count="$(state_query \
+    "SELECT count(*) FROM connector_state WHERE connector = 'granola' AND scope_kind = 'mount' AND scope_id = '$mount_id';" \
+    || printf '0')"
+  if [[ "$checkpoint_count" == "1" ]]; then
+    break
+  fi
+  sleep 0.25
+done
 if [[ "$checkpoint_count" != "1" ]]; then
   echo "mounted Granola discovery did not record its incremental checkpoint" >&2
   exit 1
@@ -280,48 +308,31 @@ entity_count_before="$(state_query \
   "SELECT count(*) FROM entities WHERE mount_id = '$mount_id';")"
 
 step="hydrating one retained transcript through the mounted filesystem"
-selected_meeting=""
-if [[ -n "$live_note_id" ]]; then
-  if [[ ! "$live_note_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    echo "LOCALITY_GRANOLA_LIVE_NOTE_ID has an invalid shape" >&2
-    exit 1
-  fi
-  selected_relative_path="$(state_query \
-    "SELECT path FROM entities WHERE mount_id = '$mount_id' AND remote_id = '$live_note_id' AND kind_json = '\"directory\"' LIMIT 1;")"
-  if [[ -n "$selected_relative_path" ]]; then
-    if [[ "$selected_relative_path" == "." || "$selected_relative_path" == ".." || "$selected_relative_path" == */* ]]; then
-      echo "configured Granola fixture resolved outside a single meeting directory" >&2
-      exit 1
-    fi
-    preferred_meeting="$granola_mount/$selected_relative_path"
-    if cp "$preferred_meeting/transcript.md" "$transcript_copy" >/dev/null 2>&1 \
-      && grep -Eq '^\*\*(Me|Them)( | ·)' "$transcript_copy" \
-      && cp "$preferred_meeting/summary.md" "$summary_copy" >/dev/null 2>&1 \
-      && ! grep -Fxq '_No summary is available._' "$summary_copy"; then
-      selected_meeting="$preferred_meeting"
-    fi
-  fi
+selected_relative_path="$(state_query \
+  "SELECT path FROM entities WHERE mount_id = '$mount_id' AND remote_id = '$live_note_id' AND kind_json = '\"directory\"' LIMIT 1;")"
+if [[ -z "$selected_relative_path" ]]; then
+  echo "configured Granola live fixture was not returned by enumeration" >&2
+  exit 1
 fi
-if [[ -z "$selected_meeting" ]]; then
-  checked=0
-  while IFS= read -r -d '' candidate; do
-    ((checked += 1))
-    if (( checked > 20 )); then
-      break
-    fi
-    if ! cp "$candidate/transcript.md" "$transcript_copy" >/dev/null 2>&1; then
-      continue
-    fi
-    if grep -Eq '^\*\*(Me|Them)( | ·)' "$transcript_copy" \
-      && cp "$candidate/summary.md" "$summary_copy" >/dev/null 2>&1 \
-      && ! grep -Fxq '_No summary is available._' "$summary_copy"; then
-      selected_meeting="$candidate"
-      break
-    fi
-  done < <(find "$granola_mount" -mindepth 1 -maxdepth 1 -type d -print0)
+if [[ "$selected_relative_path" == "." || "$selected_relative_path" == ".." || "$selected_relative_path" == */* ]]; then
+  echo "configured Granola fixture resolved outside a single meeting directory" >&2
+  exit 1
 fi
-if [[ -z "$selected_meeting" ]]; then
-  echo "configured fixture and the first 20 mounted Granola meetings had no retained transcript" >&2
+selected_meeting="$granola_mount/$selected_relative_path"
+if ! copy_mounted_file "$selected_meeting/transcript.md" "$transcript_copy"; then
+  echo "configured Granola transcript could not be read through FUSE" >&2
+  exit 1
+fi
+if ! grep -Eq '^\*\*(Me|Them)( | ·)' "$transcript_copy"; then
+  echo "configured Granola fixture did not contain canonical transcript turns" >&2
+  exit 1
+fi
+if ! copy_mounted_file "$selected_meeting/summary.md" "$summary_copy"; then
+  echo "configured Granola summary could not be read through FUSE" >&2
+  exit 1
+fi
+if grep -Fxq '_No summary is available._' "$summary_copy"; then
+  echo "configured Granola fixture did not contain a real summary" >&2
   exit 1
 fi
 
@@ -330,13 +341,9 @@ validate_mounted_documents
 
 step="reopening the materialized summary through the mounted filesystem"
 summary_reopened=0
-for _ in {1..20}; do
-  if cp "$selected_meeting/summary.md" "$summary_reopen_copy" >/dev/null 2>&1; then
-    summary_reopened=1
-    break
-  fi
-  sleep 0.25
-done
+if copy_mounted_file "$selected_meeting/summary.md" "$summary_reopen_copy"; then
+  summary_reopened=1
+fi
 if [[ "$summary_reopened" != "1" ]]; then
   echo "materialized Granola summary could not be reopened through FUSE" >&2
   exit 1

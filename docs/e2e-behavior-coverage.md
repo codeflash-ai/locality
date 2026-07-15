@@ -24,12 +24,12 @@ export GRANOLA_API_KEY=...
 export LOCALITY_GRANOLA_LIVE_NOTE_ID=not_...
 ```
 
-The note ID should refer to a stable meeting with a retained transcript. It is
-the preferred fixture; if retention removes its transcript or the note is
-deleted, the suite selects another retained transcript without logging its
-identity. The live suite is read-only, creates an isolated Locality state
-directory, and does not print or upload meeting names, filenames, summaries,
-transcripts, API payloads, daemon/provider logs, or credentials.
+The note ID must refer to a stable meeting with a retained transcript. If
+retention removes its transcript or the note is deleted, the mounted test fails
+with a safe fixture-status message instead of scanning or logging other meeting
+paths. The live suite is read-only, creates an isolated Locality state directory,
+and does not print or upload meeting names, filenames, summaries, transcripts,
+API payloads, daemon/provider logs, or credentials.
 
 Run the public API test on any platform:
 
