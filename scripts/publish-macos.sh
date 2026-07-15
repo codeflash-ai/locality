@@ -216,6 +216,8 @@ assert_daemon_sidecar_entitlements() {
     || fail "${path} is missing ${HOST_APP_GROUP} entitlement"
   [[ "${entitlements}" == *"com.apple.security.network.server"* ]] \
     || fail "${path} is missing com.apple.security.network.server entitlement"
+  [[ "${entitlements}" != *"com.apple.security.app-sandbox"* ]] \
+    || fail "${path} must not carry com.apple.security.app-sandbox entitlement"
 }
 
 plist_print() {
@@ -373,7 +375,7 @@ verify_signed_app_in_dmg() (
     assert_host_file_provider_entitlements "${app}/Contents/MacOS/locality-desktop"
     assert_daemon_sidecar_entitlements "${app}/Contents/MacOS/loc"
     assert_daemon_sidecar_entitlements "${app}/Contents/MacOS/localityd"
-    assert_app_group_entitlement "${app}/Contents/MacOS/locality-file-providerctl"
+    assert_daemon_sidecar_entitlements "${app}/Contents/MacOS/locality-file-providerctl"
   fi
   assert_file_provider_bundle_metadata "${app}"
   assert_no_file_provider_testing_mode "${app}"

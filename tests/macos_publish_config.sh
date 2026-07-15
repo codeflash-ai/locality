@@ -57,6 +57,10 @@ grep -F -q 'assert_daemon_sidecar_entitlements "${app}/Contents/MacOS/loc"' "${P
   || fail "publish-macos must validate the loc CLI sidecar entitlements"
 grep -F -q 'assert_daemon_sidecar_entitlements "${app}/Contents/MacOS/localityd"' "${PUBLISH_SCRIPT}" \
   || fail "publish-macos must validate the daemon sidecar entitlements"
+grep -F -q 'assert_daemon_sidecar_entitlements "${app}/Contents/MacOS/locality-file-providerctl"' "${PUBLISH_SCRIPT}" \
+  || fail "publish-macos must validate the File Provider helper sidecar entitlements"
+grep -F -q 'codesign --force --sign "${APPLE_SIGNING_IDENTITY}" --options runtime --entitlements "${SIDECAR_ENTITLEMENTS}" "${OUT}/locality-file-providerctl"' "${ROOT}/apps/desktop/scripts/prepare-macos-file-provider.sh" \
+  || fail "macOS bundle preparation must sign the File Provider helper with sidecar entitlements"
 grep -q 'skipping notarization and stapling' "${PUBLISH_SCRIPT}" \
   || fail "publish-macos must skip notarization and stapling in unnotarized mode"
 grep -q 'dmg_status="unnotarized"' "${PUBLISH_SCRIPT}" \

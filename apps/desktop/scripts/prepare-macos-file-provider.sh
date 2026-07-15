@@ -22,6 +22,7 @@ cp "${APP}/Contents/MacOS/locality-file-providerctl" "${OUT}/locality-file-provi
 cp "${ROOT}/target/release/localityd" "${LOCALITYD_OUT}"
 cp "${ROOT}/target/release/loc" "${LOCALITY_OUT}"
 if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+  codesign --force --sign "${APPLE_SIGNING_IDENTITY}" --options runtime --entitlements "${SIDECAR_ENTITLEMENTS}" "${OUT}/locality-file-providerctl"
   codesign --force --sign "${APPLE_SIGNING_IDENTITY}" --options runtime \
     --entitlements "${SIDECAR_ENTITLEMENTS}" \
     "${LOCALITYD_OUT}"
