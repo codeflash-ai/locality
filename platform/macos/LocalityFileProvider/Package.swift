@@ -24,12 +24,20 @@ let package = Package(
         ),
         .executableTarget(
             name: "LocalityFileProviderCtl",
-            path: "Sources/LocalityFileProviderCtl"
+            path: "Sources/LocalityFileProviderCtl",
+            swiftSettings: [
+                .unsafeFlags(["-parse-as-library"]),
+            ]
         ),
         .testTarget(
             name: "LocalityFileProviderTests",
             dependencies: ["LocalityFileProvider"],
             path: "Tests/LocalityFileProviderTests"
+        ),
+        .testTarget(
+            name: "LocalityFileProviderCtlTests",
+            dependencies: ["LocalityFileProviderCtl"],
+            path: "Tests/LocalityFileProviderCtlTests"
         ),
     ]
 )

@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
+use std::future::Future;
 use std::io;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -382,7 +383,6 @@ impl WorkspaceMountOnboardingPrimaryAction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceMountOnboardingLaunchStrategy {
-    OpenFinder,
     InstructionsOnly,
     None,
 }
@@ -390,7 +390,6 @@ enum WorkspaceMountOnboardingLaunchStrategy {
 impl WorkspaceMountOnboardingLaunchStrategy {
     fn as_str(self) -> &'static str {
         match self {
-            Self::OpenFinder => "open_finder",
             Self::InstructionsOnly => "instructions_only",
             Self::None => "none",
         }
@@ -427,6 +426,19 @@ enum WorkspaceMountOnboardingAction {
     Start,
     AllowInMacos,
     CheckAgain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacosFileProviderActivation {
+    NotRequested,
+    Enabled,
+    ApprovalRequired,
+}
+
+enum DesktopMountCreationOutcome {
+    Created(String),
+    ApprovalRequired,
+    Failed(String),
 }
 
 impl WorkspaceMountOnboardingAction {
@@ -1296,18 +1308,18 @@ async fn run_workspace_mount_onboarding(
     app: AppHandle,
     request: WorkspaceMountOnboardingRequest,
 ) -> WorkspaceMountOnboardingReport {
-    let report = tauri::async_runtime::spawn_blocking(move || {
-        run_workspace_mount_onboarding_blocking(request)
-    })
-    .await
-    .unwrap_or_else(|error| {
-        workspace_mount_onboarding_report(
-            MacosWorkspaceMountOnboardingState::Failed,
-            format!("Mount onboarding worker failed: {error}"),
-            WorkspaceMountOnboardingPrimaryAction::RetrySetup,
-            WorkspaceMountOnboardingLaunchStrategy::None,
-        )
-    });
+    let activation_app = app.clone();
+    let report = run_workspace_mount_onboarding_with(
+        request,
+        move |action| activate_macos_file_provider_for_user_action(activation_app, action),
+        |request| async move {
+            tauri::async_runtime::spawn_blocking(move || create_desktop_mount_blocking(request))
+                .await
+                .map_err(|error| format!("Mount onboarding worker failed: {error}"))
+                .and_then(|result| result)
+        },
+    )
+    .await;
     if workspace_mount_onboarding_should_refresh_surfaces(&report) {
         refresh_desktop_surfaces(&app);
     }
@@ -1318,24 +1330,76 @@ async fn create_desktop_mount_command(
     app: AppHandle,
     request: CreateDesktopMountRequest,
 ) -> ActionReport {
-    let report =
-        match tauri::async_runtime::spawn_blocking(move || create_desktop_mount_blocking(request))
-            .await
-            .map_err(|error| format!("Mount worker failed: {error}"))
-            .and_then(|result| result)
-        {
-            Ok(message) => ActionReport { ok: true, message },
-            Err(message) => ActionReport { ok: false, message },
-        };
+    let activation_app = app.clone();
+    let report = create_desktop_mount_command_with(
+        request,
+        move |action| activate_macos_file_provider_for_user_action(activation_app, action),
+        |request| async move {
+            tauri::async_runtime::spawn_blocking(move || create_desktop_mount_blocking(request))
+                .await
+                .map_err(|error| format!("Mount worker failed: {error}"))
+                .and_then(|result| result)
+        },
+    )
+    .await;
     if report.ok {
         refresh_desktop_surfaces(&app);
     }
     report
 }
 
-fn run_workspace_mount_onboarding_blocking(
+async fn create_desktop_mount_with_activation<
+    Activate,
+    ActivationFuture,
+    CreateMount,
+    MountFuture,
+>(
+    action: WorkspaceMountOnboardingAction,
+    request: CreateDesktopMountRequest,
+    activate: Activate,
+    create_mount: CreateMount,
+) -> DesktopMountCreationOutcome
+where
+    Activate: FnOnce(WorkspaceMountOnboardingAction) -> ActivationFuture,
+    ActivationFuture: Future<Output = Result<MacosFileProviderActivation, String>>,
+    CreateMount: FnOnce(CreateDesktopMountRequest) -> MountFuture,
+    MountFuture: Future<Output = Result<String, String>>,
+{
+    let activation = if matches!(
+        action,
+        WorkspaceMountOnboardingAction::Start | WorkspaceMountOnboardingAction::AllowInMacos
+    ) {
+        activate(action).await
+    } else {
+        Ok(MacosFileProviderActivation::NotRequested)
+    };
+
+    match activation {
+        Err(message) => return DesktopMountCreationOutcome::Failed(message),
+        Ok(MacosFileProviderActivation::ApprovalRequired) => {
+            return DesktopMountCreationOutcome::ApprovalRequired;
+        }
+        Ok(MacosFileProviderActivation::NotRequested)
+        | Ok(MacosFileProviderActivation::Enabled) => {}
+    }
+
+    match create_mount(request).await {
+        Ok(message) => DesktopMountCreationOutcome::Created(message),
+        Err(message) => DesktopMountCreationOutcome::Failed(message),
+    }
+}
+
+async fn run_workspace_mount_onboarding_with<Activate, ActivationFuture, CreateMount, MountFuture>(
     request: WorkspaceMountOnboardingRequest,
-) -> WorkspaceMountOnboardingReport {
+    activate: Activate,
+    create_mount: CreateMount,
+) -> WorkspaceMountOnboardingReport
+where
+    Activate: FnOnce(WorkspaceMountOnboardingAction) -> ActivationFuture,
+    ActivationFuture: Future<Output = Result<MacosFileProviderActivation, String>>,
+    CreateMount: FnOnce(CreateDesktopMountRequest) -> MountFuture,
+    MountFuture: Future<Output = Result<String, String>>,
+{
     let action = match WorkspaceMountOnboardingAction::parse(request.action.trim()) {
         Ok(action) => action,
         Err(message) => {
@@ -1348,32 +1412,7 @@ fn run_workspace_mount_onboarding_blocking(
         }
     };
 
-    if matches!(action, WorkspaceMountOnboardingAction::AllowInMacos) {
-        #[cfg(target_os = "macos")]
-        {
-            let launch_strategy = launch_macos_file_provider_approval_surface();
-            return workspace_mount_onboarding_report(
-                MacosWorkspaceMountOnboardingState::ApprovalRequired,
-                workspace_mount_onboarding_curated_message(
-                    MacosWorkspaceMountOnboardingState::ApprovalRequired,
-                )
-                .expect("approval_required message"),
-                WorkspaceMountOnboardingPrimaryAction::CheckAgain,
-                launch_strategy,
-            );
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            return workspace_mount_onboarding_report(
-                MacosWorkspaceMountOnboardingState::Failed,
-                "macOS File Provider approval is only available on macOS.",
-                WorkspaceMountOnboardingPrimaryAction::RetrySetup,
-                WorkspaceMountOnboardingLaunchStrategy::None,
-            );
-        }
-    }
-
-    match create_desktop_mount_blocking(CreateDesktopMountRequest {
+    let mount_request = CreateDesktopMountRequest {
         connector: "notion".to_string(),
         path: request.path,
         mount_id: "notion-main".to_string(),
@@ -1381,14 +1420,109 @@ fn run_workspace_mount_onboarding_blocking(
         read_only: false,
         notion_root_page: None,
         google_docs_workspace_folder: None,
-    }) {
-        Ok(message) => workspace_mount_onboarding_report(
+    };
+
+    match create_desktop_mount_with_activation(action, mount_request, activate, create_mount).await
+    {
+        DesktopMountCreationOutcome::Created(message) => workspace_mount_onboarding_report(
             MacosWorkspaceMountOnboardingState::Created,
             message,
             WorkspaceMountOnboardingPrimaryAction::RetrySetup,
             WorkspaceMountOnboardingLaunchStrategy::None,
         ),
-        Err(message) => classify_workspace_mount_onboarding_failure(&message),
+        DesktopMountCreationOutcome::ApprovalRequired => workspace_mount_onboarding_report(
+            MacosWorkspaceMountOnboardingState::ApprovalRequired,
+            workspace_mount_onboarding_curated_message(
+                MacosWorkspaceMountOnboardingState::ApprovalRequired,
+            )
+            .expect("approval_required message"),
+            WorkspaceMountOnboardingPrimaryAction::AllowInMacos,
+            WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly,
+        ),
+        DesktopMountCreationOutcome::Failed(message) => {
+            classify_workspace_mount_onboarding_failure(&message)
+        }
+    }
+}
+
+async fn create_desktop_mount_command_with<Activate, ActivationFuture, CreateMount, MountFuture>(
+    request: CreateDesktopMountRequest,
+    activate: Activate,
+    create_mount: CreateMount,
+) -> ActionReport
+where
+    Activate: FnOnce(WorkspaceMountOnboardingAction) -> ActivationFuture,
+    ActivationFuture: Future<Output = Result<MacosFileProviderActivation, String>>,
+    CreateMount: FnOnce(CreateDesktopMountRequest) -> MountFuture,
+    MountFuture: Future<Output = Result<String, String>>,
+{
+    match create_desktop_mount_with_activation(
+        WorkspaceMountOnboardingAction::Start,
+        request,
+        activate,
+        create_mount,
+    )
+    .await
+    {
+        DesktopMountCreationOutcome::Created(message) => ActionReport { ok: true, message },
+        DesktopMountCreationOutcome::ApprovalRequired => ActionReport {
+            ok: false,
+            message: workspace_mount_onboarding_curated_message(
+                MacosWorkspaceMountOnboardingState::ApprovalRequired,
+            )
+            .expect("approval_required message")
+            .to_string(),
+        },
+        DesktopMountCreationOutcome::Failed(message) => ActionReport { ok: false, message },
+    }
+}
+
+async fn activate_macos_file_provider_for_user_action(
+    app: AppHandle,
+    action: WorkspaceMountOnboardingAction,
+) -> Result<MacosFileProviderActivation, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if matches!(action, WorkspaceMountOnboardingAction::CheckAgain) {
+            return Ok(MacosFileProviderActivation::NotRequested);
+        }
+
+        let activation = tauri::async_runtime::spawn_blocking(move || {
+            macos_file_provider::register_domain_and_wait(
+                &app,
+                localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+                localityd::file_provider::MACOS_FILE_PROVIDER_DISPLAY_NAME,
+            )
+        })
+        .await
+        .map_err(|error| format!("File Provider activation worker failed: {error}"))??;
+
+        Ok(match activation {
+            macos_file_provider::DomainActivation::Enabled => MacosFileProviderActivation::Enabled,
+            macos_file_provider::DomainActivation::ApprovalRequired => {
+                MacosFileProviderActivation::ApprovalRequired
+            }
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        non_macos_file_provider_activation(action)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn non_macos_file_provider_activation(
+    action: WorkspaceMountOnboardingAction,
+) -> Result<MacosFileProviderActivation, String> {
+    match action {
+        WorkspaceMountOnboardingAction::AllowInMacos => {
+            Err("macOS File Provider approval is only available on macOS.".to_string())
+        }
+        WorkspaceMountOnboardingAction::Start | WorkspaceMountOnboardingAction::CheckAgain => {
+            Ok(MacosFileProviderActivation::NotRequested)
+        }
     }
 }
 
@@ -9353,9 +9487,9 @@ fn workspace_mount_onboarding_curated_message(
     state: MacosWorkspaceMountOnboardingState,
 ) -> Option<&'static str> {
     match state {
-        MacosWorkspaceMountOnboardingState::ApprovalRequired => {
-            Some("Enable Locality in Finder, then return here and click Check again.")
-        }
+        MacosWorkspaceMountOnboardingState::ApprovalRequired => Some(
+            "Approve Locality in the macOS File Provider prompt. If the prompt was dismissed, use Allow in macOS to try again.",
+        ),
         MacosWorkspaceMountOnboardingState::WaitingForCloudStorageRoot => {
             Some("Locality is still waiting for the CloudStorage folder to appear.")
         }
@@ -9449,33 +9583,6 @@ fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
 #[cfg(not(target_os = "macos"))]
 fn macos_workspace_mount_domain_user_enabled() -> Result<bool, String> {
     Ok(false)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_file_provider_approval_surface_path(candidates: &[PathBuf]) -> Option<PathBuf> {
-    candidates.iter().find(|path| path.exists()).cloned()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn macos_file_provider_approval_surface_path(_candidates: &[PathBuf]) -> Option<PathBuf> {
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn launch_macos_file_provider_approval_surface() -> WorkspaceMountOnboardingLaunchStrategy {
-    if let Some(path) =
-        macos_file_provider_approval_surface_path(&macos_file_provider_cloud_storage_roots())
-    {
-        if open_in_file_manager(&path).is_ok() {
-            return WorkspaceMountOnboardingLaunchStrategy::OpenFinder;
-        }
-    }
-    WorkspaceMountOnboardingLaunchStrategy::InstructionsOnly
-}
-
-#[cfg(not(target_os = "macos"))]
-fn launch_macos_file_provider_approval_surface() -> WorkspaceMountOnboardingLaunchStrategy {
-    WorkspaceMountOnboardingLaunchStrategy::None
 }
 
 fn connection_metadata_key(
@@ -12637,6 +12744,248 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_registers_before_creating_the_mount() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "/tmp/locality".to_string(),
+                action: "start".to_string(),
+            },
+            |action| {
+                assert_eq!(action, super::WorkspaceMountOnboardingAction::Start);
+                events.borrow_mut().push("activate");
+                std::future::ready(Ok(super::MacosFileProviderActivation::Enabled))
+            },
+            |_| {
+                events.borrow_mut().push("mount");
+                std::future::ready(Ok("mount created".to_string()))
+            },
+        ));
+
+        assert_eq!(events.into_inner(), vec!["activate", "mount"]);
+        assert_eq!(report.state, "created");
+        assert_eq!(report.message, "mount created");
+    }
+
+    #[test]
+    fn onboarding_does_not_create_mount_while_native_approval_is_pending() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "/tmp/locality".to_string(),
+                action: "start".to_string(),
+            },
+            |_| {
+                events.borrow_mut().push("activate");
+                std::future::ready(Ok(super::MacosFileProviderActivation::ApprovalRequired))
+            },
+            |_| {
+                events.borrow_mut().push("mount");
+                std::future::ready(Ok("mount created".to_string()))
+            },
+        ));
+
+        assert_eq!(events.into_inner(), vec!["activate"]);
+        assert_eq!(report.state, "approval_required");
+        assert_eq!(report.primary_action, "allow_in_macos");
+        assert_eq!(report.launch_strategy, "instructions_only");
+    }
+
+    #[test]
+    fn onboarding_reports_native_registration_failure_without_creating_mount() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "/tmp/locality".to_string(),
+                action: "start".to_string(),
+            },
+            |_| {
+                events.borrow_mut().push("activate");
+                std::future::ready(Err("main thread unavailable".to_string()))
+            },
+            |_| {
+                events.borrow_mut().push("mount");
+                std::future::ready(Ok("mount created".to_string()))
+            },
+        ));
+
+        assert_eq!(events.into_inner(), vec!["activate"]);
+        assert_eq!(report.state, "failed");
+        assert_eq!(report.message, "main thread unavailable");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn onboarding_check_again_queries_existing_domain_without_native_registration() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "/tmp/locality".to_string(),
+                action: "check_again".to_string(),
+            },
+            |_| {
+                events.borrow_mut().push("activate");
+                std::future::ready(Ok(super::MacosFileProviderActivation::Enabled))
+            },
+            |_| {
+                events.borrow_mut().push("mount");
+                std::future::ready(Err("registered but not enabled".to_string()))
+            },
+        ));
+
+        assert_eq!(events.into_inner(), vec!["mount"]);
+        assert_eq!(report.state, "approval_required");
+    }
+
+    #[test]
+    fn onboarding_allow_in_macos_retries_native_activation() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "/tmp/locality".to_string(),
+                action: "allow_in_macos".to_string(),
+            },
+            |action| {
+                assert_eq!(action, super::WorkspaceMountOnboardingAction::AllowInMacos);
+                events.borrow_mut().push("activate");
+                std::future::ready(Ok(super::MacosFileProviderActivation::ApprovalRequired))
+            },
+            |_| {
+                events.borrow_mut().push("mount");
+                std::future::ready(Ok("mount created".to_string()))
+            },
+        ));
+
+        assert_eq!(events.into_inner(), vec!["activate"]);
+        assert_eq!(report.state, "approval_required");
+        assert_eq!(report.primary_action, "allow_in_macos");
+    }
+
+    #[test]
+    fn onboarding_invalid_action_skips_activation_and_mount_creation() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(super::run_workspace_mount_onboarding_with(
+            super::WorkspaceMountOnboardingRequest {
+                path: "/tmp/locality".to_string(),
+                action: "unsupported".to_string(),
+            },
+            |_| {
+                events.borrow_mut().push("activate");
+                std::future::ready(Ok(super::MacosFileProviderActivation::Enabled))
+            },
+            |_| {
+                events.borrow_mut().push("mount");
+                std::future::ready(Ok("mount created".to_string()))
+            },
+        ));
+
+        assert!(events.into_inner().is_empty());
+        assert_eq!(report.state, "failed");
+        assert_eq!(report.primary_action, "retry_setup");
+        assert_eq!(
+            report.message,
+            "Unsupported onboarding mount action `unsupported`."
+        );
+    }
+
+    #[test]
+    fn source_manager_mount_uses_the_same_activation_gate() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(super::create_desktop_mount_command_with(
+            desktop_mount_request_for_orchestration_test(),
+            |action| {
+                assert_eq!(action, super::WorkspaceMountOnboardingAction::Start);
+                events.borrow_mut().push("activate");
+                std::future::ready(Ok(super::MacosFileProviderActivation::Enabled))
+            },
+            |_| {
+                events.borrow_mut().push("mount");
+                std::future::ready(Ok("mount created".to_string()))
+            },
+        ));
+
+        assert_eq!(events.into_inner(), vec!["activate", "mount"]);
+        assert!(report.ok);
+        assert_eq!(report.message, "mount created");
+    }
+
+    #[test]
+    fn source_manager_mount_waits_for_native_approval_without_creating_mount() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(super::create_desktop_mount_command_with(
+            desktop_mount_request_for_orchestration_test(),
+            |_| {
+                events.borrow_mut().push("activate");
+                std::future::ready(Ok(super::MacosFileProviderActivation::ApprovalRequired))
+            },
+            |_| {
+                events.borrow_mut().push("mount");
+                std::future::ready(Ok("mount created".to_string()))
+            },
+        ));
+
+        assert_eq!(events.into_inner(), vec!["activate"]);
+        assert!(!report.ok);
+        assert_eq!(
+            report.message,
+            "Approve Locality in the macOS File Provider prompt. If the prompt was dismissed, use Allow in macOS to try again."
+        );
+    }
+
+    #[test]
+    fn source_manager_mount_preserves_native_activation_error_without_creating_mount() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = tauri::async_runtime::block_on(super::create_desktop_mount_command_with(
+            desktop_mount_request_for_orchestration_test(),
+            |_| {
+                events.borrow_mut().push("activate");
+                std::future::ready(Err("native registration failed".to_string()))
+            },
+            |_| {
+                events.borrow_mut().push("mount");
+                std::future::ready(Ok("mount created".to_string()))
+            },
+        ));
+
+        assert_eq!(events.into_inner(), vec!["activate"]);
+        assert!(!report.ok);
+        assert_eq!(report.message, "native registration failed");
+    }
+
+    fn desktop_mount_request_for_orchestration_test() -> super::CreateDesktopMountRequest {
+        super::CreateDesktopMountRequest {
+            connector: "notion".to_string(),
+            path: "/tmp/locality".to_string(),
+            mount_id: "notion-main".to_string(),
+            connection_id: None,
+            read_only: false,
+            notion_root_page: None,
+            google_docs_workspace_folder: None,
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_file_provider_activation_covers_all_onboarding_actions() {
+        assert_eq!(
+            super::non_macos_file_provider_activation(super::WorkspaceMountOnboardingAction::Start),
+            Ok(super::MacosFileProviderActivation::NotRequested)
+        );
+        assert_eq!(
+            super::non_macos_file_provider_activation(
+                super::WorkspaceMountOnboardingAction::CheckAgain
+            ),
+            Ok(super::MacosFileProviderActivation::NotRequested)
+        );
+        assert_eq!(
+            super::non_macos_file_provider_activation(
+                super::WorkspaceMountOnboardingAction::AllowInMacos
+            ),
+            Err("macOS File Provider approval is only available on macOS.".to_string())
+        );
+    }
+
+    #[test]
     fn file_provider_unavailable_error_is_recoverable_after_access_change() {
         assert!(super::recoverable_macos_file_provider_activation_error(
             "Could not register macOS File Provider: The application cannot be used right now."
@@ -12657,25 +13006,6 @@ mod tests {
         assert!(super::recoverable_macos_file_provider_activation_error(
             "Could not open macOS File Provider domain `loc`: File Provider domain loc exists but macOS has not created /Users/test/Library/CloudStorage/Locality"
         ));
-    }
-
-    #[test]
-    fn macos_file_provider_approval_surface_path_uses_first_existing_candidate() {
-        let temp = TestTempDir::new("approval-surface");
-        let missing = temp.path().join("Library/CloudStorage/Locality");
-        let existing = temp.path().join("Library/CloudStorage/Locality-Locality");
-        fs::create_dir_all(&existing).expect("create fallback root");
-
-        let expected = if cfg!(target_os = "macos") {
-            Some(existing.clone())
-        } else {
-            None
-        };
-
-        assert_eq!(
-            super::macos_file_provider_approval_surface_path(&[missing, existing]),
-            expected
-        );
     }
 
     #[test]
@@ -12733,7 +13063,9 @@ mod tests {
             super::workspace_mount_onboarding_curated_message(
                 super::MacosWorkspaceMountOnboardingState::ApprovalRequired
             ),
-            Some("Enable Locality in Finder, then return here and click Check again.")
+            Some(
+                "Approve Locality in the macOS File Provider prompt. If the prompt was dismissed, use Allow in macOS to try again."
+            )
         );
         assert_eq!(
             super::workspace_mount_onboarding_curated_message(

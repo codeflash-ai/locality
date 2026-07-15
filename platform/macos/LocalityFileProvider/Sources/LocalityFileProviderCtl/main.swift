@@ -340,15 +340,13 @@ private func fileProviderDirectoryName(for displayName: String) -> String {
 
 private func shouldReplaceExistingDomain(_ domain: NSFileProviderDomain, displayName: String) -> Bool {
   let expectedName = fileProviderDirectoryName(for: displayName)
+  let state: UserVisibleDomainURLState
   do {
-    let url = try userVisibleDomainURLFromManager(for: domain)
-    guard let url else {
-      return false
-    }
-    return url.lastPathComponent != expectedName
+    state = .available(try userVisibleDomainURLFromManager(for: domain))
   } catch {
-    return true
+    state = .unavailable
   }
+  return domainNeedsReplacement(state, expectedDirectoryName: expectedName)
 }
 
 private func realHomeDirectoryURL() -> URL {
