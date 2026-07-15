@@ -21,3 +21,14 @@ import Testing
   let url = URL(fileURLWithPath: "/Users/test/Library/CloudStorage/Locality-Old")
   #expect(domainNeedsReplacement(.available(url), expectedDirectoryName: "Locality"))
 }
+
+@Test func displayNameMismatchDoesNotReplaceWhenVisibleURLMatchesExpectedRoot() {
+  let url = URL(fileURLWithPath: "/Users/test/Library/CloudStorage/Locality")
+
+  #expect(
+    !existingDomainNeedsReplacement(
+      displayName: "Old Locality",
+      requestedDisplayName: "Locality",
+      visibleURLState: .available(url)
+    ))
+}

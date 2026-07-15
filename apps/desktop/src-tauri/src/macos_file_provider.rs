@@ -93,9 +93,9 @@ where
 
         let remaining = poll_timeout - elapsed;
         if let Some(state) = query(remaining)? {
-            let (user_enabled, _disconnected, _hidden) =
+            let (user_enabled, disconnected, hidden) =
                 (state.user_enabled, state.disconnected, state.hidden);
-            if user_enabled {
+            if user_enabled && !disconnected && !hidden {
                 return Ok(DomainActivation::Enabled);
             }
         }
@@ -318,6 +318,50 @@ mod tests {
                     user_enabled: false,
                     disconnected: false,
                     hidden: false,
+                }))
+            },
+            |duration| clock.set(clock.get() + duration),
+            || clock.get(),
+        );
+
+        assert_eq!(result, Ok(DomainActivation::ApprovalRequired));
+    }
+
+    #[test]
+    fn disconnected_domain_reaches_approval_required_even_when_user_enabled() {
+        let clock = Cell::new(Duration::ZERO);
+        let result = register_domain_and_wait_with(
+            successful_add,
+            Duration::from_millis(10),
+            Duration::from_millis(2),
+            Duration::from_millis(1),
+            |_| {
+                Ok(Some(DomainState {
+                    user_enabled: true,
+                    disconnected: true,
+                    hidden: false,
+                }))
+            },
+            |duration| clock.set(clock.get() + duration),
+            || clock.get(),
+        );
+
+        assert_eq!(result, Ok(DomainActivation::ApprovalRequired));
+    }
+
+    #[test]
+    fn hidden_domain_reaches_approval_required_even_when_user_enabled() {
+        let clock = Cell::new(Duration::ZERO);
+        let result = register_domain_and_wait_with(
+            successful_add,
+            Duration::from_millis(10),
+            Duration::from_millis(2),
+            Duration::from_millis(1),
+            |_| {
+                Ok(Some(DomainState {
+                    user_enabled: true,
+                    disconnected: false,
+                    hidden: true,
                 }))
             },
             |duration| clock.set(clock.get() + duration),

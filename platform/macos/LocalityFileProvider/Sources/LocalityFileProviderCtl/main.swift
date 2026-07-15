@@ -82,7 +82,11 @@ private enum Command {
     case .register(let mountId, let displayName):
       let identifier = NSFileProviderDomainIdentifier(mountId)
       if let existing = try getDomains().first(where: { $0.identifier == identifier }) {
-        if existing.displayName == displayName && !shouldReplaceExistingDomain(existing, displayName: displayName) {
+        if shouldReplaceExistingDomain(existing, displayName: displayName) {
+          try waitForVoid { completion in
+            NSFileProviderManager.remove(existing, completionHandler: completion)
+          }
+        } else {
           return FileProviderCtlReport(
             ok: true,
             action: "register",
@@ -91,10 +95,6 @@ private enum Command {
             url: nil,
             message: "already registered \(mountId)"
           )
-        } else {
-          try waitForVoid { completion in
-            NSFileProviderManager.remove(existing, completionHandler: completion)
-          }
         }
       }
 
@@ -328,25 +328,18 @@ private func userVisibleDomainURL(for domain: NSFileProviderDomain) throws -> UR
   return candidate
 }
 
-private func fileProviderDirectoryName(for displayName: String) -> String {
-  if displayName.isEmpty {
-    return "Locality"
-  }
-  if displayName == "Locality" || displayName.hasPrefix("Locality-") {
-    return displayName
-  }
-  return "Locality-\(displayName)"
-}
-
 private func shouldReplaceExistingDomain(_ domain: NSFileProviderDomain, displayName: String) -> Bool {
-  let expectedName = fileProviderDirectoryName(for: displayName)
   let state: UserVisibleDomainURLState
   do {
     state = .available(try userVisibleDomainURLFromManager(for: domain))
   } catch {
     state = .unavailable
   }
-  return domainNeedsReplacement(state, expectedDirectoryName: expectedName)
+  return existingDomainNeedsReplacement(
+    displayName: domain.displayName,
+    requestedDisplayName: displayName,
+    visibleURLState: state
+  )
 }
 
 private func realHomeDirectoryURL() -> URL {

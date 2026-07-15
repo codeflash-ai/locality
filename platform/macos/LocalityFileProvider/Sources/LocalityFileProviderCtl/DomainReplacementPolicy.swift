@@ -18,3 +18,24 @@ func domainNeedsReplacement(
     return url.lastPathComponent != expectedDirectoryName
   }
 }
+
+func existingDomainNeedsReplacement(
+  displayName _: String,
+  requestedDisplayName: String,
+  visibleURLState: UserVisibleDomainURLState
+) -> Bool {
+  domainNeedsReplacement(
+    visibleURLState,
+    expectedDirectoryName: fileProviderDirectoryName(for: requestedDisplayName)
+  )
+}
+
+func fileProviderDirectoryName(for displayName: String) -> String {
+  if displayName.isEmpty {
+    return "Locality"
+  }
+  if displayName == "Locality" || displayName.hasPrefix("Locality-") {
+    return displayName
+  }
+  return "Locality-\(displayName)"
+}
