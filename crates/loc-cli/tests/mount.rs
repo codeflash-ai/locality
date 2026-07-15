@@ -977,6 +977,7 @@ fn seed_cli_notion_connection(state_root: &Path, connection_id: &str, workspace_
 fn notion_capabilities_json() -> String {
     serde_json::to_string(&ConnectorCapabilities {
         supports_block_updates: true,
+        supports_entity_body_updates: false,
         supports_databases: true,
         supports_oauth: true,
         supports_remote_observation: true,

@@ -10,6 +10,7 @@ use locality_core::journal::PushId;
 use locality_core::model::{
     CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId, TreeEntry,
 };
+use locality_core::planner::PushOperationKind;
 use locality_core::undo::{UndoApplier, UndoApplyRequest, UndoOperation, UndoPlan, UndoPlanStatus};
 
 #[test]
@@ -62,6 +63,44 @@ fn connector_capabilities_are_serializable_stage10_flags() {
 
     assert!(json.contains("supports_remote_observation"));
     assert!(json.contains("supports_lazy_child_enumeration"));
+}
+
+#[test]
+fn connector_capabilities_default_entity_body_updates_for_old_json() {
+    let old_json = r#"{
+        "supports_block_updates": true,
+        "supports_databases": false,
+        "supports_oauth": false,
+        "supports_remote_observation": true,
+        "supports_lazy_child_enumeration": true,
+        "supports_media_download": false,
+        "supports_undo": true,
+        "supports_batch_observation": false
+    }"#;
+
+    let old: ConnectorCapabilities = serde_json::from_str(old_json).expect("old capabilities");
+    assert!(!old.supports_entity_body_updates);
+
+    let current = ConnectorCapabilities {
+        supports_entity_body_updates: true,
+        ..old
+    };
+    let decoded: ConnectorCapabilities = serde_json::from_str(
+        &serde_json::to_string(&current).expect("serialize current capabilities"),
+    )
+    .expect("current capabilities");
+    assert!(decoded.supports_entity_body_updates);
+}
+
+#[test]
+fn default_supported_operations_exclude_unadvertised_entity_body_updates() {
+    let connector = FakeConnector::default();
+
+    assert!(
+        !connector
+            .supported_push_operations()
+            .contains(&PushOperationKind::UpdateEntityBody)
+    );
 }
 
 #[derive(Debug, Default)]
@@ -145,6 +184,7 @@ impl Connector for FakeConnector {
             .push(request.plan.operations.len());
         Ok(ApplyUndoResult {
             changed_remote_ids: request.plan.affected_entities.clone(),
+            observations: Vec::new(),
         })
     }
 }

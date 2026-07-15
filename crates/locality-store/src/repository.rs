@@ -286,6 +286,7 @@ fn journal_touches_any_entity(journal: &JournalEntry, remote_ids: &[RemoteId]) -
 fn apply_effect_touches_any_entity(effect: &JournalApplyEffect, remote_ids: &[RemoteId]) -> bool {
     match effect {
         JournalApplyEffect::ArchivedEntity { entity_id, .. }
+        | JournalApplyEffect::UpdatedEntityBody { entity_id, .. }
         | JournalApplyEffect::UpdatedProperties { entity_id, .. }
         | JournalApplyEffect::MovedEntity { entity_id, .. }
         | JournalApplyEffect::CreatedEntity { entity_id, .. } => {

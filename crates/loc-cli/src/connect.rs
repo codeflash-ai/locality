@@ -1217,6 +1217,7 @@ fn granola_capabilities_json() -> Result<String, ConnectError> {
 fn notion_capabilities_json() -> Result<String, ConnectError> {
     let capabilities = ConnectorCapabilities {
         supports_block_updates: true,
+        supports_entity_body_updates: false,
         supports_databases: true,
         supports_oauth: true,
         supports_remote_observation: true,

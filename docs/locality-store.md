@@ -86,6 +86,10 @@ Shadow blocks, journal plans, journal preimages, and journal apply effects are J
   reset.
 - If a new writer produces state that older readers must not open, raise that
   component's `min_reader_version` so old binaries return `NeedsUpdate`.
+- `durable:journals` version 3 adds whole-entity body operations and complete
+  entity reverse payloads. Its v2-to-v3 migration updates component metadata
+  only, leaves `PRAGMA user_version` and existing journal JSON rows unchanged,
+  and raises the minimum reader version to 3.
 - Unknown required components block older binaries. Unknown non-required
   rebuildable components are ignored by older binaries.
 

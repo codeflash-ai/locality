@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use locality_core::LocalityError;
 use locality_core::model::{EntityKind, HydrationState, MountId, RemoteId};
 use locality_core::planner::{PropertyValue, PushOperation};
-use locality_core::push::PushPipelineAction;
+use locality_core::push::{BodyDiffMode, PushPipelineAction};
 use locality_core::shadow::{MarkdownBlockKind, ShadowDocument};
 use locality_core::validation::ValidationReport;
 use locality_notion::media::sha256_hex;
@@ -1470,14 +1470,53 @@ fn prepare_push_preserves_structured_missing_shadow_error() {
     );
 }
 
+#[test]
+fn prepare_push_uses_source_body_diff_mode_for_existing_entities() {
+    let fixture = PrepareFixture::new();
+    let mut store = fixture.store("fake");
+    store
+        .save_shadow(
+            &fixture.mount_id,
+            ShadowDocument::from_synced_body(
+                RemoteId::new("page-1"),
+                "Old description.",
+                8,
+                [RemoteId::new("paragraph-1")],
+            )
+            .expect("shadow"),
+        )
+        .expect("save shadow");
+    let path = fixture.write_page(
+        "Roadmap.md",
+        "First changed paragraph.\n\nSecond changed paragraph.",
+    );
+    let validator = RecordingValidator {
+        body_diff_mode: BodyDiffMode::WholeEntity,
+        ..RecordingValidator::default()
+    };
+
+    let prepared = prepare_push(&store, &job(path), None, &validator).expect("prepare push");
+
+    assert!(matches!(
+        prepared.pipeline.plan.expect("plan").operations.as_slice(),
+        [PushOperation::UpdateEntityBody { body, .. }]
+            if body == "First changed paragraph.\n\nSecond changed paragraph."
+    ));
+}
+
 #[derive(Default)]
 struct RecordingValidator {
+    body_diff_mode: BodyDiffMode,
     create_count: Cell<usize>,
     paths: RefCell<Vec<PathBuf>>,
     parents: RefCell<Vec<RemoteId>>,
 }
 
 impl SourcePushValidator for RecordingValidator {
+    fn body_diff_mode(&self) -> BodyDiffMode {
+        self.body_diff_mode
+    }
+
     fn validate_create_frontmatter(
         &self,
         context: SourceValidationContext<'_>,

@@ -319,6 +319,7 @@ pub struct PlanSummaryOutput {
     pub blocks_archived: usize,
     pub entities_created: usize,
     pub entities_archived: usize,
+    pub entity_bodies_updated: usize,
     pub entities_moved: usize,
     pub properties_updated: usize,
 }
@@ -334,6 +335,7 @@ impl From<PlanSummary> for PlanSummaryOutput {
             blocks_archived: value.blocks_archived,
             entities_created: value.entities_created,
             entities_archived: value.entities_archived,
+            entity_bodies_updated: value.entity_bodies_updated,
             entities_moved: value.entities_moved,
             properties_updated: value.properties_updated,
         }
@@ -370,6 +372,10 @@ pub enum PushOperationOutput {
     },
     ArchiveEntity {
         entity_id: String,
+    },
+    UpdateEntityBody {
+        entity_id: String,
+        body: String,
     },
     UpdateProperties {
         entity_id: String,
@@ -437,6 +443,10 @@ impl From<PushOperation> for PushOperationOutput {
             },
             PushOperation::ArchiveEntity { entity_id } => Self::ArchiveEntity {
                 entity_id: entity_id.0,
+            },
+            PushOperation::UpdateEntityBody { entity_id, body } => Self::UpdateEntityBody {
+                entity_id: entity_id.0,
+                body,
             },
             PushOperation::UpdateProperties {
                 entity_id,

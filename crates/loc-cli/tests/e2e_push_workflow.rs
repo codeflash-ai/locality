@@ -11381,7 +11381,7 @@ fn live_undo_database_row_create_archives_remote_row() {
     assert!(
         undo_plan.operations.iter().any(|operation| matches!(
             operation,
-            UndoOperationOutput::ArchiveCreatedEntity { entity_id }
+            UndoOperationOutput::ArchiveCreatedEntity { entity_id, .. }
                 if entity_id == &created_row_id
         )),
         "{undo:#?}"
@@ -15487,6 +15487,7 @@ fn seed_cli_live_connection(state_root: &Path, connection_id: &ConnectionId, sto
 fn notion_capabilities_json_for_live_test() -> String {
     serde_json::to_string(&ConnectorCapabilities {
         supports_block_updates: true,
+        supports_entity_body_updates: false,
         supports_databases: true,
         supports_oauth: true,
         supports_remote_observation: true,
@@ -17153,6 +17154,7 @@ impl Connector for BlockingGuardrailConnector {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             supports_block_updates: true,
+            supports_entity_body_updates: false,
             supports_databases: false,
             supports_oauth: false,
             supports_remote_observation: false,
@@ -17261,6 +17263,7 @@ impl Connector for PropertyOnlyConnector {
     fn capabilities(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             supports_block_updates: true,
+            supports_entity_body_updates: false,
             supports_databases: true,
             supports_oauth: false,
             supports_remote_observation: false,

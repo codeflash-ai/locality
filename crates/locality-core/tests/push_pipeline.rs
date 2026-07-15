@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 
 use locality_core::canonical::{ParsedCanonicalDocument, parse_canonical_markdown};
+use locality_core::journal::{JournalApplyEffect, PushId, PushOperationId};
 use locality_core::model::RemoteId;
 use locality_core::planner::{
-    GuardrailDecision, GuardrailPolicy, PlanDegradationKind, PropertyValue, PushOperation,
-    PushOperationKind,
+    GuardrailDecision, GuardrailPolicy, PlanDegradationKind, PlanSummary, PropertyValue,
+    PushOperation, PushOperationKind, PushPlan,
 };
 use locality_core::push::{
-    PushApproval, PushPipelineAction, PushPipelineRequest, PushStage, plan_push_pipeline,
+    BodyDiffMode, PushApproval, PushPipelineAction, PushPipelineRequest, PushStage,
+    plan_push_pipeline,
 };
 use locality_core::shadow::ShadowDocument;
 use serde_json::json;
@@ -270,6 +272,127 @@ fn frontmatter_property_edits_plan_property_update() {
 }
 
 #[test]
+fn whole_entity_body_mode_emits_one_body_update_and_keeps_property_updates() {
+    let parsed = parse_canonical_markdown(
+        "---\nloc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n\"Status\": \"Done\"\n---\nFirst changed paragraph.\n\nSecond changed paragraph.",
+    )
+    .expect("canonical document");
+    let shadow = ShadowDocument::from_synced_body(
+        RemoteId::new("page-1"),
+        "Old paragraph.",
+        9,
+        [RemoteId::new("paragraph-1")],
+    )
+    .expect("shadow")
+    .with_frontmatter(
+        "loc:\n  id: page-1\n  type: page\n  synced_at: now\n  remote_edited_at: now\ntitle: Roadmap\n\"Status\": \"Todo\"\n",
+    );
+
+    let output = plan_push_pipeline(
+        request(&parsed, &shadow).with_body_diff_mode(BodyDiffMode::WholeEntity),
+    );
+    let plan = output.plan.expect("plan");
+
+    assert_eq!(
+        plan.operations,
+        vec![
+            PushOperation::UpdateProperties {
+                entity_id: RemoteId::new("page-1"),
+                properties: [(
+                    "Status".to_string(),
+                    PropertyValue::String("Done".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            },
+            PushOperation::UpdateEntityBody {
+                entity_id: RemoteId::new("page-1"),
+                body: "First changed paragraph.\n\nSecond changed paragraph.".to_string(),
+            },
+        ]
+    );
+    assert_eq!(plan.summary.entity_bodies_updated, 1);
+    assert_eq!(plan.summary.blocks_created, 0);
+    assert_eq!(plan.summary.blocks_updated, 0);
+    assert_eq!(plan.summary.blocks_archived, 0);
+}
+
+#[test]
+fn whole_entity_body_mode_omits_body_operation_when_body_is_unchanged() {
+    let parsed = parsed_doc("Same body.");
+    let shadow = shadow("Same body.", ["paragraph-1"]);
+
+    let output = plan_push_pipeline(
+        request(&parsed, &shadow).with_body_diff_mode(BodyDiffMode::WholeEntity),
+    );
+
+    assert_eq!(output.action, PushPipelineAction::Noop);
+    assert_eq!(output.plan.expect("plan").operations, Vec::new());
+}
+
+#[test]
+fn whole_entity_body_erase_requires_destructive_confirmation() {
+    let parsed = parsed_doc("");
+    let shadow = shadow("Existing description.", ["paragraph-1"]);
+
+    let output = plan_push_pipeline(
+        request(&parsed, &shadow)
+            .with_body_diff_mode(BodyDiffMode::WholeEntity)
+            .with_approval(PushApproval {
+                assume_yes: true,
+                confirm_dangerous: false,
+            }),
+    );
+
+    assert_eq!(output.action, PushPipelineAction::ConfirmDangerousPlan);
+    assert_eq!(
+        output.guardrail,
+        GuardrailDecision::ConfirmRequired {
+            reasons: vec!["1 entity body would be cleared".to_string()],
+        }
+    );
+    assert!(matches!(
+        output.plan.expect("plan").operations.as_slice(),
+        [PushOperation::UpdateEntityBody { body, .. }] if body.is_empty()
+    ));
+}
+
+#[test]
+fn whole_entity_body_mode_treats_directive_looking_lines_as_opaque_markdown() {
+    let body = "Description text.\n\n::loc{id=literal type=not-closed\n\n::afs{missing-fields}";
+    let parsed = parsed_doc(body);
+    let shadow = shadow("Old description.", ["paragraph-1"]);
+
+    let output = plan_push_pipeline(
+        request(&parsed, &shadow).with_body_diff_mode(BodyDiffMode::WholeEntity),
+    );
+
+    assert!(output.validation.is_clean());
+    assert_eq!(
+        output.plan.expect("plan").operations,
+        vec![PushOperation::UpdateEntityBody {
+            entity_id: RemoteId::new("page-1"),
+            body: body.to_string(),
+        }]
+    );
+}
+
+#[test]
+fn push_pipeline_request_defaults_to_block_body_diff_mode() {
+    let parsed = parsed_doc("Changed body.");
+    let shadow = shadow("Old body.", ["paragraph-1"]);
+
+    let plan = plan_push_pipeline(request(&parsed, &shadow))
+        .plan
+        .expect("plan");
+
+    assert!(matches!(
+        plan.operations.as_slice(),
+        [PushOperation::UpdateBlock { .. }]
+    ));
+}
+
+#[test]
 fn legacy_property_update_operation_json_stays_readable() {
     let operation: PushOperation = serde_json::from_value(json!({
         "type": "update_properties",
@@ -319,6 +442,73 @@ fn move_entity_operation_json_and_summary_are_stable() {
     assert_eq!(PushOperationKind::MoveEntity.as_str(), "move_entity");
     assert_eq!(plan.summary.entities_moved, 1);
     assert_eq!(plan.summary.properties_updated, 0);
+}
+
+#[test]
+fn update_entity_body_durable_names_and_summary_are_stable() {
+    let operation = PushOperation::UpdateEntityBody {
+        entity_id: RemoteId::new("issue-1"),
+        body: "First.\n\nSecond.".to_string(),
+    };
+    let operation_json = serde_json::to_value(&operation).expect("serialize operation");
+
+    assert_eq!(
+        operation_json,
+        json!({
+            "type": "update_entity_body",
+            "entity_id": "issue-1",
+            "body": "First.\n\nSecond.",
+        })
+    );
+    assert_eq!(operation.kind(), PushOperationKind::UpdateEntityBody);
+    assert_eq!(
+        PushOperationKind::UpdateEntityBody.as_str(),
+        "update_entity_body"
+    );
+    assert_eq!(
+        PushOperationId::for_operation(&PushId("push-1".to_string()), 2, &operation).0,
+        "push-1:2:update_entity_body:issue-1"
+    );
+    assert_eq!(
+        PushPlan::new(vec![RemoteId::new("issue-1")], vec![operation])
+            .summary
+            .entity_bodies_updated,
+        1
+    );
+
+    let effect = JournalApplyEffect::UpdatedEntityBody {
+        operation_id: PushOperationId("push-1:2:update_entity_body:issue-1".to_string()),
+        operation_index: 2,
+        entity_id: RemoteId::new("issue-1"),
+    };
+    assert_eq!(
+        serde_json::to_value(effect).expect("serialize apply effect"),
+        json!({
+            "type": "updated_entity_body",
+            "operation_id": "push-1:2:update_entity_body:issue-1",
+            "operation_index": 2,
+            "entity_id": "issue-1",
+        })
+    );
+}
+
+#[test]
+fn legacy_plan_summary_defaults_entity_body_update_count() {
+    let summary: PlanSummary = serde_json::from_value(json!({
+        "blocks_created": 0,
+        "blocks_updated": 0,
+        "blocks_replaced": 0,
+        "blocks_moved": 0,
+        "media_updated": 0,
+        "blocks_archived": 0,
+        "entities_created": 0,
+        "entities_archived": 0,
+        "entities_moved": 0,
+        "properties_updated": 0,
+    }))
+    .expect("legacy summary");
+
+    assert_eq!(summary.entity_bodies_updated, 0);
 }
 
 fn request<'a>(

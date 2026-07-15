@@ -178,6 +178,21 @@ pub fn plan_block_diff(
     Ok(PushPlan::new(vec![shadow.entity_id.clone()], operations).with_degradations(degradations))
 }
 
+pub fn plan_whole_entity_diff(
+    shadow: &ShadowDocument,
+    edited: &CanonicalDocument,
+) -> LocalityResult<PushPlan> {
+    let mut operations = property_diff_operations(shadow, edited)?;
+    if !rendered_bodies_equivalent(&shadow.rendered_body, &edited.body) {
+        operations.push(PushOperation::UpdateEntityBody {
+            entity_id: shadow.entity_id.clone(),
+            body: edited.body.clone(),
+        });
+    }
+
+    Ok(PushPlan::new(vec![shadow.entity_id.clone()], operations))
+}
+
 fn property_diff_operations(
     shadow: &ShadowDocument,
     edited: &CanonicalDocument,

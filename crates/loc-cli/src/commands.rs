@@ -5163,8 +5163,9 @@ fn write_log_report<W: Write>(report: &LogReport, output: &mut W) -> io::Result<
         }
         writeln!(
             output,
-            "  summary: {} updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
+            "  summary: {} blocks updated, {} entity bodies updated, {} replaced, {} media updated, {} created, {} moved, {} archived",
             entry.plan_summary.blocks_updated,
+            entry.plan_summary.entity_bodies_updated,
             entry.plan_summary.blocks_replaced,
             entry.plan_summary.media_updated,
             entry.plan_summary.blocks_created,
@@ -6586,9 +6587,15 @@ fn write_diff_report_fields<W: Write>(
 
     writeln!(
         output,
-        "{} block{} updated, {} replaced, {} media updated, {} block{} created, {} entit{} created, {} moved, {} block{} archived, {} entit{} archived",
+        "{} block{} updated, {} entity bod{} updated, {} replaced, {} media updated, {} block{} created, {} entit{} created, {} moved, {} block{} archived, {} entit{} archived",
         plan.summary.blocks_updated,
         plural(plan.summary.blocks_updated),
+        plan.summary.entity_bodies_updated,
+        if plan.summary.entity_bodies_updated == 1 {
+            "y"
+        } else {
+            "ies"
+        },
         plan.summary.blocks_replaced,
         plan.summary.media_updated,
         plan.summary.blocks_created,
@@ -7539,6 +7546,8 @@ fn history_error_exit_code(error: &HistoryError) -> i32 {
         HistoryError::MountNotFound(_)
         | HistoryError::JournalNotFound(_)
         | HistoryError::Store(locality_store::StoreError::EntityPathMissing { .. }) => EXIT_USAGE,
+        HistoryError::UnsafeUndoLocalState { .. } => EXIT_VALIDATION,
+        HistoryError::InvalidUndoObservation { .. } => EXIT_INTERNAL,
         HistoryError::Store(_) => EXIT_INTERNAL,
     }
 }
@@ -8814,6 +8823,7 @@ mod tests {
                     blocks_archived: 0,
                     entities_created: 0,
                     entities_archived: 0,
+                    entity_bodies_updated: 0,
                     entities_moved: 0,
                     properties_updated: 0,
                 },
@@ -8826,7 +8836,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(output).expect("utf8 output"),
-            "push push-1\n  status: reconciled\n  mount: notion-main\n  entities: page-1\n  author: anonymous\n  created_at_unix_ms: 1783612800000\n  previous: push-0\n  summary: 1 updated, 0 replaced, 0 media updated, 0 created, 0 moved, 0 archived\n  operations: 1\n\ndiff --locality a/Roadmap.md b/Roadmap.md\n"
+            "push push-1\n  status: reconciled\n  mount: notion-main\n  entities: page-1\n  author: anonymous\n  created_at_unix_ms: 1783612800000\n  previous: push-0\n  summary: 1 blocks updated, 0 entity bodies updated, 0 replaced, 0 media updated, 0 created, 0 moved, 0 archived\n  operations: 1\n\ndiff --locality a/Roadmap.md b/Roadmap.md\n"
         );
     }
 
@@ -8880,6 +8890,7 @@ mod tests {
                 blocks_archived: 0,
                 entities_created: 0,
                 entities_archived: 0,
+                entity_bodies_updated: 0,
                 entities_moved: 0,
                 properties_updated: 0,
             },
@@ -9945,6 +9956,7 @@ mod tests {
                 blocks_archived: 0,
                 entities_created: 0,
                 entities_archived: 0,
+                entity_bodies_updated: 0,
                 entities_moved: 0,
                 properties_updated: 0,
             },

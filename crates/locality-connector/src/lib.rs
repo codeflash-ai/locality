@@ -24,6 +24,8 @@ pub struct ConnectorKind(pub &'static str);
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorCapabilities {
     pub supports_block_updates: bool,
+    #[serde(default)]
+    pub supports_entity_body_updates: bool,
     pub supports_databases: bool,
     pub supports_oauth: bool,
     pub supports_remote_observation: bool,
@@ -178,13 +180,20 @@ pub struct ApplyUndoRequest<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplyUndoResult {
     pub changed_remote_ids: Vec<RemoteId>,
+    pub observations: Vec<RemoteObservation>,
 }
 
 pub trait Connector {
     fn kind(&self) -> ConnectorKind;
     fn capabilities(&self) -> ConnectorCapabilities;
     fn supported_push_operations(&self) -> std::collections::BTreeSet<PushOperationKind> {
-        PushOperationKind::all().into_iter().collect()
+        let mut operations = PushOperationKind::all()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        if !self.capabilities().supports_entity_body_updates {
+            operations.remove(&PushOperationKind::UpdateEntityBody);
+        }
+        operations
     }
     fn enumerate(&self, request: EnumerateRequest) -> LocalityResult<Vec<TreeEntry>>;
     /// Observe one entity without hydrating its body.
@@ -252,6 +261,7 @@ where
 
         Ok(UndoApplyResult {
             changed_remote_ids: result.changed_remote_ids,
+            observations: result.observations,
         })
     }
 }

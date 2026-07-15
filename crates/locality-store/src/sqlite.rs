@@ -45,6 +45,7 @@ use crate::repository::{
 
 const DB_FILE: &str = "state.sqlite3";
 const SCHEMA_VERSION: i64 = 18;
+const JOURNALS_COMPONENT_VERSION: i64 = 3;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
@@ -122,8 +123,8 @@ const CURRENT_COMPONENT_DEFINITIONS: &[StateComponentDefinition] = &[
     StateComponentDefinition {
         component_id: "durable:journals",
         component_kind: "durable_json",
-        current_version: 2,
-        min_reader_version: 1,
+        current_version: JOURNALS_COMPONENT_VERSION,
+        min_reader_version: JOURNALS_COMPONENT_VERSION,
         required: true,
         rebuildable: false,
         data_json: "{}",
@@ -1768,7 +1769,7 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         ensure_state_components_allow_schema_migration(connection, user_version)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, false)?;
         migrate_windows_cloud_files_projection_layout_to_v2(connection, false)?;
-        migrate_journals_component_to_v2(connection)?;
+        migrate_journals_component_to_v3(connection)?;
         migrate_virtual_mutations_component_to_v2(connection)?;
         return Ok(());
     }
@@ -2281,9 +2282,9 @@ fn state_component_issue_allows_schema_migration(
         issue,
         StateCompatibilityIssue::OlderComponent {
             component_id,
-            found: 1,
-            current: 2,
-        } if component_id == "durable:journals"
+            found,
+            current: JOURNALS_COMPONENT_VERSION,
+        } if component_id == "durable:journals" && matches!(*found, 1 | 2)
     ) || matches!(
         issue,
         StateCompatibilityIssue::OlderComponent {
@@ -2753,6 +2754,9 @@ fn remap_apply_effect_operation_index(
         | JournalApplyEffect::ArchivedEntity {
             operation_index, ..
         }
+        | JournalApplyEffect::UpdatedEntityBody {
+            operation_index, ..
+        }
         | JournalApplyEffect::UpdatedProperties {
             operation_index, ..
         }
@@ -3037,7 +3041,7 @@ fn migrate_virtual_mutations_component_to_v2(connection: &Connection) -> StoreRe
     migrate_state_component_to_current(connection, "durable:virtual_mutations")
 }
 
-fn migrate_journals_component_to_v2(connection: &Connection) -> StoreResult<()> {
+fn migrate_journals_component_to_v3(connection: &Connection) -> StoreResult<()> {
     migrate_state_component_to_current(connection, "durable:journals")
 }
 

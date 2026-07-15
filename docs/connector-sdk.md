@@ -55,8 +55,9 @@ missing or inactive profile as an auth/setup problem before attempting remote
 I/O.
 
 Capabilities are explicit connector-neutral booleans. The current contract
-tracks block updates, databases, OAuth, cheap remote observation, lazy child
-enumeration, media download, entity moves, undo, and future batch observation.
+tracks block updates, whole-entity body updates, databases, OAuth, cheap remote
+observation, lazy child enumeration, media download, entity moves, undo, and
+future batch observation.
 Hosts should use capabilities for scheduling and preflight decisions, not for
 bypassing authoritative push concurrency checks.
 
@@ -74,7 +75,18 @@ rule to lower contiguous compatible `append_block` operations into
 `append block children` calls of up to 100 children while preserving per-block
 journal and undo semantics.
 
-Undo requests include the target push ID, mount ID, and a connector-neutral complete undo plan. Connectors should fail the request rather than partially applying a plan they cannot support.
+Undo requests include the target push ID, mount ID, and a connector-neutral
+complete undo plan. Connectors should fail the request rather than partially
+applying a plan they cannot support. Expected-current fields make drift guards
+available to connectors, but existing Notion block and entity undo lowering does
+not yet enforce those remote guards. Connectors that require guarded undo, such
+as whole-entity sources, must validate the complete plan before the first write.
+
+After reversing a move or restoring an archived entity, connectors must return a
+fresh non-deleted `RemoteObservation` for the changed entity. Archiving an entity
+created by the target push must return an observation that reports that created
+entity as deleted. The host validates mount, entity, parent, path, deletion state,
+and path ownership before reconciling local files.
 
 ## v1 connector
 

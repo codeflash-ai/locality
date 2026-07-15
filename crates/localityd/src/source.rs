@@ -19,6 +19,7 @@ use locality_core::freshness::RemoteObservation;
 use locality_core::hydration::HydrationRequest;
 use locality_core::model::{CanonicalDocument, EntityKind, MountId, RemoteId, TreeEntry};
 use locality_core::planner::PushOperationKind;
+use locality_core::push::BodyDiffMode;
 use locality_core::shadow::ShadowDocument;
 use locality_core::validation::ValidationReport;
 use locality_core::{LocalityError, LocalityResult};
@@ -674,6 +675,10 @@ impl HydrationSource for ResolvedSource {
 }
 
 pub trait SourcePushValidator {
+    fn body_diff_mode(&self) -> BodyDiffMode {
+        BodyDiffMode::Block
+    }
+
     fn validate_changed_frontmatter(
         &self,
         _context: SourceValidationContext<'_>,
@@ -713,6 +718,15 @@ pub struct SourceValidationContext<'a> {
 }
 
 impl SourcePushValidator for ResolvedSource {
+    fn body_diff_mode(&self) -> BodyDiffMode {
+        match self {
+            Self::Notion(source) => source.body_diff_mode(),
+            Self::GoogleDocs(source) => source.body_diff_mode(),
+            Self::Gmail(source) => source.body_diff_mode(),
+            Self::Granola(source) => source.body_diff_mode(),
+        }
+    }
+
     fn validate_changed_frontmatter(
         &self,
         context: SourceValidationContext<'_>,

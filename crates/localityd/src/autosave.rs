@@ -130,8 +130,12 @@ pub fn auto_save_plan_block_reason(plan: &PushPlan) -> Option<String> {
 
     for operation in &plan.operations {
         match operation {
+            PushOperation::UpdateEntityBody { body, .. } if body.is_empty() => {
+                return Some("clearing entity bodies requires review".to_string());
+            }
             PushOperation::CreateEntity { .. }
             | PushOperation::UpdateBlock { .. }
+            | PushOperation::UpdateEntityBody { .. }
             | PushOperation::AppendBlock { .. }
             | PushOperation::UpdateProperties { .. } => {}
             PushOperation::MoveEntity { .. } => {
@@ -347,6 +351,18 @@ mod tests {
         assert_eq!(
             auto_save_plan_block_reason(&degraded),
             Some("diff needs review before auto-save".to_string())
+        );
+
+        let body_erase = PushPlan::new(
+            vec![RemoteId::new("page-1")],
+            vec![PushOperation::UpdateEntityBody {
+                entity_id: RemoteId::new("page-1"),
+                body: String::new(),
+            }],
+        );
+        assert_eq!(
+            auto_save_plan_block_reason(&body_erase),
+            Some("clearing entity bodies requires review".to_string())
         );
     }
 }
