@@ -392,8 +392,64 @@ if [[ "$duplicate_remote_ids" != "0" || "$duplicate_paths" != "0" ]]; then
 fi
 
 step="running final diagnostics"
+doctor_exit=0
 LOCALITY_STATE_DIR="$state_root" "$loc_bin" doctor --json \
-  >"$doctor_report" 2>>"$command_log"
-assert_json_true "$doctor_report" ok
+  >"$doctor_report" 2>>"$command_log" || doctor_exit="$?"
+python3 - "$doctor_report" "$doctor_exit" "$mount_id" "$connection_id" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+exit_code = int(sys.argv[2])
+mount_id = sys.argv[3]
+connection_id = sys.argv[4]
+
+# The CI test launches locality-fuse directly because GitHub-hosted runners do
+# not provide a user systemd session. Doctor must see every other component as
+# healthy and report only that intentional lack of persistent registration.
+if exit_code != 3 or report.get("ok") is not False or report.get("status") != "error":
+    raise SystemExit("doctor did not report the expected direct-launch lifecycle exception")
+if (report.get("daemon") or {}).get("state") != "running":
+    raise SystemExit("doctor did not observe the live daemon")
+
+connections = {
+    connection.get("connection_id"): connection
+    for connection in report.get("connections", [])
+}
+connection = connections.get(connection_id)
+if not connection:
+    raise SystemExit("doctor omitted the live Granola connection")
+if connection.get("status") != "active" or connection.get("credential_status") != "ok":
+    raise SystemExit("doctor did not report a healthy live Granola connection")
+
+mounts = {mount.get("mount_id"): mount for mount in report.get("mounts", [])}
+mount = mounts.get(mount_id)
+if not mount:
+    raise SystemExit("doctor omitted the live Granola mount")
+expected_mount = {
+    "connector": "granola",
+    "projection": "linux-fuse",
+    "read_only": True,
+    "root_exists": True,
+    "connection_id": connection_id,
+}
+for field, expected in expected_mount.items():
+    if mount.get(field) != expected:
+        raise SystemExit(f"doctor reported an unexpected Granola mount {field}")
+provider = mount.get("provider") or {}
+if provider.get("state") != "unregistered" or provider.get("registered") is not False:
+    raise SystemExit("doctor did not identify the direct-launch FUSE lifecycle exception")
+if provider.get("helper_present") is not True:
+    raise SystemExit("doctor could not find the built Linux FUSE helper")
+
+errors = {
+    finding.get("code")
+    for finding in report.get("findings", [])
+    if finding.get("severity") == "error"
+}
+if errors != {"provider_unregistered"}:
+    raise SystemExit("doctor reported an unexpected error during the live Granola test")
+PY
 
 echo "live Granola API, CLI, daemon, and Linux FUSE read-only checks passed"

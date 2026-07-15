@@ -105,6 +105,9 @@ API payloads, the API key, or daemon/provider logs. It has two layers:
   binary, starts `localityd` and Linux FUSE, discovers meetings, hydrates the
   configured meeting through filesystem reads, verifies the incremental
   checkpoint and clean/read-only state, repeats discovery, and runs `loc doctor`.
+  GitHub-hosted runners start the FUSE helper directly because they do not have
+  a user systemd session, so the test requires the sole doctor error to be the
+  expected `provider_unregistered` lifecycle finding.
 
 Required environment:
 
