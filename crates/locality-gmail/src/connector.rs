@@ -712,7 +712,7 @@ mod tests {
     use crate::client::GmailApi;
     use crate::dto::{
         GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-        GmailMessagePartBody, GmailMessageRef,
+        GmailMessagePartBody, GmailMessageRef, GmailThread, GmailThreadList,
     };
     use crate::settings::{GmailMountSettings, GmailProjectionView};
 
@@ -1444,6 +1444,16 @@ mod tests {
             })
         }
 
+        fn list_threads(
+            &self,
+            _label_id: &str,
+            _max_results: u32,
+            _page_token: Option<&str>,
+            _query: Option<&str>,
+        ) -> locality_core::LocalityResult<GmailThreadList> {
+            Ok(GmailThreadList::default())
+        }
+
         fn get_message_metadata(
             &self,
             message_id: &str,
@@ -1463,6 +1473,17 @@ mod tests {
             message_id: &str,
         ) -> locality_core::LocalityResult<GmailMessage> {
             Ok(message_fixture(message_id))
+        }
+
+        fn get_thread_metadata(
+            &self,
+            _thread_id: &str,
+        ) -> locality_core::LocalityResult<GmailThread> {
+            Ok(GmailThread::default())
+        }
+
+        fn get_thread_full(&self, _thread_id: &str) -> locality_core::LocalityResult<GmailThread> {
+            Ok(GmailThread::default())
         }
 
         fn get_attachment(

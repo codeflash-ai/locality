@@ -11,11 +11,28 @@ pub struct GmailMessageList {
     pub result_size_estimate: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailThreadList {
+    #[serde(default)]
+    pub threads: Vec<GmailThreadRef>,
+    pub next_page_token: Option<String>,
+    pub result_size_estimate: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailMessageRef {
     pub id: String,
     pub thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailThreadRef {
+    pub id: String,
+    pub snippet: Option<String>,
+    pub history_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +46,15 @@ pub struct GmailMessage {
     pub internal_date: Option<String>,
     pub payload: Option<GmailMessagePart>,
     pub raw: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailThread {
+    pub id: String,
+    pub history_id: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<GmailMessage>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

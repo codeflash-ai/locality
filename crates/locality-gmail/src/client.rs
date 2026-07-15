@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 
 use crate::dto::{
     GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-    GmailMessagePartBody,
+    GmailMessagePartBody, GmailThread, GmailThreadList,
 };
 
 pub const DEFAULT_GMAIL_API_BASE_URL: &str = "https://gmail.googleapis.com/gmail/v1";
@@ -27,8 +27,17 @@ pub trait GmailApi: std::fmt::Debug + Send + Sync {
         page_token: Option<&str>,
         query: Option<&str>,
     ) -> LocalityResult<GmailMessageList>;
+    fn list_threads(
+        &self,
+        label_id: &str,
+        max_results: u32,
+        page_token: Option<&str>,
+        query: Option<&str>,
+    ) -> LocalityResult<GmailThreadList>;
     fn get_message_metadata(&self, message_id: &str) -> LocalityResult<GmailMessage>;
     fn get_message_full(&self, message_id: &str) -> LocalityResult<GmailMessage>;
+    fn get_thread_metadata(&self, thread_id: &str) -> LocalityResult<GmailThread>;
+    fn get_thread_full(&self, thread_id: &str) -> LocalityResult<GmailThread>;
     fn get_attachment(
         &self,
         message_id: &str,
@@ -124,6 +133,26 @@ impl GmailApi for HttpGmailApiClient {
         self.get_json("/users/me/messages", params)
     }
 
+    fn list_threads(
+        &self,
+        label_id: &str,
+        max_results: u32,
+        page_token: Option<&str>,
+        search_query: Option<&str>,
+    ) -> LocalityResult<GmailThreadList> {
+        let mut params = vec![
+            ("labelIds".to_string(), label_id.to_string()),
+            ("maxResults".to_string(), max_results.to_string()),
+        ];
+        if let Some(page_token) = page_token {
+            params.push(("pageToken".to_string(), page_token.to_string()));
+        }
+        if let Some(search_query) = search_query {
+            params.push(("q".to_string(), search_query.to_string()));
+        }
+        self.get_json("/users/me/threads", params)
+    }
+
     fn get_message_metadata(&self, message_id: &str) -> LocalityResult<GmailMessage> {
         let mut query = vec![("format".to_string(), "metadata".to_string())];
         for header in ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID"] {
@@ -135,6 +164,23 @@ impl GmailApi for HttpGmailApiClient {
     fn get_message_full(&self, message_id: &str) -> LocalityResult<GmailMessage> {
         self.get_json(
             &format!("/users/me/messages/{message_id}"),
+            vec![("format".to_string(), "full".to_string())],
+        )
+    }
+
+    fn get_thread_metadata(&self, thread_id: &str) -> LocalityResult<GmailThread> {
+        let thread_id = percent_encode_path_segment(thread_id);
+        let mut query = vec![("format".to_string(), "metadata".to_string())];
+        for header in ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID"] {
+            query.push(("metadataHeaders".to_string(), header.to_string()));
+        }
+        self.get_json(&format!("/users/me/threads/{thread_id}"), query)
+    }
+
+    fn get_thread_full(&self, thread_id: &str) -> LocalityResult<GmailThread> {
+        let thread_id = percent_encode_path_segment(thread_id);
+        self.get_json(
+            &format!("/users/me/threads/{thread_id}"),
             vec![("format".to_string(), "full".to_string())],
         )
     }
@@ -272,6 +318,78 @@ mod tests {
         );
         assert!(!query.contains("From%2CTo"));
         assert!(!query.contains("From,To"));
+    }
+
+    #[test]
+    fn list_threads_calls_gmail_threads_endpoint_with_query() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"threads":[{"id":"thread-1","snippet":"hello"}],"nextPageToken":"next"}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        let threads = client
+            .list_threads(
+                "INBOX",
+                100,
+                Some("page-2"),
+                Some("after:2026/07/01 before:2026/07/15"),
+            )
+            .expect("threads");
+
+        assert_eq!(threads.threads[0].id, "thread-1");
+        assert_eq!(threads.next_page_token.as_deref(), Some("next"));
+        let request = request_rx.recv().expect("request line");
+        server.join().expect("server exits");
+        assert!(request.starts_with("GET /users/me/threads?"), "{request}");
+        assert!(request.contains("labelIds=INBOX"), "{request}");
+        assert!(request.contains("maxResults=100"), "{request}");
+        assert!(request.contains("pageToken=page-2"), "{request}");
+        assert!(
+            request.contains("q=after%3A2026%2F07%2F01+before%3A2026%2F07%2F15"),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn get_thread_metadata_requests_metadata_format_headers() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"id":"thread-1","messages":[{"id":"msg-1","threadId":"thread-1"}]}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        let thread = client.get_thread_metadata("thread-1").expect("thread");
+
+        assert_eq!(thread.id, "thread-1");
+        let request = request_rx.recv().expect("request line");
+        server.join().expect("server exits");
+        assert!(
+            request.starts_with("GET /users/me/threads/thread-1?"),
+            "{request}"
+        );
+        assert!(request.contains("format=metadata"), "{request}");
+        assert!(request.contains("metadataHeaders=Subject"), "{request}");
+    }
+
+    #[test]
+    fn get_thread_full_percent_encodes_thread_path_segment() {
+        let (base_url, request_rx, server) = spawn_response_server(
+            "HTTP/1.1 200 OK",
+            r#"{"id":"thread/1 space","messages":[]}"#,
+        );
+        let client = HttpGmailApiClient::with_base_url("access-token", base_url);
+
+        client
+            .get_thread_full("thread/1 space")
+            .expect("thread response");
+
+        let request = request_rx.recv().expect("request line");
+        server.join().expect("server exits");
+        let target = request.split_whitespace().nth(1).expect("request target");
+        assert_eq!(target, "/users/me/threads/thread%2F1%20space?format=full");
+        assert!(!target.contains("thread/1"), "{target}");
+        assert!(!target.contains(' '), "{target}");
     }
 
     #[test]

@@ -525,7 +525,7 @@ mod tests {
     use locality_gmail::client::GmailApi;
     use locality_gmail::dto::{
         GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
-        GmailMessagePartBody,
+        GmailMessagePartBody, GmailThread, GmailThreadList,
     };
 
     use super::*;
@@ -620,12 +620,30 @@ mod tests {
             Ok(GmailMessageList::default())
         }
 
+        fn list_threads(
+            &self,
+            _label_id: &str,
+            _max_results: u32,
+            _page_token: Option<&str>,
+            _query: Option<&str>,
+        ) -> LocalityResult<GmailThreadList> {
+            Ok(GmailThreadList::default())
+        }
+
         fn get_message_metadata(&self, message_id: &str) -> LocalityResult<GmailMessage> {
             Ok(message_fixture(message_id))
         }
 
         fn get_message_full(&self, message_id: &str) -> LocalityResult<GmailMessage> {
             Ok(message_fixture(message_id))
+        }
+
+        fn get_thread_metadata(&self, _thread_id: &str) -> LocalityResult<GmailThread> {
+            Ok(GmailThread::default())
+        }
+
+        fn get_thread_full(&self, _thread_id: &str) -> LocalityResult<GmailThread> {
+            Ok(GmailThread::default())
         }
 
         fn get_attachment(
