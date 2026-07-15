@@ -73,9 +73,11 @@ remote Gmail drafts in v1.
 Inbox and sent messages render as Markdown with Locality identity frontmatter and
 Gmail metadata frontmatter such as mailbox, message ID, thread ID, labels,
 sender, recipients, subject, and date. The connector renders available plain text
-body content, or strips HTML tags as a fallback. Attachments are not downloaded
-in v1; messages with attachments but no renderable body show an attachment note
-instead.
+body content, or strips HTML tags as a fallback. When a specific message is
+hydrated, inbound attachments are downloaded on demand under
+`.loc/gmail/attachments/...` and the hydrated message frontmatter records their
+local paths. Metadata-only stubs omit attachment frontmatter because attachment
+presence is unknown until full message hydration.
 
 ## Write Policy
 

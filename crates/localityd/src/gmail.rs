@@ -549,6 +549,7 @@ mod tests {
         assert_eq!(hydrated.assets.len(), 1);
         assert_eq!(hydrated.assets[0].path, expected_path);
         assert_eq!(hydrated.assets[0].bytes, b"attachment bytes");
+        assert_eq!(hydrated.assets[0].media, None);
         let calls = api.calls.lock().expect("calls");
         assert_eq!(
             calls.attachments,
@@ -556,9 +557,51 @@ mod tests {
         );
     }
 
-    #[derive(Default, Debug)]
+    #[test]
+    fn gmail_hydration_propagates_attachment_body_decode_errors() {
+        let api = Arc::new(FakeGmailApi::with_attachment_data(None));
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
+        let request = HydrationRequest::new(
+            MountId::new("gmail-main"),
+            RemoteId::new("msg-attach"),
+            "inbox/msg-attach.md",
+            HydrationState::Hydrated,
+            HydrationReason::ExplicitPull,
+        );
+
+        let error = connector
+            .fetch_render(&request)
+            .expect_err("missing attachment body data");
+
+        assert!(
+            matches!(
+                error,
+                LocalityError::Io(ref message)
+                    if message.contains("gmail attachment response did not include body data")
+            ),
+            "{error}"
+        );
+    }
+
+    #[derive(Debug)]
     struct FakeGmailApi {
         calls: Mutex<FakeCalls>,
+        attachment_data: Mutex<Option<String>>,
+    }
+
+    impl FakeGmailApi {
+        fn with_attachment_data(attachment_data: Option<String>) -> Self {
+            Self {
+                calls: Mutex::new(FakeCalls::default()),
+                attachment_data: Mutex::new(attachment_data),
+            }
+        }
+    }
+
+    impl Default for FakeGmailApi {
+        fn default() -> Self {
+            Self::with_attachment_data(Some(URL_SAFE_NO_PAD.encode(b"attachment bytes")))
+        }
     }
 
     #[derive(Default, Debug)]
@@ -595,10 +638,15 @@ mod tests {
                 .expect("calls")
                 .attachments
                 .push((message_id.to_string(), attachment_id.to_string()));
+            let data = self
+                .attachment_data
+                .lock()
+                .expect("attachment data")
+                .clone();
             Ok(GmailMessagePartBody {
                 attachment_id: Some(attachment_id.to_string()),
                 size: Some(16),
-                data: Some(URL_SAFE_NO_PAD.encode(b"attachment bytes")),
+                data,
             })
         }
 

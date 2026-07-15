@@ -72,13 +72,19 @@ fn synthetic_body_block_ids(message_id: &str, body: &str) -> Vec<RemoteId> {
 }
 
 pub fn message_frontmatter(bundle: &GmailNativeBundle) -> String {
-    let specs = collect_attachment_specs(&bundle.message);
-    message_frontmatter_with_attachments(bundle, &specs)
+    message_frontmatter_with_attachment_state(bundle, None)
 }
 
 fn message_frontmatter_with_attachments(
     bundle: &GmailNativeBundle,
     attachment_specs: &[GmailAttachmentSpec],
+) -> String {
+    message_frontmatter_with_attachment_state(bundle, Some(attachment_specs))
+}
+
+fn message_frontmatter_with_attachment_state(
+    bundle: &GmailNativeBundle,
+    attachment_specs: Option<&[GmailAttachmentSpec]>,
 ) -> String {
     let message = &bundle.message;
     let version = remote_version(message);
@@ -87,10 +93,12 @@ fn message_frontmatter_with_attachments(
         .get("subject")
         .cloned()
         .unwrap_or_else(|| "(no subject)".to_string());
-    let attachments = attachment_frontmatter(attachment_specs);
+    let attachments = attachment_specs
+        .map(attachment_frontmatter)
+        .unwrap_or_default();
 
     format!(
-        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\ngmail:\n  mailbox: {}\n  message_id: {}\n  thread_id: {}\n  labels: [{}]\n  attachments:{}from: {}\nto: [{}]\ncc: [{}]\nbcc: []\nsubject: {}\ndate: {}\n",
+        "loc:\n  id: {}\n  type: page\n  connector: {}\n  synced_at: {}\n  remote_edited_at: {}\ntitle: {}\ngmail:\n  mailbox: {}\n  message_id: {}\n  thread_id: {}\n  labels: [{}]\n{}from: {}\nto: [{}]\ncc: [{}]\nbcc: []\nsubject: {}\ndate: {}\n",
         yaml_scalar(&message.id),
         GMAIL_CONNECTOR_ID,
         yaml_scalar(&version),
@@ -116,10 +124,10 @@ fn message_frontmatter_with_attachments(
 
 fn attachment_frontmatter(attachment_specs: &[GmailAttachmentSpec]) -> String {
     if attachment_specs.is_empty() {
-        return " []\n".to_string();
+        return "  attachments: []\n".to_string();
     }
 
-    let mut output = String::from("\n");
+    let mut output = String::from("  attachments:\n");
     for spec in attachment_specs {
         output.push_str(&format!(
             "    - filename: {}\n      attachment_id: {}\n      mime_type: {}\n      size: {}\n      path: {}\n",
@@ -438,8 +446,8 @@ mod tests {
     use locality_core::LocalityError;
 
     use super::{
-        GmailDraftDocument, GmailNativeBundle, build_draft_mime, remote_version,
-        render_gmail_message, yaml_scalar,
+        GmailDraftDocument, GmailNativeBundle, build_draft_mime, message_frontmatter,
+        remote_version, render_gmail_message, yaml_scalar,
     };
     use crate::dto::GmailMessage;
 
@@ -470,6 +478,7 @@ mod tests {
 
         assert!(rendered.document.frontmatter.contains("connector: gmail"));
         assert!(rendered.document.frontmatter.contains("mailbox: \"inbox\""));
+        assert!(rendered.document.frontmatter.contains("attachments: []"));
         assert!(rendered.document.frontmatter.contains("subject: \"Hello\""));
         assert_eq!(rendered.document.body, "Hello from Gmail.\n");
         assert_eq!(rendered.shadow.entity_id.as_str(), "msg-1");
@@ -499,6 +508,30 @@ mod tests {
         .expect("render");
 
         assert_eq!(rendered.document.body, "Hello from padded.\n");
+    }
+
+    #[test]
+    fn message_frontmatter_omits_attachments_when_metadata_cannot_know_them() {
+        let message: GmailMessage = serde_json::from_value(serde_json::json!({
+            "id": "msg-metadata",
+            "threadId": "thread-metadata",
+            "labelIds": ["INBOX"],
+            "internalDate": "1720900000000",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    { "name": "Subject", "value": "Metadata only" }
+                ]
+            }
+        }))
+        .expect("message");
+
+        let frontmatter = message_frontmatter(&GmailNativeBundle {
+            mailbox: "inbox".to_string(),
+            message,
+        });
+
+        assert!(!frontmatter.contains("attachments:"));
     }
 
     #[test]
