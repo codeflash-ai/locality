@@ -66,18 +66,68 @@ CLI overrides:
 
 ## Projection And Pull
 
-Pull enumerates the recent 100 inbox messages and recent 100 sent messages for
-v1. The `draft/` folder is created locally, but the connector does not enumerate
-remote Gmail drafts in v1.
+By default, Pull enumerates the recent 100 inbox messages and recent 100 sent
+messages. The `draft/` folder is created locally, but the connector does not
+enumerate remote Gmail drafts.
 
-Inbox and sent messages render as Markdown with Locality identity frontmatter and
-Gmail metadata frontmatter such as mailbox, message ID, thread ID, labels,
-sender, recipients, subject, and date. The connector renders available plain text
-body content, or strips HTML tags as a fallback. When a specific message is
-hydrated, inbound attachments are downloaded on demand under
-`.loc/gmail/attachments/...` and the hydrated message frontmatter records their
-local paths. Metadata-only stubs omit attachment frontmatter because attachment
-presence is unknown until full message hydration.
+Gmail mounts can be registered with a date window:
+
+```bash
+./target/debug/loc mount gmail ~/Locality/gmail-main \
+  --after 2026-07-01 \
+  --before 2026-07-15
+```
+
+Date-window mounts use Gmail search query dates and page through all matching
+messages for `inbox/` and `sent/` instead of stopping after the first recent 100
+results.
+
+Message view is the default projection:
+
+```text
+gmail-main/
+  inbox/
+    1720900000000-quarterly-update-msg-1.md
+  sent/
+    1720900100000-reply-msg-2.md
+  draft/
+```
+
+Thread view is opt-in:
+
+```bash
+./target/debug/loc mount gmail ~/Locality/gmail-main --view threads
+```
+
+Thread view projects thread pages and child messages:
+
+```text
+gmail-main/
+  inbox/
+    1720900000000-quarterly-update-thread-a/
+      page.md
+      1720900000000-quarterly-update-msg-1.md
+  sent/
+  draft/
+```
+
+Inbox, sent, and thread content is read-only. Creating a Markdown file directly
+under `draft/` remains the send surface.
+
+## Attachments
+
+Gmail attachment bytes are fetched on demand. Enumeration and metadata refreshes
+do not download attachment bodies. When a specific message or thread is
+hydrated, Locality downloads the attachment bodies referenced by that message or
+thread and writes them under:
+
+```text
+.loc/gmail/attachments/<message-id>/
+```
+
+Rendered message frontmatter includes attachment filename, MIME type, size,
+Gmail attachment ID, and the local path. Draft sends still reject `attachment`
+or `attachments` frontmatter; outbound attachments require a separate design.
 
 ## Write Policy
 

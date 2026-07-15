@@ -56,7 +56,10 @@ The first schema keeps high-value lookup fields relational and stores complex co
 
 - `connector_profiles`: profile id, connector, display name, auth kind, scopes, capabilities, enabled action classes, connector version, and status;
 - `connections`: connection id, optional profile id, connector, account/workspace labels, auth kind, `secret_ref`, scopes, capabilities, status, and expiry metadata;
-- `mounts`: mount id, connector, root path, optional remote root id, optional connection id, read-only flag, projection mode (`plain_files`, `macos_file_provider`, `linux_fuse`, or `windows_cloud_files`), and generic mount settings JSON;
+- `mounts`: mount id, connector, local root, optional remote root id, read-only
+  flag, projection mode (`plain_files`, `macos_file_provider`, `linux_fuse`, or
+  `windows_cloud_files`), optional connection id, and connector-specific
+  `settings_json`;
 - `entities`: mount id, remote id, kind, title, projected path, hydration, content hash, remote edit time;
 - `entity_search_fts`: derived full-text index over entity titles/paths and
   observed remote titles/paths. It is rebuildable and stores no secrets;
