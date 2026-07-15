@@ -749,7 +749,10 @@ fn debug_live_mode_status_blocking() -> Result<DesktopLiveModeDebugStatus, Strin
     let mounts = store
         .load_mounts()
         .map_err(|error| format!("Could not load mounts for Live Mode debug: {error}"))?;
-    let Some(mount) = choose_mount(&mounts) else {
+    let connections = store
+        .list_connections()
+        .map_err(|error| format!("Could not load connections for Live Mode debug: {error}"))?;
+    let Some(mount) = choose_mount(&mounts, &connections) else {
         return Ok(DesktopLiveModeDebugStatus {
             mount_id: None,
             enabled: false,
@@ -2318,7 +2321,10 @@ fn live_mode_enabled_mount(state_root: &Path) -> Result<Option<MountConfig>, Str
     let mounts = store
         .load_mounts()
         .map_err(|error| format!("Live Mode could not inspect mounted folders: {error}"))?;
-    let Some(mount) = choose_mount(&mounts) else {
+    let connections = store
+        .list_connections()
+        .map_err(|error| format!("Live Mode could not inspect connections: {error}"))?;
+    let Some(mount) = choose_mount(&mounts, &connections) else {
         return Ok(None);
     };
     let Some(record) = store
@@ -2424,7 +2430,10 @@ fn set_mount_live_mode_blocking(change: MountLiveModeChange) -> Result<ActionRep
     let mounts = store
         .load_mounts()
         .map_err(|error| format!("Could not inspect mounted folders: {error}"))?;
-    let mount = choose_mount(&mounts)
+    let connections = store
+        .list_connections()
+        .map_err(|error| format!("Could not inspect connections: {error}"))?;
+    let mount = choose_mount(&mounts, &connections)
         .ok_or_else(|| "Create a Notion folder before turning on Live Mode.".to_string())?;
     let now = live_mode_timestamp();
     let existing = store
@@ -3431,7 +3440,7 @@ fn load_desktop_snapshot_from_store(
         .list_connections()
         .map_err(|error| error.to_string())?;
     let journals = store.list_journal().unwrap_or_default();
-    let mount = choose_mount(&mounts);
+    let mount = choose_mount(&mounts, &connections);
     let connection = choose_connection(&connections, mount.as_ref());
     let needs_onboarding = desktop_needs_onboarding(connection.as_ref(), mount.as_ref());
     let pending_changes = match mount.as_ref() {
@@ -3563,10 +3572,20 @@ fn degraded_snapshot(message: String) -> DesktopSnapshot {
     }
 }
 
-fn choose_mount(mounts: &[MountConfig]) -> Option<MountConfig> {
+fn choose_mount(mounts: &[MountConfig], connections: &[ConnectionRecord]) -> Option<MountConfig> {
+    let has_active_connection = |mount: &&MountConfig| {
+        choose_connection_for_mount(connections, mount)
+            .as_ref()
+            .is_some_and(|connection| {
+                connection.status == "active" && connection.connector == mount.connector
+            })
+    };
+
     mounts
         .iter()
-        .find(|mount| mount.connector == "notion")
+        .find(|mount| mount.connector == "notion" && has_active_connection(mount))
+        .or_else(|| mounts.iter().find(has_active_connection))
+        .or_else(|| mounts.iter().find(|mount| mount.connector == "notion"))
         .or_else(|| mounts.first())
         .cloned()
 }
@@ -4821,7 +4840,7 @@ fn notion_access_miss_message() -> String {
     };
     let mounts = store.load_mounts().unwrap_or_default();
     let connections = store.list_connections().unwrap_or_default();
-    let mount = choose_mount(&mounts);
+    let mount = choose_mount(&mounts, &connections);
     let connection = choose_connection(&connections, mount.as_ref());
     let workspace = connection
         .as_ref()
@@ -11353,6 +11372,65 @@ mod tests {
     }
 
     #[test]
+    fn desktop_snapshot_prefers_active_granola_over_stale_notion_mount() {
+        let temp = TestTempDir::new("desktop-granola-first");
+        let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
+        let mut stale_notion = test_connection("workspace-1", "Old Notion");
+        stale_notion.status = "revoked".to_string();
+        let granola_connection = ConnectionRecord {
+            connection_id: ConnectionId::new("granola-default"),
+            profile_id: None,
+            connector: "granola".to_string(),
+            display_name: "granola-default".to_string(),
+            account_label: Some("Granola".to_string()),
+            workspace_id: None,
+            workspace_name: Some("Granola".to_string()),
+            auth_kind: "api_key".to_string(),
+            secret_ref: "connection:granola-default".to_string(),
+            scopes: Vec::new(),
+            capabilities_json: "{}".to_string(),
+            status: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            expires_at: None,
+        };
+        let notion_mount = MountConfig::new(
+            MountId::new("notion-main"),
+            "notion",
+            temp.path().join("notion"),
+        )
+        .with_connection_id(stale_notion.connection_id.clone())
+        .projection(ProjectionMode::LinuxFuse);
+        let granola_mount = MountConfig::new(
+            MountId::new("granola-main"),
+            "granola",
+            temp.path().join("granola"),
+        )
+        .with_connection_id(granola_connection.connection_id.clone())
+        .read_only(true)
+        .projection(ProjectionMode::LinuxFuse);
+
+        store
+            .save_connection(stale_notion)
+            .expect("save stale notion connection");
+        store
+            .save_connection(granola_connection)
+            .expect("save granola connection");
+        store
+            .save_mount(notion_mount)
+            .expect("save stale notion mount");
+        store.save_mount(granola_mount).expect("save granola mount");
+
+        let snapshot = super::load_desktop_snapshot_from_store(&store, temp.path())
+            .expect("load snapshot from test store");
+
+        assert_eq!(snapshot.active_mount_id.as_deref(), Some("granola-main"));
+        assert_eq!(snapshot.mount.connector, "granola");
+        assert_eq!(snapshot.connection.connector, "granola");
+        assert!(!snapshot.needs_onboarding);
+    }
+
+    #[test]
     fn desktop_mount_by_id_returns_selected_mount_not_preferred_mount() {
         let temp = TestTempDir::new("desktop-selected-mount-by-id");
         let mut store = SqliteStateStore::open(temp.path().to_path_buf()).expect("open store");
@@ -16540,7 +16618,8 @@ fn agent_guidance_mount_path_at(state_root: &Path) -> Option<String> {
     }
     let store = SqliteStateStore::open(state_root.to_path_buf()).ok()?;
     let mounts = store.load_mounts().ok()?;
-    let mount = choose_mount(&mounts)?;
+    let connections = store.list_connections().ok()?;
+    let mount = choose_mount(&mounts, &connections)?;
     Some(display_path(&mount_access_root(&mount)))
 }
 
