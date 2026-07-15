@@ -105,8 +105,8 @@ impl GmailProjectionView {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GmailDateWindow {
-    pub after: GmailSearchDate,
-    pub before: GmailSearchDate,
+    after: GmailSearchDate,
+    before: GmailSearchDate,
 }
 
 impl<'de> Deserialize<'de> for GmailDateWindow {
@@ -137,6 +137,14 @@ impl GmailDateWindow {
             ));
         }
         Ok(Self { after, before })
+    }
+
+    pub fn after(&self) -> &GmailSearchDate {
+        &self.after
+    }
+
+    pub fn before(&self) -> &GmailSearchDate {
+        &self.before
     }
 
     pub fn query(&self) -> String {
@@ -181,7 +189,10 @@ impl GmailSearchDate {
         let year = value[0..4].parse::<u32>().unwrap_or(0);
         let month = value[5..7].parse::<u32>().unwrap_or(0);
         let day = value[8..10].parse::<u32>().unwrap_or(0);
-        if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
+        if year == 0
+            || !(1..=12).contains(&month)
+            || !(1..=days_in_month(year, month)).contains(&day)
+        {
             return Err(settings_validation(
                 "gmail_mount_date_invalid",
                 format!("Gmail date `{value}` is not a calendar date"),
@@ -280,6 +291,11 @@ mod tests {
             .with_view(GmailProjectionView::Threads);
 
         let json = settings.to_json().expect("json");
+        assert_eq!(
+            json,
+            r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#
+        );
+
         let parsed = GmailMountSettings::from_json(&json).expect("parsed json");
 
         assert_eq!(parsed.gmail.view, GmailProjectionView::Threads);
@@ -290,9 +306,22 @@ mod tests {
     }
 
     #[test]
+    fn date_window_accessors_expose_validated_dates() {
+        let window = GmailMountSettings::with_date_window("2026-07-01", "2026-07-15")
+            .expect("date window")
+            .gmail
+            .date_window
+            .expect("window");
+
+        assert_eq!(window.after().as_str(), "2026-07-01");
+        assert_eq!(window.before().as_str(), "2026-07-15");
+    }
+
+    #[test]
     fn date_window_rejects_invalid_or_reversed_dates() {
         assert!(GmailSearchDate::parse("2026-02-29").is_err());
         assert!(GmailSearchDate::parse("2024-02-29").is_ok());
+        assert!(GmailSearchDate::parse("0000-01-01").is_err());
         assert!(GmailMountSettings::with_date_window("2026-07-15", "2026-07-01").is_err());
     }
 
@@ -312,6 +341,16 @@ mod tests {
             r#"{"gmail":{"date_window":{"after":"2026-07-15","before":"2026-07-01"}}}"#,
         )
         .expect_err("reversed date window");
+
+        assert_settings_json_error(error, "`--before` must be later than `--after`");
+    }
+
+    #[test]
+    fn json_date_window_rejects_equal_windows() {
+        let error = GmailMountSettings::from_json(
+            r#"{"gmail":{"date_window":{"after":"2026-07-15","before":"2026-07-15"}}}"#,
+        )
+        .expect_err("equal date window");
 
         assert_settings_json_error(error, "`--before` must be later than `--after`");
     }
