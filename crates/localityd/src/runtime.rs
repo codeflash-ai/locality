@@ -93,9 +93,21 @@ const MAX_WORKSPACE_FRESHNESS_JOBS_PER_TICK: usize = 100;
 const LIVE_MODE_REMOTE_OBSERVE_QUEUE_SHARE: f64 = 1.0 / 3.0;
 const LIVE_MODE_REMOTE_OBSERVE_MAX_QUEUE_JOBS: usize = FRESHNESS_JOB_BUDGET_UNITS as usize;
 const AUTO_FAST_FORWARD_ACTIVE_LEASE_MS: u64 = 30_000;
-const MAX_CHILD_REFRESH_WORKERS: usize = 3;
-const MAX_BACKGROUND_CHILD_REFRESH_WORKERS: usize = 2;
+const DEFAULT_MAX_CHILD_REFRESH_WORKERS: usize = 32;
+const DEFAULT_MAX_BACKGROUND_CHILD_REFRESH_WORKERS: usize = 16;
+const DEFAULT_PERIODIC_DISCOVERY_SCHEDULER_INTERVAL: Duration = Duration::from_secs(15);
+const CHILD_REFRESH_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const CHILD_REFRESH_RETRY_MAX_DELAY: Duration = Duration::from_secs(300);
+const PERIODIC_DISCOVERY_DEPTH: u32 = u32::MAX;
 const DEBUG_QUEUE_ITEM_LIMIT: usize = 25;
+
+fn child_refresh_retry_delay(attempts: u32) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(31);
+    let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    CHILD_REFRESH_RETRY_INITIAL_DELAY
+        .saturating_mul(multiplier)
+        .min(CHILD_REFRESH_RETRY_MAX_DELAY)
+}
 
 impl DaemonRuntimeHandle {
     pub fn request(&self, request: DaemonRequest) -> DaemonResponse {
@@ -511,20 +523,32 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let mut store = SqliteStateStore::open(state_root.clone()).map_err(LocalityError::from)?;
         let mounts = store.load_mounts().map_err(LocalityError::from)?;
         let credentials = open_credential_store(&state_root);
-        let source = ResolvedSourceSet::new(&store, credentials.as_ref(), &mounts)
-            .map_err(LocalityError::from)?;
+        let (source, unavailable) =
+            ResolvedSourceSet::new_available(&store, credentials.as_ref(), &mounts);
+        for (mount_id, error) in unavailable {
+            eprintln!(
+                "localityd scheduled pull skipped unavailable mount `{}`: {}",
+                mount_id.0,
+                error.message()
+            );
+        }
+        let available_mounts = mounts
+            .iter()
+            .filter(|mount| source.contains_mount(&mount.mount_id))
+            .cloned()
+            .collect::<Vec<_>>();
         let mut hydration = HydrationCollector::default();
         let report = reconcile_scheduled_pull_with_state_root(
             &mut store,
             &mut hydration,
-            &mounts,
+            &available_mounts,
             &tick,
             &source,
             &DefaultFetchScheduleStrategy,
             &policy,
             Some(&state_root),
         )?;
-        let freshness_jobs = workspace_virtual_freshness_jobs(&store, &mounts, &tick)?;
+        let freshness_jobs = workspace_virtual_freshness_jobs(&store, &available_mounts, &tick)?;
 
         Ok(ScheduledPullRuntimeReport {
             report,
@@ -651,6 +675,12 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let mut store = SqliteStateStore::open(state_root.clone()).map_err(LocalityError::from)?;
         let mount_id = MountId::new(mount_id);
         ensure_virtual_fs_mount(&store, &mount_id)?;
+        let mount = store
+            .get_mount(&mount_id)
+            .map_err(LocalityError::from)?
+            .ok_or_else(|| {
+                LocalityError::InvalidState(format!("mount `{}` is missing", mount_id.0))
+            })?;
         if !virtual_fs_children_refresh_needed(&store, &mount_id, &container_identifier)? {
             return Ok(VirtualFsRefreshChildrenReport::default());
         }
@@ -658,13 +688,19 @@ impl RuntimeJobRunner for DefaultRuntimeJobRunner {
         let connector = resolve_source_for_mount_id(&store, credentials.as_ref(), &mount_id)
             .map_err(LocalityError::from)?;
         let content_root = virtual_fs_content_root(&state_root, &mount_id);
-        refresh_virtual_fs_children_with_content_root(
+        let report = refresh_virtual_fs_children_with_content_root(
             &mut store,
             &connector,
             &content_root,
             &mount_id,
             &container_identifier,
-        )
+        )?;
+        if mount.connector == locality_granola::GRANOLA_CONNECTOR_ID
+            && container_identifier == mount_point_identifier(&mount)
+        {
+            crate::granola::record_granola_discovery_success(&mut store, &mount)?;
+        }
+        Ok(report)
     }
 
     fn run_virtual_fs_materialize(
@@ -1036,6 +1072,7 @@ struct ChildRefreshKey {
 struct ChildRefreshQueue {
     order: VecDeque<ChildRefreshKey>,
     pending: BTreeMap<ChildRefreshKey, ChildRefreshRequest>,
+    not_before: BTreeMap<ChildRefreshKey, Instant>,
 }
 
 impl ChildRefreshQueue {
@@ -1059,10 +1096,22 @@ impl ChildRefreshQueue {
         if let Some(existing) = self.pending.get_mut(&key) {
             if request.priority > existing.priority {
                 existing.priority = request.priority;
+                self.not_before.remove(&key);
             }
             existing.depth = request.depth;
         }
         false
+    }
+
+    fn queue_after(&mut self, request: ChildRefreshRequest, delay: Duration) -> bool {
+        let key = request.key();
+        let ready_at = Instant::now() + delay;
+        let inserted = self.queue(request);
+        self.not_before
+            .entry(key)
+            .and_modify(|current| *current = (*current).max(ready_at))
+            .or_insert(ready_at);
+        inserted
     }
 
     fn pop_ready(
@@ -1071,6 +1120,7 @@ impl ChildRefreshQueue {
     ) -> Option<ChildRefreshRequest> {
         let index = self.next_ready_index(active)?;
         let key = self.order.remove(index)?;
+        self.not_before.remove(&key);
         self.pending.remove(&key)
     }
 
@@ -1104,11 +1154,19 @@ impl ChildRefreshQueue {
         &self,
         active: &BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
     ) -> Option<usize> {
+        let now = Instant::now();
         let mut best: Option<(usize, ChildRefreshPriority, u32)> = None;
         for (index, key) in self.order.iter().enumerate() {
             let Some(request) = self.pending.get(key) else {
                 continue;
             };
+            if self
+                .not_before
+                .get(key)
+                .is_some_and(|ready_at| *ready_at > now)
+            {
+                continue;
+            }
             if active.values().any(|active| {
                 active.request.priority == request.priority && active.request.depth < request.depth
             }) {
@@ -1133,6 +1191,9 @@ struct RuntimeState {
     child_refreshes: ChildRefreshQueue,
     active_child_refreshes: BTreeMap<ChildRefreshKey, ActiveChildRefresh>,
     completed_child_refreshes: BTreeMap<ChildRefreshKey, ChildRefreshPriority>,
+    child_refresh_failures: BTreeMap<ChildRefreshKey, u32>,
+    last_periodic_discovery: BTreeMap<MountId, Instant>,
+    next_periodic_discovery_check: Instant,
     pending_file_provider_children: BTreeMap<ChildRefreshKey, Vec<FileProviderChildrenWaiter>>,
     hydration: HydrationQueue,
     freshness: FreshnessQueue,
@@ -1247,10 +1308,10 @@ impl RuntimeState {
         sender: Sender<RuntimeMessage>,
     ) -> Self {
         let hydration = load_persisted_hydrations(&config.state_root);
-        let child_refreshes = if config.background_connector_sync {
+        let (child_refreshes, child_refresh_failures) = if config.background_connector_sync {
             load_persisted_child_refreshes(&config.state_root)
         } else {
-            ChildRefreshQueue::default()
+            (ChildRefreshQueue::default(), BTreeMap::new())
         };
 
         Self {
@@ -1263,6 +1324,9 @@ impl RuntimeState {
             child_refreshes,
             active_child_refreshes: BTreeMap::new(),
             completed_child_refreshes: BTreeMap::new(),
+            child_refresh_failures,
+            last_periodic_discovery: BTreeMap::new(),
+            next_periodic_discovery_check: Instant::now(),
             pending_file_provider_children: BTreeMap::new(),
             hydration,
             freshness: FreshnessQueue::new(),
@@ -1782,26 +1846,47 @@ impl RuntimeState {
     ) {
         match result {
             Ok(report) => {
+                self.child_refresh_failures.remove(&ChildRefreshKey {
+                    mount_id: mount_id.to_string(),
+                    container_identifier: container_identifier.to_string(),
+                });
                 self.delete_metadata_discovery_job(mount_id, container_identifier);
                 self.mark_child_refresh_completed(mount_id, container_identifier, priority);
                 if report.changed {
                     self.signal_macos_file_provider_container(mount_id, container_identifier);
                 }
-                self.queue_child_refresh_descendants(mount_id, container_identifier, depth);
+                if depth != PERIODIC_DISCOVERY_DEPTH {
+                    self.queue_child_refresh_descendants(mount_id, container_identifier, depth);
+                }
             }
             Err(error) => {
-                self.record_metadata_discovery_failure(
-                    mount_id,
-                    container_identifier,
-                    error.to_string(),
-                );
-                if self.config.background_connector_sync {
-                    self.child_refreshes.queue(ChildRefreshRequest {
+                if depth != PERIODIC_DISCOVERY_DEPTH {
+                    self.record_metadata_discovery_failure(
+                        mount_id,
+                        container_identifier,
+                        error.to_string(),
+                    );
+                }
+                if self.config.background_connector_sync && depth != PERIODIC_DISCOVERY_DEPTH {
+                    let key = ChildRefreshKey {
                         mount_id: mount_id.to_string(),
                         container_identifier: container_identifier.to_string(),
-                        priority,
-                        depth,
-                    });
+                    };
+                    let attempts = self
+                        .child_refresh_failures
+                        .entry(key)
+                        .and_modify(|attempts| *attempts = attempts.saturating_add(1))
+                        .or_insert(1);
+                    let retry_delay = child_refresh_retry_delay(*attempts);
+                    self.child_refreshes.queue_after(
+                        ChildRefreshRequest {
+                            mount_id: mount_id.to_string(),
+                            container_identifier: container_identifier.to_string(),
+                            priority,
+                            depth,
+                        },
+                        retry_delay,
+                    );
                 }
                 eprintln!(
                     "localityd virtual filesystem child refresh failed for `{mount_id}:{container_identifier}`: {error}"
@@ -1824,6 +1909,12 @@ impl RuntimeState {
                 self.queue_hydration(request);
             }
             self.next_hydration_retry = None;
+        }
+
+        if now >= self.next_periodic_discovery_check {
+            self.next_periodic_discovery_check =
+                now + DEFAULT_PERIODIC_DISCOVERY_SCHEDULER_INTERVAL;
+            self.queue_due_periodic_discovery(now);
         }
 
         match self.scheduler.advance_by(elapsed) {
@@ -1878,14 +1969,15 @@ impl RuntimeState {
             return;
         }
         while self.active_job.is_none()
-            && self.active_child_refreshes.len() < MAX_CHILD_REFRESH_WORKERS
+            && self.active_child_refreshes.len() < DEFAULT_MAX_CHILD_REFRESH_WORKERS
         {
             let Some(request) = self.child_refreshes.pop_ready(&self.active_child_refreshes) else {
                 break;
             };
 
             if request.priority == ChildRefreshPriority::Background
-                && self.active_background_child_refreshes() >= MAX_BACKGROUND_CHILD_REFRESH_WORKERS
+                && self.active_background_child_refreshes()
+                    >= DEFAULT_MAX_BACKGROUND_CHILD_REFRESH_WORKERS
             {
                 self.child_refreshes.queue(request);
                 break;
@@ -2043,11 +2135,19 @@ impl RuntimeState {
             }
         };
         self.completed_child_refreshes.clear();
+        let primed_at = Instant::now();
 
         for mount in mounts
             .into_iter()
             .filter(|mount| mount.projection.uses_virtual_filesystem())
         {
+            if crate::source::source_descriptor(&mount.connector)
+                .periodic_discovery_interval()
+                .is_some()
+            {
+                self.last_periodic_discovery
+                    .insert(mount.mount_id.clone(), primed_at);
+            }
             self.queue_child_refresh(
                 mount.mount_id.0.clone(),
                 ROOT_CONTAINER_IDENTIFIER.to_string(),
@@ -2060,6 +2160,54 @@ impl RuntimeState {
                 ChildRefreshPriority::Background,
                 0,
             );
+        }
+    }
+
+    fn queue_due_periodic_discovery(&mut self, now: Instant) {
+        if !self.config.background_connector_sync {
+            return;
+        }
+        let mounts = match SqliteStateStore::open(self.config.state_root.clone())
+            .and_then(|store| store.load_mounts())
+        {
+            Ok(mounts) => mounts,
+            Err(error) => {
+                eprintln!("localityd failed to inspect periodic discovery mounts: {error}");
+                return;
+            }
+        };
+
+        for mount in mounts
+            .into_iter()
+            .filter(|mount| mount.projection.uses_virtual_filesystem())
+        {
+            let Some(interval) =
+                crate::source::source_descriptor(&mount.connector).periodic_discovery_interval()
+            else {
+                continue;
+            };
+            if self
+                .last_periodic_discovery
+                .get(&mount.mount_id)
+                .is_some_and(|last| now.saturating_duration_since(*last) < interval)
+            {
+                continue;
+            }
+            let request = ChildRefreshRequest {
+                mount_id: mount.mount_id.0.clone(),
+                container_identifier: mount_point_identifier(&mount),
+                priority: ChildRefreshPriority::Background,
+                depth: PERIODIC_DISCOVERY_DEPTH,
+            };
+            let key = request.key();
+            if self.child_refreshes.contains(&key) || self.active_child_refreshes.contains_key(&key)
+            {
+                continue;
+            }
+            self.completed_child_refreshes.remove(&key);
+            if self.child_refreshes.queue(request) {
+                self.last_periodic_discovery.insert(mount.mount_id, now);
+            }
         }
     }
 
@@ -2907,8 +3055,11 @@ fn load_persisted_hydrations(state_root: &Path) -> HydrationQueue {
     queue
 }
 
-fn load_persisted_child_refreshes(state_root: &Path) -> ChildRefreshQueue {
+fn load_persisted_child_refreshes(
+    state_root: &Path,
+) -> (ChildRefreshQueue, BTreeMap<ChildRefreshKey, u32>) {
     let mut queue = ChildRefreshQueue::default();
+    let mut failures = BTreeMap::new();
     match SqliteStateStore::open(state_root.to_path_buf())
         .and_then(|store| store.list_metadata_discovery_jobs())
     {
@@ -2922,12 +3073,18 @@ fn load_persisted_child_refreshes(state_root: &Path) -> ChildRefreshQueue {
                             .ok()
                     })
                     .unwrap_or(job.depth);
-                queue.queue(ChildRefreshRequest {
+                let request = ChildRefreshRequest {
                     mount_id: job.mount_id.0,
                     container_identifier: job.container_identifier,
                     priority: child_refresh_priority_from_metadata(job.priority),
                     depth,
-                });
+                };
+                if job.attempts > 0 {
+                    failures.insert(request.key(), job.attempts);
+                    queue.queue_after(request, child_refresh_retry_delay(job.attempts));
+                } else {
+                    queue.queue(request);
+                }
             }
         }
         Err(error) => {
@@ -2935,7 +3092,7 @@ fn load_persisted_child_refreshes(state_root: &Path) -> ChildRefreshQueue {
         }
     }
 
-    queue
+    (queue, failures)
 }
 
 fn metadata_discovery_priority_from_child_refresh(
@@ -4884,7 +5041,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use locality_core::LocalityError;
     use locality_core::canonical::render_canonical_markdown;
@@ -4910,8 +5067,8 @@ mod tests {
     use super::{
         ActiveChildRefresh, ActiveRuntimeJob, ChildRefreshPriority, ChildRefreshQueue,
         ChildRefreshRequest, DaemonRequest, DefaultRuntimeJobRunner, JobCompletion,
-        RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState, execute_file_event,
-        execute_observe_entity_job, observable_remote_identifier,
+        RemoteDiscoveryHint, RuntimeJobRunner, RuntimeState, child_refresh_retry_delay,
+        execute_file_event, execute_observe_entity_job, observable_remote_identifier,
         remote_fast_forward_discovery_hints, repair_clean_remote_deleted_projections,
     };
 
@@ -5015,6 +5172,72 @@ mod tests {
     }
 
     #[test]
+    fn delayed_child_refresh_does_not_block_another_source() {
+        let mut queue = ChildRefreshQueue::default();
+        let delayed = request(
+            "notion-main",
+            "mount:notion-main",
+            ChildRefreshPriority::Background,
+            0,
+        );
+        queue.queue_after(delayed.clone(), std::time::Duration::from_secs(60));
+        queue.queue(request(
+            "granola-main",
+            "mount:granola-main",
+            ChildRefreshPriority::Background,
+            0,
+        ));
+
+        let ready = queue.pop_ready(&BTreeMap::new()).expect("healthy source");
+
+        assert_eq!(ready.mount_id, "granola-main");
+        assert!(queue.pop_ready(&BTreeMap::new()).is_none());
+        assert_eq!(queue.debug_requests(10), vec![delayed]);
+    }
+
+    #[test]
+    fn interactive_child_refresh_promotes_a_delayed_request_immediately() {
+        let mut queue = ChildRefreshQueue::default();
+        queue.queue_after(
+            request(
+                "notion-main",
+                "mount:notion-main",
+                ChildRefreshPriority::Background,
+                0,
+            ),
+            std::time::Duration::from_secs(60),
+        );
+        queue.queue(request(
+            "notion-main",
+            "mount:notion-main",
+            ChildRefreshPriority::Interactive,
+            0,
+        ));
+
+        let ready = queue
+            .pop_ready(&BTreeMap::new())
+            .expect("interactive promotion");
+
+        assert_eq!(ready.priority, ChildRefreshPriority::Interactive);
+    }
+
+    #[test]
+    fn child_refresh_retry_delay_is_bounded_exponential_backoff() {
+        assert_eq!(
+            child_refresh_retry_delay(1),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            child_refresh_retry_delay(5),
+            std::time::Duration::from_secs(16)
+        );
+        assert_eq!(
+            child_refresh_retry_delay(99),
+            std::time::Duration::from_secs(300)
+        );
+    }
+
+    #[test]
     fn metadata_discovery_jobs_reload_into_child_refresh_queue() {
         let state_root = temp_runtime_root("runtime-metadata-discovery-reload");
         seed_virtual_mount(&state_root);
@@ -5072,6 +5295,96 @@ mod tests {
         assert_eq!(requests[0].container_identifier, "children:page-1");
         assert_eq!(requests[0].depth, 2);
 
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn failed_metadata_discovery_reloads_with_retry_backoff() {
+        let state_root = temp_runtime_root("runtime-metadata-discovery-reload-backoff");
+        seed_virtual_mount(&state_root);
+        {
+            let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+            store
+                .upsert_metadata_discovery_job(metadata_discovery_job(
+                    "children:page-1",
+                    MetadataDiscoveryPriority::Background,
+                    1,
+                ))
+                .expect("queue discovery");
+            store
+                .record_metadata_discovery_job_failure(
+                    &MountId::new("notion-main"),
+                    "children:page-1",
+                    "offline".to_string(),
+                )
+                .expect("record failure");
+        }
+
+        let mut runtime = runtime_state_for_root(state_root.clone());
+
+        assert_eq!(runtime.child_refreshes.debug_requests(10).len(), 1);
+        assert!(
+            runtime
+                .child_refreshes
+                .pop_ready(&BTreeMap::new())
+                .is_none()
+        );
+        assert_eq!(
+            runtime.child_refresh_failures.get(&super::ChildRefreshKey {
+                mount_id: "notion-main".to_string(),
+                container_identifier: "children:page-1".to_string(),
+            }),
+            Some(&1)
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn periodic_discovery_queues_only_the_granola_mount_root_without_persisting_a_job() {
+        let state_root = temp_runtime_root("runtime-granola-periodic-discovery");
+        {
+            let mut store = SqliteStateStore::open(state_root.clone()).expect("open store");
+            store
+                .save_mount(
+                    MountConfig::new(
+                        MountId::new("granola-main"),
+                        "granola",
+                        state_root.join("Locality/granola-main"),
+                    )
+                    .read_only(true)
+                    .projection(ProjectionMode::LinuxFuse),
+                )
+                .expect("save Granola mount");
+        }
+        let mut runtime = runtime_state_for_root(state_root.clone());
+
+        runtime.queue_due_periodic_discovery(Instant::now());
+
+        let requests = runtime.child_refreshes.debug_requests(10);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].mount_id, "granola-main");
+        assert_eq!(requests[0].container_identifier, "mount:granola-main");
+        assert_eq!(requests[0].priority, ChildRefreshPriority::Background);
+        assert_eq!(requests[0].depth, super::PERIODIC_DISCOVERY_DEPTH);
+        let jobs = SqliteStateStore::open(state_root.clone())
+            .expect("open store")
+            .list_metadata_discovery_jobs()
+            .expect("list discovery jobs");
+        assert!(jobs.is_empty());
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
+    #[test]
+    fn periodic_discovery_does_not_change_notion_scheduling() {
+        let state_root = temp_runtime_root("runtime-notion-no-periodic-discovery");
+        seed_virtual_mount(&state_root);
+        let mut runtime = runtime_state_for_root(state_root.clone());
+
+        runtime.queue_due_periodic_discovery(Instant::now());
+
+        assert!(runtime.child_refreshes.debug_requests(10).is_empty());
         let _ = std::fs::remove_dir_all(state_root);
     }
 

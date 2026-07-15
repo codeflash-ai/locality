@@ -624,8 +624,6 @@ p {
 .workspace-card .live-mode-control,
 .attention-panel .primary-button,
 .attention-panel .secondary-button,
-.suggestion-card .primary-button,
-.suggestion-card .secondary-button,
 .located-path .secondary-button,
 .activity-item .secondary-button,
 .footer-actions .primary-button,
@@ -1687,7 +1685,6 @@ p {
 .activity-item,
 .setting-row,
 .option-row,
-.suggestion-card,
 .attention-panel {
   display: flex;
   align-items: center;
@@ -1727,7 +1724,6 @@ p {
 
 .workspace-card,
 .panel,
-.suggestion-card,
 .attention-panel,
 .empty-action-panel,
 .mount-hero,
@@ -1744,7 +1740,6 @@ p {
 }
 
 .workspace-card,
-.suggestion-card,
 .attention-panel,
 .empty-action-panel,
 .mount-hero,
@@ -2807,6 +2802,11 @@ button.home-stat:hover {
   fill: #ea4335;
 }
 
+.connector-icon.granola {
+  background: #eee9df;
+  color: #443f37;
+}
+
 .connector-choice-facts {
   display: grid;
   border: 1px solid var(--line-soft);
@@ -2863,29 +2863,6 @@ button.home-stat:hover {
 
 .compact-settings {
   grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.suggestion-card {
-  justify-content: flex-start;
-}
-
-.suggestion-card > svg {
-  color: var(--accent);
-}
-
-.suggestion-card h3 {
-  margin-top: 4px;
-  font-size: 15px;
-}
-
-.suggestion-card p:last-child {
-  margin-top: 3px;
-  color: var(--muted);
-  font-size: var(--type-body);
-}
-
-.suggestion-card .secondary-button {
-  margin-left: auto;
 }
 
 .discovery-panel {

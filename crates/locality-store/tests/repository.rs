@@ -13,13 +13,38 @@ use locality_core::planner::{PushOperation, PushPlan};
 use locality_core::shadow::ShadowDocument;
 use locality_store::{
     AutoSaveEnrollmentRecord, AutoSaveOrigin, AutoSaveRepository, AutoSaveState, ConnectionId,
-    EntityRecord, EntityRepository, FreshnessStateRecord, FreshnessStateRepository,
-    InMemoryStateStore, JournalRepository, MetadataDiscoveryJobRecord,
-    MetadataDiscoveryJobRepository, MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord,
-    MountLiveModeRepository, MountLiveModeState, MountRepository, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
-    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
+    ConnectorStateRecord, ConnectorStateRepository, EntityRecord, EntityRepository,
+    FreshnessStateRecord, FreshnessStateRepository, InMemoryStateStore, JournalRepository,
+    MetadataDiscoveryJobRecord, MetadataDiscoveryJobRepository, MetadataDiscoveryPriority,
+    MountConfig, MountLiveModeRecord, MountLiveModeRepository, MountLiveModeState, MountRepository,
+    RemoteObservationRecord, RemoteObservationRepository, ShadowRepository, SqliteStateStore,
+    StoreError, VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
+
+#[test]
+fn connector_state_round_trips_by_connector_scope() {
+    let mut store = InMemoryStateStore::new();
+    let record = ConnectorStateRecord {
+        connector: "granola".to_string(),
+        scope_kind: "mount".to_string(),
+        scope_id: "granola-main".to_string(),
+        state_version: 1,
+        min_reader_version: 1,
+        state_json: r#"{"last_success_unix_ms":123}"#.to_string(),
+        updated_at: "unix_ms:123".to_string(),
+    };
+
+    store
+        .save_connector_state(record.clone())
+        .expect("save connector state");
+
+    assert_eq!(
+        store
+            .get_connector_state("granola", "mount", "granola-main")
+            .expect("load connector state"),
+        Some(record)
+    );
+}
 
 #[test]
 fn mount_config_round_trips_with_read_only_flag() {
@@ -141,6 +166,12 @@ fn remounting_same_mount_id_to_different_connection_clears_source_scoped_state()
             .is_empty()
     );
     assert!(store.list_journal().expect("list journal").is_empty());
+    assert_eq!(
+        store
+            .get_connector_state("notion", "mount", mount_id().as_str())
+            .expect("load connector state"),
+        None
+    );
     assert!(matches!(
         store.load_shadow(&mount_id(), &RemoteId::new("page-1")),
         Err(StoreError::ShadowMissing { .. })
@@ -877,6 +908,17 @@ fn journal_entry(push_id: &str, status: JournalStatus) -> JournalEntry {
 }
 
 fn seed_source_scoped_state(store: &mut InMemoryStateStore) {
+    store
+        .save_connector_state(ConnectorStateRecord {
+            connector: "notion".to_string(),
+            scope_kind: "mount".to_string(),
+            scope_id: mount_id().0,
+            state_version: 1,
+            min_reader_version: 1,
+            state_json: "{}".to_string(),
+            updated_at: "1".to_string(),
+        })
+        .expect("save connector state");
     store
         .save_entity(entity_record("page-1", "Roadmap.md"))
         .expect("save entity");

@@ -28,7 +28,6 @@ import {
   Search,
   Settings,
   ShieldCheck,
-  Sparkles,
   Square,
   PanelLeftClose,
   PanelLeftOpen,
@@ -47,9 +46,12 @@ import {
   selectedMountIdAfterOpenViewEvent,
   selectedMountIdAfterViewChange,
   selectedMountRow,
+  sourceDestructiveConfirmation,
+  sourceDestructiveConfirmationMatches,
   type MountRow,
   type MountSummary,
   type ProviderRuntimeSummary,
+  type SourceDestructiveAction,
 } from "./mounts";
 import { connectionMissing, connectionReady } from "./connection-state";
 import { copyLoginLinkDisabled, loginLinkFlowMode } from "./onboarding-connect";
@@ -82,6 +84,13 @@ import {
   updateStatusLabel,
   type UpdateStatus,
 } from "./updater";
+import {
+  sourceSetupIsActiveConnector,
+  sourceSetupIsBusy,
+  sourceSetupProgressLabel,
+  type SourceConnectorId,
+  type SourceSetupState,
+} from "./source-setup";
 import localityShortDarkUrl from "./assets/brand/locality-short-dark.svg";
 import localityShortLightUrl from "./assets/brand/locality-short-light.svg";
 
@@ -96,8 +105,6 @@ type ReviewFilter = "all" | "approvals" | "problems";
 type FileStatusFilter = "all" | "review" | "conflict" | "synced";
 type DestructiveSettingsAction = "reset" | "uninstall";
 type SettingsSection = "general" | "sources" | "sync" | "activity" | "agents" | "advanced" | "about";
-type SourceSetupState = "idle" | "connecting" | "creating" | "changing" | "success" | "error";
-type SourceConnectorId = "notion" | "google-docs" | "gmail";
 type SourceListViewMode = "list" | "tiles";
 type ConnectorOption = {
   id: SourceConnectorId;
@@ -2582,17 +2589,6 @@ function HomeView({
         </section>
       )}
 
-      <section className="suggestion-card">
-        <Sparkles />
-        <div>
-          <p className="label">Suggestion</p>
-          <h3>Connect {snapshot.suggestions[0]?.connector ?? "Linear"}</h3>
-          <p>{snapshot.suggestions[0]?.description ?? "Connect more workspaces as local files."}</p>
-        </div>
-        <SecondaryButton compact disabled>
-          Coming Soon
-        </SecondaryButton>
-      </section>
     </div>
   );
 }
@@ -2615,12 +2611,17 @@ function MountsView({
   const [refreshing, setRefreshing] = useState(false);
   const [sourceDialogOpen, setSourceDialogOpen] = useState(false);
   const [sourceDialogState, setSourceDialogState] = useState<SourceSetupState>("idle");
+  const [sourceDialogConnector, setSourceDialogConnector] = useState<SourceConnectorId | null>(null);
   const [sourceDialogMessage, setSourceDialogMessage] = useState("");
+  const sourceSetupBusy = sourceSetupIsBusy(sourceDialogState);
 
   function openAddSourceDialog() {
     setActionError("");
-    setSourceDialogMessage("");
-    setSourceDialogState("idle");
+    if (!sourceSetupBusy) {
+      setSourceDialogMessage("");
+      setSourceDialogState("idle");
+      setSourceDialogConnector(null);
+    }
     setSourceDialogOpen(true);
   }
 
@@ -2706,6 +2707,9 @@ function MountsView({
     if (connector === "notion") {
       return connectNotionSource();
     }
+    if (connector === "granola") {
+      return { ok: false, message: "Granola requires an API key." };
+    }
 
     const command = connector === "google-docs" ? "connect_google_docs" : "connect_gmail";
     setActionError("");
@@ -2726,11 +2730,12 @@ function MountsView({
     connector: SourceConnectorId,
     options?: { googleDocsWorkspaceFolder?: string },
   ) {
-    if (sourceDialogState === "connecting" || sourceDialogState === "creating" || sourceDialogState === "changing") {
+    if (sourceSetupBusy) {
       return;
     }
 
     setSourceDialogMessage("");
+    setSourceDialogConnector(connector);
     const nextState = connector === "notion"
       ? connectionMissing(snapshot)
         ? "connecting"
@@ -2769,6 +2774,35 @@ function MountsView({
     }
   }
 
+  async function connectGranolaSource(apiKey: string) {
+    if (sourceSetupBusy) {
+      return;
+    }
+    setSourceDialogMessage("");
+    setSourceDialogConnector("granola");
+    setSourceDialogState("connecting");
+    try {
+      const report = await callCommand<ActionReport>(
+        "connect_granola",
+        { apiKey },
+        { ok: true, message: "Connected demo Granola source." },
+      );
+      setSourceDialogMessage(report.message);
+      setSourceDialogState(report.ok ? "success" : "error");
+      if (!report.ok) {
+        setActionError(report.message);
+      }
+      if (report.ok) {
+        await onRefresh();
+      }
+    } catch (error) {
+      const message = errorMessage(error);
+      setSourceDialogMessage(message);
+      setActionError(message);
+      setSourceDialogState("error");
+    }
+  }
+
   async function refreshMounts() {
     if (refreshing) {
       return;
@@ -2802,7 +2836,7 @@ function MountsView({
       <ViewHeader title={PRODUCT_TERMS.sources}>
         <SecondaryButton
           compact
-          busy={sourceDialogState === "connecting" || sourceDialogState === "creating" || sourceDialogState === "changing"}
+          busy={sourceSetupBusy}
           icon={<Plus />}
           onClick={openAddSourceDialog}
         >
@@ -2901,8 +2935,10 @@ function MountsView({
         <AddSourceDialog
           snapshot={snapshot}
           state={sourceDialogState}
+          activeConnector={sourceDialogConnector}
           message={sourceDialogMessage}
           onAction={(connector, options) => void runSourceDialogAction(connector, options)}
+          onGranolaAction={(apiKey) => void connectGranolaSource(apiKey)}
           onClose={() => setSourceDialogOpen(false)}
         />
       )}
@@ -2913,22 +2949,27 @@ function MountsView({
 function AddSourceDialog({
   snapshot,
   state,
+  activeConnector,
   message,
   onAction,
+  onGranolaAction,
   onClose,
 }: {
   snapshot: DesktopSnapshot;
   state: SourceSetupState;
+  activeConnector: SourceConnectorId | null;
   message: string;
   onAction: (connector: SourceConnectorId, options?: { googleDocsWorkspaceFolder?: string }) => void;
+  onGranolaAction: (apiKey: string) => void;
   onClose: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [viewMode, setViewMode] = useState<SourceListViewMode>("list");
   const [googleDocsWorkspaceFolder, setGoogleDocsWorkspaceFolder] = useState("Locality");
+  const [granolaApiKey, setGranolaApiKey] = useState("");
   const needsConnection = connectionMissing(snapshot);
   const needsFolder = !needsConnection && mountMissing(snapshot);
-  const busy = state === "connecting" || state === "creating" || state === "changing";
+  const busy = sourceSetupIsBusy(state);
   const sourceStatus = needsConnection
     ? "Not connected"
     : needsFolder
@@ -2960,6 +3001,14 @@ function AddSourceDialog({
       keywords: ["gmail", "mail", "email", "inbox", "drafts"],
       mounted: mountedConnectors.has("gmail"),
     },
+    {
+      id: "granola",
+      name: "Granola",
+      description: "Meeting summaries and raw transcripts as read-only files.",
+      status: mountedConnectors.has("granola") ? "Mounted" : "API key required",
+      keywords: ["granola", "meetings", "notes", "transcripts", "summaries"],
+      mounted: mountedConnectors.has("granola"),
+    },
   ];
   const normalizedQuery = query.trim().toLowerCase();
   const visibleConnectors = normalizedQuery
@@ -2980,7 +3029,7 @@ function AddSourceDialog({
             <h2 id="add-source-title">Connect a workspace</h2>
             <p>Choose the system Locality should expose as local files.</p>
           </div>
-          <button className="icon-button has-tooltip" data-tooltip="Close" disabled={busy} onClick={onClose}>
+          <button className="icon-button has-tooltip" data-tooltip="Close" onClick={onClose}>
             <X />
           </button>
         </div>
@@ -3020,7 +3069,11 @@ function AddSourceDialog({
         <div className="source-list-scroll">
           <div className={`connector-choice-grid ${viewMode}`}>
             {visibleConnectors.map((connector) => {
+              const connectorBusy = sourceSetupIsActiveConnector(state, activeConnector, connector.id);
               const disabled = busy || (connector.id !== "notion" && connector.mounted);
+              const displayedStatus = connectorBusy
+                ? sourceSetupProgressLabel(state, connector.mounted)
+                : connector.status;
               const actionLabel = sourceActionLabel(connector.id, {
                 needsConnection,
                 needsFolder,
@@ -3040,13 +3093,15 @@ function AddSourceDialog({
                     </div>
                     <StatusPill
                       tone={
-                        connector.mounted || (connector.id === "notion" && !needsConnection && !needsFolder)
+                        connectorBusy
+                          ? "warn"
+                          : connector.mounted || (connector.id === "notion" && !needsConnection && !needsFolder)
                           ? "ready"
                           : "warn"
                       }
-                      title={connector.status}
+                      title={displayedStatus}
                     >
-                      {connector.status}
+                      {displayedStatus}
                     </StatusPill>
                   </div>
                   <div className="connector-choice-facts">
@@ -3059,6 +3114,11 @@ function AddSourceDialog({
                     ) : connector.id === "google-docs" ? (
                       <>
                         <SettingRow title="Workspace folder" value={googleDocsWorkspaceFolder || "Locality"} />
+                        <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
+                      </>
+                    ) : connector.id === "granola" ? (
+                      <>
+                        <SettingRow title="Content" value="Summaries and transcripts" />
                         <SettingRow title="Local folder" value={sourceDefaultPath(snapshot, connector.id)} />
                       </>
                     ) : (
@@ -3078,19 +3138,47 @@ function AddSourceDialog({
                       />
                     </label>
                   )}
-                  {connector.mounted && connector.id !== "notion" ? (
+                  {connector.id === "granola" && !connector.mounted && (
+                    <>
+                      <label className="source-inline-field">
+                        <span>Granola API key</span>
+                        <input
+                          type="password"
+                          autoComplete="off"
+                          value={granolaApiKey}
+                          placeholder="Paste API key"
+                          disabled={busy}
+                          onChange={(event) => setGranolaApiKey(event.target.value)}
+                        />
+                      </label>
+                      <p className="quiet-note">
+                        Create a key in Granola Settings → Connectors → API keys. Business or Enterprise is required.
+                      </p>
+                    </>
+                  )}
+                  {connector.mounted && connector.id !== "notion" && !connectorBusy ? (
                     <SecondaryButton compact disabled icon={<Check />}>
                       Mounted
                     </SecondaryButton>
+                  ) : connector.id === "granola" ? (
+                    <PrimaryButton
+                      compact
+                      busy={connectorBusy}
+                      disabled={disabled || (!connector.mounted && !granolaApiKey.trim())}
+                      icon={<ShieldCheck />}
+                      onClick={() => onGranolaAction(granolaApiKey)}
+                    >
+                      {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : "Connect Granola"}
+                    </PrimaryButton>
                   ) : (
                     <PrimaryButton
                       compact
-                      busy={busy}
-                      disabled={connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim()}
-                      icon={busy ? <Loader2 className="spin-icon" /> : sourceActionIcon(connector.id, needsConnection)}
+                      busy={connectorBusy}
+                      disabled={disabled || (connector.id === "google-docs" && !googleDocsWorkspaceFolder.trim())}
+                      icon={sourceActionIcon(connector.id, needsConnection)}
                       onClick={() => onAction(connector.id, { googleDocsWorkspaceFolder })}
                     >
-                      {busy ? "Working" : actionLabel}
+                      {connectorBusy ? sourceSetupProgressLabel(state, connector.mounted) : actionLabel}
                     </PrimaryButton>
                   )}
                 </article>
@@ -3102,6 +3190,7 @@ function AddSourceDialog({
           </div>
         </div>
 
+        {busy && <p className="quiet-note inline-note">Setup continues if you close this window.</p>}
         {message && <p className={state === "error" ? "field-error" : "quiet-note inline-note"}>{message}</p>}
       </section>
     </div>
@@ -3116,6 +3205,8 @@ function sourceDisplayName(connector: SourceConnectorId) {
       return "Google Docs";
     case "gmail":
       return "Gmail";
+    case "granola":
+      return "Granola";
   }
 }
 
@@ -3127,6 +3218,8 @@ function sourceMountId(connector: SourceConnectorId) {
       return "google-docs-main";
     case "gmail":
       return "gmail-main";
+    case "granola":
+      return "granola-main";
   }
 }
 
@@ -3145,6 +3238,8 @@ function sourceDefaultPath(snapshot: DesktopSnapshot, connector: SourceConnector
       return "~/Library/CloudStorage/Locality/google-docs-main";
     case "gmail":
       return "~/Library/CloudStorage/Locality/gmail-main";
+    case "granola":
+      return "~/Library/CloudStorage/Locality/granola";
   }
 }
 
@@ -3193,6 +3288,7 @@ function ConnectorIcon({ connector }: { connector: SourceConnectorId }) {
           <path className="gmail-red" d="M6.5 9.2c0-1.5 1.8-2.4 3-1.5L16 12.6l6.5-4.9c1.2-.9 3 .0 3 1.5v.9L16 17.2 6.5 10.1v-.9Z" />
         </svg>
       )}
+      {connector === "granola" && <span>G</span>}
     </span>
   );
 }
@@ -3486,6 +3582,10 @@ function MountDetailView({
   const [accessState, setAccessState] = useState<"idle" | "changing" | "success" | "error">("idle");
   const [pullMessage, setPullMessage] = useState("");
   const [pullState, setPullState] = useState<"idle" | "pulling" | "success" | "error">("idle");
+  const [sourceAction, setSourceAction] = useState<SourceDestructiveAction | null>(null);
+  const [sourceConfirmation, setSourceConfirmation] = useState("");
+  const [sourceActionBusy, setSourceActionBusy] = useState(false);
+  const [sourceActionMessage, setSourceActionMessage] = useState("");
   const accountLabel = isActiveMount ? snapshot.connection.accountLabel.trim() : "";
   const showAccount = accountLabel.length > 0 && accountLabel !== mount.workspaceName;
   const providerState = mount.provider?.state ?? "Not registered";
@@ -3567,6 +3667,51 @@ function MountDetailView({
     } catch (error) {
       setPullMessage(errorMessage(error));
       setPullState("error");
+    }
+  }
+
+  function requestSourceAction(action: SourceDestructiveAction) {
+    setSourceActionMessage("");
+    setSourceConfirmation("");
+    setSourceAction(action);
+  }
+
+  function cancelSourceAction() {
+    if (sourceActionBusy) {
+      return;
+    }
+    setSourceAction(null);
+    setSourceConfirmation("");
+  }
+
+  async function confirmSourceAction() {
+    if (!sourceAction || sourceActionBusy) {
+      return;
+    }
+    setSourceActionMessage("");
+    setSourceActionBusy(true);
+    try {
+      const command = sourceAction === "reset" ? "reset_source_state" : "disconnect_source";
+      const report = await callCommand<ActionReport>(
+        command,
+        { mountId: mount.mountId, confirmation: sourceConfirmation },
+        {
+          ok: true,
+          message: sourceAction === "reset"
+            ? `Reset demo source ${mount.mountId}.`
+            : `Disconnected demo source ${mount.mountId}.`,
+        },
+      );
+      setSourceActionMessage(report.message);
+      if (report.ok) {
+        setSourceAction(null);
+        setSourceConfirmation("");
+        await onRefresh().catch(() => undefined);
+      }
+    } catch (error) {
+      setSourceActionMessage(errorMessage(error));
+    } finally {
+      setSourceActionBusy(false);
     }
   }
 
@@ -3766,20 +3911,180 @@ function MountDetailView({
           <div>
             <h3>Source-scoped destructive actions</h3>
             <p>
-              Disconnect and reset actions need typed confirmation before they are safe to expose.
-              Until then, use Settings for all-machine maintenance.
+              Reset rebuilds this source from remote data. Disconnect revokes its saved connection
+              while keeping the registered local folder available for reconnection.
             </p>
+            {sourceActionMessage && <p className="quiet-note inline-note">{sourceActionMessage}</p>}
           </div>
           <div className="danger-actions">
-            <SecondaryButton compact disabled>
-              Reset Source State
+            <SecondaryButton
+              compact
+              icon={sourceActionBusy && sourceAction === "reset" ? <Loader2 className="spin-icon" /> : <RotateCcw />}
+              disabled={sourceActionBusy}
+              onClick={() => requestSourceAction("reset")}
+            >
+              {sourceActionBusy && sourceAction === "reset" ? "Resetting" : "Reset Source State"}
             </SecondaryButton>
-            <SecondaryButton compact disabled>
-              Disconnect Source
+            <SecondaryButton
+              compact
+              icon={sourceActionBusy && sourceAction === "disconnect" ? <Loader2 className="spin-icon" /> : <Trash2 />}
+              disabled={sourceActionBusy}
+              onClick={() => requestSourceAction("disconnect")}
+            >
+              {sourceActionBusy && sourceAction === "disconnect" ? "Disconnecting" : "Disconnect Source"}
             </SecondaryButton>
           </div>
         </div>
       </details>
+      {sourceAction && (
+        <DestructiveSourceDialog
+          action={sourceAction}
+          mount={mount}
+          value={sourceConfirmation}
+          busy={sourceActionBusy}
+          message={sourceActionMessage}
+          onChange={setSourceConfirmation}
+          onCancel={cancelSourceAction}
+          onConfirm={() => void confirmSourceAction()}
+        />
+      )}
+    </div>
+  );
+}
+
+function DestructiveSourceDialog({
+  action,
+  mount,
+  value,
+  busy,
+  message,
+  onChange,
+  onCancel,
+  onConfirm,
+}: {
+  action: SourceDestructiveAction;
+  mount: MountSummary;
+  value: string;
+  busy: boolean;
+  message: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const isReset = action === "reset";
+  const requiredValue = sourceDestructiveConfirmation(action, mount.mountId);
+  const confirmed = sourceDestructiveConfirmationMatches(action, mount.mountId, value);
+  const title = isReset ? `Reset ${mount.connectorName} source state` : `Disconnect ${mount.connectorName} source`;
+  const actionLabel = isReset ? "Reset source state" : "Disconnect source";
+  const description = isReset
+    ? `This clears Locality's cached state for ${mount.mountId} and rebuilds it from ${mount.connectorName}.`
+    : `This revokes the saved connection used by ${mount.mountId}.`;
+  const consequences = isReset
+    ? [
+        "The remote source is not changed.",
+        "Pending local changes are preserved in Locality's recovery folder before reset.",
+        "The source folder is repopulated from remote data.",
+      ]
+    : [
+        "The remote source is not changed.",
+        "Cached local files and the mount registration are kept.",
+        "Any other mount using the same saved connection will also need reconnection.",
+      ];
+
+  return (
+    <TypedDestructiveDialog
+      titleId="destructive-source-title"
+      title={title}
+      description={description}
+      consequences={consequences}
+      requiredValue={requiredValue}
+      actionLabel={actionLabel}
+      value={value}
+      confirmed={confirmed}
+      busy={busy}
+      message={message}
+      onChange={onChange}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+    />
+  );
+}
+
+function TypedDestructiveDialog({
+  titleId,
+  title,
+  description,
+  consequences,
+  requiredValue,
+  actionLabel,
+  value,
+  confirmed,
+  busy,
+  message = "",
+  onChange,
+  onCancel,
+  onConfirm,
+}: {
+  titleId: string;
+  title: string;
+  description: string;
+  consequences: string[];
+  requiredValue: string;
+  actionLabel: string;
+  value: string;
+  confirmed: boolean;
+  busy: boolean;
+  message?: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="destructive-modal" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+        <div className="destructive-modal-header">
+          <div>
+            <h2 id={titleId}>{title}</h2>
+            <p>{description}</p>
+          </div>
+          <button className="icon-button has-tooltip" data-tooltip="Cancel" disabled={busy} onClick={onCancel}>
+            <X />
+          </button>
+        </div>
+        <ul className="destructive-list">
+          {consequences.map((item) => (
+            <li key={item}>{item}</li>
+          ))}
+        </ul>
+        <label className="destructive-input-label">
+          <span>
+            Type <strong>{requiredValue}</strong> to confirm
+          </span>
+          <input
+            autoFocus
+            value={value}
+            disabled={busy}
+            onChange={(event) => onChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                onCancel();
+              }
+              if (event.key === "Enter" && confirmed && !busy) {
+                onConfirm();
+              }
+            }}
+          />
+        </label>
+        {message && <p className="field-error">{message}</p>}
+        <div className="modal-actions">
+          <SecondaryButton disabled={busy} onClick={onCancel}>
+            Cancel
+          </SecondaryButton>
+          <button className="destructive-action-button" disabled={!confirmed || busy} onClick={onConfirm}>
+            {busy ? "Working..." : actionLabel}
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
@@ -5012,51 +5317,20 @@ function DestructiveSettingsDialog({
       ];
 
   return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="destructive-modal" role="dialog" aria-modal="true" aria-labelledby="destructive-settings-title">
-        <div className="destructive-modal-header">
-          <div>
-            <h2 id="destructive-settings-title">{title}</h2>
-            <p>{description}</p>
-          </div>
-          <button className="icon-button has-tooltip" data-tooltip="Cancel" disabled={busy} onClick={onCancel}>
-            <X />
-          </button>
-        </div>
-        <ul className="destructive-list">
-          {consequences.map((item) => (
-            <li key={item}>{item}</li>
-          ))}
-        </ul>
-        <label className="destructive-input-label">
-          <span>
-            Type <strong>{requiredValue}</strong> to confirm
-          </span>
-          <input
-            autoFocus
-            value={value}
-            disabled={busy}
-            onChange={(event) => onChange(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                onCancel();
-              }
-              if (event.key === "Enter" && confirmed && !busy) {
-                onConfirm();
-              }
-            }}
-          />
-        </label>
-        <div className="modal-actions">
-          <SecondaryButton disabled={busy} onClick={onCancel}>
-            Cancel
-          </SecondaryButton>
-          <button className="destructive-action-button" disabled={!confirmed || busy} onClick={onConfirm}>
-            {busy ? "Working..." : actionLabel}
-          </button>
-        </div>
-      </section>
-    </div>
+    <TypedDestructiveDialog
+      titleId="destructive-settings-title"
+      title={title}
+      description={description}
+      consequences={consequences}
+      requiredValue={requiredValue}
+      actionLabel={actionLabel}
+      value={value}
+      confirmed={confirmed}
+      busy={busy}
+      onChange={onChange}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+    />
   );
 }
 

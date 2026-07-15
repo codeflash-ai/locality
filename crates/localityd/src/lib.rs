@@ -4,6 +4,7 @@ pub mod file_provider;
 pub mod freshness;
 pub mod gmail;
 pub mod google_docs;
+pub mod granola;
 pub mod hydration;
 pub mod ipc;
 pub mod mcp;

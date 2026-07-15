@@ -10,6 +10,7 @@ members = [
   "crates/locality-notion",
   "crates/locality-google-docs",
   "crates/locality-gmail",
+  "crates/locality-granola",
   "platform/linux/locality-fuse",
   "platform/windows/locality-cloud-files",
 ]
@@ -29,3 +30,4 @@ locality-store = { path = "crates/locality-store" }
 locality-notion = { path = "crates/locality-notion" }
 locality-google-docs = { path = "crates/locality-google-docs" }
 locality-gmail = { path = "crates/locality-gmail" }
+locality-granola = { path = "crates/locality-granola" }

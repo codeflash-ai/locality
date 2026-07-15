@@ -41,6 +41,24 @@ export type MountRow = {
   active: boolean;
 };
 
+export type SourceDestructiveAction = "reset" | "disconnect";
+
+export function sourceDestructiveConfirmation(
+  action: SourceDestructiveAction,
+  mountId: string,
+): string {
+  const verb = action === "reset" ? "RESET" : "DISCONNECT";
+  return `${verb} ${mountId.trim()}`;
+}
+
+export function sourceDestructiveConfirmationMatches(
+  action: SourceDestructiveAction,
+  mountId: string,
+  value: string,
+): boolean {
+  return value.trim() === sourceDestructiveConfirmation(action, mountId);
+}
+
 export function mountRows(
   mounts: MountSummary[],
   fallbackMount: MountSummary,

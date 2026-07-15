@@ -10,6 +10,7 @@ use locality_google_docs::{
     GOOGLE_DOCS_CONNECTOR_ID, GOOGLE_DOCS_OAUTH_SCOPES, HttpGoogleDocsOAuthBrokerClient,
     StoredGoogleDocsCredential, google_docs_capabilities_json,
 };
+use locality_granola::{GRANOLA_CONNECTOR_ID, GranolaApi, HttpGranolaApiClient};
 use locality_notion::NotionConfig;
 use locality_notion::client::{DEFAULT_NOTION_TOKEN_ENV, HttpNotionApi, NotionApi};
 use locality_notion::oauth::{
@@ -27,6 +28,7 @@ pub const DEFAULT_NOTION_PROFILE_ID: &str = "notion-token-default";
 pub const DEFAULT_NOTION_OAUTH_PROFILE_ID: &str = "notion-oauth-default";
 pub const DEFAULT_GOOGLE_DOCS_OAUTH_PROFILE_ID: &str = "google-docs-oauth-default";
 pub const DEFAULT_GMAIL_OAUTH_PROFILE_ID: &str = "gmail-oauth-default";
+pub const DEFAULT_GRANOLA_API_KEY_PROFILE_ID: &str = "granola-api-key-default";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectOptions {
@@ -159,6 +161,22 @@ pub struct NotionConnectionProbeResult {
 
 pub trait NotionConnectionProbe {
     fn probe(&self, token: &str) -> Result<NotionConnectionProbeResult, ConnectError>;
+}
+
+pub trait GranolaConnectionProbe {
+    fn probe(&self, api_key: &str) -> Result<(), ConnectError>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HttpGranolaConnectionProbe;
+
+impl GranolaConnectionProbe for HttpGranolaConnectionProbe {
+    fn probe(&self, api_key: &str) -> Result<(), ConnectError> {
+        HttpGranolaApiClient::new(api_key)
+            .list_notes(None, 1, None, None, None)
+            .map(|_| ())
+            .map_err(|error| ConnectError::ConnectionProbeFailed(error.to_string()))
+    }
 }
 
 pub trait NotionOAuthExchange {
@@ -314,6 +332,71 @@ where
         workspace_id: probe_result.workspace_id,
         workspace_name: probe_result.workspace_name,
         auth_kind: "token".to_string(),
+    })
+}
+
+pub fn run_connect_granola<S, P>(
+    store: &mut S,
+    credentials: &dyn CredentialStore,
+    options: ConnectOptions,
+    probe: &P,
+) -> Result<ConnectReport, ConnectError>
+where
+    S: ConnectionRepository + ConnectorProfileRepository,
+    P: GranolaConnectionProbe,
+{
+    let connection_id = match options.connection_id {
+        Some(connection_id) => connection_id,
+        None => default_connection_id_for_connector(
+            store,
+            GRANOLA_CONNECTOR_ID,
+            "granola-default",
+            "Granola",
+        )?,
+    };
+    probe.probe(&options.token)?;
+    let secret_ref = format!("connection:{}", connection_id.0);
+    credentials
+        .put(&secret_ref, &options.token)
+        .map_err(|error| ConnectError::Credential(CredentialStorageFailure::granola(error)))?;
+
+    let now = timestamp();
+    let profile_id = ConnectorProfileId::new(DEFAULT_GRANOLA_API_KEY_PROFILE_ID);
+    store
+        .save_connector_profile(default_granola_api_key_profile(now.clone()))
+        .map_err(ConnectError::Store)?;
+    let display_name = connection_id.0.clone();
+    store
+        .save_connection(ConnectionRecord {
+            connection_id: connection_id.clone(),
+            profile_id: Some(profile_id.clone()),
+            connector: GRANOLA_CONNECTOR_ID.to_string(),
+            display_name: display_name.clone(),
+            account_label: None,
+            workspace_id: None,
+            workspace_name: None,
+            auth_kind: "api_key".to_string(),
+            secret_ref,
+            scopes: vec!["read".to_string()],
+            capabilities_json: granola_capabilities_json()?,
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            expires_at: None,
+        })
+        .map_err(ConnectError::Store)?;
+
+    Ok(ConnectReport {
+        ok: true,
+        command: "connect",
+        connection_id: connection_id.0,
+        profile_id: profile_id.0,
+        connector: GRANOLA_CONNECTOR_ID.to_string(),
+        display_name,
+        account_label: None,
+        workspace_id: None,
+        workspace_name: None,
+        auth_kind: "api_key".to_string(),
     })
 }
 
@@ -824,6 +907,7 @@ enum CredentialFailureConnector {
     Notion,
     GoogleDocs,
     Gmail,
+    Granola,
 }
 
 impl CredentialEncodeFailure {
@@ -837,6 +921,10 @@ impl CredentialEncodeFailure {
 
     pub fn gmail(message: impl Into<String>) -> Self {
         Self::new(CredentialFailureConnector::Gmail, message)
+    }
+
+    pub fn granola(message: impl Into<String>) -> Self {
+        Self::new(CredentialFailureConnector::Granola, message)
     }
 
     fn new(connector: CredentialFailureConnector, message: impl Into<String>) -> Self {
@@ -870,6 +958,10 @@ impl CredentialStorageFailure {
 
     pub fn gmail(error: CredentialError) -> Self {
         Self::new(CredentialFailureConnector::Gmail, error)
+    }
+
+    pub fn granola(error: CredentialError) -> Self {
+        Self::new(CredentialFailureConnector::Granola, error)
     }
 
     fn new(connector: CredentialFailureConnector, error: CredentialError) -> Self {
@@ -908,6 +1000,7 @@ impl CredentialFailureConnector {
         match connector {
             GOOGLE_DOCS_CONNECTOR_ID => Self::GoogleDocs,
             GMAIL_CONNECTOR_ID => Self::Gmail,
+            GRANOLA_CONNECTOR_ID => Self::Granola,
             _ => Self::Notion,
         }
     }
@@ -917,6 +1010,7 @@ impl CredentialFailureConnector {
             Self::Notion => "Notion",
             Self::GoogleDocs => "Google Docs",
             Self::Gmail => "Gmail",
+            Self::Granola => "Granola",
         }
     }
 
@@ -925,6 +1019,7 @@ impl CredentialFailureConnector {
             Self::Notion => "loc connect notion",
             Self::GoogleDocs => "loc connect google-docs",
             Self::Gmail => "loc connect gmail",
+            Self::Granola => "loc connect granola --api-key-stdin",
         }
     }
 }
@@ -1097,6 +1192,28 @@ fn default_gmail_oauth_profile(now: String) -> ConnectorProfileRecord {
     }
 }
 
+fn default_granola_api_key_profile(now: String) -> ConnectorProfileRecord {
+    ConnectorProfileRecord {
+        profile_id: ConnectorProfileId::new(DEFAULT_GRANOLA_API_KEY_PROFILE_ID),
+        connector: GRANOLA_CONNECTOR_ID.to_string(),
+        display_name: "Granola API key".to_string(),
+        auth_kind: "api_key".to_string(),
+        scopes: vec!["read".to_string()],
+        capabilities_json: granola_capabilities_json().unwrap_or_else(|_| "{}".to_string()),
+        enabled_actions_json: "[\"read\"]".to_string(),
+        connector_version: "granola.v1".to_string(),
+        status: "active".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn granola_capabilities_json() -> Result<String, ConnectError> {
+    serde_json::to_string(&ConnectorCapabilities::read_only()).map_err(|error| {
+        ConnectError::CredentialEncode(CredentialEncodeFailure::granola(error.to_string()))
+    })
+}
+
 fn notion_capabilities_json() -> Result<String, ConnectError> {
     let capabilities = ConnectorCapabilities {
         supports_block_updates: true,
@@ -1166,4 +1283,55 @@ fn string_field(value: &serde_json::Value, pointer: &str) -> Option<String> {
         .pointer(pointer)
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use locality_store::{
+        ConnectionId, ConnectionRepository, CredentialStore, InMemoryCredentialStore,
+        InMemoryStateStore,
+    };
+
+    use super::{ConnectOptions, GranolaConnectionProbe, run_connect_granola};
+
+    #[derive(Debug)]
+    struct SuccessfulGranolaProbe;
+
+    impl GranolaConnectionProbe for SuccessfulGranolaProbe {
+        fn probe(&self, api_key: &str) -> Result<(), super::ConnectError> {
+            assert_eq!(api_key, "grn_test_secret");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn granola_connect_stores_secret_outside_connection_metadata() {
+        let mut store = InMemoryStateStore::new();
+        let credentials = InMemoryCredentialStore::new();
+        let report = run_connect_granola(
+            &mut store,
+            &credentials,
+            ConnectOptions {
+                connection_id: Some(ConnectionId::new("granola-work")),
+                token: "grn_test_secret".to_string(),
+            },
+            &SuccessfulGranolaProbe,
+        )
+        .expect("connect Granola");
+
+        assert_eq!(report.connector, "granola");
+        assert_eq!(report.auth_kind, "api_key");
+        let connection = store
+            .get_connection(&ConnectionId::new("granola-work"))
+            .expect("read connection")
+            .expect("connection");
+        assert_eq!(connection.secret_ref, "connection:granola-work");
+        assert!(!format!("{connection:?}").contains("grn_test_secret"));
+        assert_eq!(
+            credentials
+                .get("connection:granola-work")
+                .expect("stored credential"),
+            "grn_test_secret"
+        );
+    }
 }

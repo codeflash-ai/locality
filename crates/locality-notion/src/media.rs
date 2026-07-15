@@ -348,6 +348,9 @@ pub fn replace_media_manifest(
     assets: &[DownloadedMediaAsset],
 ) -> LocalityResult<()> {
     let existing = load_media_manifest(mount_root)?;
+    if assets.is_empty() && existing.assets.is_empty() {
+        return Ok(());
+    }
     let mut manifest = MediaManifest {
         version: 1,
         assets: BTreeMap::new(),
@@ -627,11 +630,26 @@ fn write_atomic(path: &Path, contents: &[u8]) -> LocalityResult<()> {
 mod tests {
     #[cfg(windows)]
     use super::resolve_media_href_with_content_root;
-    use super::{MediaAsset, local_media_href, media_local_path, resolve_media_href};
+    use super::{
+        MediaAsset, local_media_href, media_local_path, replace_media_manifest, resolve_media_href,
+    };
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::Path;
     use std::thread;
+
+    #[test]
+    fn replacing_absent_manifest_with_no_assets_does_not_create_mount_root() {
+        let root = std::env::temp_dir().join(format!(
+            "locality-empty-media-manifest-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        replace_media_manifest(&root, &[]).expect("replace empty manifest");
+
+        assert!(!root.exists());
+    }
 
     #[test]
     fn media_paths_mirror_page_paths_under_media_directory() {

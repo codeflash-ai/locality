@@ -195,6 +195,11 @@ test-rust: ## Run all Rust workspace tests.
 test-linux-fuse: ## Run the optional Linux FUSE smoke test when enabled by env vars.
 	tests/linux_fuse_smoke.sh
 
+.PHONY: test-live-granola
+test-live-granola: ## Run live Granola API integrity and optional Linux FUSE tests.
+	$(CARGO) test -p locality-granola --test live_integrity -- --ignored --test-threads=1
+	tests/live_granola_vfs_read.sh
+
 .PHONY: test-linux-publish-config
 test-linux-publish-config: ## Validate Linux package publish configuration.
 	tests/linux_publish_config.sh
