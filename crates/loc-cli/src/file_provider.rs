@@ -359,12 +359,7 @@ pub fn signal_macos_file_provider_container(
 ) -> Result<FileProviderHelperReport, FileProviderHelperError> {
     run_macos_file_provider_helper(
         "signal",
-        vec![
-            "--mount-id".to_string(),
-            localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
-            "--identifier".to_string(),
-            macos_file_provider_item_identifier(mount_id, container_identifier),
-        ],
+        macos_file_provider_container_args(mount_id, container_identifier),
     )
 }
 
@@ -378,12 +373,7 @@ pub fn refresh_macos_file_provider_container(
     }
     run_macos_file_provider_helper(
         "reimport",
-        vec![
-            "--mount-id".to_string(),
-            localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
-            "--identifier".to_string(),
-            macos_file_provider_item_identifier(mount_id, container_identifier),
-        ],
+        macos_file_provider_container_args(mount_id, container_identifier),
     )
     .or_else(|_| signal_macos_file_provider_container(mount_id, container_identifier))
 }
@@ -417,6 +407,16 @@ fn macos_file_provider_item_identifier(mount_id: &str, identifier: &str) -> Stri
         macos_file_provider_encode_identifier_component(mount_id),
         macos_file_provider_encode_identifier_component(identifier)
     )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_provider_container_args(mount_id: &str, identifier: &str) -> Vec<String> {
+    vec![
+        "--mount-id".to_string(),
+        localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID.to_string(),
+        "--identifier".to_string(),
+        macos_file_provider_item_identifier(mount_id, identifier),
+    ]
 }
 
 #[cfg(target_os = "macos")]
@@ -3066,21 +3066,36 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_file_provider_signal_identifier_matches_shared_domain_contract() {
+    fn macos_file_provider_container_args_match_shared_domain_contract() {
         assert_eq!(
-            super::macos_file_provider_item_identifier("notion-main", "root"),
-            "root"
+            super::macos_file_provider_container_args("notion-main", "root"),
+            vec![
+                "--mount-id",
+                localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+                "--identifier",
+                "root",
+            ]
         );
         assert_eq!(
-            super::macos_file_provider_item_identifier("notion-main", "working-set"),
-            "working-set"
+            super::macos_file_provider_container_args("notion-main", "working-set"),
+            vec![
+                "--mount-id",
+                localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+                "--identifier",
+                "working-set",
+            ]
         );
         assert_eq!(
-            super::macos_file_provider_item_identifier(
+            super::macos_file_provider_container_args(
                 "notion-main",
                 "children:38e3ac0e-bb88-80f9-96d6-fb1cfcc66574",
             ),
-            "m:bm90aW9uLW1haW4:Y2hpbGRyZW46MzhlM2FjMGUtYmI4OC04MGY5LTk2ZDYtZmIxY2ZjYzY2NTc0"
+            vec![
+                "--mount-id",
+                localityd::file_provider::MACOS_FILE_PROVIDER_DOMAIN_ID,
+                "--identifier",
+                "m:bm90aW9uLW1haW4:Y2hpbGRyZW46MzhlM2FjMGUtYmI4OC04MGY5LTk2ZDYtZmIxY2ZjYzY2NTc0",
+            ]
         );
     }
 
