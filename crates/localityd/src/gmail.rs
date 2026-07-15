@@ -9,8 +9,12 @@ use locality_core::model::{RemoteId, TreeEntry};
 use locality_core::planner::PropertyValue;
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
-use locality_gmail::attachments::decode_attachment_body;
-use locality_gmail::render::{GmailNativeBundle, remote_version, render_gmail_message};
+use locality_gmail::attachments::{GmailAttachmentSpec, decode_attachment_body};
+use locality_gmail::client::GmailApi;
+use locality_gmail::render::{
+    GmailNativeBundle, GmailThreadNativeBundle, remote_version, render_gmail_message,
+    render_gmail_thread, thread_remote_version,
+};
 use locality_gmail::{
     GMAIL_CONNECTOR_ID, GmailConfig, GmailConnector, GmailMountSettings, GmailOAuthScopeError,
     HttpGmailOAuthBrokerClient, StoredGmailCredential,
@@ -466,20 +470,24 @@ impl HydrationSource for GmailConnector {
         let native = self.fetch(FetchRequest {
             remote_id: request.remote_id.clone(),
         })?;
+        if native.kind == "gmail_thread" {
+            let bundle = serde_json::from_slice::<GmailThreadNativeBundle>(&native.raw).map_err(
+                |error| LocalityError::Io(format!("gmail thread native decode failed: {error}")),
+            )?;
+            let rendered = render_gmail_thread(&bundle)?;
+            let assets = gmail_attachment_assets(self.api(), &rendered.attachment_specs)?;
+            return Ok(HydratedEntity {
+                document: rendered.document,
+                shadow: rendered.shadow,
+                remote_edited_at: Some(thread_remote_version(&bundle.thread)),
+                assets,
+            });
+        }
+
         let bundle = serde_json::from_slice::<GmailNativeBundle>(&native.raw)
             .map_err(|error| LocalityError::Io(format!("gmail native decode failed: {error}")))?;
         let rendered = render_gmail_message(&bundle)?;
-        let mut assets = Vec::new();
-        for spec in &rendered.attachment_specs {
-            let body = self
-                .api()
-                .get_attachment(&spec.message_id, &spec.attachment_id)?;
-            assets.push(HydratedAsset {
-                path: spec.local_path.clone(),
-                bytes: decode_attachment_body(&body)?,
-                media: None,
-            });
-        }
+        let assets = gmail_attachment_assets(self.api(), &rendered.attachment_specs)?;
         Ok(HydratedEntity {
             document: rendered.document,
             shadow: rendered.shadow,
@@ -494,6 +502,22 @@ impl HydrationSource for GmailConnector {
     ) -> LocalityResult<Option<String>> {
         Ok(None)
     }
+}
+
+fn gmail_attachment_assets(
+    api: &dyn GmailApi,
+    attachment_specs: &[GmailAttachmentSpec],
+) -> LocalityResult<Vec<HydratedAsset>> {
+    let mut assets = Vec::new();
+    for spec in attachment_specs {
+        let body = api.get_attachment(&spec.message_id, &spec.attachment_id)?;
+        assets.push(HydratedAsset {
+            path: spec.local_path.clone(),
+            bytes: decode_attachment_body(&body)?,
+            media: None,
+        });
+    }
+    Ok(assets)
 }
 
 impl crate::reconcile::ScheduledPullSource for GmailConnector {
@@ -583,6 +607,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gmail_hydration_downloads_thread_attachments_as_assets() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let request = HydrationRequest::new(
+            MountId::new("gmail-main"),
+            RemoteId::new("gmail-thread:inbox:thread-attach"),
+            "inbox/thread-attach/page.md",
+            HydrationState::Hydrated,
+            HydrationReason::ExplicitPull,
+        );
+
+        let hydrated = connector.fetch_render(&request).expect("hydrate thread");
+        let expected_path = attachment_local_path("msg-attach", "attach-1", "Invoice.pdf");
+
+        assert_eq!(hydrated.assets.len(), 1);
+        assert_eq!(hydrated.assets[0].path, expected_path);
+        assert_eq!(hydrated.assets[0].bytes, b"attachment bytes");
+        assert_eq!(
+            hydrated.remote_edited_at,
+            Some(locality_gmail::render::thread_remote_version(
+                &thread_fixture("thread-attach")
+            ))
+        );
+        assert!(
+            hydrated
+                .document
+                .frontmatter
+                .contains("thread_id: \"thread-attach\"")
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(
+            calls.attachments,
+            vec![("msg-attach".to_string(), "attach-1".to_string())]
+        );
+    }
+
     #[derive(Debug)]
     struct FakeGmailApi {
         calls: Mutex<FakeCalls>,
@@ -639,11 +700,11 @@ mod tests {
         }
 
         fn get_thread_metadata(&self, _thread_id: &str) -> LocalityResult<GmailThread> {
-            Ok(GmailThread::default())
+            Ok(thread_fixture(_thread_id))
         }
 
         fn get_thread_full(&self, _thread_id: &str) -> LocalityResult<GmailThread> {
-            Ok(GmailThread::default())
+            Ok(thread_fixture(_thread_id))
         }
 
         fn get_attachment(
@@ -702,5 +763,13 @@ mod tests {
             }
         }))
         .expect("message")
+    }
+
+    fn thread_fixture(thread_id: &str) -> GmailThread {
+        GmailThread {
+            id: thread_id.to_string(),
+            history_id: Some("h1".to_string()),
+            messages: vec![message_fixture("msg-attach")],
+        }
     }
 }
