@@ -466,6 +466,7 @@ fn list_message_refs(
     };
 
     let mut page_token = None;
+    let mut seen_page_tokens = BTreeSet::new();
     let mut messages = Vec::new();
     loop {
         let page = api.list_messages(
@@ -478,6 +479,11 @@ fn list_message_refs(
         let Some(next) = page.next_page_token else {
             break;
         };
+        if !seen_page_tokens.insert(next.clone()) {
+            return Err(LocalityError::InvalidState(format!(
+                "gmail pagination returned repeated page token `{next}` for label `{label_id}`"
+            )));
+        }
         page_token = Some(next);
     }
     Ok(messages)
@@ -704,6 +710,7 @@ mod tests {
         GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
         GmailMessageRef,
     };
+    use crate::settings::{GmailMountSettings, GmailProjectionView};
 
     #[test]
     fn enumerate_projects_three_folders_and_recent_inbox_sent_messages() {
@@ -830,6 +837,75 @@ mod tests {
     }
 
     #[test]
+    fn enumerate_with_date_window_rejects_repeated_page_token() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.panic_after_list_calls = Some(2);
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), None),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-1".to_string(),
+                        thread_id: Some("thread-1".to_string()),
+                    }],
+                    next_page_token: Some("same-token".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), Some("same-token".to_string())),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-2".to_string(),
+                        thread_id: Some("thread-2".to_string()),
+                    }],
+                    next_page_token: Some("same-token".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+        }
+        let settings =
+            GmailMountSettings::with_date_window("2026-07-01", "2026-07-15").expect("settings");
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let error = connector
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("gmail-main"),
+                cursor: None,
+            })
+            .expect_err("repeated page token should fail");
+
+        let message = error.to_string();
+        assert!(message.contains("repeated page token"));
+        assert!(message.contains("same-token"));
+    }
+
+    #[test]
+    fn enumerate_with_thread_view_returns_unsupported_until_thread_projection_exists() {
+        let api = Arc::new(FakeGmailApi::default());
+        let settings = GmailMountSettings::default().with_view(GmailProjectionView::Threads);
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let error = connector
+            .enumerate(EnumerateRequest {
+                mount_id: MountId::new("gmail-main"),
+                cursor: None,
+            })
+            .expect_err("thread view is guarded until Task 8");
+
+        assert!(matches!(error, LocalityError::Unsupported(_)));
+        assert!(error.to_string().contains("Task 8"));
+        assert!(api.calls.lock().expect("calls").list_max_results.is_empty());
+    }
+
+    #[test]
     fn list_children_for_draft_folder_returns_empty_remote_entries() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api);
@@ -898,6 +974,69 @@ mod tests {
         let frontmatter = entry.stub_frontmatter.as_ref().expect("frontmatter");
         assert!(frontmatter.contains("mailbox: \"inbox\""));
         assert!(!frontmatter.contains("mailbox: \"sent\""));
+    }
+
+    #[test]
+    fn list_children_for_inbox_with_date_window_pages_messages_with_gmail_query() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), None),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-1".to_string(),
+                        thread_id: Some("thread-1".to_string()),
+                    }],
+                    next_page_token: Some("inbox-page-2".to_string()),
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.paged_message_ids.insert(
+                ("INBOX".to_string(), Some("inbox-page-2".to_string())),
+                GmailMessageList {
+                    messages: vec![GmailMessageRef {
+                        id: "inbox-msg-2".to_string(),
+                        thread_id: Some("thread-2".to_string()),
+                    }],
+                    next_page_token: None,
+                    result_size_estimate: Some(2),
+                },
+            );
+        }
+        let settings =
+            GmailMountSettings::with_date_window("2026-07-01", "2026-07-15").expect("settings");
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("gmail-main"),
+                container: ChildContainer::DirectoryChildren(RemoteId::new("gmail-folder:inbox")),
+                parent_path: "inbox".into(),
+            })
+            .expect("list inbox");
+
+        assert!(result.entries.iter().any(|entry| {
+            entry.remote_id == RemoteId::new("inbox-msg-1") && entry.path.starts_with("inbox/")
+        }));
+        assert!(result.entries.iter().any(|entry| {
+            entry.remote_id == RemoteId::new("inbox-msg-2") && entry.path.starts_with("inbox/")
+        }));
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(
+            calls.list_queries,
+            vec![
+                "after:2026/07/01 before:2026/07/15".to_string(),
+                "after:2026/07/01 before:2026/07/15".to_string(),
+            ]
+        );
+        assert_eq!(
+            calls.list_page_tokens,
+            vec![None, Some("inbox-page-2".to_string())]
+        );
     }
 
     #[test]
@@ -1211,6 +1350,7 @@ mod tests {
         list_queries: Vec<String>,
         paged_message_ids: std::collections::BTreeMap<(String, Option<String>), GmailMessageList>,
         list_page_tokens: Vec<Option<String>>,
+        panic_after_list_calls: Option<usize>,
         sent_search_results: std::collections::BTreeMap<String, String>,
         sent_search_results_after_send: std::collections::BTreeMap<String, String>,
         send_error: Option<LocalityError>,
@@ -1232,6 +1372,12 @@ mod tests {
             let mut calls = self.calls.lock().expect("calls");
             calls.list_max_results.push(max_results);
             calls.list_page_tokens.push(_page_token.map(str::to_string));
+            if let Some(limit) = calls.panic_after_list_calls {
+                assert!(
+                    calls.list_max_results.len() <= limit,
+                    "list_messages exceeded call limit {limit}"
+                );
+            }
             if let Some(query) = query {
                 calls.list_queries.push(query.to_string());
             }

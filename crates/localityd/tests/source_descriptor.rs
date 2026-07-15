@@ -353,6 +353,32 @@ fn resolving_gmail_mount_uses_active_oauth_connection_credentials() {
 }
 
 #[test]
+fn resolving_gmail_mount_with_invalid_settings_reports_validation_detail() {
+    let mut store = InMemoryStateStore::new();
+    let credentials = InMemoryCredentialStore::new();
+    let (connection_id, secret_ref) =
+        save_gmail_connection(&mut store, "gmail-default", GMAIL_CONNECTOR_ID, "oauth");
+    credentials
+        .put(
+            &secret_ref,
+            &serde_json::to_string(&stored_gmail_credential("gmail-access-token"))
+                .expect("credential json"),
+        )
+        .expect("save credential");
+    let mount = gmail_mount()
+        .with_connection_id(connection_id)
+        .with_settings_json("{");
+
+    let error = resolve_source_for_mount(&store, &credentials, &mount)
+        .expect_err("invalid Gmail settings should reject resolver");
+
+    assert_eq!(error.code(), "credential_store_unavailable");
+    let message = error.message();
+    assert!(message.contains("Gmail mount `gmail-main` settings are invalid"));
+    assert!(message.contains("Gmail mount settings JSON is invalid"));
+}
+
+#[test]
 fn resolving_expired_gmail_credential_rejects_refresh_missing_required_scope() {
     let mut store = InMemoryStateStore::new();
     let credentials = InMemoryCredentialStore::new();

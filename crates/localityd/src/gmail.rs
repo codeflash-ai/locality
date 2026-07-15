@@ -107,11 +107,23 @@ fn gmail_config_from_mount(
 ) -> Result<GmailConfig, ConnectorResolveError> {
     let settings = GmailMountSettings::from_json(&mount.settings_json).map_err(|error| {
         ConnectorResolveError::CredentialStoreUnavailable(format!(
-            "Gmail mount `{}` settings are invalid: {error}",
-            mount.mount_id.0
+            "Gmail mount `{}` settings are invalid: {}",
+            mount.mount_id.0,
+            gmail_settings_error_message(error)
         ))
     })?;
     Ok(GmailConfig::new(token).with_settings(settings))
+}
+
+fn gmail_settings_error_message(error: LocalityError) -> String {
+    match error {
+        LocalityError::Validation(issues) => issues
+            .into_iter()
+            .map(|issue| issue.message)
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => other.to_string(),
+    }
 }
 
 fn connection_access_token(
