@@ -44,7 +44,7 @@ use crate::repository::{
 };
 
 const DB_FILE: &str = "state.sqlite3";
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 const LINUX_FUSE_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const WINDOWS_CLOUD_FILES_PROJECTION_LAYOUT_VERSION: i64 = 2;
 const RETIRED_NOTION_WORKSPACE_ROOTS_COMPONENT_ID: &str = "projection:notion_workspace_roots";
@@ -228,7 +228,7 @@ impl MountRepository for SqliteStateStore {
         let transaction = connection.transaction()?;
         let existing = transaction
             .query_row(
-                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
+                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
                  FROM mounts
                  WHERE mount_id = ?1",
                 params![&mount.mount_id.0],
@@ -241,6 +241,7 @@ impl MountRepository for SqliteStateStore {
                         row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
@@ -255,15 +256,16 @@ impl MountRepository for SqliteStateStore {
         }
 
         transaction.execute(
-            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO mounts (mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(mount_id) DO UPDATE SET
                 connector = excluded.connector,
                 root = excluded.root,
                 remote_root_id = excluded.remote_root_id,
                 read_only = excluded.read_only,
                 projection_json = excluded.projection_json,
-                connection_id = excluded.connection_id",
+                connection_id = excluded.connection_id,
+                settings_json = excluded.settings_json",
             params![
                 &mount.mount_id.0,
                 &mount.connector,
@@ -272,6 +274,7 @@ impl MountRepository for SqliteStateStore {
                 bool_to_int(mount.read_only),
                 to_json(&mount.projection)?,
                 mount.connection_id.as_ref().map(|connection_id| connection_id.0.as_str()),
+                mount.settings_json.as_str(),
             ],
         )?;
         transaction.commit()?;
@@ -282,7 +285,7 @@ impl MountRepository for SqliteStateStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
+                "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
                  FROM mounts
                  WHERE mount_id = ?1",
                 params![mount_id.0],
@@ -295,6 +298,7 @@ impl MountRepository for SqliteStateStore {
                         row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
@@ -306,7 +310,7 @@ impl MountRepository for SqliteStateStore {
     fn load_mounts(&self) -> StoreResult<Vec<MountConfig>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
+            "SELECT mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
              FROM mounts
              ORDER BY mount_id",
         )?;
@@ -319,6 +323,7 @@ impl MountRepository for SqliteStateStore {
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
 
@@ -1550,6 +1555,7 @@ type MountRow = (
     i64,
     String,
     Option<String>,
+    String,
 );
 type ConnectionRow = (
     String,
@@ -1708,7 +1714,8 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
             remote_root_id TEXT,
             read_only INTEGER NOT NULL CHECK (read_only IN (0, 1)),
             projection_json TEXT NOT NULL DEFAULT '\"plain_files\"',
-            connection_id TEXT
+            connection_id TEXT,
+            settings_json TEXT NOT NULL DEFAULT '{}'
         );
 
         CREATE TABLE IF NOT EXISTS connections (
@@ -2129,6 +2136,16 @@ fn initialize_schema(connection: &Connection) -> StoreResult<()> {
         }
     }
 
+    if user_version < 18 && !column_exists(connection, "mounts", "settings_json")? {
+        connection.execute_batch(
+            "ALTER TABLE mounts
+             ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}';",
+        )?;
+        if user_version >= 13 {
+            record_schema_migration(connection, user_version, SCHEMA_VERSION)?;
+        }
+    }
+
     if user_version < SCHEMA_VERSION {
         seed_default_notion_profile(connection)?;
         migrate_linux_fuse_projection_layout_to_v2(connection, user_version < 13)?;
@@ -2225,6 +2242,7 @@ fn mount_from_row(row: MountRow) -> StoreResult<MountConfig> {
         read_only: row.4 != 0,
         projection: from_json::<ProjectionMode>(&row.5)?,
         connection_id: row.6.map(ConnectionId),
+        settings_json: row.7,
     })
 }
 

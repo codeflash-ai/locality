@@ -1,4 +1,7 @@
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use locality_core::freshness::{FreshnessTier, RemoteVersion};
 use locality_core::journal::{
@@ -14,8 +17,8 @@ use locality_store::{
     InMemoryStateStore, JournalRepository, MetadataDiscoveryJobRecord,
     MetadataDiscoveryJobRepository, MetadataDiscoveryPriority, MountConfig, MountLiveModeRecord,
     MountLiveModeRepository, MountLiveModeState, MountRepository, RemoteObservationRecord,
-    RemoteObservationRepository, ShadowRepository, StoreError, VirtualMutationKind,
-    VirtualMutationRecord, VirtualMutationRepository,
+    RemoteObservationRepository, ShadowRepository, SqliteStateStore, StoreError,
+    VirtualMutationKind, VirtualMutationRecord, VirtualMutationRepository,
 };
 
 #[test]
@@ -32,6 +35,38 @@ fn mount_config_round_trips_with_read_only_flag() {
         Some(mount)
     );
     assert_eq!(store.load_mounts().expect("load mounts").len(), 1);
+}
+
+#[test]
+fn repository_persists_mount_settings_json() {
+    fn exercise<S>(store: &mut S)
+    where
+        S: MountRepository,
+    {
+        let mount_id = MountId::new("gmail-main");
+        let mount = MountConfig::new(mount_id.clone(), "gmail", "/tmp/Locality/gmail-main")
+            .with_settings_json(
+                r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#,
+            );
+
+        store.save_mount(mount).expect("save mount");
+
+        let loaded = store
+            .get_mount(&mount_id)
+            .expect("load mount")
+            .expect("mount exists");
+        assert_eq!(
+            loaded.settings_json,
+            r#"{"gmail":{"date_window":{"after":"2026-07-01","before":"2026-07-15"},"view":"threads"}}"#
+        );
+    }
+
+    let mut memory = InMemoryStateStore::new();
+    exercise(&mut memory);
+
+    let fixture = SqliteFixture::new();
+    let mut sqlite = fixture.open();
+    exercise(&mut sqlite);
 }
 
 #[test]
@@ -595,6 +630,40 @@ fn in_memory_store_satisfies_core_journal_store_contract() {
 
 fn mount_id() -> MountId {
     MountId::new("notion-main")
+}
+
+struct SqliteFixture {
+    state_root: PathBuf,
+}
+
+impl SqliteFixture {
+    fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "locality-store-repository-sqlite-{}-{unique}-{suffix}",
+            std::process::id()
+        ));
+        Self {
+            state_root: root.join("state"),
+        }
+    }
+
+    fn open(&self) -> SqliteStateStore {
+        SqliteStateStore::open(self.state_root.clone()).expect("open sqlite store")
+    }
+}
+
+impl Drop for SqliteFixture {
+    fn drop(&mut self) {
+        if let Some(root) = self.state_root.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
 }
 
 #[test]

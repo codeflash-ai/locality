@@ -73,6 +73,7 @@ pub struct MountConfig {
     pub connection_id: Option<ConnectionId>,
     pub read_only: bool,
     pub projection: ProjectionMode,
+    pub settings_json: String,
 }
 
 impl MountConfig {
@@ -85,6 +86,7 @@ impl MountConfig {
             connection_id: None,
             read_only: false,
             projection: ProjectionMode::PlainFiles,
+            settings_json: "{}".to_string(),
         }
     }
 
@@ -105,6 +107,11 @@ impl MountConfig {
 
     pub fn projection(mut self, projection: ProjectionMode) -> Self {
         self.projection = projection;
+        self
+    }
+
+    pub fn with_settings_json(mut self, settings_json: impl Into<String>) -> Self {
+        self.settings_json = settings_json.into();
         self
     }
 }

@@ -49,7 +49,7 @@ fn sqlite_store_initializes_idempotently() {
 
     assert!(first.db_path.exists());
     assert_eq!(first.db_path, second.db_path);
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert_eq!(journal_mode, "wal");
 }
 
@@ -88,7 +88,7 @@ fn sqlite_store_seeds_state_compatibility_components() {
                 1,
                 0
             ),
-            ("core:schema".to_string(), "schema".to_string(), 17, 1, 1, 0),
+            ("core:schema".to_string(), "schema".to_string(), 18, 1, 1, 0),
             (
                 "durable:auto_save".to_string(),
                 "durable_json".to_string(),
@@ -215,6 +215,7 @@ fn sqlite_store_retires_removed_notion_workspace_roots_component() {
             read_only: false,
             projection: ProjectionMode::LinuxFuse,
             connection_id: None,
+            settings_json: "{}".to_string(),
         })
         .expect("save notion workspace mount");
     drop(store);
@@ -349,12 +350,12 @@ fn sqlite_store_retires_removed_notion_workspace_roots_component() {
 }
 
 #[test]
-fn sqlite_schema_snapshot_matches_v17_contract() {
+fn sqlite_schema_snapshot_matches_v18_contract() {
     let fixture = SqliteFixture::new();
     let store = fixture.open();
     let connection = Connection::open(&store.db_path).expect("raw connection");
 
-    assert_eq!(SqliteStateStore::current_schema_version(), 17);
+    assert_eq!(SqliteStateStore::current_schema_version(), 18);
     assert_eq!(
         schema_column_snapshot(&connection),
         "\
@@ -369,7 +370,7 @@ hydration_jobs: mount_id, remote_id, path, target_state_json, reason_json, attem
 journals: push_id, mount_id, remote_ids_json, plan_json, preimages_json, apply_effects_json, status_json, metadata_json, readable_diff_json
 metadata_discovery_jobs: mount_id, container_identifier, priority_json, depth, attempts, last_error, created_at, updated_at
 mount_live_modes: mount_id, enabled, state_json, last_reason, last_run_at, created_at, updated_at
-mounts: mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
+mounts: mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id, settings_json
 projection_state: mount_id, projection, layout_version, min_reader_version, os_domain_id, root_item_id, repair_generation, state_json, updated_at
 remote_observations: mount_id, remote_id, kind_json, title, parent_remote_id, projected_path, remote_version_json, observed_at, deleted, raw_metadata_json
 shadows: mount_id, entity_id, frontmatter, body_hash, rendered_body, blocks_json
@@ -391,7 +392,7 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
         before.issues,
         vec![StateCompatibilityIssue::OlderSchema {
             found: 12,
-            current: 17,
+            current: 18,
         }]
     );
 
@@ -402,13 +403,13 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
         .expect("user version");
     let migration_count: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM state_migrations WHERE migration_id = 'schema-12-to-17'",
+            "SELECT COUNT(*) FROM state_migrations WHERE migration_id = 'schema-12-to-18'",
             [],
             |row| row.get(0),
         )
         .expect("migration row count");
 
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert_eq!(migration_count, 1);
     assert_eq!(
         store.get_mount(&fixture.mount_id).expect("get mount"),
@@ -423,7 +424,7 @@ fn sqlite_store_reports_v12_state_as_migratable_then_migrates() {
     );
 
     let after =
-        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v17");
+        SqliteStateStore::inspect_compatibility(fixture.state_root.clone()).expect("inspect v18");
     assert_eq!(after.status, StateCompatibilityStatus::Ready);
 }
 
@@ -443,7 +444,7 @@ fn sqlite_store_rejects_newer_schema_version() {
         error,
         StoreError::SchemaVersion {
             found: 999,
-            supported: 17,
+            supported: 18,
         }
     );
 }
@@ -466,7 +467,7 @@ fn sqlite_store_reports_newer_schema_as_needing_update() {
         report.issues,
         vec![StateCompatibilityIssue::NewerSchema {
             found: 999,
-            supported: 17,
+            supported: 18,
         }]
     );
 }
@@ -780,7 +781,7 @@ fn sqlite_store_v13_valid_linux_fuse_v1_component_migrates_to_v2() {
 }
 
 #[test]
-fn sqlite_store_v14_missing_live_mode_component_migrates_to_v17() {
+fn sqlite_store_v14_missing_live_mode_component_migrates_to_v18() {
     let fixture = SqliteFixture::new();
     let mount_point_root = fixture
         .state_root
@@ -827,7 +828,7 @@ fn sqlite_store_v14_missing_live_mode_component_migrates_to_v17() {
         )
         .expect("live mode component version");
 
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert!(sqlite_table_exists(&connection, "mount_live_modes"));
     assert_eq!(component_version, 1);
     assert_eq!(query_state_migration_count(&connection), 1);
@@ -2049,7 +2050,7 @@ fn sqlite_store_migrates_v5_projection_and_connections_schema() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert_eq!(connection_column_count, 1);
     assert_eq!(projection_column_count, 1);
     assert_eq!(connection_table_count, 1);
@@ -2124,7 +2125,7 @@ fn sqlite_store_migrates_v6_projection_schema_to_connections() {
         )
         .expect("connections table");
 
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert_eq!(connection_column_count, 1);
     assert_eq!(connection_table_count, 1);
     assert_eq!(
@@ -2209,7 +2210,7 @@ fn sqlite_store_migrates_v7_hydration_jobs_schema() {
         )
         .expect("hydration_jobs table");
 
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert_eq!(hydration_jobs_table_count, 1);
     assert!(
         store
@@ -2296,7 +2297,7 @@ fn sqlite_store_migrates_v8_connections_to_default_connector_profile() {
         )
         .expect("profile_id column");
 
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert_eq!(profile_column_count, 1);
     let migrated_connection = store
         .get_connection(&ConnectionId::new("notion-work"))
@@ -2415,7 +2416,7 @@ fn sqlite_store_migrates_v11_entity_search_index() {
         )
         .expect("entity search table");
 
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert_eq!(search_table_count, 1);
     let matches = store
         .list_entity_search_candidates(&fixture.mount_id, "launch", None)
@@ -2843,7 +2844,7 @@ fn sqlite_store_migrates_v1_journals_with_empty_preimages() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert!(entry.preimages.is_empty());
     assert!(entry.apply_effects.is_empty());
 }
@@ -2914,7 +2915,7 @@ fn sqlite_store_migrates_v2_journals_with_empty_apply_effects() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert!(entry.apply_effects.is_empty());
 }
 
@@ -2977,7 +2978,7 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .query_row(
             "SELECT COUNT(*)
              FROM state_migrations
-             WHERE migration_id = 'schema-16-to-17'",
+             WHERE migration_id = 'schema-16-to-18'",
             [],
             |row| row.get(0),
         )
@@ -2987,7 +2988,7 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
         .expect("get migrated journal")
         .expect("journal");
 
-    assert_eq!(user_version, 17);
+    assert_eq!(user_version, 18);
     assert_eq!(journals_component_version, 2);
     assert_eq!(
         metadata_json,
@@ -2996,6 +2997,64 @@ fn sqlite_store_migrates_v16_journals_with_empty_edit_metadata() {
     assert_eq!(migration_count, 1);
     assert_eq!(entry.metadata, JournalMetadata::default());
     assert_eq!(entry.readable_diff, None);
+}
+
+#[test]
+fn sqlite_store_migrates_v17_mounts_with_default_settings_json() {
+    let fixture = SqliteFixture::new();
+    fs::create_dir_all(&fixture.state_root).expect("create state root");
+    let db_path = fixture.state_root.join("state.sqlite3");
+    let connection = Connection::open(&db_path).expect("raw connection");
+    connection
+        .execute_batch(
+            r#"
+            PRAGMA user_version = 17;
+            CREATE TABLE mounts (
+                mount_id TEXT PRIMARY KEY,
+                connector TEXT NOT NULL,
+                root TEXT NOT NULL,
+                remote_root_id TEXT,
+                read_only INTEGER NOT NULL CHECK (read_only IN (0, 1)),
+                projection_json TEXT NOT NULL DEFAULT '"plain_files"',
+                connection_id TEXT
+            );
+            CREATE TABLE state_components (
+                component_id TEXT PRIMARY KEY,
+                component_kind TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                min_reader_version INTEGER NOT NULL DEFAULT 1,
+                required INTEGER NOT NULL CHECK (required IN (0, 1)),
+                rebuildable INTEGER NOT NULL CHECK (rebuildable IN (0, 1)),
+                data_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO mounts (
+                mount_id, connector, root, remote_root_id, read_only, projection_json, connection_id
+            )
+            VALUES (
+                'gmail-main', 'gmail', '/tmp/Locality/gmail-main', NULL, 0, '"plain_files"', NULL
+            );
+            "#,
+        )
+        .expect("seed v17 state");
+    insert_current_state_components_for_v17(&connection);
+    drop(connection);
+
+    let store = SqliteStateStore::open(fixture.state_root.clone()).expect("migrate v17");
+    let connection = Connection::open(&store.db_path).expect("raw migrated connection");
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("user version");
+    let settings_json: String = connection
+        .query_row(
+            "SELECT settings_json FROM mounts WHERE mount_id = 'gmail-main'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("settings json");
+
+    assert_eq!(user_version, 18);
+    assert_eq!(settings_json, "{}");
 }
 
 fn query_state_components(connection: &Connection) -> Vec<(String, String, i64, i64, i64, i64)> {
@@ -3248,6 +3307,25 @@ fn insert_current_state_components_for_v16(connection: &Connection) {
         let version = match definition.component_id {
             "core:schema" => 16,
             "durable:journals" => 1,
+            _ => definition.current_version,
+        };
+        insert_state_component(
+            connection,
+            definition.component_id,
+            definition.component_kind,
+            version,
+            definition.min_reader_version,
+            definition.required,
+            definition.rebuildable,
+            definition.data_json,
+        );
+    }
+}
+
+fn insert_current_state_components_for_v17(connection: &Connection) {
+    for definition in SqliteStateStore::current_component_definitions() {
+        let version = match definition.component_id {
+            "core:schema" => 17,
             _ => definition.current_version,
         };
         insert_state_component(

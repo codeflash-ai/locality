@@ -44,6 +44,8 @@
   migration history, connector state, and projection state tables.
 - SQLite migrates pre-shared-root `linux_fuse` and `windows_cloud_files`
   projection layout state to mount-point roots under the shared projection root.
+- SQLite migrates v17 rows to v18 by adding `mounts.settings_json`, a generic
+  mount-scoped JSON settings field used by connector-specific mount options.
 - SQLite records component versions for durable subsystems so compatibility is
   decided from persisted state contracts instead of desktop build IDs.
 - SQLite enables WAL mode, a busy timeout, foreign keys, and `PRAGMA user_version` schema versioning.
@@ -54,7 +56,7 @@ The first schema keeps high-value lookup fields relational and stores complex co
 
 - `connector_profiles`: profile id, connector, display name, auth kind, scopes, capabilities, enabled action classes, connector version, and status;
 - `connections`: connection id, optional profile id, connector, account/workspace labels, auth kind, `secret_ref`, scopes, capabilities, status, and expiry metadata;
-- `mounts`: mount id, connector, root path, optional remote root id, optional connection id, read-only flag, and projection mode (`plain_files`, `macos_file_provider`, `linux_fuse`, or `windows_cloud_files`);
+- `mounts`: mount id, connector, root path, optional remote root id, optional connection id, read-only flag, projection mode (`plain_files`, `macos_file_provider`, `linux_fuse`, or `windows_cloud_files`), and generic mount settings JSON;
 - `entities`: mount id, remote id, kind, title, projected path, hydration, content hash, remote edit time;
 - `entity_search_fts`: derived full-text index over entity titles/paths and
   observed remote titles/paths. It is rebuildable and stores no secrets;
@@ -84,7 +86,7 @@ Shadow blocks, journal plans, journal preimages, and journal apply effects are J
 - Unknown required components block older binaries. Unknown non-required
   rebuildable components are ignored by older binaries.
 
-The SQLite test suite includes a v13 schema snapshot, old-DB migration fixtures,
+The SQLite test suite includes a v18 schema snapshot, old-DB migration fixtures,
 newer-schema detection, newer-component detection, and unknown-component
 compatibility checks. A PR that changes durable state should update these tests
 as part of the same change.
