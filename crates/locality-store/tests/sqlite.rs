@@ -1676,6 +1676,36 @@ fn remounting_same_mount_id_with_different_settings_json_clears_source_scoped_st
 }
 
 #[test]
+fn remounting_same_source_keeps_source_scoped_state() {
+    let fixture = SqliteFixture::new();
+    let mut store = fixture.open();
+    let mount = fixture
+        .mount_config()
+        .with_connection_id(ConnectionId::new("workspace"))
+        .with_settings_json(r#"{"gmail":{"view":"messages"}}"#);
+    store.save_mount(mount.clone()).expect("save mount");
+    seed_source_scoped_state(&mut store, &fixture.mount_id);
+
+    store.save_mount(mount).expect("remount same source");
+    drop(store);
+
+    let reopened = fixture.open();
+    assert_eq!(
+        reopened
+            .list_entities(&fixture.mount_id)
+            .expect("list entities")
+            .len(),
+        1
+    );
+    assert_eq!(reopened.list_journal().expect("list journal").len(), 1);
+    assert!(
+        reopened
+            .load_shadow(&fixture.mount_id, &RemoteId::new("page-1"))
+            .is_ok()
+    );
+}
+
+#[test]
 fn virtual_mutations_round_trip_and_delete_after_reopen() {
     let fixture = SqliteFixture::new();
     let mut store = fixture.open();
