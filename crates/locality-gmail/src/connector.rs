@@ -92,6 +92,10 @@ impl GmailConnector {
     pub fn config(&self) -> &GmailConfig {
         &self.config
     }
+
+    pub fn api(&self) -> &dyn GmailApi {
+        self.api.as_ref()
+    }
 }
 
 impl Connector for GmailConnector {

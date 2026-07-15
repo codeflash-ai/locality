@@ -9,6 +9,7 @@ use locality_core::model::{RemoteId, TreeEntry};
 use locality_core::planner::PropertyValue;
 use locality_core::validation::{ValidationIssue, ValidationReport};
 use locality_core::{LocalityError, LocalityResult};
+use locality_gmail::attachments::decode_attachment_body;
 use locality_gmail::render::{GmailNativeBundle, remote_version, render_gmail_message};
 use locality_gmail::{
     GMAIL_CONNECTOR_ID, GmailConfig, GmailConnector, GmailMountSettings, GmailOAuthScopeError,
@@ -19,7 +20,7 @@ use locality_store::{
     CredentialStore, MountConfig,
 };
 
-use crate::hydration::{HydratedEntity, HydrationSource};
+use crate::hydration::{HydratedAsset, HydratedEntity, HydrationSource};
 use crate::notion::ConnectorResolveError;
 use crate::source::{SourceAdapter, SourcePushValidator, SourceValidationContext};
 
@@ -468,11 +469,22 @@ impl HydrationSource for GmailConnector {
         let bundle = serde_json::from_slice::<GmailNativeBundle>(&native.raw)
             .map_err(|error| LocalityError::Io(format!("gmail native decode failed: {error}")))?;
         let rendered = render_gmail_message(&bundle)?;
+        let mut assets = Vec::new();
+        for spec in &rendered.attachment_specs {
+            let body = self
+                .api()
+                .get_attachment(&spec.message_id, &spec.attachment_id)?;
+            assets.push(HydratedAsset {
+                path: spec.local_path.clone(),
+                bytes: decode_attachment_body(&body)?,
+                media: None,
+            });
+        }
         Ok(HydratedEntity {
             document: rendered.document,
             shadow: rendered.shadow,
             remote_edited_at: Some(remote_version(&bundle.message)),
-            assets: Vec::new(),
+            assets,
         })
     }
 
@@ -498,5 +510,131 @@ impl crate::reconcile::ScheduledPullSource for GmailConnector {
         _remote_id: &RemoteId,
     ) -> LocalityResult<Option<String>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use locality_core::hydration::{HydrationReason, HydrationRequest};
+    use locality_core::model::{HydrationState, MountId, RemoteId};
+    use locality_gmail::attachments::attachment_local_path;
+    use locality_gmail::client::GmailApi;
+    use locality_gmail::dto::{
+        GmailDraft, GmailDraftCreateRequest, GmailDraftSendRequest, GmailMessage, GmailMessageList,
+        GmailMessagePartBody,
+    };
+
+    use super::*;
+    use crate::hydration::HydrationSource;
+
+    #[test]
+    fn gmail_hydration_downloads_message_attachments_as_assets() {
+        let api = Arc::new(FakeGmailApi::default());
+        let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
+        let request = HydrationRequest::new(
+            MountId::new("gmail-main"),
+            RemoteId::new("msg-attach"),
+            "inbox/msg-attach.md",
+            HydrationState::Hydrated,
+            HydrationReason::ExplicitPull,
+        );
+
+        let hydrated = connector.fetch_render(&request).expect("hydrate");
+        let expected_path = attachment_local_path("msg-attach", "attach-1", "Invoice.pdf");
+
+        assert_eq!(hydrated.assets.len(), 1);
+        assert_eq!(hydrated.assets[0].path, expected_path);
+        assert_eq!(hydrated.assets[0].bytes, b"attachment bytes");
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(
+            calls.attachments,
+            vec![("msg-attach".to_string(), "attach-1".to_string())]
+        );
+    }
+
+    #[derive(Default, Debug)]
+    struct FakeGmailApi {
+        calls: Mutex<FakeCalls>,
+    }
+
+    #[derive(Default, Debug)]
+    struct FakeCalls {
+        attachments: Vec<(String, String)>,
+    }
+
+    impl GmailApi for FakeGmailApi {
+        fn list_messages(
+            &self,
+            _label_id: &str,
+            _max_results: u32,
+            _page_token: Option<&str>,
+            _query: Option<&str>,
+        ) -> LocalityResult<GmailMessageList> {
+            Ok(GmailMessageList::default())
+        }
+
+        fn get_message_metadata(&self, message_id: &str) -> LocalityResult<GmailMessage> {
+            Ok(message_fixture(message_id))
+        }
+
+        fn get_message_full(&self, message_id: &str) -> LocalityResult<GmailMessage> {
+            Ok(message_fixture(message_id))
+        }
+
+        fn get_attachment(
+            &self,
+            message_id: &str,
+            attachment_id: &str,
+        ) -> LocalityResult<GmailMessagePartBody> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .attachments
+                .push((message_id.to_string(), attachment_id.to_string()));
+            Ok(GmailMessagePartBody {
+                attachment_id: Some(attachment_id.to_string()),
+                size: Some(16),
+                data: Some(URL_SAFE_NO_PAD.encode(b"attachment bytes")),
+            })
+        }
+
+        fn create_draft(&self, _request: GmailDraftCreateRequest) -> LocalityResult<GmailDraft> {
+            panic!("not used")
+        }
+
+        fn send_draft(&self, _request: GmailDraftSendRequest) -> LocalityResult<GmailMessage> {
+            panic!("not used")
+        }
+    }
+
+    fn message_fixture(id: &str) -> GmailMessage {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "threadId": "thread-attach",
+            "labelIds": ["INBOX"],
+            "internalDate": "1720900000000",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "headers": [
+                    { "name": "Subject", "value": "Attachments" }
+                ],
+                "parts": [
+                    {
+                        "mimeType": "text/plain",
+                        "body": { "data": "Qm9keQo" }
+                    },
+                    {
+                        "filename": "Invoice.pdf",
+                        "mimeType": "application/pdf",
+                        "body": { "attachmentId": "attach-1", "size": 16 }
+                    }
+                ]
+            }
+        }))
+        .expect("message")
     }
 }
