@@ -903,6 +903,49 @@ fn pull_virtual_file_accepts_mount_point_directory_target() {
 }
 
 #[test]
+fn pull_accepts_virtual_named_markdown_page_workspace_file_target() {
+    let fixture = PullFixture::new();
+    let state_root = unique_temp_path("loc-cli-pull-state");
+    let mut store = InMemoryStateStore::new();
+    fixture.mount_with_projection(&mut store, ProjectionMode::LinuxFuse);
+    store
+        .save_entity(
+            EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                EntityKind::Page,
+                "Design Notes",
+                "Roadmap/Design Notes/2026-07-14-hello-msg-1.md",
+            )
+            .with_hydration(HydrationState::Stub)
+            .with_remote_edited_at("2026-06-10T00:00:00.000Z"),
+        )
+        .expect("save named markdown entity");
+    let connector = fixture.connector("Roadmap");
+
+    let report = run_pull_with_state_root(
+        &mut store,
+        &connector,
+        fixture
+            .mount_point_root()
+            .join("Roadmap/Design Notes/2026-07-14-hello-msg-1/2026-07-14-hello-msg-1.md"),
+        Some(&state_root),
+    )
+    .expect("pull virtual named markdown page workspace file");
+
+    assert!(report.ok);
+    assert_eq!(report.enumerated, 0);
+    assert_eq!(report.hydrated, 1);
+    assert!(
+        virtual_fs_content_root(&state_root, &fixture.mount_id)
+            .join("Roadmap/Design Notes/2026-07-14-hello-msg-1.md")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(state_root);
+}
+
+#[test]
 fn pull_virtual_page_directory_recursively_hydrates_child_pages() {
     let fixture = PullFixture::new();
     let state_root = unique_temp_path("loc-cli-pull-state");

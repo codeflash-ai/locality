@@ -639,13 +639,14 @@ fn list_thread_entries(
     parent_path: &Path,
 ) -> LocalityResult<Vec<TreeEntry>> {
     let threads = list_thread_refs(api, settings, label_id)?;
-    threads
-        .into_iter()
-        .map(|thread_ref| {
-            let thread = api.get_thread_metadata(&thread_ref.id)?;
-            Ok(thread_entry(mount_id, parent_path, mailbox, thread))
-        })
-        .collect()
+    let mut entries = Vec::new();
+    for thread_ref in threads {
+        let thread = api.get_thread_metadata(&thread_ref.id)?;
+        if thread_starts_in_date_window(settings, &thread) {
+            entries.push(thread_entry(mount_id, parent_path, mailbox, thread));
+        }
+    }
+    Ok(entries)
 }
 
 fn list_message_refs(
@@ -856,6 +857,55 @@ fn thread_directory_name(thread: &GmailThread, title: &str) -> String {
         safe_slug(title),
         safe_slug(&thread.id)
     )
+}
+
+fn thread_starts_in_date_window(settings: &GmailMountSettings, thread: &GmailThread) -> bool {
+    let Some(window) = settings.gmail.date_window.as_ref() else {
+        return true;
+    };
+    let Some(start_date) = thread_start_utc_date_key(thread) else {
+        return true;
+    };
+    let after = gmail_search_date_key(window.after().as_str());
+    let before = gmail_search_date_key(window.before().as_str());
+    start_date >= after && start_date < before
+}
+
+fn thread_start_utc_date_key(thread: &GmailThread) -> Option<i32> {
+    thread
+        .messages
+        .iter()
+        .filter_map(|message| message.internal_date.as_deref())
+        .filter_map(gmail_internal_date_utc_key)
+        .min()
+}
+
+fn gmail_search_date_key(value: &str) -> i32 {
+    let year = value[0..4].parse::<i32>().unwrap_or(0);
+    let month = value[5..7].parse::<i32>().unwrap_or(0);
+    let day = value[8..10].parse::<i32>().unwrap_or(0);
+    year * 10_000 + month * 100 + day
+}
+
+fn gmail_internal_date_utc_key(value: &str) -> Option<i32> {
+    let millis = value.parse::<i64>().ok()?;
+    let days = millis.div_euclid(86_400_000);
+    let (year, month, day) = civil_date_from_unix_days(days);
+    Some(year * 10_000 + month as i32 * 100 + day as i32)
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (year as i32, month as u32, day as u32)
 }
 
 fn mailbox_from_labels(labels: &[String]) -> &'static str {
@@ -1547,6 +1597,95 @@ mod tests {
     }
 
     #[test]
+    fn list_children_for_thread_view_date_window_filters_by_thread_start_date() {
+        let api = Arc::new(FakeGmailApi::default());
+        {
+            let mut calls = api.calls.lock().expect("calls");
+            calls.paged_thread_ids.insert(
+                ("INBOX".to_string(), None),
+                GmailThreadList {
+                    threads: vec![
+                        crate::dto::GmailThreadRef {
+                            id: "thread-start-before-window".to_string(),
+                            snippet: Some("older start".to_string()),
+                            history_id: Some("h-before".to_string()),
+                        },
+                        crate::dto::GmailThreadRef {
+                            id: "thread-start-in-window".to_string(),
+                            snippet: Some("inside start".to_string()),
+                            history_id: Some("h-inside".to_string()),
+                        },
+                    ],
+                    next_page_token: None,
+                    result_size_estimate: Some(2),
+                },
+            );
+            calls.thread_metadata.insert(
+                "thread-start-before-window".to_string(),
+                thread_fixture_with_messages(
+                    "thread-start-before-window",
+                    [
+                        ("old-start-msg", "1782820800000"),
+                        ("matching-later-msg", "1782993600000"),
+                    ],
+                ),
+            );
+            calls.thread_metadata.insert(
+                "thread-start-in-window".to_string(),
+                thread_fixture_with_messages(
+                    "thread-start-in-window",
+                    [
+                        ("window-start-msg", "1782993600000"),
+                        ("newer-after-window-msg", "1784548800000"),
+                    ],
+                ),
+            );
+        }
+        let settings = GmailMountSettings::with_date_window("2026-07-01", "2026-07-15")
+            .expect("settings")
+            .with_view(crate::settings::GmailProjectionView::Threads);
+        let connector = GmailConnector::with_api(
+            GmailConfig::new("token").with_settings(settings),
+            api.clone(),
+        );
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("gmail-main"),
+                container: ChildContainer::DirectoryChildren(RemoteId::new("gmail-folder:inbox")),
+                parent_path: "inbox".into(),
+            })
+            .expect("list inbox threads");
+
+        assert!(!result.entries.iter().any(|entry| {
+            entry.remote_id == RemoteId::new("gmail-thread:inbox:thread-start-before-window")
+        }));
+        let included = result
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.remote_id == RemoteId::new("gmail-thread:inbox:thread-start-in-window")
+            })
+            .expect("thread whose start is in range");
+        assert_eq!(
+            included.path,
+            std::path::PathBuf::from("inbox/1782993600000-hello-thread-start-in-window/page.md")
+        );
+        assert!(
+            included
+                .stub_frontmatter
+                .as_ref()
+                .expect("thread frontmatter")
+                .contains("message_count: 2")
+        );
+        let calls = api.calls.lock().expect("calls");
+        assert_eq!(
+            calls.thread_list_queries,
+            vec!["after:2026/07/01 before:2026/07/15".to_string()]
+        );
+    }
+
+    #[test]
     fn apply_create_entity_creates_and_sends_gmail_draft() {
         let api = Arc::new(FakeGmailApi::default());
         let connector = GmailConnector::with_api(GmailConfig::new("token"), api.clone());
@@ -1921,6 +2060,9 @@ mod tests {
         list_max_results: Vec<u32>,
         list_queries: Vec<String>,
         paged_message_ids: std::collections::BTreeMap<(String, Option<String>), GmailMessageList>,
+        thread_list_queries: Vec<String>,
+        paged_thread_ids: std::collections::BTreeMap<(String, Option<String>), GmailThreadList>,
+        thread_metadata: std::collections::BTreeMap<String, GmailThread>,
         list_page_tokens: Vec<Option<String>>,
         panic_after_list_calls: Option<usize>,
         sent_search_results: std::collections::BTreeMap<String, String>,
@@ -2019,7 +2161,25 @@ mod tests {
             page_token: Option<&str>,
             query: Option<&str>,
         ) -> locality_core::LocalityResult<GmailThreadList> {
-            let _ = (max_results, page_token, query);
+            let _ = max_results;
+            let mut calls = self.calls.lock().expect("calls");
+            if let Some(query) = query {
+                calls.thread_list_queries.push(query.to_string());
+            }
+            if let Some(page) = calls
+                .paged_thread_ids
+                .get(&(label_id.to_string(), page_token.map(str::to_string)))
+                .cloned()
+            {
+                return Ok(page);
+            }
+            if query.is_some() {
+                return Ok(GmailThreadList {
+                    threads: Vec::new(),
+                    next_page_token: None,
+                    result_size_estimate: Some(0),
+                });
+            }
             let id = match label_id {
                 "INBOX" => "thread-inbox-1",
                 "SENT" => "thread-sent-1",
@@ -2061,6 +2221,16 @@ mod tests {
             &self,
             thread_id: &str,
         ) -> locality_core::LocalityResult<GmailThread> {
+            if let Some(thread) = self
+                .calls
+                .lock()
+                .expect("calls")
+                .thread_metadata
+                .get(thread_id)
+                .cloned()
+            {
+                return Ok(thread);
+            }
             Ok(thread_fixture(thread_id))
         }
 
@@ -2121,6 +2291,25 @@ mod tests {
             id: thread_id.to_string(),
             history_id: Some("h1".to_string()),
             messages: vec![message_fixture(message_id)],
+        }
+    }
+
+    fn thread_fixture_with_messages<const N: usize>(
+        thread_id: &str,
+        messages: [(&str, &str); N],
+    ) -> crate::dto::GmailThread {
+        crate::dto::GmailThread {
+            id: thread_id.to_string(),
+            history_id: Some("h1".to_string()),
+            messages: messages
+                .into_iter()
+                .map(|(id, internal_date)| {
+                    let mut message = message_fixture(id);
+                    message.thread_id = Some(thread_id.to_string());
+                    message.internal_date = Some(internal_date.to_string());
+                    message
+                })
+                .collect(),
         }
     }
 

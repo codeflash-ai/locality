@@ -14,6 +14,7 @@ use locality_core::diff::{BlockDiffEngine, DiffEngine};
 use locality_core::freshness::FreshnessTier;
 use locality_core::journal::{JournalEntry, JournalStatus};
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, MountId, RemoteId};
+use locality_core::path_projection::named_markdown_page_workspace_entity_path;
 use locality_core::planner::PushOperation;
 use locality_core::shadow::rendered_bodies_equivalent;
 use locality_store::{
@@ -769,6 +770,25 @@ where
         .is_some()
     {
         return Ok(ScopeFilter::Exact(relative_path.to_path_buf()));
+    }
+
+    if mount.projection.uses_virtual_filesystem()
+        && let Some(entity_path) = named_markdown_page_workspace_entity_path(relative_path)
+    {
+        if store
+            .find_entity_by_path(&mount.mount_id, &entity_path)
+            .map_err(StatusError::Store)?
+            .is_some()
+        {
+            return Ok(ScopeFilter::Exact(entity_path));
+        }
+        if store
+            .find_virtual_mutation_by_path(&mount.mount_id, &entity_path)
+            .map_err(StatusError::Store)?
+            .is_some()
+        {
+            return Ok(ScopeFilter::Exact(entity_path));
+        }
     }
 
     let has_children = store

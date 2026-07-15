@@ -17,7 +17,8 @@ use locality_core::freshness::RemoteVersion;
 use locality_core::hydration::{HydrationReason, HydrationRequest};
 use locality_core::model::{CanonicalDocument, EntityKind, HydrationState, RemoteId, TreeEntry};
 use locality_core::path_projection::{
-    is_page_document_path, page_container_path, page_listing_parent_path,
+    is_page_document_path, named_markdown_page_workspace_entity_path, page_container_path,
+    page_listing_parent_path,
 };
 use locality_core::shadow::ShadowDocument;
 use locality_store::{
@@ -100,7 +101,8 @@ where
     let (mount, matched) = find_mount_for_path(&mounts, &target_path)
         .ok_or_else(|| PullError::MountNotFound(target_path.clone()))?;
     let mount = mount.clone();
-    let relative_path = matched.relative_path;
+    let relative_path =
+        resolve_virtual_named_markdown_page_workspace_path(store, &mount, &matched.relative_path)?;
     let source = source.scoped_to_mount(&mount);
     let page_directory = page_directory_target(store, &mount, &relative_path)?;
     let refresh_bases = prepare_visible_projection_pull(
@@ -491,6 +493,39 @@ where
     Ok(Some(PageDirectoryTarget { page }))
 }
 
+fn resolve_virtual_named_markdown_page_workspace_path<S>(
+    store: &S,
+    mount: &MountConfig,
+    relative_path: &Path,
+) -> Result<PathBuf, PullError>
+where
+    S: EntityRepository,
+{
+    if !mount.projection.uses_virtual_filesystem() {
+        return Ok(relative_path.to_path_buf());
+    }
+    if store
+        .find_entity_by_path(&mount.mount_id, relative_path)
+        .map_err(PullError::Store)?
+        .is_some()
+    {
+        return Ok(relative_path.to_path_buf());
+    }
+
+    let Some(entity_path) = named_markdown_page_workspace_entity_path(relative_path) else {
+        return Ok(relative_path.to_path_buf());
+    };
+    if store
+        .find_entity_by_path(&mount.mount_id, &entity_path)
+        .map_err(PullError::Store)?
+        .is_some()
+    {
+        return Ok(entity_path);
+    }
+
+    Ok(relative_path.to_path_buf())
+}
+
 fn pull_page_directory_path<S, Source>(
     store: &mut S,
     source: &Source,
@@ -613,7 +648,8 @@ where
     let mut row_ids = Vec::new();
     let mut page_ids = Vec::new();
     let is_database_directory = target.schema_database_id.is_some();
-    let recursive_page_hydration = target.container.is_some() && !is_database_directory;
+    let recursive_page_hydration =
+        matches!(target.container, Some(ChildContainer::PageChildren(_)));
     if let Some(container) = target.container {
         let result = source
             .list_children(ListChildrenRequest {
@@ -622,6 +658,18 @@ where
                 parent_path: target.parent_path.clone(),
             })
             .map_err(PullError::Connector)?;
+        let returned_remote_ids = result
+            .entries
+            .iter()
+            .map(|entry| entry.remote_id.clone())
+            .collect::<BTreeSet<_>>();
+        crate::virtual_fs::prune_stale_virtual_children(
+            store,
+            &mount.mount_id,
+            &target.parent_path,
+            &returned_remote_ids,
+        )
+        .map_err(PullError::Store)?;
         enumerated = result.entries.len();
         let should_hydrate_rows = is_database_directory
             && state_root.is_some()
@@ -870,7 +918,7 @@ where
             }),
             EntityKind::Directory => Some(VirtualDirectoryTarget {
                 parent_path: entity.path,
-                container: None,
+                container: Some(ChildContainer::DirectoryChildren(entity.remote_id)),
                 schema_database_id: None,
             }),
             EntityKind::Page | EntityKind::Asset | EntityKind::Unknown(_) => None,
@@ -2148,13 +2196,13 @@ impl PullError {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use locality_connector::{
-        ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, Connector,
-        ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest, ListChildrenRequest,
-        ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
+        ApplyPlanRequest, ApplyPlanResult, ApplyUndoRequest, ApplyUndoResult, ChildContainer,
+        Connector, ConnectorCapabilities, ConnectorKind, EnumerateRequest, FetchRequest,
+        ListChildrenRequest, ListChildrenResult, NativeEntity, ObserveRequest, ParsedEntity,
     };
     use locality_core::LocalityResult;
     use locality_core::canonical::render_canonical_markdown;
@@ -2414,6 +2462,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pull_virtual_directory_prunes_clean_stale_child_subtree() {
+        let fixture = PullFixture::new();
+        let mut store = InMemoryStateStore::new();
+        let mount = MountConfig::new(fixture.mount_id.clone(), "gmail", fixture.root.clone())
+            .projection(ProjectionMode::LinuxFuse);
+        store.save_mount(mount.clone()).expect("save mount");
+        let inbox_id = RemoteId::new("gmail-folder:inbox");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                inbox_id.clone(),
+                EntityKind::Directory,
+                "Inbox",
+                "inbox",
+            ))
+            .expect("save inbox");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("gmail-thread:inbox:old-thread"),
+                EntityKind::Page,
+                "Old Thread",
+                "inbox/old-thread/page.md",
+            ))
+            .expect("save old thread");
+        store
+            .save_entity(EntityRecord::new(
+                fixture.mount_id.clone(),
+                RemoteId::new("gmail-thread-message:inbox:old-thread:old-msg"),
+                EntityKind::Page,
+                "Old Message",
+                "inbox/old-thread/old-msg.md",
+            ))
+            .expect("save old thread child");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    fixture.mount_id.clone(),
+                    RemoteId::new("gmail-thread:inbox:dirty-thread"),
+                    EntityKind::Page,
+                    "Dirty Thread",
+                    "inbox/dirty-thread/page.md",
+                )
+                .with_hydration(HydrationState::Dirty),
+            )
+            .expect("save dirty thread");
+        let new_thread_id = RemoteId::new("gmail-thread:inbox:new-thread");
+        let source = FakePullSource::new(Vec::new(), Vec::new()).with_children(
+            &inbox_id,
+            vec![tree_entry(
+                &fixture.mount_id,
+                &new_thread_id,
+                "New Thread",
+                "inbox/new-thread/page.md",
+                HydrationState::Stub,
+            )],
+        );
+
+        let report = super::pull_virtual_directory_path(
+            &mut store,
+            &source,
+            &mount,
+            Path::new("inbox"),
+            fixture.root.join("inbox"),
+            None,
+        )
+        .expect("pull virtual directory")
+        .expect("virtual directory report");
+
+        assert_eq!(report.enumerated, 1);
+        assert!(
+            store
+                .get_entity(
+                    &fixture.mount_id,
+                    &RemoteId::new("gmail-thread:inbox:old-thread")
+                )
+                .expect("old thread lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_entity(
+                    &fixture.mount_id,
+                    &RemoteId::new("gmail-thread-message:inbox:old-thread:old-msg")
+                )
+                .expect("old message lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_entity(
+                    &fixture.mount_id,
+                    &RemoteId::new("gmail-thread:inbox:dirty-thread")
+                )
+                .expect("dirty thread lookup")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_entity(&fixture.mount_id, &new_thread_id)
+                .expect("new thread lookup")
+                .is_some()
+        );
+    }
+
     struct PullFixture {
         mount: MountConfig,
         mount_id: MountId,
@@ -2516,6 +2670,7 @@ mod tests {
     #[derive(Clone)]
     struct FakePullSource {
         entries: Vec<locality_core::model::TreeEntry>,
+        children: BTreeMap<RemoteId, Vec<locality_core::model::TreeEntry>>,
         rendered: BTreeMap<RemoteId, HydratedEntity>,
         schemas: BTreeMap<RemoteId, String>,
     }
@@ -2527,6 +2682,7 @@ mod tests {
         ) -> Self {
             Self {
                 entries,
+                children: BTreeMap::new(),
                 rendered: rendered
                     .into_iter()
                     .map(|entity| (entity.shadow.entity_id.clone(), entity))
@@ -2537,6 +2693,15 @@ mod tests {
 
         fn with_schema(mut self, database_id: &RemoteId, schema: &str) -> Self {
             self.schemas.insert(database_id.clone(), schema.to_string());
+            self
+        }
+
+        fn with_children(
+            mut self,
+            parent_id: &RemoteId,
+            entries: Vec<locality_core::model::TreeEntry>,
+        ) -> Self {
+            self.children.insert(parent_id.clone(), entries);
             self
         }
     }
@@ -2567,11 +2732,17 @@ mod tests {
 
         fn list_children(
             &self,
-            _request: ListChildrenRequest,
+            request: ListChildrenRequest,
         ) -> LocalityResult<ListChildrenResult> {
-            Err(locality_core::LocalityError::NotImplemented(
-                "fake list children",
-            ))
+            let key = match request.container {
+                ChildContainer::DirectoryChildren(remote_id)
+                | ChildContainer::DatabaseRows(remote_id)
+                | ChildContainer::PageChildren(remote_id) => remote_id,
+                ChildContainer::Root => RemoteId::new("root"),
+            };
+            Ok(ListChildrenResult {
+                entries: self.children.get(&key).cloned().unwrap_or_default(),
+            })
         }
 
         fn fetch(&self, _request: FetchRequest) -> LocalityResult<NativeEntity> {

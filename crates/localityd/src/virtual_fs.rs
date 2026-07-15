@@ -466,11 +466,18 @@ where
     let result = connector.list_children(ListChildrenRequest {
         mount_id: mount.mount_id.clone(),
         container,
-        parent_path,
+        parent_path: parent_path.clone(),
     })?;
+    let returned_remote_ids = result
+        .entries
+        .iter()
+        .map(|entry| entry.remote_id.clone())
+        .collect::<BTreeSet<_>>();
+    let pruned = prune_stale_virtual_children(store, mount_id, &parent_path, &returned_remote_ids)
+        .map_err(LocalityError::from)?;
 
     let mut saved = 0;
-    let mut changed = false;
+    let mut changed = pruned > 0;
     for entry in result.entries {
         let existing = store
             .get_entity(&entry.mount_id, &entry.remote_id)
@@ -484,6 +491,53 @@ where
     }
 
     Ok(VirtualFsRefreshChildrenReport { saved, changed })
+}
+
+pub(crate) fn prune_stale_virtual_children<S>(
+    store: &mut S,
+    mount_id: &MountId,
+    parent_path: &Path,
+    returned_remote_ids: &BTreeSet<RemoteId>,
+) -> Result<usize, StoreError>
+where
+    S: EntityRepository,
+{
+    let entities = store.list_entities(mount_id)?;
+    let mut delete_ids = BTreeSet::new();
+    for entity in entities.iter().filter(|entity| {
+        entity_listing_parent_path(entity) == parent_path
+            && !returned_remote_ids.contains(&entity.remote_id)
+    }) {
+        let subtree = stale_virtual_child_subtree(&entities, entity);
+        if subtree.iter().any(|entity| {
+            matches!(
+                entity.hydration,
+                HydrationState::Dirty | HydrationState::Conflicted
+            )
+        }) {
+            continue;
+        }
+        delete_ids.extend(subtree.into_iter().map(|entity| entity.remote_id.clone()));
+    }
+
+    let pruned = delete_ids.len();
+    for remote_id in delete_ids {
+        store.delete_entity(mount_id, &remote_id)?;
+    }
+    Ok(pruned)
+}
+
+fn stale_virtual_child_subtree<'a>(
+    entities: &'a [EntityRecord],
+    child: &EntityRecord,
+) -> Vec<&'a EntityRecord> {
+    let subtree_root = entity_parent_container_path(child);
+    entities
+        .iter()
+        .filter(|entity| {
+            entity.remote_id == child.remote_id || entity.path.starts_with(&subtree_root)
+        })
+        .collect()
 }
 
 pub fn refresh_virtual_fs_children_with_content_root<S, C>(
@@ -4177,6 +4231,88 @@ mod tests {
         assert!(report.children.iter().any(|child| {
             child.identifier == "children:page-new" && child.kind == VirtualFsItemKind::Folder
         }));
+    }
+
+    #[test]
+    fn refresh_children_prunes_clean_stale_virtual_child_subtree() {
+        let mount_id = MountId::new("notion-main");
+        let mut store = InMemoryStateStore::new();
+        let mount = virtual_mount(&mount_id);
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("old-page"),
+                EntityKind::Page,
+                "Old",
+                "old/page.md",
+            ))
+            .expect("save old page");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("old-child"),
+                EntityKind::Page,
+                "Old Child",
+                "old/child/page.md",
+            ))
+            .expect("save old child");
+        store
+            .save_entity(
+                EntityRecord::new(
+                    mount_id.clone(),
+                    RemoteId::new("dirty-page"),
+                    EntityKind::Page,
+                    "Dirty",
+                    "dirty/page.md",
+                )
+                .with_hydration(HydrationState::Dirty),
+            )
+            .expect("save dirty page");
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("new-page"),
+                kind: EntityKind::Page,
+                title: "New Page".to_string(),
+                path: "new/page.md".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::new(),
+            database_schema: None,
+        };
+
+        let saved = refresh_virtual_fs_children(
+            &mut store,
+            &connector,
+            &mount_id,
+            &mount_point_identifier(&mount),
+        )
+        .expect("refresh children");
+
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("old-page"))
+                .expect("old page lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("old-child"))
+                .expect("old child lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("dirty-page"))
+                .expect("dirty page lookup")
+                .is_some()
+        );
     }
 
     #[test]
