@@ -143,6 +143,8 @@ impl Connector for GranolaConnector {
     }
 
     fn list_children(&self, request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
+        let complete = !matches!(request.container, ChildContainer::Root)
+            || self.config.updated_after.is_none();
         let entries = match request.container {
             ChildContainer::Root => self
                 .all_notes()?
@@ -154,7 +156,11 @@ impl Connector for GranolaConnector {
             }
             _ => Vec::new(),
         };
-        Ok(ListChildrenResult { entries })
+        Ok(if complete {
+            ListChildrenResult::complete(entries)
+        } else {
+            ListChildrenResult::incremental(entries)
+        })
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {
@@ -376,6 +382,7 @@ fn safe_filename(value: &str, byte_limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use locality_connector::{ChildContainer, Connector, EnumerateRequest, ListChildrenRequest};
@@ -475,23 +482,47 @@ mod tests {
                 .iter()
                 .all(|entry| entry.stub_frontmatter.is_none())
         );
+        assert!(result.is_complete());
     }
 
     #[test]
-    fn incremental_enumeration_passes_updated_after_filter_to_api() {
+    fn full_root_listing_is_a_complete_snapshot() {
+        let api = Arc::new(FakeApi::with_notes(vec![summary(
+            "not_recent",
+            "2026-07-14T18:30:00Z",
+            Some("Sync"),
+        )]));
+        let connector = GranolaConnector::with_api(GranolaConfig::new("secret"), api);
+
+        let result = connector
+            .list_children(ListChildrenRequest {
+                mount_id: MountId::new("granola-main"),
+                container: ChildContainer::Root,
+                parent_path: PathBuf::new(),
+            })
+            .expect("list full root");
+
+        assert!(result.is_complete());
+        assert_eq!(result.entries.len(), 1);
+    }
+
+    #[test]
+    fn incremental_root_listing_passes_filter_and_does_not_authorize_pruning() {
         let api = Arc::new(FakeApi::default());
         let connector = GranolaConnector::with_api(
             GranolaConfig::new("secret").with_updated_after("2026-07-12"),
             api.clone(),
         );
 
-        connector
-            .enumerate(EnumerateRequest {
+        let result = connector
+            .list_children(ListChildrenRequest {
                 mount_id: MountId::new("granola-main"),
-                cursor: None,
+                container: ChildContainer::Root,
+                parent_path: PathBuf::new(),
             })
-            .expect("enumerate incrementally");
+            .expect("list root incrementally");
 
+        assert!(!result.is_complete());
         assert_eq!(
             api.updated_after.lock().unwrap().as_slice(),
             &[Some("2026-07-12".to_string())]

@@ -86,9 +86,43 @@ pub struct ListChildrenRequest {
     pub parent_path: std::path::PathBuf,
 }
 
+/// Whether a child listing is a complete snapshot of a container or only a
+/// mergeable subset.
+///
+/// Hosts may remove locally known children that are absent from a complete
+/// listing. Incremental listings must only upsert the returned entries because
+/// absence does not mean that a remote child was deleted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChildListingCompleteness {
+    Complete,
+    #[default]
+    Incremental,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ListChildrenResult {
     pub entries: Vec<TreeEntry>,
+    pub completeness: ChildListingCompleteness,
+}
+
+impl ListChildrenResult {
+    pub fn complete(entries: Vec<TreeEntry>) -> Self {
+        Self {
+            entries,
+            completeness: ChildListingCompleteness::Complete,
+        }
+    }
+
+    pub fn incremental(entries: Vec<TreeEntry>) -> Self {
+        Self {
+            entries,
+            completeness: ChildListingCompleteness::Incremental,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.completeness == ChildListingCompleteness::Complete
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,7 +202,9 @@ pub trait Connector {
     ///
     /// This must not fetch full document bodies. Returning metadata only lets
     /// FileProvider/FUSE make directory navigation lazy while page hydration
-    /// remains tied to file open or explicit pull.
+    /// remains tied to file open or explicit pull. Results must declare whether
+    /// they are a complete container snapshot. Incremental results are merged
+    /// and never authorize deletion of omitted children.
     fn list_children(&self, _request: ListChildrenRequest) -> LocalityResult<ListChildrenResult> {
         Err(locality_core::LocalityError::Unsupported(
             "connector does not support lazy child enumeration",

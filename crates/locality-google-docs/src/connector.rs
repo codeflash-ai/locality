@@ -224,14 +224,12 @@ impl Connector for GoogleDocsConnector {
             | locality_connector::ChildContainer::DatabaseRows(remote_id)
             | locality_connector::ChildContainer::DirectoryChildren(remote_id) => remote_id.0,
         };
-        Ok(ListChildrenResult {
-            entries: list_drive_children(
-                self.drive.as_ref(),
-                &request.mount_id,
-                &parent_id,
-                &request.parent_path,
-            )?,
-        })
+        Ok(ListChildrenResult::complete(list_drive_children(
+            self.drive.as_ref(),
+            &request.mount_id,
+            &parent_id,
+            &request.parent_path,
+        )?))
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {

@@ -491,13 +491,17 @@ where
         container,
         parent_path: parent_path.clone(),
     })?;
-    let returned_remote_ids = result
-        .entries
-        .iter()
-        .map(|entry| entry.remote_id.clone())
-        .collect::<BTreeSet<_>>();
-    let pruned = prune_stale_virtual_children(store, mount_id, &parent_path, &returned_remote_ids)
-        .map_err(LocalityError::from)?;
+    let pruned = if result.is_complete() {
+        let returned_remote_ids = result
+            .entries
+            .iter()
+            .map(|entry| entry.remote_id.clone())
+            .collect::<BTreeSet<_>>();
+        prune_stale_virtual_children(store, mount_id, &parent_path, &returned_remote_ids)
+            .map_err(LocalityError::from)?
+    } else {
+        0
+    };
 
     let mut saved = 0;
     let mut changed = pruned > 0;
@@ -4545,6 +4549,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::new(),
             database_schema: None,
+            complete: true,
         };
         let mount_point_root = mount_point_identifier(&mount);
 
@@ -4638,6 +4643,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::new(),
             database_schema: None,
+            complete: true,
         };
 
         let saved = refresh_virtual_fs_children(
@@ -4666,6 +4672,62 @@ mod tests {
             store
                 .get_entity(&mount_id, &RemoteId::new("dirty-page"))
                 .expect("dirty page lookup")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn incremental_refresh_merges_without_pruning_omitted_children() {
+        let mount_id = MountId::new("granola-main");
+        let mut store = InMemoryStateStore::new();
+        let mount = virtual_mount_with_connector(&mount_id, "granola");
+        store.save_mount(mount.clone()).expect("save mount");
+        store
+            .save_entity(EntityRecord::new(
+                mount_id.clone(),
+                RemoteId::new("old-meeting"),
+                EntityKind::Directory,
+                "Old meeting",
+                "Old meeting",
+            ))
+            .expect("save old meeting");
+        let connector = StaticChildrenConnector {
+            entries: vec![TreeEntry {
+                mount_id: mount_id.clone(),
+                remote_id: RemoteId::new("recent-meeting"),
+                kind: EntityKind::Directory,
+                title: "Recent meeting".to_string(),
+                path: "Recent meeting".into(),
+                hydration: HydrationState::Stub,
+                content_hash: None,
+                remote_edited_at: None,
+                stub_frontmatter: None,
+            }],
+            expected_parent_path: PathBuf::new(),
+            database_schema: None,
+            complete: false,
+        };
+
+        let saved = refresh_virtual_fs_children(
+            &mut store,
+            &connector,
+            &mount_id,
+            &mount_point_identifier(&mount),
+        )
+        .expect("merge incremental root refresh");
+
+        assert_eq!(saved.saved, 1);
+        assert!(saved.changed);
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("old-meeting"))
+                .expect("old meeting lookup")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_entity(&mount_id, &RemoteId::new("recent-meeting"))
+                .expect("recent meeting lookup")
                 .is_some()
         );
     }
@@ -4709,6 +4771,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
             database_schema: None,
+            complete: true,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -4764,6 +4827,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
             database_schema: Some((RemoteId::new("database-1"), schema.to_string())),
+            complete: true,
         };
 
         let saved = refresh_virtual_fs_children_with_content_root(
@@ -4862,6 +4926,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
             database_schema: None,
+            complete: true,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -4920,6 +4985,7 @@ mod tests {
             }],
             expected_parent_path: PathBuf::from("Root/Tasks"),
             database_schema: None,
+            complete: true,
         };
 
         let saved = refresh_virtual_fs_children(&mut store, &connector, &mount_id, "database-1")
@@ -4940,6 +5006,7 @@ mod tests {
         entries: Vec<TreeEntry>,
         expected_parent_path: PathBuf,
         database_schema: Option<(RemoteId, String)>,
+        complete: bool,
     }
 
     impl Connector for StaticChildrenConnector {
@@ -4969,8 +5036,10 @@ mod tests {
             request: ListChildrenRequest,
         ) -> locality_core::LocalityResult<ListChildrenResult> {
             assert_eq!(request.parent_path, self.expected_parent_path);
-            Ok(ListChildrenResult {
-                entries: self.entries.clone(),
+            Ok(if self.complete {
+                ListChildrenResult::complete(self.entries.clone())
+            } else {
+                ListChildrenResult::incremental(self.entries.clone())
             })
         }
 
@@ -6225,6 +6294,7 @@ mod tests {
                 entries: Vec::new(),
                 expected_parent_path: PathBuf::new(),
                 database_schema: None,
+                complete: true,
             },
             &mount_id,
             ROOT_CONTAINER_IDENTIFIER,

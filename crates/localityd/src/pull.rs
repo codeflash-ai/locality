@@ -658,18 +658,20 @@ where
                 parent_path: target.parent_path.clone(),
             })
             .map_err(PullError::Connector)?;
-        let returned_remote_ids = result
-            .entries
-            .iter()
-            .map(|entry| entry.remote_id.clone())
-            .collect::<BTreeSet<_>>();
-        crate::virtual_fs::prune_stale_virtual_children(
-            store,
-            &mount.mount_id,
-            &target.parent_path,
-            &returned_remote_ids,
-        )
-        .map_err(PullError::Store)?;
+        if result.is_complete() {
+            let returned_remote_ids = result
+                .entries
+                .iter()
+                .map(|entry| entry.remote_id.clone())
+                .collect::<BTreeSet<_>>();
+            crate::virtual_fs::prune_stale_virtual_children(
+                store,
+                &mount.mount_id,
+                &target.parent_path,
+                &returned_remote_ids,
+            )
+            .map_err(PullError::Store)?;
+        }
         enumerated = result.entries.len();
         let should_hydrate_rows = is_database_directory
             && state_root.is_some()
@@ -2697,9 +2699,9 @@ mod tests {
                 | ChildContainer::PageChildren(remote_id) => remote_id,
                 ChildContainer::Root => RemoteId::new("root"),
             };
-            Ok(ListChildrenResult {
-                entries: self.children.get(&key).cloned().unwrap_or_default(),
-            })
+            Ok(ListChildrenResult::complete(
+                self.children.get(&key).cloned().unwrap_or_default(),
+            ))
         }
 
         fn fetch(&self, _request: FetchRequest) -> LocalityResult<NativeEntity> {

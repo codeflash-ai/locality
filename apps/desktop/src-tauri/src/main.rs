@@ -13948,11 +13948,9 @@ mod tests {
             request: locality_connector::ListChildrenRequest,
         ) -> locality_core::LocalityResult<locality_connector::ListChildrenResult> {
             match request.container {
-                locality_connector::ChildContainer::Root => {
-                    Ok(locality_connector::ListChildrenResult {
-                        entries: self.entries.clone(),
-                    })
-                }
+                locality_connector::ChildContainer::Root => Ok(
+                    locality_connector::ListChildrenResult::complete(self.entries.clone()),
+                ),
                 locality_connector::ChildContainer::PageChildren(_)
                 | locality_connector::ChildContainer::DatabaseRows(_)
                 | locality_connector::ChildContainer::DirectoryChildren(_) => {

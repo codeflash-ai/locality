@@ -194,9 +194,12 @@ virtual identifiers such as root, mount point, page, database, and source-root
 containers to `ChildContainer`.
 
 `refresh_virtual_fs_children` calls `connector.list_children`, saves returned
-metadata records, refreshes database schema cache when supplied, prunes clean
-old children that disappeared remotely, and handles source-root rehoming by
-listing sibling containers.
+metadata records, refreshes database schema cache when supplied, and handles
+source-root rehoming by listing sibling containers. A child result explicitly
+declares whether it is a complete snapshot or an incremental subset. Only a
+complete snapshot may prune clean old children that disappeared remotely;
+incremental results merge returned identities without interpreting omitted
+children as deletions.
 
 Runtime child-refresh behavior:
 

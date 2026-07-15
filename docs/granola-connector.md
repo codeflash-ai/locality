@@ -64,7 +64,9 @@ pagination. Locality stores a versioned, mount-scoped discovery checkpoint.
 Later discovery requests use Granola's `updated_after` filter with a two-day
 overlap so delayed edits and meetings near a date boundary are not missed.
 The returned identities are merged into durable entity state, making the
-overlap safe. Summary and transcript files still hydrate lazily when opened.
+overlap safe. These root results are explicitly marked incremental, so meetings
+outside the recent window are retained rather than mistaken for remote
+deletions. Summary and transcript files still hydrate lazily when opened.
 
 While the daemon's background connector sync is enabled, it schedules a
 Granola root discovery every five minutes. The check is independent of the

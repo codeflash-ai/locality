@@ -244,7 +244,7 @@ impl Connector for NotionConnector {
             &request.parent_path,
         )?;
 
-        Ok(ListChildrenResult { entries })
+        Ok(ListChildrenResult::complete(entries))
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {

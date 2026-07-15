@@ -222,9 +222,7 @@ impl Connector for GmailConnector {
             }
             ChildContainer::PageChildren(remote_id) => {
                 let Some((mailbox, thread_id)) = parse_thread_remote_id(&remote_id) else {
-                    return Ok(ListChildrenResult {
-                        entries: Vec::new(),
-                    });
+                    return Ok(ListChildrenResult::complete(Vec::new()));
                 };
                 let thread = self.api.get_thread_metadata(thread_id)?;
                 thread
@@ -243,7 +241,7 @@ impl Connector for GmailConnector {
             }
             _ => Vec::new(),
         };
-        Ok(ListChildrenResult { entries })
+        Ok(ListChildrenResult::complete(entries))
     }
 
     fn observe(&self, request: ObserveRequest) -> LocalityResult<RemoteObservation> {

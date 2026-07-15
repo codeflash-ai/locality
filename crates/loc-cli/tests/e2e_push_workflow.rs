@@ -14386,13 +14386,12 @@ impl Connector for NestedPagePullSource {
         &self,
         request: ListChildrenRequest,
     ) -> locality_core::LocalityResult<ListChildrenResult> {
-        Ok(ListChildrenResult {
-            entries: self
-                .child_entries
+        Ok(ListChildrenResult::complete(
+            self.child_entries
                 .get(&request.parent_path)
                 .cloned()
                 .unwrap_or_default(),
-        })
+        ))
     }
 
     fn fetch(&self, _request: FetchRequest) -> locality_core::LocalityResult<NativeEntity> {
